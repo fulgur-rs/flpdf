@@ -139,7 +139,7 @@ impl QPDFJob {
             return Ok(());
         };
         let logger = self.logger();
-        let message_prefix = self.message_prefix().to_owned();
+        let message_prefix = self.message_prefix_bytes().to_owned();
         let input_name = self.input_name_bytes().to_owned();
         emit_diagnostics(diagnostics, 0, &logger, &message_prefix, &input_name)?;
         Ok(())
@@ -184,7 +184,7 @@ impl QPDFJob {
     ) -> std::result::Result<(), CheckError> {
         let logger = self.logger();
         let input_name = self.input_name_bytes().to_owned();
-        let message_prefix = self.message_prefix().to_owned();
+        let message_prefix = self.message_prefix_bytes().to_owned();
 
         // Top-level `--check` delivers open-time document warnings live unless
         // `--no-warn` is active, matching qpdf's `doProcess`/`doCheck` order.
@@ -262,7 +262,7 @@ fn check_document<R: Read + Seek + 'static>(
     check_document_with_suppression(
         pdf,
         logger,
-        message_prefix,
+        message_prefix.as_bytes(),
         input_name.as_bytes(),
         false,
         false,
@@ -273,7 +273,7 @@ fn check_document<R: Read + Seek + 'static>(
 fn check_document_with_suppression<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     logger: &QPDFLogger,
-    message_prefix: &str,
+    message_prefix: &[u8],
     input_name: &[u8],
     suppress_warnings: bool,
     show_encryption_key: bool,
@@ -522,7 +522,7 @@ fn inspect_new_diagnostics<R: Read + Seek>(
     pdf: &Pdf<R>,
     seen: usize,
     logger: &QPDFLogger,
-    message_prefix: &str,
+    message_prefix: &[u8],
     input_name: &[u8],
     suppress_warnings: bool,
     replay_diagnostics: bool,
@@ -840,7 +840,7 @@ fn map_in_try_error(logger: &QPDFLogger, error: crate::Error, logger_failure: bo
 
 fn map_check_phase_error(
     logger: &QPDFLogger,
-    message_prefix: &str,
+    message_prefix: &[u8],
     error: crate::Error,
     logger_failure: bool,
 ) -> CheckError {
@@ -855,7 +855,11 @@ fn map_check_phase_error(
 /// rendered. qpdf continues to its single final `errors detected` throw after
 /// the outer check catch (`QPDFJob.cc:788-793`); do not return the intermediate
 /// status before that line has been emitted.
-fn finish_check_error(logger: &QPDFLogger, message_prefix: &str, result: CheckError) -> CheckError {
+fn finish_check_error(
+    logger: &QPDFLogger,
+    message_prefix: &[u8],
+    result: CheckError,
+) -> CheckError {
     match result {
         CheckError::ErrorsDetected => report_errors_detected(logger, message_prefix),
         other => other,
@@ -896,7 +900,7 @@ fn take_logger_failure<R: Read + Seek>(
 /// and use [`map_in_try_error`] for everything the try block covers.
 fn map_check_error(
     logger: &QPDFLogger,
-    message_prefix: &str,
+    message_prefix: &[u8],
     input_name: &[u8],
     error: crate::Error,
     logger_failure: bool,
@@ -939,8 +943,10 @@ fn emit_check_catch_error(logger: &QPDFLogger, error: &crate::Error) -> Result<(
 /// stream decode failures. qpdf's exception category is not part of the
 /// message; `Error::Unsupported` is the crate's transport for the same
 /// parser failure and its display prefix must not leak into `--check` output.
-fn report_errors_detected(logger: &QPDFLogger, message_prefix: &str) -> CheckError {
-    match logger.error(format!("{message_prefix}: errors detected\n")) {
+fn report_errors_detected(logger: &QPDFLogger, message_prefix: &[u8]) -> CheckError {
+    let mut message = message_prefix.to_vec();
+    message.extend_from_slice(b": errors detected\n");
+    match logger.error(message) {
         Ok(()) => CheckError::ErrorsDetected,
         Err(error) => CheckError::Operation(error),
     }
@@ -954,14 +960,21 @@ fn emit_new_diagnostics<R: Read + Seek>(
     message_prefix: &str,
     input_name: &[u8],
 ) -> std::result::Result<(bool, bool), CheckError> {
-    emit_new_diagnostics_with_suppression(pdf, seen, logger, message_prefix, input_name, false)
+    emit_new_diagnostics_with_suppression(
+        pdf,
+        seen,
+        logger,
+        message_prefix.as_bytes(),
+        input_name,
+        false,
+    )
 }
 
 fn emit_new_diagnostics_with_suppression<R: Read + Seek>(
     pdf: &Pdf<R>,
     seen: usize,
     logger: &QPDFLogger,
-    message_prefix: &str,
+    message_prefix: &[u8],
     input_name: &[u8],
     suppress_warnings: bool,
 ) -> std::result::Result<(bool, bool), CheckError> {
@@ -981,7 +994,7 @@ fn emit_diagnostics(
     diagnostics: &crate::Diagnostics,
     seen: usize,
     logger: &QPDFLogger,
-    message_prefix: &str,
+    message_prefix: &[u8],
     input_name: &[u8],
 ) -> Result<(bool, bool)> {
     emit_diagnostics_with_suppression(diagnostics, seen, logger, message_prefix, input_name, false)
@@ -991,7 +1004,7 @@ fn emit_diagnostics_with_suppression(
     diagnostics: &crate::Diagnostics,
     seen: usize,
     logger: &QPDFLogger,
-    _message_prefix: &str,
+    _message_prefix: &[u8],
     _input_name: &[u8],
     suppress_warnings: bool,
 ) -> Result<(bool, bool)> {
@@ -1037,11 +1050,11 @@ fn emit_warning(logger: &QPDFLogger, input_name: &[u8], message: impl AsRef<str>
 
 fn emit_error(
     logger: &QPDFLogger,
-    message_prefix: &str,
+    message_prefix: &[u8],
     input_name: &[u8],
     error: &crate::Error,
 ) -> Result<()> {
-    let mut line = message_prefix.as_bytes().to_vec();
+    let mut line = message_prefix.to_vec();
     line.extend_from_slice(b": ");
     line.extend_from_slice(input_name);
     line.extend_from_slice(b": ");
@@ -1180,7 +1193,7 @@ mod tests {
         let output = Arc::new(Mutex::new(Vec::new()));
         let logger = logger_with_capture(Arc::clone(&output));
         assert!(matches!(
-            report_errors_detected(&logger, "qpdf"),
+            report_errors_detected(&logger, b"qpdf"),
             CheckError::ErrorsDetected
         ));
         assert_eq!(
@@ -1288,7 +1301,7 @@ mod tests {
         let logger = logger_with_capture(Arc::clone(&output));
         let result = map_check_phase_error(
             &logger,
-            "qpdf",
+            b"qpdf",
             Error::Internal("encrypted PDF has no encryption revision".to_owned()),
             false,
         );
@@ -1324,7 +1337,7 @@ mod tests {
         logger.set_output_streams(None, Some(PipelineHandle::new(FailingCapture)));
 
         assert!(matches!(
-            report_errors_detected(&logger, "qpdf"),
+            report_errors_detected(&logger, b"qpdf"),
             CheckError::Operation(Error::System(message)) if message == "logger failure"
         ));
     }
@@ -1342,7 +1355,7 @@ mod tests {
             b"stream filter type is not name or array",
         ));
 
-        let result = emit_diagnostics(&diagnostics, 0, &logger, "qpdf", b"destination.pdf")
+        let result = emit_diagnostics(&diagnostics, 0, &logger, b"qpdf", b"destination.pdf")
             .expect("object warning replay");
         assert_eq!(result, (true, false));
         assert_eq!(
@@ -1609,14 +1622,14 @@ mod tests {
             b" object is supposed to be a stream or an array of streams but is neither",
         ));
 
-        let (warnings, errors) = emit_diagnostics(&diagnostics, 0, &logger, "qpdf", b"input.pdf")
+        let (warnings, errors) = emit_diagnostics(&diagnostics, 0, &logger, b"qpdf", b"input.pdf")
             .expect("diagnostics should be delivered");
         assert!(warnings);
         assert!(!errors);
         emit_warning(&logger, b"input.pdf", "linearization warning").unwrap();
         emit_error(
             &logger,
-            "qpdf",
+            b"qpdf",
             b"input.pdf",
             &Error::Internal("fatal".to_owned()),
         )
@@ -1628,12 +1641,12 @@ mod tests {
             9,
             b"bad object",
         ));
-        emit_error(&logger, "qpdf", b"input.pdf", &qpdf_error).unwrap();
+        emit_error(&logger, b"qpdf", b"input.pdf", &qpdf_error).unwrap();
         let open_failure = Error::OpenFailure {
             source: Box::new(qpdf_error),
             diagnostics: Diagnostics::default(),
         };
-        emit_error(&logger, "qpdf", b"input.pdf", &open_failure).unwrap();
+        emit_error(&logger, b"qpdf", b"input.pdf", &open_failure).unwrap();
 
         let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
         assert!(output.contains("WARNING: input.pdf (object 5 0, offset 232): expected endobj\n"));
@@ -2435,7 +2448,7 @@ mod tests {
         let logger = logger_with_capture(Arc::clone(&output));
 
         let result =
-            emit_new_diagnostics_with_suppression(&pdf, 0, &logger, "qpdf", b"broken.pdf", false)
+            emit_new_diagnostics_with_suppression(&pdf, 0, &logger, b"qpdf", b"broken.pdf", false)
                 .expect("diagnostics should be delivered");
 
         assert_eq!(result, (true, false));
@@ -2691,7 +2704,7 @@ mod tests {
         failing_logger.set_output_streams(None, Some(PipelineHandle::new(FailingCapture)));
         let mapped = map_check_error(
             &failing_logger,
-            "qpdf",
+            b"qpdf",
             b"input.pdf",
             Error::parse(0, "malformed"),
             false,

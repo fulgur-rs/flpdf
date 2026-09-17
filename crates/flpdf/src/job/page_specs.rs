@@ -213,7 +213,7 @@ pub fn copy_duplicate_page_annotations<R: Read + Seek>(
 
 /// Execute the qpdf-shaped in-place page-tree portion for one source.
 fn prefixed_info_line(job: &super::QPDFJob, body: &[u8]) -> Vec<u8> {
-    let mut message = job.message_prefix().as_bytes().to_vec();
+    let mut message = job.message_prefix_bytes().to_vec();
     message.extend_from_slice(b": ");
     message.extend_from_slice(body);
     message

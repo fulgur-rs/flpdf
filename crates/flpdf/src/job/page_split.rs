@@ -193,7 +193,7 @@ impl QPDFJob {
                 let logger = self.logger();
                 if verbose {
                     let mut message = Vec::new();
-                    message.extend_from_slice(self.message_prefix().as_bytes());
+                    message.extend_from_slice(self.message_prefix_bytes());
                     message.extend_from_slice(b": ");
                     message.extend_from_slice(self.input_name_bytes());
                     message.extend_from_slice(b": checking for shared resources\n");
@@ -209,7 +209,7 @@ impl QPDFJob {
                     })?;
                 if verbose && !should_remove {
                     let mut message = Vec::new();
-                    message.extend_from_slice(self.message_prefix().as_bytes());
+                    message.extend_from_slice(self.message_prefix_bytes());
                     message.extend_from_slice(b": no shared resources found\n");
                     logger.info(message)?;
                 }
@@ -366,11 +366,10 @@ impl QPDFJob {
             // file" for the earlier, successfully written chunks before
             // failing.
             if options.verbose {
-                let message = format!(
-                    "{}: wrote file {}\n",
-                    self.message_prefix(),
-                    output_path.display()
-                );
+                let mut message = self.message_prefix_bytes().to_vec();
+                message.extend_from_slice(b": wrote file ");
+                message.extend_from_slice(&path_bytes(&output_path));
+                message.push(b'\n');
                 self.logger().info(message)?;
             }
             written.push(output_path);

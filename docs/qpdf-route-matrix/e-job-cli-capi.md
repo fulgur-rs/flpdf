@@ -308,6 +308,8 @@ semantic page-label caller 5 箇所だけを移行した。
 | E-28 | `qpdf/test_driver.cc` consumer（`QPDF` / `QPDFObjectHandle` / helper の public API を呼ぶ 99 ケース） | `qpdf/test_driver.cc:3540-3562` | `crates/flpdf-qtest-tools/src/driver/mod.rs::run` と `driver/*.rs` | prod: 1 bin（`crates/flpdf-qtest-tools/src/bin/driver.rs`）/ test: `driver_cli.rs`, `driver_goldens.rs`, `xref_parsedoffset_cli.rs` | mixed | case/API ごとの領域 A〜D owner（下記詳細表参照） | **2026-09-17 `.48.115` / `.48.116` / `.48.117` / `.48.118` / `.48.120` / `.48.121` / `.48.122` / `.48.123` / `.48.125` / `.48.127` / `.48.128` / `.48.133` / `.48.134` / `.48.135` / `.48.136` / `.48.137` / `.48.138` / `.48.139` / `.48.140` 反映**: 99 ケース全件（0/1 統合で 98 行）を imports・型経由メソッド・呼出し順序まで A〜D owner と照合し、現行は `canonical` 51 / `mixed` 48 / `bridge` 0 / `unknown` 0。test 2/3/4/5/6/7/8/9/11/17/19/21/31/34/38/42/46/48/50/52/68/71/72/73/75/85/86/87/89/92/97/98 のcaller-side `Pdf::resolve`・accessor bridge・driver-local重複walkは撤去済み。case 4 は qpdf public `isNull()` 対応の `try_is_null()`、case 7/8 は qpdf public `isStream()` 対応の resolving `type_code()`、case 9 は qpdf public `getRoot()` 対応の `root_handle()`へ移行したが、D1 writer境界のためcase-level分類はmixedのまま。詳細は「E-28 detail」表を参照。consumer 全体としてはmixedも残るため引き続き`mixed`。 |
 | E-29 | `QPDFJob::createQPDF` の入力オープン側（`processFile` → `doProcess` → `doProcessOnce`。`QPDF` 構築直後に必ず `setQPDFOptions` を適用してから読む） | `libqpdf/QPDFJob.cc:428-481`, `libqpdf/QPDFJob.cc:1793-1804`, `libqpdf/QPDFJob.cc:1695-1716`, `libqpdf/QPDFJob.cc:650-666`（`noWarn` → `setSuppressWarnings` は `libqpdf/QPDFJob.cc:663-665`） | `crates/flpdf/src/job/lifecycle.rs::QPDFJob::open_document_with_description`、`open_with_description`、`open_for_encryption_inspection_with_description`、`open_job_source`。CLI の通常入力と secondary source はこれらの job boundary または同じ `PdfOpenOptions` policy を使う。reopenable な page source は `crates/flpdf-cli/src/main.rs::open_page_source`、JSON input は `QPDFJob::create_from_json` を通る | 旧 `Pdf::open_with_options` / `Pdf::create_from_json` route: job boundary からは prod 0 / test 0 だが、direct `Pdf::open_with_options` は2つの意図的な exception route が残る（`python3 scripts/qpdf-route-callers.py --symbol open_with_options` は `crates/flpdf-cli/src/main.rs` に production caller 1 を報告する）。job の各 open boundary は job suppression を open 前に OR 済み。`open_page_source` は reopenable source のため direct `open_file_with_options` を残す。`run_copy_attachments_from` の attachment donor open も同じく direct `Pdf::open_with_options` を使う — qpdf の `copyAttachments`（`libqpdf/QPDFJob.cc:2100`）が donor を `processFile(other, ...)` で job 本体の main input slot と独立に開いており、donor を job 経由（`job.open_with_description`）で開くと `job.input_name()` が donor のパスで上書きされ、後続の duplicate-key エラー（`self.input_name()` を使用、qpdf の `pdf.getFilename()` @ `QPDFJob.cc:2127` に対応）が target ではなく donor を誤って名指すため。両 route とも同じ `suppress_warnings` option を明示適用する | mixed | `crates/flpdf/src/job/lifecycle.rs::QPDFJob::open_with_description` | qpdf の `doProcessOnce` 境界に合わせ、ordinary open、overlay/underlay、copy-encryption、encryption probe、attachment copy、page source、JSON input の open-time warning delivery を `--no-warn` で抑止する。warning collection と completion/exit status は保持する。この noWarn 欠落自体は `flpdf-3yn9.47` で closed。残る donor open とCLI orchestrationの分離は別責務で、`flpdf-44hb` の donorごとの verbose→open→copy 順序は Job JSON経路にも該当する。 |
 
+E-17 row supersession note（2026-09-17）: 上記 E-17 行の `lifecycle.rs:1781`、11/124 集計、および `flpdf-3yn9.48.6` / `.48.7` 時点の「未実装」記述は履歴スナップショットであり、現行状態を表さない。現行の canonical raw argv initializer、全 qpdf option table、`@file` / top-level `--` / job-JSON occurrence 境界は、下記 `flpdf-3yn9.48.147` の節と option correspondence table によって上書きされる。production CLI consumer を切り替えていないため E-17/E-21 の classification は引き続き `mixed` である。
+
 
 `flpdf-5nle` で attachment mutation の output boundary を更新した。`QPDFJob::handleTransformations` の
 `addAttachments` / `removeEmbeddedFile` 相当の mutation 後、`run_all_attachment_mutations` は
@@ -1190,6 +1192,25 @@ job-json attributionを保持し、Rust固有の `(os error N)`を出さない�
 missing job-jsonのexit/stdout/stderrをqpdf 11.9.0と比較する。新しいbridgeや
 deviation markerは追加しない。
 
+
+### E-17 bounded canonical raw argv initializer (`flpdf-3yn9.48.147`, 2026-09-17)
+
+The pinned qpdf boundary is `QPDFArgParser::parseArgs` → `QPDFJob::Config`
+callbacks → `run` / `getExitCode` (`qpdf/qpdf.cc:27-43`,
+`libqpdf/QPDFArgParser.cc:429-566`, and `qpdf/auto_job_init.hh`). The
+library now exposes `QPDFJob::initialize_from_raw_argv`, and the UTF-8
+`initialize_from_argv` convenience wrapper delegates to it. The parser owns
+the generated main/pages/encryption/underlay-overlay/attachment/copy-attachment/
+page-label option tables, raw Unix path/password bytes, one-level `@file`
+expansion, top-level `--` reset, immediate parameter/choice validation, and
+same-job `jobJsonFile` layering.
+
+The existing qtest/C API consumers remain on this canonical initializer, while
+the production CLI is intentionally not switched in this prerequisite issue;
+E-17/E-21 therefore remain `mixed` until the separate flat-CLI consumer
+migration. Focused raw-boundary tests cover the option registry, non-UTF-8
+argv, page/encryption segments, job-JSON occurrence ordering, and a qpdf 11.9.0
+output differential.
 
 ### E-17 / E-21 argv-order parse validation (`flpdf-godwa`, 2026-09-16)
 

@@ -9,10 +9,759 @@ use flpdf::{
     QPDFLogger,
 };
 use std::fs::File;
-use std::io::{BufReader, Cursor};
+use std::io::{BufReader, Cursor, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+
+#[test]
+fn raw_argv_initializer_matches_qpdf_final_configuration_state() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+
+    // QPDFJob::EncConfig keeps permissions across repeated --encrypt groups;
+    // only the passwords and key length are replaced by the later group.
+    let repeated_output = tempdir.path().join("repeated-encryption.pdf");
+    let mut repeated = QPDFJob::new();
+    repeated
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            fixture.to_string_lossy().into_owned().into_bytes(),
+            b"--allow-weak-crypto".to_vec(),
+            b"--encrypt".to_vec(),
+            b"user".to_vec(),
+            b"owner".to_vec(),
+            b"128".to_vec(),
+            b"--print=none".to_vec(),
+            b"--".to_vec(),
+            b"--encrypt".to_vec(),
+            b"user-2".to_vec(),
+            b"owner-2".to_vec(),
+            b"128".to_vec(),
+            b"--".to_vec(),
+            repeated_output.to_string_lossy().into_owned().into_bytes(),
+        ])
+        .expect("repeated encryption groups should initialize");
+    assert_eq!(repeated.run().unwrap(), JobExitCode::Success);
+    let repeated_bytes = std::fs::read(&repeated_output).unwrap();
+    assert!(
+        repeated_bytes
+            .windows(b"/P -2056".len())
+            .any(|window| window == b"/P -2056"),
+        "repeated output did not retain qpdf permissions: {}",
+        String::from_utf8_lossy(&repeated_bytes)
+    );
+
+    // qpdf delays the insecure-empty-owner check until the final configuration
+    // pass, so a later --decrypt is allowed to clear the pending encryption.
+    let decrypt_output = tempdir.path().join("decrypt-after-encrypt.pdf");
+    let mut decrypt_after_encrypt = QPDFJob::new();
+    decrypt_after_encrypt
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            fixture.to_string_lossy().into_owned().into_bytes(),
+            b"--encrypt".to_vec(),
+            b"user".to_vec(),
+            Vec::new(),
+            b"256".to_vec(),
+            b"--".to_vec(),
+            b"--decrypt".to_vec(),
+            decrypt_output.to_string_lossy().into_owned().into_bytes(),
+        ])
+        .expect("later --decrypt should clear the pending encryption");
+    assert_eq!(decrypt_after_encrypt.run().unwrap(), JobExitCode::Success);
+
+    // A job-json inputFile changes Config, but it does not change the argv
+    // parser's local gave_input flag. The following positional argument must
+    // therefore be rejected by Config::inputFile, just as qpdf does.
+    let job_json = tempdir.path().join("input-only.json");
+    std::fs::write(
+        &job_json,
+        serde_json::json!({"inputFile": fixture}).to_string(),
+    )
+    .unwrap();
+    let mut json_then_positional = QPDFJob::new();
+    let error = json_then_positional
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            format!("--job-json-file={}", job_json.display()).into_bytes(),
+            tempdir
+                .path()
+                .join("unexpected-output.pdf")
+                .to_string_lossy()
+                .into_owned()
+                .into_bytes(),
+        ])
+        .expect_err("a positional input after job-json inputFile must be rejected");
+    assert!(matches!(error, Error::Usage(_)));
+
+    // Named --file does not set QPDFJob_argv's called_pages_file flag. Thus a
+    // following positional numeric token is a second filename, not a range.
+    let pages_output = tempdir.path().join("named-file-pages.pdf");
+    let mut named_file_pages = QPDFJob::new();
+    named_file_pages
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            b"--empty".to_vec(),
+            b"--pages".to_vec(),
+            format!("--file={}", fixture.display()).into_bytes(),
+            b"1".to_vec(),
+            b"--".to_vec(),
+            pages_output.to_string_lossy().into_owned().into_bytes(),
+        ])
+        .expect("named pages arguments should initialize");
+    assert_eq!(named_file_pages.run().unwrap(), JobExitCode::Error);
+
+    for option in [b"--json=".as_slice(), b"--json-output=".as_slice()] {
+        let mut job = QPDFJob::new();
+        assert!(
+            job.initialize_from_raw_argv(&[
+                b"qpdfjob".to_vec(),
+                fixture.to_string_lossy().into_owned().into_bytes(),
+                option.to_vec(),
+            ])
+            .is_err(),
+            "an explicit empty value must not select a JSON default"
+        );
+    }
+}
+
+#[test]
+fn raw_argv_help_and_attachment_defaults_match_qpdf() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+
+    let (logger, info) = logger_with_info_sink();
+    let mut help = QPDFJob::new();
+    help.set_logger(logger);
+    help.initialize_from_raw_argv(&[b"qpdfjob".to_vec(), b"--help".to_vec()])
+        .unwrap();
+    assert!(String::from_utf8_lossy(&info.lock().unwrap().bytes).contains("Topics:"));
+
+    let mut unknown_help = QPDFJob::new();
+    let error = unknown_help
+        .initialize_from_raw_argv(&[b"qpdfjob".to_vec(), b"--help=foobar".to_vec()])
+        .expect_err("unknown help targets must be usage errors");
+    assert!(matches!(error, Error::Usage(_)));
+
+    let output = tempdir.path().join("attachment-defaults.pdf");
+    let mut attachment_job = QPDFJob::new();
+    attachment_job
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            fixture.to_string_lossy().into_owned().into_bytes(),
+            b"--add-attachment".to_vec(),
+            fixture.to_string_lossy().into_owned().into_bytes(),
+            b"--key=".to_vec(),
+            b"--filename=".to_vec(),
+            b"--".to_vec(),
+            output.to_string_lossy().into_owned().into_bytes(),
+        ])
+        .unwrap();
+    assert_eq!(attachment_job.run().unwrap(), JobExitCode::Success);
+    let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
+    assert!(pdf
+        .embedded_files()
+        .get_embedded_file(b"one-page.pdf")
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn raw_argv_password_file_preserves_terminal_cr_and_warns_on_extra_lines() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let encrypted = tempdir.path().join("encrypted.pdf");
+    let decrypted = tempdir.path().join("decrypted.pdf");
+    let mut source = Pdf::open(BufReader::new(File::open(&fixture).unwrap())).unwrap();
+    let mut writer = PdfWriter::new(&mut source);
+    writer.set_encryption_parameters(EncryptParams::v4_aes128(b"pw-\r", b"owner"));
+    writer.set_output_file(&encrypted).unwrap();
+    writer.write().unwrap();
+
+    let password_file = tempdir.path().join("password.txt");
+    std::fs::write(&password_file, b"pw-\r").unwrap();
+    let mut job = QPDFJob::new();
+    job.initialize_from_raw_argv(&[
+        b"qpdfjob".to_vec(),
+        encrypted.to_string_lossy().into_owned().into_bytes(),
+        decrypted.to_string_lossy().into_owned().into_bytes(),
+        format!("--password-file={}", password_file.display()).into_bytes(),
+    ])
+    .unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+
+    let extra_lines = tempdir.path().join("password-extra.txt");
+    std::fs::write(&extra_lines, b"pw-\r\nignored\n").unwrap();
+    let (logger, errors) = logger_with_error_sink();
+    let mut warning_job = QPDFJob::new();
+    warning_job.set_logger(logger);
+    warning_job
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            fixture.to_string_lossy().into_owned().into_bytes(),
+            tempdir
+                .path()
+                .join("warning-output.pdf")
+                .to_string_lossy()
+                .into_owned()
+                .into_bytes(),
+            format!("--password-file={}", extra_lines.display()).into_bytes(),
+        ])
+        .unwrap();
+    assert!(String::from_utf8_lossy(&errors.lock().unwrap().bytes)
+        .contains("WARNING: all but the first line of the password file are ignored"));
+}
+
+#[test]
+fn raw_argv_modern_accessibility_n_emits_qpdf_diagnostic() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("accessibility.pdf");
+    let (logger, errors) = logger_with_error_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.initialize_from_raw_argv(&[
+        b"qpdfjob".to_vec(),
+        fixture.to_string_lossy().into_owned().into_bytes(),
+        b"--encrypt".to_vec(),
+        b"user".to_vec(),
+        b"owner".to_vec(),
+        b"128".to_vec(),
+        b"--force-V4".to_vec(),
+        b"--use-aes=y".to_vec(),
+        b"--accessibility=n".to_vec(),
+        b"--".to_vec(),
+        output.to_string_lossy().into_owned().into_bytes(),
+    ])
+    .unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    assert!(String::from_utf8_lossy(&errors.lock().unwrap().bytes)
+        .contains("-accessibility=n is ignored for modern encryption formats"));
+}
+
+#[test]
+fn raw_argv_encryption_config_survives_repeated_groups_and_decrypt() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+
+    let aes_toggle_output = tempdir.path().join("aes-toggle.pdf");
+    let mut aes_toggle = QPDFJob::new();
+    aes_toggle
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            fixture.to_string_lossy().into_owned().into_bytes(),
+            b"--allow-weak-crypto".to_vec(),
+            b"--encrypt".to_vec(),
+            b"user".to_vec(),
+            b"owner".to_vec(),
+            b"128".to_vec(),
+            b"--use-aes=y".to_vec(),
+            b"--".to_vec(),
+            b"--encrypt".to_vec(),
+            b"user-2".to_vec(),
+            b"owner-2".to_vec(),
+            b"128".to_vec(),
+            b"--use-aes=n".to_vec(),
+            b"--".to_vec(),
+            aes_toggle_output
+                .to_string_lossy()
+                .into_owned()
+                .into_bytes(),
+        ])
+        .unwrap();
+    assert_eq!(aes_toggle.run().unwrap(), JobExitCode::Success);
+    let aes_toggle_bytes = std::fs::read(aes_toggle_output).unwrap();
+    assert!(aes_toggle_bytes
+        .windows(b"/V 2".len())
+        .any(|window| window == b"/V 2"));
+    assert!(aes_toggle_bytes
+        .windows(b"/R 3".len())
+        .any(|window| window == b"/R 3"));
+
+    let decrypt_output = tempdir.path().join("decrypt-encrypt.pdf");
+    let mut decrypt_encrypt = QPDFJob::new();
+    decrypt_encrypt
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            fixture.to_string_lossy().into_owned().into_bytes(),
+            b"--allow-weak-crypto".to_vec(),
+            b"--encrypt".to_vec(),
+            b"user".to_vec(),
+            b"owner".to_vec(),
+            b"128".to_vec(),
+            b"--print=none".to_vec(),
+            b"--".to_vec(),
+            b"--decrypt".to_vec(),
+            b"--encrypt".to_vec(),
+            b"user-2".to_vec(),
+            b"owner-2".to_vec(),
+            b"128".to_vec(),
+            b"--".to_vec(),
+            decrypt_output.to_string_lossy().into_owned().into_bytes(),
+        ])
+        .unwrap();
+    assert_eq!(decrypt_encrypt.run().unwrap(), JobExitCode::Success);
+    let decrypt_bytes = std::fs::read(decrypt_output).unwrap();
+    assert!(decrypt_bytes
+        .windows(b"/P -2056".len())
+        .any(|window| window == b"/P -2056"));
+
+    let json_config = tempdir.path().join("aes-config.json");
+    let json_output = tempdir.path().join("aes-config-output.pdf");
+    std::fs::write(
+        &json_config,
+        serde_json::json!({
+            "inputFile": fixture,
+            "outputFile": json_output,
+            "encrypt": {
+                "userPassword": "json-user",
+                "ownerPassword": "json-owner",
+                "128bit": {"useAes": "y"}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut json_then_argv = QPDFJob::new();
+    json_then_argv
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            format!("--job-json-file={}", json_config.display()).into_bytes(),
+            b"--allow-weak-crypto".to_vec(),
+            b"--encrypt".to_vec(),
+            b"argv-user".to_vec(),
+            b"argv-owner".to_vec(),
+            b"128".to_vec(),
+            b"--use-aes=n".to_vec(),
+            b"--".to_vec(),
+        ])
+        .unwrap();
+    assert_eq!(json_then_argv.run().unwrap(), JobExitCode::Success);
+    let json_bytes = std::fs::read(json_output).unwrap();
+    assert!(json_bytes
+        .windows(b"/V 2".len())
+        .any(|window| window == b"/V 2"));
+
+    let mut insecure = QPDFJob::new();
+    let error = insecure
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            fixture.to_string_lossy().into_owned().into_bytes(),
+            b"--encrypt".to_vec(),
+            b"user".to_vec(),
+            Vec::new(),
+            b"256".to_vec(),
+            b"--".to_vec(),
+            tempdir
+                .path()
+                .join("rejected-insecure.pdf")
+                .to_string_lossy()
+                .into_owned()
+                .into_bytes(),
+        ])
+        .expect_err("the final qpdf configuration check must reject insecure encryption");
+    assert!(matches!(error, Error::Usage(_)));
+}
+
+#[test]
+fn raw_argv_256_bit_group_keeps_aes_for_a_later_128_bit_group() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("256-then-128.pdf");
+    let mut job = QPDFJob::new();
+    job.initialize_from_raw_argv(&[
+        b"qpdfjob".to_vec(),
+        fixture.to_string_lossy().into_owned().into_bytes(),
+        b"--encrypt".to_vec(),
+        b"user".to_vec(),
+        b"owner".to_vec(),
+        b"256".to_vec(),
+        b"--".to_vec(),
+        b"--encrypt".to_vec(),
+        b"user-2".to_vec(),
+        b"owner-2".to_vec(),
+        b"128".to_vec(),
+        b"--".to_vec(),
+        output.to_string_lossy().into_owned().into_bytes(),
+    ])
+    .unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    let bytes = std::fs::read(output).unwrap();
+    assert!(bytes.windows(b"/V 4".len()).any(|window| window == b"/V 4"));
+}
+
+#[test]
+fn raw_argv_named_pages_range_does_not_change_positional_state() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let (logger, info) = logger_with_info_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.initialize_from_raw_argv(&[
+        b"qpdfjob".to_vec(),
+        b"--empty".to_vec(),
+        b"--pages".to_vec(),
+        fixture.to_string_lossy().into_owned().into_bytes(),
+        b"--range=1".to_vec(),
+        format!("--file={}", fixture.display()).into_bytes(),
+        b"1".to_vec(),
+        b"--".to_vec(),
+        b"--show-npages".to_vec(),
+    ])
+    .unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    assert_eq!(info.lock().unwrap().bytes, b"2\n");
+
+    let third_source = tempfile::tempdir().unwrap();
+    let third_file = third_source.path().join("1");
+    std::fs::copy(&fixture, &third_file).unwrap();
+    let (logger, info) = logger_with_info_sink();
+    let mut repeated_named_range = QPDFJob::new();
+    repeated_named_range.set_logger(logger);
+    repeated_named_range
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            b"--empty".to_vec(),
+            b"--pages".to_vec(),
+            fixture.to_string_lossy().into_owned().into_bytes(),
+            b"1".to_vec(),
+            format!("--file={}", fixture.display()).into_bytes(),
+            b"--range=1".to_vec(),
+            third_file.to_string_lossy().into_owned().into_bytes(),
+            b"--".to_vec(),
+            b"--show-npages".to_vec(),
+        ])
+        .unwrap();
+    assert_eq!(repeated_named_range.run().unwrap(), JobExitCode::Success);
+    assert_eq!(info.lock().unwrap().bytes, b"3\n");
+}
+
+#[test]
+fn raw_argv_help_table_and_completion_emit_qpdf_output() {
+    let (logger, info) = logger_with_info_sink();
+    let mut usage = QPDFJob::new();
+    usage.set_logger(logger);
+    usage
+        .initialize_from_raw_argv(&[b"qpdfjob".to_vec(), b"--help=usage".to_vec()])
+        .unwrap();
+    assert!(String::from_utf8_lossy(&info.lock().unwrap().bytes).contains("Usage:"));
+
+    let (logger, info) = logger_with_info_sink();
+    let mut encryption = QPDFJob::new();
+    encryption.set_logger(logger);
+    encryption
+        .initialize_from_raw_argv(&[b"qpdfjob".to_vec(), b"--help=encryption".to_vec()])
+        .unwrap();
+    assert!(String::from_utf8_lossy(&info.lock().unwrap().bytes)
+        .contains("Create encrypted files. Usage:"));
+
+    let (logger, info) = logger_with_info_sink();
+    let mut rotate = QPDFJob::new();
+    rotate.set_logger(logger);
+    rotate
+        .initialize_from_raw_argv(&[b"qpdfjob".to_vec(), b"--help=--rotate".to_vec()])
+        .unwrap();
+    assert!(!info.lock().unwrap().bytes.is_empty());
+
+    let (logger, info) = logger_with_info_sink();
+    let mut linearize = QPDFJob::new();
+    linearize.set_logger(logger);
+    linearize
+        .initialize_from_raw_argv(&[b"qpdfjob".to_vec(), b"--help=--linearize".to_vec()])
+        .unwrap();
+    assert!(String::from_utf8_lossy(&info.lock().unwrap().bytes).contains("Create linearized"));
+
+    let (logger, info) = logger_with_info_sink();
+    let mut option_help = QPDFJob::new();
+    option_help.set_logger(logger);
+    option_help
+        .initialize_from_raw_argv(&[b"qpdfjob".to_vec(), b"--help=--allow-insecure".to_vec()])
+        .unwrap();
+    assert!(String::from_utf8_lossy(&info.lock().unwrap().bytes).contains("Allow creation"));
+
+    let (logger, info) = logger_with_info_sink();
+    let mut page_ranges = QPDFJob::new();
+    page_ranges.set_logger(logger);
+    page_ranges
+        .initialize_from_raw_argv(&[b"qpdfjob".to_vec(), b"--help=page-ranges".to_vec()])
+        .unwrap();
+    assert!(String::from_utf8_lossy(&info.lock().unwrap().bytes)
+        .contains("A full description of the page range syntax"));
+
+    let (logger, info) = logger_with_info_sink();
+    let mut decrypt_help = QPDFJob::new();
+    decrypt_help.set_logger(logger);
+    decrypt_help
+        .initialize_from_raw_argv(&[b"qpdfjob".to_vec(), b"--help=--decrypt".to_vec()])
+        .unwrap();
+    assert!(String::from_utf8_lossy(&info.lock().unwrap().bytes)
+        .contains("Create an unencrypted output file"));
+
+    let qpdf_help = Command::new("qpdf").args(["--help=all"]).output().unwrap();
+    assert!(qpdf_help.status.success());
+    let (logger, info) = logger_with_info_sink();
+    let mut all_help = QPDFJob::new();
+    all_help.set_logger(logger);
+    all_help
+        .initialize_from_raw_argv(&[b"qpdf".to_vec(), b"--help=all".to_vec()])
+        .unwrap();
+    assert_eq!(info.lock().unwrap().bytes, qpdf_help.stdout);
+
+    let (logger, info) = logger_with_info_sink();
+    let mut custom_all_help = QPDFJob::new();
+    custom_all_help.set_logger(logger);
+    custom_all_help
+        .initialize_from_raw_argv(&[b"/opt/custom-qpdf".to_vec(), b"--help=all".to_vec()])
+        .unwrap();
+    assert!(String::from_utf8_lossy(&info.lock().unwrap().bytes)
+        .starts_with("Run \"custom-qpdf --help=topic\""));
+
+    let (logger, info) = logger_with_info_sink();
+    let mut completion = QPDFJob::new();
+    completion.set_logger(logger);
+    completion
+        .initialize_from_raw_argv(&[b"qpdfjob".to_vec(), b"--completion-bash".to_vec()])
+        .unwrap();
+    assert_eq!(
+        info.lock().unwrap().bytes,
+        b"complete -o bashdefault -o default -o nospace -C \"qpdfjob\" qpdfjob\n"
+    );
+
+    let (logger, info) = logger_with_info_sink();
+    let mut custom_completion = QPDFJob::new();
+    custom_completion.set_logger(logger);
+    custom_completion
+        .initialize_from_raw_argv(&[b"/opt/custom-qpdf".to_vec(), b"--completion-bash".to_vec()])
+        .unwrap();
+    assert_eq!(
+        info.lock().unwrap().bytes,
+        b"complete -o bashdefault -o default -o nospace -C \"/opt/custom-qpdf\" custom-qpdf\n"
+    );
+
+    let (logger, info) = logger_with_info_sink();
+    let mut custom_zsh_completion = QPDFJob::new();
+    custom_zsh_completion.set_logger(logger);
+    custom_zsh_completion
+        .initialize_from_raw_argv(&[b"/opt/custom-qpdf".to_vec(), b"--completion-zsh".to_vec()])
+        .unwrap();
+    assert_eq!(
+        info.lock().unwrap().bytes,
+        b"autoload -U +X bashcompinit && bashcompinit && complete -o bashdefault -o default -C \"/opt/custom-qpdf\" custom-qpdf\n"
+    );
+
+    for option in [
+        "--copyright",
+        "--show-crypto",
+        "--json-help=1",
+        "--json-help=2",
+        "--json-help=latest",
+        "--job-json-help",
+    ] {
+        let oracle = Command::new("qpdf").arg(option).output().unwrap();
+        if !oracle.status.success() {
+            continue;
+        }
+        let (logger, info) = logger_with_info_sink();
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.initialize_from_raw_argv(&[b"qpdf".to_vec(), option.as_bytes().to_vec()])
+            .unwrap();
+        let output = info.lock().unwrap().bytes.clone();
+        if option == "--show-crypto" {
+            // qpdf enumerates the providers compiled into the process. The
+            // pinned qpdf binary has gnutls on Linux and gnutls+openssl on
+            // macOS; flpdf's library boundary intentionally does not own a
+            // process-global provider registry.
+            assert!(!output.is_empty(), "{option} must report a provider");
+        } else {
+            assert_eq!(output, oracle.stdout, "{option}");
+        }
+    }
+}
+
+#[test]
+fn json_encrypt_allow_insecure_reaches_final_configuration_check() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("allowed.pdf");
+    let json = serde_json::json!({
+        "inputFile": fixture,
+        "outputFile": output,
+        "encrypt": {
+            "userPassword": "u",
+            "ownerPassword": "",
+            "256bit": {"allowInsecure": ""}
+        }
+    });
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json.to_string()).unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+}
+
+#[test]
+fn json_encrypt_insecure_can_be_cleared_by_later_argv_decrypt() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let json_path = tempdir.path().join("insecure.json");
+    let output = tempdir.path().join("decrypted.pdf");
+    std::fs::write(
+        &json_path,
+        serde_json::json!({
+            "encrypt": {
+                "userPassword": "u",
+                "ownerPassword": "",
+                "256bit": {}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut job = QPDFJob::new();
+    job.initialize_from_raw_argv(&[
+        b"qpdfjob".to_vec(),
+        fixture.to_string_lossy().into_owned().into_bytes(),
+        format!("--job-json-file={}", json_path.display()).into_bytes(),
+        b"--decrypt".to_vec(),
+        output.to_string_lossy().into_owned().into_bytes(),
+    ])
+    .unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+}
+
+#[test]
+fn json_encrypt_keeps_qpdf_r2_permissions_from_an_earlier_argv_group() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let json_path = tempdir.path().join("encrypt-40.json");
+    let output = tempdir.path().join("encrypt-40.pdf");
+    std::fs::write(
+        &json_path,
+        serde_json::json!({
+            "encrypt": {
+                "userPassword": "json-user",
+                "ownerPassword": "json-owner",
+                "40bit": {}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_raw_argv(&[
+        b"qpdfjob".to_vec(),
+        fixture.to_string_lossy().into_owned().into_bytes(),
+        b"--allow-weak-crypto".to_vec(),
+        b"--encrypt".to_vec(),
+        b"argv-user".to_vec(),
+        b"argv-owner".to_vec(),
+        b"40".to_vec(),
+        b"--print=n".to_vec(),
+        b"--".to_vec(),
+        format!("--job-json-file={}", json_path.display()).into_bytes(),
+        output.to_string_lossy().into_owned().into_bytes(),
+    ])
+    .unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    let bytes = std::fs::read(output).unwrap();
+    assert!(bytes
+        .windows(b"/P -8".len())
+        .any(|window| window == b"/P -8"));
+
+    let extract_json = tempdir.path().join("extract-40.json");
+    let extract_output = tempdir.path().join("extract-128.pdf");
+    std::fs::write(
+        &extract_json,
+        serde_json::json!({
+            "encrypt": {
+                "userPassword": "json-user",
+                "ownerPassword": "json-owner",
+                "40bit": {"extract": "n"}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut r2_then_r3 = QPDFJob::new();
+    r2_then_r3
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            fixture.to_string_lossy().into_owned().into_bytes(),
+            b"--allow-weak-crypto".to_vec(),
+            b"--encrypt".to_vec(),
+            b"argv-user".to_vec(),
+            b"argv-owner".to_vec(),
+            b"40".to_vec(),
+            b"--extract=n".to_vec(),
+            b"--".to_vec(),
+            format!("--job-json-file={}", extract_json.display()).into_bytes(),
+            b"--encrypt".to_vec(),
+            b"argv-user-2".to_vec(),
+            b"argv-owner-2".to_vec(),
+            b"128".to_vec(),
+            b"--".to_vec(),
+            extract_output.to_string_lossy().into_owned().into_bytes(),
+        ])
+        .unwrap();
+    assert_eq!(r2_then_r3.run().unwrap(), JobExitCode::Success);
+    let extract_bytes = std::fs::read(extract_output).unwrap();
+    assert!(extract_bytes
+        .windows(b"/P -4".len())
+        .any(|window| window == b"/P -4"));
+}
+
+#[test]
+fn raw_argv_job_json_positionals_reject_existing_config_slots() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+
+    let input_json = tempdir.path().join("input.json");
+    std::fs::write(
+        &input_json,
+        serde_json::json!({"inputFile": fixture}).to_string(),
+    )
+    .unwrap();
+    let mut input_job = QPDFJob::new();
+    assert!(matches!(
+        input_job
+            .initialize_from_raw_argv(&[
+                b"qpdfjob".to_vec(),
+                format!("--job-json-file={}", input_json.display()).into_bytes(),
+                b"unexpected-output.pdf".to_vec(),
+            ])
+            .unwrap_err(),
+        Error::Usage(_)
+    ));
+
+    let output_json = tempdir.path().join("output.json");
+    std::fs::write(
+        &output_json,
+        serde_json::json!({"outputFile": tempdir.path().join("configured.pdf")}).to_string(),
+    )
+    .unwrap();
+    let mut output_job = QPDFJob::new();
+    assert!(matches!(
+        output_job
+            .initialize_from_raw_argv(&[
+                b"qpdfjob".to_vec(),
+                format!("--job-json-file={}", output_json.display()).into_bytes(),
+                fixture.to_string_lossy().into_owned().into_bytes(),
+                b"second-output.pdf".to_vec(),
+            ])
+            .unwrap_err(),
+        Error::Usage(_)
+    ));
+}
 
 #[cfg(target_os = "linux")]
 use std::ffi::OsString;
@@ -111,6 +860,63 @@ fn logger_with_error_sink() -> (QPDFLogger, Arc<Mutex<SinkState>>) {
         state: Arc::clone(&state),
     })));
     (logger, state)
+}
+
+fn add_raw_argv_output_if_required(args: &mut Vec<Vec<u8>>) {
+    let inspection = args.iter().any(|argument| {
+        let name = argument
+            .strip_prefix(b"--")
+            .unwrap_or(argument)
+            .split(|byte| *byte == b'=')
+            .next()
+            .unwrap_or_default();
+        matches!(
+            name,
+            b"check"
+                | b"check-linearization"
+                | b"is-encrypted"
+                | b"job-json-help"
+                | b"json"
+                | b"json-help"
+                | b"json-output"
+                | b"list-attachments"
+                | b"requires-password"
+                | b"show-attachment"
+                | b"show-encryption"
+                | b"show-linearization"
+                | b"show-npages"
+                | b"show-pages"
+                | b"show-object"
+                | b"show-xref"
+                | b"version"
+                | b"copyright"
+                | b"show-crypto"
+                | b"help"
+                | b"completion-bash"
+                | b"completion-zsh"
+        )
+    });
+    if !inspection {
+        args.push(b"raw-argv-output.pdf".to_vec());
+    }
+}
+
+/// qpdf's Windows C-runtime text stdout is CRLF-terminated while a recording
+/// pipeline receives the logger's logical LF bytes. Compare the text payload
+/// independently of that host transport convention.
+fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut remaining = bytes;
+    while let Some((&byte, rest)) = remaining.split_first() {
+        if byte == b'\r' && rest.first() == Some(&b'\n') {
+            normalized.push(b'\n');
+            remaining = &rest[1..];
+        } else {
+            normalized.push(byte);
+            remaining = rest;
+        }
+    }
+    normalized
 }
 
 #[cfg(target_os = "linux")]
@@ -459,6 +1265,1253 @@ fn argv_page_label_option_table_accepts_specs_until_its_terminator() {
         "--".to_owned(),
     ])
     .expect("qpdf page-label option table should consume its positional specs");
+}
+
+#[test]
+fn raw_argv_initializer_reaches_the_canonical_writer_for_qpdf_options() {
+    let input =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("raw-argv-output.pdf");
+    let args = vec![
+        b"qpdfjob".to_vec(),
+        input.as_os_str().to_string_lossy().as_bytes().to_vec(),
+        output.as_os_str().to_string_lossy().as_bytes().to_vec(),
+        b"--qdf".to_vec(),
+        b"--no-original-object-ids".to_vec(),
+        b"--object-streams=disable".to_vec(),
+        b"--stream-data=preserve".to_vec(),
+        b"--min-version=1.3".to_vec(),
+        b"--force-version=1.3".to_vec(),
+        b"--remove-unreferenced-resources=no".to_vec(),
+        b"--warning-exit-0".to_vec(),
+    ];
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_raw_argv(&args)
+        .expect("the library raw argv boundary should own qpdf options");
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+
+    let written = std::fs::read(output).unwrap();
+    assert!(written.starts_with(b"%PDF-1.3\n"));
+    assert!(written
+        .windows(b"%QDF-".len())
+        .any(|window| window == b"%QDF-"));
+}
+
+#[test]
+fn raw_argv_initializer_applies_job_json_files_at_their_argv_occurrence() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("job-json-output.pdf");
+    let job_json = tempdir.path().join("job.json");
+    std::fs::write(
+        &job_json,
+        serde_json::json!({
+            "inputFile": input,
+            "outputFile": output,
+            "qdf": ""
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let args = vec![
+        b"qpdfjob".to_vec(),
+        format!("--job-json-file={}", job_json.display()).into_bytes(),
+        b"--object-streams=disable".to_vec(),
+    ];
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_raw_argv(&args)
+        .expect("job-json-file must layer into the same job configuration");
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    assert!(std::fs::read(output)
+        .unwrap()
+        .windows(b"%QDF-".len())
+        .any(|window| window == b"%QDF-"));
+}
+
+#[test]
+fn raw_argv_initializer_parses_pages_and_encryption_segments() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("segments-output.pdf");
+    let args = vec![
+        b"qpdfjob".to_vec(),
+        fixture.as_os_str().to_string_lossy().as_bytes().to_vec(),
+        b"--allow-weak-crypto".to_vec(),
+        b"--pages".to_vec(),
+        b".".to_vec(),
+        b"1".to_vec(),
+        b"--".to_vec(),
+        b"--encrypt".to_vec(),
+        b"user".to_vec(),
+        b"owner".to_vec(),
+        b"128".to_vec(),
+        b"--".to_vec(),
+        output.as_os_str().to_string_lossy().as_bytes().to_vec(),
+    ];
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_raw_argv(&args)
+        .expect("pages and encryption option tables should be library-owned");
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    assert!(std::fs::read(output)
+        .unwrap()
+        .windows(b"/Encrypt".len())
+        .any(|window| { window == b"/Encrypt" }));
+}
+
+#[test]
+fn raw_argv_initializer_parses_attachment_and_overlay_segments() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let donor = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/attachment-two-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("named-segments-output.pdf");
+    let args = vec![
+        b"qpdfjob".to_vec(),
+        fixture.to_string_lossy().into_owned().into_bytes(),
+        b"--add-attachment".to_vec(),
+        fixture.to_string_lossy().into_owned().into_bytes(),
+        b"--key=fixture".to_vec(),
+        b"--filename=fixture.pdf".to_vec(),
+        b"--mimetype=application/pdf".to_vec(),
+        b"--description=fixture".to_vec(),
+        b"--creationdate=D:20240101120000Z".to_vec(),
+        b"--moddate=D:20240101120000Z".to_vec(),
+        b"--replace".to_vec(),
+        b"--".to_vec(),
+        b"--copy-attachments-from".to_vec(),
+        donor.to_string_lossy().into_owned().into_bytes(),
+        b"--password=".to_vec(),
+        b"--prefix=copied-".to_vec(),
+        b"--".to_vec(),
+        b"--overlay".to_vec(),
+        fixture.to_string_lossy().into_owned().into_bytes(),
+        b"--to=1".to_vec(),
+        b"--from=1".to_vec(),
+        b"--repeat=1".to_vec(),
+        b"--".to_vec(),
+        output.to_string_lossy().into_owned().into_bytes(),
+    ];
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_raw_argv(&args)
+        .expect("all qpdf named segment tables should be library-owned");
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    assert!(output.is_file());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn raw_argv_initializer_preserves_non_utf8_path_and_password_bytes() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let input = non_utf8_path(tempdir.path(), b"input-\x80.pdf");
+    let output = non_utf8_path(tempdir.path(), b"output-\x81.pdf");
+    let encrypted = non_utf8_path(tempdir.path(), b"encrypted-\x82.pdf");
+    let decrypted = non_utf8_path(tempdir.path(), b"decrypted-\x83.pdf");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf"),
+        &input,
+    )
+    .unwrap();
+    let mut input_bytes = input.as_os_str().as_bytes().to_vec();
+    let mut output_bytes = output.as_os_str().as_bytes().to_vec();
+    let mut password = b"--password=".to_vec();
+    password.extend_from_slice(b"pw-\xff");
+    let args = vec![
+        b"qpdfjob".to_vec(),
+        std::mem::take(&mut input_bytes),
+        std::mem::take(&mut output_bytes),
+        password,
+    ];
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_raw_argv(&args)
+        .expect("raw Unix argv bytes must not pass through String");
+    assert_eq!(job.input_name_bytes(), input.as_os_str().as_bytes());
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    assert!(output.is_file());
+
+    let mut source = Pdf::open(BufReader::new(File::open(&input).unwrap())).unwrap();
+    let mut writer = PdfWriter::new(&mut source);
+    writer.set_static_id(true);
+    writer.set_encryption_parameters(EncryptParams::v4_aes128(
+        b"pw-\xff".to_vec(),
+        b"owner".to_vec(),
+    ));
+    writer.set_output_file(&encrypted).unwrap();
+    writer.write().unwrap();
+
+    let mut encrypted_job = QPDFJob::new();
+    encrypted_job
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            encrypted.as_os_str().as_bytes().to_vec(),
+            decrypted.as_os_str().as_bytes().to_vec(),
+            b"--password-mode=bytes".to_vec(),
+            b"--password=pw-\xff".to_vec(),
+        ])
+        .expect("raw password bytes must reach the reader unchanged");
+    assert_eq!(encrypted_job.run().unwrap(), JobExitCode::Success);
+    assert!(decrypted.is_file());
+}
+
+#[test]
+fn raw_argv_initializer_owns_every_main_table_option() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let password_file = tempdir.path().join("password.txt");
+    std::fs::write(&password_file, b"secret\nignored\n").unwrap();
+    let pass1 = tempdir.path().join("pass1.pdf");
+    let update = tempdir.path().join("update.json");
+    std::fs::write(&update, b"{}").unwrap();
+
+    let bare_options: &[&[u8]] = &[
+        b"--allow-weak-crypto",
+        b"--check",
+        b"--check-linearization",
+        b"--coalesce-contents",
+        b"--decrypt",
+        b"--deterministic-id",
+        b"--externalize-inline-images",
+        b"--filtered-stream-data",
+        b"--flatten-rotation",
+        b"--generate-appearances",
+        b"--ignore-xref-streams",
+        b"--is-encrypted",
+        b"--json-input",
+        b"--keep-inline-images",
+        b"--linearize",
+        b"--list-attachments",
+        b"--newline-before-endstream",
+        b"--no-original-object-ids",
+        b"--no-warn",
+        b"--optimize-images",
+        b"--password-is-hex-key",
+        b"--preserve-unreferenced",
+        b"--preserve-unreferenced-resources",
+        b"--progress",
+        b"--qdf",
+        b"--raw-stream-data",
+        b"--recompress-flate",
+        b"--remove-page-labels",
+        b"--report-memory-usage",
+        b"--requires-password",
+        b"--remove-restrictions",
+        b"--show-encryption",
+        b"--show-encryption-key",
+        b"--show-linearization",
+        b"--show-npages",
+        b"--show-pages",
+        b"--show-xref",
+        b"--static-aes-iv",
+        b"--static-id",
+        b"--suppress-password-recovery",
+        b"--suppress-recovery",
+        b"--test-json-schema",
+        b"--verbose",
+        b"--warning-exit-0",
+        b"--with-images",
+    ];
+    for option in bare_options {
+        let mut args = vec![
+            b"qpdfjob".to_vec(),
+            input.to_string_lossy().into_owned().into_bytes(),
+            option.to_vec(),
+        ];
+        add_raw_argv_output_if_required(&mut args);
+        let mut job = QPDFJob::new();
+        job.set_logger(QPDFLogger::create());
+        job.initialize_from_raw_argv(&args)
+            .unwrap_or_else(|error| panic!("{option:?} must be accepted: {error}"));
+    }
+
+    let parameter_options: Vec<Vec<u8>> = vec![
+        b"--compression-level=6".to_vec(),
+        format!("--copy-encryption={}", input.display()).into_bytes(),
+        b"--encryption-file-password=secret".to_vec(),
+        b"--force-version=1.3".to_vec(),
+        b"--ii-min-bytes=1024".to_vec(),
+        format!("--linearize-pass1={}", pass1.display()).into_bytes(),
+        b"--min-version=1.3".to_vec(),
+        b"--oi-min-area=16384".to_vec(),
+        b"--oi-min-height=128".to_vec(),
+        b"--oi-min-width=128".to_vec(),
+        b"--password=secret".to_vec(),
+        format!("--password-file={}", password_file.display()).into_bytes(),
+        b"--remove-attachment=missing-key".to_vec(),
+        b"--rotate=+90:1".to_vec(),
+        b"--show-attachment=missing-key".to_vec(),
+        b"--show-object=trailer".to_vec(),
+        b"--json-stream-prefix=stream".to_vec(),
+        format!("--update-from-json={}", update.display()).into_bytes(),
+        b"--collate=2,3".to_vec(),
+        b"--split-pages=2".to_vec(),
+        b"--compress-streams=y".to_vec(),
+        b"--decode-level=generalized".to_vec(),
+        b"--flatten-annotations=screen".to_vec(),
+        b"--json-key=pages".to_vec(),
+        b"--json-stream-data=inline".to_vec(),
+        b"--keep-files-open=y".to_vec(),
+        b"--normalize-content=n".to_vec(),
+        b"--object-streams=preserve".to_vec(),
+        b"--password-mode=bytes".to_vec(),
+        b"--remove-unreferenced-resources=auto".to_vec(),
+        b"--stream-data=preserve".to_vec(),
+        b"--json=1".to_vec(),
+        b"--json-output=2".to_vec(),
+    ];
+    for option in parameter_options {
+        let mut args = vec![
+            b"qpdfjob".to_vec(),
+            input.to_string_lossy().into_owned().into_bytes(),
+        ];
+        if option == b"--json-key=pages" {
+            args.push(b"--json=2".to_vec());
+        }
+        args.push(option.clone());
+        add_raw_argv_output_if_required(&mut args);
+        let mut job = QPDFJob::new();
+        job.set_logger(QPDFLogger::create());
+        job.initialize_from_raw_argv(&args)
+            .unwrap_or_else(|error| panic!("{option:?} must be accepted: {error}"));
+    }
+
+    let mut empty_job = QPDFJob::new();
+    let mut empty_args = vec![b"qpdfjob".to_vec(), b"--empty".to_vec()];
+    add_raw_argv_output_if_required(&mut empty_args);
+    empty_job
+        .initialize_from_raw_argv(&empty_args)
+        .expect("--empty with an output path should initialize");
+    let mut replace_job = QPDFJob::new();
+    replace_job
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            input.to_string_lossy().into_owned().into_bytes(),
+            b"--replace-input".to_vec(),
+        ])
+        .unwrap();
+}
+
+#[test]
+fn raw_argv_initializer_preserves_qpdf_parameter_and_choice_boundaries() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+
+    let mut job = QPDFJob::new();
+    let error = job
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            input.to_string_lossy().into_owned().into_bytes(),
+            b"--rotate".to_vec(),
+            b"+90:1".to_vec(),
+        ])
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::Usage(usage)
+            if usage.to_string() == "--rotate must be given as --rotate=[+|-]angle"
+    ));
+
+    let mut job = QPDFJob::new();
+    let error = job
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            input.to_string_lossy().into_owned().into_bytes(),
+            b"--object-streams=maybe".to_vec(),
+        ])
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::Usage(usage)
+            if usage.to_string() == "--object-streams must be given as --object-streams={disable,preserve,generate}"
+    ));
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_raw_argv(&[
+        b"qpdfjob".to_vec(),
+        b"-".to_vec(),
+        b"-qdf".to_vec(),
+        b"out.pdf".to_vec(),
+    ])
+    .expect("qpdf accepts single-dash spellings for registered options");
+}
+
+#[test]
+fn raw_argv_initializer_accepts_the_qpdf_help_table_as_a_sole_option() {
+    for option in [
+        b"--version".to_vec(),
+        b"--copyright".to_vec(),
+        b"--show-crypto".to_vec(),
+        b"--job-json-help".to_vec(),
+        b"--json-help=latest".to_vec(),
+        b"--help".to_vec(),
+    ] {
+        let mut job = QPDFJob::new();
+        job.initialize_from_raw_argv(&[b"qpdfjob".to_vec(), option.clone()])
+            .unwrap_or_else(|error| panic!("{option:?} must be accepted: {error}"));
+        assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    }
+}
+
+#[test]
+fn raw_argv_stdin_file_helper() {
+    let Some(mode) = std::env::var_os("FLPDF_RAW_ARGV_STDIN_HELPER") else {
+        return;
+    };
+    let input = std::env::var_os("FLPDF_RAW_ARGV_STDIN_INPUT")
+        .expect("stdin helper input path must be provided")
+        .into_string()
+        .expect("stdin helper input path must be UTF-8");
+    let args = match mode.to_str() {
+        Some("argfile") => vec![b"qpdfjob".to_vec(), b"@-".to_vec()],
+        Some("password") => vec![
+            b"qpdfjob".to_vec(),
+            input.into_bytes(),
+            b"--password-file=-".to_vec(),
+            b"-".to_vec(),
+        ],
+        _ => panic!("unknown stdin helper mode: {mode:?}"),
+    };
+    QPDFJob::new()
+        .initialize_from_raw_argv(&args)
+        .expect("stdin-backed argv file should initialize");
+}
+
+#[test]
+fn raw_argv_initializer_reads_stdin_for_argfile_and_password_file() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let input = input.to_string_lossy().into_owned();
+    let executable = std::env::current_exe().unwrap();
+    for (mode, contents) in [
+        ("argfile", format!("{input}\n--show-npages\n").into_bytes()),
+        ("password", b"secret\r\nignored\n".to_vec()),
+    ] {
+        let mut child = Command::new(&executable)
+            .args(["--exact", "raw_argv_stdin_file_helper", "--nocapture"])
+            .env("FLPDF_RAW_ARGV_STDIN_HELPER", mode)
+            .env("FLPDF_RAW_ARGV_STDIN_INPUT", &input)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .expect("stdin helper pipe should be available")
+            .write_all(&contents)
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "stdin helper {mode} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn raw_argv_show_npages_matches_the_qpdf_11_9_0_boundary() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let qpdf = Command::new("qpdf")
+        .arg("--show-npages")
+        .arg(&input)
+        .output();
+    let Ok(qpdf) = qpdf else {
+        return;
+    };
+    assert!(qpdf.status.success());
+
+    let (logger, info) = logger_with_info_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.initialize_from_raw_argv(&[
+        b"qpdfjob".to_vec(),
+        input.to_string_lossy().into_owned().into_bytes(),
+        b"--show-npages".to_vec(),
+    ])
+    .unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    assert_eq!(
+        normalize_text_newlines(&info.lock().unwrap().bytes),
+        normalize_text_newlines(&qpdf.stdout)
+    );
+}
+
+#[test]
+fn raw_argv_writer_matches_qpdf_process_contract() {
+    let version = Command::new("qpdf").arg("--version").output();
+    if !version.as_ref().is_ok_and(|output| {
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout).starts_with("qpdf version 11.9.0")
+    }) {
+        return;
+    }
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let input =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let qpdf_output = tempdir.path().join("qpdf-output.pdf");
+    let flpdf_output = tempdir.path().join("flpdf-output.pdf");
+    let flags = [
+        "--static-id",
+        "--qdf",
+        "--object-streams=disable",
+        "--stream-data=uncompress",
+    ];
+    let qpdf = Command::new("qpdf")
+        .args(flags)
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .unwrap();
+    assert!(qpdf.status.success(), "qpdf failed: {qpdf:?}");
+
+    let args = vec![
+        b"qpdfjob".to_vec(),
+        input.as_os_str().to_string_lossy().as_bytes().to_vec(),
+        flpdf_output
+            .as_os_str()
+            .to_string_lossy()
+            .as_bytes()
+            .to_vec(),
+        b"--static-id".to_vec(),
+        b"--qdf".to_vec(),
+        b"--object-streams=disable".to_vec(),
+        b"--stream-data=uncompress".to_vec(),
+    ];
+    let mut job = QPDFJob::new();
+    job.initialize_from_raw_argv(&args)
+        .expect("raw argv should configure the qpdf writer");
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    assert_eq!(
+        std::fs::read(flpdf_output).unwrap(),
+        std::fs::read(qpdf_output).unwrap(),
+        "raw QPDFJob argv writer must match qpdf 11.9.0"
+    );
+}
+
+#[test]
+fn raw_argv_initializer_covers_remaining_choice_and_segment_boundaries() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let input = input.to_string_lossy().into_owned().into_bytes();
+
+    let accept = |mut args: Vec<Vec<u8>>| {
+        args.insert(1, input.clone());
+        add_raw_argv_output_if_required(&mut args);
+        let mut job = QPDFJob::new();
+        let logger = QPDFLogger::create();
+        logger.set_info(Some(logger.discard()));
+        logger.set_warn(Some(logger.discard()));
+        logger.set_error(Some(logger.discard()));
+        logger.set_save(Some(logger.discard()), false).unwrap();
+        job.set_logger(logger);
+        job.initialize_from_raw_argv(&args)
+            .unwrap_or_else(|error| panic!("argv {:?} must be accepted: {error}", args));
+    };
+
+    for option in [
+        b"--decode-level=none".to_vec(),
+        b"--decode-level=specialized".to_vec(),
+        b"--decode-level=all".to_vec(),
+        b"--flatten-annotations=all".to_vec(),
+        b"--flatten-annotations=print".to_vec(),
+        b"--json-stream-data=none".to_vec(),
+        b"--json-stream-data=file".to_vec(),
+        b"--password-mode=hex-bytes".to_vec(),
+        b"--password-mode=unicode".to_vec(),
+        b"--password-mode=auto".to_vec(),
+        b"--remove-unreferenced-resources=yes".to_vec(),
+        b"--remove-unreferenced-resources=no".to_vec(),
+        b"--stream-data=compress".to_vec(),
+        b"--stream-data=uncompress".to_vec(),
+        b"--compress-streams=n".to_vec(),
+        b"--normalize-content=y".to_vec(),
+        b"--json=latest".to_vec(),
+        b"--json=2".to_vec(),
+        b"--json-output".to_vec(),
+        b"--json-output=latest".to_vec(),
+        b"--json-object=trailer".to_vec(),
+    ] {
+        accept(vec![b"qpdfjob".to_vec(), option]);
+    }
+    accept(vec![
+        b"qpdfjob".to_vec(),
+        b"--json=1".to_vec(),
+        b"--json-key=objects".to_vec(),
+    ]);
+
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/one-page.pdf")
+        .to_string_lossy()
+        .into_owned()
+        .into_bytes();
+    accept(vec![
+        b"qpdfjob".to_vec(),
+        b"--underlay".to_vec(),
+        fixture.clone(),
+        b"--".to_vec(),
+    ]);
+    accept(vec![
+        b"qpdfjob".to_vec(),
+        b"--pages".to_vec(),
+        b"--file=.".to_vec(),
+        b"--range=1".to_vec(),
+        b"--password=page-password".to_vec(),
+        b"--".to_vec(),
+    ]);
+
+    for key_length in [b"40".as_slice(), b"128".as_slice(), b"256".as_slice()] {
+        let mut args = vec![b"qpdfjob".to_vec(), b"--allow-weak-crypto".to_vec()];
+        let print = if key_length == b"40" {
+            b"--print=y".to_vec()
+        } else {
+            b"--print=low".to_vec()
+        };
+        let modify = if key_length == b"40" {
+            b"--modify=y".to_vec()
+        } else {
+            b"--modify=none".to_vec()
+        };
+        let mut segment = vec![b"--encrypt".to_vec(), b"user".to_vec(), b"owner".to_vec()];
+        segment.push(key_length.to_vec());
+        segment.extend_from_slice(&[
+            print,
+            modify,
+            b"--extract=n".to_vec(),
+            b"--annotate=n".to_vec(),
+        ]);
+        if key_length == b"128" {
+            segment.extend_from_slice(&[
+                b"--force-V4".to_vec(),
+                b"--use-aes=n".to_vec(),
+                b"--form=n".to_vec(),
+                b"--assemble=n".to_vec(),
+                b"--accessibility=n".to_vec(),
+                b"--modify-other=n".to_vec(),
+            ]);
+        } else if key_length == b"256" {
+            segment.push(b"--force-R5".to_vec());
+        }
+        segment.push(b"--".to_vec());
+        args.extend(segment);
+        accept(args);
+    }
+    accept(vec![
+        b"qpdfjob".to_vec(),
+        b"--encrypt".to_vec(),
+        b"--user-password=user".to_vec(),
+        b"--owner-password=owner".to_vec(),
+        b"--bits=128".to_vec(),
+        b"--use-aes=y".to_vec(),
+        b"--".to_vec(),
+    ]);
+
+    let reject = |args: Vec<Vec<u8>>| {
+        let mut job = QPDFJob::new();
+        assert!(
+            job.initialize_from_raw_argv(&args).is_err(),
+            "argv should be rejected: {args:?}"
+        );
+    };
+    reject(Vec::new());
+    reject(vec![b"qpdfjob".to_vec(), b"-x".to_vec()]);
+    reject(vec![b"qpdfjob".to_vec(), b"--pages".to_vec()]);
+    reject(vec![b"qpdfjob".to_vec(), b"--encrypt".to_vec()]);
+    reject(vec![b"qpdfjob".to_vec(), b"--underlay".to_vec()]);
+    reject(vec![b"qpdfjob".to_vec(), b"--add-attachment".to_vec()]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        b"--copy-attachments-from".to_vec(),
+    ]);
+    reject(vec![b"qpdfjob".to_vec(), b"--set-page-labels".to_vec()]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--add-attachment".to_vec(),
+        fixture.clone(),
+        b"--mimetype=textplain".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--add-attachment".to_vec(),
+        fixture.clone(),
+        b"--creationdate=not-a-date".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--copy-attachments-from".to_vec(),
+        b"--unknown".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--pages".to_vec(),
+        b"--password=before-file".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--encrypt".to_vec(),
+        b"user".to_vec(),
+        b"owner".to_vec(),
+        b"128".to_vec(),
+        b"--use-aes".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![b"qpdfjob".to_vec(), input, b"--json=3".to_vec()]);
+}
+
+#[test]
+fn raw_argv_initializer_covers_error_and_choice_boundaries() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/one-page.pdf")
+        .to_string_lossy()
+        .into_owned()
+        .into_bytes();
+    let accept = |mut args: Vec<Vec<u8>>| {
+        args.insert(1, input.clone());
+        add_raw_argv_output_if_required(&mut args);
+        let mut job = QPDFJob::new();
+        let logger = QPDFLogger::create();
+        logger.set_info(Some(logger.discard()));
+        logger.set_warn(Some(logger.discard()));
+        logger.set_error(Some(logger.discard()));
+        logger.set_save(Some(logger.discard()), false).unwrap();
+        job.set_logger(logger);
+        job.initialize_from_raw_argv(&args)
+            .unwrap_or_else(|error| panic!("argv {:?} must be accepted: {error}", args));
+    };
+    let reject = |args: Vec<Vec<u8>>| {
+        assert!(
+            QPDFJob::new().initialize_from_raw_argv(&args).is_err(),
+            "argv should be rejected: {args:?}"
+        );
+    };
+
+    // Main-table value/choice branches not used by the broad acceptance
+    // sweep above.
+    for option in [
+        b"--decode-level=none".to_vec(),
+        b"--decode-level=specialized".to_vec(),
+        b"--decode-level=all".to_vec(),
+        b"--flatten-annotations=all".to_vec(),
+        b"--flatten-annotations=print".to_vec(),
+        b"--json-stream-data=none".to_vec(),
+        b"--json-stream-data=file".to_vec(),
+        b"--password-mode=hex-bytes".to_vec(),
+        b"--password-mode=unicode".to_vec(),
+        b"--password-mode=auto".to_vec(),
+        b"--remove-unreferenced-resources=yes".to_vec(),
+        b"--remove-unreferenced-resources=no".to_vec(),
+        b"--stream-data=compress".to_vec(),
+        b"--stream-data=uncompress".to_vec(),
+        b"--compress-streams=n".to_vec(),
+        b"--normalize-content=y".to_vec(),
+        b"--json=latest".to_vec(),
+        b"--json=2".to_vec(),
+        b"--json-output".to_vec(),
+        b"--json-output=latest".to_vec(),
+        b"--json-object=trailer".to_vec(),
+    ] {
+        accept(vec![b"qpdfjob".to_vec(), option]);
+    }
+    for key in [
+        b"acroform".as_slice(),
+        b"attachments".as_slice(),
+        b"encrypt".as_slice(),
+        b"objectinfo".as_slice(),
+        b"outlines".as_slice(),
+        b"pagelabels".as_slice(),
+        b"pages".as_slice(),
+        b"qpdf".as_slice(),
+    ] {
+        let version = if matches!(key, b"objects" | b"objectinfo") {
+            b"--json=1".to_vec()
+        } else {
+            b"--json=2".to_vec()
+        };
+        accept(vec![
+            b"qpdfjob".to_vec(),
+            version,
+            [b"--json-key=".as_slice(), key].concat(),
+        ]);
+    }
+
+    // Error branches at the raw argv boundary.
+    reject(Vec::new());
+    reject(vec![b"qpdfjob".to_vec(), b"-x".to_vec()]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        b"input.pdf".to_vec(),
+        b"extra.pdf".to_vec(),
+        b"x".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--empty".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--replace-input".to_vec(),
+        b"out.pdf".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--json=3".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--json-output=1".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--compression-level=999999999999999999999999".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--pages".to_vec(),
+        b"--password=x".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--pages".to_vec(),
+        b"file.pdf".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--pages".to_vec(),
+        b"--range=bad".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--pages".to_vec(),
+        b"file.pdf".to_vec(),
+        b"--range=1".to_vec(),
+        b"--range=2".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--pages".to_vec(),
+        b"--unknown".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--underlay".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--overlay".to_vec(),
+        b"--file=a".to_vec(),
+        b"--file=b".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--overlay".to_vec(),
+        b"--to=bad".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--add-attachment".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--copy-attachments-from".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--set-page-labels".to_vec(),
+        b"bad".to_vec(),
+        b"--".to_vec(),
+    ]);
+
+    let password_dir = tempfile::tempdir().unwrap();
+    let empty_password = password_dir.path().join("empty-password");
+    std::fs::write(&empty_password, b"").unwrap();
+    let mut password_file_args = vec![b"qpdfjob".to_vec()];
+    password_file_args.push(format!("--password-file={}", empty_password.display()).into_bytes());
+    accept(password_file_args);
+
+    let missing_job_json = password_dir.path().join("missing-job.json");
+    let error = QPDFJob::new()
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            format!("--job-json-file={}", missing_job_json.display()).into_bytes(),
+        ])
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::Usage(usage) if usage.to_string().contains("error with job-json file")
+    ));
+
+    let pages_job_json = password_dir.path().join("pages-job.json");
+    std::fs::write(
+        &pages_job_json,
+        serde_json::json!({
+            "pages": [{"file": String::from_utf8_lossy(&input)}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        format!("--job-json-file={}", pages_job_json.display()).into_bytes(),
+        b"--pages".to_vec(),
+        b"--".to_vec(),
+    ]);
+
+    // Exercise the page-table file/range/password callbacks, including the
+    // qpdf positional range-versus-file fallback and repeated-source path.
+    accept(vec![
+        b"qpdfjob".to_vec(),
+        b"--pages".to_vec(),
+        b"--file=.".to_vec(),
+        b"--".to_vec(),
+    ]);
+    accept(vec![
+        b"qpdfjob".to_vec(),
+        b"--pages".to_vec(),
+        b".".to_vec(),
+        b"1".to_vec(),
+        input.clone(),
+        b"--".to_vec(),
+    ]);
+    accept(vec![
+        b"qpdfjob".to_vec(),
+        b"--pages".to_vec(),
+        b".".to_vec(),
+        input.clone(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--pages".to_vec(),
+        b".".to_vec(),
+        vec![0xff],
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--pages".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--pages".to_vec(),
+        b"--file=.".to_vec(),
+        b"--password=first".to_vec(),
+        b"--password=second".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--pages".to_vec(),
+        b"--bogus".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--pages".to_vec(),
+        b"---bogus".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--pages".to_vec(),
+        b".".to_vec(),
+        b"not-a-range-or-file".to_vec(),
+        b"--".to_vec(),
+    ]);
+
+    // Underlay is the second half of the shared UO table; all option forms are
+    // accepted before the terminator, and the same state reports its own
+    // table-specific failures.
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        b"--underlay".to_vec(),
+        b"--file=".to_vec(),
+        b"--".to_vec(),
+    ]);
+    accept(vec![
+        b"qpdfjob".to_vec(),
+        b"--underlay".to_vec(),
+        format!("--file={}", String::from_utf8_lossy(&input)).into_bytes(),
+        b"--password=pw".to_vec(),
+        b"--to=1".to_vec(),
+        b"--from=".to_vec(),
+        b"--repeat=".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--underlay".to_vec(),
+        b"--file=a".to_vec(),
+        b"--file=b".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--underlay".to_vec(),
+        b"--bogus".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--underlay".to_vec(),
+        b"---bogus".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--underlay".to_vec(),
+        b"--from=bad!".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--underlay".to_vec(),
+        b"--from=\xff".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--underlay".to_vec(),
+        b"--file=a".to_vec(),
+        b"b".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--underlay".to_vec(),
+        b"--".to_vec(),
+    ]);
+
+    // Cover the attachment defaults/date validator and copy-attachment
+    // boundary without invoking the output stage.
+    accept(vec![
+        b"qpdfjob".to_vec(),
+        b"--add-attachment".to_vec(),
+        input.clone(),
+        b"--creationdate=D:20240101120000".to_vec(),
+        b"--moddate=D:20240101120000+01'00'".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--add-attachment".to_vec(),
+        input.clone(),
+        b"--bogus".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--add-attachment".to_vec(),
+        input.clone(),
+        b"---bogus".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--copy-attachments-from".to_vec(),
+        Vec::new(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--copy-attachments-from".to_vec(),
+        b"---bogus".to_vec(),
+        b"--".to_vec(),
+    ]);
+
+    // Encryption table selection is immediate after the key length. Exercise
+    // the R=6 path, dashed form, mixed-mode errors, and dynamic-table errors.
+    accept(vec![
+        b"qpdfjob".to_vec(),
+        b"--encrypt".to_vec(),
+        b"user".to_vec(),
+        b"owner".to_vec(),
+        b"256".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--encrypt".to_vec(),
+        b"--user-password=user".to_vec(),
+        b"value".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--encrypt".to_vec(),
+        b"--user-password=user".to_vec(),
+        b"--use-aes=y".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--encrypt".to_vec(),
+        b"user".to_vec(),
+        b"owner".to_vec(),
+        b"128".to_vec(),
+        b"extra".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--encrypt".to_vec(),
+        b"user".to_vec(),
+        b"owner".to_vec(),
+        b"999".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--encrypt".to_vec(),
+        b"user".to_vec(),
+        b"".to_vec(),
+        b"256".to_vec(),
+        b"--".to_vec(),
+    ]);
+    for key_length in [b"40".as_slice(), b"256".as_slice()] {
+        reject(vec![
+            b"qpdfjob".to_vec(),
+            input.clone(),
+            b"--encrypt".to_vec(),
+            b"user".to_vec(),
+            b"owner".to_vec(),
+            key_length.to_vec(),
+            b"--bogus".to_vec(),
+            b"--".to_vec(),
+        ]);
+    }
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--encrypt".to_vec(),
+        b"user".to_vec(),
+        b"owner".to_vec(),
+        b"128".to_vec(),
+        b"--bits=256".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--encrypt".to_vec(),
+        b"user".to_vec(),
+        b"owner".to_vec(),
+        b"128".to_vec(),
+        b"---bogus".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--encrypt".to_vec(),
+        b"--".to_vec(),
+    ]);
+    accept(vec![
+        b"qpdfjob".to_vec(),
+        b"--encrypt".to_vec(),
+        b"user".to_vec(),
+        b"owner".to_vec(),
+        b"128".to_vec(),
+        b"--print=none".to_vec(),
+        b"--modify=assembly".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--encrypt".to_vec(),
+        b"user".to_vec(),
+        b"owner".to_vec(),
+        b"128".to_vec(),
+        b"--use-aes=x".to_vec(),
+        b"--".to_vec(),
+    ]);
+    reject(vec![
+        b"qpdfjob".to_vec(),
+        input.clone(),
+        b"--split-pages=999999999999999999999999".to_vec(),
+    ]);
+
+    let mut empty_positional = QPDFJob::new();
+    empty_positional
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            Vec::new(),
+            b"raw-argv-output.pdf".to_vec(),
+        ])
+        .expect("an empty positional input with an output path should initialize");
+    reject(vec![b"qpdfjob".to_vec(), b"---bad".to_vec()]);
+    reject(vec![b"qpdfjob".to_vec(), b"--json-help=3".to_vec()]);
+    for option in [b"--json-help=1".to_vec(), b"--json-help=2".to_vec()] {
+        let mut job = QPDFJob::new();
+        job.set_logger(QPDFLogger::create());
+        job.initialize_from_raw_argv(&[b"qpdfjob".to_vec(), option])
+            .unwrap();
+    }
 }
 
 #[test]
@@ -2053,7 +4106,7 @@ fn write_qpdf_output_sink_error_does_not_prefix_the_input_name() {
     );
     assert_eq!(
         state.lock().unwrap().bytes,
-        b"qpdf: qpdf output: Pl_StdioFile::write: No space left on device\n"
+        b"qpdfjob: qpdf output: Pl_StdioFile::write: No space left on device\n"
     );
 }
 
@@ -2100,7 +4153,11 @@ fn linearized_output_sink_error_reports_the_qpdf_output_pipeline() {
 #[test]
 fn write_qpdf_without_an_output_runs_inspection() {
     let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
-    let args = vec!["qpdfjob".to_owned(), input.to_string_lossy().into_owned()];
+    let args = vec![
+        "qpdfjob".to_owned(),
+        input.to_string_lossy().into_owned(),
+        "--check".to_owned(),
+    ];
     let mut job = QPDFJob::new();
     job.initialize_from_argv(&args).unwrap();
     let mut pdf = job.create_qpdf().unwrap().expect("input should open");
@@ -2189,6 +4246,11 @@ fn create_qpdf_reports_unconfigured_and_malformed_inputs() {
     let args = vec![
         "qpdfjob".to_owned(),
         malformed.to_string_lossy().into_owned(),
+        tempdir
+            .path()
+            .join("output.pdf")
+            .to_string_lossy()
+            .into_owned(),
     ];
     let mut job = QPDFJob::new();
     job.initialize_from_argv(&args).unwrap();
@@ -4265,5 +6327,70 @@ fn config_copy_attachments_from_matches_the_json_configured_path() {
         std::fs::read(&via_config).unwrap(),
         std::fs::read(&via_json).unwrap(),
         "the Config builder and the JSON path must produce byte-identical output"
+    );
+}
+
+/// A missing `--password-file` must surface as a usage error.
+///
+/// qpdf's `Config::passwordFile` lets `QUtil::read_lines_from_file` throw a
+/// `QPDFSystemError` (`QPDFJob_config.cc:661-668`); `ArgParser::parseOptions`
+/// catches every callback `runtime_error` and routes it through `usage()`
+/// (`QPDFJob_argv.cc:407-415`). A bare file-I/O error would give CLI-style
+/// consumers the wrong class and drop the usage framing.
+#[test]
+fn missing_password_file_is_a_usage_error() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let missing = tempdir.path().join("absent-password.txt");
+    let mut job = QPDFJob::new();
+    let error = job
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            b"in.pdf".to_vec(),
+            format!("--password-file={}", missing.display()).into_bytes(),
+            b"out.pdf".to_vec(),
+        ])
+        .expect_err("a missing password file must fail");
+    assert!(
+        matches!(error, flpdf::Error::Usage(_)),
+        "expected a usage error, got {error:?}"
+    );
+}
+
+/// A second argv initialization restarts the lifecycle.
+///
+/// `initialize_from_json_with_partial` layers onto the existing configuration
+/// only while the job has not run. Without clearing that flag here, a
+/// `--job-json-file` occurrence in the second argv would take the post-run
+/// fresh-configuration branch and discard the input/output parsed before it.
+#[test]
+fn argv_initialization_after_a_run_keeps_later_job_json_layering() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let first_output = tempdir.path().join("first.pdf");
+    let second_output = tempdir.path().join("second.pdf");
+    let job_json = tempdir.path().join("job.json");
+    std::fs::write(&job_json, br#"{"qdf": ""}"#).unwrap();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_raw_argv(&[
+        b"qpdfjob".to_vec(),
+        fixture.to_string_lossy().into_owned().into_bytes(),
+        first_output.to_string_lossy().into_owned().into_bytes(),
+    ])
+    .expect("first initialization");
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+
+    job.initialize_from_raw_argv(&[
+        b"qpdfjob".to_vec(),
+        fixture.to_string_lossy().into_owned().into_bytes(),
+        format!("--job-json-file={}", job_json.display()).into_bytes(),
+        second_output.to_string_lossy().into_owned().into_bytes(),
+    ])
+    .expect("the input and output parsed before --job-json-file must survive");
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    assert!(
+        second_output.exists(),
+        "the second run must write its output"
     );
 }

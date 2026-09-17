@@ -1,0 +1,1460 @@
+Run "qpdf --help=topic" for help on a topic.
+Run "qpdf --help=--option" for help on an option.
+Run "qpdf --help=all" to see all available help.
+
+Topics:
+  add-attachment: attach (embed) files
+  advanced-control: tweak qpdf's behavior
+  attachments: work with embedded files
+  completion: shell completion
+  copy-attachments: copy attachments from another file
+  encryption: create encrypted files
+  exit-status: meanings of qpdf's exit codes
+  general: general options
+  help: information about qpdf
+  inspection: inspect PDF files
+  json: JSON output for PDF information
+  modification: change parts of the PDF
+  overlay-underlay: overlay/underlay pages from other files
+  page-ranges: page range syntax
+  page-selection: select pages from one or more files
+  pdf-dates: PDF date format
+  testing: options for testing or debugging
+  transformation: make structural PDF changes
+  usage: basic invocation
+
+== add-attachment (attach (embed) files) ==
+
+The options listed below appear between --add-attachment and its
+terminating "--".
+
+Related options:
+  --creationdate: set attachment's creation date
+  --description: set attachment's description
+  --filename: set attachment's displayed filename
+  --key: specify attachment key
+  --mimetype: attachment mime type, e.g. application/pdf
+  --moddate: set attachment's modification date
+  --replace: replace attachment with same key
+
+== advanced-control (tweak qpdf's behavior) ==
+
+Advanced control options control qpdf's behavior in ways that would
+normally never be needed by a user but that may be useful to
+developers or people investigating problems with specific files.
+
+Related options:
+  --ignore-xref-streams: use xref tables rather than streams
+  --password-is-hex-key: provide hex-encoded encryption key
+  --password-mode: tweak how qpdf encodes passwords
+  --suppress-password-recovery: don't try different password encodings
+  --suppress-recovery: suppress error recovery
+
+== attachments (work with embedded files) ==
+
+It is possible to list, add, or delete embedded files (also known
+as attachments) and to copy attachments from other files. See help
+on individual options for details. Run qpdf --help=add-attachment
+for additional details about adding attachments. See also
+--help=--list-attachments and --help=--show-attachment.
+
+Related options:
+  --add-attachment: start add attachment options
+  --copy-attachments-from: start copy attachment options
+  --remove-attachment: remove an embedded file
+
+== completion (shell completion) ==
+
+Shell completion is supported with bash and zsh. Use
+eval $(qpdf --completion-bash) or eval $(qpdf --completion-zsh)
+to enable. The QPDF_EXECUTABLE environment variable overrides the
+path to qpdf that these commands output.
+
+Related options:
+  --completion-bash: enable bash completion
+  --completion-zsh: enable zsh completion
+
+== copy-attachments (copy attachments from another file) ==
+
+The options listed below appear between --copy-attachments-from and
+its terminating "--".
+
+To copy attachments from a password-protected file, use
+the --password option after the file name.
+
+Related options:
+  --prefix: key prefix for copying attachments
+
+== encryption (create encrypted files) ==
+
+Create encrypted files. Usage:
+
+--encrypt \
+  [--user-password=user-password] \
+  [--owner-password=owner-password] \
+  --bits=key-length [options] --
+
+OR
+
+--encrypt user-password owner-password key-length [options] --
+
+The first form, with flags for the passwords and bit length, was
+introduced in qpdf 11.7.0. Only the --bits option is is mandatory.
+This form allows you to use any text as the password. If passwords
+are specified, they must be given before the --bits option.
+
+The second form has been in qpdf since the beginning and wil
+continue to be supported. Either or both of user-password and
+owner-password may be empty strings.
+
+The key-length parameter must be either 40, 128, or 256. The user
+and/or owner password may be omitted. Omitting either password
+enables the PDF file to be opened without a password. Specifying
+the same value for the user and owner password and specifying an
+empty owner password are both considered insecure.
+
+Encryption options are terminated by "--" by itself.
+
+40-bit encryption is insecure, as is 128-bit encryption without
+AES. Use 256-bit encryption unless you have a specific reason to
+use an insecure format, such as testing or compatibility with very
+old viewers. You must use the --allow-weak-crypto to create
+encrypted files that use insecure cryptographic algorithms. The
+--allow-weak-crypto flag appears outside of --encrypt ... --
+(before --encrypt or after --).
+
+Available options vary by key length. Not all readers respect all
+restrictions. Different PDF readers respond differently to various
+combinations of options. Sometimes a PDF viewer may show you
+restrictions that differ from what you selected. This is probably
+not a bug in qpdf.
+
+Options for 40-bit only:
+  --annotate=[y|n]         restrict comments, filling forms, and signing
+  --extract=[y|n]          restrict text/graphic extraction
+  --modify=[y|n]           restrict document modification
+  --print=[y|n]            restrict printing
+
+Options for 128-bit or 256-bit:
+  --accessibility=[y|n]    restrict accessibility (usually ignored)
+  --annotate=[y|n]         restrict commenting/filling form fields
+  --assemble=[y|n]         restrict document assembly
+  --extract=[y|n]          restrict text/graphic extraction
+  --form=[y|n]             restrict filling form fields
+  --modify-other=[y|n]     restrict other modifications
+  --modify=modify-opt      control modify access by level
+  --print=print-opt        control printing access
+  --cleartext-metadata     prevent encryption of metadata
+
+For 128-bit only:
+  --use-aes=[y|n]          indicates whether to use AES encryption
+  --force-V4               forces use of V=4 encryption handler
+
+For 256-bit only:
+  --force-R5               forces use of deprecated R=5 encryption
+  --allow-insecure         allow user password with empty owner password
+
+Values for print-opt:
+  none                     disallow printing
+  low                      allow only low-resolution printing
+  full                     allow full printing
+
+Values for modify-opt:
+  none                     allow no modifications
+  assembly                 allow document assembly only
+  form                     assembly + filling in form fields and signing
+  annotate                 form + commenting and modifying forms
+  all                      allow full document modification
+
+Related options:
+  --accessibility: restrict document accessibility
+  --allow-insecure: allow empty owner passwords
+  --annotate: restrict document annotation
+  --assemble: restrict document assembly
+  --bits: specify encryption key length
+  --cleartext-metadata: don't encrypt metadata
+  --extract: restrict text/graphic extraction
+  --force-R5: use unsupported R=5 encryption
+  --force-V4: force V=4 in encryption dictionary
+  --form: restrict form filling
+  --modify: restrict document modification
+  --modify-other: restrict other modifications
+  --owner-password: specify owner password
+  --print: restrict printing
+  --use-aes: use AES with 128-bit encryption
+  --user-password: specify user password
+
+== exit-status (meanings of qpdf's exit codes) ==
+
+Meaning of exit codes:
+
+- 0: no errors or warnings
+- 1: not used by qpdf but may be used by the shell if unable to invoke qpdf
+- 2: errors detected
+- 3: warnings detected, unless --warning-exit-0 is given
+
+Related options:
+  --warning-exit-0: exit 0 even with warnings
+
+== general (general options) ==
+
+General options control qpdf's behavior in ways that are not
+directly related to the operation it is performing.
+
+Related options:
+  --allow-weak-crypto: allow insecure cryptographic algorithms
+  --deterministic-id: generate ID deterministically
+  --keep-files-open: manage keeping multiple files open
+  --keep-files-open-threshold: set threshold for --keep-files-open
+  --no-warn: suppress printing of warning messages
+  --password: password for encrypted file
+  --password-file: read password from a file
+  --progress: show progress when writing
+  --verbose: print additional information
+
+== help (information about qpdf) ==
+
+Help options provide some information about qpdf itself. Help
+options are only valid as the first and only command-line argument.
+
+Related options:
+  --copyright: show copyright information
+  --help: provide help
+  --job-json-help: show format of job JSON
+  --show-crypto: show available crypto providers
+  --version: show qpdf version
+
+== inspection (inspect PDF files) ==
+
+These options provide tools for inspecting PDF files. When any of
+the options in this section are specified, no output file may be
+given.
+
+Related options:
+  --check: partially check whether PDF is valid
+  --check-linearization: check linearization tables
+  --filtered-stream-data: show filtered stream data
+  --is-encrypted: silently test whether a file is encrypted
+  --list-attachments: list embedded files
+  --raw-stream-data: show raw stream data
+  --requires-password: silently test a file's password
+  --show-attachment: export an embedded file
+  --show-encryption: information about encrypted files
+  --show-encryption-key: show key with --show-encryption
+  --show-linearization: show linearization hint tables
+  --show-npages: show number of pages
+  --show-object: show contents of an object
+  --show-pages: display page dictionary information
+  --show-xref: show cross reference data
+  --with-images: include image details with --show-pages
+
+== json (JSON output for PDF information) ==
+
+Show information about the PDF file in JSON format. Please see the
+JSON chapter in the qpdf manual for details.
+
+Related options:
+  --json: show file in JSON format
+  --json-help: show format of JSON output
+  --json-input: input file is qpdf JSON
+  --json-key: limit which keys are in JSON output
+  --json-object: limit which objects are in JSON
+  --json-output: apply defaults for JSON serialization
+  --json-stream-data: how to handle streams in json output
+  --json-stream-prefix: prefix for json stream data files
+  --update-from-json: update a PDF from qpdf JSON
+
+== modification (change parts of the PDF) ==
+
+Modification options make systematic changes to certain parts of
+the PDF, causing the PDF to render differently from the original.
+
+Related options:
+  --collate: collate with --pages
+  --file: source for pages
+  --flatten-annotations: push annotations into content
+  --flatten-rotation: remove rotation from page dictionary
+  --generate-appearances: generate appearances for form fields
+  --keep-inline-images: exclude inline images from optimization
+  --oi-min-area: minimum area for --optimize-images
+  --oi-min-height: minimum height for --optimize-images
+  --oi-min-width: minimum width for --optimize-images
+  --optimize-images: use efficient compression for images
+  --overlay: begin overlay options
+  --pages: begin page selection
+  --range: page range
+  --remove-page-labels: remove explicit page numbers
+  --rotate: rotate pages
+  --set-page-labels: number pages for the entire document
+  --split-pages: write pages to separate files
+  --underlay: begin underlay options
+
+== overlay-underlay (overlay/underlay pages from other files) ==
+
+These options allow pages from another file to be overlaid or
+underlaid on the primary output. Overlaid pages are drawn on top of
+the destination page and may obscure the page. Underlaid pages are
+drawn below the destination page. Usage:
+
+{--overlay|--underlay} [--file=]file
+      [--password=password]
+      [--to=page-range]
+      [--from=[page-range]]
+      [--repeat=page-range]
+      --
+
+Note the use of "--" by itself to terminate overlay/underlay options.
+
+For overlay and underlay, a file and optional password are specified, along
+with a series of optional page ranges. The default behavior is that each
+page of the overlay or underlay file is imposed on the corresponding page
+of the primary output until it runs out of pages, and any extra pages are
+ignored. You can also give a page range with --repeat to cause
+those pages to be repeated after the original pages are exhausted.
+
+This options are repeatable. Pages will be stacked in order of
+appearance: first underlays, then the original page, then overlays.
+
+Run qpdf --help=page-ranges for help with page ranges.
+
+Related options:
+  --from: source pages for underlay/overlay
+  --repeat: overlay/underlay pages to repeat
+  --to: destination pages for underlay/overlay
+
+== page-ranges (page range syntax) ==
+
+A full description of the page range syntax, with examples, can be
+found in the manual. In summary, a range is a comma-separated list
+of groups. A group is a number or a range of numbers separated by a
+dash. A group may be prepended by x to exclude its members from the
+previous group. A number may be one of
+
+- <n>        where <n> represents a number is the <n>th page
+- r<n>       is the <n>th page from the end
+- z          the last page, same as r1
+
+- a,b,c      pages a, b, and c
+- a-b        pages a through b inclusive; if a > b, this counts down
+- a-b,xc     pages a through b except page c
+- a-b,xc-d   pages a through b except pages c through d
+
+You can append :even or :odd to select every other page from the
+resulting set of pages, where :odd starts with the first page and
+:even starts with the second page. These are odd and even pages
+from the resulting set, not based on the original page numbers.
+
+== page-selection (select pages from one or more files) ==
+
+Use the --pages option to select pages from multiple files. Usage:
+
+qpdf in.pdf --pages --file=input-file \
+    [--range=page-range] [--password=password] [...] -- out.pdf
+
+OR
+
+qpdf in.pdf --pages input-file [--password=password] [page-range] \
+    [...] -- out.pdf
+
+Between --pages and the -- that terminates pages option, repeat
+the following:
+
+--file=filename [--range=page-range] [--password=password] [options]
+
+For compatibility, the file and range can be specified
+positionally. qpdf versions prior to 11.9.0
+require --password=password to immediately follow the filename. In
+the older syntax, repeat the following:
+
+filename [--password=password] [page-range]
+
+Document-level information, such as outlines, tags, etc., is taken
+from in.pdf and is preserved in out.pdf. You can use --empty in place
+of an input file to start from an empty file and just copy pages
+equally from all files. You can use "." as a shorthand for the
+primary input file (if not --empty). In the above example, "."
+would refer to in.pdf.
+
+Use --password=password to specify the password for a
+password-protected input file. If the same input file is used more
+than once, you only need to supply the password the first time. If
+the page range is omitted, all pages are selected.
+
+Run qpdf --help=page-ranges for help with page ranges.
+
+Use --collate=n to cause pages to be collated in groups of n pages
+(default 1) instead of concatenating the input.
+Use --collate=i,j,k,... to take i from the first, then j from the
+second, then k from the third, then i from the first, etc.
+
+Examples:
+
+- Start with in.pdf and append all pages from a.pdf and the even
+  pages from b.pdf, and write the output to out.pdf. Document-level
+  information from in.pdf is retained. Note the use of "." to refer
+  to in.pdf.
+
+  qpdf in.pdf --pages . a.pdf b.pdf 1-z:even -- out.pdf
+
+- Take all the pages from a.pdf, all the pages from b.pdf in
+  reverse, and only pages 3 and 6 from c.pdf and write the result
+  to out.pdf. Use password "x" to open b.pdf:
+
+  qpdf --empty --pages a.pdf b.pdf --password=x z-1 c.pdf 3,6
+
+More examples are in the manual.
+
+== pdf-dates (PDF date format) ==
+
+When a date is required, the date should conform to the PDF date
+format specification, which is "D:yyyymmddhhmmssz" where "z" is
+either literally upper case "Z" for UTC or a timezone offset in
+the form "-hh'mm'" or "+hh'mm'". Negative timezone offsets indicate
+time before UTC. Positive offsets indicate how far after. For
+example, US Eastern Standard Time (America/New_York) is "-05'00'",
+and Indian Standard Time (Asia/Calcutta) is "+05'30'".
+
+Examples:
+- D:20210207161528-05'00'   February 7, 2021 at 4:15:28 p.m.
+- D:20210207211528Z         February 7, 2021 at 21:15:28 UTC
+
+== testing (options for testing or debugging) ==
+
+The options below are useful when writing automated test code that
+includes files created by qpdf or when testing qpdf itself.
+
+Related options:
+  --linearize-pass1: save pass 1 of linearization
+  --report-memory-usage: best effort report of memory usage
+  --static-aes-iv: use a fixed AES vector
+  --static-id: use a fixed document ID
+  --test-json-schema: test generated json against schema
+
+== transformation (make structural PDF changes) ==
+
+The options below tell qpdf to apply transformations that change
+the structure without changing the content.
+
+Related options:
+  --coalesce-contents: combine content streams
+  --compress-streams: compress uncompressed streams
+  --compression-level: set compression level for flate
+  --copy-encryption: copy another file's encryption details
+  --decode-level: control which streams to uncompress
+  --decrypt: remove encryption from input file
+  --encrypt: start encryption options
+  --encryption-file-password: supply password for --copy-encryption
+  --externalize-inline-images: convert inline to regular images
+  --force-version: set output PDF version
+  --ii-min-bytes: set minimum size for --externalize-inline-images
+  --linearize: linearize (web-optimize) output
+  --min-version: set minimum PDF version
+  --newline-before-endstream: force a newline before endstream
+  --no-original-object-ids: omit original object IDs in qdf
+  --normalize-content: fix newlines in content streams
+  --object-streams: control use of object streams
+  --preserve-unreferenced: preserve unreferenced objects
+  --preserve-unreferenced-resources: use --remove-unreferenced-resources=no
+  --qdf: enable viewing PDF code in a text editor
+  --recompress-flate: uncompress and recompress flate
+  --remove-restrictions: remove security restrictions from input file
+  --remove-unreferenced-resources: remove unreferenced page resources
+  --stream-data: control stream compression
+
+== usage (basic invocation) ==
+
+Read a PDF file, apply transformations or modifications, and write
+a new PDF file.
+
+Usage: qpdf [infile] [options] [outfile]
+   OR  qpdf --help[={topic|--option}]
+
+- infile, options, and outfile may be in any order as long as infile
+  precedes outfile.
+- Use --empty in place of an input file for a zero-page, empty input
+- Use --replace-input in place of an output file to overwrite the
+  input file with the output
+- outfile may be - to write to stdout; reading from stdin is not supported
+- @filename is an argument file; each line is treated as a separate
+  command-line argument
+- @- may be used to read arguments from stdin
+- Later options may override earlier options if contradictory
+
+Related options:
+  --empty: use empty file as input
+  --job-json-file: job JSON file
+  --replace-input: overwrite input with output
+
+== --accessibility (restrict document accessibility) ==
+
+--accessibility=[y|n]
+
+This option is ignored except with very old encryption formats.
+The current PDF specification does not allow restriction of
+document accessibility. This option is not available with 40-bit
+encryption.
+
+== --add-attachment (start add attachment options) ==
+
+--add-attachment file [options] --
+
+The --add-attachment flag and its options may be repeated to add
+multiple attachments. Run qpdf --help=add-attachment for details.
+
+== --allow-insecure (allow empty owner passwords) ==
+
+Allow creation of PDF files with empty owner passwords and
+non-empty user passwords when using 256-bit encryption.
+
+== --allow-weak-crypto (allow insecure cryptographic algorithms) ==
+
+Allow creation of files with weak cryptographic algorithms. This
+option is necessary to create 40-bit files or 128-bit files that
+use RC4 encryption.
+
+== --annotate (restrict document annotation) ==
+
+--annotate=[y|n]
+
+Enable/disable modifying annotations including making comments
+and filling in form fields. For 128-bit and 256-bit encryption,
+this also enables editing, creating, and deleting form fields
+unless --modify-other=n or --modify=none is also specified.
+
+== --assemble (restrict document assembly) ==
+
+--assemble=[y|n]
+
+Enable/disable document assembly (rotation and reordering of
+pages). This option is not available with 40-bit encryption.
+
+== --bits (specify encryption key length) ==
+
+--bits={48|128|256}
+
+Specify the encryption key length. For best security, always use
+a key length of 256.
+
+== --check (partially check whether PDF is valid) ==
+
+Check the structure of the PDF file as well as a number of other
+aspects of the file, and write information about the file to
+standard output. Note that qpdf does not perform any validation
+of the actual PDF page content or semantic correctness of the
+PDF file. It merely checks that the PDF file is syntactically
+valid. See also qpdf --help=exit-status.
+
+== --check-linearization (check linearization tables) ==
+
+Check to see whether a file is linearized and, if so, whether
+the linearization hint tables are correct.
+
+== --cleartext-metadata (don't encrypt metadata) ==
+
+If specified, don't encrypt document metadata even when
+encrypting the rest of the document. This option is not
+available with 40-bit encryption.
+
+== --coalesce-contents (combine content streams) ==
+
+If a page has an array of content streams, concatenate them into
+a single content stream.
+
+== --collate (collate with --pages) ==
+
+--collate[=n[,m,...]]
+
+Collate rather than concatenate pages specified with --pages.
+With a numeric parameter, collate in groups of n. The default
+is 1. With comma-separated numeric parameters, take n from the
+first file, m from the second, etc. Run
+qpdf --help=page-selection for additional details.
+
+== --completion-bash (enable bash completion) ==
+
+Output a command that enables bash completion
+
+== --completion-zsh (enable zsh completion) ==
+
+Output a command that enables zsh completion
+
+== --compress-streams (compress uncompressed streams) ==
+
+--compress-streams=[y|n]
+
+Setting --compress-streams=n prevents qpdf from compressing
+uncompressed streams. This can be useful if you are leaving some
+streams uncompressed intentionally.
+
+== --compression-level (set compression level for flate) ==
+
+--compression-level=level
+
+Set a compression level from 1 (least, fastest) to 9 (most,
+slowest) when compressing files with flate (used in zip and
+gzip), which is the default compression for most PDF files.
+You need --recompress-flate with this option if you want to
+change already compressed streams.
+
+== --copy-attachments-from (start copy attachment options) ==
+
+--copy-attachments-from file [options] --
+
+The --copy-attachments-from flag and its options may be repeated
+to copy attachments from multiple files. Run
+qpdf --help=copy-attachments for details.
+
+== --copy-encryption (copy another file's encryption details) ==
+
+--copy-encryption=file
+
+Copy encryption details from the specified file instead of
+preserving the input file's encryption. Use --encryption-file-password
+to specify the encryption file's password.
+
+== --copyright (show copyright information) ==
+
+Display copyright and license information.
+
+== --creationdate (set attachment's creation date) ==
+
+--creationdate=date
+
+Specify the attachment's creation date in PDF format; defaults
+to the current time. Run qpdf --help=pdf-dates for information
+about the date format.
+
+== --decode-level (control which streams to uncompress) ==
+
+--decode-level=parameter
+
+When uncompressing streams, control which types of compression
+schemes should be uncompressed:
+- none: don't uncompress anything. This is the default with
+  --json-output.
+- generalized: uncompress streams compressed with a
+  general-purpose compression algorithm. This is the default
+  except when --json-output is given.
+- specialized: in addition to generalized, also uncompress
+  streams compressed with a special-purpose but non-lossy
+  compression scheme
+- all: in addition to specialized, uncompress streams compressed
+  with lossy compression schemes like JPEG (DCT)
+qpdf does not know how to uncompress all compression schemes.
+
+== --decrypt (remove encryption from input file) ==
+
+Create an unencrypted output file even if the input file was
+encrypted. Normally qpdf preserves whatever encryption was
+present on the input file. This option overrides that behavior.
+
+== --description (set attachment's description) ==
+
+--description="text"
+
+Supply descriptive text for the attachment, displayed by some
+PDF viewers.
+
+== --deterministic-id (generate ID deterministically) ==
+
+Generate a secure, random document ID only using static
+information, such as the page contents. Does not use the file's
+name or attributes or the current time.
+
+== --empty (use empty file as input) ==
+
+Use in place of infile for an empty input. Especially useful
+with --pages.
+
+== --encrypt (start encryption options) ==
+
+--encrypt [options] --
+
+Run qpdf --help=encryption for details.
+
+== --encryption-file-password (supply password for --copy-encryption) ==
+
+--encryption-file-password=password
+
+If the file named in --copy-encryption requires a password, use
+this option to supply the password.
+
+== --externalize-inline-images (convert inline to regular images) ==
+
+Convert inline images to regular images.
+
+== --extract (restrict text/graphic extraction) ==
+
+--extract=[y|n]
+
+Enable/disable text/graphic extraction for purposes other than
+accessibility.
+
+== --file (source for pages) ==
+
+--file=file
+
+Specify the file for the current page operation. This is used
+with --pages, --overlay, and --underlay and appears between the
+option and the terminating --. Run qpdf --help=page-selection
+for details.
+
+== --filename (set attachment's displayed filename) ==
+
+--filename=name
+
+Specify the filename to be used for the attachment. This is what
+is usually displayed to the user and is the name most graphical
+PDF viewers will use when saving a file. It defaults to the last
+element (basename) of the attached file's filename.
+
+== --filtered-stream-data (show filtered stream data) ==
+
+When used with --show-object, if the object is a stream, write
+the filtered (uncompressed, potentially binary) stream data to
+standard output instead of the object's contents. See also
+--raw-stream-data.
+
+== --flatten-annotations (push annotations into content) ==
+
+--flatten-annotations=parameter
+
+Push page annotations into the content streams. This may be
+necessary in some case when printing or splitting files.
+Parameters: "all", "print", "screen".
+
+== --flatten-rotation (remove rotation from page dictionary) ==
+
+For each page that is rotated using the /Rotate key in the
+page's dictionary, remove the /Rotate key and implement the
+identical rotation semantics by modifying the page's contents.
+This can be useful if a broken PDF viewer fails to properly
+consider page rotation metadata.
+
+== --force-R5 (use unsupported R=5 encryption) ==
+
+Use an undocumented, unsupported, deprecated encryption
+algorithm that existed only in Acrobat version IX. This option
+should not be used except for compatibility testing.
+
+== --force-V4 (force V=4 in encryption dictionary) ==
+
+This option is for testing and is never needed in practice since
+qpdf does this automatically when needed.
+
+== --force-version (set output PDF version) ==
+
+--force-version=version
+
+Force the output PDF file's PDF version header to be the specified
+value, even if the file uses features that may not be available
+in that version.
+
+== --form (restrict form filling) ==
+
+--form=[y|n]
+
+Enable/disable whether filling form fields is allowed even if
+modification of annotations is disabled. This option is not
+available with 40-bit encryption.
+
+== --from (source pages for underlay/overlay) ==
+
+--from=[page-range]
+
+Specify pages from the overlay/underlay file that are applied to
+the destination pages. See qpdf --help=page-ranges for help
+with the page range syntax. The page range may be omitted
+if --repeat is used.
+
+== --generate-appearances (generate appearances for form fields) ==
+
+PDF form fields consist of values and appearances, which may be
+inconsistent with each other if a form field value has been
+modified without updating its appearance. This option tells qpdf
+to generate new appearance streams. There are some limitations,
+which are discussed in the manual.
+
+== --help (provide help) ==
+
+--help[=--option|topic]
+
+--help: provide general information and a list of topics
+--help=--option: provide help on a specific option
+--help=topic: provide help on a topic
+
+== --ignore-xref-streams (use xref tables rather than streams) ==
+
+Ignore any cross-reference streams in the file, falling back to
+cross-reference tables or triggering document recovery.
+
+== --ii-min-bytes (set minimum size for --externalize-inline-images) ==
+
+--ii-min-bytes=size-in-bytes
+
+Don't externalize inline images smaller than this size. The
+default is 1,024. Use 0 for no minimum.
+
+== --is-encrypted (silently test whether a file is encrypted) ==
+
+Silently exit with a code indicating the file's encryption status:
+
+0: the file is encrypted
+1: not used
+2: the file is not encrypted
+
+This can be used with password-protected files even if you don't
+know the password.
+
+== --job-json-file (job JSON file) ==
+
+--job-json-file=file
+
+Specify the name of a file whose contents are expected to
+contain a QPDFJob JSON file. Run qpdf --job-json-help for a
+description of the JSON input file format.
+
+== --job-json-help (show format of job JSON) ==
+
+Describe the format of the QPDFJob JSON input used by
+--job-json-file.
+
+== --json (show file in JSON format) ==
+
+--json[=version]
+
+Generate a JSON representation of the file. This is described in
+depth in the JSON section of the manual. "version" may be a
+specific version or "latest" (the default). Run qpdf --json-help
+for a description of the generated JSON object.
+
+== --json-help (show format of JSON output) ==
+
+--json-help[=version]
+
+Describe the format of the JSON output by writing to standard
+output a JSON object with the same keys and with values
+containing descriptive text.
+
+== --json-input (input file is qpdf JSON) ==
+
+Treat the input file as a JSON file in qpdf JSON format. See the
+"qpdf JSON Format" section of the manual for information about
+how to use this option.
+
+== --json-key (limit which keys are in JSON output) ==
+
+--json-key=key
+
+This option is repeatable. If given, only the specified
+top-level keys will be included in the JSON output. Otherwise,
+all keys will be included. With --json-output, when not given,
+only the "qpdf" key will appear in the output.
+
+== --json-object (limit which objects are in JSON) ==
+
+--json-object={trailer|obj[,gen]}
+
+This option is repeatable. If given, only specified objects will
+be shown in the "objects" key of the JSON output. Otherwise, all
+objects will be shown.
+
+== --json-output (apply defaults for JSON serialization) ==
+
+--json-output[=version]
+
+Implies --json=version. Changes default values for certain
+options so that the JSON output written is the most faithful
+representation of the original PDF and contains no additional
+JSON keys. See also --json-stream-data, --json-stream-prefix,
+and --decode-level.
+
+== --json-stream-data (how to handle streams in json output) ==
+
+--json-stream-data={none|inline|file}
+
+When used with --json, this option controls whether streams in
+json output should be omitted, written inline (base64-encoded)
+or written to a file. If "file" is chosen, the file will be the
+name of the output file appended with -nnn where nnn is the
+object number. The prefix can be overridden with
+--json-stream-prefix. The default is "none", except
+when --json-output is specified, in which case the default is
+"inline".
+
+== --json-stream-prefix (prefix for json stream data files) ==
+
+--json-stream-prefix=file-prefix
+
+When used with --json-stream-data=file, --json-stream-data=file-prefix
+sets the prefix for stream data files, overriding the default,
+which is to use the output file name. Whatever is given here
+will be appended with -nnn to create the name of the file that
+will contain the data for the stream stream in object nnn.
+
+== --keep-files-open (manage keeping multiple files open) ==
+
+--keep-files-open=[y|n]
+
+When qpdf needs to work with many files, as when merging large
+numbers of files, explicitly indicate whether files should be
+kept open. The default behavior is to determine this based on
+the number of files.
+
+== --keep-files-open-threshold (set threshold for --keep-files-open) ==
+
+--keep-files-open-threshold=count
+
+Set the threshold used by --keep-files-open, overriding the
+default value of 200.
+
+== --keep-inline-images (exclude inline images from optimization) ==
+
+Prevent inline images from being considered by --optimize-images.
+
+== --key (specify attachment key) ==
+
+--key=key
+
+Specify the key to use for the attachment in the embedded files
+table. It defaults to the last element (basename) of the
+attached file's filename.
+
+== --linearize (linearize (web-optimize) output) ==
+
+Create linearized (web-optimized) output files.
+
+== --linearize-pass1 (save pass 1 of linearization) ==
+
+--linearize-pass1=file
+
+Write the first pass of linearization to the named file. The
+resulting file is not a valid PDF file. This option is useful only
+for debugging qpdf.
+
+== --list-attachments (list embedded files) ==
+
+Show the key and stream number for each embedded file. Combine
+with --verbose for more detailed information.
+
+== --mimetype (attachment mime type, e.g. application/pdf) ==
+
+--mimetype=type/subtype
+
+Specify the mime type for the attachment, such as text/plain,
+application/pdf, image/png, etc.
+
+== --min-version (set minimum PDF version) ==
+
+--min-version=version
+
+Force the PDF version of the output to be at least the specified
+version. The version number format is
+"major.minor[.extension-level]", which sets the version header
+to "major.minor" and the extension level, if specified, to
+"extension-level".
+
+== --moddate (set attachment's modification date) ==
+
+--moddate=date
+
+Specify the attachment's modification date in PDF format;
+defaults to the current time. Run qpdf --help=pdf-dates for
+information about the date format.
+
+== --modify (restrict document modification) ==
+
+--modify=modify-opt
+
+For 40-bit files, modify-opt may only be y or n and controls all
+aspects of document modification.
+
+For 128-bit and 256-bit encryption, modify-opt values allow
+enabling and disabling levels of restriction in a manner similar
+to how some PDF creation tools do it. modify-opt values map to
+other combinations of options as follows:
+
+all: allow full modification (the default)
+annotate: --modify-other=n
+form: --modify-other=n --annotate=n
+assembly: --modify-other=n --annotate=n --form=n
+none: --modify-other=n --annotate=n --form=n --assemble=n
+
+== --modify-other (restrict other modifications) ==
+
+--modify-other=[y|n]
+
+Enable/disable modifications not controlled by --assemble,
+--annotate, or --form. --modify-other=n is implied by any of the
+other --modify options. This option is not available with 40-bit
+encryption.
+
+== --newline-before-endstream (force a newline before endstream) ==
+
+For an extra newline before endstream. Using this option enables
+qpdf to preserve PDF/A when rewriting such files.
+
+== --no-original-object-ids (omit original object IDs in qdf) ==
+
+Omit comments in a QDF file indicating the object ID an object
+had in the original file.
+
+== --no-warn (suppress printing of warning messages) ==
+
+Suppress printing of warning messages. If warnings were
+encountered, qpdf still exits with exit status 3.
+Use --warning-exit-0 with --no-warn to completely ignore
+warnings.
+
+== --normalize-content (fix newlines in content streams) ==
+
+--normalize-content=[y|n]
+
+Normalize newlines to UNIX-style newlines in PDF content
+streams, which is useful for viewing them in a programmer's text
+editor across multiple platforms. This is also turned on by
+--qdf.
+
+== --object-streams (control use of object streams) ==
+
+--object-streams=mode
+
+Control what qpdf does regarding object streams. Options:
+- preserve: preserve original object streams, if any (the default)
+- disable: create output files with no object streams
+- generate: create object streams, and compress objects when possible
+
+== --oi-min-area (minimum area for --optimize-images) ==
+
+--oi-min-area=area-in-pixels
+
+Don't optimize images whose area in pixels is below the specified value.
+
+== --oi-min-height (minimum height for --optimize-images) ==
+
+--oi-min-height=height
+
+Don't optimize images whose height is below the specified value.
+
+== --oi-min-width (minimum width for --optimize-images) ==
+
+--oi-min-width=width
+
+Don't optimize images whose width is below the specified value.
+
+== --optimize-images (use efficient compression for images) ==
+
+Attempt to use DCT (JPEG) compression for images that fall
+within certain constraints as long as doing so decreases the
+size in bytes of the image. See also help for the following
+options:
+  --oi-min-width
+  --oi-min-height
+  --oi-min-area
+  --keep-inline-images
+
+== --overlay (begin overlay options) ==
+
+--overlay file [options] --
+
+Overlay pages from another file on the output.
+Run qpdf --help=overlay-underlay for details.
+
+== --owner-password (specify owner password) ==
+
+--owner-password=owner-password
+
+Set the owner password of the encrypted file.
+
+== --pages (begin page selection) ==
+
+--pages [--file=]file [options] [...] --
+
+Run qpdf --help=page-selection for details.
+
+== --password (password for encrypted file) ==
+
+--password=password
+
+Specify a password for an encrypted, password-protected file.
+Not needed for encrypted files without a password.
+
+== --password-file (read password from a file) ==
+
+--password-file=filename
+
+The first line of the specified file is used as the password.
+This is used in place of the --password option.
+
+== --password-is-hex-key (provide hex-encoded encryption key) ==
+
+Provide the underlying file encryption key as a hex-encoded
+string rather than supplying a password. This is an expert
+option.
+
+== --password-mode (tweak how qpdf encodes passwords) ==
+
+--password-mode=mode
+
+Fine-tune how qpdf controls encoding of Unicode passwords. Valid
+options are auto, bytes, hex-bytes, and unicode.
+
+== --prefix (key prefix for copying attachments) ==
+
+--prefix=prefix
+
+Prepend a prefix to each key; may be needed if there are
+duplicate attachment keys. This affects the key only, not the
+file name.
+
+== --preserve-unreferenced (preserve unreferenced objects) ==
+
+Preserve all objects from the input even if not referenced.
+
+== --preserve-unreferenced-resources (use --remove-unreferenced-resources=no) ==
+
+Synonym for --remove-unreferenced-resources=no. Use that instead.
+
+== --print (restrict printing) ==
+
+--print=print-opt
+
+Control what kind of printing is allowed. For 40-bit encryption,
+print-opt may only be y or n and enables or disables all
+printing. For 128-bit and 256-bit encryption, print-opt may have
+the following values:
+
+none: disallow printing
+low: allow low-resolution printing only
+full: allow full printing (the default)
+
+== --progress (show progress when writing) ==
+
+Indicate progress when writing files.
+
+== --qdf (enable viewing PDF code in a text editor) ==
+
+Create a PDF file suitable for viewing in a text editor and even
+editing. This is for editing the PDF code, not the page contents.
+All streams that can be uncompressed are uncompressed, and
+content streams are normalized, among other changes. The
+companion tool "fix-qdf" can be used to repair hand-edited QDF
+files. QDF is a feature specific to the qpdf tool. Please see
+the "QDF Mode" chapter in the manual.
+
+== --range (page range) ==
+
+--range=numeric-range
+
+Specify the page range for the current page operation with
+--pages. If omitted, all pages are selected. This is used
+with --pages and appears between --pages and --. Run
+qpdf --help=page-selection for details.
+
+== --raw-stream-data (show raw stream data) ==
+
+When used with --show-object, if the object is a stream, write
+the raw (compressed) binary stream data to standard output
+instead of the object's contents. See also
+--filtered-stream-data.
+
+== --recompress-flate (uncompress and recompress flate) ==
+
+The default generalized compression scheme used by PDF is flate,
+which is the same as used by zip and gzip. Usually qpdf just
+leaves these alone. This option tells qpdf to uncompress and
+recompress streams compressed with flate. This can be useful
+when combined with --compression-level.
+
+== --remove-attachment (remove an embedded file) ==
+
+--remove-attachment=key
+
+Remove an embedded file using its key. Get the key with
+--list-attachments.
+
+== --remove-page-labels (remove explicit page numbers) ==
+
+Exclude page labels (explicit page numbers) from the output file.
+
+== --remove-restrictions (remove security restrictions from input file) ==
+
+Remove restrictions associated with digitally signed PDF files.
+This may be combined with --decrypt to allow free editing of
+previously signed/encrypted files. This option invalidates and
+disables any digital signatures but leaves their visual
+appearances intact.
+
+== --remove-unreferenced-resources (remove unreferenced page resources) ==
+
+--remove-unreferenced-resources=parameter
+
+Remove from a page's resource dictionary any resources that are
+not referenced in the page's contents. Parameters: "auto"
+(default), "yes", "no".
+
+== --repeat (overlay/underlay pages to repeat) ==
+
+--repeat=page-range
+
+Specify pages from the overlay/underlay that are repeated after
+"from" pages have been exhausted. See qpdf --help=page-ranges
+for help with the page range syntax.
+
+== --replace (replace attachment with same key) ==
+
+Indicate that any existing attachment with the same key should
+be replaced by the new attachment. Otherwise, qpdf gives an
+error if an attachment with that key is already present.
+
+== --replace-input (overwrite input with output) ==
+
+Use in place of outfile to overwrite the input file with the output.
+
+== --report-memory-usage (best effort report of memory usage) ==
+
+This is used by qpdf's performance test suite to report the
+maximum amount of memory used in supported environments.
+
+== --requires-password (silently test a file's password) ==
+
+Silently exit with a code indicating the file's password status:
+
+0: a password, other than as supplied, is required
+1: not used
+2: the file is not encrypted
+3: the file is encrypted, and correct password (if any) has been supplied
+
+== --rotate (rotate pages) ==
+
+--rotate=[+|-]angle[:page-range]
+
+Rotate specified pages by multiples of 90 degrees specifying
+either absolute or relative angles. "angle" may be 0, 90, 180,
+or 270. You almost always want to use +angle or -angle rather
+than just angle, as discussed in the manual. Run
+qpdf --help=page-ranges for help with page ranges.
+
+== --set-page-labels (number pages for the entire document) ==
+
+--set-page-labels label-spec ... --
+
+Set page labels (explicit page numbers) for the entire file.
+Each label-spec has the form
+
+first-page:[type][/start[/prefix]]
+
+where
+
+- "first-page" represents a sequential page number using the
+  same format as page ranges: a number, a number preceded by "r"
+  to indicate counting from the end, or "z" indicating the last
+  page
+- "type" is one of
+  - D: Arabic numerals (digits)
+  - A: Upper-case alphabetic characters
+  - a: Lower-case alphabetic characters
+  - R: Upper-case Roman numerals
+  - r: Lower-case Roman numerals
+  - omitted: the page number does not appear, though the prefix,
+    if specified will still appear
+- "start" must be a number >= 1
+- "prefix"` may be any string and is prepended to each page
+  label
+
+The first label spec must have a first-page value of 1,
+indicating the first page of the document. If multiple page
+label specs are specified, they must be given in increasing
+order.
+
+If multiple page label specs are specified, they must be given
+in increasing order.
+
+A given page label spec causes pages to be numbered according to
+that scheme starting with first-page and continuing until the
+next label spec or the end of the document. If you want to omit
+numbering starting at a certain page, you can use first-page: as
+the spec.
+
+Example: "1:r 5:D" would number the first four pages i through
+iv, then the remaining pages with Arabic numerals starting with
+1 and continuing sequentially until the end of the document. For
+additional examples, please consult the manual.
+
+== --show-attachment (export an embedded file) ==
+
+--show-attachment=key
+
+Write the contents of the specified attachment to standard
+output as binary data. Get the key with --list-attachments.
+
+== --show-crypto (show available crypto providers) ==
+
+Show a list of available crypto providers, one per line. The
+default provider is shown first.
+
+== --show-encryption (information about encrypted files) ==
+
+Show document encryption parameters. Also show the document's
+user password if the owner password is given and the file was
+encrypted using older encryption formats that allow user
+password recovery.
+
+== --show-encryption-key (show key with --show-encryption) ==
+
+When used with --show-encryption or --check, causes the
+underlying encryption key to be displayed.
+
+== --show-linearization (show linearization hint tables) ==
+
+Check and display all data in the linearization hint tables.
+
+== --show-npages (show number of pages) ==
+
+Print the number of pages in the input file on a line by itself.
+Useful for scripts.
+
+== --show-object (show contents of an object) ==
+
+--show-object={trailer|obj[,gen]}
+
+Show the contents of the given object. This is especially useful
+for inspecting objects that are inside of object streams (also
+known as "compressed objects").
+
+== --show-pages (display page dictionary information) ==
+
+Show the object and generation number for each page dictionary
+object and for each content stream associated with the page.
+
+== --show-xref (show cross reference data) ==
+
+Show the contents of the cross-reference table or stream (object
+locations in the file) in a human-readable form. This is
+especially useful for files with cross-reference streams, which
+are stored in a binary format.
+
+== --split-pages (write pages to separate files) ==
+
+--split-pages[=n]
+
+This option causes qpdf to create separate output files for each
+page or group of pages rather than a single output file.
+
+File names are generated from the specified output file as follows:
+
+- If the string %d appears in the output file name, it is replaced with a
+  zero-padded page range starting from 1
+- Otherwise, if the output file name ends in .pdf (case insensitive), a
+  zero-padded page range, preceded by a dash, is inserted before the file
+  extension
+- Otherwise, the file name is appended with a zero-padded page range
+  preceded by a dash.
+
+Page ranges are single page numbers for single-page groups or first-last
+for multi-page groups.
+
+== --static-aes-iv (use a fixed AES vector) ==
+
+Use a static initialization vector for AES-CBC. This is intended
+for testing only so that output files can be reproducible. Never
+use it for production files. This option is not secure since it
+significantly weakens the encryption.
+
+== --static-id (use a fixed document ID) ==
+
+Use a fixed value for the document ID. This is intended for
+testing only. Never use it for production files. See also
+qpdf --help=--deterministic-id.
+
+== --stream-data (control stream compression) ==
+
+--stream-data=parameter
+
+This option controls how streams are compressed in the output.
+It is less granular than the newer options, --compress-streams
+and --decode-level.
+
+Parameters:
+- compress: same as --compress-streams=y --decode-level=generalized
+- preserve: same as --compress-streams=n --decode-level=none
+- uncompress: same as --compress-streams=n --decode-level=generalized
+
+== --suppress-password-recovery (don't try different password encodings) ==
+
+Suppress qpdf's usual behavior of attempting different encodings
+of a password that contains non-ASCII Unicode characters if the
+first attempt doesn't succeed.
+
+== --suppress-recovery (suppress error recovery) ==
+
+Avoid attempting to recover when errors are found in a file's
+cross reference table or stream lengths.
+
+== --test-json-schema (test generated json against schema) ==
+
+This is used by qpdf's test suite to check consistency between
+the output of qpdf --json and the output of qpdf --json-help.
+
+== --to (destination pages for underlay/overlay) ==
+
+--to=page-range
+
+Specify the range of pages in the primary output to apply
+overlay/underlay to. See qpdf --help=page-ranges for help with
+the page range syntax.
+
+== --underlay (begin underlay options) ==
+
+--underlay file [options] --
+
+Underlay pages from another file on the output.
+Run qpdf --help=overlay-underlay for details.
+
+== --update-from-json (update a PDF from qpdf JSON) ==
+
+--update-from-json=qpdf-json-file
+
+Update a PDF file from a JSON file. Please see the "qpdf JSON"
+chapter of the manual for information about how to use this
+option.
+
+== --use-aes (use AES with 128-bit encryption) ==
+
+--use-aes=[y|n]
+
+Enables/disables use of the more secure AES encryption with
+128-bit encryption. Specifying --use-aes=y forces the PDF
+version to be at least 1.6. This option is only available with
+128-bit encryption. The default is "n" for compatibility
+reasons. Use 256-bit encryption instead.
+
+== --user-password (specify user password) ==
+
+--user-password=user-password
+
+Set the user password of the encrypted file.
+
+== --verbose (print additional information) ==
+
+Output additional information about various things qpdf is
+doing, including information about files created and operations
+performed.
+
+== --version (show qpdf version) ==
+
+Display the version of qpdf.
+
+== --warning-exit-0 (exit 0 even with warnings) ==
+
+Use exit status 0 instead of 3 when warnings are present. When
+combined with --no-warn, warnings are completely ignored.
+
+== --with-images (include image details with --show-pages) ==
+
+When used with --show-pages, also shows the object and
+generation numbers for the image objects on each page.
+
+====
+
+For detailed help, visit the qpdf manual: https://qpdf.readthedocs.io

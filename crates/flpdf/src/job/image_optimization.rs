@@ -62,7 +62,7 @@ impl Default for ImageOptimizationOptions {
 pub fn optimize_images<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     logger: &QPDFLogger,
-    message_prefix: &str,
+    message_prefix: &[u8],
     verbose: bool,
     options: ImageOptimizationOptions,
 ) -> Result<()> {
@@ -153,7 +153,7 @@ pub fn optimize_images<R: Read + Seek + 'static>(
 
 fn log_skip(
     logger: &QPDFLogger,
-    message_prefix: &str,
+    message_prefix: &[u8],
     verbose: bool,
     description: &str,
     reason: SkipReason,
@@ -169,13 +169,19 @@ fn log_skip(
 
 fn log_verbose(
     logger: &QPDFLogger,
-    message_prefix: &str,
+    message_prefix: &[u8],
     verbose: bool,
     description: &str,
     message: String,
 ) -> Result<()> {
     if verbose {
-        logger.info(format!("{message_prefix}: {description}: {message}\n"))?;
+        let mut line = message_prefix.to_vec();
+        line.extend_from_slice(b": ");
+        line.extend_from_slice(description.as_bytes());
+        line.extend_from_slice(b": ");
+        line.extend_from_slice(message.as_bytes());
+        line.push(b'\n');
+        logger.info(line)?;
     }
     Ok(())
 }

@@ -17,7 +17,9 @@ use super::page_split::SplitPageOptions;
 use super::resource_pruning::RemoveUnreferencedResources;
 use super::rotate::flatten_rotation_on_pages;
 use super::rotate_spec::{parse_rotation_parameter, RotationSpec};
-use crate::encryption::{EncryptMethod, EncryptParams, PasswordMode};
+use crate::encryption::{
+    EncryptMethod, EncryptParams, PasswordMode, PermissionsConfig, R2PermissionsConfig,
+};
 use crate::json_inspect::{DecodeLevel as JsonDecodeLevel, JsonKey};
 use crate::linearization::{show_linearization_pdf_with_warnings, ShowLinearizationError};
 use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
@@ -33,6 +35,9 @@ use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+
+#[path = "argv.rs"]
+mod argv;
 
 type ProgressHandler = Box<dyn FnMut(u8) -> Result<()> + 'static>;
 type SharedProgressHandler = Rc<RefCell<ProgressHandler>>;
@@ -170,11 +175,33 @@ impl Write for JobOutputWriter {
     }
 }
 
+/// Persistent qpdf `Config` encryption state.
+///
+/// qpdf's `encrypt()` and `decrypt()` callbacks change the active operation,
+/// but `decrypt()` does not reset the password, permission, AES, revision, or
+/// metadata fields that a later `encrypt()` callback reuses
+/// (`QPDFJob_config.cc:147-157,1088-1101`). Keep those fields independently
+/// from the writer's currently active parameters so argv occurrence order
+/// remains observable across `--decrypt` and repeated `--encrypt` groups.
+#[derive(Debug, Clone, Default)]
+struct EncryptionDefaults {
+    user_password: Vec<u8>,
+    owner_password: Vec<u8>,
+    use_aes: bool,
+    force_v4: bool,
+    force_r5: bool,
+    allow_insecure: bool,
+    cleartext_metadata: bool,
+    permissions: PermissionsConfig,
+    r2_permissions: R2PermissionsConfig,
+    accessibility_disabled: bool,
+}
+
 /// Portable writer/input state populated by the qpdf job argv/JSON boundary.
 ///
-/// This is deliberately smaller than the CLI's clap model. It owns the
-/// settings needed for job initialization; full command-line transform
-/// dispatch remains in the operation-specific job slices.
+/// This owns the settings needed for qpdf job initialization and the later
+/// create/write/inspection stages. Native flpdf subcommand parsing remains in
+/// the CLI, but qpdf's flat option grammar terminates here.
 #[derive(Debug, Clone, Default)]
 struct JobConfiguration {
     input_file: Option<PathBuf>,
@@ -242,6 +269,7 @@ struct JobConfiguration {
     linearize: bool,
     linearize_pass1: Option<PathBuf>,
     allow_weak_crypto: bool,
+    encryption_defaults: EncryptionDefaults,
     page_specs: Vec<JobPageConfig>,
     page_specs_origin: PageSpecsOrigin,
     collate: Option<Vec<usize>>,
@@ -773,7 +801,11 @@ fn job_json_print_permission(
     Ok(())
 }
 
-fn parse_job_encrypt(value: &crate::json::Json, allow_weak_crypto: bool) -> Result<EncryptParams> {
+fn parse_job_encrypt(
+    value: &crate::json::Json,
+    _allow_weak_crypto: bool,
+    inherited: &EncryptionDefaults,
+) -> Result<(EncryptParams, EncryptionDefaults)> {
     let members = job_json_members(value);
     let user_password = job_json_string(&members, b"userPassword")?;
     let owner_password = job_json_string(&members, b"ownerPassword")?;
@@ -801,28 +833,30 @@ fn parse_job_encrypt(value: &crate::json::Json, allow_weak_crypto: bool) -> Resu
         .get(key_length.as_bytes())
         .expect("key length was found in the encryption dictionary");
     let settings = job_json_members(settings);
-    let allow_insecure = job_json_bare(&settings, b"allowInsecure")?;
-    if key_length == "256bit"
-        && owner_password.is_empty()
-        && !user_password.is_empty()
-        && !allow_insecure
-    {
-        return Err(Error::Usage(UsageError::new(
-            "A PDF with a non-empty user password and an empty owner password encrypted with a 256-bit key is insecure as it can be opened without a password. If you really want to do this, you must also give the --allow-insecure option before the -- that follows --encrypt.",
-        )));
-    }
-    let mut permissions = crate::PermissionsConfig::default();
+    let allow_insecure = inherited.allow_insecure || job_json_bare(&settings, b"allowInsecure")?;
+    let mut permissions = inherited.permissions;
+    let mut r2_permissions = inherited.r2_permissions;
+    let mut accessibility_disabled = inherited.accessibility_disabled;
     if let Some(value) = job_json_yn(&settings, b"accessibility")? {
         permissions.accessibility = value;
+        accessibility_disabled = !value;
     }
     if let Some(value) = job_json_yn(&settings, b"annotate")? {
-        permissions.annotate = value;
+        if key_length == "40bit" {
+            r2_permissions.annotate = value;
+        } else {
+            permissions.annotate = value;
+        }
     }
     if let Some(value) = job_json_yn(&settings, b"assemble")? {
         permissions.assemble = value;
     }
     if let Some(value) = job_json_yn(&settings, b"extract")? {
-        permissions.extract = value;
+        if key_length == "40bit" {
+            r2_permissions.extract = value;
+        } else {
+            permissions.extract = value;
+        }
     }
     if let Some(value) = job_json_yn(&settings, b"form")? {
         permissions.fill_forms = value;
@@ -835,29 +869,57 @@ fn parse_job_encrypt(value: &crate::json::Json, allow_weak_crypto: bool) -> Resu
         // cov:ignore-start: llvm-cov attributes this successful choice continuation to the match body
     )? {
         // cov:ignore-end
-        job_json_modify_permission(&value, &mut permissions)?;
+        if key_length == "40bit" {
+            r2_permissions.modify = value == "y";
+        } else {
+            job_json_modify_permission(&value, &mut permissions)?;
+        }
     }
     if let Some(value) = job_json_yn(&settings, b"modifyOther")? {
         permissions.modify_contents = value;
     }
     if let Some(value) = job_json_choice(&settings, b"print", &["full", "low", "none"], true)? {
-        job_json_print_permission(&value, &mut permissions)?;
+        if key_length == "40bit" {
+            r2_permissions.print = value == "y";
+        } else {
+            job_json_print_permission(&value, &mut permissions)?;
+        }
     }
+
+    let defaults_user_password = user_password.clone();
+    let defaults_owner_password = owner_password.clone();
+    let use_aes = match key_length {
+        // Config::encrypt(256, ...) unconditionally sets use_aes before the
+        // JSON encryption handler applies its key-length-specific options
+        // (`QPDFJob_config.cc:1088-1096`).
+        "256bit" => true,
+        "128bit" => job_json_choice(&settings, b"useAes", &["y", "n"], true)?
+            .map_or(inherited.use_aes, |value| value == "y"),
+        // Config::encrypt(40, ...) leaves use_aes untouched, so a later
+        // 128-bit group can still reuse AES selected by an earlier group.
+        "40bit" => inherited.use_aes,
+        _ => unreachable!("key length was validated above"), // cov:ignore: key length comes only from the validated qpdf job schema choices
+    };
+    let force_v4 =
+        inherited.force_v4 || (key_length == "128bit" && job_json_bare(&settings, b"forceV4")?);
+    let force_r5 =
+        inherited.force_r5 || (key_length == "256bit" && job_json_bare(&settings, b"forceR5")?);
+    let cleartext_metadata =
+        inherited.cleartext_metadata || job_json_bare(&settings, b"cleartextMetadata")?;
 
     let mut params = match key_length {
         "40bit" => EncryptParams::rc4(EncryptMethod::V1Rc440, user_password, owner_password),
         "128bit" => {
-            let use_aes = job_json_choice(&settings, b"useAes", &["y", "n"], true)?;
-            if use_aes.as_deref() == Some("y") {
+            if use_aes {
                 EncryptParams::v4_aes128(user_password, owner_password)
-            } else if job_json_bare(&settings, b"forceV4")? {
+            } else if force_v4 || cleartext_metadata {
                 EncryptParams::rc4(EncryptMethod::V4Rc4128, user_password, owner_password)
             } else {
                 EncryptParams::rc4(EncryptMethod::V2Rc4128, user_password, owner_password)
             }
         }
         "256bit" => {
-            if job_json_bare(&settings, b"forceR5")? {
+            if force_r5 {
                 EncryptParams::v5_r5(user_password, owner_password)
             } else {
                 EncryptParams::v5_r6(user_password, owner_password)
@@ -866,6 +928,7 @@ fn parse_job_encrypt(value: &crate::json::Json, allow_weak_crypto: bool) -> Resu
         _ => unreachable!("key length was validated above"), // cov:ignore: key length comes only from the validated qpdf job schema choices
     };
     params.permissions = permissions;
+    params.r2_permissions = r2_permissions;
     if matches!(
         params.method,
         EncryptMethod::V4Aes128
@@ -875,15 +938,23 @@ fn parse_job_encrypt(value: &crate::json::Json, allow_weak_crypto: bool) -> Resu
     ) {
         params.permissions.accessibility = true;
     }
-    if job_json_bare(&settings, b"cleartextMetadata")? {
-        params.encrypt_metadata = false;
-    }
-    if (params.is_weak_rc4() || params.is_deprecated_r5()) && !allow_weak_crypto {
-        return Err(Error::Usage(UsageError::new(
-            "refusing to write a file with weak or deprecated encryption without allowWeakCrypto",
-        )));
-    }
-    Ok(params)
+    params.encrypt_metadata = !cleartext_metadata;
+    // qpdf defers weak-RC4 refusal until `setEncryptionOptions` at writer
+    // setup (`QPDFJob.cc:2738-2762`), so a later JSON/argv occurrence can
+    // still set allowWeakCrypto or decrypt before the final write.
+    let defaults = EncryptionDefaults {
+        user_password: defaults_user_password,
+        owner_password: defaults_owner_password,
+        use_aes,
+        force_v4,
+        force_r5,
+        allow_insecure,
+        cleartext_metadata,
+        permissions,
+        r2_permissions,
+        accessibility_disabled,
+    };
+    Ok((params, defaults))
 }
 
 fn parse_json_decode_level(value: &str) -> crate::writer::DecodeLevel {
@@ -1300,94 +1371,6 @@ fn parse_job_page_labels(
     Ok(entries)
 }
 
-/// Expand qpdf's one-level `@file` argument syntax before any option in
-/// `argv` is inspected (`QPDFArgParser::handleArgFileArguments`,
-/// `QPDFArgParser.cc:232-260,437`). Each physical line in the file becomes
-/// one argument; a file that cannot be opened is left as an ordinary
-/// `@path` token for the regular parser, and lines read from a file are not
-/// rescanned for another `@file` reference. `argv[0]` (the program name) is
-/// never subject to expansion, matching qpdf's `for (i = 1; i < argc; ++i)`
-/// loop bound.
-///
-/// This function's `&[String]` signature only supports UTF-8 argument-file
-/// content, unlike `flpdf-cli`'s byte-preserving `@file` expansion over raw
-/// OS argv (`crates/flpdf-cli/src/arg_parser.rs::expand_arg_files`).
-fn expand_arg_files(argv: &[String]) -> Result<Vec<String>> {
-    let mut expanded = Vec::with_capacity(argv.len());
-    let mut iter = argv.iter();
-    if let Some(program) = iter.next() {
-        expanded.push(program.clone());
-    }
-    for argument in iter {
-        let Some(path) = argument.strip_prefix('@').filter(|path| !path.is_empty()) else {
-            expanded.push(argument.clone());
-            continue;
-        };
-        match read_argument_file_lines(path)? {
-            Some(lines) => expanded.extend(lines),
-            None => expanded.push(argument.clone()),
-        }
-    }
-    Ok(expanded)
-}
-
-/// Read one `@file` argument file, returning `None` when it cannot be
-/// opened so the caller preserves the original `@path` token as an ordinary
-/// argument (`QPDFArgParser.cc:238-243`). `-` reads from standard input
-/// instead, without qpdf's openability probe (`QPDFArgParser.cc:239`, which
-/// only guards a non-`-` `argfile`).
-fn read_argument_file_lines(path: &str) -> Result<Option<Vec<String>>> {
-    let bytes = if path == "-" {
-        // cov:ignore-start: reads this process's real stdin (QPDFArgParser.cc:239
-        // exempts "-" from the openability probe), which an in-process
-        // `cargo test` binary cannot redirect per test without process-level
-        // tricks. `crates/flpdf-cli` exercises the equivalent `-` stdin path
-        // for its own argv/password readers via real subprocess stdin piping
-        // (`crates/flpdf-cli/tests/cli_zlib_flate.rs`), but `initialize_from_argv`
-        // itself has no CLI caller yet to spawn as a subprocess against.
-        let mut bytes = Vec::new();
-        std::io::stdin()
-            .read_to_end(&mut bytes)
-            .map_err(|error| Error::file_io("read argument file", "-", error))?;
-        bytes
-        // cov:ignore-end
-    } else {
-        let mut file = match File::open(path) {
-            Ok(file) => file,
-            Err(_) => return Ok(None),
-        };
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(|error| Error::file_io("read argument file", path, error))?;
-        bytes
-    };
-    Ok(Some(split_argument_file_lines(&bytes)))
-}
-
-/// Split argument-file bytes into physical lines, matching qpdf's
-/// `QUtil::read_lines_from_file(..., preserve_eol=false)`: a trailing `\r`
-/// immediately before `\n` is stripped, and a final line with no trailing
-/// newline is still kept.
-fn split_argument_file_lines(bytes: &[u8]) -> Vec<String> {
-    let text = String::from_utf8_lossy(bytes);
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    for ch in text.chars() {
-        if ch == '\n' {
-            if line.ends_with('\r') {
-                line.pop();
-            }
-            lines.push(std::mem::take(&mut line));
-        } else {
-            line.push(ch);
-        }
-    }
-    if !line.is_empty() {
-        lines.push(line);
-    }
-    lines
-}
-
 /// qpdf-compatible status returned by a completed job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -1432,6 +1415,7 @@ pub struct QPDFJob {
     input_name: String,
     input_name_bytes: Vec<u8>,
     message_prefix: String,
+    message_prefix_bytes: Vec<u8>,
     warnings: bool,
     suppress_warnings: bool,
     warnings_exit_zero: bool,
@@ -1472,6 +1456,10 @@ pub struct QPDFJob {
     /// partial JSON sequence starts fresh, while CLI settings before the first
     /// sequence remain visible to qpdf's shared Config.
     has_run: bool,
+    /// qpdf's help/version callbacks terminate the argv entry point before a
+    /// document lifecycle starts. Keep that result on the job so a caller that
+    /// uniformly invokes `run` observes the same successful early exit.
+    argv_early_exit: bool,
 }
 
 /// Fluent configuration proxy for the qpdf `QPDFJob::Config` surface.
@@ -1558,6 +1546,7 @@ impl QPDFJob {
             input_name: String::new(),
             input_name_bytes: Vec::new(),
             message_prefix: "qpdf".to_owned(),
+            message_prefix_bytes: b"qpdf".to_vec(),
             warnings: false,
             suppress_warnings: false,
             warnings_exit_zero: false,
@@ -1571,6 +1560,7 @@ impl QPDFJob {
             empty_primary_created: false,
             partial_json_initialized: false,
             has_run: false,
+            argv_early_exit: false,
         }
     }
 
@@ -1605,7 +1595,20 @@ impl QPDFJob {
     ///
     /// Mirrors `QPDFJob::setMessagePrefix` (`QPDFJob.cc:303-307`).
     pub fn set_message_prefix(&mut self, message_prefix: impl Into<String>) {
-        self.message_prefix = message_prefix.into();
+        let message_prefix = message_prefix.into();
+        self.message_prefix_bytes = message_prefix.as_bytes().to_vec();
+        self.message_prefix = message_prefix;
+    }
+
+    /// Set the qpdf diagnostic prefix from its original raw argv bytes.
+    ///
+    /// qpdf stores the first argv element in a std::string and emits those bytes without
+    /// UTF-8 replacement (QUtil.cc:788-803, QPDFJob_argv.cc:427-428).
+    /// Keep the lossy string projection for the existing text getter while
+    /// preserving the source bytes for logger and pipeline output.
+    pub(crate) fn set_message_prefix_bytes(&mut self, message_prefix: Vec<u8>) {
+        self.message_prefix = String::from_utf8_lossy(&message_prefix).into_owned();
+        self.message_prefix_bytes = message_prefix;
     }
 
     /// Set the qpdf input name used by inspection diagnostics.
@@ -1738,29 +1741,48 @@ impl QPDFJob {
         for notice in auto_password_notices {
             match notice {
                 crate::encryption::PasswordWriteNotice::Info if self.configuration.verbose => {
-                    self.logger.info(format!(
-                        "{}: automatically converting Unicode password to single-byte encoding as required for 40-bit or 128-bit encryption\n",
-                        self.message_prefix
+                    self.logger.info(self.prefixed_message(
+                        b"automatically converting Unicode password to single-byte encoding as required for 40-bit or 128-bit encryption\n",
                     ))?;
                 }
                 crate::encryption::PasswordWriteNotice::Warning => {
-                    self.logger.error(format!(
-                        "{}: WARNING: supplied password looks like a Unicode password with characters not allowed in passwords for 40-bit and 128-bit encryption; most readers will not be able to open this file with the supplied password. (Use --password-mode=bytes to suppress this warning and use the password anyway.)\n",
-                        self.message_prefix
+                    self.logger.error(self.prefixed_message(
+                        b"WARNING: supplied password looks like a Unicode password with characters not allowed in passwords for 40-bit and 128-bit encryption; most readers will not be able to open this file with the supplied password. (Use --password-mode=bytes to suppress this warning and use the password anyway.)\n",
                     ))?;
                 }
                 crate::encryption::PasswordWriteNotice::None
                 | crate::encryption::PasswordWriteNotice::Info => {}
             }
         }
+        if self
+            .configuration
+            .encryption_defaults
+            .accessibility_disabled
+            && writer_configuration
+                .encryption_parameters()
+                .is_some_and(|params| {
+                    // cov:ignore-start: modern accessibility warning regression executes this predicate; LLVM maps the covered match continuation elsewhere
+                    matches!(
+                        params.method,
+                        EncryptMethod::V4Aes128
+                            | EncryptMethod::V4Rc4128
+                            | EncryptMethod::V5R5Aes256
+                            | EncryptMethod::V5R6Aes256
+                    )
+                    // cov:ignore-end
+                })
+        {
+            self.logger.error(self.prefixed_message(
+                b"-accessibility=n is ignored for modern encryption formats\n",
+            ))?; // cov:ignore: accessibility warning regression executes the logger write; LLVM maps the covered continuation to the format call
+        }
         if !self.configuration.allow_weak_crypto
             && writer_configuration
                 .encryption_parameters()
                 .is_some_and(EncryptParams::is_weak_rc4)
         {
-            let message = format!(
-                "{}: refusing to write a file with RC4, a weak cryptographic algorithm\nPlease use 256-bit keys for better security.\nPass --allow-weak-crypto to enable writing insecure files.\nSee also https://qpdf.readthedocs.io/en/stable/weak-crypto.html\n",
-                self.message_prefix
+            let message = self.prefixed_message(
+                b"refusing to write a file with RC4, a weak cryptographic algorithm\nPlease use 256-bit keys for better security.\nPass --allow-weak-crypto to enable writing insecure files.\nSee also https://qpdf.readthedocs.io/en/stable/weak-crypto.html\n",
             );
             self.logger.error(message)?;
             return Err(Error::System(
@@ -1875,7 +1897,7 @@ impl QPDFJob {
         if !self.configuration.verbose || self.configuration.keep_files_open.is_some() {
             return Ok(());
         }
-        let mut message = self.message_prefix.as_bytes().to_vec();
+        let mut message = self.message_prefix_bytes().to_vec();
         message.extend_from_slice(b": selecting --keep-open-files=");
         message.extend_from_slice(if self.keep_files_open_for_page_specs(specs) {
             b"y\n"
@@ -1896,7 +1918,7 @@ impl QPDFJob {
         if !self.configuration.verbose {
             return Ok(());
         }
-        let mut message = self.message_prefix.as_bytes().to_vec();
+        let mut message = self.message_prefix_bytes.clone();
         message.extend_from_slice(b": processing ");
         message.extend_from_slice(source_name.as_ref());
         message.push(b'\n');
@@ -1939,6 +1961,21 @@ impl QPDFJob {
         &self.message_prefix
     }
 
+    /// Return the raw qpdf diagnostic prefix bytes.
+    #[must_use]
+    pub(crate) fn message_prefix_bytes(&self) -> &[u8] {
+        &self.message_prefix_bytes
+    }
+
+    /// Prefix a qpdf diagnostic body without converting the prefix through
+    /// UTF-8.
+    pub(crate) fn prefixed_message(&self, body: &[u8]) -> Vec<u8> {
+        let mut message = self.message_prefix_bytes.clone();
+        message.extend_from_slice(b": ");
+        message.extend_from_slice(body);
+        message
+    }
+
     /// Register qpdf's progress callback for writers configured by this job.
     ///
     /// The callback is shared rather than moved into one writer so the same
@@ -1966,7 +2003,7 @@ impl QPDFJob {
             Some(reporter) => Rc::clone(reporter),
             None if self.configuration.progress => {
                 let logger = self.logger.clone();
-                let prefix = self.message_prefix.clone();
+                let prefix = self.message_prefix_bytes.clone();
                 // `writeOutfile` swaps `m->outfilename` to the `.~qpdf-temp#`
                 // replacement target before `setWriterOptions` builds this
                 // reporter (`libqpdf/QPDFJob.cc:3033-3037` then `:2926-2935`),
@@ -1980,9 +2017,13 @@ impl QPDFJob {
                         |path| path.display().to_string(),
                     );
                 let callback: ProgressHandler = Box::new(move |percent| {
-                    logger.info(format!(
-                        "{prefix}: {output_name}: write progress: {percent}%\n"
-                    ))
+                    let mut message = prefix.clone();
+                    message.extend_from_slice(b": ");
+                    message.extend_from_slice(output_name.as_bytes());
+                    message.extend_from_slice(b": write progress: ");
+                    message.extend_from_slice(percent.to_string().as_bytes());
+                    message.extend_from_slice(b"%\n");
+                    logger.info(message)
                 });
                 Rc::new(RefCell::new(callback))
             }
@@ -1992,14 +2033,15 @@ impl QPDFJob {
             .register_progress_reporter(Box::new(move |percent| (reporter.borrow_mut())(percent)));
     }
 
-    /// Initialize the qpdf-compatible argument set supported by this job.
+    /// Initialize the complete qpdf 11.9.0 argument set supported by this job.
     ///
-    /// This mirrors `QPDFJob::initializeFromArgv` for one input, one output,
-    /// replace-input, deterministic/static IDs, object-stream mode, password,
-    /// decrypt, check, progress reporting, and the `--keep-files-open`
-    /// options. Other command-line options are handled by the CLI.
+    /// This is the library-owned counterpart of
+    /// `QPDFJob::initializeFromArgv`: all generated main-table options and the
+    /// pages, encryption, underlay/overlay, attachment, copy-attachment, and
+    /// page-label option tables mutate this job's one `JobConfiguration`.
+    /// Native flpdf subcommands remain a separate CLI surface.
     ///
-    /// The argv grammar foundation matches `QPDFArgParser::parseArgs`
+    /// The argv grammar matches `QPDFArgParser::parseArgs`
     /// (`QPDFArgParser.cc:429-560`): a one-level `@file` expansion runs
     /// before any option is inspected, and a top-level `--` resets to the
     /// main option table rather than ending option parsing (an option
@@ -2012,132 +2054,29 @@ impl QPDFJob {
     /// same [`Error::Usage`] arms this function already raises for its other
     /// qpdf-compatible options.
     pub fn initialize_from_argv(&mut self, argv: &[String]) -> Result<()> {
-        let argv = expand_arg_files(argv)?;
-        let mut configuration = JobConfiguration::default();
-        let mut positionals = Vec::new();
-        let mut page_label_specs: Option<Vec<String>> = None;
+        let raw = argv
+            .iter()
+            .map(|argument| argument.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        self.initialize_from_raw_argv(&raw)
+    }
 
-        for argument in argv.iter().skip(1) {
-            if let Some(specs) = page_label_specs.as_mut() {
-                if argument == "--" {
-                    let parsed = std::mem::take(specs)
-                        .into_iter()
-                        .map(|spec| parse_page_label_spec(spec.as_bytes()))
-                        .collect::<Result<Vec<_>>>()?;
-                    configuration.set_page_labels = Some(parsed);
-                    page_label_specs = None;
-                    continue;
-                }
-                if argument.len() > 1 && argument.starts_with('-') {
-                    return Err(UsageError::new(format!(
-                        "unrecognized argument {argument} (set page labels options must be terminated with --)"
-                    ))
-                    .into());
-                }
-                specs.push(argument.clone());
-                continue;
-            }
-            if argument == "--" {
-                // qpdf's `--` is a main-option-table reset, not an
-                // end-of-options terminator (`QPDFArgParser.cc:447-451,543`):
-                // the token itself is dropped and parsing resumes in the
-                // same (already main) table, so a following `--`-prefixed
-                // token is still recognized as an option.
-                continue;
-            }
-            if argument.starts_with("--") {
-                match argument.as_str() {
-                    "--remove-page-labels" => configuration.remove_page_labels = true,
-                    "--set-page-labels" => page_label_specs = Some(Vec::new()),
-                    "--deterministic-id" => configuration.writer.set_deterministic_id(true),
-                    "--static-id" => configuration.writer.set_static_id(true),
-                    "--replace-input" => {
-                        // `ArgParser::argReplaceInput` reaches
-                        // `Config::replaceInput` for every occurrence of the
-                        // flag (`libqpdf/QPDFJob_argv.cc:91-96`), and that
-                        // setter rejects a second output selection —
-                        // `replace_input` being already set counts
-                        // (`libqpdf/QPDFJob_config.cc:53-61`).
-                        if configuration.replace_input {
-                            return Err(UsageError::new(
-                                "replace-input can't be used since output file has already been given",
-                            )
-                            .into());
-                        }
-                        configuration.replace_input = true;
-                    }
-                    "--decrypt" => {
-                        configuration.writer.set_preserve_encryption(false);
-                    }
-                    "--progress" => configuration.progress = true,
-                    "--check" => configuration.check = true,
-                    _ if argument.starts_with("--keep-files-open=") => {
-                        let value = &argument["--keep-files-open=".len()..];
-                        configuration.keep_files_open = match value {
-                            "y" => Some(true),
-                            "n" => Some(false),
-                            _ => {
-                                return Err(UsageError::new(format!(
-                                    "invalid value for --keep-files-open: {value}"
-                                ))
-                                .into())
-                            }
-                        };
-                    }
-                    _ if argument.starts_with("--keep-files-open-threshold=") => {
-                        let value = &argument["--keep-files-open-threshold=".len()..];
-                        configuration.keep_files_open_threshold =
-                            Some(parse_qpdf_collate_uint(value.as_bytes())?);
-                    }
-                    _ if argument.starts_with("--password=") => {
-                        configuration.password = argument.as_bytes()[11..].to_vec();
-                    }
-                    _ if argument.starts_with("--object-streams=") => {
-                        configuration
-                            .writer
-                            .set_object_stream_mode(parse_object_stream_mode(&argument[17..])?);
-                    }
-                    _ => {
-                        return Err(
-                            UsageError::new(format!("unrecognized argument {argument}")).into()
-                        );
-                    }
-                }
-            } else if argument.starts_with('-') {
-                return Err(UsageError::new(format!("unrecognized argument {argument}")).into());
-            } else {
-                positionals.push(argument.clone());
-            }
-        }
-
-        if page_label_specs.is_some() {
-            return Err(UsageError::new("missing -- at end of set page labels options").into());
-        }
-
-        if positionals.len() > 2 {
-            return Err(UsageError::new(format!("unknown argument {}", positionals[2])).into());
-        }
-        configuration.input_file = positionals.first().map(PathBuf::from);
-        configuration.output_file = positionals.get(1).map(PathBuf::from);
-        if configuration.replace_input && configuration.output_file.is_some() {
-            return Err(UsageError::new(
-                "replace-input can't be used since output file has already been given",
-            )
-            .into());
-        }
-        if configuration.input_file.is_none() && !configuration.check {
-            return Err(UsageError::new("an input file name is required").into());
-        }
-
-        self.configuration = configuration;
-        let input_name = self
-            .configuration
-            .input_file
-            .as_ref()
-            .map_or_else(String::new, |path| path.display().to_string());
-        self.set_input_name(input_name);
-        self.warnings = false;
-        Ok(())
+    /// Initialize the job from qpdf's raw argv byte boundary.
+    ///
+    /// qpdf's `QPDFArgParser` receives `char const*` values and passes the
+    /// original bytes directly to `QPDFJob::Config` callbacks. Keeping this
+    /// entry point generic over `AsRef<[u8]>` lets Unix callers supply literal
+    /// non-UTF-8 paths and passwords while the existing [`Self::initialize_from_argv`]
+    /// remains a checked UTF-8 convenience wrapper.
+    ///
+    /// The parser owns the complete qpdf 11.9.0 option-table grammar. Native
+    /// flpdf subcommands are intentionally outside this library boundary.
+    pub fn initialize_from_raw_argv<A: AsRef<[u8]>>(&mut self, argv: &[A]) -> Result<()> {
+        let raw = argv
+            .iter()
+            .map(|argument| argument.as_ref().to_vec())
+            .collect::<Vec<_>>();
+        argv::initialize(self, raw)
     }
 
     /// Initialize the qpdf-compatible job-JSON fields supported by this
@@ -2208,7 +2147,7 @@ impl QPDFJob {
             suppress_password_recovery: self.configuration.suppress_password_recovery,
             password_is_hex_key: self.configuration.password_is_hex_key,
             verbose: self.configuration.verbose,
-            message_prefix: self.message_prefix.as_bytes().to_vec(),
+            message_prefix: self.message_prefix_bytes.clone(),
             ..PdfOpenOptions::default()
         }
     }
@@ -2328,11 +2267,15 @@ impl QPDFJob {
                 })();
                 active.remove(&identity);
                 nested_result.map_err(|error| {
-                    Error::System(format!(
-                        "error with job-json file {}: {error}\nRun {} --job-json-help for information on the file format.",
-                        path.display(),
-                        self.message_prefix
-                    ))
+                    let mut message = b"error with job-json file ".to_vec();
+                    message.extend_from_slice(&path_description_bytes(&path));
+                    message.extend_from_slice(b": ");
+                    message.extend_from_slice(error.to_string().as_bytes());
+                    message.extend_from_slice(b"\nRun ");
+                    message.extend_from_slice(self.message_prefix_bytes());
+                    message
+                        .extend_from_slice(b" --job-json-help for information on the file format.");
+                    Error::SystemBytes(message)
                 })?;
             } else {
                 let mut members = std::collections::BTreeMap::new();
@@ -2777,12 +2720,13 @@ impl QPDFJob {
             // handler visits `copyEncryption` before `encrypt`, so preserve
             // that precedence in the configuration snapshot.
             configuration.copy_encryption_applies_to_writer = false;
-            configuration
-                .writer
-                .set_encryption_parameters(parse_job_encrypt(
-                    value,
-                    configuration.allow_weak_crypto,
-                )?); // cov:ignore: llvm-cov attributes this successful encryption parse continuation to its opening expressions
+            let (params, encryption_defaults) = parse_job_encrypt(
+                value,
+                configuration.allow_weak_crypto,
+                &configuration.encryption_defaults,
+            )?; // cov:ignore: llvm-cov attributes this successful encryption parse continuation to its opening expressions
+            configuration.encryption_defaults = encryption_defaults;
+            configuration.writer.set_encryption_parameters(params);
         }
 
         if let Some(value) = members.get(b"pages".as_slice()) {
@@ -2924,7 +2868,7 @@ impl QPDFJob {
         options.logger = Some(self.logger.clone());
         options.description = input_name;
         options.verbose |= self.configuration.verbose;
-        options.message_prefix = self.message_prefix.as_bytes().to_vec();
+        options.message_prefix = self.message_prefix_bytes.clone();
         // qpdf's noWarn (`Config::noWarn`, `QPDFJob_config.cc:407-410`)
         // applies `pdf.setSuppressWarnings(true)` to every QPDF this job
         // opens (`QPDFJob.cc:663-665`), not just the final completion
@@ -3501,7 +3445,7 @@ impl QPDFJob {
                     self.record_warnings();
                 }
                 if self.configuration.verbose && output != Path::new("-") && !splitting {
-                    let mut message = self.message_prefix.as_bytes().to_vec();
+                    let mut message = self.message_prefix_bytes.clone();
                     message.extend_from_slice(b": wrote file ");
                     message.extend_from_slice(&path_description_bytes(&output));
                     message.push(b'\n');
@@ -3626,8 +3570,19 @@ impl QPDFJob {
         Ok(())
     }
 
+    /// Clear the completed-run flag when a new initialization restarts the
+    /// job's lifecycle. qpdf has no such flag: `initializeFromArgv` simply
+    /// rebuilds the configuration, so this reset keeps the Rust side's
+    /// post-run JSON-layering branch from seeing a stale value.
+    pub(super) fn reset_has_run_for_initialization(&mut self) {
+        self.has_run = false;
+    }
+
     /// Run the configured create/write or check lifecycle.
     pub fn run(&mut self) -> Result<JobExitCode> {
+        if self.argv_early_exit {
+            return Ok(JobExitCode::Success);
+        }
         self.partial_json_initialized = false;
         self.has_run = true;
         if self.configuration.is_encrypted || self.configuration.requires_password {
@@ -3839,7 +3794,7 @@ impl QPDFJob {
             optimize_images(
                 pdf,
                 &self.logger,
-                &self.message_prefix,
+                self.message_prefix_bytes(),
                 configuration.verbose,
                 image_options,
             )?; // cov:ignore: llvm-cov attributes this successful multiline image phase call to its opening expressions
@@ -3905,7 +3860,7 @@ impl QPDFJob {
                 // as bytes keeps a key like `key-\xff` intact; going through
                 // `String::from_utf8_lossy` would print U+FFFD where qpdf
                 // prints the original byte.
-                let mut message = self.message_prefix.clone().into_bytes();
+                let mut message = self.message_prefix_bytes.clone();
                 message.extend_from_slice(b": removed attachment ");
                 message.extend_from_slice(key);
                 message.push(b'\n');
@@ -3958,7 +3913,7 @@ impl QPDFJob {
             .chain(configuration.overlays.iter())
             .map(|overlay| overlay.path.as_path())
             .collect();
-        let mut message = self.message_prefix.as_bytes().to_vec();
+        let mut message = self.message_prefix_bytes.clone();
         message.extend_from_slice(b": processing underlay/overlay\n");
         for page in report {
             message.extend_from_slice(b"  page ");
@@ -4315,19 +4270,20 @@ impl QPDFJob {
             // cov:ignore-end
         }
         if self.warnings {
-            self.logger.error(format!(
-                "{}: there are warnings; original file kept in {}\n",
-                self.message_prefix,
-                backup.display()
-            ))?; // cov:ignore: llvm-cov attributes this successful warning logger write to its opening expressions
+            let mut message = self.message_prefix_bytes.clone();
+            message.extend_from_slice(b": there are warnings; original file kept in ");
+            message.extend_from_slice(&path_description_bytes(&backup));
+            message.push(b'\n');
+            self.logger.error(message)?; // cov:ignore: llvm-cov attributes this successful warning logger write to its opening expressions
         } else if let Err(error) = std::fs::remove_file(&backup) {
             // cov:ignore-start: backup deletion failure depends on external filesystem permissions or races
-            self.logger.error(format!(
-                "{}: unable to delete original file ({}); original file left in {}, but the input was successfully replaced\n",
-                self.message_prefix,
-                error,
-                backup.display()
-            ))?;
+            let mut message = self.message_prefix_bytes.clone();
+            message.extend_from_slice(b": unable to delete original file (");
+            message.extend_from_slice(error.to_string().as_bytes());
+            message.extend_from_slice(b"); original file left in ");
+            message.extend_from_slice(&path_description_bytes(&backup));
+            message.extend_from_slice(b", but the input was successfully replaced\n");
+            self.logger.error(message)?;
             // cov:ignore-end
         }
         Ok(())
@@ -4421,6 +4377,21 @@ impl QPDFJob {
             )
             .into());
         }
+        if !self.configuration.encryption_defaults.allow_insecure {
+            if let Some(params) = self.configuration.writer.encryption_parameters() {
+                if matches!(
+                    params.method,
+                    EncryptMethod::V5R5Aes256 | EncryptMethod::V5R6Aes256
+                ) && params.owner_password.is_empty()
+                    && !params.user_password.is_empty()
+                {
+                    return Err(UsageError::new(
+                        "A PDF with a non-empty user password and an empty owner password encrypted with a 256-bit key is insecure as it can be opened without a password. If you really want to do this, you must also give the --allow-insecure option before the -- that follows --encrypt.",
+                    )
+                    .into());
+                }
+            }
+        }
         if self.configuration.output_file.as_deref() == Some(Path::new("-")) || implicit_json_stdout
         {
             if self.configuration.split_pages.is_some_and(|size| size != 0) {
@@ -4491,7 +4462,7 @@ impl QPDFJob {
         // separate preserves custom-pipeline boundaries as well as bytes.
         let pipeline = self.logger.get_error()?;
         pipeline
-            .write(self.message_prefix.as_bytes())
+            .write(&self.message_prefix_bytes)
             .map_err(Error::from)?;
         pipeline.write(b": ").map_err(Error::from)?;
         pipeline
@@ -4648,7 +4619,7 @@ impl QPDFJob {
         options.logger = Some(self.logger.clone());
         options.description = input_name;
         options.verbose |= self.configuration.verbose;
-        options.message_prefix = self.message_prefix.as_bytes().to_vec();
+        options.message_prefix = self.message_prefix_bytes.clone();
         // qpdf's `setQPDFOptions` applies `noWarn` to every ordinary QPDF
         // immediately after construction and before `processFile`
         // (`QPDFJob.cc:650-666,1695-1711`). Preserve an explicit caller
@@ -4701,7 +4672,7 @@ impl QPDFJob {
         // apply to this open exactly like the ordinary path
         // (`QPDFJob.cc:1717-1791`).
         options.verbose |= self.configuration.verbose;
-        options.message_prefix = self.message_prefix.as_bytes().to_vec();
+        options.message_prefix = self.message_prefix_bytes.clone();
         // The encryption-inspection creation path is still a qpdf input
         // QPDF, so `noWarn` must be applied before authentication/parsing just
         // like the ordinary `doProcessOnce` path.
@@ -4837,7 +4808,7 @@ impl QPDFJob {
         // gets the report here too; the argument only adds the CLI's own flag.
         if verbose || self.configuration.verbose {
             if let Some(filename) = output_filename {
-                let mut message = self.message_prefix.as_bytes().to_vec();
+                let mut message = self.message_prefix_bytes.clone();
                 message.extend_from_slice(b": wrote file ");
                 message.extend_from_slice(&path_description_bytes(&filename));
                 message.push(b'\n');
@@ -4976,10 +4947,11 @@ impl QPDFJob {
             } else {
                 ""
             };
-            self.logger.warn(format!(
-                "{}: operation succeeded with warnings{suffix}\n",
-                self.message_prefix
-            ))?;
+            let mut message = self.message_prefix_bytes.clone();
+            message.extend_from_slice(b": operation succeeded with warnings");
+            message.extend_from_slice(suffix.as_bytes());
+            message.push(b'\n');
+            self.logger.warn(message)?;
         }
 
         Ok(())
@@ -6534,49 +6506,64 @@ mod tests {
             job_json_print_permission("invalid", &mut crate::PermissionsConfig::default()).is_err()
         );
 
+        let inherited = EncryptionDefaults::default();
         let encrypt_40 = crate::json::Json::parse(
             br#"{"userPassword":"u","ownerPassword":"o","40bit":{"annotate":"y","extract":"n","modify":"none","print":"low"}}"#,
         )
         .unwrap();
-        assert!(parse_job_encrypt(&encrypt_40, true).is_ok());
+        assert!(parse_job_encrypt(&encrypt_40, true, &inherited).is_ok());
         let encrypt_128 = crate::json::Json::parse(
             br#"{"userPassword":"u","ownerPassword":"o","128bit":{"accessibility":"y","annotate":"n","assemble":"y","cleartextMetadata":"","extract":"n","form":"y","modifyOther":"n","modify":"all","print":"full","forceV4":"","useAes":"n"}}"#,
         )
         .unwrap();
-        assert!(parse_job_encrypt(&encrypt_128, true).is_ok());
+        assert!(parse_job_encrypt(&encrypt_128, true, &inherited).is_ok());
+        let encrypt_128_no_accessibility = crate::json::Json::parse(
+            br#"{"userPassword":"u","ownerPassword":"o","128bit":{"accessibility":"n","useAes":"y"}}"#,
+        )
+        .unwrap();
+        assert!(parse_job_encrypt(&encrypt_128_no_accessibility, true, &inherited).is_ok());
         let encrypt_256 = crate::json::Json::parse(
             br#"{"userPassword":"u","ownerPassword":"o","256bit":{"forceR5":"","allowInsecure":""}}"#,
         )
         .unwrap();
-        assert!(parse_job_encrypt(&encrypt_256, true).is_ok());
+        assert!(parse_job_encrypt(&encrypt_256, true, &inherited).is_ok());
         let encrypt_128_rc4 =
             crate::json::Json::parse(br#"{"userPassword":"u","ownerPassword":"o","128bit":{}}"#)
                 .unwrap();
-        assert!(parse_job_encrypt(&encrypt_128_rc4, true).is_ok());
+        assert!(parse_job_encrypt(&encrypt_128_rc4, true, &inherited).is_ok());
         let encrypt_256_r6 =
             crate::json::Json::parse(br#"{"userPassword":"u","ownerPassword":"o","256bit":{}}"#)
                 .unwrap();
-        assert!(parse_job_encrypt(&encrypt_256_r6, true).is_ok());
+        let (_, encrypt_256_defaults) =
+            parse_job_encrypt(&encrypt_256_r6, true, &inherited).unwrap();
+        assert!(encrypt_256_defaults.use_aes);
         let insecure_256 =
             crate::json::Json::parse(br#"{"userPassword":"u","ownerPassword":"","256bit":{}}"#)
                 .unwrap();
-        assert!(parse_job_encrypt(&insecure_256, true).is_err());
+        let (_, insecure_defaults) = parse_job_encrypt(&insecure_256, true, &inherited).unwrap();
+        assert!(!insecure_defaults.allow_insecure);
         let allowed_insecure_256 = crate::json::Json::parse(
             br#"{"userPassword":"u","ownerPassword":"","256bit":{"allowInsecure":""}}"#,
         )
         .unwrap();
-        assert!(parse_job_encrypt(&allowed_insecure_256, true).is_ok());
+        assert!(parse_job_encrypt(&allowed_insecure_256, true, &inherited).is_ok());
         let missing_password = crate::json::Json::parse(br#"{"128bit":{}}"#).unwrap();
-        assert!(parse_job_encrypt(&missing_password, true).is_err());
+        assert!(parse_job_encrypt(&missing_password, true, &inherited).is_err());
         let duplicate_key_length = crate::json::Json::parse(
             br#"{"userPassword":"u","ownerPassword":"o","40bit":{},"128bit":{}}"#,
         )
         .unwrap();
-        assert!(parse_job_encrypt(&duplicate_key_length, true).is_err());
+        assert!(parse_job_encrypt(&duplicate_key_length, true, &inherited).is_err());
         let no_key_length =
             crate::json::Json::parse(br#"{"userPassword":"u","ownerPassword":"o"}"#).unwrap();
-        assert!(parse_job_encrypt(&no_key_length, true).is_err());
-        assert!(parse_job_encrypt(&encrypt_40, false).is_err());
+        assert!(parse_job_encrypt(&no_key_length, true, &inherited).is_err());
+        assert!(parse_job_encrypt(&encrypt_40, false, &inherited).is_ok());
+
+        let (_, aes_defaults) =
+            parse_job_encrypt(&encrypt_128_no_accessibility, true, &inherited).unwrap();
+        let (_, r2_defaults) = parse_job_encrypt(&encrypt_40, true, &aes_defaults).unwrap();
+        let (params, _) = parse_job_encrypt(&encrypt_128_rc4, true, &r2_defaults).unwrap();
+        assert_eq!(params.method, EncryptMethod::V4Aes128);
     }
 
     #[test]
