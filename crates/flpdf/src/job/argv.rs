@@ -2140,16 +2140,23 @@ fn completion(argv0: &[u8], zsh: bool) -> Vec<u8> {
     .into_bytes()
 }
 
-fn show_crypto(job: &QPDFJob) -> Result<()> {
-    let provider = std::env::var_os("QPDF_CRYPTO_PROVIDER")
-        .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_else(|| String::from_utf8_lossy(QPDF_SHOW_CRYPTO).trim().to_owned());
-    if !matches!(provider.as_str(), "gnutls" | "openssl" | "native") {
+fn show_crypto_provider(job: &QPDFJob, provider: &str) -> Result<()> {
+    let registered = QPDF_SHOW_CRYPTO
+        .split(|byte| *byte == b'\n')
+        .any(|name| !name.is_empty() && name == provider.as_bytes());
+    if !registered {
         return Err(Error::Usage(UsageError::new(format!(
             "QPDFCryptoProvider: request to set default provider to unknown implementation \"{provider}\""
         ))));
     }
     job.logger.info(format!("{provider}\n"))
+}
+
+fn show_crypto(job: &QPDFJob) -> Result<()> {
+    let provider = std::env::var_os("QPDF_CRYPTO_PROVIDER")
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from_utf8_lossy(QPDF_SHOW_CRYPTO).trim().to_owned());
+    show_crypto_provider(job, &provider)
 }
 
 fn help_from_generated_table(value: Option<&[u8]>, program: &str) -> Option<Vec<u8>> {
@@ -2250,24 +2257,10 @@ fn handle_sole_help_option(job: &mut QPDFJob, argv0: &[u8], argument: &[u8]) -> 
                 )
                 .into());
             }
-            let version = match value {
-                // cov:ignore: json-help choice test executes this validated match; LLVM maps the hit to a match arm
-                None | Some(b"latest") => 2,
-                Some(b"1") => 1,
-                Some(b"2") => 2,
-                _ => {
-                    // cov:ignore-start: the preceding matches validate the json-help choice
-                    return Err(UsageError::new(
-                        "--json-help must be given as --json-help={1,2,latest}",
-                    )
-                    .into());
-                    // cov:ignore-end
-                } // cov:ignore: LLVM maps the validated json-help arm exit to the match body
-            }; // cov:ignore: LLVM maps the covered json-help version match continuation to its arms
             job.argv_early_exit = true; // cov:ignore: json-help success is exercised; llvm-cov leaves this shared match assignment at zero in its duplicate record
-            let help = match version {
-                1 => QPDF_JSON_HELP_1,
-                2 => QPDF_JSON_HELP_2,
+            let help = match value {
+                Some(b"1") => QPDF_JSON_HELP_1,
+                Some(b"2") => QPDF_JSON_HELP_2,
                 _ => QPDF_JSON_HELP_LATEST,
             };
             job.logger.info(help)?;
@@ -2310,4 +2303,18 @@ fn read_password_file(job: &QPDFJob, value: &[u8]) -> Result<Option<Vec<u8>>> {
         password.pop();
     }
     Ok(Some(password))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn show_crypto_rejects_a_provider_outside_the_pinned_registry() {
+        let job = QPDFJob::new();
+        let error = show_crypto_provider(&job, "openssl").unwrap_err();
+        assert!(matches!(error, Error::Usage(usage) if usage
+            .to_string()
+            .contains("unknown implementation \"openssl\"")));
+    }
 }
