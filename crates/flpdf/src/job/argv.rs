@@ -1594,11 +1594,11 @@ impl EncryptionState {
             )
         };
 
-        let mut use_aes = inherited.and_then(|params| match params.method {
-            EncryptMethod::V4Aes128 => Some(true),
-            EncryptMethod::V4Rc4128 => Some(false),
-            EncryptMethod::V5R5Aes256 | EncryptMethod::V5R6Aes256 => Some(true),
-            EncryptMethod::V1Rc440 | EncryptMethod::V2Rc4128 => Some(false),
+        let mut use_aes = inherited.map(|params| match params.method {
+            EncryptMethod::V4Aes128 => true,
+            EncryptMethod::V4Rc4128 => false,
+            EncryptMethod::V5R5Aes256 | EncryptMethod::V5R6Aes256 => true,
+            EncryptMethod::V1Rc440 | EncryptMethod::V2Rc4128 => false,
         });
         let mut force_v4 = inherited.is_some_and(|params| {
             matches!(
