@@ -1800,11 +1800,11 @@ fn parse_encryption_yn(value: &[u8]) -> Result<bool> {
     }
 }
 
-/// Handle qpdf's dynamically registered help-table options when they are the
-/// sole post-program argument. The full help prose remains a CLI presentation
-/// concern, but the library must accept the same table entries, report the
-/// general help text, and terminate before it asks for an input file
-/// (`QPDFArgParser.cc:30-34,219-228,766-780`).
+// Handle qpdf's dynamically registered help-table options when they are the
+// sole post-program argument. The full help prose remains a CLI presentation
+// concern, but the library must accept the same table entries, report the
+// general help text, and terminate before it asks for an input file
+// (`QPDFArgParser.cc:30-34,219-228,766-780`).
 
 const QPDF_HELP_USAGE: &[u8] =
     br#"Read a PDF file, apply transformations or modifications, and write
@@ -2065,9 +2065,7 @@ const QPDF_HELP_OPTIONS: &[&[u8]] = &[
 ];
 
 fn known_help_target(value: &[u8]) -> bool {
-    value == b"all"
-        || QPDF_HELP_TOPICS.iter().any(|topic| *topic == value)
-        || QPDF_HELP_OPTIONS.iter().any(|option| *option == value)
+    value == b"all" || QPDF_HELP_TOPICS.contains(&value) || QPDF_HELP_OPTIONS.contains(&value)
 }
 
 fn program_name(argv0: &[u8]) -> String {
