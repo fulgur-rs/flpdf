@@ -333,6 +333,16 @@ flpdf の `linearization/plan.rs::first_page_is_private` は、既存 canonical
 fixture では、従来の Part 2 placementと byte outputを保持する。残りの stopOnError call
 site は親 `flpdf-rbyc6` の別 sliceであり、この route entryでは混ぜない。
 
+### Linearization diagnostic source-state boundary (`flpdf-qlwe5`, 2026-09-17)
+
+`QPDF::stopOnError`は`InputSource::getLastOffset()`を使い、page-loop exceptionは
+`getAllPagesInternal`の再帰中に保持された`last_object_description`を使う。flpdfは
+linearized setupでpage preparationを`getObjectCount`前へ置き、成功したstream parse後の
+last-offsetをqpdfのlazy `readStream`境界へ揃える。`filter-on-write-out.pdf`と
+`pages-loop.pdf`のqpdf/flpdf linearize stderr、exit 2、zero-byte outputを比較し、
+このD18/D21 consumer gapを固定する。q2nkaのprobe差分と、rbyc6の未移植stopOnError文言群は
+別責務として混ぜない。
+
 ### Linearized Preserve Part-9 ObjStm container order (`flpdf-psgss`, 2026-09-17)
 
 qpdf の Preserve は source ObjStm の membership と container 境界を保持したまま、

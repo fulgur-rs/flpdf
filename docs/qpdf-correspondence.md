@@ -3739,6 +3739,21 @@ flpdfのlinearization probeはこの境界で早期return・warning抑止をし�
 出力bytesもqpdf 11.9.0と一致させた。plain側のlegacy `isDataModified` early returnは
 このlinearized consumerのscope外である。
 
+### Linearization stop diagnostics retain qpdf source state (`flpdf-qlwe5`, 2026-09-17)
+
+qpdfのlinearization writerはpage-tree preparationとstream/object setupの後に、
+`QPDF::stopOnError`を`damagedPDF("", message)`として現在のInputSource offsetで投げる
+（`QPDF_linearization.cc:1190-1194`; `QPDF.cc:2590-2593,2635-2643`）。ページ循環は
+`getAllPagesInternal`の`visited`判定位置と、その時点の`last_object_description`を
+そのまま`qpdf_e_pages`へ渡す（`QPDF_pages.cc:77-107`）。
+
+flpdfはlinearized writer setupでcanonical page preparationを`getObjectCount`前に置き、
+lazy stream parserの成功した`readStream`境界ではqpdfと同じstream-data offsetを
+`InputSource::last_offset`へ復元する。これにより`filter-on-write-out.pdf`の
+`no pages found`（offset 331）と`pages-loop.pdf`の循環（object 3 0）をqpdfと一致させる。
+通常rewrite/checkのdiagnosticsは変更せず、q2nkaが所有するlinearized stream probe後の
+stop-on-error consumer境界だけを固定する。
+
 ### `QPDF::getRoot` の test_driver consumer
 
 `libqpdf/QPDF.cc:2355-2368` の `QPDF::getRoot` は trailer の `/Root` を
