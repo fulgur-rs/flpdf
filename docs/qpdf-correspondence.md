@@ -3846,6 +3846,14 @@ overlay の所有者のときだけそれを返し、他スレッドには通常
 `// qpdf-deviation:` / `// qpdf-deviation-start:` … `// qpdf-deviation-end`
 で機械可読にマークしてある。
 
+`get_warn` も同じ overlay を参照する（`flpdf-gvung`, 2026-09-17）。明示的な
+warn sink が無いとき qpdf の `getWarn` は error pipeline を返す仕様
+（`include/qpdf/QPDFLogger.hh:47-48` の "warn -- whatever error points to"）
+なので、overlay 有効時に「error が指す先」へ追従するのが qpdf の既定と
+整合する。**repair 診断はこの `get_warn` 経路を通る**ため、overlay が
+`get_error` だけに効いていた間は qtest の汚染回帰テストが
+process-global 実装でも通ってしまい、判別力を持たなかった。
+
 overlay が無効な通常経路の挙動は qpdf と同一で、出力バイト・warning 文言・
 配送順はいずれも変わらない。
 
