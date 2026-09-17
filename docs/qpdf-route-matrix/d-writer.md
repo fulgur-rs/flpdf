@@ -456,11 +456,14 @@ encryption は上記 3 経路すべてで `doWriteSetup` の同一分岐（D-0�
   `crates/flpdf/src/writer/plain/body.rs::initialize_live_queue` が選ぶ seed 関数と
   `%PCLm 1.0` header marker だけである。
 * qpdfのPCLmも `writeStandard` 内で `enqueueObjectsPCLm` の専用seedを選ぶ
-  （`libqpdf/QPDFWriter.cc:2928-2954,2991-3044`）。したがってこの専用routeは未実装の
-  legacy fallbackではない。PCLmのlate trailer referenceは `writer.rs:3682-3711` の
-  route-local mapで、qpdf setupがPCLmで`qdf=false`/decode none/compress off/encryption off
-  にする（`QPDFWriter.cc:2072-2076`）ため、plain helperのQDF専用のstream length-holder
-  `+2`、XRef stream除外は適用しない。この境界をh5yreの文書受入として記録する。
+  （`libqpdf/QPDFWriter.cc:2928-2954,2991-3044`）。**差分はseedの選択だけ**で、それ以降の
+  queue walk・emission・trailerはstandardと共有される。flpdfもこれに合わせ、
+  `initialize_live_queue` がseed関数を選ぶ形になった（route-local map `writer.rs:3682-3711`
+  と `writer.rs::write_pclm` は撤去済み）。`doWriteSetup` がPCLmで触るのは
+  `stream_decode_level`/`compress_streams`/`encrypted` の3つだけで
+  （`QPDFWriter.cc:2071-2076`）、**`qdf_mode` と object-stream mode は設定のまま残る**
+  ため、QDF専用のstream length-holder `+2`とXRef stream除外はQDFが有効なときPCLmでも
+  適用される。
 * `QPDFWriter::generateObjectStreams` の責務は候補走査、even split、fresh container allocation
   に分かれる。flpdfでは候補を
   `writer/object_streams/eligibility.rs::compressible_objgens_qpdf_plan`、分割を
@@ -481,12 +484,12 @@ parity を主張しない。checker の current logical aggregate は README §1
 259 logical rows で、分類別の内訳は README §1 / §4 と本ファイルの「分類集計」を見る
 （ここに再掲していた内訳は drift していた）。
 
-**PCLm root/late-trailer boundary (current main):** PR #1861 (`flpdf-ccij8`) now sends
-only an indirect source `/Root` through `output_root_copy_with_adbe`; the direct-root
-non-reconciliation contract remains. This fixes the PCLm root regression without making
-PCLm share the plain live body owner. PCLm's local late-reference map is intentionally
-non-QDF (`qdf=false`) and is separately covered by the PCLm late-number tests; it must not
-be described as the QDF `extend_late_trailer_map` behavior.
+**PCLm root/late-trailer boundary (historical):** PR #1861 (`flpdf-ccij8`) sent only an
+indirect source `/Root` through `output_root_copy_with_adbe` while PCLm still owned a
+route-local late-reference map. That map was removed when PCLm moved onto the shared live
+body owner, so PCLm now uses the same `plain::extend_late_trailer_map` as the standard
+route and is no longer pinned to `qdf=false`. The direct-root contract is covered by the
+`mini-pclm-direct-root-*` golden.
 
 **D14 current slice (2026-09-07):** `writer/object.rs::TrailerKind` and
 `ObjectWriterEmission::write_trailer_with_ref_map_and_kind` now own the qpdf
@@ -543,8 +546,8 @@ snapshot is historical. The current production boundaries are:
 
 | current route | setup / membership owner | body / emission owner | late trailer numbering |
 |---|---|---|---|
-| non-linearized standard except PCLm | `writer.rs` の `build_writer_setup` が Preserve の `source_object_stream_data` snapshot と Generate setup を持ち、`plain::build_live_object_stream_plan` は渡された snapshot を消費する | `plain::write_plain` → `plain::emit_live` → `LiveQueue`/`WriteObject` | shared `plain::extend_late_trailer_map` and direct-root assignment |
-| PCLm | `pclm::Plan::build` → `pclm::EmissionQueue` | `writer.rs::write_pclm` own page/content/strip/synthetic/root loop, classic xref and trailer; shared OutputSink/object serializer only | route-local map in `writer.rs:3682-3711`, intentionally `qdf=false`; no QDF length-holder `+2` or XRef exclusion |
+| non-linearized standard (PCLm を含む) | `writer.rs` の `build_writer_setup` が Preserve の `source_object_stream_data` snapshot と Generate setup を持ち、`plain::build_live_object_stream_plan` は渡された snapshot を消費する | `plain::write_plain` → `plain::emit_live` → `LiveQueue`/`WriteObject` | shared `plain::extend_late_trailer_map` and direct-root assignment |
+| PCLm（上の行の派生） | 同上。違いは `initialize_live_queue` が `enqueue_objects_pclm` を seed 関数に選ぶ点と `%PCLm 1.0` header marker だけ | 同上 | 同上（route-local map は撤去済み） |
 | linearized | `linearization::plan`/writer setup | dedicated two-pass `linearization` writer | linearization-specific trailer/hint owner |
 
 The table separates owner boundaries; it does not change the row classifications or claim
