@@ -2192,8 +2192,7 @@ CLI の page-operation route も同じ順序を保つ。qpdf は `createQPDF` �
 （`QPDFJob.cc:450-507,2137-2248,2847-2945`）。flpdf は page selection と
 rotation の完了後に `write_with_pdf_writer(..., linearize, linearize_pass1)`
 へ渡し、`--split-pages` では `doSplitPages` 相当の各 chunk writer に同じ
-linearization 設定を再適用する（`crates/flpdf-cli/src/main.rs` の
-`run_page_extraction_after_plan` / `split_rewritten_pdf`、
+linearization 設定を再適用する（`QPDFJob::write_qpdf` と
 `crates/flpdf/src/job/page_split.rs`）。rewrite の linearized branch でも
 `--flatten-rotation` を writer planning 前に実行する。
 
@@ -2204,6 +2203,15 @@ flpdf の top-level / `rewrite` page-operation route も、ページ選択後の
 との V4 AES-128 byte comparison を `page_ops_qpdf_matrix.rs::pages_encrypt_then_split_outputs_encrypted_chunks_like_qpdf`
 で固定した。`--copy-encryption`、`--decrypt`、`--coalesce-contents` など別の未対応組合せは
 この変更の対象外である。
+
+2026-09-17（`flpdf-3yn9.48.142`）: rewrite サブコマンドの `--pages … --split-pages`
+も、ページ選択後の CLI-local split helper を削除して `QPDFJob::write_qpdf` の
+`writeQPDF` → `doSplitPages` 分岐へ接続した。qpdf の `setWriterOptions` が最初の
+chunk の page-copy 後に行われる順序に合わせ、暗号化パスワード通知と弱暗号判定は
+`job/page_split.rs` の chunk writer 設定時へ移し、resource/page-copy 診断より前に
+通知されないことを `cli_pages_verbose_diagnostics.rs` の qpdf 11.9.0 differential
+で固定した。qpdf の `doSplitPages` は private なので `SplitPageOptions` と
+`QPDFJob::split_pages` は crate 内 API に狭めた。
 
 ### Attachment mutation with split-pages output dispatch (`flpdf-8q13h`, 2026-09-16)
 

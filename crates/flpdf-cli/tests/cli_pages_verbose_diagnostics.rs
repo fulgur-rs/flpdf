@@ -277,6 +277,67 @@ fn verbose_pages_split_reports_merge_and_split_preflights_like_qpdf() {
     );
 }
 
+#[test]
+fn rewrite_pages_split_keeps_write_time_password_notice_after_split_preflight() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let primary = fixture("three-page.pdf");
+    let output = temp.path().join("rewrite-pages-%d.pdf");
+    let primary = primary.to_str().unwrap().to_owned();
+    let output = output.to_str().unwrap().to_owned();
+    let qpdf_args = vec![
+        "--verbose".to_owned(),
+        "--allow-weak-crypto".to_owned(),
+        "--encrypt".to_owned(),
+        "café".to_owned(),
+        "owner".to_owned(),
+        "128".to_owned(),
+        "--".to_owned(),
+        primary.clone(),
+        "--pages".to_owned(),
+        primary.clone(),
+        "1".to_owned(),
+        "--".to_owned(),
+        "--split-pages=1".to_owned(),
+        output.clone(),
+    ];
+    let mut flpdf_args = vec!["rewrite".to_owned()];
+    flpdf_args.extend(qpdf_args.iter().cloned());
+
+    let qpdf = run_qpdf(&qpdf_args);
+    assert_success(&qpdf, "qpdf rewrite-equivalent pages then split-pages");
+    let flpdf = run_flpdf(&flpdf_args);
+    assert_success(&flpdf, "flpdf rewrite pages then split-pages");
+
+    let without_destination = |bytes: &[u8]| {
+        String::from_utf8_lossy(&normalize_text_newlines(bytes))
+            .lines()
+            .filter(|line| !line.contains(": wrote file "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        without_destination(&flpdf.stdout),
+        without_destination(&qpdf.stdout),
+        "rewrite --pages --split-pages stdout must keep qpdf's write-time notice order"
+    );
+    for stdout in [&qpdf.stdout, &flpdf.stdout] {
+        assert!(
+            String::from_utf8_lossy(stdout).contains("rewrite-pages-1.pdf"),
+            "split output report must name the generated chunk: {:?}",
+            String::from_utf8_lossy(stdout)
+        );
+    }
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr),
+        "rewrite --pages --split-pages stderr must match qpdf"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn verbose_pages_preserves_non_utf8_source_and_output_path_bytes() {

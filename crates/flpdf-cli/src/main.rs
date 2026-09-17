@@ -8,7 +8,6 @@ use flpdf::job::{
     copy_duplicate_page_annotations, AttachmentAddOptions, CheckError, FlattenAnnotationsMode,
     ImageOptimizationOptions, JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput,
     JsonStreamData, PageSpecInput, PageSpecJobOutput, QPDFJob, RemoveUnreferencedResources,
-    SplitPageOptions,
 };
 use flpdf::pipeline::{FlateAction, Pipeline, PipelineHandle, PlFlate, PlStdioFile};
 use flpdf::qutil::same_file as qpdf_same_file;
@@ -8734,34 +8733,48 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     }
 
     let split_progress = split_pages_active && options.progress;
-    if split_progress {
-        // qpdf creates a fresh writer for each split output. The source
-        // document does not have a separate observable write step, so only the
-        // per-chunk writers must consume the progress stream.
-        options.progress = false;
-    }
-    if let Some(n) = split_pages.filter(|size| *size > 0) {
-        let (_, mut split_job) = split_pdf(
-            pdf,
-            n,
-            output,
-            input_path,
-            options.deterministic_id,
-            split_progress,
-            verbose,
-            no_warn,
-            remove_unref.into(),
-            writer_configuration(&options, linearize, linearize_pass1)?,
-        )?;
-        // Preserve any warnings raised while preparing the source before the
-        // split job started, matching the non-split branch's
-        // `finish_operation_warnings_with_prior` checks below.
-        split_job.record_document_warnings(pdf);
+    if split_pages.is_some_and(|size| size > 0) {
+        // qpdf keeps split dispatch inside the one job's writeQPDF boundary
+        // (`QPDFJob.cc:483-503`). The page-selection pipeline has already
+        // prepared this live document, so configure only the writer-stage
+        // state here and let write_qpdf own the split/resource/warning/status
+        // boundary rather than creating a second split helper route.
+        let mut split_job = new_cli_job(no_warn);
+        split_job.set_input_file(input_path.to_path_buf())?;
+        split_job.set_output_file(output.to_path_buf())?;
+        split_job.set_verbose(verbose);
+        split_job.set_progress(split_progress);
+        split_job.set_password_mode(options.password_mode);
+        split_job.set_allow_weak_crypto(options.allow_weak_crypto);
+        split_job.set_linearization(linearize, linearize_pass1.map(std::path::Path::to_path_buf));
+        {
+            let mut configuration = split_job.config();
+            configuration.split_pages(
+                page_ops
+                    .split_pages
+                    .as_deref()
+                    .expect("positive split_pages has a raw CLI value")
+                    .as_bytes(),
+            )?;
+            configuration.remove_unreferenced_resources(remove_unref.into());
+        }
+        split_job.set_writer_configuration(writer_configuration_unnormalized(
+            &options,
+            linearize,
+            linearize_pass1,
+        )?);
+        // Preserve warnings raised while preparing the source before the
+        // canonical write boundary starts.
         if prior_warnings {
             split_job.record_warnings();
         }
-        split_job.complete(true)?;
-        return finish_job_exit_status(split_job.get_exit_code());
+        return match split_job.write_qpdf(pdf) {
+            Ok(()) => finish_job_exit_status(split_job.get_exit_code()),
+            Err(_) => Err(Box::new(CliExitError {
+                code: ExitCode::Errors,
+                message: String::new(),
+            })),
+        };
     } else {
         let announce_file = standard_output.is_none();
         write_with_pdf_writer(
@@ -8794,56 +8807,6 @@ fn parse_split_n(raw: &str) -> CliResult<usize> {
 /// usage error instead of silently selecting the ordinary rewrite path.
 fn split_pages_active(raw: Option<&str>) -> bool {
     raw.is_some_and(|value| value.parse::<usize>().map_or(true, |size| size > 0))
-}
-
-/// Run qpdf's fresh-document split job on the already-transformed source.
-///
-/// qpdf invokes `doSplitPages` on the same live document after page operations
-/// have completed. Keeping that source document intact preserves its object
-/// identities for QDF `Original object ID` comments and lets each fresh chunk
-/// writer observe the source graph directly.
-#[allow(clippy::too_many_arguments)]
-fn split_pdf<R: Read + Seek + 'static>(
-    source: &mut Pdf<R>,
-    chunk_size: usize,
-    output: &Path,
-    input_path: &Path,
-    deterministic_id: bool,
-    progress: bool,
-    verbose: bool,
-    suppress_warnings: bool,
-    remove_unreferenced_resources: RemoveUnreferencedResources,
-    writer_configuration: WriterConfiguration,
-) -> CliResult<(Vec<PathBuf>, QPDFJob)> {
-    let mut job = QPDFJob::new();
-    job.set_logger(cli_logger());
-    job.set_message_prefix(progname());
-    job.set_input_name_bytes(path_description(input_path));
-    // qpdf never creates a second job for `--split-pages`: `writeQPDF`
-    // (`QPDFJob.cc:483-503`) calls `doSplitPages` on `this` and gates
-    // "operation succeeded with warnings" on the same `m->suppress_warnings`
-    // used everywhere else. flpdf's split path uses a fresh `QPDFJob`
-    // instead, so that job's own suppression must be set explicitly, and
-    // before `split_pages` runs so warnings raised during the split itself
-    // are suppressed too, not only the final summary line. The same reasoning
-    // applies to `--warning-exit-0`: qpdf's single job reaches
-    // `QPDFJob.cc:560` with `m->warnings_exit_zero` already set, so this
-    // fresh job must carry the same policy or `--split-pages` would still
-    // exit 3 on a repair warning.
-    job.set_suppress_warnings(suppress_warnings);
-    job.set_warnings_exit_zero(cli_warning_exit_zero());
-    if progress {
-        job.set_progress(true);
-        job.set_output_file(output.to_path_buf())?;
-    }
-    let options = SplitPageOptions::new(chunk_size, output)
-        .with_input_path(input_path)
-        .with_deterministic_id(deterministic_id)
-        .with_verbose(verbose)
-        .with_remove_unreferenced_resources(remove_unreferenced_resources)
-        .with_writer_configuration(writer_configuration);
-    let written = job.split_pages(source, options)?;
-    Ok((written, job))
 }
 
 /// Apply `--rotate` / `--split-pages` to a plain (no `--pages`) rewrite.

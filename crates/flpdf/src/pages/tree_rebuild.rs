@@ -70,7 +70,7 @@
 //! Obsolete intermediate `/Pages` nodes are intentionally left as orphan
 //! objects (unreachable from the page tree) for the unreferenced-resource
 //! pruning layer to remove, mirroring the precedent set by
-//! [`crate::job::QPDFJob::split_pages`]. Their qpdf-inheritable keys are
+//! `QPDFJob::split_pages`. Their qpdf-inheritable keys are
 //! removed before they become orphaned, so preserved orphan objects still
 //! match qpdf's flattening-side cleanup.
 
