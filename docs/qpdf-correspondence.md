@@ -230,6 +230,27 @@ candidate reports `(trailer, offset 53): empty object treated as null`; and a
 self-`/Prev` section retains one three-warning recovery sequence. The warning
 detail, object attribution, offset, and order match the Rust route.
 
+### Canonical trailer nested value descriptions (`flpdf-7yb9k`, 2026-09-17)
+
+qpdf constructs `QPDFParser` for `readTrailer` with the literal object
+description `trailer` (`libqpdf/QPDF.cc:1312-1317`). The parser shares one
+`input->getName() + ", " + object_description + " at offset $PO"` template
+with every non-null scalar and container it creates
+(`libqpdf/qpdf/QPDFParser.hh:14-27`; `libqpdf/QPDFParser.cc:219-277,304-365,394-444`).
+Each value keeps its own parsed offset through the set-once description path
+(`libqpdf/qpdf/QPDFValue.hh:60-105`; `libqpdf/QPDFValue.cc:14-32`), and
+`typeWarning`/`objectWarning` render that value description
+(`libqpdf/QPDFObjectHandle.cc:2168-2212`).
+
+The canonical flpdf `CanonicalTrailerParser` now supplies the same shared
+`filename, trailer at offset $PO` template through `HandleResolver` while
+`read_trailer` parses the dictionary. The existing top-level setter remains
+for the owner-less/bootstrap boundary; nested canonical values receive their
+own token offsets without a post-parse recursive tagging pass. A synthetic
+classic-xref fixture with `/ID 7` at offset 393 compares qpdf 11.9.0 and flpdf
+stderr, exit status, and output bytes in
+`crates/flpdf-cli/tests/cmp_trailer_value_description_tests.rs`.
+
 ### Input-source lifecycle (2026-09-03)
 
 qpdf constructs a `QPDF` with an `InvalidInputSource`, leaves its trailer

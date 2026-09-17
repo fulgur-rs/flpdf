@@ -1432,8 +1432,36 @@ mod tests {
         .expect("run test 42");
         assert!(stdout.is_empty());
         let warning_text = String::from_utf8(stderr).expect("warnings are UTF-8");
+        let contextual_warning_count = warning_text
+            .lines()
+            .filter(|line| line.starts_with("WARNING: , trailer at offset "))
+            .count();
+        assert!(contextual_warning_count > 0);
+        assert!(warning_text.contains("WARNING: , trailer at offset 400:"));
+        let normalized_warning_text = warning_text
+            .lines()
+            .map(|line| {
+                let Some(rest) = line.strip_prefix("WARNING: , trailer at offset ") else {
+                    return line.to_owned();
+                };
+                let offset_end = rest
+                    .bytes()
+                    .position(|byte| !byte.is_ascii_digit())
+                    .unwrap_or(rest.len());
+                let suffix = &rest[offset_end..];
+                if let Some(message) = suffix.strip_prefix(": ") {
+                    format!("WARNING: {message}")
+                } else if suffix.starts_with(" ->") {
+                    format!("WARNING: {suffix}")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
         assert_eq!(
-            warning_text,
+            normalized_warning_text,
             concat!(
                 "WARNING: operation for string attempted on object of type dictionary: returning empty string\n",
                 "WARNING: returning null for out of bounds array access\n",
