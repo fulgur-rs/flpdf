@@ -1602,7 +1602,7 @@ impl QPDFJob {
 
     /// Set the qpdf diagnostic prefix from its original raw argv bytes.
     ///
-    /// qpdf stores argv[0] in a std::string and emits those bytes without
+    /// qpdf stores the first argv element in a std::string and emits those bytes without
     /// UTF-8 replacement (QUtil.cc:788-803, QPDFJob_argv.cc:427-428).
     /// Keep the lossy string projection for the existing text getter while
     /// preserving the source bytes for logger and pipeline output.
@@ -1741,15 +1741,13 @@ impl QPDFJob {
         for notice in auto_password_notices {
             match notice {
                 crate::encryption::PasswordWriteNotice::Info if self.configuration.verbose => {
-                    self.logger.info(format!(
-                        "{}: automatically converting Unicode password to single-byte encoding as required for 40-bit or 128-bit encryption\n",
-                        self.message_prefix
+                    self.logger.info(self.prefixed_message(
+                        b"automatically converting Unicode password to single-byte encoding as required for 40-bit or 128-bit encryption\n",
                     ))?;
                 }
                 crate::encryption::PasswordWriteNotice::Warning => {
-                    self.logger.error(format!(
-                        "{}: WARNING: supplied password looks like a Unicode password with characters not allowed in passwords for 40-bit and 128-bit encryption; most readers will not be able to open this file with the supplied password. (Use --password-mode=bytes to suppress this warning and use the password anyway.)\n",
-                        self.message_prefix
+                    self.logger.error(self.prefixed_message(
+                        b"WARNING: supplied password looks like a Unicode password with characters not allowed in passwords for 40-bit and 128-bit encryption; most readers will not be able to open this file with the supplied password. (Use --password-mode=bytes to suppress this warning and use the password anyway.)\n",
                     ))?;
                 }
                 crate::encryption::PasswordWriteNotice::None
@@ -1774,9 +1772,8 @@ impl QPDFJob {
                     // cov:ignore-end
                 })
         {
-            self.logger.error(format!(
-                "{}: -accessibility=n is ignored for modern encryption formats\n", // cov:ignore: accessibility warning regression executes the logger write; LLVM maps the covered continuation to the format call
-                self.message_prefix
+            self.logger.error(self.prefixed_message(
+                b"-accessibility=n is ignored for modern encryption formats\n",
             ))?; // cov:ignore: accessibility warning regression executes the logger write; LLVM maps the covered continuation to the format call
         }
         if !self.configuration.allow_weak_crypto
@@ -1784,9 +1781,8 @@ impl QPDFJob {
                 .encryption_parameters()
                 .is_some_and(EncryptParams::is_weak_rc4)
         {
-            let message = format!(
-                "{}: refusing to write a file with RC4, a weak cryptographic algorithm\nPlease use 256-bit keys for better security.\nPass --allow-weak-crypto to enable writing insecure files.\nSee also https://qpdf.readthedocs.io/en/stable/weak-crypto.html\n",
-                self.message_prefix
+            let message = self.prefixed_message(
+                b"refusing to write a file with RC4, a weak cryptographic algorithm\nPlease use 256-bit keys for better security.\nPass --allow-weak-crypto to enable writing insecure files.\nSee also https://qpdf.readthedocs.io/en/stable/weak-crypto.html\n",
             );
             self.logger.error(message)?;
             return Err(Error::System(
@@ -1971,6 +1967,15 @@ impl QPDFJob {
         &self.message_prefix_bytes
     }
 
+    /// Prefix a qpdf diagnostic body without converting the prefix through
+    /// UTF-8.
+    pub(crate) fn prefixed_message(&self, body: &[u8]) -> Vec<u8> {
+        let mut message = self.message_prefix_bytes.clone();
+        message.extend_from_slice(b": ");
+        message.extend_from_slice(body);
+        message
+    }
+
     /// Register qpdf's progress callback for writers configured by this job.
     ///
     /// The callback is shared rather than moved into one writer so the same
@@ -1998,7 +2003,7 @@ impl QPDFJob {
             Some(reporter) => Rc::clone(reporter),
             None if self.configuration.progress => {
                 let logger = self.logger.clone();
-                let prefix = self.message_prefix.clone();
+                let prefix = self.message_prefix_bytes.clone();
                 // `writeOutfile` swaps `m->outfilename` to the `.~qpdf-temp#`
                 // replacement target before `setWriterOptions` builds this
                 // reporter (`libqpdf/QPDFJob.cc:3033-3037` then `:2926-2935`),
@@ -2012,9 +2017,13 @@ impl QPDFJob {
                         |path| path.display().to_string(),
                     );
                 let callback: ProgressHandler = Box::new(move |percent| {
-                    logger.info(format!(
-                        "{prefix}: {output_name}: write progress: {percent}%\n"
-                    ))
+                    let mut message = prefix.clone();
+                    message.extend_from_slice(b": ");
+                    message.extend_from_slice(output_name.as_bytes());
+                    message.extend_from_slice(b": write progress: ");
+                    message.extend_from_slice(percent.to_string().as_bytes());
+                    message.extend_from_slice(b"%\n");
+                    logger.info(message)
                 });
                 Rc::new(RefCell::new(callback))
             }
@@ -2258,11 +2267,15 @@ impl QPDFJob {
                 })();
                 active.remove(&identity);
                 nested_result.map_err(|error| {
-                    Error::System(format!(
-                        "error with job-json file {}: {error}\nRun {} --job-json-help for information on the file format.",
-                        path.display(),
-                        self.message_prefix
-                    ))
+                    let mut message = b"error with job-json file ".to_vec();
+                    message.extend_from_slice(&path_description_bytes(&path));
+                    message.extend_from_slice(b": ");
+                    message.extend_from_slice(error.to_string().as_bytes());
+                    message.extend_from_slice(b"\nRun ");
+                    message.extend_from_slice(self.message_prefix_bytes());
+                    message
+                        .extend_from_slice(b" --job-json-help for information on the file format.");
+                    Error::SystemBytes(message)
                 })?;
             } else {
                 let mut members = std::collections::BTreeMap::new();
@@ -3773,7 +3786,7 @@ impl QPDFJob {
             optimize_images(
                 pdf,
                 &self.logger,
-                &self.message_prefix,
+                self.message_prefix_bytes(),
                 configuration.verbose,
                 image_options,
             )?; // cov:ignore: llvm-cov attributes this successful multiline image phase call to its opening expressions
@@ -4249,19 +4262,20 @@ impl QPDFJob {
             // cov:ignore-end
         }
         if self.warnings {
-            self.logger.error(format!(
-                "{}: there are warnings; original file kept in {}\n",
-                self.message_prefix,
-                backup.display()
-            ))?; // cov:ignore: llvm-cov attributes this successful warning logger write to its opening expressions
+            let mut message = self.message_prefix_bytes.clone();
+            message.extend_from_slice(b": there are warnings; original file kept in ");
+            message.extend_from_slice(&path_description_bytes(&backup));
+            message.push(b'\n');
+            self.logger.error(message)?; // cov:ignore: llvm-cov attributes this successful warning logger write to its opening expressions
         } else if let Err(error) = std::fs::remove_file(&backup) {
             // cov:ignore-start: backup deletion failure depends on external filesystem permissions or races
-            self.logger.error(format!(
-                "{}: unable to delete original file ({}); original file left in {}, but the input was successfully replaced\n",
-                self.message_prefix,
-                error,
-                backup.display()
-            ))?;
+            let mut message = self.message_prefix_bytes.clone();
+            message.extend_from_slice(b": unable to delete original file (");
+            message.extend_from_slice(error.to_string().as_bytes());
+            message.extend_from_slice(b"); original file left in ");
+            message.extend_from_slice(&path_description_bytes(&backup));
+            message.extend_from_slice(b", but the input was successfully replaced\n");
+            self.logger.error(message)?;
             // cov:ignore-end
         }
         Ok(())
@@ -4925,10 +4939,11 @@ impl QPDFJob {
             } else {
                 ""
             };
-            self.logger.warn(format!(
-                "{}: operation succeeded with warnings{suffix}\n",
-                self.message_prefix
-            ))?;
+            let mut message = self.message_prefix_bytes.clone();
+            message.extend_from_slice(b": operation succeeded with warnings");
+            message.extend_from_slice(suffix.as_bytes());
+            message.push(b'\n');
+            self.logger.warn(message)?;
         }
 
         Ok(())

@@ -2128,16 +2128,45 @@ fn program_name_bytes(argv0: &[u8]) -> &[u8] {
     }
 }
 
-fn program_name(argv0: &[u8]) -> String {
-    let name = program_name_bytes(argv0);
-    String::from_utf8_lossy(name).into_owned()
+fn help_top(program: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    for suffix in [
+        b" --help=topic\" for help on a topic.\n".as_slice(),
+        b" --help=--option\" for help on an option.\n".as_slice(),
+        b" --help=all\" to see all available help.\n".as_slice(),
+    ] {
+        output.extend_from_slice(b"Run \"");
+        output.extend_from_slice(program);
+        output.extend_from_slice(suffix);
+    }
+    output.extend_from_slice(
+        b"\nTopics:\n  add-attachment: attach (embed) files\n  advanced-control: tweak qpdf's behavior\n  attachments: work with embedded files\n  completion: shell completion\n  copy-attachments: copy attachments from another file\n  encryption: create encrypted files\n  exit-status: meanings of qpdf's exit codes\n  general: general options\n  help: information about qpdf\n  inspection: inspect PDF files\n  json: JSON output for PDF information\n  modification: change parts of the PDF\n  overlay-underlay: overlay/underlay pages from other files\n  page-ranges: page range syntax\n  page-selection: select pages from one or more files\n  pdf-dates: PDF date format\n  testing: options for testing or debugging\n  transformation: make structural PDF changes\n  usage: basic invocation\n\nFor detailed help, visit the qpdf manual: https://qpdf.readthedocs.io\n",
+    );
+    output
 }
 
-fn help_top(program: &str) -> Vec<u8> {
-    format!(
-        "Run \"{program} --help=topic\" for help on a topic.\nRun \"{program} --help=--option\" for help on an option.\nRun \"{program} --help=all\" to see all available help.\n\nTopics:\n  add-attachment: attach (embed) files\n  advanced-control: tweak qpdf's behavior\n  attachments: work with embedded files\n  completion: shell completion\n  copy-attachments: copy attachments from another file\n  encryption: create encrypted files\n  exit-status: meanings of qpdf's exit codes\n  general: general options\n  help: information about qpdf\n  inspection: inspect PDF files\n  json: JSON output for PDF information\n  modification: change parts of the PDF\n  overlay-underlay: overlay/underlay pages from other files\n  page-ranges: page range syntax\n  page-selection: select pages from one or more files\n  pdf-dates: PDF date format\n  testing: options for testing or debugging\n  transformation: make structural PDF changes\n  usage: basic invocation\n\nFor detailed help, visit the qpdf manual: https://qpdf.readthedocs.io\n"
-    )
-    .into_bytes()
+fn help_all_for_program(program: &[u8]) -> Vec<u8> {
+    if program == b"qpdf" {
+        return QPDF_HELP_ALL.as_bytes().to_vec();
+    }
+    let marker = b"qpdf --help=";
+    let source = QPDF_HELP_ALL.as_bytes();
+    let mut output = Vec::with_capacity(source.len());
+    let mut cursor = 0;
+    let mut replacements = 0;
+    while let Some(relative) = source[cursor..]
+        .windows(marker.len())
+        .position(|window| window == marker && replacements < 3)
+    {
+        let offset = cursor + relative;
+        output.extend_from_slice(&source[cursor..offset]);
+        output.extend_from_slice(program);
+        output.extend_from_slice(b" --help=");
+        cursor = offset + marker.len();
+        replacements += 1;
+    }
+    output.extend_from_slice(&source[cursor..]);
+    output
 }
 
 fn version_output(program: &[u8]) -> Vec<u8> {
@@ -2286,16 +2315,12 @@ fn show_crypto(job: &QPDFJob) -> Result<()> {
     show_crypto_provider(job, &provider)
 }
 
-fn help_from_generated_table(value: Option<&[u8]>, program: &str) -> Option<Vec<u8>> {
+fn help_from_generated_table(value: Option<&[u8]>, program: &[u8]) -> Option<Vec<u8>> {
     let Some(value) = value else {
         return Some(help_top(program));
     };
     if value == b"all" {
-        let mut all = QPDF_HELP_ALL.to_owned();
-        if program != "qpdf" {
-            all = all.replacen("qpdf --help=", &format!("{program} --help="), 3);
-        }
-        return Some(all.into_bytes());
+        return Some(help_all_for_program(program));
     }
     let target = String::from_utf8_lossy(value);
     let marker = format!("== {target} (");
@@ -2314,7 +2339,7 @@ fn help_from_generated_table(value: Option<&[u8]>, program: &str) -> Option<Vec<
     )
 }
 
-fn help_text(value: Option<&[u8]>, program: &str) -> Vec<u8> {
+fn help_text(value: Option<&[u8]>, program: &[u8]) -> Vec<u8> {
     if let Some(help) = help_from_generated_table(value, program) {
         return help;
     } // cov:ignore: the generated table covers every validated help target; LLVM maps this covered exit to the closing brace
@@ -2340,7 +2365,6 @@ fn handle_sole_help_option(job: &mut QPDFJob, argv0: &[u8], argument: &[u8]) -> 
     let Some((name, value)) = option_parts(argument) else {
         return Ok(false);
     };
-    let program = program_name(argv0);
     let program_bytes = program_name_bytes(argv0);
     match name {
         b"version" | b"copyright" | b"show-crypto" | b"job-json-help" | b"completion-bash"
@@ -2363,7 +2387,7 @@ fn handle_sole_help_option(job: &mut QPDFJob, argv0: &[u8], argument: &[u8]) -> 
                             return Err(UsageError::new(message).into());
                         }
                     }
-                    job.logger.info(help_text(value, &program))?;
+                    job.logger.info(help_text(value, program_bytes))?;
                 }
                 b"job-json-help" => job.logger.info(QPDF_JOB_JSON_HELP)?,
                 _ => unreachable!(), // cov:ignore: the outer match restricts this arm to the listed help names
@@ -2414,9 +2438,8 @@ fn read_password_file(job: &QPDFJob, value: &[u8]) -> Result<Option<Vec<u8>>> {
     }
     let first_newline = bytes.iter().position(|byte| *byte == b'\n');
     if first_newline.is_some_and(|index| index + 1 < bytes.len()) {
-        job.logger.error(format!(
-            "{}: WARNING: all but the first line of the password file are ignored\n",
-            job.message_prefix
+        job.logger.error(job.prefixed_message(
+            b"WARNING: all but the first line of the password file are ignored\n",
         ))?; // cov:ignore: password-file warning test executes the logger write; LLVM maps the covered continuation to the format call
     }
     let first_line_len = first_newline.unwrap_or(bytes.len());
@@ -2499,10 +2522,13 @@ mod tests {
 
     #[test]
     fn program_name_matches_qpdf_basename_and_exe_stripping() {
-        assert_eq!(program_name(b"/opt/custom-qpdf"), "custom-qpdf");
-        assert_eq!(program_name(b"C:\\tools\\qpdf.exe"), "qpdf");
-        assert_eq!(program_name(b"/tmp/custom\\qpdf.exe"), "custom\\qpdf");
-        assert_eq!(program_name(b"/tmp/"), "");
+        assert_eq!(program_name_bytes(b"/opt/custom-qpdf"), b"custom-qpdf");
+        assert_eq!(program_name_bytes(b"C:\\tools\\qpdf.exe"), b"qpdf");
+        assert_eq!(
+            program_name_bytes(b"/tmp/custom\\qpdf.exe"),
+            b"custom\\qpdf"
+        );
+        assert_eq!(program_name_bytes(b"/tmp/"), b"");
     }
 
     #[test]

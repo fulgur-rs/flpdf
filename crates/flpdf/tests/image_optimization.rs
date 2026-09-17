@@ -144,7 +144,7 @@ fn optimizer_matches_qpdf_metadata_decisions_and_installs_lazy_jpeg() {
         ..ImageOptimizationOptions::default()
     };
 
-    optimize_images(&mut pdf, &logger, "qpdf", true, options).expect("optimize fixture");
+    optimize_images(&mut pdf, &logger, b"qpdf", true, options).expect("optimize fixture");
 
     assert_eq!(filter_name(&mut pdf, b"/Good"), Some(b"DCTDecode".to_vec()));
     assert_eq!(filter_name(&mut pdf, b"/Small"), None);
@@ -161,6 +161,6 @@ fn optimizer_matches_qpdf_metadata_decisions_and_installs_lazy_jpeg() {
     let mut keep_inline_pdf = Pdf::open(Cursor::new(bytes)).expect("fixture PDF");
     let mut keep_options = options;
     keep_options.keep_inline_images = true;
-    optimize_images(&mut keep_inline_pdf, &logger, "qpdf", true, keep_options)
+    optimize_images(&mut keep_inline_pdf, &logger, b"qpdf", true, keep_options)
         .expect("optimize fixture with inline images kept");
 }

@@ -177,7 +177,7 @@ impl QPDFJob {
                 // (`QPDFJob.cc:2066-2068`); build the diagnostic as bytes
                 // too so a non-UTF-8 value isn't replaced with U+FFFD.
                 let mut message = Vec::new();
-                message.extend_from_slice(self.message_prefix().as_bytes());
+                message.extend_from_slice(self.message_prefix_bytes());
                 message.extend_from_slice(b": attached ");
                 message.extend_from_slice(&path_bytes(&option.path));
                 message.extend_from_slice(b" as ");
@@ -335,7 +335,7 @@ impl QPDFJob {
             return Ok(());
         }
         let mut message = Vec::new();
-        message.extend_from_slice(self.message_prefix().as_bytes());
+        message.extend_from_slice(self.message_prefix_bytes());
         message.extend_from_slice(b": copying attachments from ");
         message.extend_from_slice(options.path.display().to_string().as_bytes());
         message.push(b'\n');
