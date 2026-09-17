@@ -4106,7 +4106,7 @@ fn write_qpdf_output_sink_error_does_not_prefix_the_input_name() {
     );
     assert_eq!(
         state.lock().unwrap().bytes,
-        b"qpdf: qpdf output: Pl_StdioFile::write: No space left on device\n"
+        b"qpdfjob: qpdf output: Pl_StdioFile::write: No space left on device\n"
     );
 }
 
