@@ -559,7 +559,6 @@ fn reconstruction_after_a_committed_free_row_suppresses_it_like_qpdf() {
     );
 }
 
-
 /// Build a single-page document whose cross-reference section is a classic
 /// table, inserting `between` after the last subsection entry and writing
 /// `startxref_value` (default: the table offset) after the `startxref`
