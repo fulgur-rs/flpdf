@@ -542,21 +542,29 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
         if node_type.try_as_name()?.as_deref() == Some(b"Pages") {
             let kids = node_obj.try_get_key(b"/Kids")?;
             if let Some(kids_items) = kids.try_as_array()? {
-                // Push in reverse order so that the first kid is popped first.
                 // qpdf classifies an entry by `/Kids` containment, not
                 // `/Type`: an entry with `/Kids` is a subtree and everything
                 // else is a page leaf even when it is not a dictionary
                 // (`libqpdf/QPDF_pages.cc:91-131`). Subtree expansion itself
                 // still keys on `/Type /Pages` in `visit_node`.
-                for (index, kid) in kids_items.iter().enumerate().rev() {
+                //
+                // Classify -- and in particular promote -- in forward order.
+                // qpdf allocates each promoted leaf during its forward
+                // depth-first walk (`libqpdf/QPDF_pages.cc:95-101`), so
+                // `/Kids [42 43]` must mint the object for `42` before the one
+                // for `43`; `pages/repair.rs` does the same. Only the stack
+                // insertion is reversed afterwards, so the first kid is still
+                // popped first.
+                let mut classified = Vec::with_capacity(kids_items.len());
+                for (index, kid) in kids_items.iter().enumerate() {
                     if page_kid_has_kids(kid)? {
                         if let Some(r) = kid.object_ref() {
-                            self.stack.push((PageNode::Indirect(r), depth + 1));
+                            classified.push(PageNode::Indirect(r));
                         } else {
-                            self.stack.push((PageNode::Direct(kid.clone()), depth + 1));
+                            classified.push(PageNode::Direct(kid.clone()));
                         }
                     } else if let Some(r) = kid.object_ref() {
-                        self.stack.push((PageNode::Leaf(r), depth + 1));
+                        classified.push(PageNode::Leaf(r));
                     } else {
                         // qpdf promotes every direct kid to an indirect page
                         // object before pushing it (`libqpdf/QPDF_pages.cc:95-101`),
@@ -567,8 +575,11 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
                         let promoted_ref = promoted
                             .object_ref()
                             .expect("make_indirect_object_handle returns an indirect handle");
-                        self.stack.push((PageNode::Leaf(promoted_ref), depth + 1));
+                        classified.push(PageNode::Leaf(promoted_ref));
                     }
+                }
+                for node in classified.into_iter().rev() {
+                    self.stack.push((node, depth + 1));
                 }
             }
             return Ok(None);
@@ -754,6 +765,44 @@ mod tests {
             refs,
             vec![page.object_ref().expect("indirect page identity")]
         );
+    }
+
+    /// qpdf allocates each promoted leaf during its forward depth-first walk
+    /// (`libqpdf/QPDF_pages.cc:95-101`), so the first kid gets the lower fresh
+    /// object number. Classifying right-to-left would swap them and change the
+    /// object numbering a caller observes.
+    #[test]
+    fn direct_scalar_kids_are_promoted_in_forward_order() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let pages = pdf
+            .root_handle()
+            .expect("empty catalog")
+            .try_get_key(b"/Pages")
+            .expect("empty /Pages");
+        let kids = ObjectHandle::array(vec![ObjectHandle::integer(42), ObjectHandle::integer(43)]);
+        pages
+            .replace_key(b"/Kids", kids.clone())
+            .expect("install scalar kids");
+        pages
+            .replace_key(b"/Count", ObjectHandle::integer(2))
+            .expect("install count");
+
+        let refs = page_refs(&mut pdf).expect("two scalar leaves are two pages");
+
+        assert_eq!(refs.len(), 2);
+        assert!(
+            refs[0].number < refs[1].number,
+            "the first kid must mint the lower object number, got {refs:?}"
+        );
+        let values: Vec<_> = refs
+            .iter()
+            .map(|r| {
+                pdf.get_object_handle(*r)
+                    .try_as_integer()
+                    .expect("resolve promoted leaf")
+            })
+            .collect();
+        assert_eq!(values, vec![Some(42), Some(43)]);
     }
 
     #[test]
