@@ -1020,7 +1020,7 @@ impl<'a> Tokenizer<'a> {
     /// This is the single entrypoint every flpdf realization of
     /// `QPDF::readToken` routes through: `ByteCursor::read_token`'s classic
     /// xref subsection lookahead and `startxref` value read, the trailer's
-    /// `stream`-keyword lookahead, [`next_object_stream_integer`]'s ObjStm
+    /// `stream`-keyword lookahead, [`Self::next_object_stream_integer`]'s ObjStm
     /// header integers, the xref-reconstruction line scan's `int int obj`
     /// probe, and the canonical resolve path's `endstream`/`endobj` framing
     /// checks. `QPDFObjectHandle`'s own content-stream tokenization
