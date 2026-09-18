@@ -114,10 +114,9 @@ impl SharedObjectHintEntry {
 /// `m->normalize_content && m->normalized_streams.count(old_og)` gate
 /// (`QPDFWriter.cc:1277`) is false for every stream in that case, so no
 /// per-stream membership computation is needed.
-fn linearization_content_normalize_refs<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+fn linearization_content_normalize_refs(
     options: &crate::writer::WriterOptions,
-    page_refs: &[ObjectRef],
+    page_handles: &[ObjectHandle],
     normalized_streams_snapshot: Option<&BTreeSet<QpdfObjGen>>,
 ) -> Result<BTreeSet<QpdfObjGen>> {
     if !options.content_normalization {
@@ -127,8 +126,7 @@ fn linearization_content_normalize_refs<R: Read + Seek>(
         return Ok(snapshot.clone());
     } // cov:ignore: LLVM attributes the executed snapshot-return block to the preceding lines.
     let mut refs = BTreeSet::new();
-    for page_ref in page_refs {
-        let page = pdf.get_object_handle(*page_ref);
+    for page in page_handles {
         let contents = page.try_get_key(b"/Contents")?;
         let mut record_stream = |stream: &ObjectHandle| -> Result<()> {
             if stream.type_code()? == 10 {
@@ -1720,7 +1718,7 @@ impl LinearizationPlan {
         // content-normalization probe consume that stable sequence. Empty
         // page lists intentionally remain uncached, matching qpdf's
         // `m->all_pages.empty()` sentinel in QPDF_pages.cc:42-44.
-        let prepared_page_refs = if options.content_normalization {
+        let prepared_page_handles = if options.content_normalization {
             prepared_page_sequence
                 .as_ref()
                 .map_or(&[][..], |prepared| prepared.pages.as_slice())
@@ -1728,9 +1726,8 @@ impl LinearizationPlan {
             &[][..]
         };
         let content_normalize_refs = linearization_content_normalize_refs(
-            pdf,
             options,
-            prepared_page_refs,
+            prepared_page_handles,
             normalized_streams_snapshot,
         )?; // cov:ignore: LLVM attributes this executed multiline call terminator to the preceding line.
         let mut skipped_raw_stream_parameter_streams: BTreeSet<QpdfObjGen> = BTreeSet::new();
@@ -4215,7 +4212,7 @@ mod tests {
     use super::{
         collect_direct_handle_refs, collect_direct_handle_refs_with_context,
         collect_direct_handle_refs_with_stream_parameters_context, first_page_is_private,
-        LinearizationPlan, RawLinearizationPlan,
+        linearization_content_normalize_refs, LinearizationPlan, RawLinearizationPlan,
     };
     use crate::acroform_document_helper::AcroFormDocumentHelper;
     use crate::object_handle::ObjectHandle;
@@ -4271,6 +4268,23 @@ mod tests {
         };
 
         assert!(plan.has_raw_projection_gap());
+    }
+
+    #[test]
+    fn content_normalize_probe_walks_prepared_page_handles_without_snapshot() {
+        let options = WriterOptions {
+            content_normalization: true,
+            ..WriterOptions::default()
+        };
+        let page = ObjectHandle::dictionary(vec![(
+            b"/Contents".to_vec(),
+            ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
+        )]);
+
+        let refs = linearization_content_normalize_refs(&options, &[page], None)
+            .expect("live page handles should be inspected when no snapshot exists");
+
+        assert!(refs.is_empty(), "a direct stream has no indirect identity");
     }
 
     #[test]

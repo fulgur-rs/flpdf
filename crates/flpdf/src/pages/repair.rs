@@ -15,14 +15,14 @@ use crate::{Error, Pdf, QpdfErrorCode, QpdfExc, Result};
 /// The effective `/Pages` root and leaf order after qpdf-compatible repair.
 ///
 /// Returned by [`prepare_for_optimization`]; see that function for what "repair" covers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct PreparedPages {
     /// The effective `/Pages` root, after correcting a catalog whose `/Pages` points
     /// into the tree instead of at the true root.
     pub root: PageTreeRoot,
     /// Every `Page` leaf in document order, with qpdf's `getAllPagesInternal` repairs
     /// applied (see [`prepare_for_optimization`]).
-    pub pages: Vec<ObjectRef>,
+    pub pages: Vec<ObjectHandle>,
 }
 
 /// Location of the repaired `/Pages` root.
@@ -30,11 +30,11 @@ pub struct PreparedPages {
 /// qpdf's object handles preserve a direct `/Pages` dictionary embedded in the
 /// catalog. `Direct` therefore records its catalog owner instead of minting an
 /// object for the page-tree root.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum PageTreeRoot {
-    Indirect(ObjectRef),
+    Indirect(ObjectHandle),
     Direct {
-        catalog: ObjectRef,
+        catalog: ObjectHandle,
     },
     /// The `/Pages` root is direct and its Catalog is also direct in the
     /// trailer. The Catalog itself has no `ObjectRef`; consumers recover the
@@ -172,13 +172,11 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
         .qpdf_obj_gen()
         .filter(|object_gen| object_gen.is_indirect())
     {
-        Some(object_gen) => PageTreeRoot::Indirect(project_page_object_ref(object_gen)?),
-        None => match catalog.object_ref() {
-            Some(catalog_ref) => PageTreeRoot::Direct {
-                catalog: catalog_ref,
-            },
-            None => PageTreeRoot::DirectCatalog,
+        Some(_) => PageTreeRoot::Indirect(pages.clone()),
+        None if catalog.is_indirect() => PageTreeRoot::Direct {
+            catalog: catalog.clone(),
         },
+        None => PageTreeRoot::DirectCatalog,
     };
     let prepared = PreparedPages {
         root,
@@ -194,7 +192,7 @@ struct CanonicalRepairState {
     seen: BTreeSet<QpdfObjGen>,
     visited: BTreeSet<QpdfObjGen>,
     visited_direct: HashSet<ObjectHandleIdentity>,
-    pages: Vec<ObjectRef>,
+    pages: Vec<ObjectHandle>,
 }
 
 /// One suspended `getAllPagesInternal` frame.
@@ -329,12 +327,11 @@ fn repair_page_tree_handle<R: Read + Seek>(
             .filter(|object_gen| object_gen.is_indirect());
         // cov:ignore-start: every direct leaf is promoted above and every
         // remaining leaf is an indirect handle with its QpdfObjGen identity.
-        let page_object_gen = page_object_gen.ok_or_else(|| {
+        page_object_gen.ok_or_else(|| {
             Error::Internal("page-tree leaf lost its indirect identity".to_owned())
         })?;
         // cov:ignore-end
-        let page_ref = project_page_object_ref(page_object_gen)?;
-        state.pages.push(page_ref);
+        state.pages.push(kid.clone());
     }
     Ok(())
 }
@@ -432,10 +429,11 @@ fn promote_page_handle<R: Read + Seek>(
     Ok(promoted)
 }
 
-fn project_page_object_ref(object_gen: QpdfObjGen) -> Result<ObjectRef> {
-    // `PreparedPages` is an existing ObjectRef-valued public projection. Raw
-    // page identities are still traversed and diagnosed by their qpdf key, but
-    // cannot be silently narrowed to a different valid N G R reference here.
+pub(crate) fn page_ref_from_handle(handle: &ObjectHandle) -> Result<ObjectRef> {
+    let object_gen = handle
+        .qpdf_obj_gen()
+        .filter(|object_gen| object_gen.is_indirect())
+        .ok_or_else(|| Error::Unsupported("page handle has no indirect identity".to_owned()))?;
     object_gen.to_object_ref().ok_or_else(|| {
         Error::Unsupported(format!(
             "page object {} {} cannot be represented as a valid ObjectRef",
@@ -443,6 +441,12 @@ fn project_page_object_ref(object_gen: QpdfObjGen) -> Result<ObjectRef> {
             object_gen.get_gen()
         ))
     })
+}
+
+impl PreparedPages {
+    pub(crate) fn page_refs(self) -> Result<Vec<ObjectRef>> {
+        self.pages.iter().map(page_ref_from_handle).collect()
+    }
 }
 
 fn replace_handle_key(holder: &ObjectHandle, key: &[u8], value: ObjectHandle) -> Result<()> {
@@ -473,8 +477,10 @@ fn is_rectangle_handle(value: &ObjectHandle) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use super::prepare_for_optimization;
     use super::prepare_for_optimization_with_max_depth;
-    use crate::Pdf;
+    use crate::object_handle::ObjectValue;
+    use crate::{ObjectHandle, Pdf};
     use std::io::Cursor;
 
     #[test]
@@ -498,5 +504,55 @@ mod tests {
             .expect_err("the explicit depth bound should stop at the direct root");
 
         assert!(error.to_string().contains("direct /Pages node"));
+    }
+
+    #[test]
+    fn prepared_pages_keeps_a_raw_page_identity_live() {
+        let mut pdf = Pdf::empty().expect("empty PDF should open");
+        let catalog = pdf.root_handle().expect("empty PDF has a catalog");
+        let pages = catalog
+            .try_get_key(b"/Pages")
+            .expect("catalog has a page-tree root");
+        let raw_page = pdf.get_object_handle_by_raw_identity(3, 65_535);
+        raw_page.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+                (
+                    b"/MediaBox".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(612),
+                        ObjectHandle::integer(792),
+                    ]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        pages
+            .replace_key(b"/Kids", ObjectHandle::array(vec![raw_page.clone()]))
+            .expect("replace page-tree kids");
+        pages
+            .replace_key(b"/Count", ObjectHandle::integer(1))
+            .expect("replace page count");
+
+        let prepared = prepare_for_optimization(&mut pdf)
+            .expect("raw page identity must not fail during canonical repair")
+            .expect("the empty document has a page tree");
+
+        assert_eq!(prepared.pages.len(), 1);
+        assert_eq!(prepared.pages[0].qpdf_obj_gen(), raw_page.qpdf_obj_gen());
+        assert_eq!(prepared.pages[0].object_ref(), None);
+
+        crate::optimization::inherited_attrs::push(&mut pdf, &prepared, true, false)
+            .expect("raw page identity must survive inherited-attribute push");
+        crate::optimization::Optimization::optimize(
+            &mut pdf,
+            &std::collections::BTreeMap::new(),
+            true,
+            |_, _| Ok(0),
+        )
+        .expect("raw page identity must survive qpdf optimization traversal");
     }
 }

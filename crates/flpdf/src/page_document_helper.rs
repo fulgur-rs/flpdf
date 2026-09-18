@@ -92,9 +92,10 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
             return Err(Error::Missing("/Root"));
         }
         self.pdf.root_handle()?;
-        Ok(crate::pages::repair::prepare_for_optimization(self.pdf)?
-            .map(|prepared| prepared.pages)
-            .unwrap_or_default())
+        match crate::pages::repair::prepare_for_optimization(self.pdf)? {
+            Some(prepared) => prepared.page_refs(),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Materialize inherited page attributes on each leaf page.

@@ -312,11 +312,11 @@ fn promote_page_tree_inheritable_values<R: Read + Seek>(
 
 fn page_tree_root_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    page_root: PageTreeRoot,
+    page_root: &PageTreeRoot,
 ) -> Result<ObjectHandle> {
     match page_root {
-        PageTreeRoot::Indirect(root_ref) => Ok(pdf.get_object_handle(root_ref)),
-        PageTreeRoot::Direct { catalog } => pdf.get_object_handle(catalog).try_get_key(b"/Pages"),
+        PageTreeRoot::Indirect(root) => Ok(root.clone()),
+        PageTreeRoot::Direct { catalog } => catalog.try_get_key(b"/Pages"),
         PageTreeRoot::DirectCatalog => pdf.root_handle()?.try_get_key(b"/Pages"),
     }
 }
@@ -484,7 +484,7 @@ fn rebuild_page_tree_canonical<R: Read + Seek>(
     // replaces the page tree wholesale, so invalidate the cached prepared
     // snapshot before any replacement can fail partway.
     pdf.invalidate_page_list_cache();
-    let root = page_tree_root_handle(pdf, page_root)?;
+    let root = page_tree_root_handle(pdf, &page_root)?;
     let mut page_tree_nodes = Vec::new();
     collect_page_tree_nodes(
         root.clone(),
@@ -502,6 +502,10 @@ fn rebuild_page_tree_canonical<R: Read + Seek>(
     // Capture qpdf's repaired leaf order before changing /Kids or /Parent.
     // Any original leaf absent from ref_map is a removed page.
     let original_pages = prepared.pages;
+    let original_page_refs: Vec<ObjectRef> = original_pages
+        .iter()
+        .filter_map(ObjectHandle::object_ref)
+        .collect();
 
     let mut new_kids: Vec<ObjectRef> = Vec::with_capacity(selected.len());
     let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
@@ -561,10 +565,17 @@ fn rebuild_page_tree_canonical<R: Read + Seek>(
     // root remains the live dictionary embedded in the catalog.
     // cov:ignore-start: prepare_for_optimization guarantees that the retained /Pages root is a dictionary
     if !root.try_is_dictionary()? {
-        return Err(Error::Unsupported(match page_root {
-            PageTreeRoot::Indirect(root_ref) => {
-                format!("document /Pages root {root_ref} is not a dictionary")
-            }
+        return Err(Error::Unsupported(match &page_root {
+            PageTreeRoot::Indirect(root) => root
+                .qpdf_obj_gen()
+                .map(|object_gen| {
+                    format!(
+                        "document /Pages root {} {} is not a dictionary",
+                        object_gen.get_obj(),
+                        object_gen.get_gen()
+                    )
+                })
+                .unwrap_or_else(|| "document /Pages root is not a dictionary".into()),
             PageTreeRoot::Direct { .. } => {
                 "document catalog /Pages root is not a dictionary".into()
             }
@@ -598,7 +609,7 @@ fn rebuild_page_tree_canonical<R: Read + Seek>(
     // A removed page is an original leaf that no selection kept (absent from
     // `ref_map`). New refs minted for duplicate selections are fresh object
     // numbers, never original leaves, so they are correctly excluded.
-    let removed_pages: BTreeSet<ObjectRef> = original_pages
+    let removed_pages: BTreeSet<ObjectRef> = original_page_refs
         .into_iter()
         .filter(|p| !ref_map.contains_key(p))
         .collect();
@@ -1003,7 +1014,7 @@ mod tests {
         let prepared = crate::pages::repair::prepare_for_optimization(&mut pdf)
             .expect("page preparation must succeed")
             .expect("fixture has a page tree");
-        assert_eq!(prepared.pages, vec![ObjectRef::new(3, 0)]);
+        assert_eq!(prepared.pages[0].object_ref(), Some(ObjectRef::new(3, 0)));
 
         rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)])
             .expect("flat page rebuild must succeed");
@@ -1365,7 +1376,7 @@ mod tests {
         let prepared = crate::pages::repair::prepare_for_optimization(&mut pdf)
             .expect("page preparation must succeed")
             .expect("fixture has a page tree");
-        assert_eq!(prepared.pages, vec![ObjectRef::new(3, 0)]);
+        assert_eq!(prepared.pages[0].object_ref(), Some(ObjectRef::new(3, 0)));
 
         let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0), ObjectRef::new(3, 0)])
             .expect("duplicate rebuild must succeed");

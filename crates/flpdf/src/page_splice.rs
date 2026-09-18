@@ -892,7 +892,14 @@ mod tests {
         let prepared = crate::pages::repair::prepare_for_optimization(&mut pdf)
             .unwrap()
             .expect("flat page tree should be prepared");
-        assert_eq!(prepared.pages, page_list(&mut pdf));
+        assert_eq!(
+            prepared
+                .pages
+                .iter()
+                .map(|page| page.object_ref().expect("page identity"))
+                .collect::<Vec<_>>(),
+            page_list(&mut pdf)
+        );
 
         splice_pages(&mut pdf, 0..1, &[]).unwrap();
 

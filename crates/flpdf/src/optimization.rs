@@ -320,11 +320,11 @@ impl Optimization {
         F: FnMut(Option<QpdfObjGen>, &ObjectHandle) -> crate::Result<u8>,
     {
         let prepared = Self::prepare_pdf(pdf, allow_changes, true)?;
-        let page_refs = prepared
+        let page_handles = prepared
             .as_ref()
             .map(|prepared| prepared.pages.as_slice())
             .unwrap_or_default();
-        let mut maps = Self::build_maps(pdf, page_refs, skip_stream_parameters)?;
+        let mut maps = Self::build_maps(pdf, page_handles, skip_stream_parameters)?;
         maps.filter_compressed_objects(object_stream_data);
         Ok(maps)
     }
@@ -390,7 +390,7 @@ impl Optimization {
 
     fn build_maps<R, F>(
         pdf: &mut Pdf<R>,
-        page_refs: &[ObjectRef],
+        page_handles: &[ObjectHandle],
         mut skip_stream_parameters: F,
     ) -> crate::Result<Self>
     where
@@ -399,12 +399,11 @@ impl Optimization {
     {
         let mut maps = Self::default();
 
-        for (page_number, &page_ref) in page_refs.iter().enumerate() {
-            let page = pdf.get_object_handle(page_ref);
+        for (page_number, page) in page_handles.iter().enumerate() {
             maps.update_object_maps(
                 pdf,
                 ObjectUser::Page(page_number as u32),
-                page,
+                page.clone(),
                 &mut skip_stream_parameters,
             )?;
         }
