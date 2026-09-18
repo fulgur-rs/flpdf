@@ -3996,6 +3996,14 @@ flpdfのlinearization probeはこの境界で早期return・warning抑止をし�
 出力bytesもqpdf 11.9.0と一致させた。plain側のlegacy `isDataModified` early returnは
 このlinearized consumerのscope外である。
 
+2026-09-18（`flpdf-8od1h`）: 上記でscope外としていたplain側の`isDataModified`
+early return自体を`canonical_stream_will_be_refiltered_with_policy`から撤去し、
+canonical `canonical_stream_filter_probe`へ統一した。qpdfの`willFilterStream`
+（`QPDFWriter.cc:1254`）は`isDataModified() || compress_streams || stream_decode_level`
+をfilterフラグへ畳むだけで早期returnを持たない。modified streamを含むlibrary
+RED/GREENテスト（`modified_streams_use_the_canonical_refilter_probe`）と
+qpdf-zlib-compat byte比較で検証済み（route matrix C22 は `canonical` へ再分類）。
+
 ### Linearization stop diagnostics retain qpdf source state (`flpdf-qlwe5`, 2026-09-17)
 
 qpdfのlinearization writerはpage-tree preparationとstream/object setupの後に、
