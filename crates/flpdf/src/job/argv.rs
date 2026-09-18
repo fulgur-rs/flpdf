@@ -2628,4 +2628,37 @@ mod tests {
             b"custom-\xff version 11.9.0\nRun custom-\xff --copyright to see copyright and license information.\n"
         );
     }
+
+    #[test]
+    fn job_json_file_open_error_strips_the_os_error_suffix_for_other_failures() {
+        // Neither NotFound (ENOENT) nor IsADirectory (EISDIR): exercises the
+        // generic strerror-style fallback arm, distinct from both of
+        // job_json_file_open_error's special-cased kinds.
+        let error = std::io::Error::from_raw_os_error(13); // EACCES
+        let rendered = job_json_file_open_error(Path::new("job.json"), error);
+        let Error::SystemBytes(message) = rendered else {
+            panic!("expected a byte-preserving SystemBytes error, got {rendered:?}");
+        };
+        let text = String::from_utf8(message).expect("ASCII path and strerror text");
+        assert!(
+            text.starts_with("open job.json: "),
+            "path must be rendered byte-preserving, got {text:?}"
+        );
+        assert!(
+            !text.contains("(os error"),
+            "qpdf's strerror wording has no numeric os-error suffix: {text:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_json_file_open_error_preserves_non_utf8_path_bytes() {
+        let path = path_from_bytes(b"\xff");
+        let error = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let rendered = job_json_file_open_error(&path, error);
+        let Error::SystemBytes(message) = rendered else {
+            panic!("expected a byte-preserving SystemBytes error, got {rendered:?}");
+        };
+        assert_eq!(message, b"open \xff: No such file or directory");
+    }
 }
