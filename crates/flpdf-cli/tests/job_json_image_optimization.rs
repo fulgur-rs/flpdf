@@ -414,6 +414,176 @@ fn job_json_inline_image_options_match_qpdf_when_available() {
 }
 
 #[test]
+fn job_json_cli_externalize_and_thresholds_layer_after_json_like_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        directory.path().join("input.pdf"),
+        inline_image_pdf(200, 200),
+    )
+    .expect("write input");
+    let qpdf_job = serde_json::json!({
+        "inputFile": "input.pdf",
+        "outputFile": "qpdf.pdf",
+        "staticId": ""
+    });
+    let flpdf_job = serde_json::json!({
+        "inputFile": "input.pdf",
+        "outputFile": "flpdf.pdf",
+        "staticId": ""
+    });
+    std::fs::write(directory.path().join("qpdf.json"), qpdf_job.to_string())
+        .expect("write qpdf job");
+    std::fs::write(directory.path().join("flpdf.json"), flpdf_job.to_string())
+        .expect("write flpdf job");
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .args([
+            "--job-json-file=qpdf.json",
+            "--externalize-inline-images",
+            "--ii-min-bytes=0",
+        ])
+        .output()
+        .expect("run qpdf layered image options");
+    assert!(qpdf.status.success(), "qpdf job failed: {qpdf:?}");
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .current_dir(directory.path())
+        .args([
+            "--job-json-file=flpdf.json",
+            "--externalize-inline-images",
+            "--ii-min-bytes=0",
+        ])
+        .output()
+        .expect("run flpdf layered image options");
+    assert!(flpdf.status.success(), "flpdf job failed: {flpdf:?}");
+
+    let qpdf_output = directory.path().join("qpdf.pdf");
+    let flpdf_output = directory.path().join("flpdf.pdf");
+    assert_eq!(image_filters(&qpdf_output), image_filters(&flpdf_output));
+    assert_eq!(image_filters(&flpdf_output), ["/FlateDecode"]);
+}
+
+#[test]
+fn job_json_cli_optimize_and_thresholds_layer_after_json_like_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().expect("tempdir");
+    std::fs::write(directory.path().join("input.pdf"), raw_image_pdf(200, 200))
+        .expect("write input");
+    let qpdf_job = serde_json::json!({
+        "inputFile": "input.pdf",
+        "outputFile": "qpdf.pdf",
+        "staticId": ""
+    });
+    let flpdf_job = serde_json::json!({
+        "inputFile": "input.pdf",
+        "outputFile": "flpdf.pdf",
+        "staticId": ""
+    });
+    std::fs::write(directory.path().join("qpdf.json"), qpdf_job.to_string())
+        .expect("write qpdf job");
+    std::fs::write(directory.path().join("flpdf.json"), flpdf_job.to_string())
+        .expect("write flpdf job");
+    let image_options = [
+        "--optimize-images",
+        "--oi-min-width=0",
+        "--oi-min-height=0",
+        "--oi-min-area=0",
+    ];
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .args(["--job-json-file=qpdf.json"])
+        .args(image_options)
+        .output()
+        .expect("run qpdf layered optimizer options");
+    assert!(qpdf.status.success(), "qpdf job failed: {qpdf:?}");
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .current_dir(directory.path())
+        .args(["--job-json-file=flpdf.json"])
+        .args(image_options)
+        .output()
+        .expect("run flpdf layered optimizer options");
+    assert!(flpdf.status.success(), "flpdf job failed: {flpdf:?}");
+
+    assert_eq!(
+        image_filters(&directory.path().join("qpdf.pdf")),
+        image_filters(&directory.path().join("flpdf.pdf"))
+    );
+    assert_eq!(
+        image_filters(&directory.path().join("flpdf.pdf")),
+        ["/DCTDecode"]
+    );
+}
+
+#[test]
+fn job_json_cli_keep_inline_images_layers_after_json_like_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        directory.path().join("input.pdf"),
+        inline_image_pdf(200, 200),
+    )
+    .expect("write input");
+    let qpdf_job = serde_json::json!({
+        "inputFile": "input.pdf",
+        "outputFile": "qpdf.pdf",
+        "optimizeImages": "",
+        "oiMinWidth": "0",
+        "oiMinHeight": "0",
+        "oiMinArea": "0",
+        "staticId": ""
+    });
+    let flpdf_job = serde_json::json!({
+        "inputFile": "input.pdf",
+        "outputFile": "flpdf.pdf",
+        "optimizeImages": "",
+        "oiMinWidth": "0",
+        "oiMinHeight": "0",
+        "oiMinArea": "0",
+        "staticId": ""
+    });
+    std::fs::write(directory.path().join("qpdf.json"), qpdf_job.to_string())
+        .expect("write qpdf job");
+    std::fs::write(directory.path().join("flpdf.json"), flpdf_job.to_string())
+        .expect("write flpdf job");
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .args(["--job-json-file=qpdf.json", "--keep-inline-images"])
+        .output()
+        .expect("run qpdf keep-inline layering");
+    assert!(qpdf.status.success(), "qpdf job failed: {qpdf:?}");
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .current_dir(directory.path())
+        .args(["--job-json-file=flpdf.json", "--keep-inline-images"])
+        .output()
+        .expect("run flpdf keep-inline layering");
+    assert!(flpdf.status.success(), "flpdf job failed: {flpdf:?}");
+
+    assert!(
+        pages_json(&directory.path().join("qpdf.pdf"))["pages"][0]["images"]
+            .as_array()
+            .expect("qpdf image array")
+            .is_empty()
+    );
+    assert_eq!(
+        pages_json(&directory.path().join("qpdf.pdf")),
+        pages_json(&directory.path().join("flpdf.pdf"))
+    );
+}
+
+#[test]
 fn job_json_image_options_reject_wrong_types_at_the_json_boundary() {
     let directory = tempfile::tempdir().expect("tempdir");
     std::fs::write(directory.path().join("input.pdf"), raw_image_pdf(200, 200))
