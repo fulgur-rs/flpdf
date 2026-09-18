@@ -3976,6 +3976,38 @@ mod object_emitter_tests {
         Ok(())
     }
 
+    /// The other `emit_live` unit tests in this module build their PDF from
+    /// `pdf()` (`one-page-no-ext.pdf`), whose `/Pages` tree has `/Count 0`,
+    /// so `qdf_page_context`'s page/content walk never actually iterates for
+    /// them. Exercise it against a page with a real indirect content stream
+    /// so its independent re-derivation of `contents_sequences` and
+    /// `normalized_streams` (mirroring `initialize_special_streams`,
+    /// `writer.rs`) is itself under test, not just its signature.
+    #[test]
+    fn qdf_page_context_walks_a_real_pages_content_stream() -> crate::Result<()> {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        ))?;
+        let page_ref = ObjectRef::new(3, 0);
+        let content_ref = ObjectRef::new(7, 0);
+        assert_eq!(
+            PageDocumentHelper::new(&mut pdf).get_all_pages()?,
+            vec![page_ref]
+        );
+
+        let content_stream_state = qdf_page_context(&mut pdf)?;
+
+        assert_eq!(content_stream_state.page_sequences.get(&page_ref), Some(&1));
+        assert_eq!(
+            content_stream_state.contents_sequences.get(&content_ref),
+            Some(&1)
+        );
+        assert!(content_stream_state
+            .normalized_streams
+            .contains(&QpdfObjGen::from_valid_object_ref_for_test(content_ref)));
+        Ok(())
+    }
+
     #[test]
     fn encrypted_live_body_adjusts_aes_stream_length_before_emission() -> crate::Result<()> {
         let mut pdf = pdf();
