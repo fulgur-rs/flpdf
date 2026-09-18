@@ -1065,7 +1065,7 @@ fn write_part1_xref_and_trailer(
         )?; // cov:ignore: obsolete compatibility branch is not a canonical caller
         let data_start = header_end.checked_add(1).ok_or_else(|| {
             crate::Error::Unsupported("Part-1 xref entry offset overflows usize".to_string())
-        })?;
+        })?; // cov:ignore: pass1 selects the ID value before installing this callback
         let data_end = data_start.checked_add(data_len).ok_or_else(|| {
             crate::Error::Unsupported("Part-1 xref patch range overflows usize".to_string())
         })?;
@@ -1304,7 +1304,7 @@ fn write_main_xref_and_trailer(
             // cov:ignore-start: pass1 selects the ID value before installing this callback
             crate::Error::Internal("missing pass-1 linearization ID value".to_string())
             // cov:ignore-end
-        })?;
+        })?; // cov:ignore: pass1 selects the ID value before installing this callback
         id_value.write_id_value_with_qpdf_obj_gen_map(output, map, removed_refs)
     };
     source_trailer.write_trailer_with_ref_map_and_kind(
