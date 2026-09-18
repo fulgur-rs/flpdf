@@ -3542,9 +3542,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// input being diagnosed as qpdf diagnoses it or not.
     ///
     /// **Both halves are pinned, because each is a different outcome.** Delete
-    /// the `allow_eof` below and every fixture whose input ends where a
-    /// framing keyword was expected reddens. The `endstream` ones swap the
-    /// missing keyword for `unexpected EOF`, a wrong message;
+    /// the `allow_eof` call inside [`Tokenizer::read_qpdf_token`] below and
+    /// every fixture whose input ends where a framing keyword was expected
+    /// reddens. The `endstream` ones swap the missing keyword for `unexpected
+    /// EOF`, a wrong message;
     /// `a_stream_ending_the_input_after_endstream_warns_and_still_resolves`,
     /// the `endobj` half, stops *resolving at all* — there the difference is
     /// not the message but whether the object comes back.
@@ -3559,12 +3560,15 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// its last offset while it skips whitespace and comments
     /// (`libqpdf/QPDFTokenizer.cc:926-961`), so return the token start after
     /// that skipped prefix rather than the attempted-read position.
+    ///
+    /// [`Tokenizer::read_qpdf_token`] is the single entrypoint every flpdf
+    /// realization of `QPDF::readToken` routes through (`tokenizer.rs`); this
+    /// call is qpdf's `readObject`/`readStream` framing checks, unmodified.
     fn read_token_from_input(&self) -> Result<(Token, u64)> {
         let start = self.tell()?;
         let token = self.scan_forward(|bytes| {
             let mut tokenizer = Tokenizer::new(bytes);
-            tokenizer.allow_eof();
-            let token = tokenizer.read_token(true, 0)?;
+            let token = tokenizer.read_qpdf_token(0)?;
             Ok((token, tokenizer.position()))
         })?;
         let token_start = if token.token_type == TokenType::Eof {
