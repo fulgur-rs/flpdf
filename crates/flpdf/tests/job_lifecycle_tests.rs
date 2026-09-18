@@ -2548,6 +2548,36 @@ fn raw_argv_missing_job_json_file_uses_qpdf_strerror_wording() {
     );
 }
 
+/// A nested `jobJsonFile` JSON key dispatches through the same
+/// `Config::jobJsonFile` callback as `--job-json-file`
+/// (`libqpdf/qpdf/auto_job_json_init.hh:472-474`), so a missing include must
+/// use the same qpdf `strerror`-based wording as
+/// `raw_argv_missing_job_json_file_uses_qpdf_strerror_wording` above.
+/// Confirmed against `/usr/bin/qpdf` 11.9.0 (nested one layer via
+/// `--job-json-file`): the inner "error with job-json file ...: open ...:
+/// No such file or directory" text is unchanged; only the outer argv-level
+/// wrapping (added by `apply_job_json_file`, not exercised by this
+/// library-level call) differs.
+#[test]
+fn nested_missing_job_json_file_uses_qpdf_strerror_wording() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing-nested.json");
+    let json = serde_json::json!({ "jobJsonFile": missing }).to_string();
+
+    let error = QPDFJob::new()
+        .initialize_from_json(&json)
+        .expect_err("a missing nested jobJsonFile include must fail");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "error with job-json file {}: open {}: No such file or directory\n\
+             Run qpdfjob json --job-json-help for information on the file format.",
+            missing.display(),
+            missing.display()
+        )
+    );
+}
+
 #[test]
 fn page_label_order_errors_are_not_usage_errors() {
     // qpdf raises the three order/page-count failures with
