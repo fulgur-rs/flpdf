@@ -1046,13 +1046,12 @@ fn write_part1_xref_and_trailer(
         let data_len = (first_page_count as usize)
             .checked_mul(CLASSIC_XREF_ENTRY_WIDTH)
             .ok_or_else(|| {
-                // cov:ignore-start: first_page_count is a u32 and supported
-                // targets have enough usize capacity for these fixed entries;
-                // this is defensive overflow handling.
+                // Defensive overflow handling; the enclosing compatibility
+                // block is not a canonical production caller.
                 crate::Error::Unsupported(
                     "Part-1 xref placeholder length exceeds usize range".to_string(),
                 )
-            })?; // cov:ignore-end
+            })?;
         let header_end = write_xref_table_from_offsets(
             out,
             param_dict_obj_number,
@@ -1064,15 +1063,11 @@ fn write_part1_xref_and_trailer(
             0,
         )?; // cov:ignore: obsolete compatibility branch is not a canonical caller
         let data_start = header_end.checked_add(1).ok_or_else(|| {
-            // cov:ignore-start: OutputSink positions cannot reach usize::MAX
             crate::Error::Unsupported("Part-1 xref entry offset overflows usize".to_string())
-            // cov:ignore-end
-        })?; // cov:ignore: defensive position overflow
+        })?;
         let data_end = data_start.checked_add(data_len).ok_or_else(|| {
-            // cov:ignore-start: fixed-width rows cannot exceed the addressable output buffer
             crate::Error::Unsupported("Part-1 xref patch range overflows usize".to_string())
-            // cov:ignore-end
-        })?; // cov:ignore: defensive patch-range overflow
+        })?;
         Some(Part1XrefPatch {
             start_num: param_dict_obj_number,
             count: first_page_count,
