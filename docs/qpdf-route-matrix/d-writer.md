@@ -568,7 +568,12 @@ the remaining route-specific trailer framing is migrated.
 that "null visibility" is an unresolved residual bridge — does not hold up
 under an oracle check. Both trailer-entry serializers
 (`writer/object.rs::unparse_trailer_entries_with_ref_map_and_kind` for
-classic, `writer/serialize.rs::write_live_trailer_entries` for xref-stream)
+classic, `writer/serialize.rs::write_live_trailer_entries` for plain
+xref-stream, and `linearization/writer.rs:1393
+canonical_linearization_trailer_entries` for linearized xref-stream —
+three, not two; the third is production-reachable from
+`linearization/writer.rs:2448` inside `do_write_pass`, and the flpdf
+column of this row does not list it yet)
 already apply qpdf's dereferencing null check
 (`QPDF_Dictionary::getKeys()`'s `!isNull()` filter, matching
 `QPDF_Dictionary.cc:117-127` and `QPDFObjectHandle.cc:352-356`) before a
@@ -576,11 +581,24 @@ trailer key is emitted. A targeted fixture with a trailer key set to an
 indirect reference at object number 0 (`/CustomKey 0 0 R`, which qpdf treats
 as non-indirect and therefore null — see the `object_zero_child_serializes_as_null_through_the_scalar_container_route`
 test in `writer/object.rs`) drops that key from the output identically in
-qpdf 11.9.0 and flpdf, across classic, `--qdf`, and
-`--object-streams=generate` forms. `writer/serialize.rs`'s explicit
-`object_ref.number == 0` check is therefore defensive, not a gap: the general
-null-dereference check already covers this case through normal object
-resolution. What remains "mixed" is purely structural — two independently
+qpdf 11.9.0 and flpdf, across classic, `--qdf`,
+`--object-streams=generate`, `--linearize`, and
+`--linearize --object-streams=generate` forms — the last two exercising
+the third serializer above.
+
+The scope of that evidence is narrower than "the explicit check is
+defensive, not a gap", which an earlier draft of this note claimed.
+Both parsers null out `0 0 R` at parse time (qpdf
+`QPDFParser.cc:168`, flpdf `parser.rs:872`), so every one of those runs
+terminates on the `try_is_null()` arm and the
+`object_ref.number == 0` predicate is never evaluated. What the fixture
+establishes is that the parse-derived shape cannot diverge; the
+predicate's own behaviour is untested by it. A library-API caller can
+still install a non-null object 0 through `Pdf::get_object_handle` plus
+`replace_object`, where flpdf deliberately pins serialization as null
+(`writer/object.rs:6108`) while qpdf's `unparseChild`
+(`QPDFWriter.cc:1149-1154`) would write the value; that path is a
+separate question from this row. What remains "mixed" is purely structural — two independently
 maintained trailer-entry loops instead of qpdf's single `writeTrailer`
 function — with no observed byte divergence. Reclassifying the row to
 canonical would require merging those two loops, which was judged too large
