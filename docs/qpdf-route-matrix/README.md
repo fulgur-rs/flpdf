@@ -171,7 +171,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 | **resolve 境界で例外は必ず warning に降格し、未解決なら null になる**（`QPDF::resolve` から例外は出ない） | `libqpdf/QPDF.cc:1737-1742` / `libqpdf/QPDF.cc:1745-1749` | A4 canonical。B22 mixed — resolve 側の再構築経路は `flpdf-3yn9.48.19` で qpdf の retry 条件（`getType() == 1` 限定、それ以外は `not found in file after regenerating cross reference table` をwarn して null、`libqpdf/QPDF.cc:1618-1633`）に揃えた。ただし本番経路では再構築後に compressed entry が残らない（`install_source_xref_entries` がテーブルを丸ごと置換し `recover_xref_entries` は `Uncompressed` しか挿入しない）ため、compressed 側は qpdf 同様に防御的な分岐で、end-to-end 実証はP3 の probe として継続中（`libqpdf/QPDF.cc:1618-1633`） | qpdf が warn + null で続行する入力で flpdf が `Err` を返し、その object 以降の処理が止まる。probe B-P3 |
 | **回復予算は `bool` 1 個**（2 回目の `reconstruct_xref` は引数の例外をそのまま re-throw する。残り回数カウンタは存在しない） | `libqpdf/QPDF.cc:518-522` / `include/qpdf/QPDF.hh:1480` | B25 mixed（open 時は `already_reconstructed` を経由して `ResolverCore` に転記）。B34 bridge — qpdf に対応物のない 64 回の read-to-end fallback 予算（`crates/flpdf/src/pdf.rs:148-154`） | 破損 PDF で回復の起きる回数が変わり、reconstruct の 3 連 warn（B33）が余分に出る／出ない |
 | **reconstruct が xref から消すのは type 1 entry のみ。ObjStm の内部は意図的に走査しない** | `libqpdf/QPDF.cc:532-541` / `libqpdf/QPDF.cc:618-622` | B24 canonical（**両側 absent が 1:1 対応**）。B23 canonical で scan 本体は 2 経路が共有 | 回復後に compressed entry を復元すると、qpdf が到達しない object を出力に含める。コミット `6ddb9661` で 1 度是正済みの退行そのもの |
-| **xref entry の上書き規則は 3 primitive で違う**（`insertXrefEntry` = first-seen wins、`insertFreeXrefEntry` = 未登録時のみ、`insertReconstructedXrefEntry` = 後勝ち + `deleted_objects` 抑止） | `libqpdf/QPDF.cc:1149-1184` / `libqpdf/QPDF.cc:1187-1192` / `libqpdf/QPDF.cc:1197-1210` | B19 canonical。B20 mixed — `deleted_objects` 抑止が `merge_recovered_qpdf_state` の事後 `retain` で適用され、bootstrap の 4 つの handoff のうち初段 parse 失敗（`crates/flpdf/src/xref.rs:1368-1383`）だけがこれを通らない | 増分更新 PDF でどの世代の object が読まれるかが変わる。free entry を含む classic xref の直後が壊れた入力で `qpdf --show-xref` と食い違う。probe B-P2 |
+| **xref entry の上書き規則は 3 primitive で違う**（`insertXrefEntry` = first-seen wins、`insertFreeXrefEntry` = 未登録時のみ、`insertReconstructedXrefEntry` = 後勝ち + `deleted_objects` 抑止） | `libqpdf/QPDF.cc:1149-1184` / `libqpdf/QPDF.cc:1187-1192` / `libqpdf/QPDF.cc:1197-1210` | B19 canonical。B20 mixed — `deleted_objects` 抑止は 2026-09-18（`flpdf-3yn9.48.157`）に `recover_xref_from_linear_scan` の行スキャン直後（`crates/flpdf/src/xref.rs:2004`）へ移し、5 つの reconstruction handoff すべてに適用した。mixed が残るのは qpdf の 1 関数が guard / 後勝ち / 抑止の 3 箇所に分かれている点 | 増分更新 PDF でどの世代の object が読まれるかが変わる。`/XRefStm` が free 行の直後で壊れる入力で `qpdf --show-xref` と食い違っていた（probe B-P2 で実測・解消） |
 | **`QPDF::readToken` は `allow_bad = true` を保証するが、全token consumerがこの責務ではない** | `libqpdf/QPDF.cc:1535-1539,1801-1814,846-946` | B7 mixed。canonical/bootstrap ObjStm headerは `Tokenizer::next_object_stream_integer`、classic xrefはByteCursorを使う | ObjStm headerはqpdfの2 token読取→integer検査順を専用consumerで保持する。classic xrefはreadLine/parse_xrefEntryに対応するため、falseを一律trueへ変えない（B-P7） |
 | **`QPDFParser` は context があれば warn、無ければ同じ診断を例外に昇格する** | `libqpdf/QPDFParser.cc:487-498`（`libqpdf/QPDFParser.cc:496` が throw）/ `libqpdf/QPDFParser.cc:161-165` | B3 canonical（`has_context` 分岐 1 本）。B32 mixed — qpdf の 2 軸（例外クラス × `qpdf_error_code_e`）を `crates/flpdf/src/error.rs::Error` の 1 軸に畳んでいる | document なしの parse で構文エラーが黙って null になる。`Error::Parse` だけが reconstruct の trigger（`crates/flpdf/src/reader/resolver.rs:1615`）なので、振り分けを誤ると回復分岐自体が起きなくなる |
 
@@ -670,7 +670,7 @@ A11 を A10 の後に置く理由で、facade の `next_available_object_ref` �
 3. **B8〜B13 / B34** — canonical file-object/header/stream/trailer責務へbootstrap consumerを移す。
    B10のEOL warning、B11のrecovery、B13のreadTrailer、B34のfallback撤去をbounded sliceに分ける。
 4. **B22 / B25 / B20** — canonical reconstructと3種のxref登録primitiveへconsumerを順次移行する。
-   B20のdeleted_objects抑止primitiveは全reconstruct統合を待たずに移植できる。
+   B20のdeleted_objects抑止は2026-09-18（`flpdf-3yn9.48.157`）に全reconstruct handoffへ適用済みで、残るのはguard/後勝ち/抑止を1つのprimitiveへ束ねる作業。
 5. **B27 / B28 / B30 / B32 / B33** — bootstrap handoff・warning配送・例外分類を同じownerへ寄せる。
    warning順序とresolve境界のwarn/null降格を各sliceで検証する。
 6. **B14** — 自己参照Prevの既存probeでは二重warningは再現しない。visited初期化の変更を先に決めず、
@@ -978,7 +978,7 @@ consumer全体のmixed分類は残るため、行分類の確定を全parity完�
 | A-3 | 内部契約確認 | A13 | removeObjectのcache eraseとowner切断をinternal witnessで確認する。削除済みpublic wrapperをprobe前提に戻さない。 |
 | A-4 | 未観測 | A1/A20 | bootstrap handleの持越しidentityとdisconnect順序を確認する。 |
 | B-P1 | 既存probeで二重warningなし | B14 | 自己参照Prevでは双方同じ3 warning・exit 3。追加chainを調べ、二重pushを既知事実として扱わない。 |
-| B-P2 | consumer調査 | B20 | 初段parse失敗handoffのdeleted_objects状態と登録primitiveの抑止をoracle fixtureで照合する。 |
+| B-P2 | consumer調査 | B20 | **解消（2026-09-18、`flpdf-3yn9.48.157`）**: `/XRefStm` が free 行の直後に unknown entry type を持つ hybrid fixture で `qpdf --show-xref` と照合し、初段parse失敗handoffが抑止を落とす乖離を実測・修正した。 |
 | B-P3 | 未観測 | B22 | 再構築後compressed entryのresolveを比較し、qpdfのwarn/nullとRustの例外境界を固定する。 |
 | B-P4 | 未観測 | B27 | bootstrap handleとxref双方のwarningを出すfixtureでcollection/delivery順を比較する。 |
 | B-P6 | bounded cutover済み | B29 | QPDF.cc:345-363のdrain/anyWarningsを同じdocument collectionへ移植し、Job完了（inspect/write JSON/write/check/linearization）から移行済み。num_warningsも公開queryへ昇格。残るsnapshot/bookmark consumerは後続移行でcaller-zeroを確認する。 |

@@ -365,3 +365,196 @@ fn canonical_route_repair_warnings_match_qpdf() {
         );
     }
 }
+
+/// A classic xref table whose `/XRefStm` commits a free row and then fails.
+///
+/// qpdf's `processXRefStream` calls `insertFreeXrefEntry` inline while it
+/// walks the payload (`libqpdf/QPDF.cc:1124-1127`), so the tombstone for
+/// object 4 is already in `m->deleted_objects` when the following type-3 row
+/// makes `insertXrefEntry` throw `unknown xref stream entry type 3`
+/// (`libqpdf/QPDF.cc:1180-1183`). `read_xrefTable` does not catch that
+/// exception, so `read_xref` hands straight to `reconstruct_xref`, which keeps
+/// the filter for the whole line scan and clears it only afterwards
+/// (`libqpdf/QPDF.cc:575`): `insertReconstructedXrefEntry` therefore refuses
+/// object 4 (`libqpdf/QPDF.cc:1197-1210`) even though `4 0 obj` is present in
+/// the file and the scan finds it.
+///
+/// A classic table's own `f` rows cannot reach this state. Both qpdf
+/// (`libqpdf/QPDF.cc:880-931`: `deleted_items` is collected during the entry
+/// loop but only handed to `insertFreeXrefEntry` after the `/XRefStm` read)
+/// and flpdf defer them, so a failure inside the section discards them
+/// instead of committing them. An xref stream's inline free rows are the only
+/// way a tombstone survives into reconstruction.
+///
+/// Object 6 exists so that reconstruction overwrites the default type-0 row
+/// `try_emplace` leaves behind for the throwing entry; without it
+/// `qpdf --show-xref` aborts on that unrenderable row and shows no table at
+/// all. The `/XRefStm` entry for object 4 must not be preceded by a live
+/// classic row for the same object-generation slot, because
+/// `insertFreeXrefEntry` only records a tombstone for an object that is not
+/// already in the table.
+fn classic_table_whose_xref_stm_commits_a_free_row_then_fails() -> (Vec<u8>, [usize; 7]) {
+    let mut bytes = b"%PDF-1.5\n".to_vec();
+    let mut offsets = [0usize; 7];
+    let object = |bytes: &mut Vec<u8>, offsets: &mut [usize; 7], number: usize, body: &[u8]| {
+        offsets[number] = bytes.len();
+        bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    };
+    object(
+        &mut bytes,
+        &mut offsets,
+        1,
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    object(
+        &mut bytes,
+        &mut offsets,
+        2,
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    object(
+        &mut bytes,
+        &mut offsets,
+        3,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+    );
+    object(&mut bytes, &mut offsets, 4, b"42");
+    object(&mut bytes, &mut offsets, 6, b"43");
+
+    // /W [1 2 1]: object 0 free, object 4 free, object 6 unknown type 3.
+    let payload: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0];
+    offsets[5] = bytes.len();
+    bytes.extend_from_slice(b"5 0 obj\n");
+    bytes.extend_from_slice(
+        format!(
+            "<< /Type /XRef /W [1 2 1] /Index [0 1 4 1 6 1] /Size 7 /Length {} >>\nstream\n",
+            payload.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&payload);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{:010} 00000 n \n", offsets[1]).as_bytes());
+    bytes.extend_from_slice(format!("{:010} 00000 n \n", offsets[2]).as_bytes());
+    bytes.extend_from_slice(format!("{:010} 00000 n \n", offsets[3]).as_bytes());
+    // Object 4 is free here too, so the deferred classic row cannot register
+    // it before the `/XRefStm` tombstone is recorded.
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{:010} 00000 n \n", offsets[5]).as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 6 /Root 1 0 R /XRefStm {} >>\nstartxref\n{xref}\n%%EOF\n",
+            offsets[5]
+        )
+        .as_bytes(),
+    );
+    (bytes, offsets)
+}
+
+/// Render an xref table the way `qpdf --show-xref` renders it
+/// (`QPDF::showXRefTable`, `libqpdf/QPDF.cc:1212-1240`).
+fn render_xref_table(table: &std::collections::BTreeMap<ObjectRef, XrefEntry>) -> Vec<String> {
+    table
+        .iter()
+        .map(|(object_ref, entry)| match entry {
+            XrefEntry::Uncompressed { offset } => format!(
+                "{}/{}: uncompressed; offset = {offset}",
+                object_ref.number, object_ref.generation
+            ),
+            XrefEntry::Compressed { stream, index } => format!(
+                "{}/{}: compressed; stream = {stream}, index = {index}",
+                object_ref.number, object_ref.generation
+            ),
+            XrefEntry::Free { next } => format!(
+                "{}/{}: free; next = {next}",
+                object_ref.number, object_ref.generation
+            ),
+        })
+        .collect()
+}
+
+/// A free row that an xref stream committed before failing must still suppress
+/// its object number during reconstruction, on the handoff that reaches
+/// reconstruction straight from the initial section's parse failure.
+///
+/// This is the one recovery handoff that does not pass through
+/// `merge_recovered_qpdf_state`, and qpdf applies the suppression inside
+/// `insertReconstructedXrefEntry` rather than after the scan, so it cannot
+/// depend on the handoff taken.
+#[test]
+fn reconstruction_after_a_committed_free_row_suppresses_it_like_qpdf() {
+    let (fixture, offsets) = classic_table_whose_xref_stm_commits_a_free_row_then_fails();
+    assert_eq!(
+        fixture.get(offsets[4]..offsets[4] + b"4 0 obj".len()),
+        Some(b"4 0 obj".as_slice()),
+        "the freed object must really be in the file, or the scan has nothing to suppress"
+    );
+
+    let pdf = Pdf::open_with_options(
+        Cursor::new(fixture.clone()),
+        PdfOpenOptions {
+            repair: true,
+            suppress_warnings: true,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("the reconstructed table keeps the classic trailer, so the open succeeds");
+    let table = pdf.get_xref_table();
+    assert!(
+        !table.contains_key(&ObjectRef::new(4, 0)),
+        "the /XRefStm free row must suppress object 4 during reconstruction: {:?}",
+        render_xref_table(&table)
+    );
+    let rendered = render_xref_table(&table);
+    assert_eq!(
+        rendered,
+        vec![
+            format!("1/0: uncompressed; offset = {}", offsets[1]),
+            format!("2/0: uncompressed; offset = {}", offsets[2]),
+            format!("3/0: uncompressed; offset = {}", offsets[3]),
+            format!("5/0: uncompressed; offset = {}", offsets[5]),
+            format!("6/0: uncompressed; offset = {}", offsets[6]),
+        ],
+        "the surviving rows are the ones the line scan found outside the tombstone"
+    );
+
+    if !qpdf_available() {
+        eprintln!("qpdf 11.9.0 is not available; skipping only the oracle comparison");
+        return;
+    }
+    let directory = tempfile::tempdir().expect("create qpdf fixture directory");
+    let input = directory.path().join("xref-stm-free-row-then-failure.pdf");
+    fs::write(&input, &fixture).expect("write qpdf fixture");
+    let qpdf = Command::new("qpdf")
+        .args(["--warning-exit-0", "--show-xref"])
+        .arg(&input)
+        .output()
+        .expect("qpdf should spawn");
+    let stderr = String::from_utf8_lossy(&qpdf.stderr);
+    assert!(
+        qpdf.status.success(),
+        "qpdf --show-xref must render the reconstructed table: {stderr}"
+    );
+    assert!(
+        stderr.contains("unknown xref stream entry type 3"),
+        "the fixture must actually fail the /XRefStm read after the free row: {stderr}"
+    );
+    let shown: Vec<String> = String::from_utf8_lossy(&qpdf.stdout)
+        .lines()
+        .filter(|line| line.contains(": uncompressed;") || line.contains(": compressed;"))
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        !shown.is_empty(),
+        "qpdf must show a reconstructed table, not an empty one: {stderr}"
+    );
+    assert_eq!(
+        rendered, shown,
+        "flpdf's reconstructed xref table must equal qpdf 11.9.0's"
+    );
+}

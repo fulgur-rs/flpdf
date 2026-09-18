@@ -942,6 +942,11 @@ fn load_xref_state_from_window(
         }
         None => return Err(Error::parse(0, "startxref does not fit source window")),
     };
+    // qpdf's `m->deleted_objects` exists for the whole `QPDF` read, so every
+    // reconstruction handoff below consults the same registration filter --
+    // including the `startxref == 0` one, where no section has been read yet
+    // and the filter is therefore still empty.
+    let mut registration = XrefRegistration::default();
     // qpdf's `xref_offset == 0` check (`QPDF.cc:450-452`) throws
     // damagedPDF("can't find startxref") immediately and never calls
     // read_xref at all -- whether xref_offset is 0 because startxref itself
@@ -967,6 +972,7 @@ fn load_xref_state_from_window(
             None,
             None,
             None,
+            &registration.deleted_objects,
             options.clone(),
             initial_diagnostics,
             None,
@@ -976,7 +982,6 @@ fn load_xref_state_from_window(
         return Ok(recovered);
     }
 
-    let mut registration = XrefRegistration::default();
     let mut observed_first_xref_item_offset = None;
     // No caller-local diagnostic sink: the owner is the single warning sink
     // for this read, matching qpdf's one `m->warnings`
@@ -1010,6 +1015,7 @@ fn load_xref_state_from_window(
                 None,
                 Some(&registration.entries),
                 Some(&registration.raw_entries),
+                &registration.deleted_objects,
                 options.clone(),
                 initial_diagnostics,
                 observed_first_xref_item_offset,
@@ -1027,8 +1033,12 @@ fn load_xref_state_from_window(
     )?; // cov:ignore: this is the defensive logger-failure edge after a successful initial xref parse; the same live sink is covered at the Pdf open boundary
 
     if let Some((offset, message)) = loaded.pending_reconstruction_trigger.take() {
+        // cov:ignore-start: CanonicalXrefContext never defers reconstruction, so
+        // validate_classic_trailer never records a pending trigger; the live
+        // resolver performs any read-time recovery internally
         let trigger = Error::parse(offset as usize, message);
         let diagnostics = std::mem::take(&mut loaded.loaded.repair_diagnostics);
+        let deleted_objects = std::mem::take(&mut registration.deleted_objects);
         let recovered = recover_xref_from_linear_scan(
             bytes,
             version.clone(),
@@ -1037,15 +1047,16 @@ fn load_xref_state_from_window(
             Some(&loaded.loaded.trailer),
             Some(&registration.entries),
             Some(&registration.raw_entries),
+            &deleted_objects,
             options.clone(),
             diagnostics,
             Some(loaded.first_xref_item_offset),
             canonical_trailer_owner,
-        )?; // cov:ignore: a pending trigger always carries a parsed fallback trailer
-        let deleted_objects = std::mem::take(&mut registration.deleted_objects);
-        loaded = merge_recovered_qpdf_state(recovered, loaded, &deleted_objects);
+        )?;
+        loaded = merge_recovered_qpdf_state(recovered, loaded);
         registration.replace_effective_entries(loaded.loaded.entries.clone())?;
         registration.deleted_objects.clear();
+        // cov:ignore-end
     }
 
     let mut previous_parse_diagnostics = Diagnostics::default();
@@ -1072,12 +1083,13 @@ fn load_xref_state_from_window(
                 Some(&loaded.loaded.trailer),
                 Some(&registration.entries),
                 Some(&registration.raw_entries),
+                &deleted_objects,
                 options.clone(),
                 previous_parse_diagnostics,
                 observed_first_xref_item_offset,
                 canonical_trailer_owner,
             )?;
-            let mut recovered = merge_recovered_qpdf_state(recovered, loaded, &deleted_objects);
+            let mut recovered = merge_recovered_qpdf_state(recovered, loaded);
             recovered.header_offset = header_offset;
             return Ok(recovered);
             // cov:ignore-end
@@ -1115,6 +1127,7 @@ fn load_xref_state_from_window(
         // The trigger is only recorded by a bounded (repair-mode) read; keep
         // this path as the single qpdf-style reconstruction handoff.
         let diagnostics = std::mem::take(&mut loaded.loaded.repair_diagnostics);
+        let deleted_objects = std::mem::take(&mut registration.deleted_objects);
         let recovered = recover_xref_from_linear_scan(
             bytes,
             version.clone(),
@@ -1123,13 +1136,13 @@ fn load_xref_state_from_window(
             Some(&loaded.loaded.trailer),
             None, // cov:ignore: an existing fallback trailer suppresses candidate re-entry, so no prior candidate state is consumed here
             None, // cov:ignore: no prior raw registration is consumed here
+            &deleted_objects,
             options.clone(),
             diagnostics,
             None,
             canonical_trailer_owner,
         )?; // cov:ignore: recover_xref_entries has no fallible branch; retain defensive propagation
-        let deleted_objects = std::mem::take(&mut registration.deleted_objects);
-        let mut recovered = merge_recovered_qpdf_state(recovered, loaded, &deleted_objects);
+        let mut recovered = merge_recovered_qpdf_state(recovered, loaded);
         recovered.header_offset = header_offset;
 
         // qpdf continues the original read_xref call after
@@ -1948,6 +1961,7 @@ fn recover_xref_from_linear_scan(
     fallback_trailer: Option<&ObjectHandle>,
     preexisting_entries: Option<&BTreeMap<ObjectRef, XrefEntry>>,
     preexisting_raw_entries: Option<&BTreeMap<QpdfObjGen, XrefEntry>>,
+    deleted_objects: &BTreeSet<u32>,
     options: XrefLoadOptions,
     mut repair_diagnostics: Diagnostics,
     observed_first_xref_item_offset: Option<u64>,
@@ -1978,6 +1992,16 @@ fn recover_xref_from_linear_scan(
     })?;
     // cov:ignore-end
     let mut entries = recovered.entries;
+    // qpdf's third `insertReconstructedXrefEntry` condition
+    // (`QPDF.cc:1204-1209`): a scanned row whose object number a free row
+    // already registered is never written to `m->xref_table`, and
+    // `reconstruct_xref` clears that filter only after the scan completes
+    // (`QPDF.cc:575`). The rows this scan produced are exactly the
+    // `insertReconstructedXrefEntry` calls qpdf would make, so applying the
+    // filter here -- before the preexisting rows are merged back and before
+    // the candidate re-entry reads the table -- suppresses the same object
+    // numbers qpdf suppresses, on every reconstruction handoff alike.
+    entries.retain(|object_ref, _| !deleted_objects.contains(&object_ref.number));
     // qpdf removes only type-1 rows before its reconstruction scan
     // (`QPDF.cc:516-575`). A failed xref-stream insertion can leave a default
     // type-0 row in the table, and compressed rows survive as well. Carry those
@@ -2125,7 +2149,6 @@ fn prepend_repair_diagnostics(target: &mut Diagnostics, initial: Diagnostics) {
 fn merge_recovered_qpdf_state(
     mut recovered: LoadedXrefState,
     mut accumulated: LoadedXrefState,
-    accumulated_deleted_objects: &BTreeSet<u32>,
 ) -> LoadedXrefState {
     let mut repair_diagnostics = std::mem::take(&mut accumulated.loaded.repair_diagnostics);
     for diagnostic in recovered.loaded.repair_diagnostics.entries() {
@@ -2144,22 +2167,12 @@ fn merge_recovered_qpdf_state(
     recovered.classic_trailer_offset = accumulated
         .classic_trailer_offset
         .or(recovered.classic_trailer_offset);
-    // qpdf `reconstruct_xref` removes existing type-1 entries before scanning,
-    // and `insertReconstructedXrefEntry` suppresses object numbers in that
-    // scan's local filter (`QPDF.cc:516-575`, `:1194-1210`). It clears the
-    // scan filter at `:575`, before any candidate xref-stream re-read
-    // (`:576-607`). Consume the accumulated filter only to apply that scan's
-    // merge effect; a candidate re-read owns a fresh registration. This is not
-    // `replaceObject`/`removeObject` cache mutation history.
-    recovered
-        .loaded
-        .entries
-        .retain(|object_ref, _| !accumulated_deleted_objects.contains(&object_ref.number));
-    recovered.raw_entries.retain(|object_ref, _| {
-        u32::try_from(object_ref.get_obj())
-            .map(|number| !accumulated_deleted_objects.contains(&number))
-            .unwrap_or(true)
-    });
+    // The reconstruction scan's own `insertReconstructedXrefEntry` filter was
+    // already applied inside `recover_xref_from_linear_scan`, which is where
+    // qpdf applies it (`QPDF.cc:1197-1210`). Rows that were already in
+    // `m->xref_table` when reconstruction started survive regardless of that
+    // filter -- qpdf never retroactively erases them -- so this merge only
+    // carries them forward.
     for (&object_ref, &entry) in &accumulated.raw_entries {
         if !matches!(entry, XrefEntry::Uncompressed { .. }) {
             recovered.raw_entries.entry(object_ref).or_insert(entry);
@@ -5964,7 +5977,7 @@ mod final_handle_tests {
             },
         );
 
-        recovered = merge_recovered_qpdf_state(recovered, accumulated, &BTreeSet::new());
+        recovered = merge_recovered_qpdf_state(recovered, accumulated);
 
         assert_eq!(
             recovered.raw_entries.get(&QpdfObjGen::new(6, 0)),
