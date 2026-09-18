@@ -274,6 +274,17 @@ parser内部の呼出（`crates/flpdf/src/parser.rs:428,1758`）はparse中に�
 起こさないqpdf契約も確認する必要があるため、全呼出の機械置換にはしない。
 E27の手製source metadata再parseと関連するが、stream data開始offsetとは別の値である。
 
+2026-09-18（`flpdf-4t328`）: pinned qpdf の `getUTF8Value` / `getValueAsUTF8`
+はともに裸の `asString()` を通る（`libqpdf/QPDFObjectHandle.cc:680-702`）。
+flpdfの `try_get_utf8_value`（warning-producing）と
+`try_get_value_as_utf8`（silent）は `ObjectHandle::try_as_string` へ寄せ、
+`try_dereference` + 非解決 `as_string` の二重経路を撤去した。
+`getStringValue` / `getValueAsString` に対応する raw string accessor は qpdfの
+`isString()` 境界が別責務なので変更していない。併せて encryption state の4箇所と
+page-label `/P` の1箇所も同じ canonical string routeへ移行した。
+これはA6全体をcanonicalへ再分類する変更ではなく、A6の string/UTF-8 cohort内の
+mixed callerを削減する bounded cutoverである。
+
 2026-09-08（`flpdf-3yn9.48.28` 実装時点での訂正）: 上記の `check.rs:652` 呼出は
 `e91e9913`（`flpdf-3yn9.48.27.2`、typed qpdf warnings/catches移行）で既に撤去
 済みであることを確認した — `linearization_parameter_offset` が

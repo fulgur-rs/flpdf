@@ -3276,12 +3276,6 @@ impl ObjectHandle {
     /// An uninitialized handle returns `Ok(None)`, matching `asString`'s
     /// `dereference() ? ... : nullptr` branch
     /// (`libqpdf/QPDFObjectHandle.cc:327-330`).
-    // No production caller lands in this PR by design: the resolve+cast
-    // callers that currently prepend an explicit resolve to `as_string()`
-    // live in other files, migrated one cohort per owning stream
-    // (flpdf-3yn9.48.151/.152/.153). Remove this allow once the first
-    // cohort PR lands.
-    #[allow(dead_code)]
     pub(crate) fn try_as_string(&self) -> Result<Option<Vec<u8>>> {
         if !self.is_initialized() {
             return Ok(None);
@@ -3724,9 +3718,7 @@ impl ObjectHandle {
     /// Return qpdf's warning-free UTF-8 string view
     /// (`libqpdf/QPDFObjectHandle.cc:694-702`).
     pub fn try_get_value_as_utf8(&self) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .try_get_value_as_string()?
-            .map(|value| utf8_value(&value)))
+        Ok(self.try_as_string()?.map(|value| utf8_value(&value)))
     }
 
     /// Return qpdf's warning-free operator bytes
@@ -4015,8 +4007,8 @@ impl ObjectHandle {
     /// An uninitialized handle returns `Ok(None)`, matching `asReal`'s
     /// `dereference() ? ... : nullptr` branch
     /// (`libqpdf/QPDFObjectHandle.cc:301-304`).
-    // No production caller lands in this PR by design: see the note on
-    // `try_as_string` above (flpdf-3yn9.48.151/.152/.153).
+    // qpdf has no internal caller of `asReal`; keep this primitive available
+    // for a later caller cutover without treating it as an active route here.
     #[allow(dead_code)]
     pub(crate) fn try_as_real(&self) -> Result<Option<f64>> {
         if !self.is_initialized() {
@@ -4131,8 +4123,7 @@ impl ObjectHandle {
     /// Return qpdf's UTF-8 string view, warning and yielding an empty string
     /// for any other type (`libqpdf/QPDFObjectHandle.cc:613-640`).
     pub fn try_get_utf8_value(&self) -> Result<Vec<u8>> {
-        self.try_dereference()?;
-        match self.as_string() {
+        match self.try_as_string()? {
             Some(value) => Ok(utf8_value(&value)),
             None => {
                 self.type_warning("string", "returning empty string")?;
@@ -20008,6 +19999,25 @@ pub(crate) mod warning_emission_tests {
         assert!(warnings(&dictionary_recorder)
             .iter()
             .all(|message| message.contains("object 3 0: operation for")));
+    }
+
+    #[test]
+    fn qpdf_utf8_accessors_resolve_indirect_strings_through_as_string() {
+        let (warning, warning_recorder) =
+            handle_resolving(ObjectValue::String(b"warning".to_vec()));
+        assert!(!warning.is_resolved());
+        assert_eq!(warning.try_get_utf8_value().unwrap(), b"warning");
+        assert!(warning.is_resolved());
+        assert!(warnings(&warning_recorder).is_empty());
+
+        let (silent, silent_recorder) = handle_resolving(ObjectValue::String(b"silent".to_vec()));
+        assert!(!silent.is_resolved());
+        assert_eq!(
+            silent.try_get_value_as_utf8().unwrap(),
+            Some(b"silent".to_vec())
+        );
+        assert!(silent.is_resolved());
+        assert!(warnings(&silent_recorder).is_empty());
     }
 
     #[test]

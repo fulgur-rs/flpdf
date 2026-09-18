@@ -766,8 +766,7 @@ fn required_name_from_handle(dict: &ObjectHandle, key: &'static str) -> Result<S
 fn required_32_byte_string_from_handle(dict: &ObjectHandle, key: &'static str) -> Result<[u8; 32]> {
     let key_name = format!("/{key}");
     let value = dict.try_get_key(key_name.as_bytes())?;
-    value.try_dereference()?;
-    let Some(bytes) = value.as_string() else {
+    let Some(bytes) = value.try_as_string()? else {
         return Err(if value.is_null() {
             crate::error::EncryptedError::Malformed {
                 reason: format!("missing /{key} entry"),
@@ -793,8 +792,7 @@ fn required_v_lt_5_32_byte_string_from_handle(
 ) -> Result<[u8; 32]> {
     let key_name = format!("/{key}");
     let value = dict.try_get_key(key_name.as_bytes())?;
-    value.try_dereference()?;
-    let Some(bytes) = value.as_string() else {
+    let Some(bytes) = value.try_as_string()? else {
         return Err(if value.is_null() {
             crate::error::EncryptedError::Malformed {
                 reason: format!("missing /{key} entry"),
@@ -823,8 +821,7 @@ fn required_v_lt_5_32_byte_string_from_handle(
 fn required_48_byte_string_from_handle(dict: &ObjectHandle, key: &'static str) -> Result<[u8; 48]> {
     let key_name = format!("/{key}");
     let value = dict.try_get_key(key_name.as_bytes())?;
-    value.try_dereference()?;
-    let Some(bytes) = value.as_string() else {
+    let Some(bytes) = value.try_as_string()? else {
         return Err(if value.is_null() {
             crate::error::EncryptedError::Malformed {
                 reason: format!("missing /{key} entry"),
@@ -887,8 +884,7 @@ fn r6_perms_warning_from_handle(
     let Some(perms) = entries.get(b"/Perms".as_slice()).cloned() else {
         return Ok(None);
     };
-    perms.try_dereference()?;
-    let Some(bytes) = perms.as_string() else {
+    let Some(bytes) = perms.try_as_string()? else {
         return Ok(Some("R=6 /Perms entry is not a string".into()));
     };
     let Ok(bytes) = <[u8; 16]>::try_from(bytes.as_slice()) else {

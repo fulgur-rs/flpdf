@@ -4771,4 +4771,15 @@ dispatch one.
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDFObjectHandle::getValueAsBool` / `getValueAsInt` / `getValueAsUInt` / `getValueAsReal` / `getValueAsNumber` / `getValueAsName` / `getValueAsString` / `getValueAsUTF8` / `getValueAsOperator` / `getValueAsInlineImage` | `include/qpdf/QPDFObjectHandle.hh:601-606,640-711`; `libqpdf/QPDFObjectHandle.cc:484-748`; `qpdf/test_driver.cc:2973-3062` | `object_handle.rs::ObjectHandle::try_get_value_as_bool` / `try_get_value_as_int` / `try_get_value_as_int_as_int` / `try_get_value_as_uint` / `try_get_value_as_uint_as_uint` / `try_get_value_as_real` / `try_get_value_as_number` / `try_get_value_as_name` / `try_get_value_as_string` / `try_get_value_as_utf8` / `try_get_value_as_operator` / `try_get_value_as_inline_image` | ✅ the receiver resolves before a silent type check; wrong-type values return `None` without `typeWarning`; names retain qpdf's slash-prefixed canonical spelling; UTF-8 conversion uses the string value boundary; integer and unsigned-integer saturation retains qpdf's `warnIfPossible` messages. This is distinct from the warning-producing `try_get_*_value` getXValue family above. |
+| `QPDFObjectHandle::getValueAsBool` / `getValueAsInt` / `getValueAsUInt` / `getValueAsReal` / `getValueAsNumber` / `getValueAsName` / `getValueAsString` / `getValueAsUTF8` / `getValueAsOperator` / `getValueAsInlineImage` | `include/qpdf/QPDFObjectHandle.hh:601-606,640-711`; `libqpdf/QPDFObjectHandle.cc:484-748`; `qpdf/test_driver.cc:2973-3062` | `object_handle.rs::ObjectHandle::try_get_value_as_bool` / `try_get_value_as_int` / `try_get_value_as_int_as_int` / `try_get_value_as_uint` / `try_get_value_as_uint_as_uint` / `try_get_value_as_real` / `try_get_value_as_number` / `try_get_value_as_name` / `try_get_value_as_string` / `try_get_value_as_utf8` / `try_get_value_as_operator` / `try_get_value_as_inline_image` | ✅ the receiver resolves before a silent type check; wrong-type values return `None` without `typeWarning`; names retain qpdf's slash-prefixed canonical spelling; the UTF-8 accessor follows qpdf's `asString()` boundary through `try_as_string`; integer and unsigned-integer saturation retains qpdf's `warnIfPossible` messages. This is distinct from the warning-producing `try_get_*_value` getXValue family above. `try_get_value_as_string` remains on qpdf's separate `getValueAsString`/`isString` boundary. |
+
+The pinned qpdf `getUTF8Value` and `getValueAsUTF8` implementations both call
+the private `asString()` helper (`libqpdf/QPDFObjectHandle.cc:680-702`), while
+`getStringValue` and `getValueAsString` intentionally use their own
+`isString()` paths (`:659-678`). flpdf preserves that split: the warning-
+producing `try_get_utf8_value` and silent `try_get_value_as_utf8` call the
+resolving `ObjectHandle::try_as_string`, and the raw string accessors remain
+on their direct string-value boundaries. The selected encryption and page-label
+consumers likewise use `try_as_string` instead of repeating
+`try_dereference` plus `as_string`; `pdf_string::unparse_binary` is a separate
+byte-serialization responsibility and is not part of this correspondence.
