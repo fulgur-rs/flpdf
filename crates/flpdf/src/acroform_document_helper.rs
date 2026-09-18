@@ -12,6 +12,7 @@ use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity, ResourceConflicts};
 use crate::page_object_helper::PageObjectHelper;
 use crate::pdf_string::utf8_value;
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::resource_finder::ResourceFinder;
 use crate::resource_replacer::{filter_resource_names_from_stream, ResourceRenames};
 use crate::{Error, Matrix, ObjectRef, Pdf, Rectangle, Result, DEFAULT_MAX_ACROFORM_DEPTH};
@@ -454,7 +455,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 .direct_orphan_field
                 .is_some()
         };
-        let mut fields: Vec<_> = self.form_field_handles()?.into_values().collect();
+        let mut fields: Vec<_> = self.form_field_handles_raw()?.into_values().collect();
         if has_direct_orphan {
             // The qpdf map key for every direct object is QPDFObjGen(0, 0),
             // which sorts before all indirect field keys and is materialized
@@ -654,7 +655,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 
         let fields = acroform.try_get_key(b"/Fields")?;
         if let Some(fields) = fields.try_as_array()? {
-            let mut visited = BTreeSet::new();
+            let mut visited = BTreeSet::<QpdfObjGen>::new();
             for field in fields {
                 self.traverse_field_handles(field, None, 0, &mut visited, &mut cache)?;
             }
@@ -679,6 +680,18 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// mutating consumer must retain these canonical handles so a later edit
     /// cannot fall back to a stale value snapshot.
     pub(crate) fn form_field_handles(&mut self) -> Result<BTreeMap<ObjectRef, ObjectHandle>> {
+        Ok(self
+            .form_field_handles_raw()?
+            .into_iter()
+            .filter_map(|(object_gen, field)| {
+                object_gen
+                    .to_object_ref()
+                    .map(|object_ref| (object_ref, field))
+            })
+            .collect())
+    }
+
+    fn form_field_handles_raw(&mut self) -> Result<BTreeMap<QpdfObjGen, ObjectHandle>> {
         self.analyze()?;
         let cache = self.cache.borrow();
         let cache = cache
@@ -687,10 +700,13 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let mut fields = BTreeMap::new();
         for identity in cache.field_to_annotations.keys() {
             if let Some(field) = cache.field_handles.get(identity) {
-                let Some(field_ref) = field.object_ref() else {
+                let Some(object_gen) = field
+                    .qpdf_obj_gen()
+                    .filter(|object_gen| object_gen.is_indirect())
+                else {
                     continue;
                 };
-                fields.entry(field_ref).or_insert_with(|| field.clone());
+                fields.entry(object_gen).or_insert_with(|| field.clone());
             }
         }
         Ok(fields)
@@ -1604,7 +1620,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let Some(mut cache) = self.cache.borrow_mut().take() else {
             return Ok(());
         };
-        let mut visited = BTreeSet::new();
+        let mut visited = BTreeSet::<QpdfObjGen>::new();
         let result = self.traverse_field_handles(field, None, 0, &mut visited, &mut cache);
         *self.cache.borrow_mut() = Some(cache);
         result
@@ -1796,7 +1812,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         field: ObjectHandle,
         parent: Option<ObjectHandle>,
         depth: usize,
-        visited: &mut BTreeSet<ObjectRef>,
+        visited: &mut BTreeSet<QpdfObjGen>,
         cache: &mut AcroFormCache,
     ) -> Result<()> {
         if depth > DEFAULT_MAX_ACROFORM_DEPTH {
@@ -1804,7 +1820,10 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         }
 
         field.try_dereference()?;
-        let Some(field_ref) = field.object_ref() else {
+        let Some(field_object_gen) = field
+            .qpdf_obj_gen()
+            .filter(|object_gen| object_gen.is_indirect())
+        else {
             field.warn_if_possible(
                 "encountered a direct object as a field or annotation while traversing /AcroForm; ignoring field or annotation",
             )?; // cov:ignore: warning continuation is an llvm-cov defensive error-edge artifact
@@ -1816,7 +1835,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             )?; // cov:ignore: warning continuation is an llvm-cov defensive error-edge artifact
             return Ok(());
         }
-        if !visited.insert(field_ref) {
+        if !visited.insert(field_object_gen) {
             field.warn_if_possible("loop detected while traversing /AcroForm")?;
             return Ok(());
         }
@@ -1849,7 +1868,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         }
 
         if is_field && field.try_has_key(b"/T")? {
-            let name = FormFieldObjectHelper::new(field_ref, self.pdf).fully_qualified_name()?;
+            let name = self.canonical_fully_qualified_name(field.clone())?;
             record_field_name(cache, field, name);
         }
         Ok(())
@@ -2532,6 +2551,7 @@ fn without_pdf_name_slash(value: &[u8]) -> Vec<u8> {
 #[allow(clippy::mutable_key_type)]
 mod final_handle_tests {
     use super::{AcroFormDocumentHelper, ForeignResourcePlan, InheritedFieldOverrides};
+    use crate::object_handle::ObjectValue;
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
     use crate::{ObjectHandle, ObjectRef, Pdf, QPDFLogger};
     use std::collections::{BTreeSet, HashMap};
@@ -2587,6 +2607,59 @@ mod final_handle_tests {
             .join("../../tests/fixtures/compat")
             .join(name);
         Pdf::open(Cursor::new(std::fs::read(path).expect("fixture exists"))).expect("fixture opens")
+    }
+
+    #[test]
+    fn field_tree_cache_keeps_a_raw_generation_field_indirect() {
+        let mut pdf = Pdf::empty().expect("empty PDF should open");
+        let raw_field = pdf.get_object_handle_by_raw_identity(11, 65_535);
+        raw_field.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"/FT".to_vec(), ObjectHandle::name(b"Tx".to_vec())),
+                (b"/T".to_vec(), ObjectHandle::string(b"raw".to_vec())),
+                (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+                (
+                    b"/Rect".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(10),
+                        ObjectHandle::integer(10),
+                    ]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+
+        let catalog = pdf.root_handle().expect("empty PDF has a catalog");
+        let acroform = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Fields".to_vec(),
+                ObjectHandle::array(vec![raw_field.clone()]),
+            )]))
+            .expect("AcroForm allocation");
+        catalog
+            .replace_key(b"/AcroForm", acroform)
+            .expect("install AcroForm");
+
+        let mut helper =
+            AcroFormDocumentHelper::new_for_field_tree(&mut pdf).expect("field-tree helper");
+        let fields = helper
+            .get_form_fields()
+            .expect("raw field should survive analysis");
+
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].qpdf_obj_gen(), raw_field.qpdf_obj_gen());
+        assert_eq!(fields[0].object_ref(), None);
+        drop(helper);
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .all(|diagnostic| !diagnostic
+                .message_string()
+                .contains("encountered a direct object as a field")));
     }
 
     #[test]

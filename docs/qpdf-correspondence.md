@@ -336,6 +336,14 @@ qpdf 11.9.0 と full-byte 比較し、container-before-plain の part4 順序を
 container の共通 enum layout は stream subclass の 56-byte shape を inline
 で保持せず、stream value だけがその payload allocation を負担する。
 
+`flpdf-rghuz` では、`QPDFAcroFormDocumentHelper::traverseField` の分析 cacheを
+qpdfの raw identity boundaryへ寄せた。qpdf は `isIndirect()` と `QPDFObjGen::set`
+で generationを射影せず field associationを保持する
+（`QPDFAcroFormDocumentHelper.cc:235-286`）。flpdfも field-treeの visited setと
+`get_form_fields`の内部順序を`QpdfObjGen`へ寄せ、qualified-name更新は live handle
+climbを使う。direct objectだけが従来の警告対象で、generation 65535の indirect
+fieldはcacheから落とさない。公開`ObjectRef` mapは既存 projection boundaryとして残す。
+
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
 | `QPDFObjectHandle::makeResourcesIndirect` | `include/qpdf/QPDFObjectHandle.hh:789-793`; `libqpdf/QPDFObjectHandle.cc:1042-1060` | `object_handle.rs::make_resources_indirect` + `acroform_document_helper.rs::prepare_foreign_resource_plan` | ✅ direct second-level resource values are promoted in place through the canonical resolver before `mergeResources`; category dictionaries are not promoted and the walk is non-recursive. Tests cover direct/indirect categories, already-indirect values, non-dictionary top-level entries, alias identity, and the foreign AcroForm caller |
