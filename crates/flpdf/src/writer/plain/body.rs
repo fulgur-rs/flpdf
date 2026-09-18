@@ -3987,7 +3987,7 @@ mod object_emitter_tests {
     fn qdf_page_context_walks_a_real_pages_content_stream() -> crate::Result<()> {
         let mut pdf = Pdf::open(Cursor::new(
             include_bytes!("../../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
-        ))?;
+        ))?; // cov:ignore: LLVM attributes the executed multiline Pdf::open call terminator to an unhit continuation line.
         let page_ref = ObjectRef::new(3, 0);
         let content_ref = ObjectRef::new(7, 0);
         assert_eq!(
