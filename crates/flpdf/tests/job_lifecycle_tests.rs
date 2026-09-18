@@ -6,7 +6,7 @@ use flpdf::json_inspect::DecodeLevel;
 use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
 use flpdf::{
     EncryptParams, EncryptedError, Error, ObjectHandle, PageRange, Pdf, PdfOpenOptions, PdfWriter,
-    QPDFLogger,
+    QPDFLogger, WriterConfiguration,
 };
 use std::fs::File;
 use std::io::{BufReader, Cursor, Write};
@@ -3297,6 +3297,77 @@ fn create_qpdf_returns_an_erased_multi_source_document_for_later_write() {
     assert_eq!(job.get_exit_code(), JobExitCode::Success);
     let mut written = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
     assert_eq!(flpdf::pages::page_refs(&mut written).unwrap().len(), 2);
+}
+
+/// A multi-source merge replaces `create_qpdf`'s returned document with a
+/// fresh, unencrypted target (`docs/qpdf-correspondence.md`, `flpdf-clq9`),
+/// so a caller that still needs the encrypted primary's own encryption bits
+/// after `create_qpdf` returns cannot read them back from that document.
+/// `QPDFJob::encryption_status`/`take_primary_copy_encryption` expose the
+/// pre-merge snapshot for exactly that case (flpdf-3yn9.48.192).
+#[test]
+fn create_qpdf_captures_the_primary_encryption_snapshot_before_a_multi_source_merge() {
+    let primary = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
+    let secondary =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("multi-source-encrypted.pdf");
+    let json = serde_json::json!({
+        "inputFile": primary,
+        "outputFile": output,
+        "pages": [
+            {"file": ".", "range": "1"},
+            {"file": secondary, "range": "1"}
+        ]
+    })
+    .to_string();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json).unwrap();
+    let mut pdf = job
+        .create_qpdf()
+        .unwrap()
+        .expect("createQPDF should return an erased merged document");
+
+    // The fresh merged target cannot answer the primary's own question.
+    assert!(
+        !pdf.is_encrypted(),
+        "the multi-source merge target is always a fresh, unencrypted document"
+    );
+
+    let (encrypted, password_incorrect) = job.encryption_status();
+    assert!(
+        encrypted,
+        "the primary's own encryption bit must survive the merge"
+    );
+    assert!(!password_incorrect);
+
+    let donor = job.take_primary_copy_encryption().expect(
+        "a multi-source merge of an encrypted primary must snapshot a copy-encryption donor",
+    );
+    assert!(
+        job.take_primary_copy_encryption().is_none(),
+        "the snapshot is consumed by the first take"
+    );
+
+    // Feed the snapshot to a *separate* job's writer configuration, the way
+    // a caller that completes the write on a different `QPDFJob` instance
+    // (rather than this same job's own `write_qpdf`) must.
+    let mut writer_configuration = WriterConfiguration::default();
+    writer_configuration.copy_encryption_parameters(donor);
+    let mut write_job = QPDFJob::new();
+    write_job.set_output_file(&output).unwrap();
+    write_job
+        .config()
+        .writer_configuration(writer_configuration);
+    write_job.write_qpdf(&mut pdf).unwrap();
+
+    let written = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+    assert!(
+        written.is_encrypted(),
+        "the copied donor must reproduce the primary's encryption on the output"
+    );
 }
 
 #[test]

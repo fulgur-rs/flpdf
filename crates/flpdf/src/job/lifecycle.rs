@@ -3343,6 +3343,48 @@ impl QPDFJob {
         }
     }
 
+    /// Return the primary document's encryption status captured by the last
+    /// `create_qpdf` (or `create_from_json_document`/`create_empty_document`).
+    ///
+    /// This is qpdf's own `QPDFJob::getEncryptionStatus`
+    /// (`include/qpdf/QPDFJob.hh:400-402`, `libqpdf/QPDFJob.cc:645-648`),
+    /// which returns a bitwise-OR of `qpdf_encryption_status_e` values set by
+    /// the `pdf.isEncrypted()` check inside `createQPDF`
+    /// (`libqpdf/QPDFJob.cc:449-453`). The pair returned here (`encrypted`,
+    /// `password_incorrect`) carries the same two bits as an idiomatic Rust
+    /// tuple instead of a C-style bitmask.
+    ///
+    /// A multi-source page-spec merge replaces `create_qpdf`'s returned
+    /// document with a fresh, unencrypted target
+    /// (`docs/qpdf-correspondence.md`, `flpdf-clq9`), so a caller that still
+    /// needs the primary's own encryption bits after `create_qpdf` returns
+    /// cannot read them back from that document; this snapshot, captured
+    /// before the merge, is the only remaining source.
+    #[must_use]
+    pub fn encryption_status(&self) -> (bool, bool) {
+        (
+            self.encryption_status.encrypted,
+            self.encryption_status.password_incorrect,
+        )
+    }
+
+    /// Take the copy-encryption donor snapshot captured when a multi-source
+    /// page-spec merge replaced the primary with a fresh target.
+    ///
+    /// qpdf's `handlePageSpecs` mutates the primary `QPDF` object in place
+    /// instead of building a fresh merged document
+    /// (`libqpdf/QPDFJob.cc:2359-2362`), so `writeQPDF` simply reads the
+    /// still-live primary's `/Encrypt` state directly and has no counterpart
+    /// accessor for this. flpdf's canonical multi-source merge necessarily
+    /// creates a fresh target instead (`docs/qpdf-correspondence.md`,
+    /// `flpdf-clq9`): [`Self::write_qpdf`] already consumes this snapshot
+    /// internally (via the same field) when it writes through *this* job. A
+    /// caller that completes the write on a *different* `QPDFJob` instance
+    /// must take the snapshot here first, before configuring that instance.
+    pub fn take_primary_copy_encryption(&mut self) -> Option<crate::CopyEncryptionSource> {
+        self.primary_copy_encryption.take()
+    }
+
     /// Write a created document through the configured qpdf writer and
     /// complete the shared warning/status boundary.
     pub fn write_qpdf<R>(&mut self, pdf: &mut Pdf<R>) -> Result<()>

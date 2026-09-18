@@ -208,7 +208,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 | **`run()` は `createQPDF()` → `writeQPDF()` の 2 呼び出しだけ**（この 2 段構成は「QPDF を作ってから書き出す前に改変できるようにするため」に意図的に公開されている） | `libqpdf/QPDFJob.cc:513-520` / `include/qpdf/QPDFJob.hh:371-373` | E-1 canonical。flpdf の通常 `run` は `create_qpdf` → `write_qpdf` → `get_exit_code` を通り、旧 `run_document_erased` / `run_document_stages` は撤去済み。暗号 status queryは qpdf の認証例外を保つため専用早期分岐 | public 2 段の間で返却文書を変更でき、通常の `--pages` / `--rotate` / overlay も create stageで完了する |
 | **「検査するか / 分割するか / 書くか」の判断は `writeQPDF` の内側にあり、判定は `createsOutput()` 1 個** | `libqpdf/QPDFJob.cc:483-511` / `libqpdf/QPDFJob.cc:528-532` | E-3 canonical。flpdf の `write_qpdf` が output/replace-input/JSON暗黙stdoutを含む `creates_output` を判定し、inspection・split・JSON/ordinary writeを選択する | 出力指定と inspection フラグの qpdf 優先順位を write stage内で保持し、report helperと完了を分離する |
 | **`createQPDF` の変換は固定順序**（`updateFromJSON` → `handlePageSpecs` → `handleRotations` → `handleUnderOverlay` → `handleTransformations`。`addAttachments` / `copyAttachments` は `handleTransformations` の内側） | `libqpdf/QPDFJob.cc:428-481` / `libqpdf/QPDFJob.cc:2242-2247` | E-12 canonical。flpdf の `prepare_document` / `prepare_document_transformations` がこの順序を `create_qpdf` 内で実行し、`.94` で `--pages` post-plan の rotation/imageも `QPDFJob::apply_transformations` へ接続した。 | rotation → underlay/overlay → image/appearance/annotation/coalesce/flatten の順序と、page-selection後の同じ transformation ownerを共有する。E-4/E-10/E-21のCLI全体移行とroute-wide parity closureは別スコープ |
-| **入力は必ず `doProcessOnce` 経由で開き、`QPDF` 構築直後に `setQPDFOptions`（`noWarn` → `setSuppressWarnings`）を適用してから読む** | `libqpdf/QPDFJob.cc:1695-1716` / `libqpdf/QPDFJob.cc:650-666` / `libqpdf/QPDFJob.cc:663-665` | E-29 mixed。`crates/flpdf/src/job/lifecycle.rs::QPDFJob::open_with_description`、`open_document_with_description`、`open_for_encryption_inspection_with_description`、`open_job_source` は job suppression を open 前に適用済み。CLI の通常入力・overlay/underlay・copy-encryption・encryption probe・attachment copy・page source・JSON input も同じ policy を使用する（reopenable page source は `crates/flpdf-cli/src/main.rs::open_page_source`）。 | `--no-warn` で open-time warning の stderr delivery を抑止し、warning collection と qpdf の exit status は保持する。reopenable source の separate implementation は構造上残るが suppression policy は共通 |
+| **入力は必ず `doProcessOnce` 経由で開き、`QPDF` 構築直後に `setQPDFOptions`（`noWarn` → `setSuppressWarnings`）を適用してから読む** | `libqpdf/QPDFJob.cc:1695-1716` / `libqpdf/QPDFJob.cc:650-666` / `libqpdf/QPDFJob.cc:663-665` | E-29 mixed。`crates/flpdf/src/job/lifecycle.rs::QPDFJob::open_with_description`、`open_document_with_description`、`open_for_encryption_inspection_with_description`、`open_job_source` は job suppression を open 前に適用済み。CLI の通常入力・overlay/underlay・copy-encryption・encryption probe・attachment copy・page source・JSON input も同じ policy を使用する（`flpdf-3yn9.48.192` で multi-source `--pages` の page source open も CLI 直書きの `open_page_source` から `create_qpdf` の `open_job_source` へ cutover し、この route の reopenable page source 例外は解消した）。 | `--no-warn` で open-time warning の stderr delivery を抑止し、warning collection と qpdf の exit status は保持する。reopenable source の separate implementation は構造上残るが suppression policy は共通 |
 | **CLI 実行ファイルは `QPDFJob` の public surface しか触らない**（`initializeFromArgv` → `run` → `getExitCode` の 3 呼び出し、62 行） | `qpdf/qpdf.cc:26-44` / `libqpdf/qpdfjob-c.cc:19-161` | E-21 mixed（`crates/flpdf-cli/src/main.rs::main` は 9313 行で `run()` は `--job-json-file` の 1 箇所のみ）。E-22 / E-23 canonical — C API 相当の 2 consumer だけが qpdf の構造を正しく踏襲している | `QPDFJob` の private orchestration を直しても CLI の挙動が追随しない（逆も同じ）。argv 解釈の正本が CLI 側と library 側の 2 本になる（E-17） |
 | **exit code は状態を溜めて `getExitCode()` で 1 回だけ判定する** | `libqpdf/QPDFJob.cc:522-564` / `libqpdf/QPDFJob.cc:534-564` | E-19 mixed。`complete(creates_output)` を各ステージが個別に呼び、CLI からも 6 箇所呼ぶ。E-7 — inspection の個別 public メソッドはその場で `complete` するが `doInspection` 相当の経路は `*_report`（完了しない）を使う | 複数の inspection フラグを同時指定したときの warning 集計と exit code が qpdf と食い違う。probe E-P3 |
 | **`qpdf_check_pdf`（C API）は `doCheck` を呼ばない** — `QPDFWriter` に `Pl_Discard` + `setDecodeLevel(qpdf_dl_all)` を設定して `write()` するだけ | `libqpdf/qpdf-c.cc:224-231` / `libqpdf/qpdf-c.cc:58-66` | E-23 canonical（`crates/flpdf-qtest-tools/src/bin/qpdf_ctest.rs` がこの構造を保持）。E-8 の `QPDFJob::check` は別責務 | C API 相当の check が `--check` と同じ診断を出すようになり、qtest の期待出力が変わる |
@@ -622,9 +622,10 @@ primitive新設には既存consumerのRED、dead route削除には0 callerと移
 
 E-29 は `.47` で完了したため候補表から除外した。`--no-warn` の open-time delivery は
 ordinary input だけでなく、overlay/underlay、copy-encryption、encryption probe、attachment
-copy、page source、JSON input の各 route で qpdf と同じ抑制 policy を受ける。残る
-`open_page_source` の direct `open_file_with_options` は、source を後で close/reopen する
-必要があるための構造上の例外であり、open 前に同じ `PdfOpenOptions::suppress_warnings` を設定する。
+copy、page source、JSON input の各 route で qpdf と同じ抑制 policy を受ける。旧
+`open_page_source` の direct `open_file_with_options`（multi-source `--pages` の reopenable
+source を開くための CLI 直書き経路）は `flpdf-3yn9.48.192` で撤去し、この route も
+`create_qpdf` の `open_job_source` を通るようになった。
 
 **probe 実行時の注記**: 出力に `/FlateDecode` が含まれる（`strings q.pdf \| grep -c Flate` → 2）ため、
 上表の byte 比較はすべて `qpdf-zlib-compat` feature でビルドした flpdf で行った。
@@ -742,14 +743,12 @@ D27の全pre-write sweepとfollow-upは完了済み。D19 / D30はbyte-neutral t
 1. **E-29（完了）** — `open_with_description`、`open_document_with_description`、
    `open_for_encryption_inspection_with_description`、`open_job_source`、JSON seed の各入力境界で
    `suppress_warnings` を open 前に OR / 適用した（`libqpdf/QPDFJob.cc:663-665`）。CLI 直書きの
-   `Pdf::open_with_options` / `Pdf::create_from_json` は通常 route から消えたが、direct
-   `Pdf::open_with_options` は2つの exception route に残る: reopenable source を必要とする
-   `open_page_source`（`open_file_with_options`）、および qpdf の `copyAttachments`
-   （`libqpdf/QPDFJob.cc:2100`、donor を `processFile(other, ...)` で job 本体の main input
-   slot と独立に開く）に対応する `run_copy_attachments_from` の attachment donor open
-   （donor を job 経由で開くと `job.input_name()` が donor のパスで上書きされ、後続の
-   duplicate-key エラーが target ではなく donor を誤って名指すため、意図的に job 非経由）。
-   どちらも同じ `suppress_warnings` option を open 前に渡す。
+   `Pdf::open_with_options` / `Pdf::create_from_json` は通常 route から消えた。旧
+   `open_page_source`（reopenable source を必要とした direct `open_file_with_options` 経路）は
+   `flpdf-3yn9.48.192` で撤去し、multi-source `--pages` も `create_qpdf` の `open_job_source` を
+   通るようになった。qpdf の `copyAttachments`（`libqpdf/QPDFJob.cc:2100`、donor を
+   `processFile(other, ...)` で job 本体の main input slot と独立に開く）に対応する attachment
+   donor open は同じ `suppress_warnings` option を open 前に渡す。
    `crates/flpdf-cli/tests/cli_no_warn.rs` が ordinary・secondary・JSON・split-pages route と
    qpdf の warning delivery / exit status を比較する。
 2. **E-19 / E-7** — `complete` / exit code の 1 回判定化。前提: probe E-P3。
