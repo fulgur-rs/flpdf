@@ -3309,7 +3309,7 @@ fn job_json_file_rejects_same_input_and_output_without_truncating_input() {
         .assert()
         .code(2)
         .stderr(predicates::str::diff(expected_usage(
-            "input file and output file are the same; use --replace-input to intentionally overwrite the input",
+            "input file and output file are the same; use --replace-input to intentionally overwrite the input file",
         )));
 
     assert_eq!(fs::read(&input).unwrap(), before);
@@ -3349,7 +3349,10 @@ fn job_json_implicit_json_destination_rejects_an_input_named_dash() {
         .code(2);
     let stderr = String::from_utf8(assertion.get_output().stderr.clone()).unwrap();
     assert!(
-        stderr.contains("input file and output file are the same;"),
+        stderr.contains(
+            "input file and output file are the same; use --replace-input to intentionally \
+             overwrite the input file"
+        ),
         "unexpected diagnostic: {stderr:?}"
     );
 
