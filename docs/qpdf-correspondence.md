@@ -4783,15 +4783,29 @@ the page-copy path, which has to tolerate a non-dictionary page the way
 Three page-tree classification divergences remain open, all of them cases
 where qpdf's leaf arm performs a repair that actually lands on a dictionary
 and that `PageWalk` does not perform at all (`pages::repair` does). Measured
-against qpdf 11.9.0 on purpose-built fixtures: a dictionary kid with neither
-`/Type` nor `/Kids` is a page for qpdf (which also writes `/Type /Page` into
-it) and is still dropped here; a dictionary kid carrying both `/Type /Page`
-and `/Kids` is an interior node for qpdf (which rewrites its `/Type` to
-`/Pages`) and is still returned as a page here; a direct non-dictionary kid is
-promoted by `QPDF::makeIndirectObject` into a new page object and is still
-dropped here. Closing them means giving `page_refs` qpdf's repairing walk,
-which is the `pages::repair` / `PageWalk` consolidation, not a change to the
-dispatch.
+against qpdf 11.9.0 on purpose-built fixtures. Two of the originally listed
+gaps are closed: an indirect kid without `/Kids` is now pushed as a
+`PageNode::Leaf` (`crates/flpdf/src/pages.rs`) and a direct kid is promoted
+with `make_indirect_object_handle` before it is yielded, both byte-gated
+against qpdf-generated PCLm goldens (`mini-pclm-nondict-kid-*` for a direct
+kid, `mini-pclm-nondict-page-*` for an indirect one).
+
+What remains is the **dictionary** dispatch, which still keys on `/Type`:
+a dictionary kid with neither `/Type` nor `/Kids` is a page for qpdf (which
+also writes `/Type /Page` into it) and is dropped here; a dictionary kid
+carrying both `/Type /Page` and `/Kids` is an interior node for qpdf (which
+rewrites its `/Type` to `/Pages`) and is returned as a page here. A repeated
+non-dictionary leaf is also lost, because `PageWalk`'s `seen` set is shared
+between interior nodes and leaves while qpdf shallow-copies a duplicate page.
+Closing these means giving `page_refs` qpdf's repairing walk, which is the
+`pages::repair` / `PageWalk` consolidation, not a change to the dispatch.
+
+The writer and `--check` routes already reach the full leaf arm through
+`pages::repair`: measured on a non-dictionary kid fixture, qpdf 11.9.0 and
+flpdf both emit the same six warnings in the same order (key-containment,
+key-retrieval, `MediaBox is undefined`, `ignoring key replacement request`,
+`/Type key should be /Page but is not`, `ignoring key replacement request`).
+The diagnostic gap is specific to the non-repair `PageWalk` route.
 
 ### PCLm Generate setup membership (`flpdf-xom94`, 2026-09-18)
 
