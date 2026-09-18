@@ -101,8 +101,7 @@ impl LabelRange {
         // `try_get_string_value` would; this stays on the silent accessor and
         // falls back to an empty prefix like the pre-cutover code did.
         let prefix_handle = handle.try_get_key(b"/P")?;
-        prefix_handle.try_dereference()?;
-        let prefix_bytes = prefix_handle.as_string().unwrap_or_default();
+        let prefix_bytes = prefix_handle.try_as_string()?.unwrap_or_default();
         let prefix = crate::json_inspect::decode_pdf_text_string(&prefix_bytes)
             .unwrap_or_else(|| String::from_utf8_lossy(&prefix_bytes).into_owned());
         let start = handle.try_get_key(b"/St")?.try_as_integer()?.unwrap_or(1);
