@@ -475,7 +475,7 @@ encryption は上記 3 経路すべてで `doWriteSetup` の同一分岐（D-0�
 * `QPDFWriter::generateObjectStreams` の責務は候補走査、even split、fresh container allocation
   に分かれる。flpdfでは候補を
   `writer/object_streams/eligibility.rs::compressible_objgens_qpdf_plan`、分割を
-  `even_split_into_streams`、nonlinearized Generateのfresh sourceを
+  `even_split_into_streams`、nonlinearized Generate（PCLmを含む）のfresh sourceを
   `PdfWriter::write`のsetup、linearized Generateのgroup/slotを
   `linearization/{plan,writer,renumber}.rs`がそれぞれ所有する。linearizedのpart7/8/9 slot、
   two-pass body、hint/xrefはdedicated ownerであり、`.48.87`、`.48.88`、lz4a/#1858でplannedの
@@ -681,6 +681,20 @@ trailer value の late-number 可視性、body 後に変更された `/ID` の�
 production caller ではない。D24 はこの sliceで `canonical` へ更新したが、
 QDF/normalize と linearized の別 consumer、および D25 の残 helper caller は
 引き続き未完了である。
+
+## 2026-09-18: PCLm Generate setup membership (`flpdf-xom94`)
+
+qpdf は PCLm でも `generateObjectStreams` を `prepareFileForWrite` より前に
+実行し、Catalog `/Extensions` の indirect dictionary を同じ setup-time
+membership に含める（`QPDFWriter.cc:1970-2006,2034-2055,2187-2200`）。
+flpdf の PCLm route は既に shared `LiveQueue` を使っていたが、setup の
+`plain_generate_setup` / `capture_generate_setup` / `plain::eligible` が
+PCLm を除外していたため、この組み合わせだけ membership snapshot が欠けていた。
+
+PCLm を setup capture 対象へ接続し、indirect `/Extensions` fixture の
+qpdf 11.9.0 C++ oracle byte gate（`pclm_qpdf_byte_gate_tests.rs`）を追加した。
+PCLm の seed/emission owner は変更せず、Generate membership の setup boundary
+だけを qpdf と一致させる。
 
 ## 2026-09-13: QDF/normalize live consumer (`flpdf-ay5b`)
 

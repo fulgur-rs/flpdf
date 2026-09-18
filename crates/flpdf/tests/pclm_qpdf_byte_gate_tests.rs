@@ -7,12 +7,14 @@
 //! stay observable and are gated here. The goldens and their regeneration
 //! script live in `tests/fixtures/pclm/`.
 
-use flpdf::{ObjectStreamMode, Pdf, PdfWriter};
+use flpdf::{ObjectHandle, ObjectStreamMode, Pdf, PdfWriter};
 use std::io::Cursor;
 
 const MINI_INPUT: &[u8] = include_bytes!("../../../tests/fixtures/pclm/mini-pclm-in.pdf");
 const MINI_DIRECT_ROOT_INPUT: &[u8] =
     include_bytes!("../../../tests/fixtures/pclm/mini-pclm-direct-root-in.pdf");
+const MINI_EXT_INDIRECT_INPUT: &[u8] =
+    include_bytes!("../../../tests/fixtures/pclm/mini-pclm-ext-indirect-in.pdf");
 
 fn write_pclm(
     input: &[u8],
@@ -26,6 +28,28 @@ fn write_pclm(
     writer.set_output_memory().expect("install memory output");
     writer.write().expect("write PCLm output");
     writer.get_buffer().expect("PCLm output bytes")
+}
+
+fn write_pclm_with_indirect_extensions() -> Vec<u8> {
+    let mut pdf = Pdf::open(Cursor::new(MINI_INPUT.to_vec())).expect("open PCLm fixture");
+    let extensions = pdf
+        .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+            b"/Custom".to_vec(),
+            ObjectHandle::integer(1),
+        )]))
+        .expect("create indirect Extensions dictionary");
+    pdf.root_handle()
+        .expect("resolve Catalog")
+        .replace_key(b"/Extensions", extensions)
+        .expect("attach indirect Extensions dictionary");
+
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_pclm(true);
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    writer.set_static_id(true);
+    writer.set_output_memory().expect("install memory output");
+    writer.write().expect("write PCLm Generate output");
+    writer.get_buffer().expect("PCLm Generate output bytes")
 }
 
 fn assert_matches_golden(actual: &[u8], golden: &[u8], label: &str) {
@@ -79,6 +103,35 @@ fn pclm_generated_object_streams_match_qpdf_11_9() {
         &actual,
         include_bytes!("../../../tests/fixtures/pclm/mini-pclm-objstm.pdf"),
         "PCLm generated object streams",
+    );
+}
+
+#[test]
+fn pclm_generate_captures_indirect_extensions_before_prepare() {
+    let actual = write_pclm_with_indirect_extensions();
+    assert!(
+        actual
+            .windows(b"/N 5".len())
+            .any(|window| window == b"/N 5"),
+        "PCLm Generate must keep the setup-time Extensions member in qpdf's five-member ObjStm"
+    );
+    assert!(
+        actual
+            .windows(b"/Extensions".len())
+            .any(|window| window == b"/Extensions"),
+        "PCLm Generate output must retain the indirect Catalog Extensions entry"
+    );
+}
+
+#[test]
+fn pclm_generate_indirect_extensions_match_qpdf_11_9() {
+    let actual = write_pclm(MINI_EXT_INDIRECT_INPUT, |writer| {
+        writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    });
+    assert_matches_golden(
+        &actual,
+        include_bytes!("../../../tests/fixtures/pclm/mini-pclm-ext-indirect-objstm.pdf"),
+        "PCLm generated object streams with indirect Extensions",
     );
 }
 

@@ -866,7 +866,6 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         let effective_object_streams = effective_object_stream_mode(&options);
         let plain_generate_setup = effective_object_streams == ObjectStreamMode::Generate
             && !self.settings.linearization
-            && !options.pclm
             && plain::eligible(self.pdf.is_encrypted(), &options, effective_object_streams);
         let specialized_standard_live = effective_object_streams == options.object_streams
             && !options.qdf
@@ -874,7 +873,6 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
             && !options.pclm
             && !plain::eligible(self.pdf.is_encrypted(), &options, effective_object_streams);
         let capture_generate_setup = effective_object_streams == ObjectStreamMode::Generate
-            && !options.pclm
             && (self.settings.linearization || plain_generate_setup || specialized_standard_live);
         if capture_generate_setup {
             // qpdf initializes special streams before Generate computes its

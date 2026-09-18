@@ -4634,6 +4634,18 @@ One divergence found while gating this and deliberately left open:
 object and flpdf does not. That is a page-tree walk difference shared by every
 page-consuming route, not a PCLm one.
 
+### PCLm Generate setup membership (`flpdf-xom94`, 2026-09-18)
+
+qpdf computes Generate ObjStm membership in `doWriteSetup`, before
+`prepareFileForWrite` directizes an indirect Catalog `/Extensions` dictionary
+(`libqpdf/QPDFWriter.cc:1970-2006,2034-2055,2187-2200`). flpdf's PCLm route
+already used the shared standard `LiveQueue`, but its setup capture predicates
+excluded `options.pclm`. Removing those three exclusions lets PCLm + Generate
+consume the same `WriterSetupState.generated_compressible` snapshot as the
+other standard consumers. The new `mini-pclm-ext-indirect-objstm.pdf` golden
+and `pclm_qpdf_byte_gate_tests.rs` compare the complete output bytes against a
+pinned qpdf 11.9.0 C++ oracle. No qpdf-deviation marker is added.
+
 ### flpdf-cli --json joins writeQPDF/writeOutfile/writeJSON (`flpdf-3yn9.48.150.3`, 2026-09-18)
 
 qpdf reaches JSON output through one structure: `createQPDF` runs

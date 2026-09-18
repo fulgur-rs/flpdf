@@ -24,9 +24,11 @@ def image_object():
     )
 
 
-def build(root_entry):
+def build(root_entry, with_extensions=False):
     objects = {
-        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        1: b"<< /Type /Catalog /Pages 2 0 R"
+        + (b" /Extensions 11 0 R" if with_extensions else b"")
+        + b" >>",
         2: b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
         3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 12 12] /Contents 5 0 R"
         b" /Resources << /XObject << /Sb 7 0 R /Sa 8 0 R >> >> >>",
@@ -39,6 +41,8 @@ def build(root_entry):
         9: image_object(),
         10: image_object(),
     }
+    if with_extensions:
+        objects[11] = b"<< /Custom 1 >>"
 
     out = bytearray(b"%PDF-1.3\n%\xbf\xf7\xa2\xfe\n")
     offsets = {}
@@ -62,6 +66,8 @@ def main(directory):
         handle.write(build(b"1 0 R"))
     with open(directory + "/mini-pclm-direct-root-in.pdf", "wb") as handle:
         handle.write(build(b"<< /Type /Catalog /Pages 2 0 R >>"))
+    with open(directory + "/mini-pclm-ext-indirect-in.pdf", "wb") as handle:
+        handle.write(build(b"1 0 R", with_extensions=True))
 
 
 if __name__ == "__main__":

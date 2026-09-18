@@ -421,7 +421,6 @@ pub(crate) fn eligible(
     mode: ObjectStreamMode,
 ) -> bool {
     mode == options.object_streams
-        && !options.pclm
         && options.extra_header_text.is_empty()
         && options.encrypt.is_none()
         && options.copy_encryption.is_none()
