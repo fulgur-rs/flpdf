@@ -313,7 +313,7 @@ mod tests {
     // ── Filespec construction helpers ─────────────────────────────────────────
 
     fn next_ref(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> ObjectRef {
-        pdf.next_available_object_ref()
+        pdf.next_obj_gen()
             .expect("object-number space must have room in the test fixture")
     }
 
