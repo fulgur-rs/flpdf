@@ -234,3 +234,128 @@ fn canonical_open_reads_a_candidate_past_64_false_headers_like_qpdf() {
         "qpdf must retain the candidate entry: {shown}"
     );
 }
+
+/// A classic table whose trailer has no `/Size`: qpdf's `read_xref` validates
+/// the trailer before it accepts the section (`libqpdf/QPDF.cc:906-930`), so
+/// the missing key is a `damagedPDF` warning attributed to the trailer that
+/// is followed by reconstruction.
+fn classic_trailer_without_size() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \ntrailer\n");
+    bytes.extend_from_slice(b"<< /Root 1 0 R >>");
+    bytes.extend_from_slice(format!("\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+/// An xref stream whose `/W` widths do not describe its payload. qpdf warns
+/// about the size mismatch, fails on the unknown entry type, reconstructs,
+/// and re-reads the same candidate while reconstructing
+/// (`libqpdf/QPDF.cc:1046-1075,577-608`).
+fn xref_stream_with_wrong_payload_size() -> Vec<u8> {
+    b"%PDF-1.4\n1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Length 4 >>\nstream\nabcd\nendstream\nendobj\nstartxref\n9\n%%EOF\n".to_vec()
+}
+
+/// Collect the warnings the canonical `Pdf::open` route accumulates, whether
+/// the open ultimately succeeds or fails, rendered exactly as qpdf renders
+/// the text after its own `WARNING: ` prefix (`QPDFExc::createWhat`,
+/// `libqpdf/QPDFExc.cc:18-49`).
+fn canonical_open_warnings(bytes: Vec<u8>, description: &str) -> Vec<String> {
+    let options = PdfOpenOptions {
+        repair: true,
+        suppress_warnings: true,
+        description: description.as_bytes().to_vec(),
+        ..PdfOpenOptions::default()
+    };
+    match Pdf::open_with_options(Cursor::new(bytes), options) {
+        Ok(pdf) => pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|diagnostic| String::from_utf8_lossy(diagnostic.what_bytes()).into_owned())
+            .collect(),
+        Err(error) => {
+            let (_, diagnostics) = error
+                .open_failure()
+                .expect("a permissive open failure carries its accumulated warnings");
+            diagnostics
+                .entries()
+                .iter()
+                .map(|diagnostic| String::from_utf8_lossy(diagnostic.what_bytes()).into_owned())
+                .collect()
+        }
+    }
+}
+
+fn qpdf_warnings(path: &PathBuf) -> Vec<String> {
+    let output = Command::new("qpdf")
+        .args(["--warning-exit-0", "--show-xref"])
+        .arg(path)
+        .output()
+        .expect("qpdf should spawn");
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter_map(|line| line.strip_prefix("WARNING: "))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The canonical owner route must reproduce qpdf's repair-warning sequence
+/// -- text, order and offsets -- for the damaged shapes the migrated xref
+/// unit tests assert. Those unit tests compare flpdf against its own
+/// expectations; this one pins the same sequences to the qpdf 11.9.0 binary
+/// so the migration cannot drift both sides together.
+#[test]
+fn canonical_route_repair_warnings_match_qpdf() {
+    let directory = tempfile::tempdir().expect("create qpdf fixture directory");
+    for (name, fixture, expected) in [
+        (
+            "classic-trailer-without-size.pdf",
+            classic_trailer_without_size(),
+            vec![
+                "file is damaged".to_owned(),
+                "(trailer, offset 45): trailer dictionary lacks /Size key".to_owned(),
+                "Attempting to reconstruct cross-reference table".to_owned(),
+            ],
+        ),
+        (
+            "xref-stream-wrong-payload-size.pdf",
+            xref_stream_with_wrong_payload_size(),
+            vec![
+                "(xref stream, offset 9): Cross-reference stream data has the wrong size; expected = 2; actual = 4".to_owned(),
+                "file is damaged".to_owned(),
+                "(xref stream, offset 71): unknown xref stream entry type 97".to_owned(),
+                "Attempting to reconstruct cross-reference table".to_owned(),
+                "(xref stream, offset 9): Cross-reference stream data has the wrong size; expected = 2; actual = 4".to_owned(),
+                "reported number of objects (1) is not one plus the highest object number (1)".to_owned(),
+            ],
+        ),
+    ] {
+        let input = directory.path().join(name);
+        fs::write(&input, &fixture).expect("write qpdf fixture");
+        let description = input.to_string_lossy().into_owned();
+        // qpdf prefixes its own source name to every warning; rendering the
+        // flpdf diagnostics with the same description makes the two lists
+        // directly comparable instead of only message-detail comparable.
+        let expected: Vec<String> = expected
+            .into_iter()
+            .map(|message| format!("{description}{}{message}", if message.starts_with('(') { " " } else { ": " }))
+            .collect();
+
+        assert_eq!(
+            canonical_open_warnings(fixture, &description),
+            expected,
+            "canonical route warnings changed for {name}"
+        );
+
+        if !qpdf_available() {
+            eprintln!("qpdf 11.9.0 is not available; skipping only the oracle comparison");
+            continue;
+        }
+        assert_eq!(
+            qpdf_warnings(&input),
+            expected,
+            "qpdf 11.9.0 no longer produces the pinned sequence for {name}"
+        );
+    }
+}

@@ -6253,19 +6253,31 @@ mod final_handle_tests {
     use std::io::Write;
     use std::time::{Duration, Instant};
 
-    fn load_xref_snapshot<R: Read + Seek>(
-        reader: &mut R,
+    /// Load xref state the way `Pdf::open` does: through a `ResolverHandle`
+    /// that owns the input source before parsing starts, mirroring qpdf's
+    /// `QPDF::processInputSource` (`libqpdf/QPDF.cc:271-275`).
+    ///
+    /// The owner is returned alongside the result because every handle in
+    /// `LoadedXref` borrows its identity from that owner, and because the
+    /// route's warnings live on the owner's own sink rather than in
+    /// `LoadedXref::repair_diagnostics` -- the same split `Pdf::open` reads
+    /// (`crates/flpdf/src/engine.rs:224-248`).
+    fn load_xref_snapshot<R: Read + Seek + 'static>(
+        reader: R,
         allow_repair: bool,
-    ) -> Result<LoadedXref> {
-        let mut state = load_xref_state_with_options(
+        unique_id: u64,
+    ) -> (Rc<ResolverHandle<R>>, Result<LoadedXref>) {
+        let (owner, state) = load_xref_state_through_canonical_owner(
             reader,
             XrefLoadOptions {
                 allow_repair,
                 ..XrefLoadOptions::default()
             },
-        )?;
-        state.loaded.trailer = detach_bootstrap_handle(&state.loaded.trailer)?;
-        Ok(state.loaded)
+            crate::QPDFLogger::create(),
+            true,
+            unique_id,
+        );
+        (owner, state.map(|state| state.loaded))
     }
 
     fn malformed_candidate_fixture(count: usize) -> Vec<u8> {
@@ -6985,8 +6997,20 @@ mod final_handle_tests {
     fn timed_malformed_candidate_recovery(count: usize) -> Duration {
         let bytes = malformed_candidate_fixture(count);
         let started = Instant::now();
-        let error = load_xref_snapshot(&mut std::io::Cursor::new(&bytes), true)
-            .expect_err("the fixture has no trailer dictionary");
+        // The owner-less loader is deliberately kept here: its bounded
+        // reference-read window is the subject of this scaling guard. The
+        // canonical live-source route reproduces qpdf's own quadratic
+        // reconstruction shape instead (qpdf 11.9.0 on this fixture:
+        // 0.03s at 500 candidates, 2.09s at 5,000), so the near-linear
+        // bound below is a property of the owner-less machinery alone.
+        let error = load_xref_state_with_options(
+            &mut std::io::Cursor::new(&bytes),
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+        )
+        .expect_err("the fixture has no trailer dictionary");
         assert!(error
             .to_string()
             .contains("unable to find trailer dictionary while recovering damaged file"));
@@ -7835,18 +7859,20 @@ mod final_handle_tests {
         let xref = bytes.len();
         bytes.extend_from_slice(b" xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n");
         bytes.extend_from_slice(b"trailer\n<< /Size 2 /Root 1 0 R >>\n");
-        let state = load_xref_state_with_options(
-            &mut std::io::Cursor::new({
+        let (owner, result) = load_xref_state_through_canonical_owner(
+            std::io::Cursor::new({
                 let mut bytes = bytes.clone();
                 bytes.extend_from_slice(format!("startxref\n{xref}\n%%EOF\n").as_bytes());
                 bytes
             }),
             XrefLoadOptions::default(),
-        )
-        .expect("one space still leaves the table readable");
-        let messages: Vec<_> = state
-            .loaded
-            .repair_diagnostics
+            crate::QPDFLogger::create(),
+            true,
+            40,
+        );
+        result.expect("one space still leaves the table readable");
+        let owner_diagnostics = owner.repair_diagnostics();
+        let messages: Vec<_> = owner_diagnostics
             .entries()
             .iter()
             .map(|diagnostic| diagnostic.get_message_detail().to_vec())
@@ -7939,14 +7965,17 @@ mod final_handle_tests {
         // A startxref past the end forces the line-scan reconstruction.
         bytes.extend_from_slice(b"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n999999\n%%EOF\n");
 
-        let state = load_xref_state_with_options(
-            &mut std::io::Cursor::new(bytes),
+        let (_owner, result) = load_xref_state_through_canonical_owner(
+            std::io::Cursor::new(bytes),
             XrefLoadOptions {
                 allow_repair: true,
                 ..XrefLoadOptions::default()
             },
-        )
-        .expect("reconstruction recovers the well-formed objects");
+            crate::QPDFLogger::create(),
+            true,
+            41,
+        );
+        let state = result.expect("reconstruction recovers the well-formed objects");
         let recovered: Vec<_> = state
             .loaded
             .entries
@@ -7990,12 +8019,15 @@ mod final_handle_tests {
                     .as_bytes(),
             );
 
-            let state = load_xref_state_with_options(
-                &mut std::io::Cursor::new(bytes),
+            let (owner, result) = load_xref_state_through_canonical_owner(
+                std::io::Cursor::new(bytes),
                 XrefLoadOptions::default(),
-            )
-            .unwrap_or_else(|error| panic!("separator {separator:?} must parse: {error:?}"));
-            let diagnostics = state.loaded.repair_diagnostics.entries().to_vec();
+                crate::QPDFLogger::create(),
+                true,
+                42,
+            );
+            result.unwrap_or_else(|error| panic!("separator {separator:?} must parse: {error:?}"));
+            let diagnostics = owner.repair_diagnostics().entries().to_vec();
             assert!(
                 diagnostics.is_empty(),
                 "separator {separator:?} must not trigger recovery: {diagnostics:?}"
@@ -8014,12 +8046,15 @@ mod final_handle_tests {
             format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
         );
 
-        let state = load_xref_state_with_options(
-            &mut std::io::Cursor::new(bytes),
+        let (owner, result) = load_xref_state_through_canonical_owner(
+            std::io::Cursor::new(bytes),
             XrefLoadOptions::default(),
-        )
-        .expect("a vertical tab is a space to qpdf");
-        let diagnostics = state.loaded.repair_diagnostics.entries().to_vec();
+            crate::QPDFLogger::create(),
+            true,
+            43,
+        );
+        result.expect("a vertical tab is a space to qpdf");
+        let diagnostics = owner.repair_diagnostics().entries().to_vec();
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
@@ -8177,18 +8212,20 @@ mod final_handle_tests {
         lenient.extend_from_slice(
             b"xref\n0 2\n 0000000000  65535  f \n0000000009 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\n",
         );
-        let state = load_xref_state_with_options(
-            &mut std::io::Cursor::new({
+        let (lenient_owner, lenient_result) = load_xref_state_through_canonical_owner(
+            std::io::Cursor::new({
                 let mut bytes = lenient.clone();
                 bytes.extend_from_slice(format!("startxref\n{lenient_xref}\n%%EOF\n").as_bytes());
                 bytes
             }),
             XrefLoadOptions::default(),
-        )
-        .expect("qpdf accepts the lenient row and keeps reading");
-        let lenient_messages: Vec<_> = state
-            .loaded
-            .repair_diagnostics
+            crate::QPDFLogger::create(),
+            true,
+            44,
+        );
+        lenient_result.expect("qpdf accepts the lenient row and keeps reading");
+        let lenient_diagnostics = lenient_owner.repair_diagnostics();
+        let lenient_messages: Vec<_> = lenient_diagnostics
             .entries()
             .iter()
             .map(|diagnostic| diagnostic.get_message_detail().to_vec())
@@ -8236,10 +8273,10 @@ mod final_handle_tests {
     #[test]
     fn reconstructed_read_trailer_attributes_empty_candidate_to_trailer() {
         let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\nendobj\ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n";
-        let loaded = load_xref_snapshot(&mut std::io::Cursor::new(bytes), true)
-            .expect("the later dictionary candidate is recoverable");
-        let warning = loaded
-            .repair_diagnostics
+        let (owner, result) = load_xref_snapshot(std::io::Cursor::new(bytes.to_vec()), true, 31);
+        result.expect("the later dictionary candidate is recoverable");
+        let owner_diagnostics = owner.repair_diagnostics();
+        let warning = owner_diagnostics
             .entries()
             .iter()
             .find(|warning| warning.get_message_detail() == b"empty object treated as null")
@@ -8258,11 +8295,11 @@ mod final_handle_tests {
             )
             .as_bytes(),
         );
-        let loaded = load_xref_snapshot(&mut std::io::Cursor::new(bytes), true)
-            .expect("repair mode keeps the parsed trailer after reporting the loop");
+        let (owner, result) = load_xref_snapshot(std::io::Cursor::new(bytes), true, 32);
+        result.expect("repair mode keeps the parsed trailer after reporting the loop");
         assert_eq!(
-            loaded
-                .repair_diagnostics
+            owner
+                .repair_diagnostics()
                 .entries()
                 .iter()
                 .filter(|warning| warning.get_message_detail() == b"stream keyword found in trailer")
@@ -8408,9 +8445,8 @@ mod final_handle_tests {
     fn assert_strict_classic_trailer_error(trailer: &str, message: &str) {
         let (bytes, _) = classic_xref_with_trailer(trailer);
         let offset = trailer_value_offset(&bytes);
-        let mut reader = std::io::Cursor::new(bytes);
-        let error = load_xref_snapshot(&mut reader, false)
-            .expect_err("strict classic trailer validation must reject the fixture");
+        let (_owner, result) = load_xref_snapshot(std::io::Cursor::new(bytes), false, 33);
+        let error = result.expect_err("strict classic trailer validation must reject the fixture");
 
         assert!(matches!(
             error,
@@ -8515,8 +8551,8 @@ mod final_handle_tests {
     #[test]
     fn candidate_xref_stream_wrong_size_warning_survives_later_decode_failure() {
         let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Length 4 >>\nstream\nabcd\nendstream\nendobj\n%%EOF\n";
-        let error = load_xref_snapshot(&mut std::io::Cursor::new(bytes), true)
-            .expect_err("the malformed candidate must fail after warning");
+        let (_owner, result) = load_xref_snapshot(std::io::Cursor::new(bytes.to_vec()), true, 34);
+        let error = result.expect_err("the malformed candidate must fail after warning");
         let (source, diagnostics) = error
             .open_failure()
             .expect("permissive candidate failure carries repair diagnostics");
@@ -8549,10 +8585,10 @@ mod final_handle_tests {
     #[test]
     fn nonzero_xref_stream_decode_warning_is_kept_before_recovery() {
         let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Length 4 >>\nstream\nabcd\nendstream\nendobj\nstartxref\n9\n%%EOF\n";
-        let loaded = load_xref_snapshot(&mut std::io::Cursor::new(bytes), true)
-            .expect("the reconstruction re-entry must skip the already-registered entry");
-        let messages: Vec<_> = loaded
-            .repair_diagnostics
+        let (owner, result) = load_xref_snapshot(std::io::Cursor::new(bytes.to_vec()), true, 35);
+        result.expect("the reconstruction re-entry must skip the already-registered entry");
+        let owner_diagnostics = owner.repair_diagnostics();
+        let messages: Vec<_> = owner_diagnostics
             .entries()
             .iter()
             .map(|diagnostic| String::from_utf8_lossy(diagnostic.what_bytes()).into_owned())
@@ -8938,9 +8974,8 @@ mod final_handle_tests {
     #[test]
     fn strict_classic_xref_rejects_non_integer_previous_offset() {
         let (bytes, offset) = classic_xref_with_malformed_previous();
-        let mut reader = std::io::Cursor::new(bytes);
-        let error = load_xref_snapshot(&mut reader, false)
-            .expect_err("strict xref chain validation must reject malformed /Prev");
+        let (_owner, result) = load_xref_snapshot(std::io::Cursor::new(bytes), false, 36);
+        let error = result.expect_err("strict xref chain validation must reject malformed /Prev");
 
         assert!(matches!(
             error,
@@ -8955,11 +8990,10 @@ mod final_handle_tests {
     #[test]
     fn repair_mode_reports_classic_trailer_validation_before_recovery() {
         let (bytes, _) = classic_xref_with_trailer("<< /Root 1 0 R >>");
-        let mut reader = std::io::Cursor::new(bytes);
-        let loaded = load_xref_snapshot(&mut reader, true)
-            .expect("repair mode must recover a trailer missing /Size");
-        let messages: Vec<_> = loaded
-            .repair_diagnostics
+        let (owner, result) = load_xref_snapshot(std::io::Cursor::new(bytes), true, 37);
+        result.expect("repair mode must recover a trailer missing /Size");
+        let owner_diagnostics = owner.repair_diagnostics();
+        let messages: Vec<_> = owner_diagnostics
             .entries()
             .iter()
             .map(|diagnostic| diagnostic.message_string())
@@ -9548,6 +9582,7 @@ mod final_handle_tests {
 
     #[test]
     fn xref_window_and_byte_cursor_keep_their_defensive_error_boundaries() {
+        let repair_owner = canonical_test_resolver(Vec::new(), BTreeMap::new(), true, 47);
         let recovered = load_xref_state_from_window(
             &[],
             10,
@@ -9560,10 +9595,11 @@ mod final_handle_tests {
             },
             Diagnostics::default(),
             Vec::new(),
-            None,
+            Some(repair_owner.as_ref()),
         );
         assert!(recovered.is_err());
 
+        let strict_owner = canonical_test_resolver(Vec::new(), BTreeMap::new(), false, 48);
         let strict = load_xref_state_from_window(
             &[],
             10,
@@ -9573,7 +9609,7 @@ mod final_handle_tests {
             XrefLoadOptions::default(),
             Diagnostics::default(),
             Vec::new(),
-            None,
+            Some(strict_owner.as_ref()),
         );
         assert!(strict.is_err());
 
@@ -9583,9 +9619,14 @@ mod final_handle_tests {
             Err(Error::Parse { message, .. }) if message == "unexpected end of stream field"
         ));
 
-        let error =
-            load_xref_state_from_bytes(b"%PDF-1.4\n%%EOF\n", XrefLoadOptions::default(), None)
-                .expect_err("strict owner-less loading must reject a missing startxref");
+        let (_owner, result) = load_xref_state_through_canonical_owner(
+            std::io::Cursor::new(b"%PDF-1.4\n%%EOF\n".to_vec()),
+            XrefLoadOptions::default(),
+            crate::QPDFLogger::create(),
+            true,
+            49,
+        );
+        let error = result.expect_err("strict loading must reject a missing startxref");
         assert!(matches!(
             error,
             Error::Parse { message, .. } if message == "can't find startxref"
@@ -9713,9 +9754,14 @@ mod final_handle_tests {
     #[test]
     fn hybrid_xref_stream_with_indirect_filter_loads_without_reconstruction() {
         let bytes = hybrid_xref_with_indirect_filter();
-        let mut reader = std::io::Cursor::new(bytes);
-        let state = load_xref_state_with_options(&mut reader, XrefLoadOptions::default())
-            .expect("hybrid xref with an indirect /Filter must load");
+        let (_owner, result) = load_xref_state_through_canonical_owner(
+            std::io::Cursor::new(bytes),
+            XrefLoadOptions::default(),
+            crate::QPDFLogger::create(),
+            true,
+            45,
+        );
+        let state = result.expect("hybrid xref with an indirect /Filter must load");
 
         assert!(
             !state.already_reconstructed,
@@ -10152,7 +10198,7 @@ mod final_handle_tests {
                 .as_bytes(),
         );
 
-        let mut reader = std::io::Cursor::new(bytes);
+        let reader = std::io::Cursor::new(bytes);
         let mut initial_registration = XrefRegistration::default();
         let mut initial_diagnostics = Diagnostics::default();
         let mut initial_first_xref_item_offset = None;
@@ -10174,18 +10220,21 @@ mod final_handle_tests {
         .expect("the initial classic section must defer the stale /Size mismatch");
         assert!(initial.pending_reconstruction_trigger.is_some());
 
-        let recovered = load_xref_state_with_options(
-            &mut reader,
+        let (recovered_owner, recovered_result) = load_xref_state_through_canonical_owner(
+            reader,
             XrefLoadOptions {
                 allow_repair: true,
                 ..XrefLoadOptions::default()
             },
-        )
-        .expect("repair mode must complete the recovered size revalidation");
+            crate::QPDFLogger::create(),
+            true,
+            46,
+        );
+        let recovered =
+            recovered_result.expect("repair mode must complete the recovered size revalidation");
         assert!(recovered.already_reconstructed);
-        assert!(recovered
-            .loaded
-            .repair_diagnostics
+        assert!(recovered_owner
+            .repair_diagnostics()
             .entries()
             .iter()
             .any(|diagnostic| diagnostic.message_string().contains("expected 2 0 obj")));
