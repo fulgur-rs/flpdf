@@ -146,6 +146,38 @@ fn qdf_generate_writer_rewrites_a_reachable_direct_root() -> flpdf::Result<()> {
             .expect("inspect direct-root QDF page count");
         assert!(pages.status.success());
         assert_eq!(String::from_utf8_lossy(&pages.stdout).trim(), "1");
+
+        // D14: `mode == Generate` is the one combination (direct `/Root` +
+        // `qdf` + xref-stream form) no other test in this repository
+        // byte-compares against real qpdf. The QDF trailer's direct `/Root`
+        // child indents its own keys 2 spaces deeper than the `/Root` key
+        // itself and closes at the `/Root` key's own indent
+        // (`unparseChild(trailer.getKey("/Root"), 1, 0)` ->
+        // `QPDFWriter.cc:1188,1333-1335`: qpdf's `2 * level` indent step),
+        // which the xref-stream route's old independent trailer walk got
+        // wrong (it used indent 0, not 2) until this issue unified it onto
+        // the classic route's owner.
+        if mode == flpdf::ObjectStreamMode::Generate {
+            let qpdf_output = temporary
+                .path()
+                .join(format!("qpdf-qdf-{mode_name}-direct-root.pdf"));
+            let result = Command::new("qpdf")
+                .args(["--qdf", "--static-id", "--object-streams=generate"])
+                .arg(&input)
+                .arg(&qpdf_output)
+                .output()
+                .expect("run qpdf QDF Generate direct-root rewrite");
+            assert!(
+                result.status.success(),
+                "qpdf QDF Generate direct-root rewrite failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(
+                output,
+                std::fs::read(&qpdf_output)?,
+                "QDF Generate direct-root xref-stream trailer must match qpdf byte-for-byte"
+            );
+        }
     }
     Ok(())
 }

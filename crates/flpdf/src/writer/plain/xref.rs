@@ -196,7 +196,7 @@ fn append_xref_stream_and_trailer(
         None,
         stream_layout.payload.len(),
         trailer.qdf,
-    )?;
+    )?; // cov:ignore: covered multiline call; LLVM attributes this terminator to the call setup
 
     match &trailer.id {
         IdPlan::Deterministic {

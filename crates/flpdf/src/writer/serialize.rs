@@ -592,7 +592,7 @@ pub(crate) mod xref_stream {
             dict.index,
             payload_len,
             qdf,
-        )?;
+        )?; // cov:ignore: covered multiline call; LLVM attributes this terminator to the call setup
         let mut entries = dict
             .canonical_entries
             .map_or_else(Vec::new, ToOwned::to_owned);
