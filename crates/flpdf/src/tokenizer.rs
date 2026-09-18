@@ -1000,39 +1000,10 @@ impl<'a> Tokenizer<'a> {
         byte
     }
 
-    pub(crate) fn skip_ignorable(&mut self) -> Result<()> {
-        let saved_allow_eof = self.allow_eof;
-        let saved_include_ignorable = self.include_ignorable;
-        self.allow_eof = true;
-        self.include_ignorable = false;
-        let token = self.read_token(false, 0);
-        self.allow_eof = saved_allow_eof;
-        self.include_ignorable = saved_include_ignorable;
-
-        let token = token?;
-        if token.token_type == TokenType::Eof {
-            return Ok(());
-        }
-        self.set_position(token.start)
-    }
-
-    pub(crate) fn next_integer(&mut self) -> Result<i64> {
-        let token = self.read_token(false, 0)?;
-        if !token.is_integer() {
-            return Err(Error::parse(token.start, "expected integer"));
-        }
-        std::str::from_utf8(&token.value)
-            .ok()
-            .and_then(|value| value.parse::<i64>().ok())
-            .ok_or_else(|| Error::parse(token.start, "integer is out of range"))
-    }
-
     /// Read one integer using qpdf's `QPDF::readToken` contract. The qpdf
     /// wrapper always calls the tokenizer with `allow_bad = true`, then its
     /// caller checks the returned token type (`QPDF.cc:1535-1539,1801-1814`)
-    /// instead of letting the tokenizer throw first. Keep this as a separate
-    /// consumer so the ordinary `next_integer` callers retain their stricter
-    /// `allow_bad = false` behavior.
+    /// instead of letting the tokenizer throw first.
     pub(crate) fn next_object_stream_integer(&mut self) -> Result<i64> {
         let token = self.read_token(true, 0)?;
         if !token.is_integer() {
@@ -1045,22 +1016,6 @@ impl<'a> Tokenizer<'a> {
             .ok()
             .and_then(|value| value.parse::<i64>().ok())
             .ok_or_else(|| Error::parse(token.start, "integer is out of range"))
-    }
-
-    pub(crate) fn expect_word(&mut self, expected: &[u8]) -> Result<()> {
-        let token = self.read_token(false, 0)?;
-        if token.is_word_value(expected) {
-            Ok(())
-        } else {
-            Err(Error::parse(
-                token.start,
-                format!(
-                    "expected word {}, found {}",
-                    String::from_utf8_lossy(expected),
-                    token_description(&token)
-                ),
-            ))
-        }
     }
 }
 
@@ -1149,18 +1104,6 @@ pub(crate) fn is_delimiter(byte: u8) -> bool {
 
 fn is_token_delimiter(byte: u8) -> bool {
     is_ws(byte) || is_delimiter(byte)
-}
-
-fn token_description(token: &Token) -> String {
-    if token.token_type == TokenType::Eof {
-        "EOF".into()
-    } else {
-        format!(
-            "{:?} token {:?}",
-            token.token_type,
-            String::from_utf8_lossy(&token.raw)
-        )
-    }
 }
 
 #[cfg(test)]

@@ -120,12 +120,24 @@ fn ownerless_xref_api_is_removed_in_favor_of_the_canonical_pdf_route() {
 
     let xref = read_source("xref.rs");
     assert!(!xref.contains("load_xref_and_trailer"));
-    assert!(xref.contains("#[cfg(test)]\npub(crate) fn load_xref_state_with_options"));
     for dead in [
         "pub fn load_xref_and_trailer(",
         "pub fn load_xref_and_trailer_with_repair(",
         "pub fn load_xref_and_trailer_best_effort(",
         "pub struct LoadedXref",
+        // The owner-less standalone loaders and the second parser
+        // implementation they drove are removed: every xref route now runs
+        // through the document's own `CanonicalTrailerOwner`.
+        "fn load_xref_state_with_options",
+        "fn load_xref_state_from_bytes",
+        "Option<&dyn CanonicalTrailerOwner>",
+        "struct XrefReadContext",
+        "struct BootstrapCache",
+        "struct BootstrapHandleDocument",
+        "enum XrefReadContextSpec",
+        "struct XrefDetachedHandles",
+        "fn detach_bootstrap_handle",
+        "fn parse_trailer_candidate",
     ] {
         assert!(
             !xref.contains(dead),

@@ -9,16 +9,18 @@ fn parser_has_no_detached_live_object_projection() {
 }
 
 #[test]
-fn xref_stream_production_parses_through_the_handle_route_once() {
+fn xref_stream_production_parses_through_the_canonical_owner_once() {
     let source = include_str!("../src/xref.rs");
-    let parse_xref_stream = slice_between(
-        source,
-        "fn parse_xref_stream(",
-        "fn xref_file_object_diagnostic",
-    );
+    let parse_xref_stream = slice_between(source, "fn parse_xref_stream(", "\ntype XrefWidths");
 
-    assert!(parse_xref_stream.contains("read_file_object_handle("));
-    assert!(!parse_xref_stream.contains("read_file_object("));
+    assert!(
+        parse_xref_stream.contains("parse_xref_stream_with_canonical_owner("),
+        "the xref stream entry point must delegate to the canonical owner route"
+    );
+    assert!(
+        !parse_xref_stream.contains("read_file_object_handle("),
+        "the second, owner-less xref stream reader is removed"
+    );
     assert!(
         !parse_xref_stream.contains("error_diagnostics_sink"),
         "xref stream parser must not carry a parser-local diagnostic sink"

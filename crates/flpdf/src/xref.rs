@@ -1,67 +1,46 @@
 //! Load, validate, and recover PDF cross-reference data. Xref streams are
 //! parsed as live `ObjectHandle` graphs before their encoded payloads enter the
-//! handle-native filter pipeline. [`crate::Pdf::open`] supplies the canonical resolver
-//! owner for xref streams, hybrid sections, `/Prev` chains, and reconstruction
-//! candidates; the standalone loader uses a short-lived bootstrap owner.
+//! handle-native filter pipeline.
 //!
 //! qpdf correspondence: QPDF.cc xref loading and repair.
 //!
+//! Every xref route runs through one
+//! `CanonicalTrailerOwner` -- the document's own resolver -- exactly as
+//! qpdf's `QPDF::processInputSource` hands the document its input source
+//! before any parsing starts (`libqpdf/QPDF.cc:245-275`) and then reads PDF
+//! objects only as they are needed (`include/qpdf/QPDF.hh:67-97,1453-1457`).
+//! That owner supplies xref streams, hybrid sections, `/Prev` chains and
+//! reconstruction candidates alike; there is no second, owner-less parser.
 //!
-//!
-//! qpdf keeps its shared `QPDF::Members::file` input source and does not read
-//! PDF objects until they are needed (`include/qpdf/QPDF.hh:67-97,1453-1457`,
-//! `libqpdf/QPDF.cc:245-275`). The bootstrap owner follows that boundary:
-//! handle identity and diagnostics are available during xref parsing, while
-//! its `Rc<[u8]>` source snapshot is initialized only for an actual indirect
-//! object or stream-length resolution.
-//!
-//! The canonical `Pdf::open` route uses `load_xref_state_from_source`: it keeps
-//! only the header/tail and current xref-section windows, fetches `/Prev`
-//! sections from the same live source when they fall outside the window, and
-//! performs reconstruction as a chunked live-source scan. The complete
-//! byte-slice loader below is test-only and is not part of canonical ownership.
+//! `load_xref_state_from_source` is that route: it keeps only the
+//! header/tail and current xref-section windows, fetches `/Prev` sections
+//! from the same live source when they fall outside the window, and performs
+//! reconstruction as a chunked live-source scan.
 //!
 //! qpdf's `xref_offset == 0` check (`libqpdf/QPDF.cc:450-452`) throws
 //! `damagedPDF("can't find startxref")` immediately and never calls
 //! `read_xref` at all, whether the zero came from a missing/malformed
 //! `startxref` or a syntactically valid `startxref` that explicitly names
-//! offset 0. `load_xref_state_from_bytes` preserves that boundary and enters
-//! the line-scan recovery directly, so an object at logical offset 0 cannot
-//! enter the canonical cache as a speculative xref read before
+//! offset 0. `load_xref_state_from_window` preserves that boundary and
+//! enters the line-scan recovery directly, so an object at logical offset 0
+//! cannot enter the canonical cache as a speculative xref read before
 //! `reconstruct_xref` chooses the effective occurrence
 //! (`libqpdf/QPDF.cc:450-469,516-531`).
-#[cfg(test)]
-use crate::object_handle::StreamValue;
-use crate::object_handle::{DocumentResolver, ObjectValue, SourceExtents};
+use crate::object_handle::ObjectValue;
 use crate::parser::{
-    parse_qpdf_direct_object_handle_with_diagnostics,
     parse_qpdf_file_object_handle_with_diagnostics, HandleResolver, ParserDiagnostic,
 };
 use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::qutil::{qpdf_string_to_int_checked, QpdfIntParse};
-use crate::reader::file_object::{
-    finish_file_object_handle, parse_file_object_handle_syntax, parse_file_object_header,
-    FileObjectDiagnostic, FileObjectDiagnosticKind, HandleFileObjectRead, RecoveryPolicy,
-    ResolvedStreamLength,
-};
 use crate::reader::resolver::ResolverHandle;
 use crate::tokenizer::{Token, TokenType, Tokenizer};
 use crate::writer::DecodeLevel;
 use crate::{
     Diagnostics, Error, ObjectHandle, ObjectRef, QpdfErrorCode, QpdfExc, Result, XrefEntry,
 };
-use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-#[cfg(test)]
-use std::io::SeekFrom;
 use std::io::{Read, Seek};
-use std::rc::{Rc, Weak};
-
-// The bootstrap resolver can re-enter once per indirect reference in a
-// stream's /Length or xref metadata. Keep the stack-growth values aligned with
-// the post-open resolver's measured frame layout.
-const XREF_STACK_RED_ZONE: usize = 128 * 1024;
-const XREF_STACK_GROWTH_SIZE: usize = 1024 * 1024;
+use std::rc::Rc;
 
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedXref {
@@ -78,8 +57,7 @@ pub(crate) struct LoadedXref {
 /// qpdf constructs `QPDF::Members` before `QPDF::parse`, so a classic trailer,
 /// xref stream, and every indirect child they discover are inserted into the
 /// same `obj_cache` that later resolution uses. This trait exposes the live
-/// offset-read and warning boundaries needed to keep that ownership intact;
-/// the owner-less standalone loader retains its separate bootstrap context.
+/// offset-read and warning boundaries needed to keep that ownership intact.
 pub(crate) trait CanonicalTrailerOwner {
     fn indirect_handle(&self, object_ref: ObjectRef) -> ObjectHandle;
     fn direct_handle(&self, value: ObjectValue) -> ObjectHandle;
@@ -87,8 +65,8 @@ pub(crate) trait CanonicalTrailerOwner {
     fn discard_cached_generations(&self, object_gens: &[QpdfObjGen]);
     fn set_header_offset(&self, offset: usize);
     /// qpdf's live `m->file` source boundary (`QPDF.hh:67-97,1453-1457`).
-    /// Canonical xref loading uses these operations instead of a complete
-    /// input snapshot; the owner-less loader remains byte-slice based.
+    /// Xref loading uses these operations instead of a complete input
+    /// snapshot.
     fn source_seek(&self, offset: u64) -> Result<()>;
     fn source_tell(&self) -> Result<u64>;
     fn source_length(&self) -> Result<u64>;
@@ -189,16 +167,12 @@ impl<R: Read + Seek + 'static> CanonicalTrailerOwner for ResolverHandle<R> {
 }
 
 /// Deliver diagnostics produced by the xref reader through the document's
-/// qpdf warning sink. Owner-less loading keeps the same diagnostics local for
-/// its public snapshot API; canonical loading has one live owner and must not
-/// hand a second logger channel to `engine.rs`.
+/// qpdf warning sink. The document has one live owner and must not hand a
+/// second logger channel to `engine.rs`.
 fn deliver_canonical_diagnostics(
-    owner: Option<&dyn CanonicalTrailerOwner>,
+    owner: &dyn CanonicalTrailerOwner,
     diagnostics: &mut Diagnostics,
 ) -> Result<()> {
-    let Some(owner) = owner else {
-        return Ok(());
-    };
     let batch = diagnostics.drain();
     for warning in batch.entries() {
         owner.push_warning(warning.clone())?;
@@ -206,103 +180,8 @@ fn deliver_canonical_diagnostics(
     Ok(())
 }
 
-fn with_xref_open_diagnostics(
-    error: Error,
-    local: Diagnostics,
-    owner: Option<&dyn CanonicalTrailerOwner>,
-) -> Error {
-    if let Some(owner) = owner {
-        return Error::with_open_diagnostics(error, owner.repair_diagnostics());
-    }
-    Error::with_open_diagnostics(error, local)
-}
-
-#[derive(Debug, Default)]
-struct BootstrapHandleState {
-    handles: BTreeMap<ObjectRef, BootstrapCacheEntry>,
-    resolving: BTreeSet<ObjectRef>,
-    resolved_object_streams: BTreeSet<u32>,
-    diagnostics: Diagnostics,
-    reconstruction_trigger: Option<(u64, String)>,
-}
-
-#[derive(Debug, Clone)]
-struct BootstrapCacheEntry {
-    handle: ObjectHandle,
-    source_extents: SourceExtents,
-}
-
-impl BootstrapCacheEntry {
-    fn new(handle: ObjectHandle) -> Self {
-        Self {
-            handle,
-            source_extents: SourceExtents::UNSET,
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct BootstrapCache {
-    /// qpdf's one-operation cache and resolution state. Keeping this state
-    /// apart from the owner document avoids making each context a new resolver
-    /// identity while retaining the document strongly below.
-    handle_state: Rc<RefCell<BootstrapHandleState>>,
-    handle_document: Option<Rc<BootstrapHandleDocument>>,
-    handle_document_owners: Vec<Rc<BootstrapHandleDocument>>,
-}
-
-impl Drop for BootstrapCache {
-    /// Bootstrap parsing builds the same strong object-reference cycles as the
-    /// live document cache, but it runs before `Pdf` owns a `ResolverHandle`
-    /// that could perform the normal qpdf-style disconnect walk. Break those
-    /// cycles while the temporary cache is still being destroyed, mirroring
-    /// `QPDF::~QPDF()`'s replacement of cached values with
-    /// `QPDF_Destroyed()` (`libqpdf/QPDF.cc:215-235`).
-    fn drop(&mut self) {
-        let mut states: Vec<(Rc<RefCell<BootstrapHandleState>>, usize)> = Vec::new();
-        let mut add_state = |state: Rc<RefCell<BootstrapHandleState>>| {
-            if let Some((_, references)) = states
-                .iter_mut()
-                .find(|(candidate, _)| Rc::ptr_eq(candidate, &state))
-            {
-                *references += 1;
-            } else {
-                states.push((state, 1));
-            }
-        };
-        add_state(Rc::clone(&self.handle_state));
-        if let Some(document) = &self.handle_document {
-            add_state(Rc::clone(&document.state));
-        }
-        for document in &self.handle_document_owners {
-            add_state(Rc::clone(&document.state));
-        }
-
-        for (state, internal_references) in states {
-            // A merge can leave an older BootstrapCache pointing at the same
-            // state as the cache that superseded it. Only the final owner may
-            // disconnect the handles; otherwise it invalidates the newer
-            // cache's trailer before it can be rebound.
-            if Rc::strong_count(&state) != internal_references + 1 {
-                continue;
-            }
-            let handles: Vec<_> = state
-                .borrow()
-                .handles
-                .values()
-                .map(|entry| entry.handle.clone())
-                .collect();
-            for handle in handles {
-                handle.disconnect_and_destroy();
-            }
-        }
-    }
-}
-
-type SharedBootstrapCache = Rc<RefCell<BootstrapCache>>;
-
-fn empty_bootstrap_cache() -> SharedBootstrapCache {
-    Rc::new(RefCell::new(BootstrapCache::default()))
+fn with_xref_open_diagnostics(error: Error, owner: &dyn CanonicalTrailerOwner) -> Error {
+    Error::with_open_diagnostics(error, owner.repair_diagnostics())
 }
 
 #[derive(Debug, Clone)]
@@ -320,19 +199,14 @@ pub(crate) struct LoadedXrefState {
     /// diagnostics have a different qpdf description and remain on that
     /// existing path.
     pub(crate) classic_trailer_offset: Option<usize>,
-    /// A bootstrap `/Size` lookup can request qpdf-style xref reconstruction
-    /// while the classic trailer is being validated. Keep that trigger on the
-    /// partially loaded state so the outer loader can reconstruct and then
-    /// continue with the post-chain `/Size` consistency check, rather than
-    /// treating the resolver handoff as a terminal xref parse failure.
+    /// A `/Size` lookup can request qpdf-style xref reconstruction while the
+    /// classic trailer is being validated. Keep that trigger on the partially
+    /// loaded state so the outer loader can reconstruct and then continue with
+    /// the post-chain `/Size` consistency check, rather than treating the
+    /// resolver handoff as a terminal xref parse failure.
     pub(crate) pending_reconstruction_trigger: Option<(u64, String)>,
     pub(crate) trailer_references: BTreeSet<ObjectRef>,
     pub(crate) parsed_xref_streams: BTreeMap<ObjectRef, ObjectHandle>,
-    /// Owner-less objects resolved while reading xref streams stay available
-    /// to post-chain trailer validation, matching the standalone loader's
-    /// temporary cache. Canonical-owner loading leaves this `None` because
-    /// qpdf keeps those objects in the document's one object cache.
-    pub(crate) bootstrap_cache: Option<SharedBootstrapCache>,
     pub(crate) header_offset: usize,
     /// True when open-time xref recovery via linear scan already ran.
     ///
@@ -549,744 +423,6 @@ fn damaged_warning(
     )
 }
 
-/// The owner-less context used by the standalone xref loader while an xref
-/// section is being read.
-///
-/// `Pdf::open` constructs its canonical `ResolverCore` before invoking the
-/// loader and therefore does not enter this context. The three construction
-/// sites retained here mirror the qpdf call-order contexts needed by the
-/// standalone reconstruction implementation: reconstruction's complete
-/// line-scan table, the current classic/hybrid section, and a section reached
-/// through `/Prev`.
-#[derive(Debug, Clone, Copy)]
-enum XrefReadContextSpec<'a> {
-    ActiveSection,
-    ActiveSectionWithCache {
-        bootstrap_cache: &'a SharedBootstrapCache,
-    },
-    Reconstruction {
-        line_scan_entries: &'a BTreeMap<ObjectRef, XrefEntry>,
-        reference_offsets: &'a Rc<[u64]>,
-    },
-    ReconstructionWithCache {
-        line_scan_entries: &'a BTreeMap<ObjectRef, XrefEntry>,
-        reference_offsets: &'a Rc<[u64]>,
-        bootstrap_cache: &'a SharedBootstrapCache,
-    },
-}
-
-fn context_spec_without_bootstrap_cache<'a>(
-    context_spec: XrefReadContextSpec<'a>,
-) -> XrefReadContextSpec<'a> {
-    match context_spec {
-        XrefReadContextSpec::ActiveSection | XrefReadContextSpec::ActiveSectionWithCache { .. } => {
-            XrefReadContextSpec::ActiveSection
-        }
-        XrefReadContextSpec::Reconstruction {
-            line_scan_entries,
-            reference_offsets,
-        }
-        | XrefReadContextSpec::ReconstructionWithCache {
-            line_scan_entries,
-            reference_offsets,
-            ..
-        } => XrefReadContextSpec::Reconstruction {
-            line_scan_entries,
-            reference_offsets,
-        },
-    }
-}
-
-fn context_spec_with_bootstrap_cache<'a>(
-    context_spec: XrefReadContextSpec<'a>,
-    bootstrap_cache: &'a SharedBootstrapCache,
-) -> XrefReadContextSpec<'a> {
-    match context_spec {
-        XrefReadContextSpec::ActiveSection | XrefReadContextSpec::ActiveSectionWithCache { .. } => {
-            XrefReadContextSpec::ActiveSectionWithCache { bootstrap_cache }
-        }
-        XrefReadContextSpec::Reconstruction {
-            line_scan_entries,
-            reference_offsets,
-        }
-        | XrefReadContextSpec::ReconstructionWithCache {
-            line_scan_entries,
-            reference_offsets,
-            ..
-        } => XrefReadContextSpec::ReconstructionWithCache {
-            line_scan_entries,
-            reference_offsets,
-            bootstrap_cache,
-        },
-    }
-}
-
-/// The qpdf description passed to `readObjectAtOffset` for a bootstrap object.
-/// Ordinary resolution uses an empty description, while
-/// `QPDF::read_xrefStream` passes `"xref stream"` so file-object warnings carry
-/// the same prefix (`QPDF.cc:949-963,1298-1313`).
-#[derive(Debug, Clone, Copy)]
-enum XrefObjectDescription {
-    Ordinary,
-    XrefStream,
-    ObjStmMember {
-        stream_number: u32,
-        object_ref: ObjectRef,
-    },
-}
-
-impl XrefObjectDescription {
-    fn warning_prefix(self) -> &'static str {
-        match self {
-            Self::Ordinary => "",
-            Self::XrefStream => "xref stream: ",
-            Self::ObjStmMember { .. } => "", // cov:ignore: ObjStmMember is used only by direct member parsing, never by the file-object warning-prefix boundary
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum XrefEntryLookup<'a> {
-    Registration(&'a BTreeMap<ObjectRef, XrefEntry>),
-    Reconstruction {
-        line_scan_entries: &'a BTreeMap<ObjectRef, XrefEntry>,
-        registration_entries: &'a BTreeMap<ObjectRef, XrefEntry>,
-    },
-}
-
-impl XrefEntryLookup<'_> {
-    fn get(&self, object_ref: &ObjectRef) -> Option<XrefEntry> {
-        let entry = match self {
-            Self::Registration(entries) => entries.get(object_ref),
-            Self::Reconstruction {
-                line_scan_entries,
-                registration_entries,
-            } => line_scan_entries
-                .get(object_ref)
-                .or_else(|| registration_entries.get(object_ref)),
-        };
-        entry
-            .filter(|entry| !matches!(entry, XrefEntry::Free { .. }))
-            .copied()
-    }
-
-    fn owned_entries(&self) -> BTreeMap<ObjectRef, XrefEntry> {
-        let mut entries = BTreeMap::new();
-        match self {
-            Self::Registration(source) => {
-                entries.extend(source.iter().map(|(key, value)| (*key, *value)))
-            }
-            Self::Reconstruction {
-                line_scan_entries,
-                registration_entries,
-            } => {
-                entries.extend(
-                    registration_entries
-                        .iter()
-                        .map(|(key, value)| (*key, *value)),
-                );
-                entries.extend(line_scan_entries.iter().map(|(key, value)| (*key, *value)));
-            }
-        }
-        entries.retain(|object_ref, entry| {
-            !matches!(entry, XrefEntry::Free { .. }) && self.get(object_ref).is_some()
-        });
-        entries
-    }
-}
-
-fn reconstructed_reference_offsets(entries: &BTreeMap<ObjectRef, XrefEntry>) -> Rc<[u64]> {
-    let mut offsets: Vec<u64> = entries
-        .values()
-        .filter_map(|entry| match entry {
-            XrefEntry::Uncompressed { offset } => Some(*offset),
-            XrefEntry::Compressed { .. } | XrefEntry::Free { .. } => None,
-        })
-        .collect();
-    offsets.sort_unstable();
-    offsets.dedup();
-    Rc::from(offsets)
-}
-
-/// The owner-less document context used by standalone xref loading and its
-/// tests. The normal `Pdf::open` route supplies [`CanonicalTrailerOwner`]
-/// instead, so it never constructs this pre-`Pdf` graph for xref objects. This
-/// context still gives every parsed direct child the same weak
-/// `DocumentResolver` and gives every `N G R` the same handle slot within one
-/// standalone xref-loading operation.
-struct BootstrapHandleDocument {
-    /// The static resolver only retains a source snapshot after a bootstrap
-    /// operation actually needs to read an indirect object. Direct parser
-    /// values and shared diagnostics do not require the full input buffer.
-    bytes: OnceCell<Rc<[u8]>>,
-    entry_lookup: RefCell<BTreeMap<ObjectRef, XrefEntry>>,
-    /// Sorted reconstructed object offsets used only to bound bootstrap
-    /// reference reads during recovery. Normal active-section reads leave
-    /// this unset and retain qpdf's unbounded source view.
-    reference_offsets: RefCell<Option<Rc<[u64]>>>,
-    options: XrefLoadOptions,
-    state: Rc<RefCell<BootstrapHandleState>>,
-    resolver: RefCell<Option<Weak<dyn DocumentResolver>>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ReferenceReadWindow {
-    end: usize,
-    fallback_end: usize,
-}
-
-/// A single attempt to read an uncompressed bootstrap object at a bounded
-/// `end`, with its diagnostics held back (rather than pushed immediately)
-/// until the caller decides whether this attempt or a wider retry wins.
-struct UncompressedObjectRead {
-    value: ObjectValue,
-    parsed_offset: i64,
-    end_before_space: i64,
-    end_after_space: i64,
-    /// Whether `complete_handle_stream` fell back to
-    /// `recover_stream_boundary`'s heuristic `endstream`/`endobj` search
-    /// (signaled by `FileObjectDiagnosticKind::AttemptingStreamLengthRecovery`)
-    /// rather than validating the declared `/Length` boundary exactly. A
-    /// truncated window can make that heuristic search accept a terminator
-    /// -- empty or not -- that only exists because the real one lies beyond
-    /// `end`, so this is the caller's signal to retry through the wider
-    /// fallback window rather than trusting this attempt's result.
-    used_heuristic_recovery: bool,
-    diagnostics: Vec<QpdfExc>,
-}
-
-impl std::fmt::Debug for BootstrapHandleDocument {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BootstrapHandleDocument")
-            .field("cache_len", &self.state.borrow().handles.len())
-            .field("resolving", &self.state.borrow().resolving)
-            .finish()
-    }
-}
-
-impl BootstrapHandleDocument {
-    fn new_with_state(
-        bytes: Option<&[u8]>,
-        entry_lookup: XrefEntryLookup<'_>,
-        options: XrefLoadOptions,
-        state: Rc<RefCell<BootstrapHandleState>>,
-    ) -> Rc<Self> {
-        let source_bytes = OnceCell::new();
-        if let Some(bytes) = bytes {
-            let _ = source_bytes.set(Rc::from(bytes));
-        }
-        let document = Rc::new(Self {
-            bytes: source_bytes,
-            entry_lookup: RefCell::new(entry_lookup.owned_entries()),
-            reference_offsets: RefCell::new(None),
-            options: options.clone(),
-            state,
-            resolver: RefCell::new(None),
-        });
-        let resolver: Rc<dyn DocumentResolver> = document.clone();
-        *document.resolver.borrow_mut() = Some(Rc::downgrade(&resolver));
-        document
-    }
-
-    fn ensure_source_bytes(&self, bytes: &[u8]) {
-        let _ = self.bytes.get_or_init(|| Rc::from(bytes));
-    }
-
-    fn refresh_entry_lookup(&self, entry_lookup: XrefEntryLookup<'_>) {
-        *self.entry_lookup.borrow_mut() = entry_lookup.owned_entries();
-    }
-
-    fn set_reference_offsets(&self, reference_offsets: Option<Rc<[u64]>>) {
-        *self.reference_offsets.borrow_mut() = reference_offsets;
-    }
-
-    fn reference_read_window(&self, offset: u64, source_len: usize) -> ReferenceReadWindow {
-        let Some(offsets) = self.reference_offsets.borrow().as_ref().cloned() else {
-            return ReferenceReadWindow {
-                end: source_len,
-                fallback_end: source_len,
-            };
-        };
-        let next_offset_index = offsets.partition_point(|candidate| *candidate <= offset);
-        let end = offsets
-            .get(next_offset_index)
-            .and_then(|offset| usize::try_from(*offset).ok())
-            .unwrap_or(source_len)
-            .min(source_len);
-        let fallback_index = next_offset_index
-            .saturating_add(XREF_RECONSTRUCTION_FALLBACK_SPAN)
-            .min(offsets.len());
-        let fallback_end = offsets
-            .get(fallback_index)
-            .and_then(|offset| usize::try_from(*offset).ok())
-            .unwrap_or(source_len)
-            .min(source_len);
-        ReferenceReadWindow { end, fallback_end }
-    }
-
-    fn resolver_weak(&self) -> Weak<dyn DocumentResolver> {
-        self.resolver
-            .borrow()
-            .clone()
-            .expect("bootstrap document resolver is installed before parsing")
-    }
-
-    fn handle_for_reference(&self, object_ref: ObjectRef) -> ObjectHandle {
-        if let Some(entry) = self.state.borrow().handles.get(&object_ref) {
-            return entry.handle.clone();
-        }
-        let handle = ObjectHandle::new_indirect_with_resolver(object_ref, self.resolver_weak());
-        self.state
-            .borrow_mut()
-            .handles
-            .insert(object_ref, BootstrapCacheEntry::new(handle.clone()));
-        handle
-    }
-
-    fn push_warning(&self, message: impl AsRef<[u8]>, offset: Option<u64>) {
-        // cov:ignore-start: bootstrap diagnostics are emitted only by the recoverable xref paths, which are covered through their public loader
-        self.state.borrow_mut().diagnostics.push(damaged_warning(
-            &self.options.description,
-            b"",
-            message,
-            offset,
-        ));
-        // cov:ignore-end
-    }
-
-    fn push_diagnostic(&self, diagnostic: QpdfExc) {
-        self.state.borrow_mut().diagnostics.push(diagnostic);
-    }
-
-    fn object_policy(&self) -> RecoveryPolicy {
-        if self.options.allow_repair {
-            RecoveryPolicy::Bounded
-        } else {
-            RecoveryPolicy::RequireEndstream
-        }
-    }
-
-    fn read_file_object(
-        &self,
-        input: &[u8],
-        absolute_offset: u64,
-        policy: RecoveryPolicy,
-        description: XrefObjectDescription,
-        source_bytes: &[u8],
-    ) -> Result<HandleFileObjectRead> {
-        let mut parser = BootstrapHandleParser::new(self, description);
-        let pending = parse_file_object_handle_syntax(input, &mut parser)?;
-        let resolved_length = pending.indirect_length_ref().map(|object_ref| {
-            self.ensure_source_bytes(source_bytes);
-            stacker::maybe_grow(XREF_STACK_RED_ZONE, XREF_STACK_GROWTH_SIZE, || {
-                self.resolve_length(object_ref)
-            })
-        });
-        let mut completed = finish_file_object_handle(input, pending, resolved_length, policy)?;
-        let absolute_offset = i64::try_from(absolute_offset).unwrap_or(i64::MAX);
-        let rebase = |relative: i64| {
-            if relative < 0 {
-                -1
-            } else {
-                absolute_offset.saturating_add(relative)
-            }
-        };
-        let (end_before_space, end_after_space) = (
-            completed.source_extents.end_before_space,
-            completed.source_extents.end_after_space,
-        );
-        let end_before_space = rebase(end_before_space);
-        let end_after_space = if end_before_space < 0 {
-            rebase(end_after_space)
-        } else {
-            let scan_start = usize::try_from(end_before_space).unwrap_or(usize::MAX);
-            let tail = source_bytes.get(scan_start..).unwrap_or_default();
-            match tail.iter().position(|byte| !byte.is_ascii_whitespace()) {
-                Some(index) => i64::try_from(scan_start.saturating_add(index)).unwrap_or(i64::MAX),
-                None => return Err(Error::parse(source_bytes.len(), "EOF after endobj")),
-            }
-        };
-        completed.source_extents = SourceExtents {
-            end_before_space,
-            end_after_space,
-        };
-        let _ = description;
-        Ok(completed)
-    }
-
-    // Mirrors qpdf's own three-way `/Length` classification (an integer, a
-    // resolved null, or anything else) rather than collapsing "resolved but
-    // not an integer" into the same Missing case as "genuinely absent" --
-    // the raw parser's own `resolve_stream_length` (this file, further down)
-    // keeps the same three-way split and must report the same
-    // "/Length key in stream dictionary is not an integer" diagnostic for a
-    // hybrid xref stream whose /Length resolves through the active classic
-    // table to a non-integer object.
-    fn resolve_length(&self, object_ref: ObjectRef) -> ResolvedStreamLength {
-        let handle = self.handle_for_reference(object_ref);
-        match handle.try_as_integer() {
-            Ok(Some(value)) => ResolvedStreamLength::Integer(value),
-            Ok(None) => {
-                if handle.try_is_null().unwrap_or(true) {
-                    ResolvedStreamLength::Missing
-                } else {
-                    ResolvedStreamLength::Invalid
-                }
-            }
-            // A reconstruction trigger lets `resolve_indirect` propagate a
-            // parse error so the caller can rebuild the xref table. Treat a
-            // failed indirect length as missing for this framing attempt,
-            // preserving the stream-boundary recovery fallback.
-            Err(_) => ResolvedStreamLength::Missing,
-        }
-    }
-
-    // qpdf-deviation-start: qpdf 11.9.0 reads referenced bootstrap objects to EOF; reconstruction-only windows bound flpdf recovery work
-    fn read_uncompressed_object(
-        &self,
-        object_ref: ObjectRef,
-        offset: u64,
-    ) -> Result<(ObjectValue, i64, i64, i64)> {
-        let start = usize::try_from(offset)
-            .ok()
-            .ok_or_else(|| Error::parse(0, "object offset does not fit usize"))?;
-        let source_bytes = Rc::clone(self.bytes.get().ok_or_else(|| {
-            Error::Internal("bootstrap resolver source bytes were not initialized".to_owned())
-        })?);
-        let window = self.reference_read_window(offset, source_bytes.len());
-        let narrow = self.read_uncompressed_object_with_end(
-            object_ref,
-            offset,
-            start,
-            window.end,
-            &source_bytes,
-        );
-        // A truncated window can also make `read_uncompressed_object_with_end`
-        // *succeed* with a bogus result instead of failing: under
-        // `RecoveryPolicy::Bounded`, a stream whose real `endstream`/`endobj`
-        // terminator lies beyond `window.end` makes `complete_handle_stream`
-        // fall back to `recover_stream_boundary`'s heuristic search, which can
-        // accept a terminator -- empty recovered data, or a real but earlier
-        // `endobj`/`endstream` match, either way short of the true boundary --
-        // purely because the window cut off what lies past it. Retry through
-        // the wider fallback window whenever that heuristic path was taken,
-        // not only when the narrow attempt's result happened to come back
-        // empty or an outright `Err`.
-        let should_retry = window.fallback_end > window.end
-            && match &narrow {
-                Err(Error::Parse { .. }) => true,
-                Ok(read) => read.used_heuristic_recovery,
-                Err(_) => false, // cov:ignore: the only non-Parse error this attempt can return is the already-defensive "did not produce a direct value" Internal error below, which the parser's own contract makes unreachable
-            };
-        let accepted = if should_retry {
-            self.read_uncompressed_object_with_end(
-                object_ref,
-                offset,
-                start,
-                window.fallback_end,
-                &source_bytes,
-            )
-        } else {
-            narrow
-        }?;
-        // Discard whichever attempt was not accepted rather than pushing its
-        // diagnostics too: a document qpdf could read with a single unbounded
-        // pass must not surface warnings from a speculative narrow read this
-        // window-bounding mechanism alone introduced.
-        for diagnostic in accepted.diagnostics {
-            self.push_diagnostic(diagnostic);
-        }
-        Ok((
-            accepted.value,
-            accepted.parsed_offset,
-            accepted.end_before_space,
-            accepted.end_after_space,
-        ))
-    }
-
-    fn read_uncompressed_object_with_end(
-        &self,
-        object_ref: ObjectRef,
-        offset: u64,
-        start: usize,
-        end: usize,
-        source_bytes: &[u8],
-    ) -> Result<UncompressedObjectRead> {
-        let input = source_bytes
-            .get(start..end)
-            .ok_or_else(|| Error::parse(start, "object is beyond the end of the file"))?;
-        let policy = self.object_policy();
-        let actual_object_ref =
-            parse_file_object_header(input).map_err(|error| error.rebase_offset(start))?;
-        if actual_object_ref.number == 0 {
-            return Err(Error::parse(start, "object with ID 0"));
-        }
-        if actual_object_ref != object_ref {
-            let message = format!(
-                "expected {} {} obj",
-                object_ref.number, object_ref.generation
-            );
-            if self.options.allow_repair || policy == RecoveryPolicy::Bounded {
-                let mut state = self.state.borrow_mut();
-                let trigger = &mut state.reconstruction_trigger;
-                if trigger.is_none() {
-                    *trigger = Some((offset, message.clone()));
-                }
-                return Err(Error::parse(start, message));
-            }
-            self.push_warning(
-                format!(
-                    "(object {} {}, offset {}): {}",
-                    object_ref.number, object_ref.generation, offset, message
-                ),
-                Some(offset),
-            );
-        }
-        // Rebase by `start`, matching the header parse immediately above:
-        // `input` is already the offset-relative tail slice, so an error
-        // surfaced from parsing its body (e.g. "trailing bytes after
-        // object") reports an offset relative to `input`, not the file,
-        // unless rebased here.
-        let mut completed = self
-            .read_file_object(
-                input,
-                offset,
-                policy,
-                XrefObjectDescription::Ordinary,
-                source_bytes,
-            )
-            .map_err(|error| error.rebase_offset(start))?;
-        let used_heuristic_recovery = completed.diagnostics.iter().any(|diagnostic| {
-            matches!(
-                diagnostic.kind,
-                FileObjectDiagnosticKind::AttemptingStreamLengthRecovery
-            )
-        });
-        let diagnostics = completed
-            .diagnostics
-            .iter()
-            .map(|diagnostic| {
-                xref_file_object_diagnostic(
-                    XrefObjectDescription::Ordinary,
-                    completed.object_ref,
-                    offset,
-                    &self.options.description,
-                    diagnostic.clone(),
-                )
-            })
-            .collect();
-        let parsed_offset = completed.object.get_parsed_offset();
-        let (end_before_space, end_after_space) = (
-            completed.source_extents.end_before_space,
-            completed.source_extents.end_after_space,
-        );
-        completed.remove_included_recovery_eol_for_decryption();
-        // cov:ignore-start: the handle parser guarantees an exclusively owned direct top-level value
-        let value = completed.object.into_direct_value().ok_or_else(|| {
-            Error::Internal(format!(
-                "bootstrap object {} {} did not produce a direct value",
-                object_ref.number, object_ref.generation
-            ))
-        })?;
-        // cov:ignore-end
-        Ok(UncompressedObjectRead {
-            value: value.0,
-            parsed_offset,
-            end_before_space,
-            end_after_space,
-            used_heuristic_recovery,
-            diagnostics,
-        })
-    }
-    // qpdf-deviation-end
-
-    fn resolve_objects_in_stream(&self, stream_number: u32) -> Result<()> {
-        if !self
-            .state
-            .borrow_mut()
-            .resolved_object_streams
-            .insert(stream_number)
-        {
-            return Ok(());
-        }
-
-        let stream_handle = self.handle_for_reference(ObjectRef::new(stream_number, 0));
-        stream_handle.try_dereference()?;
-        let (stream_end_before_space, stream_end_after_space) = stream_handle.end_offsets();
-        let stream_dict = stream_handle.as_stream_dict().ok_or_else(|| {
-            Error::parse(
-                0,
-                format!("supposed object stream {stream_number} is not a stream"),
-            )
-        })?;
-        if !stream_dict.try_is_dictionary_of_type(b"ObjStm", b"")? {
-            self.push_warning(
-                format!("supposed object stream {stream_number} has wrong type"),
-                None,
-            );
-        }
-        let object_count = self.handle_integer(&stream_dict, b"/N", "object stream /N")?;
-        let first = self.handle_integer(&stream_dict, b"/First", "object stream /First")?;
-        // qpdf calls getStreamData(qpdf_dl_specialized) here, which routes
-        // through the stream's canonical filter pipeline rather than a
-        // separate whole-buffer decoder (`QPDF.cc:1792`).
-        let decoded = stream_handle.get_stream_data(DecodeLevel::Specialized)?;
-
-        let mut tokenizer = Tokenizer::new(&decoded);
-        let mut members = BTreeMap::new();
-        for _ in 0..object_count {
-            let object_number = u32::try_from(tokenizer.next_object_stream_integer()?)
-                .map_err(|_| Error::parse(0, "object stream object number is invalid"))?;
-            let object_offset = usize::try_from(tokenizer.next_object_stream_integer()?)
-                .map_err(|_| Error::parse(0, "object stream object offset is invalid"))?;
-            members.insert(object_number, object_offset);
-        }
-
-        for (object_number, object_offset) in members {
-            let object_ref = ObjectRef::new(object_number, 0);
-            let entry = self.entry_lookup.borrow().get(&object_ref).copied();
-            if !matches!(entry, Some(XrefEntry::Compressed { stream, .. }) if stream == stream_number)
-            {
-                if entry.is_none() {
-                    // qpdf's `m->xref_table[og]` inserts a default type-0
-                    // entry when an ObjStm header names an absent member
-                    // (`QPDF.cc:1821-1828`).
-                    self.entry_lookup
-                        .borrow_mut()
-                        .insert(object_ref, XrefEntry::Free { next: 0 });
-                }
-                continue;
-            }
-            let member_start = first
-                .checked_add(object_offset)
-                .ok_or_else(|| Error::parse(0, "object stream member offset overflow"))?;
-            // qpdf seeks to the member offset even when it is past the
-            // decoded payload, then lets readObjectInStream report the normal
-            // EOF/empty-object result (`QPDF.cc:1825-1828`).
-            let diagnostic_start = member_start.min(decoded.len());
-            let member_data = decoded.get(diagnostic_start..).unwrap_or_default();
-            let mut parser = BootstrapHandleParser::new(
-                self,
-                XrefObjectDescription::ObjStmMember {
-                    stream_number,
-                    object_ref,
-                },
-            );
-            let (value, parsed_offset, diagnostics) =
-                match parse_qpdf_direct_object_handle_with_diagnostics(
-                    member_data,
-                    i64::try_from(diagnostic_start).unwrap_or(i64::MAX),
-                    Some(i64::try_from(diagnostic_start).unwrap_or(i64::MAX)),
-                    &mut parser,
-                ) {
-                    Ok(parsed) => parsed,
-                    // Mirror `XrefReadContext::resolve_objects_in_stream`'s own
-                    // member-context wrapping: a raw parse error must carry the
-                    // same "object stream N (object M 0, offset ...)" identity
-                    // and rebased offset a successfully-parsed member's
-                    // diagnostics already get below, not the raw member-relative
-                    // offset/message.
-                    Err(error) => {
-                        return Err(match error.rebase_offset(diagnostic_start) {
-                        Error::Parse { offset, message } => Error::parse(
-                            offset,
-                            format!(
-                                "object stream {stream_number} (object {} 0, offset {offset}): {message}",
-                                object_ref.number
-                            ),
-                        ),
-                        other => other, // cov:ignore: byte-backed direct parser errors are parse errors
-                    });
-                    }
-                };
-            let malformed = !diagnostics.is_empty() && matches!(&value, ObjectValue::Null);
-            for diagnostic in diagnostics {
-                let offset = diagnostic_start.saturating_add(diagnostic.relative_offset);
-                let mut message = format!(
-                    "object stream {stream_number} (object {} 0, offset {offset}): ",
-                    object_ref.number
-                )
-                .into_bytes();
-                message.extend_from_slice(&diagnostic.message);
-                self.push_warning(message, Some(offset as u64));
-            }
-            // qpdf's `resolveObjectsInStream` always parses the member and
-            // `updateCache` overwrites an existing cache slot
-            // (`libqpdf/QPDF.cc:1821-1828,1843-1857`). A reentrant lookup
-            // during stream-dictionary resolution can have temporarily
-            // resolved this handle to null, so do not let that provisional
-            // value suppress the real member parse.
-            let member_handle = self.handle_for_reference(object_ref);
-            member_handle.set_resolved(value);
-            if !malformed {
-                member_handle.set_parsed_offset_if_unset(parsed_offset);
-                member_handle.set_end_offsets(stream_end_before_space, stream_end_after_space);
-                if parsed_offset >= 0 && !member_handle.is_null() {
-                    member_handle.set_description(
-                        self.object_description_template(stream_number, object_ref),
-                        parsed_offset,
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn object_description_template(&self, stream_number: u32, object_ref: ObjectRef) -> Vec<u8> {
-        // qpdf renders an ObjStm member's warning from three pieces: the
-        // decoded InputSource name (`<file> object stream N`, built at
-        // `libqpdf/QPDF.cc:1796`), the parser's own description string
-        // (`object M 0`, `QPDF.cc:1451-1459`) and the parsed offset --
-        // `QPDFParser::warn` passes all three into `QPDFExc`
-        // (`libqpdf/QPDFParser.cc:509-513`). flpdf's description template
-        // carries that whole rendered prefix, with `$PO` standing in for the
-        // offset (`crates/flpdf/src/object_handle.rs:940`), so it has to keep
-        // the input description and the stream number. This is the same shape
-        // the canonical reader produces
-        // (`reader/resolver.rs::object_stream_description_template`).
-        let mut description = self.options.description.clone();
-        description.extend_from_slice(
-            format!(
-                " object stream {stream_number}, object {} {} at offset $PO",
-                object_ref.number, object_ref.generation
-            )
-            .as_bytes(),
-        );
-        description
-    }
-
-    fn handle_integer(&self, dictionary: &ObjectHandle, key: &[u8], label: &str) -> Result<usize> {
-        let value = dictionary.try_get_key(key)?.try_as_integer()?;
-        let value = value.ok_or_else(|| Error::parse(0, format!("{label} is not an integer")))?;
-        usize::try_from(value).map_err(|_| Error::parse(0, format!("{label} is invalid")))
-    }
-}
-
-struct BootstrapHandleParser<'document> {
-    document: &'document BootstrapHandleDocument,
-    description_template: Rc<Vec<u8>>,
-}
-
-impl<'document> BootstrapHandleParser<'document> {
-    fn new(
-        document: &'document BootstrapHandleDocument,
-        description: XrefObjectDescription,
-    ) -> Self {
-        let description_template = match description {
-            XrefObjectDescription::Ordinary => b"object $OG".to_vec(),
-            XrefObjectDescription::XrefStream => b"xref stream: object $OG".to_vec(),
-            XrefObjectDescription::ObjStmMember {
-                stream_number,
-                object_ref,
-            } => document.object_description_template(stream_number, object_ref),
-        };
-        Self {
-            document,
-            description_template: Rc::new(description_template),
-        }
-    }
-}
-
 struct CanonicalTrailerParser<'document> {
     owner: &'document dyn CanonicalTrailerOwner,
     description_template: Rc<Vec<u8>>,
@@ -1327,412 +463,6 @@ impl HandleResolver for CanonicalTrailerParser<'_> {
     }
 }
 
-impl HandleResolver for BootstrapHandleParser<'_> {
-    fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
-        self.document.handle_for_reference(object_ref)
-    }
-
-    fn direct_handle(&mut self, value: ObjectValue) -> ObjectHandle {
-        ObjectHandle::from_parsed_value_with_resolver(value, self.document.resolver_weak())
-    }
-
-    fn description_template(&self) -> Option<Rc<Vec<u8>>> {
-        Some(Rc::clone(&self.description_template))
-    }
-}
-
-impl DocumentResolver for BootstrapHandleDocument {
-    fn source_extents(&self, object_gen: QpdfObjGen) -> SourceExtents {
-        object_gen
-            .to_object_ref()
-            .and_then(|object_ref| {
-                self.state
-                    .borrow()
-                    .handles
-                    .get(&object_ref)
-                    .map(|entry| entry.source_extents)
-            })
-            .unwrap_or(SourceExtents::UNSET)
-    }
-
-    fn set_source_extents(&self, object_gen: QpdfObjGen, extents: SourceExtents) {
-        let Some(object_ref) = object_gen.to_object_ref() else {
-            return;
-        };
-        if let Some(entry) = self.state.borrow_mut().handles.get_mut(&object_ref) {
-            entry.source_extents = extents;
-        }
-    }
-
-    fn input_description(&self) -> Vec<u8> {
-        self.options.description.clone()
-    }
-
-    fn warn(&self, warning: QpdfExc) -> Result<()> {
-        // qpdf's QPDFObjectHandle::objectWarning/typeWarning boundary hands
-        // an already-formed exception to QPDF::warn, which appends it to the
-        // document warning collection (QPDF.cc:487-494). The owner-less
-        // bootstrap has no logger of its own; its state diagnostics are the
-        // standalone equivalent and are replayed by the xref loader.
-        self.push_diagnostic(warning);
-        Ok(())
-    }
-
-    fn warn_stream_data(&self, warning: QpdfExc) -> Result<()> {
-        // QPDF_Stream::warn uses the stream parsed offset and lets QPDF::warn
-        // collect the warning without aborting decoding
-        // (QPDF_Stream.cc:695-698, QPDF.cc:487-494). Keep this separate
-        // trait boundary so ObjectHandle::stream_data_warning can preserve
-        // the input description and offset while retaining the decoded
-        // ObjStm member.
-        self.push_diagnostic(warning);
-        Ok(())
-    }
-
-    // qpdf-deviation: qpdf has no stack-growth policy; grow the Rust bootstrap resolver stack instead of imposing an arbitrary depth cap
-    fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
-        stacker::maybe_grow(XREF_STACK_RED_ZONE, XREF_STACK_GROWTH_SIZE, || {
-            self.resolve_indirect_inner(object_ref, handle)
-        })
-    }
-}
-
-impl BootstrapHandleDocument {
-    #[inline(never)]
-    fn resolve_indirect_inner(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
-        if handle.is_resolved() {
-            return Ok(());
-        }
-        if !self.state.borrow_mut().resolving.insert(object_ref) {
-            self.push_warning(
-                format!(
-                    "loop detected resolving object {} {}",
-                    object_ref.number, object_ref.generation
-                ),
-                None,
-            );
-            handle.set_resolved(ObjectValue::Null);
-            return Ok(());
-        }
-
-        // Snapshot the row before the `match`: a temporary `Ref` produced in
-        // a scrutinee lives for the whole match expression, and the compressed
-        // arm below reaches `resolve_objects_in_stream`, which inserts qpdf's
-        // default free row for a header member absent from the table
-        // (`QPDF.cc:1821-1828`) through `entry_lookup.borrow_mut()`.
-        let entry = self.entry_lookup.borrow().get(&object_ref).copied();
-        let result = match entry {
-            Some(XrefEntry::Uncompressed { offset }) if offset != 0 => {
-                self.read_uncompressed_object(object_ref, offset)
-            }
-            Some(XrefEntry::Uncompressed { .. }) => {
-                self.push_warning("object has offset 0", Some(0));
-                Ok((ObjectValue::Null, -1, -1, -1))
-            }
-            // qpdf's `resolve` wraps `resolveObjectsInStream` in the same
-            // try/catch as the type-1 branch above (`QPDF.cc:1719-1734`): a
-            // malformed object stream (e.g. non-integer `/N` or `/First`,
-            // `QPDF.cc:1782-1784`) is caught and warned, then falls through
-            // to `updateCache(og, QPDF_Null::create(), -1, -1)`
-            // (`QPDF.cc:1744-1747`) instead of aborting resolution. Route
-            // through `result`/the `Err` arm below rather than `?` so that
-            // catch-and-null fallback, and the `resolving` guard removal
-            // just past this match, both still run on this path.
-            Some(XrefEntry::Compressed { stream, .. }) => {
-                match self.resolve_objects_in_stream(stream) {
-                    Ok(()) => {
-                        if handle.is_resolved() {
-                            self.state.borrow_mut().resolving.remove(&object_ref);
-                            return Ok(());
-                        }
-                        Ok((ObjectValue::Null, -1, -1, -1))
-                    }
-                    Err(error) => Err(error),
-                }
-            }
-            Some(XrefEntry::Free { .. }) | None => Ok((ObjectValue::Null, -1, -1, -1)),
-        };
-        self.state.borrow_mut().resolving.remove(&object_ref);
-
-        match result {
-            Ok((value, parsed_offset, end_before_space, end_after_space)) => {
-                // qpdf's readObjectAtOffset stores the parsed value only if
-                // the canonical slot is still unresolved. A nested stream
-                // `/Length` lookup may have detected a loop and installed a
-                // permanent null while this outer parse was in progress.
-                if !handle.is_resolved() {
-                    handle.set_resolved(value);
-                    handle.set_parsed_offset_if_unset(parsed_offset);
-                    handle.set_end_offsets(end_before_space, end_after_space);
-                }
-            }
-            Err(error) => {
-                // A header-generation mismatch is qpdf's reconstruction
-                // trigger. Keep the requested handle unresolved until the
-                // caller rebuilds the xref table; caching null here would
-                // prevent the post-reconstruction `/Size` lookup from
-                // resolving the same indirect value against the repaired
-                // entries.
-                if self.state.borrow().reconstruction_trigger.is_some() {
-                    return Err(error); // cov:ignore: LLVM maps the tested reconstruction handoff return to the condition edge
-                } // cov:ignore: LLVM maps the tested reconstruction handoff return to this closing branch edge
-                  // cov:ignore-start: bootstrap byte reads expose only qpdf damage and parse failures; these transport fallbacks are defensive
-                let warning = match error {
-                    Error::QpdfExc(warning) => warning,
-                    Error::Parse { offset, message } => QpdfExc::new(
-                        QpdfErrorCode::DamagedPdf,
-                        &self.options.description,
-                        format!("object {} {}", object_ref.number, object_ref.generation),
-                        i64::try_from(offset).unwrap_or(i64::MAX),
-                        message,
-                    ),
-                    Error::SystemBytes(message) => QpdfExc::new(
-                        QpdfErrorCode::DamagedPdf,
-                        &self.options.description,
-                        format!("object {} {}", object_ref.number, object_ref.generation),
-                        0,
-                        message,
-                    ),
-                    Error::System(message) | Error::Internal(message) => QpdfExc::new(
-                        QpdfErrorCode::DamagedPdf,
-                        &self.options.description,
-                        format!("object {} {}", object_ref.number, object_ref.generation),
-                        0,
-                        message,
-                    ),
-                    Error::Io(error) => QpdfExc::new(
-                        QpdfErrorCode::DamagedPdf,
-                        &self.options.description,
-                        format!("object {} {}", object_ref.number, object_ref.generation),
-                        0,
-                        error.to_string(),
-                    ),
-                    other => return Err(other),
-                };
-                // cov:ignore-end
-                self.push_diagnostic(warning);
-                handle.set_resolved(ObjectValue::Null);
-            }
-        }
-        Ok(())
-    }
-}
-
-/// A short-lived view over the shared handle cache used while a cross-reference
-/// section is being loaded. The cache is already canonical; this wrapper only
-/// retains the old load-phase commit points so the section/recovery code can
-/// keep its qpdf ordering without introducing a second value model.
-#[derive(Debug, Clone)]
-struct XrefHandleCache {
-    shared: SharedBootstrapCache,
-}
-
-impl XrefHandleCache {
-    fn get(&self, object_ref: &ObjectRef) -> Option<ObjectHandle> {
-        self.shared
-            .borrow()
-            .handle_state
-            .borrow()
-            .handles
-            .get(object_ref)
-            .map(|entry| entry.handle.clone())
-            .filter(|handle| handle.is_resolved())
-    }
-
-    fn insert(&self, object_ref: ObjectRef, handle: ObjectHandle) {
-        self.shared
-            .borrow_mut()
-            .handle_state
-            .borrow_mut()
-            .handles
-            .insert(object_ref, BootstrapCacheEntry::new(handle));
-    }
-
-    fn set_source_extents(&self, object_ref: ObjectRef, extents: SourceExtents) {
-        if let Some(entry) = self
-            .shared
-            .borrow_mut()
-            .handle_state
-            .borrow_mut()
-            .handles
-            .get_mut(&object_ref)
-        {
-            entry.source_extents = extents;
-        }
-    }
-
-    fn commit(&mut self) {}
-
-    fn shared(&self) -> SharedBootstrapCache {
-        Rc::clone(&self.shared)
-    }
-}
-
-/// Handle-only bootstrap context for qpdf's pre-`Pdf` xref reads.
-struct XrefReadContext<'bytes> {
-    bytes: &'bytes [u8],
-    document: Rc<BootstrapHandleDocument>,
-    cache: XrefHandleCache,
-    diagnostics: Diagnostics,
-    handle_diagnostics_len: usize,
-}
-
-struct XrefDetachedHandles;
-
-impl HandleResolver for XrefDetachedHandles {
-    fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
-        ObjectHandle::new_indirect_unresolved(object_ref, -1)
-    }
-
-    fn direct_handle(&mut self, value: ObjectValue) -> ObjectHandle {
-        ObjectHandle::from_value(value)
-    }
-}
-
-impl<'bytes> XrefReadContext<'bytes> {
-    fn new(
-        bytes: &'bytes [u8],
-        spec: XrefReadContextSpec<'_>,
-        registration: &XrefRegistration,
-        options: XrefLoadOptions,
-    ) -> Self {
-        let (entry_lookup, shared, reference_offsets) = match spec {
-            XrefReadContextSpec::ActiveSection => (
-                XrefEntryLookup::Registration(&registration.entries),
-                empty_bootstrap_cache(),
-                None,
-            ),
-            XrefReadContextSpec::ActiveSectionWithCache { bootstrap_cache } => (
-                XrefEntryLookup::Registration(&registration.entries),
-                Rc::clone(bootstrap_cache),
-                None,
-            ),
-            XrefReadContextSpec::Reconstruction {
-                line_scan_entries,
-                reference_offsets,
-            } => (
-                XrefEntryLookup::Reconstruction {
-                    line_scan_entries,
-                    registration_entries: &registration.entries,
-                },
-                empty_bootstrap_cache(),
-                Some(Rc::clone(reference_offsets)),
-            ),
-            XrefReadContextSpec::ReconstructionWithCache {
-                line_scan_entries,
-                reference_offsets,
-                bootstrap_cache,
-            } => (
-                XrefEntryLookup::Reconstruction {
-                    line_scan_entries,
-                    registration_entries: &registration.entries,
-                },
-                Rc::clone(bootstrap_cache),
-                Some(Rc::clone(reference_offsets)),
-            ),
-        };
-        let document = {
-            let mut cache = shared.borrow_mut();
-            if let Some(document) = cache.handle_document.as_ref() {
-                document.refresh_entry_lookup(entry_lookup);
-                Rc::clone(document)
-            } else {
-                let document = BootstrapHandleDocument::new_with_state(
-                    None,
-                    entry_lookup,
-                    options.clone(),
-                    Rc::clone(&cache.handle_state),
-                );
-                cache.handle_document = Some(Rc::clone(&document));
-                document
-            }
-        };
-        document.set_reference_offsets(reference_offsets);
-        let handle_diagnostics_len = shared
-            .borrow()
-            .handle_state
-            .borrow()
-            .diagnostics
-            .entries()
-            .len();
-        Self {
-            bytes,
-            document,
-            cache: XrefHandleCache { shared },
-            diagnostics: Diagnostics::default(),
-            handle_diagnostics_len,
-        }
-    }
-
-    fn read_file_object_handle(
-        &mut self,
-        input: &[u8],
-        absolute_offset: u64,
-        policy: RecoveryPolicy,
-        description: XrefObjectDescription,
-    ) -> Result<HandleFileObjectRead> {
-        let result =
-            self.document
-                .read_file_object(input, absolute_offset, policy, description, self.bytes);
-        self.sync_handle_diagnostics();
-        result
-    }
-
-    fn resolve_dictionary_value(
-        &mut self,
-        dictionary: &ObjectHandle,
-        key: &str,
-    ) -> Option<ObjectHandle> {
-        let mut name = Vec::with_capacity(key.len() + 1);
-        name.push(b'/');
-        name.extend_from_slice(key.as_bytes());
-        self.ensure_source_for_resolution(dictionary);
-        let value = dictionary.try_get_key(&name).ok()?;
-        self.ensure_source_for_resolution(&value);
-        let _ = value.try_dereference();
-        self.sync_handle_diagnostics();
-        Some(value)
-    }
-
-    fn ensure_source_for_resolution(&self, handle: &ObjectHandle) {
-        if handle.object_ref().is_some() && !handle.is_resolved() {
-            self.document.ensure_source_bytes(self.bytes);
-        }
-    }
-
-    fn sync_handle_diagnostics(&mut self) {
-        let shared = self.cache.shared.borrow();
-        let state = shared.handle_state.borrow();
-        for diagnostic in state
-            .diagnostics
-            .entries()
-            .iter()
-            .skip(self.handle_diagnostics_len)
-        {
-            self.diagnostics.push(diagnostic.clone());
-        }
-        self.handle_diagnostics_len = state.diagnostics.entries().len();
-    }
-
-    fn append_diagnostics_to(&mut self, diagnostics: &mut Diagnostics) {
-        self.sync_handle_diagnostics();
-        for diagnostic in self.diagnostics.entries() {
-            diagnostics.push(diagnostic.clone());
-        }
-    }
-
-    fn take_reconstruction_trigger(&self) -> Option<Error> {
-        let shared = self.cache.shared.borrow();
-        let trigger = shared
-            .handle_state
-            .borrow_mut()
-            .reconstruction_trigger
-            .take()
-            .map(|(offset, message)| Error::parse(offset as usize, message));
-        trigger
-    }
-}
-
 trait XrefObjectContext {
     fn ensure_source_for_resolution(&self, handle: &ObjectHandle);
     fn resolve_dictionary_value(
@@ -1744,10 +474,9 @@ trait XrefObjectContext {
     ///
     /// qpdf reads this in one call, `xref_obj.getStreamData(qpdf_dl_specialized)`
     /// (`libqpdf/QPDF.cc:1051`), over `QPDFObjectHandle::getStreamData`
-    /// (`QPDFObjectHandle.cc:1289-1292`). Both the bootstrap and
-    /// canonical-owner contexts use the resolver-backed handle's canonical
-    /// `get_stream_data` pipe; bootstrap retains its bounded source-read
-    /// policy in the resolver rather than a second materialized decoder.
+    /// (`QPDFObjectHandle.cc:1289-1292`). The canonical-owner context uses
+    /// the resolver-backed handle's own `get_stream_data` pipe rather than a
+    /// second materialized decoder.
     fn decoded_xref_stream_data(
         &mut self,
         object_ref: ObjectRef,
@@ -1760,51 +489,6 @@ trait XrefObjectContext {
     fn take_reconstruction_trigger(&mut self) -> Option<Error>;
     fn push_diagnostic(&mut self, diagnostic: QpdfExc);
     fn description(&self) -> &[u8];
-}
-
-impl XrefObjectContext for XrefReadContext<'_> {
-    fn ensure_source_for_resolution(&self, handle: &ObjectHandle) {
-        Self::ensure_source_for_resolution(self, handle);
-    }
-
-    fn resolve_dictionary_value(
-        &mut self,
-        dictionary: &ObjectHandle,
-        key: &str,
-    ) -> Option<ObjectHandle> {
-        Self::resolve_dictionary_value(self, dictionary, key)
-    }
-
-    fn decoded_xref_stream_data(
-        &mut self,
-        _object_ref: ObjectRef,
-        _stream_dict: &ObjectHandle,
-        object: &ObjectHandle,
-        _xref_pos: usize,
-    ) -> Result<Vec<u8>> {
-        let data = object.get_stream_data(DecodeLevel::Specialized)?;
-        Ok((*data).clone())
-    }
-
-    fn sync_handle_diagnostics(&mut self) {
-        Self::sync_handle_diagnostics(self);
-    }
-
-    fn append_diagnostics_to(&mut self, diagnostics: &mut Diagnostics) {
-        Self::append_diagnostics_to(self, diagnostics);
-    }
-
-    fn take_reconstruction_trigger(&mut self) -> Option<Error> {
-        Self::take_reconstruction_trigger(self)
-    }
-
-    fn push_diagnostic(&mut self, diagnostic: QpdfExc) {
-        self.diagnostics.push(diagnostic);
-    }
-
-    fn description(&self) -> &[u8] {
-        &self.document.options.description
-    }
 }
 
 struct CanonicalXrefContext<'owner> {
@@ -1910,55 +594,6 @@ impl XrefObjectContext for CanonicalXrefContext<'_> {
     fn description(&self) -> &[u8] {
         &self.description
     }
-}
-
-#[cfg(test)]
-fn detach_bootstrap_handle(source: &ObjectHandle) -> Result<ObjectHandle> {
-    if let Some(object_ref) = source.object_ref() {
-        return Ok(ObjectHandle::new_indirect_unresolved(
-            object_ref,
-            source.get_parsed_offset(),
-        ));
-    }
-
-    source.try_dereference()?;
-    let value = source
-        .with_value(|value| value.cloned())
-        .ok_or_else(|| Error::Internal("bootstrap trailer has no value".to_owned()))?;
-    let value = match value {
-        ObjectValue::Array(children) => ObjectValue::Array(
-            children
-                .iter()
-                .map(detach_bootstrap_handle)
-                .collect::<Result<Vec<_>>>()?,
-        ),
-        ObjectValue::Dictionary(entries) => ObjectValue::Dictionary(
-            entries
-                .into_iter()
-                .map(|(key, child)| Ok((key, detach_bootstrap_handle(&child)?)))
-                .collect::<Result<BTreeMap<_, _>>>()?,
-        ),
-        ObjectValue::Stream(mut stream) => {
-            stream.stream_dict = detach_bootstrap_handle(&stream.stream_dict)?;
-            stream.stream_token_filters = Default::default();
-            stream.content_normalization_applied = false;
-            ObjectValue::Stream(stream)
-        }
-        other => other,
-    };
-    Ok(ObjectHandle::from_value(value))
-}
-
-#[cfg(test)]
-pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
-    reader: &mut R,
-    options: XrefLoadOptions,
-) -> Result<LoadedXrefState> {
-    let mut source_bytes = Vec::new();
-    reader.seek(SeekFrom::Start(0))?;
-    reader.read_to_end(&mut source_bytes)?;
-
-    load_xref_state_from_bytes(&source_bytes, options, None)
 }
 
 fn read_live_source_range(
@@ -2156,9 +791,8 @@ pub(crate) fn load_xref_state_through_canonical_owner<R: Read + Seek + 'static>(
     (owner, loaded)
 }
 
-/// Canonical `Pdf::open` xref loading through qpdf's live input-source
-/// boundary. The initial implementation keeps bounded prefix/tail/xref
-/// windows; owner-less tests continue to use the byte-slice loader above.
+/// `Pdf::open` xref loading through qpdf's live input-source boundary. It
+/// keeps bounded prefix/tail/xref windows instead of a complete snapshot.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn load_xref_state_from_source(
     owner: &dyn CanonicalTrailerOwner,
@@ -2170,7 +804,7 @@ pub(crate) fn load_xref_state_from_source(
         Err(Error::QpdfExc(exception)) if exception.get_error_code() == QpdfErrorCode::System => {
             // qpdf's processFile C wrapper catches the initial FileInputSource
             // runtime error rather than a QPDFExc (`qpdf-c.cc:70-79`), so this
-            // bootstrap read retains its empty-location SystemBytes shape.
+            // initial read retains its empty-location SystemBytes shape.
             let mut message = options.description.clone();
             message.extend_from_slice(b": read 1024 bytes");
             return Err(Error::SystemBytes(message));
@@ -2191,7 +825,7 @@ pub(crate) fn load_xref_state_from_source(
         }
     };
     owner.set_header_offset(header_offset);
-    deliver_canonical_diagnostics(Some(owner), &mut initial_diagnostics)?;
+    deliver_canonical_diagnostics(owner, &mut initial_diagnostics)?;
 
     let logical_length = physical_length.saturating_sub(header_offset as u64);
     let tail_length = usize::try_from(logical_length.min(1054)).unwrap_or(1054);
@@ -2212,11 +846,11 @@ pub(crate) fn load_xref_state_from_source(
                 options,
                 Diagnostics::default(),
                 vec![error],
-                Some(owner),
+                owner,
             );
         }
         Err(error) => {
-            deliver_canonical_diagnostics(Some(owner), &mut initial_diagnostics)?;
+            deliver_canonical_diagnostics(owner, &mut initial_diagnostics)?;
             return Err(error);
         }
     };
@@ -2234,7 +868,7 @@ pub(crate) fn load_xref_state_from_source(
             options,
             Diagnostics::default(),
             Vec::new(),
-            Some(owner),
+            owner,
         );
     }
     let xref_window = if startxref >= logical_length {
@@ -2268,7 +902,7 @@ pub(crate) fn load_xref_state_from_source(
             options,
             initial_diagnostics,
             Vec::new(),
-            Some(owner),
+            owner,
         );
     }
     load_xref_state_from_window(
@@ -2280,71 +914,7 @@ pub(crate) fn load_xref_state_from_source(
         options,
         Diagnostics::default(),
         Vec::new(),
-        Some(owner),
-    )
-}
-
-/// Load xref state from bytes that were read by the document's own input
-/// source.  When `canonical_trailer_owner` is present, the initial classic
-/// trailer is parsed directly into that owner instead of being rebuilt through
-/// the short-lived bootstrap cache.
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-pub(crate) fn load_xref_state_from_bytes(
-    source_bytes: &[u8],
-    options: XrefLoadOptions,
-    canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
-) -> Result<LoadedXrefState> {
-    let mut initial_diagnostics = Diagnostics::default();
-    // qpdf's QPDF::parse always calls findHeader before it considers
-    // attempt_recovery (`QPDF.cc:429-438`). A missing or malformed header is a
-    // warning, not a strict-open terminal parse error; qpdf falls back to PDF
-    // 1.2 and continues to find/read startxref. Keep that warning in the same
-    // document collection for both repair modes.
-    let (version, header_offset) = match find_qpdf_header(source_bytes) {
-        Some((offset, version)) => (version, offset),
-        None => {
-            initial_diagnostics.push(damaged_warning(
-                &options.description,
-                b"",
-                "can't find PDF header",
-                None,
-            ));
-            ("1.2".to_string(), 0)
-        }
-    };
-    if let Some(owner) = canonical_trailer_owner {
-        owner.set_header_offset(header_offset);
-    }
-    deliver_canonical_diagnostics(canonical_trailer_owner, &mut initial_diagnostics)?;
-    let bytes = &source_bytes[header_offset..];
-    let startxref = match parse_startxref(bytes) {
-        Ok(offset) => offset,
-        Err(error) if options.allow_repair => {
-            return load_xref_state_from_window(
-                bytes,
-                0,
-                version,
-                header_offset,
-                0,
-                options,
-                std::mem::take(&mut initial_diagnostics),
-                vec![error],
-                canonical_trailer_owner,
-            );
-        }
-        Err(error) => return Err(error),
-    };
-    load_xref_state_from_window(
-        bytes,
-        0,
-        version,
-        header_offset,
-        startxref,
-        options,
-        initial_diagnostics,
-        Vec::new(),
-        canonical_trailer_owner,
+        owner,
     )
 }
 
@@ -2358,7 +928,7 @@ fn load_xref_state_from_window(
     options: XrefLoadOptions,
     mut initial_diagnostics: Diagnostics,
     mut parse_errors: Vec<Error>,
-    canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
+    canonical_trailer_owner: &dyn CanonicalTrailerOwner,
 ) -> Result<LoadedXrefState> {
     let allow_repair = options.allow_repair;
     let xref_pos = match startxref
@@ -2372,18 +942,15 @@ fn load_xref_state_from_window(
         }
         None => return Err(Error::parse(0, "startxref does not fit source window")),
     };
-    // qpdf-deviation-start: qpdf's xref_offset == 0 check
-    // (`QPDF.cc:450-452`) throws damagedPDF("can't find startxref")
-    // immediately and never calls read_xref at all -- whether xref_offset is
-    // 0 because startxref itself could not be parsed, or because a
-    // syntactically valid `startxref` explicitly names offset 0.
-    // parse_startxref's Ok(0) case (an explicit zero) and the Err fallback
-    // below (a missing/malformed startxref) both leave `startxref == 0`
-    // here. Below, the canonical-owner + repair-mode combination now skips
-    // the retry entirely (matching qpdf exactly, see the comment there); the
-    // remaining owner-less recovery path is entered only after this qpdf
-    // guard has classified the zero offset as the `can't find startxref`
-    // trigger; no route reads a speculative xref at logical offset zero.
+    // qpdf's `xref_offset == 0` check (`QPDF.cc:450-452`) throws
+    // damagedPDF("can't find startxref") immediately and never calls
+    // read_xref at all -- whether xref_offset is 0 because startxref itself
+    // could not be parsed, or because a syntactically valid `startxref`
+    // explicitly names offset 0. `parse_startxref`'s Ok(0) case (an explicit
+    // zero) and its Err fallback (a missing/malformed startxref) both leave
+    // `startxref == 0` here, and both hand straight to reconstruction in
+    // repair mode, so no route reads a speculative xref at logical offset
+    // zero.
     if startxref == 0 {
         if !allow_repair {
             return Err(Error::parse(0, "can't find startxref"));
@@ -2400,7 +967,6 @@ fn load_xref_state_from_window(
             None,
             None,
             None,
-            None,
             options.clone(),
             initial_diagnostics,
             None,
@@ -2411,95 +977,39 @@ fn load_xref_state_from_window(
     }
 
     let mut registration = XrefRegistration::default();
-    let mut initial_parse_diagnostics = Diagnostics::default();
     let mut observed_first_xref_item_offset = None;
-    let initial_bootstrap_cache = canonical_trailer_owner
-        .is_none()
-        .then(empty_bootstrap_cache);
-    // Unlike the owner-less bootstrap path this retry otherwise shares, a
-    // canonical owner cannot safely attempt it at all --
-    // `CanonicalTrailerOwner::indirect_handle`/`read_xref_stream_at_offset`
-    // resolve through the live document, and any warning that resolution
-    // raises is pushed immediately (`ResolverHandle::push_qpdf_warning`,
-    // matching qpdf's own `warn()` mutating `m->warnings` as it is called,
-    // `QPDF.cc:1250-1258`), not buffered for later discard the way this
-    // function's own `initial_parse_diagnostics` is. Skip the attempt
-    // entirely for this owner so it matches qpdf's real control flow
-    // (`QPDF.cc:450-452`: never call `read_xref` when the offset is zero)
-    // instead of leaking a warning qpdf never produces. `allow_repair` is
-    // required in the guard because a non-repair open can only reach
-    // `startxref == 0` via an explicit `startxref 0` in the file (the
-    // Err-from-parse_startxref arm above returns immediately when
-    // `!allow_repair`); that narrower case is unverified against qpdf and
-    // left to the unfixed bootstrap-shaped retry below.
-    let initial_context_spec = initial_bootstrap_cache
-        .as_ref()
-        .map_or(XrefReadContextSpec::ActiveSection, |bootstrap_cache| {
-            XrefReadContextSpec::ActiveSectionWithCache { bootstrap_cache }
-        });
-    let initial_parse_result =
-        if allow_repair && startxref == 0 && canonical_trailer_owner.is_some() {
-            Err(Error::parse(0, "xref not found"))
-        } else {
-            parse_xref_from_start_with_owner(
-                bytes,
-                xref_pos,
-                source_base,
-                startxref,
-                &version,
-                options.clone(),
-                &mut registration,
-                Some(&mut initial_parse_diagnostics),
-                initial_context_spec,
-                Some(&mut observed_first_xref_item_offset),
-                true,
-                canonical_trailer_owner,
-            )
-        };
-    let mut loaded = match initial_parse_result
-    // qpdf-deviation-end
-    {
+    // No caller-local diagnostic sink: the owner is the single warning sink
+    // for this read, matching qpdf's one `m->warnings`
+    // (`libqpdf/QPDF.cc:487-494`). The initial section's own warnings are
+    // already delivered through `deliver_canonical_diagnostics` inside the
+    // parse, so there is nothing left to forward before reconstruction.
+    let mut loaded = match parse_xref_from_start_with_owner(
+        bytes,
+        xref_pos,
+        source_base,
+        startxref,
+        &version,
+        options.clone(),
+        &mut registration,
+        None,
+        Some(&mut observed_first_xref_item_offset),
+        true,
+        canonical_trailer_owner,
+    ) {
         Ok(loaded) => loaded,
         Err(error) if allow_repair => {
             // Report the first recorded failure; this parse error is only the
             // trigger when the startxref stage itself succeeded.
-            let trigger = parse_errors.into_iter().next().unwrap_or_else(|| {
-                if startxref == 0 {
-                    Error::parse(0, "xref not found")
-                } else {
-                    error
-                }
-            });
-            // qpdf rejects an xref offset of zero before calling read_xref
-            // (`QPDF.cc:450-452`), so diagnostics from flpdf's marked
-            // offset-zero retry have no qpdf counterpart. Keep diagnostics
-            // from a real non-zero xref read, but discard this detour's
-            // warnings before candidate recovery.
-            if startxref != 0 {
-                for diagnostic in initial_parse_diagnostics.entries() {
-                    initial_diagnostics.push(diagnostic.clone());
-                }
-                deliver_canonical_diagnostics(
-                    canonical_trailer_owner,
-                    &mut initial_diagnostics,
-                )?; // cov:ignore: this branch only propagates a canonical warning-sink failure from a failed nonzero-startxref parse; the sink boundary is covered by Pdf open failure tests
-            }
-            let preexisting_entries = (startxref != 0).then_some(&registration.entries);
-            let preexisting_raw_entries = (startxref != 0).then_some(&registration.raw_entries);
-            let preexisting_bootstrap_cache = if startxref != 0 {
-                initial_bootstrap_cache.as_ref()
-            } else {
-                None // cov:ignore: startxref == 0 returns through the reconstruction handoff above
-            };
+            let trigger = parse_errors.into_iter().next().unwrap_or(error);
+            deliver_canonical_diagnostics(canonical_trailer_owner, &mut initial_diagnostics)?; // cov:ignore: this branch only propagates a canonical warning-sink failure from a failed xref parse; the sink boundary is covered by Pdf open failure tests
             let mut recovered = recover_xref_from_linear_scan(
                 bytes,
                 version,
                 startxref,
                 trigger,
                 None,
-                preexisting_entries,
-                preexisting_raw_entries,
-                preexisting_bootstrap_cache,
+                Some(&registration.entries),
+                Some(&registration.raw_entries),
                 options.clone(),
                 initial_diagnostics,
                 observed_first_xref_item_offset,
@@ -2527,7 +1037,6 @@ fn load_xref_state_from_window(
             Some(&loaded.loaded.trailer),
             Some(&registration.entries),
             Some(&registration.raw_entries),
-            loaded.bootstrap_cache.as_ref(),
             options.clone(),
             diagnostics,
             Some(loaded.first_xref_item_offset),
@@ -2548,7 +1057,6 @@ fn load_xref_state_from_window(
         options.clone(),
         &mut registration,
         Some(&mut previous_parse_diagnostics),
-        XrefReadContextSpec::ActiveSection,
         Some(&mut observed_first_xref_item_offset),
         canonical_trailer_owner,
     ) {
@@ -2564,7 +1072,6 @@ fn load_xref_state_from_window(
                 Some(&loaded.loaded.trailer),
                 Some(&registration.entries),
                 Some(&registration.raw_entries),
-                loaded.bootstrap_cache.as_ref(),
                 options.clone(),
                 previous_parse_diagnostics,
                 observed_first_xref_item_offset,
@@ -2583,34 +1090,15 @@ fn load_xref_state_from_window(
     // qpdf's post-chain `m->trailer.getKey("/Size").getIntValueAsInt()`
     // dereferences indirect `/Size` values through the completed active xref
     // table before applying the consistency warning (`QPDF.cc:689-704`).
-    // Keep `/Size` in the xref-loading responsibility boundary. The canonical
-    // `Pdf::open` route resolves it through the already-created resolver;
-    // owner-less standalone loading uses its retained bootstrap context.
-    let (resolved_size, size_reconstruction_trigger) = if let Some(owner) = canonical_trailer_owner
-    {
-        owner.install_xref_entries(registration.snapshot());
-        let mut context = CanonicalXrefContext::new(owner, options.description.clone());
+    // Keep `/Size` in the xref-loading responsibility boundary: the route
+    // resolves it through the document's own resolver, which already owns the
+    // active xref table.
+    let (resolved_size, size_reconstruction_trigger) = {
+        canonical_trailer_owner.install_xref_entries(registration.snapshot());
+        let mut context =
+            CanonicalXrefContext::new(canonical_trailer_owner, options.description.clone());
         let value = context.resolve_dictionary_value(&loaded.loaded.trailer, "Size");
         let trigger = context.take_reconstruction_trigger();
-        context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
-        (value, trigger)
-    } else {
-        let mut context = XrefReadContext::new(
-            bytes,
-            XrefReadContextSpec::ActiveSectionWithCache {
-                bootstrap_cache: loaded
-                    .bootstrap_cache
-                    .as_ref()
-                    .expect("owner-less xref state has a bootstrap cache"),
-            },
-            &registration,
-            options.clone(),
-        );
-        let value = context.resolve_dictionary_value(&loaded.loaded.trailer, "Size");
-        let trigger = context.take_reconstruction_trigger();
-        if trigger.is_none() {
-            context.cache.commit();
-        }
         context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
         (value, trigger)
     };
@@ -2635,7 +1123,6 @@ fn load_xref_state_from_window(
             Some(&loaded.loaded.trailer),
             None, // cov:ignore: an existing fallback trailer suppresses candidate re-entry, so no prior candidate state is consumed here
             None, // cov:ignore: no prior raw registration is consumed here
-            loaded.bootstrap_cache.as_ref(), // cov:ignore: the post-chain /Size trigger is superseded by the canonical classic-trailer validation handoff before this defensive path
             options.clone(),
             diagnostics,
             None,
@@ -2651,37 +1138,15 @@ fn load_xref_state_from_window(
         // therefore resolves the value against the newly reconstructed xref
         // before the :697-704 size consistency warning. Re-run that one
         // post-reconstruction lookup through the same owner that read the
-        // recovered xref table; the owner-less route retains its reconstruction
-        // context while `Pdf::open` uses the canonical resolver.
+        // recovered xref table -- the same resolver that read it.
         let (recovered_size, recovered_size_diagnostics) = {
-            let recovered_reference_offsets =
-                reconstructed_reference_offsets(&recovered.loaded.entries);
-            let reconstruction_registration = XrefRegistration::default();
-            if let Some(owner) = canonical_trailer_owner {
-                owner.install_xref_entries(recovered.loaded.entries.clone());
-                let mut context = CanonicalXrefContext::new(owner, options.description.clone());
-                let value = context.resolve_dictionary_value(&recovered.loaded.trailer, "Size");
-                let mut diagnostics = Diagnostics::default();
-                context.append_diagnostics_to(&mut diagnostics);
-                (value, diagnostics)
-            } else {
-                let mut context = XrefReadContext::new(
-                    bytes,
-                    XrefReadContextSpec::ReconstructionWithCache {
-                        line_scan_entries: &recovered.loaded.entries,
-                        reference_offsets: &recovered_reference_offsets,
-                        bootstrap_cache: recovered
-                            .bootstrap_cache
-                            .as_ref()
-                            .expect("owner-less recovered xref state has a bootstrap cache"),
-                    },
-                    &reconstruction_registration,
-                    options.clone(),
-                );
-                let value = context.resolve_dictionary_value(&recovered.loaded.trailer, "Size");
-                context.cache.commit();
-                (value, context.diagnostics.clone())
-            }
+            canonical_trailer_owner.install_xref_entries(recovered.loaded.entries.clone());
+            let mut context =
+                CanonicalXrefContext::new(canonical_trailer_owner, options.description.clone());
+            let value = context.resolve_dictionary_value(&recovered.loaded.trailer, "Size");
+            let mut diagnostics = Diagnostics::default();
+            context.append_diagnostics_to(&mut diagnostics);
+            (value, diagnostics)
         };
         for diagnostic in recovered_size_diagnostics.entries() {
             recovered.loaded.repair_diagnostics.push(diagnostic.clone());
@@ -2740,42 +1205,10 @@ fn load_xref_state_from_window(
         &mut loaded.loaded.entries,
         &mut loaded.parsed_xref_streams,
     );
-    if let Some(owner) = canonical_trailer_owner {
-        owner.discard_cached_generations(&discarded_generations);
-    }
+    canonical_trailer_owner.discard_cached_generations(&discarded_generations);
     discard_trailer_references(&mut loaded.trailer_references, &discarded_generations);
     loaded.header_offset = header_offset;
     Ok(loaded)
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-fn parse_xref_from_start(
-    bytes: &[u8],
-    xref_pos: usize,
-    startxref: u64,
-    version: &str,
-    options: XrefLoadOptions,
-    registration: &mut XrefRegistration,
-    error_diagnostics_sink: Option<&mut Diagnostics>,
-    context_spec: XrefReadContextSpec<'_>,
-    first_xref_item_offset_sink: Option<&mut Option<u64>>,
-    validate_current_classic_trailer: bool,
-) -> Result<LoadedXrefState> {
-    parse_xref_from_start_with_owner(
-        bytes,
-        xref_pos,
-        0,
-        startxref,
-        version,
-        options,
-        registration,
-        error_diagnostics_sink,
-        context_spec,
-        first_xref_item_offset_sink,
-        validate_current_classic_trailer,
-        None,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2788,10 +1221,9 @@ fn parse_xref_from_start_with_owner(
     options: XrefLoadOptions,
     registration: &mut XrefRegistration,
     error_diagnostics_sink: Option<&mut Diagnostics>,
-    context_spec: XrefReadContextSpec<'_>,
     first_xref_item_offset_sink: Option<&mut Option<u64>>,
     validate_current_classic_trailer: bool,
-    canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
+    canonical_trailer_owner: &dyn CanonicalTrailerOwner,
 ) -> Result<LoadedXrefState> {
     parse_xref_from_start_with_owner_and_build_diagnostics(
         bytes,
@@ -2802,7 +1234,6 @@ fn parse_xref_from_start_with_owner(
         options,
         registration,
         error_diagnostics_sink,
-        context_spec,
         first_xref_item_offset_sink,
         validate_current_classic_trailer,
         canonical_trailer_owner,
@@ -2820,10 +1251,9 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
     options: XrefLoadOptions,
     registration: &mut XrefRegistration,
     mut error_diagnostics_sink: Option<&mut Diagnostics>,
-    context_spec: XrefReadContextSpec<'_>,
     first_xref_item_offset_sink: Option<&mut Option<u64>>,
     validate_current_classic_trailer: bool,
-    canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
+    canonical_trailer_owner: &dyn CanonicalTrailerOwner,
     hybrid_build_diagnostics_sink: Option<&mut Diagnostics>,
 ) -> Result<LoadedXrefState> {
     let mut classic_xref_pos = xref_pos;
@@ -2877,14 +1307,6 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
         let (entries, trailer_start, mut table_diagnostics, first_xref_item_offset) = match table {
             Ok(table) => table,
             Err(error) => {
-                if canonical_trailer_owner.is_none() {
-                    if let (Some(warning), Some(sink)) = (
-                        whitespace_warning.clone(),
-                        error_diagnostics_sink.as_deref_mut(),
-                    ) {
-                        sink.push(warning);
-                    }
-                }
                 // The canonical owner keeps its diagnostics through
                 // `push_warning`, not through the caller's sink.
                 if let Some(warning) = whitespace_warning {
@@ -2907,33 +1329,13 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
                 ParsedXrefEntry::Free { object_ref } => deferred_free.push(object_ref),
             }
         }
-        let mut trailer_context = canonical_trailer_owner
-            .is_none()
-            .then(|| XrefReadContext::new(bytes, context_spec, registration, options.clone()));
         // The initial classic subsection is already known when qpdf calls
         // readTrailer, so parser-created indirect children belong to the
-        // document's one obj_cache. The owner-less standalone loader is the
-        // only path that still creates a bootstrap cache below.
-        if let Some(owner) = canonical_trailer_owner {
-            owner.install_xref_entries(registration.snapshot());
-        }
-        let (trailer, trailer_parser_diagnostics) = if let Some(owner) = canonical_trailer_owner {
-            let mut trailer_parser = CanonicalTrailerParser::new(owner, &options.description);
-            read_trailer(
-                bytes,
-                trailer_start,
-                base,
-                &options.description,
-                &mut trailer_parser,
-            )?
-        } else {
-            let mut trailer_parser = BootstrapHandleParser::new(
-                &trailer_context
-                    .as_ref()
-                    .expect("owner-less classic trailer has a bootstrap context")
-                    .document,
-                XrefObjectDescription::Ordinary,
-            );
+        // document's one obj_cache.
+        canonical_trailer_owner.install_xref_entries(registration.snapshot());
+        let (trailer, trailer_parser_diagnostics) = {
+            let mut trailer_parser =
+                CanonicalTrailerParser::new(canonical_trailer_owner, &options.description);
             read_trailer(
                 bytes,
                 trailer_start,
@@ -2949,14 +1351,8 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
             // non-dictionary, then throws the terminal exception
             // (`QPDF.cc:565-568,894-905`). Do not let this early return skip
             // the warning batch.
-            if let Some(owner) = canonical_trailer_owner {
-                for diagnostic in &trailer_diags {
-                    owner.push_warning(diagnostic.clone())?;
-                }
-            } else if let Some(sink) = error_diagnostics_sink.as_deref_mut() {
-                for diagnostic in &trailer_diags {
-                    sink.push(diagnostic.clone());
-                }
+            for diagnostic in &trailer_diags {
+                canonical_trailer_owner.push_warning(diagnostic.clone())?;
             }
             return Err(Error::QpdfExc(QpdfExc::new(
                 QpdfErrorCode::DamagedPdf,
@@ -2966,22 +1362,6 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
                 b"expected trailer dictionary",
             )));
         }
-        let mut bootstrap_diagnostics = Diagnostics::default();
-        if let Some(context) = trailer_context.as_mut() {
-            context.append_diagnostics_to(&mut bootstrap_diagnostics);
-        }
-        // cov:ignore-start: the trailer parser does not dereference its
-        // indirect children, so this pre-Pdf bootstrap diagnostic sink is
-        // empty for every reachable trailer shape.
-        if let Some(sink) = error_diagnostics_sink.as_deref_mut() {
-            for diagnostic in bootstrap_diagnostics.entries() {
-                sink.push(diagnostic.clone());
-            }
-        }
-        // cov:ignore-end
-        let bootstrap_cache = trailer_context
-            .as_ref()
-            .map(|context| context.cache.shared());
         let trailer_references = collect_trailer_references(&trailer);
         let mut loaded = LoadedXrefState {
             loaded: LoadedXref {
@@ -2998,44 +1378,30 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
             pending_reconstruction_trigger: None,
             trailer_references,
             parsed_xref_streams: BTreeMap::new(),
-            bootstrap_cache,
             header_offset: 0,
             already_reconstructed: false,
         };
         for diagnostic in trailer_diags {
             loaded.loaded.repair_diagnostics.push(diagnostic);
         }
-        // cov:ignore-start: the same trailer parse above cannot add bootstrap
-        // diagnostics without dereferencing a child, which it never does.
-        for diagnostic in bootstrap_diagnostics.entries() {
-            loaded.loaded.repair_diagnostics.push(diagnostic.clone());
-        }
-        // cov:ignore-end
         deliver_canonical_diagnostics(
             canonical_trailer_owner,
             &mut loaded.loaded.repair_diagnostics,
         )?; // cov:ignore: this only propagates an injected logger failure after classic trailer parsing; the live sink is covered at the Pdf open boundary
         if validate_current_classic_trailer {
-            let validation = if let Some(owner) = canonical_trailer_owner {
-                let mut context = CanonicalXrefContext::new(owner, options.description.clone());
+            let validation = {
+                let mut context =
+                    CanonicalXrefContext::new(canonical_trailer_owner, options.description.clone());
                 let validation =
                     validate_classic_trailer(&mut context, &loaded.loaded.trailer, trailer_start);
                 context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
                 validation
-            } else {
-                validate_classic_trailer(
-                    trailer_context
-                        .as_mut()
-                        .expect("owner-less classic trailer has a bootstrap context"),
-                    &loaded.loaded.trailer,
-                    trailer_start,
-                )
             };
             match validation {
                 Ok(ClassicTrailerValidation::Valid) => {}
                 Ok(ClassicTrailerValidation::NeedsReconstruction(error)) => {
                     let Error::Parse { offset, message } = error else {
-                        // cov:ignore-start: only Error::Parse creates a bootstrap reconstruction trigger
+                        // cov:ignore-start: only Error::Parse creates a reconstruction trigger
                         unreachable!("classic trailer reconstruction trigger is a parse error")
                         // cov:ignore-end
                     };
@@ -3056,13 +1422,11 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
             )?; // cov:ignore: this is the defensive logger-failure edge after classic trailer validation; the sink boundary is covered by Pdf open failure tests
         }
         merge_xref_stream_from_classic_trailer_with_build_diagnostics(
-            bytes,
             xref_pos,
             &mut loaded,
             options.clone(),
             registration,
             error_diagnostics_sink,
-            context_spec,
             canonical_trailer_owner,
             hybrid_build_diagnostics_sink,
         )?;
@@ -3083,13 +1447,11 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
         .try_into()
         .unwrap_or(usize::MAX);
     match parse_xref_stream(
-        bytes,
         absolute_xref_pos,
         startxref,
         version.to_string(),
         options.clone(),
         registration,
-        context_spec,
         canonical_trailer_owner,
     ) {
         Ok(state) => Ok(state),
@@ -3156,107 +1518,14 @@ fn validate_classic_trailer(
     Ok(ClassicTrailerValidation::Valid)
 }
 
-fn merge_bootstrap_handle_state_prefer_source(
-    destination: &Rc<RefCell<BootstrapHandleState>>,
-    source: &Rc<RefCell<BootstrapHandleState>>,
-) {
-    if Rc::ptr_eq(destination, source) {
-        return;
-    }
-    let destination = destination.borrow();
-    let mut source = source.borrow_mut();
-    let mut handles = destination.handles.clone();
-    handles.extend(source.handles.clone());
-    source.handles = handles;
-    source
-        .resolving
-        .extend(destination.resolving.iter().copied());
-    source
-        .resolved_object_streams
-        .extend(destination.resolved_object_streams.iter().copied());
-    let mut diagnostics = destination.diagnostics.clone();
-    for diagnostic in source.diagnostics.entries() {
-        diagnostics.push(diagnostic.clone());
-    }
-    source.diagnostics = diagnostics;
-    if source.reconstruction_trigger.is_none() {
-        source.reconstruction_trigger = destination.reconstruction_trigger.clone();
-    }
-}
-
-fn merge_bootstrap_cache_prefer_source(
-    destination: &mut Option<SharedBootstrapCache>,
-    source: &Option<SharedBootstrapCache>,
-) {
-    let (Some(destination), Some(source)) = (destination.as_ref(), source.as_ref()) else {
-        if destination.is_none() {
-            *destination = source.as_ref().map(Rc::clone);
-        }
-        return;
-    };
-    if Rc::ptr_eq(destination, source) {
-        return;
-    }
-    let source = source.borrow();
-    let mut destination = destination.borrow_mut();
-    destination
-        .handle_document_owners
-        .extend(source.handle_document_owners.iter().cloned());
-    if let Some(source_document) = source.handle_document.as_ref() {
-        if let Some(destination_document) = destination.handle_document.clone() {
-            if !Rc::ptr_eq(&destination_document, source_document) {
-                destination
-                    .handle_document_owners
-                    .push(destination_document);
-            }
-        }
-        merge_bootstrap_handle_state_prefer_source(&destination.handle_state, &source.handle_state);
-        destination.handle_state = Rc::clone(&source.handle_state);
-        destination.handle_document = Some(Rc::clone(source_document));
-    } else {
-        merge_bootstrap_handle_state_prefer_source(&destination.handle_state, &source.handle_state);
-    }
-}
-
-/// Read the optional hybrid-reference stream named by a classic trailer's
-/// `/XRefStm`. This is the `QPDF::read_xrefTable` branch at QPDF.cc:915-927:
-/// it reads the stream before the table's deferred free entries and deliberately
-/// discards the stream trailer's `/Prev` continuation.
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-fn merge_xref_stream_from_classic_trailer(
-    bytes: &[u8],
-    classic_xref_pos: usize,
-    loaded: &mut LoadedXrefState,
-    options: XrefLoadOptions,
-    registration: &mut XrefRegistration,
-    error_diagnostics_sink: Option<&mut Diagnostics>,
-    context_spec: XrefReadContextSpec<'_>,
-    canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
-) -> Result<()> {
-    merge_xref_stream_from_classic_trailer_with_build_diagnostics(
-        bytes,
-        classic_xref_pos,
-        loaded,
-        options,
-        registration,
-        error_diagnostics_sink,
-        context_spec,
-        canonical_trailer_owner,
-        None,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn merge_xref_stream_from_classic_trailer_with_build_diagnostics(
-    bytes: &[u8],
     classic_xref_pos: usize,
     loaded: &mut LoadedXrefState,
     options: XrefLoadOptions,
     registration: &mut XrefRegistration,
     mut error_diagnostics_sink: Option<&mut Diagnostics>,
-    context_spec: XrefReadContextSpec<'_>,
-    canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
+    canonical_trailer_owner: &dyn CanonicalTrailerOwner,
     hybrid_build_diagnostics_sink: Option<&mut Diagnostics>,
 ) -> Result<()> {
     let has_xref_stream_key = loaded
@@ -3275,40 +1544,10 @@ fn merge_xref_stream_from_classic_trailer_with_build_diagnostics(
         return Ok(());
     }
 
-    let hybrid_context_spec = if canonical_trailer_owner.is_some() {
-        context_spec_without_bootstrap_cache(context_spec)
-    } else {
-        match context_spec {
-            XrefReadContextSpec::ActiveSection | XrefReadContextSpec::Reconstruction { .. } => {
-                let bootstrap_cache = loaded
-                    .bootstrap_cache
-                    .as_ref()
-                    .expect("owner-less xref state has a bootstrap cache");
-                context_spec_with_bootstrap_cache(context_spec, bootstrap_cache)
-            }
-            XrefReadContextSpec::ActiveSectionWithCache { .. }
-            | XrefReadContextSpec::ReconstructionWithCache { .. } => context_spec,
-        }
-    };
-    let xref_stream_value = if let Some(owner) = canonical_trailer_owner {
-        let mut context = CanonicalXrefContext::new(owner, options.description.clone());
-        let value = context.resolve_dictionary_value(&loaded.loaded.trailer, "XRefStm");
-        context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
-        value
-    } else {
+    let xref_stream_value = {
         let mut context =
-            XrefReadContext::new(bytes, hybrid_context_spec, registration, options.clone());
+            CanonicalXrefContext::new(canonical_trailer_owner, options.description.clone());
         let value = context.resolve_dictionary_value(&loaded.loaded.trailer, "XRefStm");
-        if let Some(error) = context.take_reconstruction_trigger() {
-            context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
-            if let Some(sink) = error_diagnostics_sink.as_mut() {
-                for diagnostic in loaded.loaded.repair_diagnostics.entries() {
-                    sink.push(diagnostic.clone());
-                }
-            }
-            return Err(error);
-        }
-        context.cache.commit();
         context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
         value
     };
@@ -3345,13 +1584,11 @@ fn merge_xref_stream_from_classic_trailer_with_build_diagnostics(
     // its own trailer is not the current trailer and its `/Prev` is ignored.
     let mut hybrid_error_diagnostics = Diagnostics::default();
     let hybrid = match parse_xref_stream(
-        bytes,
         xref_stream_pos,
         xref_stream_pos as u64,
         loaded.loaded.version.clone(),
         options.clone(),
         registration,
-        hybrid_context_spec,
         canonical_trailer_owner,
     ) {
         Ok(hybrid) => hybrid,
@@ -3388,7 +1625,6 @@ fn merge_xref_stream_from_classic_trailer_with_build_diagnostics(
     loaded
         .parsed_xref_streams
         .extend(hybrid.parsed_xref_streams);
-    merge_bootstrap_cache_prefer_source(&mut loaded.bootstrap_cache, &hybrid.bootstrap_cache);
 
     loaded.loaded.entries = registration.snapshot();
     loaded.raw_entries = registration.raw_snapshot();
@@ -3420,8 +1656,7 @@ fn merge_previous_xref_sections(
     options: XrefLoadOptions,
     registration: &mut XrefRegistration,
     error_diagnostics_sink: Option<&mut Diagnostics>,
-    context_spec: XrefReadContextSpec<'_>,
-    canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
+    canonical_trailer_owner: &dyn CanonicalTrailerOwner,
 ) -> Result<()> {
     merge_previous_xref_sections_with_observer(
         bytes,
@@ -3431,7 +1666,6 @@ fn merge_previous_xref_sections(
         options.clone(),
         registration,
         error_diagnostics_sink,
-        context_spec,
         None,
         canonical_trailer_owner,
     )
@@ -3446,34 +1680,15 @@ fn merge_previous_xref_sections_with_observer(
     options: XrefLoadOptions,
     registration: &mut XrefRegistration,
     mut error_diagnostics_sink: Option<&mut Diagnostics>,
-    context_spec: XrefReadContextSpec<'_>,
     mut first_xref_item_offset_sink: Option<&mut Option<u64>>,
-    canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
+    canonical_trailer_owner: &dyn CanonicalTrailerOwner,
 ) -> Result<()> {
     let mut visited = HashSet::new();
     if loaded.loaded.startxref != 0 {
         visited.insert(loaded.loaded.startxref);
     }
-    let section_context_spec = if canonical_trailer_owner.is_some() {
-        context_spec_without_bootstrap_cache(context_spec)
-    } else {
-        match context_spec {
-            XrefReadContextSpec::ActiveSection | XrefReadContextSpec::Reconstruction { .. } => {
-                let bootstrap_cache = loaded
-                    .bootstrap_cache
-                    .as_ref()
-                    .expect("owner-less xref state has a bootstrap cache");
-                context_spec_with_bootstrap_cache(context_spec, bootstrap_cache)
-            }
-            XrefReadContextSpec::ActiveSectionWithCache { .. }
-            | XrefReadContextSpec::ReconstructionWithCache { .. } => context_spec,
-        }
-    };
     let previous_offset_result = resolve_previous_xref_offset(
-        bytes,
         options.clone(),
-        registration,
-        section_context_spec,
         &loaded.loaded.trailer,
         loaded.classic_trailer_offset,
         canonical_trailer_owner,
@@ -3492,13 +1707,10 @@ fn merge_previous_xref_sections_with_observer(
     while let Some(offset) = previous_offset {
         // A canonical xref window starts at the newest section. For an older
         // `/Prev`, fetch only that section from the same live source rather
-        // than falling back to a complete input snapshot. The owner-less
-        // loader continues to use its one byte-slice window.
+        // than falling back to a complete input snapshot.
         let source_window_end = source_base.saturating_add(bytes.len() as u64);
-        let live_previous_window = if let Some(owner) =
-            canonical_trailer_owner.filter(|_| offset < source_base || offset >= source_window_end)
-        {
-            Some(read_live_xref_window(owner, offset)?)
+        let live_previous_window = if offset < source_base || offset >= source_window_end {
+            Some(read_live_xref_window(canonical_trailer_owner, offset)?)
         } else {
             None
         };
@@ -3528,7 +1740,6 @@ fn merge_previous_xref_sections_with_observer(
             options.clone(),
             registration,
             Some(&mut previous_error_diagnostics),
-            section_context_spec,
             first_xref_item_offset_sink.as_deref_mut(),
             false,
             canonical_trailer_owner,
@@ -3601,10 +1812,7 @@ fn merge_previous_xref_sections_with_observer(
             }
         }
         let hop_offset_result = resolve_previous_xref_offset(
-            bytes,
             options.clone(),
-            registration,
-            section_context_spec,
             &previous.loaded.trailer,
             previous.classic_trailer_offset,
             canonical_trailer_owner,
@@ -3629,22 +1837,14 @@ fn merge_previous_xref_sections_with_observer(
 }
 
 fn resolve_previous_xref_offset(
-    bytes: &[u8],
     options: XrefLoadOptions,
-    registration: &XrefRegistration,
-    context_spec: XrefReadContextSpec<'_>,
     trailer: &ObjectHandle,
     trailer_offset: Option<usize>,
-    canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
+    canonical_trailer_owner: &dyn CanonicalTrailerOwner,
 ) -> Result<(Option<u64>, Diagnostics, Option<Error>)> {
-    if let Some(owner) = canonical_trailer_owner {
-        let mut context = CanonicalXrefContext::new(owner, options.description.clone());
-        return resolve_previous_xref_offset_with_context(&mut context, trailer, trailer_offset);
-    }
-    let mut context = XrefReadContext::new(bytes, context_spec, registration, options);
-    let result = resolve_previous_xref_offset_with_context(&mut context, trailer, trailer_offset);
-    context.cache.commit();
-    result
+    let mut context =
+        CanonicalXrefContext::new(canonical_trailer_owner, options.description.clone());
+    resolve_previous_xref_offset_with_context(&mut context, trailer, trailer_offset)
 }
 
 fn resolve_previous_xref_offset_with_context(
@@ -3748,11 +1948,10 @@ fn recover_xref_from_linear_scan(
     fallback_trailer: Option<&ObjectHandle>,
     preexisting_entries: Option<&BTreeMap<ObjectRef, XrefEntry>>,
     preexisting_raw_entries: Option<&BTreeMap<QpdfObjGen, XrefEntry>>,
-    preexisting_bootstrap_cache: Option<&SharedBootstrapCache>,
     options: XrefLoadOptions,
     mut repair_diagnostics: Diagnostics,
     observed_first_xref_item_offset: Option<u64>,
-    canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
+    canonical_trailer_owner: &dyn CanonicalTrailerOwner,
 ) -> Result<LoadedXrefState> {
     // qpdf mutates `m->first_xref_item_offset` while reading object 0's row,
     // before a later row can throw, and `reconstruct_xref` preserves that
@@ -3768,22 +1967,14 @@ fn recover_xref_from_linear_scan(
     );
     deliver_canonical_diagnostics(canonical_trailer_owner, &mut repair_diagnostics)?;
 
-    let recovered = match canonical_trailer_owner {
-        Some(owner) => recover_xref_entries_from_source(
-            owner,
-            fallback_trailer.is_none(),
-            &options.description,
-        ),
-        None => recover_xref_entries_with_owner(
-            bytes,
-            fallback_trailer.is_none(),
-            &options.description,
-            None,
-        ),
-    }
+    let recovered = recover_xref_entries_from_source(
+        canonical_trailer_owner,
+        fallback_trailer.is_none(),
+        &options.description,
+    )
     .map_err(|error| {
         // cov:ignore-start: defensive open-failure wrapper after a line-scan parser error; the live sink boundary is covered by Pdf open failure tests
-        with_xref_open_diagnostics(error, repair_diagnostics.clone(), canonical_trailer_owner)
+        with_xref_open_diagnostics(error, canonical_trailer_owner)
     })?;
     // cov:ignore-end
     let mut entries = recovered.entries;
@@ -3805,11 +1996,6 @@ fn recover_xref_from_linear_scan(
     deliver_canonical_diagnostics(canonical_trailer_owner, &mut repair_diagnostics)?;
     let mut parsed_xref_streams = BTreeMap::new();
     let mut extra_trailer_references = BTreeSet::new();
-    let mut bootstrap_cache = preexisting_bootstrap_cache.map(Rc::clone).or_else(|| {
-        canonical_trailer_owner
-            .is_none()
-            .then(empty_bootstrap_cache)
-    });
 
     // qpdf's `reconstruct_xref` (`QPDF.cc:564-616`) gates BOTH its `trailer`
     // keyword scan (`!m->trailer.isInitialized() && t1.isWord("trailer")`)
@@ -3819,14 +2005,14 @@ fn recover_xref_from_linear_scan(
     // newest revision whose `/Prev` chain later broke -- models exactly
     // that already-initialized state: qpdf never looks at a stray candidate
     // elsewhere in the file when the correct trailer is already in hand, so
-    // neither trailer capture in `recover_xref_entries` nor the candidate search
-    // runs at all in that case. `startxref` (the position that produced
+    // neither the scanner's trailer capture nor the candidate search runs at
+    // all in that case. `startxref` (the position that produced
     // `fallback_trailer`)
     // is already valid then too, so it needs no adjustment; it is only
     // rewritten to the candidate's own verified re-entry point when the
     // candidate path is what actually recovered the trailer. `last_xref_form`
     // is left as a placeholder (`Table`) in the `fallback_trailer` case: the
-    // caller (`load_xref_state_with_options`) always overwrites it via
+    // caller (`load_xref_state_from_window`) always overwrites it via
     // `merge_recovered_qpdf_state` with the already-successfully-parsed
     // revision's own real form once this returns.
     let mut candidate_xref_reentered = false;
@@ -3845,28 +2031,18 @@ fn recover_xref_from_linear_scan(
                     &mut repair_diagnostics,
                     &mut extra_trailer_references,
                     preexisting_raw_entries,
-                    preexisting_bootstrap_cache,
                     canonical_trailer_owner,
                 ) {
-                    Ok((
-                        trailer,
-                        max_offset,
-                        form,
-                        _deleted_objects,
-                        first_xref_item_offset,
-                        candidate_bootstrap_cache,
-                    )) => {
+                    Ok((trailer, max_offset, form, _deleted_objects, first_xref_item_offset)) => {
                         // Candidate re-entry has already consumed its local
                         // tombstones while filtering `entries`; never retain
                         // them past this recovery operation.
                         candidate_xref_reentered = true;
-                        bootstrap_cache = candidate_bootstrap_cache;
                         (trailer, max_offset, form, first_xref_item_offset)
                     }
                     Err(candidate_error) => {
                         return Err(with_xref_open_diagnostics(
                             candidate_error,
-                            repair_diagnostics,
                             canonical_trailer_owner,
                         ));
                     }
@@ -3878,9 +2054,7 @@ fn recover_xref_from_linear_scan(
 
     let mut trailer_references = collect_trailer_references(&trailer);
     trailer_references.extend(extra_trailer_references);
-    if let Some(owner) = canonical_trailer_owner {
-        owner.install_xref_entries(entries.clone());
-    }
+    canonical_trailer_owner.install_xref_entries(entries.clone());
     // `XrefRegistration` uses a free entry only as the private placeholder
     // left by qpdf's failed unknown-type insertion. The effective reader xref
     // table never exposes free rows; remove the placeholder at
@@ -3914,9 +2088,7 @@ fn recover_xref_from_linear_scan(
     if candidate_xref_reentered {
         let discarded_generations =
             discard_lower_generations(&mut raw_entries, &mut entries, &mut parsed_xref_streams);
-        if let Some(owner) = canonical_trailer_owner {
-            owner.discard_cached_generations(&discarded_generations);
-        }
+        canonical_trailer_owner.discard_cached_generations(&discarded_generations);
         discard_trailer_references(&mut trailer_references, &discarded_generations);
     }
     Ok(LoadedXrefState {
@@ -3934,7 +2106,6 @@ fn recover_xref_from_linear_scan(
         pending_reconstruction_trigger: None,
         trailer_references,
         parsed_xref_streams,
-        bootstrap_cache,
         header_offset: 0,
         already_reconstructed: true,
     })
@@ -4004,12 +2175,6 @@ fn merge_recovered_qpdf_state(
     recovered
         .parsed_xref_streams
         .append(&mut accumulated.parsed_xref_streams);
-    // The accumulated state is the newer parsed xref prefix, so its shared
-    // bootstrap objects supersede any same-reference value from recovery.
-    merge_bootstrap_cache_prefer_source(
-        &mut recovered.bootstrap_cache,
-        &accumulated.bootstrap_cache,
-    );
     recovered
 }
 
@@ -4036,37 +2201,22 @@ pub(crate) struct RecoveredXref {
     pub(crate) trailer_diagnostics: Vec<QpdfExc>,
 }
 
-pub(crate) fn recover_xref_entries(
-    bytes: &[u8],
-    capture_trailer: bool,
-    filename: &[u8],
-) -> Result<RecoveredXref> {
-    recover_xref_entries_with_owner(bytes, capture_trailer, filename, None)
-}
-
-fn recover_xref_entries_with_owner(
-    bytes: &[u8],
-    capture_trailer: bool,
-    filename: &[u8],
-    canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
-) -> Result<RecoveredXref> {
+/// Replay only the object-offset half of qpdf's `reconstruct_xref` line scan
+/// over a byte buffer, for the resolver's own xref rescan.
+///
+/// The trailer half of `reconstruct_xref` (`QPDF.cc:564-575`) needs the
+/// document's parser context to build handles, so it lives on the canonical
+/// live-source scanner [`recover_xref_entries_from_source`] instead. qpdf
+/// reaches both halves from the same function; this buffer entry point is the
+/// one `ResolverHandle` uses when it re-scans a source whose trailer it
+/// already holds.
+pub(crate) fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, XrefEntry>> {
     let mut entries = BTreeMap::new();
-    let mut trailer = None;
-    let mut trailer_diagnostics = Vec::new();
     let mut line_start = 0usize;
     while line_start < bytes.len() {
         let next_line_start = next_line_start(bytes, line_start);
         if let Some(first_token) = read_scan_token(bytes, line_start, next_line_start) {
-            if capture_trailer && trailer.is_none() && first_token.is_word_value(b"trailer") {
-                let (candidate, diagnostics) = parse_trailer_candidate(
-                    bytes,
-                    first_token.end,
-                    filename,
-                    canonical_trailer_owner,
-                );
-                trailer = candidate;
-                trailer_diagnostics.extend(diagnostics);
-            } else if let Some((object_ref, offset)) =
+            if let Some((object_ref, offset)) =
                 scan_object_header_after_first_token(bytes, &first_token)?
             {
                 entries.insert(object_ref, XrefEntry::Uncompressed { offset });
@@ -4074,12 +2224,7 @@ fn recover_xref_entries_with_owner(
         }
         line_start = next_line_start;
     }
-
-    Ok(RecoveredXref {
-        entries,
-        trailer,
-        trailer_diagnostics,
-    })
+    Ok(entries)
 }
 
 fn recover_xref_entries_from_source(
@@ -4168,18 +2313,6 @@ fn recover_xref_entries_from_source(
     })
 }
 
-/// How many further offset-*positions* (not bytes) a truncated reconstruction
-/// read window may extend into on a fallback retry, independent of every other
-/// entry's own retries. Bounding by position rather than sharing a global
-/// retry budget across the whole scan means no fixed number of unrelated,
-/// individually-truncated entries earlier in the (ascending object-number)
-/// scan can ever deny a later, genuine candidate or referenced object its own
-/// retry. qpdf's per-object recovery has no shared budget at all. Total work
-/// stays O(file size): at most this many additional offsets are examined per
-/// retry, and only entries within this many positions of the end of the
-/// offset-sorted list can ever have their retry reach all the way to EOF.
-const XREF_RECONSTRUCTION_FALLBACK_SPAN: usize = 64;
-
 /// qpdf's second trailer-recovery fallback (`reconstruct_xref`, `QPDF.cc:577-608`,
 /// qpdf 11.9.0): entered only when the line scan found no usable trailer dictionary.
 /// Walk the reconstructed type-1 entries in ascending object order looking for
@@ -4201,14 +2334,7 @@ const XREF_RECONSTRUCTION_FALLBACK_SPAN: usize = 64;
 /// line-scan filter was already cleared at `:575`. The returned filter is
 /// consumed only by this immediate candidate merge; it is never resolver or
 /// mutation state.
-type RecoveredXrefStream = (
-    ObjectHandle,
-    u64,
-    XrefForm,
-    BTreeSet<u32>,
-    u64,
-    Option<SharedBootstrapCache>,
-);
+type RecoveredXrefStream = (ObjectHandle, u64, XrefForm, BTreeSet<u32>, u64);
 
 #[allow(clippy::too_many_arguments)]
 fn recover_trailer_from_xref_stream_candidate(
@@ -4220,22 +2346,10 @@ fn recover_trailer_from_xref_stream_candidate(
     repair_diagnostics: &mut Diagnostics,
     trailer_references: &mut BTreeSet<ObjectRef>,
     preexisting_raw_entries: Option<&BTreeMap<QpdfObjGen, XrefEntry>>,
-    preexisting_bootstrap_cache: Option<&SharedBootstrapCache>,
-    canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
+    canonical_trailer_owner: &dyn CanonicalTrailerOwner,
 ) -> Result<RecoveredXrefStream> {
-    // All bootstrap contexts below resolve against this same line-scan map
-    // until the candidate chain has been merged. Build the sorted offset
-    // index once and pass cheap Rc clones through each context instead of
-    // sorting the full map again for every `/Prev` lookup.
-    let reference_offsets = reconstructed_reference_offsets(entries);
-    let (candidate, discovery_diagnostics) = find_xref_stream_trailer_candidate(
-        bytes,
-        entries,
-        options.clone(),
-        &reference_offsets,
-        preexisting_bootstrap_cache,
-        canonical_trailer_owner,
-    );
+    let (candidate, discovery_diagnostics) =
+        find_xref_stream_trailer_candidate(entries, options.clone(), canonical_trailer_owner);
     // qpdf's candidate search resolves every type-1 entry unconditionally
     // (`getObjectByObjGen(iter.first)` runs before the `isStreamOfType`
     // check, `QPDF.cc:585-589`), warning immediately as each is read, in
@@ -4292,21 +2406,6 @@ fn recover_trailer_from_xref_stream_candidate(
     // canonical owner has already delivered any warning raised while reading
     // the candidate object, so append the build diagnostic afterwards.
     let mut reentry_error_diagnostics = Diagnostics::default();
-    let candidate_context_spec = if canonical_trailer_owner.is_some() {
-        XrefReadContextSpec::Reconstruction {
-            line_scan_entries: entries,
-            reference_offsets: &reference_offsets,
-        }
-    } else {
-        XrefReadContextSpec::ReconstructionWithCache {
-            line_scan_entries: entries,
-            reference_offsets: &reference_offsets,
-            bootstrap_cache: candidate
-                .bootstrap_cache
-                .as_ref()
-                .expect("owner-less candidate has a bootstrap cache"),
-        }
-    };
     let reentry_result = parse_xref_from_start_with_owner(
         bytes,
         max_offset as usize,
@@ -4316,7 +2415,6 @@ fn recover_trailer_from_xref_stream_candidate(
         options.clone(),
         &mut reentry_registration,
         Some(&mut reentry_error_diagnostics),
-        candidate_context_spec,
         None,
         false,
         canonical_trailer_owner,
@@ -4365,7 +2463,6 @@ fn recover_trailer_from_xref_stream_candidate(
         options.clone(),
         &mut reentry_registration,
         Some(&mut previous_failure_diagnostics),
-        candidate_context_spec,
         canonical_trailer_owner,
     )
     .is_err()
@@ -4433,31 +2530,12 @@ fn recover_trailer_from_xref_stream_candidate(
     // qpdf's post-chain `m->trailer.getKey("/Size").getIntValueAsInt()`
     // dereferences an indirect `/Size` through the reconstructed table
     // (`QPDF.cc:697`). Resolve it through the same canonical owner used while
-    // re-entering the candidate; the owner-less loader retains its bootstrap
-    // context instead of inspecting the raw reference.
-    let resolved_size = if let Some(owner) = canonical_trailer_owner {
-        owner.install_xref_entries(entries.clone());
-        let mut context = CanonicalXrefContext::new(owner, options.description.clone());
+    // re-entering the candidate.
+    let resolved_size = {
+        canonical_trailer_owner.install_xref_entries(entries.clone());
+        let mut context =
+            CanonicalXrefContext::new(canonical_trailer_owner, options.description.clone());
         let value = context.resolve_dictionary_value(&candidate.trailer, "Size");
-        context.append_diagnostics_to(repair_diagnostics);
-        value
-    } else {
-        let merged_reference_offsets = reconstructed_reference_offsets(entries);
-        let mut context = XrefReadContext::new(
-            bytes,
-            XrefReadContextSpec::ReconstructionWithCache {
-                line_scan_entries: entries,
-                reference_offsets: &merged_reference_offsets,
-                bootstrap_cache: candidate
-                    .bootstrap_cache
-                    .as_ref()
-                    .expect("owner-less candidate has a bootstrap cache"),
-            },
-            &reentry_registration,
-            options.clone(),
-        );
-        let value = context.resolve_dictionary_value(&candidate.trailer, "Size");
-        context.cache.commit();
         context.append_diagnostics_to(repair_diagnostics);
         value
     };
@@ -4476,7 +2554,6 @@ fn recover_trailer_from_xref_stream_candidate(
         reentry.loaded.last_xref_form,
         deleted_objects,
         first_xref_item_offset,
-        candidate.bootstrap_cache,
     ))
 }
 
@@ -4487,12 +2564,6 @@ fn recover_trailer_from_xref_stream_candidate(
 struct XrefStreamCandidate {
     trailer: ObjectHandle,
     max_offset: u64,
-    /// The owner-less reconstruction pass resolves and caches every type-1
-    /// object while discovering candidates. Reuse that cache for the later
-    /// post-chain `/Size` lookup so a repair warning is not emitted again;
-    /// canonical-owner discovery uses the document cache and leaves this
-    /// field `None`.
-    bootstrap_cache: Option<SharedBootstrapCache>,
 }
 
 /// Find the trailer dictionary and re-entry offset for
@@ -4514,141 +2585,7 @@ struct XrefStreamCandidate {
 /// depends specifically on object-number order. Diagnostics are collected
 /// in this same scan order, matching qpdf's own warning sequence (each
 /// object warns, if it needs to, exactly when discovery resolves it).
-///
-/// A separate offset-sorted index bounds each candidate's parse window to
-/// the offset of its byte-adjacent neighbor, retrying with a wider window
-/// when that truncates a real object (a header-like line recorded inside an
-/// object's own payload can become a bogus next offset). That retry extends
-/// by [`XREF_RECONSTRUCTION_FALLBACK_SPAN`] further offset-*positions* rather
-/// than sharing one global attempt-count budget across the whole scan:
-/// a shared budget lets enough earlier, unrelated truncated entries deny a
-/// later, genuine candidate its own retry, which qpdf's per-object recovery
-/// has no equivalent of.
 fn find_xref_stream_trailer_candidate(
-    bytes: &[u8],
-    entries: &BTreeMap<ObjectRef, XrefEntry>,
-    options: XrefLoadOptions,
-    reference_offsets: &Rc<[u64]>,
-    preexisting_bootstrap_cache: Option<&SharedBootstrapCache>,
-    canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
-) -> (Option<XrefStreamCandidate>, Diagnostics) {
-    if let Some(owner) = canonical_trailer_owner {
-        return find_xref_stream_trailer_candidate_canonical(entries, options, owner);
-    }
-    let mut max_offset = 0u64;
-    let mut trailer: Option<ObjectHandle> = None;
-    let mut discovery_diagnostics = Diagnostics::default();
-    let empty_registration = XrefRegistration::default();
-    let context_spec = match preexisting_bootstrap_cache {
-        Some(bootstrap_cache) => XrefReadContextSpec::ReconstructionWithCache {
-            line_scan_entries: entries,
-            reference_offsets,
-            bootstrap_cache,
-        },
-        None => XrefReadContextSpec::Reconstruction {
-            line_scan_entries: entries,
-            reference_offsets,
-        },
-    };
-    let mut context = XrefReadContext::new(bytes, context_spec, &empty_registration, options);
-    let mut emitted_diagnostics = 0usize;
-    for (&object_ref, entry) in entries {
-        let XrefEntry::Uncompressed { offset } = *entry else {
-            continue;
-        };
-        let start = offset as usize;
-        let next_offset_index = reference_offsets.partition_point(|&candidate| candidate <= offset);
-        let window_end = reference_offsets
-            .get(next_offset_index)
-            .map_or(bytes.len(), |&next| next as usize);
-        // `find_xref_stream_trailer_candidate` only ever runs after
-        // `recover_xref_from_linear_scan` has already committed to repair
-        // mode, matching qpdf's `attempt_recovery` (true by default) being
-        // active throughout `reconstruct_xref`, including candidate
-        // discovery's own object reads (`getObjectByObjGen` -> `readStream`,
-        // `QPDF.cc:1391`). `Bounded` mirrors that: a directly-resolvable but
-        // mismatched `/Length` still falls through to stream-boundary
-        // recovery here, instead of being rejected outright.
-        let parsed = if let Some(cached) = context.cache.get(&object_ref) {
-            Some(cached)
-        } else {
-            let narrow =
-                read_xref_candidate(&mut context, bytes, start, window_end, offset, object_ref);
-            // Retry through the wider window when the bounded read failed or
-            // only recovered a null. The narrow attempt is dropped together
-            // with its diagnostics so the accepted read alone speaks for the
-            // object, as `read_uncompressed_object` does for its own retry:
-            // qpdf reads each candidate once, to EOF (`QPDF.cc:580-607`), and
-            // never sees the window boundary that produced them.
-            let retry =
-                window_end < bytes.len() && narrow.as_ref().is_none_or(is_recovered_null_candidate);
-            let accepted = if retry {
-                let wide_index = next_offset_index
-                    .saturating_add(XREF_RECONSTRUCTION_FALLBACK_SPAN)
-                    .min(reference_offsets.len());
-                let wide_end = reference_offsets
-                    .get(wide_index)
-                    .map_or(bytes.len(), |&next| next as usize);
-                read_xref_candidate(&mut context, bytes, start, wide_end, offset, object_ref)
-            } else {
-                narrow
-            };
-            accepted.and_then(|completed| {
-                commit_xref_candidate(&mut context, completed, offset, object_ref)
-            })
-        };
-        append_new_context_diagnostics(
-            &context,
-            &mut discovery_diagnostics,
-            &mut emitted_diagnostics,
-        );
-        let Some(object) = parsed else {
-            continue;
-        };
-        // qpdf's `getObjectByObjGen` (`QPDF.cc:585`) resolves the object
-        // before `isStreamOfType` (`QPDF.cc:587`) is even checked, so a
-        // non-stream object's own read warnings (e.g. "expected endobj",
-        // `QPDF.cc:1352-1355`) are collected above regardless of whether it
-        // turns out to be a stream at all.
-        let Some(stream_dict) = object.as_stream_dict() else {
-            continue;
-        };
-        if !is_xref_stream_dict(&mut context, &stream_dict) {
-            append_new_context_diagnostics(
-                &context,
-                &mut discovery_diagnostics,
-                &mut emitted_diagnostics,
-            );
-            continue;
-        }
-        append_new_context_diagnostics(
-            &context,
-            &mut discovery_diagnostics,
-            &mut emitted_diagnostics,
-        );
-        if offset > max_offset {
-            max_offset = offset;
-            if trailer.is_none() {
-                trailer = Some(stream_dict);
-            }
-        }
-    }
-
-    context.cache.commit();
-    let candidate = trailer.map(|dict| XrefStreamCandidate {
-        trailer: dict,
-        max_offset,
-        bootstrap_cache: Some(context.cache.shared()),
-    });
-    append_new_context_diagnostics(
-        &context,
-        &mut discovery_diagnostics,
-        &mut emitted_diagnostics,
-    );
-    (candidate, discovery_diagnostics)
-}
-
-fn find_xref_stream_trailer_candidate_canonical(
     entries: &BTreeMap<ObjectRef, XrefEntry>,
     options: XrefLoadOptions,
     owner: &dyn CanonicalTrailerOwner,
@@ -4688,87 +2625,8 @@ fn find_xref_stream_trailer_candidate_canonical(
     let candidate = trailer.map(|trailer| XrefStreamCandidate {
         trailer,
         max_offset,
-        bootstrap_cache: None,
     });
     (candidate, diagnostics)
-}
-
-/// Read one reconstruction candidate through `start..end` without touching
-/// the shared context: diagnostics and the canonical cache are committed by
-/// [`commit_xref_candidate`] only for the attempt
-/// [`find_xref_stream_trailer_candidate`] finally accepts.
-fn read_xref_candidate(
-    context: &mut XrefReadContext,
-    bytes: &[u8],
-    start: usize,
-    end: usize,
-    offset: u64,
-    object_ref: ObjectRef,
-) -> Option<HandleFileObjectRead> {
-    let input = bytes.get(start..end)?;
-    let mut completed = context
-        .read_file_object_handle(
-            input,
-            offset,
-            RecoveryPolicy::Bounded,
-            XrefObjectDescription::Ordinary,
-        )
-        .ok()?;
-    if completed.object_ref != object_ref {
-        return None;
-    }
-    completed.remove_included_recovery_eol_for_decryption();
-    Some(completed)
-}
-
-/// A bounded reconstruction read can recover an incomplete container as a
-/// null handle while retaining tokenizer/EOF diagnostics. That cannot be a
-/// /Type /XRef candidate, but the caller may recover the real object by
-/// retrying with the wider offset window.
-fn is_recovered_null_candidate(completed: &HandleFileObjectRead) -> bool {
-    completed.object.is_null() && !completed.diagnostics.is_empty()
-}
-
-/// Commit the accepted candidate read: record its diagnostics and cache the
-/// parsed handle. A recovered null is cached as well -- qpdf's `resolve`
-/// caches the null it substitutes for a failed read (`QPDF.cc:1738-1748`),
-/// so a later reference to the object neither re-reads it nor repeats its
-/// diagnostics; the caller's `/Type /XRef` check is what excludes it as a
-/// candidate.
-fn commit_xref_candidate(
-    context: &mut XrefReadContext,
-    completed: HandleFileObjectRead,
-    offset: u64,
-    object_ref: ObjectRef,
-) -> Option<ObjectHandle> {
-    for diagnostic in completed.diagnostics {
-        context.diagnostics.push(xref_file_object_diagnostic(
-            XrefObjectDescription::Ordinary,
-            object_ref,
-            offset,
-            &context.document.options.description,
-            diagnostic,
-        ));
-    }
-    let canonical = context.document.handle_for_reference(object_ref);
-    let value = completed.object.into_direct_value()?.0;
-    canonical.set_resolved(value);
-    context.cache.insert(object_ref, canonical.clone());
-    context
-        .cache
-        .set_source_extents(object_ref, completed.source_extents);
-    Some(canonical)
-}
-
-fn append_new_context_diagnostics(
-    context: &XrefReadContext,
-    diagnostics: &mut Diagnostics,
-    emitted: &mut usize,
-) {
-    for diagnostic in context.diagnostics.entries().iter().skip(*emitted) {
-        diagnostics.push(diagnostic.clone());
-    }
-    *emitted = context.diagnostics.entries().len();
 }
 
 fn is_xref_stream_dict(context: &mut dyn XrefObjectContext, dict: &ObjectHandle) -> bool {
@@ -4962,42 +2820,6 @@ fn read_trailer(
         }
     }
     Ok((trailer, diagnostics))
-}
-
-fn parse_trailer_candidate(
-    bytes: &[u8],
-    start: usize,
-    filename: &[u8],
-    canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
-) -> (Option<ObjectHandle>, Vec<QpdfExc>) {
-    if bytes.get(start..).is_none() {
-        return (None, Vec::new());
-    }
-    // qpdf's reconstruct_xref calls readTrailer() unconditionally and only
-    // rejects a non-dictionary result afterward ("Oh well.  It was worth a
-    // try.", `QPDF.cc:566-568`); any warning the parser already raised while
-    // building that rejected candidate still reaches `m->warnings`. Extract
-    // diagnostics regardless of whether the parse ultimately produced a
-    // dictionary, a different object, or an error.
-    let result = if let Some(owner) = canonical_trailer_owner {
-        let mut resolver = CanonicalTrailerParser::new(owner, filename);
-        read_trailer(bytes, start, 0, filename, &mut resolver)
-    } else {
-        let mut resolver = XrefDetachedHandles;
-        read_trailer(bytes, start, 0, filename, &mut resolver)
-    };
-    let (trailer, diagnostics) = match result {
-        Ok((handle, diagnostics)) => (
-            handle
-                .try_is_dictionary()
-                .ok()
-                .filter(|is_dict| *is_dict)
-                .map(|_| handle),
-            diagnostics,
-        ),
-        Err(_) => (None, Vec::new()), // cov:ignore: the context-aware parser recovers malformed trailer tokens as null with diagnostics
-    };
-    (trailer, diagnostics)
 }
 
 /// Format qpdf's `readTrailer()` parser diagnostics with its
@@ -5391,10 +3213,10 @@ fn parse_xref_entry_line(line: &[u8]) -> Option<(u64, i32, u8, bool)> {
     ))
 }
 
-/// An owner-less xref-stream read keeps diagnostics local until its caller
-/// decides where the standalone API should expose them. This mirrors qpdf's
-/// document-owned `QPDF::warn` channel without passing a parser-local sink
-/// through the canonical stream parser.
+/// An xref-stream read keeps its diagnostics beside the terminal error so a
+/// caller that buffers a speculative section can order them itself. This
+/// mirrors qpdf's document-owned `QPDF::warn` channel without passing a
+/// parser-local sink through the stream parser.
 #[derive(Debug)]
 struct XrefStreamFailure {
     error: Error,
@@ -5410,218 +3232,34 @@ impl XrefStreamFailure {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn parse_xref_stream(
-    bytes: &[u8],
     xref_pos: usize,
     startxref: u64,
     version: String,
     options: XrefLoadOptions,
     registration: &mut XrefRegistration,
-    context_spec: XrefReadContextSpec<'_>,
-    canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
+    canonical_trailer_owner: &dyn CanonicalTrailerOwner,
 ) -> std::result::Result<LoadedXrefState, Box<XrefStreamFailure>> {
     // qpdf's `read_xrefStream` wraps its whole body in
     // `if (!m->ignore_xref_streams)` and otherwise falls straight through to
     // `throw damagedPDF("", xref_offset, "xref not found")` — the offset is
-    // never read, so this precedes the end-of-file check below. The same error
-    // is what a non-stream object at the offset produces.
+    // never read, so this precedes the owner's own read. The same error is
+    // what a non-stream object at the offset produces.
     if options.ignore_xref_streams {
         return Err(XrefStreamFailure::new(Error::parse(
             xref_pos,
             "xref not found",
         )));
     }
-    if let Some(owner) = canonical_trailer_owner {
-        return parse_xref_stream_with_canonical_owner(
-            xref_pos,
-            startxref,
-            version,
-            options,
-            registration,
-            owner,
-        )
-        .map_err(XrefStreamFailure::new);
-    }
-    let allow_repair = options.allow_repair;
-    let Some(tail) = bytes.get(xref_pos..).filter(|slice| !slice.is_empty()) else {
-        return Err(XrefStreamFailure::new(Error::parse(
-            xref_pos,
-            "xref stream offset is beyond end of file",
-        )));
-    };
-    let policy = if allow_repair {
-        RecoveryPolicy::Bounded
-    } else {
-        RecoveryPolicy::RequireEndstream
-    };
-    let mut repair_diagnostics = Diagnostics::default();
-    // Keep the borrowed bootstrap context alive only while the xref stream
-    // object and its dictionary are being decoded. qpdf mutates the shared
-    // xref table after this read, so the Rust borrow must end before the
-    // cumulative registration receives these entries.
-    let (build_result, reconstruction_trigger, bootstrap_cache) = {
-        let mut context = XrefReadContext::new(bytes, context_spec, registration, options);
-        let mut handle_completed = match context.read_file_object_handle(
-            tail,
-            xref_pos as u64,
-            policy,
-            XrefObjectDescription::XrefStream,
-        ) {
-            Ok(completed) => completed,
-            Err(error) => {
-                context.append_diagnostics_to(&mut repair_diagnostics);
-                return Err(Box::new(XrefStreamFailure {
-                    error: error.rebase_offset(xref_pos),
-                    diagnostics: repair_diagnostics,
-                }));
-            }
-        };
-        // Xref streams are not encrypted, but filter decoding still requires
-        // the logical payload rather than qpdf's raw recovery EOL.
-        handle_completed.remove_included_recovery_eol_for_decryption();
-        let stream_data_offset = handle_completed
-            .stream_data_offset
-            .map(|offset| xref_pos.saturating_add(offset));
-        let handle_object = handle_completed.object;
-        let object_ref = handle_completed.object_ref;
-        // Push through `context.diagnostics` -- not directly into
-        // `repair_diagnostics` -- so these framing diagnostics land AFTER
-        // whatever `read_file_object_handle`'s own `sync_handle_diagnostics`
-        // call already synced there (for example a warning raised while
-        // resolving this stream's indirect `/Length` target, which runs
-        // before `finish_file_object_handle` produces these diagnostics).
-        // `context.append_diagnostics_to` below drains `context.diagnostics`
-        // into `repair_diagnostics` in that same, qpdf-matching temporal
-        // order; pushing straight into `repair_diagnostics` here would
-        // report the recovery notice before the resolution warning that
-        // caused it.
-        for diagnostic in &handle_completed.diagnostics {
-            context.diagnostics.push(xref_file_object_diagnostic(
-                // cov:ignore: stream framing diagnostics are synchronized by the canonical finalization route
-                XrefObjectDescription::XrefStream,
-                object_ref,
-                xref_pos as u64,
-                &context.document.options.description, // cov:ignore: stream framing diagnostics are synchronized by the canonical finalization path
-                diagnostic.clone(),
-            ));
-        }
-        // qpdf's own read of this object (`readObjectAtOffset`, `QPDF.cc:956`)
-        // happens before `processXRefStream` validates `/Type`, `/W`, `/Index`,
-        // `/Size`, or the entry data (`QPDF.cc:960-1128`); any repair warning
-        // already recorded above (e.g. stream-length recovery) is `warn()`-style
-        // member state, not rolled back by a later validation failure in the
-        // same call (empirically confirmed against qpdf 11.9.0: a candidate
-        // needing repair whose `/W` then fails validation still shows the
-        // repair warning before the terminal error). The shared builder keeps
-        // that validation and diagnostic ordering identical for bootstrap and
-        // canonical-owner reads.
-        let build_result = build_xref_stream(
-            &mut context,
-            xref_pos,
-            XrefStreamObjectRead {
-                object_ref,
-                object: handle_object.clone(),
-                stream_data_offset,
-            },
-            registration,
-        )
-        .map(
-            |(trailer, entries, trailer_references, has_first_xref_item)| {
-                (
-                    object_ref,
-                    handle_object.clone(),
-                    trailer,
-                    entries,
-                    trailer_references,
-                    has_first_xref_item,
-                )
-            },
-        );
-        let reconstruction_trigger = context.take_reconstruction_trigger();
-        context.append_diagnostics_to(&mut repair_diagnostics);
-        context.cache.commit();
-        let bootstrap_cache = context.cache.shared();
-        (build_result, reconstruction_trigger, bootstrap_cache)
-    };
-
-    let (object_ref, handle_object, trailer, entries, trailer_references, has_first_xref_item) =
-        match build_result {
-            Ok(built) => built,
-            Err(error) => {
-                let error = reconstruction_trigger.unwrap_or(error);
-                return Err(Box::new(XrefStreamFailure {
-                    error,
-                    diagnostics: repair_diagnostics,
-                }));
-            }
-        };
-
-    for entry in entries {
-        match entry {
-            ParsedXrefEntry::Live { object_ref, entry } => {
-                registration.insert_xref_entry(object_ref, entry);
-            }
-            ParsedXrefEntry::Free { object_ref } => {
-                registration.insert_free_xref_entry(object_ref);
-            }
-        }
-    }
-    let parsed_xref_streams = BTreeMap::from([(object_ref, handle_object)]);
-    let state = LoadedXrefState {
-        loaded: LoadedXref {
-            version,
-            startxref,
-            entries: registration.snapshot(),
-            trailer,
-            last_xref_form: XrefForm::Stream,
-            repair_diagnostics,
-        },
-        raw_entries: registration.raw_snapshot(),
-        first_xref_item_offset: if has_first_xref_item {
-            xref_pos as u64
-        } else {
-            0
-        },
-        classic_trailer_offset: None,
-        pending_reconstruction_trigger: None,
-        trailer_references,
-        parsed_xref_streams,
-        bootstrap_cache: Some(bootstrap_cache),
-        header_offset: 0,
-        already_reconstructed: false,
-    };
-
-    if let Some(error) = reconstruction_trigger {
-        return Err(Box::new(XrefStreamFailure {
-            error,
-            diagnostics: state.loaded.repair_diagnostics.clone(),
-        }));
-    }
-
-    Ok(state)
-}
-
-fn xref_file_object_diagnostic(
-    description: XrefObjectDescription,
-    object_ref: ObjectRef,
-    offset: u64,
-    filename: &[u8],
-    diagnostic: FileObjectDiagnostic,
-) -> QpdfExc {
-    let object = format!(
-        "{}object {} {}",
-        description.warning_prefix(),
-        object_ref.number,
-        object_ref.generation
-    );
-    QpdfExc::new(
-        QpdfErrorCode::DamagedPdf,
-        filename,
-        object,
-        i64::try_from(offset.saturating_add(diagnostic.relative_offset as u64)).unwrap_or(i64::MAX),
-        diagnostic.kind.message(),
+    parse_xref_stream_with_canonical_owner(
+        xref_pos,
+        startxref,
+        version,
+        options,
+        registration,
+        canonical_trailer_owner,
     )
+    .map_err(XrefStreamFailure::new)
 }
 
 type XrefWidths = (usize, usize, usize);
@@ -5693,10 +3331,9 @@ fn build_xref_stream(
     let index = parse_xref_index_handle(context, &handle_stream_dict, size)?;
     let ranges = build_xref_ranges(index)?;
     let has_first_xref_item = ranges.iter().any(|&(start, count)| start == 0 && count > 0);
-    // The bootstrap context's decoder inspects `/Filter`/`/DecodeParms`
-    // itself and needs any indirect value staged first; the canonical-owner
-    // context's `ensure_source_for_resolution` is a no-op since its resolver
-    // reads indirect values live through `get_stream_data`.
+    // `ensure_source_for_resolution` is a no-op for the canonical-owner
+    // context: its resolver reads indirect `/Filter`/`/DecodeParms` values
+    // live through `get_stream_data`.
     let stream_dictionary = handle_stream_dict.as_dictionary();
     if let Some(filter) = stream_dictionary
         .as_ref()
@@ -5782,7 +3419,7 @@ fn parse_xref_stream_with_canonical_owner(
             Err(error) => {
                 let mut diagnostics = Diagnostics::default();
                 context.append_diagnostics_to(&mut diagnostics);
-                deliver_canonical_diagnostics(Some(owner), &mut diagnostics)?;
+                deliver_canonical_diagnostics(owner, &mut diagnostics)?;
                 // `QPDF::read_xrefStream` catches the QPDFExc raised by
                 // `readObjectAtOffset` and then reports its own
                 // `damagedPDF(xref_offset, "xref not found")` below
@@ -5815,7 +3452,7 @@ fn parse_xref_stream_with_canonical_owner(
     let reconstruction_trigger = context.take_reconstruction_trigger();
     let mut diagnostics = Diagnostics::default();
     context.append_diagnostics_to(&mut diagnostics);
-    deliver_canonical_diagnostics(Some(owner), &mut diagnostics)?;
+    deliver_canonical_diagnostics(owner, &mut diagnostics)?;
     let (trailer, entries, trailer_references, has_first_xref_item) = match build_result {
         Ok(build) => build,
         Err(error) => {
@@ -5856,7 +3493,6 @@ fn parse_xref_stream_with_canonical_owner(
         // constructor skips effective xref rows, but marks historical/free
         // rows as non-live while retaining them in the complete canonical cache view.
         parsed_xref_streams: BTreeMap::from([(object_ref, handle_object)]),
-        bootstrap_cache: None,
         header_offset: 0,
         already_reconstructed: false,
     };
@@ -6249,1381 +3885,33 @@ impl<'a> ByteCursor<'a> {
 #[cfg(test)]
 mod final_handle_tests {
     use super::*;
-    use flate2::{write::ZlibEncoder, Compression};
-    use std::io::Write;
-    use std::time::{Duration, Instant};
+    use std::cell::RefCell;
 
-    fn load_xref_snapshot<R: Read + Seek>(
-        reader: &mut R,
+    /// Load xref state the way `Pdf::open` does: through a `ResolverHandle`
+    /// that owns the input source before parsing starts, mirroring qpdf's
+    /// `QPDF::processInputSource` (`libqpdf/QPDF.cc:271-275`).
+    ///
+    /// The owner is returned alongside the result because every handle in
+    /// `LoadedXref` borrows its identity from that owner, and because the
+    /// route's warnings live on the owner's own sink rather than in
+    /// `LoadedXref::repair_diagnostics` -- the same split `Pdf::open` reads
+    /// (`crates/flpdf/src/engine.rs:224-248`).
+    fn load_xref_snapshot<R: Read + Seek + 'static>(
+        reader: R,
         allow_repair: bool,
-    ) -> Result<LoadedXref> {
-        let mut state = load_xref_state_with_options(
+        unique_id: u64,
+    ) -> (Rc<ResolverHandle<R>>, Result<LoadedXref>) {
+        let (owner, state) = load_xref_state_through_canonical_owner(
             reader,
             XrefLoadOptions {
                 allow_repair,
                 ..XrefLoadOptions::default()
             },
-        )?;
-        state.loaded.trailer = detach_bootstrap_handle(&state.loaded.trailer)?;
-        Ok(state.loaded)
-    }
-
-    fn malformed_candidate_fixture(count: usize) -> Vec<u8> {
-        let mut bytes = b"%PDF-1.5\n".to_vec();
-        for index in 1..=count {
-            let target = count + index;
-            bytes.extend_from_slice(
-                format!(
-                    "{index} 0 obj\n<< /Type {target} 0 R /Length 0 /W [1 1 1] /Size 0 >>\nstream\nendstream\nendobj\n"
-                )
-                .as_bytes(),
-            );
-        }
-        for index in 1..=count {
-            let target = count + index;
-            // Each generated target must end its own line: the reconstruction
-            // line scan only recognizes an "N G obj" header as the *first*
-            // token of a physical line, so a trailing space here (rather than
-            // a newline) would concatenate the next target's header onto this
-            // one's unterminated literal, leaving every target after the
-            // first unreachable by the line scan.
-            bytes.extend_from_slice(
-                format!("{target} 0 obj\n(unterminated target {target}\n").as_bytes(),
-            );
-        }
-        bytes.extend_from_slice(b"\nstartxref\n999999\n%%EOF\n");
-        bytes
-    }
-
-    fn chained_indirect_length_bootstrap_fixture(
-        links: u32,
-    ) -> (Vec<u8>, BTreeMap<ObjectRef, XrefEntry>) {
-        let mut bytes = Vec::from(*b"%PDF-1.4\n");
-        let mut entries = BTreeMap::new();
-        for number in 1..=links {
-            entries.insert(
-                ObjectRef::new(number, 0),
-                XrefEntry::Uncompressed {
-                    offset: bytes.len() as u64,
-                },
-            );
-            bytes.extend_from_slice(
-                format!(
-                    "{number} 0 obj\n<< /Length {} 0 R >>\nstream\n\nendstream\nendobj\n",
-                    number + 1
-                )
-                .as_bytes(),
-            );
-        }
-        entries.insert(
-            ObjectRef::new(links + 1, 0),
-            XrefEntry::Uncompressed {
-                offset: bytes.len() as u64,
-            },
-        );
-        bytes.extend_from_slice(format!("{} 0 obj\n0\nendobj\n", links + 1).as_bytes());
-        (bytes, entries)
-    }
-
-    #[test]
-    fn bootstrap_long_indirect_length_chain_grows_the_stack_instead_of_aborting() {
-        #[cfg(windows)]
-        let stack_size = 32 * 1024 * 1024;
-        #[cfg(not(windows))]
-        let stack_size = 256 * 1024;
-        std::thread::Builder::new()
-            .stack_size(stack_size)
-            .spawn(|| {
-                let (bytes, entries) = chained_indirect_length_bootstrap_fixture(4_000);
-                let mut context = XrefReadContext::new(
-                    &bytes,
-                    XrefReadContextSpec::ActiveSection,
-                    &XrefRegistration {
-                        entries,
-                        ..XrefRegistration::default()
-                    },
-                    XrefLoadOptions::default(),
-                );
-                let indirect = context.document.handle_for_reference(ObjectRef::new(1, 0));
-                let dictionary = ObjectHandle::dictionary(vec![(b"/Size".to_vec(), indirect)]);
-
-                let value = context
-                    .resolve_dictionary_value(&dictionary, "Size")
-                    .expect("the chained reference must be resolved");
-                assert!(value.is_resolved());
-                assert!(value.as_stream_dict().is_some());
-            })
-            .expect("spawn")
-            .join()
-            .expect("a 4,000-link bootstrap chain must not overflow a small stack");
-    }
-
-    #[test]
-    fn bootstrap_objstm_uses_the_canonical_member_parser_and_metadata() {
-        let member_body = b"<< /Child 3 0 R >>";
-        let first = b"2 0 ".len();
-        let mut objstm_data = b"2 0 ".to_vec();
-        objstm_data.extend_from_slice(member_body);
-        let mut bytes = b"%PDF-1.5\n".to_vec();
-        let stream_offset = bytes.len() as u64;
-        let stream_header = format!(
-            "4 0 obj\n<< /Type /ObjStm /N 1 /First {first} /Length {} >>\nstream\n",
-            objstm_data.len()
-        );
-        bytes.extend_from_slice(stream_header.as_bytes());
-        bytes.extend_from_slice(&objstm_data);
-        bytes.extend_from_slice(b"\nendstream\nendobj\n3 0 obj\nnull\nendobj\n");
-
-        let mut entries = BTreeMap::new();
-        entries.insert(
-            ObjectRef::new(2, 0),
-            XrefEntry::Compressed {
-                stream: 4,
-                index: 0,
-            },
-        );
-        entries.insert(
-            ObjectRef::new(3, 0),
-            XrefEntry::Uncompressed {
-                offset: (bytes.len() - b"3 0 obj\nnull\nendobj\n".len()) as u64,
-            },
-        );
-        entries.insert(
-            ObjectRef::new(4, 0),
-            XrefEntry::Uncompressed {
-                offset: stream_offset,
-            },
-        );
-        let document = BootstrapHandleDocument::new_with_state(
-            Some(&bytes),
-            XrefEntryLookup::Registration(&entries),
-            XrefLoadOptions::default(),
-            Rc::new(RefCell::new(BootstrapHandleState::default())),
-        );
-
-        document
-            .resolve_objects_in_stream(4)
-            .expect("ObjStm members resolve through the bootstrap owner");
-        let member = document.handle_for_reference(ObjectRef::new(2, 0));
-        assert!(member.is_resolved());
-        // qpdf renders the member warning from the decoded InputSource name
-        // (`<file> object stream N`, `libqpdf/QPDF.cc:1796`), the parser's
-        // `object M 0` description (`:1451-1459`) and the parsed offset,
-        // combined by `QPDFParser::warn` (`libqpdf/QPDFParser.cc:509-513`).
-        // flpdf's template carries that whole prefix, so the stream number and
-        // the input description stay in it.
-        assert_eq!(
-            member.description(),
-            b" object stream 4, object 2 0 at offset 6"
-        );
-        let child = member
-            .try_get_key(b"/Child")
-            .expect("member dictionary child");
-        assert_eq!(child.object_ref(), Some(ObjectRef::new(3, 0)));
-
-        let source_stream = document.handle_for_reference(ObjectRef::new(4, 0));
-        assert!(source_stream.end_offsets().0 >= 0);
-        assert_eq!(member.end_offsets(), source_stream.end_offsets());
-    }
-
-    #[test]
-    fn bootstrap_objstm_preserves_raw_duplicate_key_warning_bytes() {
-        let member_ref = ObjectRef::new(7, 0);
-        let document = bootstrap_objstm_document(
-            1,
-            b"7 0 ",
-            b"<< /K#ff 1 /K#ff 2 >>",
-            BTreeMap::from([(
-                member_ref,
-                XrefEntry::Compressed {
-                    stream: 4,
-                    index: 0,
-                },
-            )]),
-        );
-
-        document
-            .resolve_objects_in_stream(4)
-            .expect("duplicate-key member warning is recoverable");
-        let member = document.handle_for_reference(member_ref);
-        assert_eq!(
-            member
-                .try_get_key(b"/K\xff")
-                .expect("decoded raw member key")
-                .as_integer(),
-            Some(2)
-        );
-        let state = document.state.borrow();
-        let warning = state
-            .diagnostics
-            .entries()
-            .iter()
-            .find(|warning| warning.get_message_detail().contains(&0xff))
-            .expect("duplicate-key ObjStm warning");
-        assert_eq!(
-            warning.get_message_detail(),
-            b"object stream 4 (object 7 0, offset 6): dictionary has duplicated key /K\xff; last occurrence overrides earlier ones"
-        );
-        assert_eq!(warning.get_file_position(), 6);
-        assert!(warning.what_bytes().ends_with(warning.get_message_detail()));
-    }
-
-    #[test]
-    fn bootstrap_objstm_propagates_member_description_to_nested_direct_values() {
-        let member_ref = ObjectRef::new(7, 0);
-        let document = bootstrap_objstm_document(
-            1,
-            b"7 0 ",
-            b"<< /Nested [ (text) << /Leaf (text) >> ] >>",
-            BTreeMap::from([(
-                member_ref,
-                XrefEntry::Compressed {
-                    stream: 4,
-                    index: 0,
-                },
-            )]),
-        );
-
-        document
-            .resolve_objects_in_stream(4)
-            .expect("the ObjStm member resolves");
-        let member = document.handle_for_reference(member_ref);
-        let nested = member
-            .try_get_key(b"/Nested")
-            .expect("nested direct value is present");
-        // With the bootstrap document's warning sink in place
-        // (`flpdf-92r5`), a type mismatch behaves as qpdf does: the accessor
-        // warns and returns qpdf's fallback rather than failing
-        // (`QPDF_Stream::warn` -> `QPDF::warn`, which records without
-        // throwing, `libqpdf/QPDF_Stream.cc:695-698` and
-        // `libqpdf/QPDF.cc:487-494`). The member context therefore has to be
-        // checked on the recorded warnings, not on an error value.
-        assert_eq!(
-            nested
-                .try_get_array_item(0)
-                .expect("nested array item is present")
-                .try_get_int_value()
-                .expect("qpdf warns and falls back instead of failing"),
-            0
-        );
-        assert_eq!(
-            nested
-                .try_get_array_item(1)
-                .expect("nested dictionary item is present")
-                .try_get_key(b"/Leaf")
-                .expect("nested dictionary leaf is present")
-                .try_get_int_value()
-                .expect("qpdf warns and falls back instead of failing"),
-            0
-        );
-        let state = document.state.borrow();
-        let contextual = state
-            .diagnostics
-            .entries()
-            .iter()
-            .filter(|warning| {
-                let object = String::from_utf8_lossy(warning.get_object()).to_string();
-                object.contains("object 7 0") && object.contains("object stream 4")
-            })
-            .count();
-        let recorded = format!("{:?}", state.diagnostics);
-        assert!(
-            contextual >= 2,
-            "both nested values must warn with the ObjStm member context: {recorded}"
-        );
-    }
-
-    fn bootstrap_objstm_document(
-        object_count: usize,
-        header: &[u8],
-        member_body: &[u8],
-        mut entries: BTreeMap<ObjectRef, XrefEntry>,
-    ) -> Rc<BootstrapHandleDocument> {
-        let mut objstm_data = header.to_vec();
-        objstm_data.extend_from_slice(member_body);
-        let mut bytes = b"%PDF-1.5\n".to_vec();
-        let stream_offset = bytes.len() as u64;
-        bytes.extend_from_slice(
-            format!(
-                "4 0 obj\n<< /Type /ObjStm /N {object_count} /First {} /Length {} >>\nstream\n",
-                header.len(),
-                objstm_data.len()
-            )
-            .as_bytes(),
-        );
-        bytes.extend_from_slice(&objstm_data);
-        bytes.extend_from_slice(b"\nendstream\nendobj\n%tail\n");
-        entries.insert(
-            ObjectRef::new(4, 0),
-            XrefEntry::Uncompressed {
-                offset: stream_offset,
-            },
-        );
-        BootstrapHandleDocument::new_with_state(
-            Some(&bytes),
-            XrefEntryLookup::Registration(&entries),
-            XrefLoadOptions::default(),
-            Rc::new(RefCell::new(BootstrapHandleState::default())),
-        )
-    }
-
-    #[test]
-    fn bootstrap_objstm_wraps_a_direct_member_parse_error() {
-        let member_ref = ObjectRef::new(7, 0);
-        let document = bootstrap_objstm_document(
-            1,
-            b"7 0 ",
-            b"[ 2147483648 0 R ]",
-            BTreeMap::from([(
-                member_ref,
-                XrefEntry::Compressed {
-                    stream: 4,
-                    index: 0,
-                },
-            )]),
-        );
-
-        let error = document
-            .resolve_objects_in_stream(4)
-            .expect_err("a malformed direct member must retain its parse error");
-        assert!(matches!(
-            error,
-            Error::Parse { message, .. }
-                if message.contains("object stream 4 (object 7 0, offset")
-        ));
-    }
-
-    #[test]
-    fn bootstrap_objstm_delivers_member_diagnostics_and_null_recovery() {
-        let member_ref = ObjectRef::new(7, 0);
-        let warning_document = bootstrap_objstm_document(
-            1,
-            b"7 0 ",
-            b"<< /A#zB 1 >>",
-            BTreeMap::from([(
-                member_ref,
-                XrefEntry::Compressed {
-                    stream: 4,
-                    index: 0,
-                },
-            )]),
-        );
-        warning_document
-            .resolve_objects_in_stream(4)
-            .expect("a recoverable member warning must not abort resolution");
-        assert!(warning_document
-            .state
-            .borrow()
-            .diagnostics
-            .entries()
-            .iter()
-            .any(|diagnostic| diagnostic
-                .message_string()
-                .contains("object stream 4 (object 7 0, offset")));
-
-        let empty_document = bootstrap_objstm_document(
-            1,
-            b"7 0 ",
-            b"endobj",
-            BTreeMap::from([(
-                member_ref,
-                XrefEntry::Compressed {
-                    stream: 4,
-                    index: 0,
-                },
-            )]),
-        );
-        empty_document
-            .resolve_objects_in_stream(4)
-            .expect("an empty member follows qpdf's null recovery");
-        let empty_member = empty_document.handle_for_reference(member_ref);
-        assert!(empty_member.is_null());
-        assert_eq!(empty_member.end_offsets(), (-1, -1));
-        assert!(empty_document
-            .state
-            .borrow()
-            .diagnostics
-            .entries()
-            .iter()
-            .any(|diagnostic| diagnostic
-                .message_string()
-                .contains("empty object treated as null")));
-    }
-
-    #[test]
-    fn bootstrap_objstm_keeps_member_after_a_recoverable_stream_warning() {
-        let member_ref = ObjectRef::new(7, 0);
-        let decoded = b"7 0 << /Value 42 >>";
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder
-            .write_all(decoded)
-            .expect("the ObjStm payload compresses");
-        let mut compressed = encoder.finish().expect("the zlib stream finishes");
-        compressed.truncate(compressed.len().saturating_sub(4));
-
-        let state = Rc::new(RefCell::new(BootstrapHandleState::default()));
-        let document = BootstrapHandleDocument::new_with_state(
-            None,
-            XrefEntryLookup::Registration(&BTreeMap::from([
-                (ObjectRef::new(4, 0), XrefEntry::Uncompressed { offset: 0 }),
-                (
-                    member_ref,
-                    XrefEntry::Compressed {
-                        stream: 4,
-                        index: 0,
-                    },
-                ),
-            ])),
-            XrefLoadOptions {
-                description: b"bootstrap-truncated.pdf".to_vec(),
-                ..XrefLoadOptions::default()
-            },
-            Rc::clone(&state),
-        );
-        let stream = document.handle_for_reference(ObjectRef::new(4, 0));
-        stream.set_resolved(ObjectValue::Stream(Box::new(StreamValue {
-            stream_dict: ObjectHandle::dictionary(vec![
-                (b"/Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
-                (b"/N".to_vec(), ObjectHandle::integer(1)),
-                (b"/First".to_vec(), ObjectHandle::integer(4)),
-                (
-                    b"/Length".to_vec(),
-                    ObjectHandle::integer(i64::try_from(compressed.len()).unwrap()),
-                ),
-                (
-                    b"/Filter".to_vec(),
-                    ObjectHandle::name(b"FlateDecode".to_vec()),
-                ),
-            ]),
-            stream_data: Some(Rc::new(compressed)),
-            stream_provider: None,
-            filter_on_write: true,
-            stream_token_filters: Default::default(),
-            content_normalization_applied: false,
-            stream_length: decoded.len(),
-        })));
-        stream.set_parsed_offset_if_unset(90);
-
-        document
-            .resolve_objects_in_stream(4)
-            .expect("a recoverable stream warning must not abort ObjStm resolution");
-        assert_eq!(
-            document
-                .handle_for_reference(member_ref)
-                .try_get_key(b"/Value")
-                .expect("the member survives the stream warning")
-                .as_integer(),
-            Some(42)
-        );
-        let state = state.borrow();
-        let warning = state
-            .diagnostics
-            .entries()
-            .iter()
-            .find(|warning| {
-                warning.get_message_detail()
-                    == b"input stream is complete but output may still be valid"
-            })
-            .expect("the recoverable zlib warning is collected");
-        assert_eq!(warning.get_filename(), b"bootstrap-truncated.pdf");
-        assert_eq!(warning.get_object(), b"");
-        assert_eq!(warning.get_file_position(), 90);
-    }
-
-    #[test]
-    fn bootstrap_stream_warning_without_a_parsed_offset_uses_the_object_warning_sink() {
-        let state = Rc::new(RefCell::new(BootstrapHandleState::default()));
-        let document = BootstrapHandleDocument::new_with_state(
-            None,
-            XrefEntryLookup::Registration(&BTreeMap::new()),
-            XrefLoadOptions::default(),
-            Rc::clone(&state),
-        );
-        let stream = document.handle_for_reference(ObjectRef::new(4, 0));
-        stream.set_resolved(ObjectValue::Stream(Box::new(StreamValue {
-            stream_dict: ObjectHandle::dictionary(vec![(
-                b"/Filter".to_vec(),
-                ObjectHandle::integer(1),
-            )]),
-            stream_data: Some(Rc::new(vec![0])),
-            stream_provider: None,
-            filter_on_write: true,
-            stream_token_filters: Default::default(),
-            content_normalization_applied: false,
-            stream_length: 1,
-        })));
-
-        let error = stream
-            .get_stream_data(DecodeLevel::Specialized)
-            .expect_err("an unfilterable stream still returns qpdf's terminal error");
-        assert!(matches!(
-            error,
-            Error::QpdfExc(ref warning)
-                if warning.get_message_detail() == b"getStreamData called on unfilterable stream"
-        ));
-        assert!(state.borrow().diagnostics.entries().iter().any(|warning| {
-            warning.get_message_detail() == b"stream filter type is not name or array"
-        }));
-    }
-
-    #[test]
-    fn bootstrap_offset_zero_and_unlisted_compressed_objects_follow_null_fallbacks() {
-        let offset_zero_ref = ObjectRef::new(1, 0);
-        let offset_zero_document = BootstrapHandleDocument::new_with_state(
-            Some(b""),
-            XrefEntryLookup::Registration(&BTreeMap::from([(
-                offset_zero_ref,
-                XrefEntry::Uncompressed { offset: 0 },
-            )])),
-            XrefLoadOptions::default(),
-            Rc::new(RefCell::new(BootstrapHandleState::default())),
-        );
-        let offset_zero = offset_zero_document.handle_for_reference(offset_zero_ref);
-        offset_zero
-            .try_dereference()
-            .expect("offset zero resolves to qpdf's null fallback");
-        assert!(offset_zero.is_null());
-
-        let unlisted_ref = ObjectRef::new(7, 0);
-        let unlisted_document = bootstrap_objstm_document(
-            0,
-            b"",
-            b"",
-            BTreeMap::from([(
-                unlisted_ref,
-                XrefEntry::Compressed {
-                    stream: 4,
-                    index: 0,
-                },
-            )]),
-        );
-        let unlisted = unlisted_document.handle_for_reference(unlisted_ref);
-        unlisted
-            .try_dereference()
-            .expect("an unlisted compressed object resolves after a successful ObjStm scan");
-        assert!(unlisted.is_null());
-    }
-
-    #[test]
-    fn bootstrap_objstm_uses_effective_xref_and_records_absent_headers() {
-        let member_body = b"<< /Value 1 >>";
-        let header = b"7 0 8 0 9 0 ";
-        let mut objstm_data = header.to_vec();
-        objstm_data.extend_from_slice(member_body);
-        let mut bytes = b"%PDF-1.5\n".to_vec();
-        let stream_offset = bytes.len() as u64;
-        let stream_header = format!(
-            "4 0 obj\n<< /Type /ObjStm /N 3 /First {} /Length {} >>\nstream\n",
-            header.len(),
-            objstm_data.len()
-        );
-        bytes.extend_from_slice(stream_header.as_bytes());
-        bytes.extend_from_slice(&objstm_data);
-        bytes.extend_from_slice(b"\nendstream\nendobj\n%tail\n");
-
-        let stream_ref = ObjectRef::new(4, 0);
-        let active_ref = ObjectRef::new(7, 0);
-        let overridden_ref = ObjectRef::new(8, 0);
-        let absent_ref = ObjectRef::new(9, 0);
-        let entries = BTreeMap::from([
-            (
-                stream_ref,
-                XrefEntry::Uncompressed {
-                    offset: stream_offset,
-                },
-            ),
-            (
-                active_ref,
-                XrefEntry::Compressed {
-                    stream: stream_ref.number,
-                    index: 0,
-                },
-            ),
-            (overridden_ref, XrefEntry::Uncompressed { offset: 1 }),
-        ]);
-        let document = BootstrapHandleDocument::new_with_state(
-            Some(&bytes),
-            XrefEntryLookup::Registration(&entries),
-            XrefLoadOptions::default(),
-            Rc::new(RefCell::new(BootstrapHandleState::default())),
-        );
-
-        document
-            .resolve_objects_in_stream(stream_ref.number)
-            .expect("the active member resolves through the bootstrap owner");
-        assert_eq!(
-            document
-                .handle_for_reference(active_ref)
-                .try_get_key(b"/Value")
-                .expect("active member dictionary")
-                .as_integer(),
-            Some(1)
-        );
-        assert!(
-            !document.handle_for_reference(overridden_ref).is_resolved(),
-            "an overridden member must not be populated from the ObjStm"
-        );
-        assert_eq!(
-            document.entry_lookup.borrow().get(&absent_ref),
-            Some(&XrefEntry::Free { next: 0 }),
-            "an absent header member receives qpdf's default free xref row"
-        );
-    }
-
-    #[test]
-    fn bootstrap_compressed_resolution_records_absent_headers_without_panicking() {
-        // Same shape as the test above, but reached through
-        // `resolve_indirect_inner` instead of calling
-        // `resolve_objects_in_stream` directly: the compressed member is
-        // resolved lazily, so the absent-header row is inserted while the
-        // caller is still inside the `match` that read the entry table.
-        let member_body = b"<< /Value 1 >>";
-        let header = b"7 0 9 0 ";
-        let mut objstm_data = header.to_vec();
-        objstm_data.extend_from_slice(member_body);
-        let mut bytes = b"%PDF-1.5\n".to_vec();
-        let stream_offset = bytes.len() as u64;
-        let stream_header = format!(
-            "4 0 obj\n<< /Type /ObjStm /N 2 /First {} /Length {} >>\nstream\n",
-            header.len(),
-            objstm_data.len()
-        );
-        bytes.extend_from_slice(stream_header.as_bytes());
-        bytes.extend_from_slice(&objstm_data);
-        bytes.extend_from_slice(b"\nendstream\nendobj\n%tail\n");
-
-        let stream_ref = ObjectRef::new(4, 0);
-        let active_ref = ObjectRef::new(7, 0);
-        let absent_ref = ObjectRef::new(9, 0);
-        let entries = BTreeMap::from([
-            (
-                stream_ref,
-                XrefEntry::Uncompressed {
-                    offset: stream_offset,
-                },
-            ),
-            (
-                active_ref,
-                XrefEntry::Compressed {
-                    stream: stream_ref.number,
-                    index: 0,
-                },
-            ),
-        ]);
-        let document = BootstrapHandleDocument::new_with_state(
-            Some(&bytes),
-            XrefEntryLookup::Registration(&entries),
-            XrefLoadOptions::default(),
-            Rc::new(RefCell::new(BootstrapHandleState::default())),
-        );
-
-        assert_eq!(
-            document
-                .handle_for_reference(active_ref)
-                .try_get_key(b"/Value")
-                .expect("the compressed member resolves lazily")
-                .as_integer(),
-            Some(1)
-        );
-        assert_eq!(
-            document.entry_lookup.borrow().get(&absent_ref),
-            Some(&XrefEntry::Free { next: 0 }),
-            "an absent header member still receives qpdf's default free xref row"
-        );
-    }
-
-    #[test]
-    fn bootstrap_objstm_does_not_use_the_legacy_whole_buffer_route() {
-        let source = include_str!("xref.rs");
-        let method = source
-            .split("fn resolve_objects_in_stream(&self, stream_number: u32)")
-            .nth(1)
-            .and_then(|rest| rest.split("fn handle_integer").next())
-            .expect("bootstrap ObjStm method");
-
-        assert!(
-            method.contains("get_stream_data(DecodeLevel::Specialized)"),
-            "bootstrap ObjStm must use qpdf's specialized stream accessor"
-        );
-        assert!(
-            method.contains("parse_qpdf_direct_object_handle_with_diagnostics"),
-            "bootstrap ObjStm members must use the direct qpdf parser"
-        );
-        assert!(
-            method.contains("next_object_stream_integer()"),
-            "bootstrap ObjStm headers must use qpdf's allow_bad token consumer"
-        );
-        assert!(
-            !method.contains("decode_stream_data_from_handle"),
-            "bootstrap ObjStm must not use the whole-buffer decoder"
-        );
-        assert!(
-            !method.contains("parse_qpdf_file_object_handle_with_diagnostics"),
-            "bootstrap ObjStm members must not use file-object framing"
-        );
-    }
-
-    #[test]
-    fn bootstrap_document_construction_defers_the_source_snapshot() {
-        let entries = BTreeMap::new();
-        let document = BootstrapHandleDocument::new_with_state(
-            None,
-            XrefEntryLookup::Registration(&entries),
-            XrefLoadOptions::default(),
-            Rc::new(RefCell::new(BootstrapHandleState::default())),
-        );
-
-        assert!(
-            document.bytes.get().is_none(),
-            "constructing the bootstrap owner must not copy the complete input"
-        );
-    }
-
-    /// Builds and recovers a [`malformed_candidate_fixture`] of `count`
-    /// candidates, asserting the expected recovery failure, and returns the
-    /// elapsed wall-clock time.
-    fn timed_malformed_candidate_recovery(count: usize) -> Duration {
-        let bytes = malformed_candidate_fixture(count);
-        let started = Instant::now();
-        let error = load_xref_snapshot(&mut std::io::Cursor::new(&bytes), true)
-            .expect_err("the fixture has no trailer dictionary");
-        assert!(error
-            .to_string()
-            .contains("unable to find trailer dictionary while recovering damaged file"));
-        started.elapsed()
-    }
-
-    #[test]
-    fn reconstruction_bounds_referenced_reads_for_malformed_candidates() {
-        // Compare a 10x candidate-count increase's elapsed time against a
-        // small baseline rather than asserting an absolute wall-clock
-        // ceiling: an absolute deadline is indistinguishable from a slow or
-        // instrumented CI runner (e.g. under `cargo llvm-cov`), while an
-        // O(n^2) regression -- the failure mode this test guards against --
-        // would scale roughly 100x over this 10x input increase, far past
-        // any noise an absolute ceiling would otherwise need to tolerate.
-        // The `+ 200ms` floor absorbs fixed overhead the ratio alone can't,
-        // since `small` can be small enough for noise to dominate a pure
-        // multiple.
-        let small = timed_malformed_candidate_recovery(500);
-        let large = timed_malformed_candidate_recovery(5_000);
-        assert!(
-            large < small * 20 + Duration::from_millis(200),
-            "elapsed time scaled worse than the bounded-window guard allows: \
-             small (500 candidates) = {small:?}, large (5,000 candidates) = {large:?}"
-        );
-    }
-
-    #[test]
-    fn reconstruction_reference_read_window_uses_adjacent_offset_and_fallback_positions() {
-        let mut entries = BTreeMap::new();
-        for index in 0..=70 {
-            let object_ref = ObjectRef::new(index + 1, 0);
-            entries.insert(
-                object_ref,
-                XrefEntry::Uncompressed {
-                    offset: u64::from(index) * 10,
-                },
-            );
-        }
-        entries.insert(ObjectRef::new(100, 0), XrefEntry::Free { next: 0 });
-        entries.insert(
-            ObjectRef::new(101, 0),
-            XrefEntry::Compressed {
-                stream: 1,
-                index: 0,
-            },
-        );
-        let reference_offsets = reconstructed_reference_offsets(&entries);
-        let context = XrefReadContext::new(
-            &[0; 800],
-            XrefReadContextSpec::Reconstruction {
-                line_scan_entries: &entries,
-                reference_offsets: &reference_offsets,
-            },
-            &XrefRegistration::default(),
-            XrefLoadOptions::default(),
-        );
-
-        assert_eq!(
-            context.document.reference_read_window(10, 800),
-            ReferenceReadWindow {
-                end: 20,
-                fallback_end: 660,
-            }
-        );
-        let shared = empty_bootstrap_cache();
-        let cached_context = XrefReadContext::new(
-            &[0; 800],
-            XrefReadContextSpec::ReconstructionWithCache {
-                line_scan_entries: &entries,
-                reference_offsets: &reference_offsets,
-                bootstrap_cache: &shared,
-            },
-            &XrefRegistration::default(),
-            XrefLoadOptions::default(),
-        );
-        assert_eq!(
-            cached_context.document.reference_read_window(10, 800),
-            ReferenceReadWindow {
-                end: 20,
-                fallback_end: 660,
-            }
-        );
-        let context_offsets = context
-            .document
-            .reference_offsets
-            .borrow()
-            .as_ref()
-            .expect("reconstruction context must retain its offset index")
-            .clone();
-        let cached_offsets = cached_context
-            .document
-            .reference_offsets
-            .borrow()
-            .as_ref()
-            .expect("cached reconstruction context must retain its offset index")
-            .clone();
-        assert!(Rc::ptr_eq(&context_offsets, &reference_offsets));
-        assert!(Rc::ptr_eq(&cached_offsets, &reference_offsets));
-    }
-
-    #[test]
-    fn active_reference_read_window_keeps_qpdf_unbounded_view() {
-        let context = XrefReadContext::new(
-            &[0; 800],
-            XrefReadContextSpec::ActiveSection,
-            &XrefRegistration::default(),
-            XrefLoadOptions::default(),
-        );
-
-        assert_eq!(
-            context.document.reference_read_window(10, 800),
-            ReferenceReadWindow {
-                end: 800,
-                fallback_end: 800,
-            }
-        );
-    }
-
-    #[test]
-    fn reconstruction_reference_read_retries_with_the_controlled_fallback_window() {
-        let mut bytes = b"1 0 obj\n<< /Length 27 >>\nstream\n".to_vec();
-        bytes.extend_from_slice(b"aaaa\n2 0 obj\nbbbbbbbbbbbbb\n");
-        let stream_length = b"aaaa\n2 0 obj\nbbbbbbbbbbbbb\n".len();
-        bytes.extend_from_slice(b"endstream\nendobj\n%%EOF\n");
-        assert_eq!(stream_length, 27);
-
-        let first_ref = ObjectRef::new(1, 0);
-        let second_ref = ObjectRef::new(2, 0);
-        let second_offset = b"1 0 obj\n<< /Length 27 >>\nstream\n".len() + b"aaaa\n".len();
-        let mut entries = BTreeMap::new();
-        entries.insert(first_ref, XrefEntry::Uncompressed { offset: 0 });
-        entries.insert(
-            second_ref,
-            XrefEntry::Uncompressed {
-                offset: second_offset as u64,
-            },
-        );
-        let reference_offsets = reconstructed_reference_offsets(&entries);
-        let context = XrefReadContext::new(
-            &bytes,
-            XrefReadContextSpec::Reconstruction {
-                line_scan_entries: &entries,
-                reference_offsets: &reference_offsets,
-            },
-            &XrefRegistration::default(),
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
-        );
-        context.document.ensure_source_bytes(&bytes);
-
-        let (value, _, _, _) = context
-            .document
-            .read_uncompressed_object(first_ref, 0)
-            .expect("the fallback window must recover a valid stream");
-        let ObjectValue::Stream(stream) = value else {
-            panic!("expected a recovered stream, got {value:?}"); // cov:ignore: the preceding expect already guarantees a Stream value from this fixture
-        };
-        // The narrow window truncates before `endstream`, which
-        // `RecoveryPolicy::Bounded` accepts as a *successful* empty stream
-        // rather than an `Err`, so a weaker `matches!(.., Stream { .. })`
-        // check alone would pass even if the retry never widened the
-        // window. Assert the full 27-byte payload was actually recovered.
-        assert_eq!(
-            stream.stream_data.as_deref().map(Vec::len),
-            Some(stream_length),
-            "the fallback window must recover the stream's real content, not an empty placeholder"
-        );
-    }
-
-    #[test]
-    fn xref_candidate_retry_widens_a_literal_truncated_by_a_false_header() {
-        let mut bytes = b"%PDF-1.4\n".to_vec();
-        let first_offset = bytes.len();
-        bytes.extend_from_slice(
-            b"1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Length 4 /Info (prefix\n",
-        );
-        let false_header_offset = bytes.len();
-        // Keep bytes after the final `endobj`: qpdf's `readObjectAtOffset`
-        // throws `EOF after endobj` when only whitespace follows it
-        // (`QPDF.cc:1652-1660`) and `resolve` turns that into a warned
-        // null (`QPDF.cc:1738-1748`), so an object that ends the file is
-        // never an xref-stream candidate in qpdf. With a trailing `%%EOF`
-        // line qpdf 11.9.0 accepts this object as its candidate and only
-        // fails later while decoding it.
-        bytes.extend_from_slice(b"2 0 obj\nsuffix) >>\nstream\nabcd\nendstream\nendobj\n%%EOF\n");
-
-        let first_ref = ObjectRef::new(1, 0);
-        let false_ref = ObjectRef::new(2, 0);
-        let mut entries = BTreeMap::new();
-        entries.insert(
-            first_ref,
-            XrefEntry::Uncompressed {
-                offset: first_offset as u64,
-            },
-        );
-        entries.insert(
-            false_ref,
-            XrefEntry::Uncompressed {
-                offset: false_header_offset as u64,
-            },
-        );
-        let reference_offsets = reconstructed_reference_offsets(&entries);
-
-        let (candidate, diagnostics) = find_xref_stream_trailer_candidate(
-            &bytes,
-            &entries,
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
-            &reference_offsets,
-            None,
-            None,
-        );
-
-        let candidate = candidate.expect("wide retry must recover the xref stream candidate");
-        assert_eq!(candidate.max_offset, first_offset as u64);
-        assert_eq!(
-            candidate
-                .trailer
-                .try_get_key(b"/Type")
-                .expect("candidate dictionary has a /Type key")
-                .as_name(),
-            Some(b"XRef".to_vec())
-        );
-        // qpdf reads the candidate once, to EOF, so the literal spanning the
-        // false header never yields a warning for object 1; the narrow
-        // attempt's tokenizer/EOF diagnostics must be dropped with it.
-        assert!(
-            diagnostics
-                .entries()
-                .iter()
-                .all(|diagnostic| diagnostic.get_object() != b"object 1 0"),
-            "the discarded narrow attempt's diagnostics must not leak once the \
-             wider retry recovers the candidate: {diagnostics:?}"
-        );
-    }
-
-    #[test]
-    fn xref_candidate_scan_keeps_the_diagnostics_of_an_unretryable_recovered_null() {
-        let mut bytes = b"%PDF-1.4\n".to_vec();
-        let first_offset = bytes.len();
-        bytes.extend_from_slice(b"1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Info (unterminated");
-
-        let first_ref = ObjectRef::new(1, 0);
-        let mut entries = BTreeMap::new();
-        entries.insert(
-            first_ref,
-            XrefEntry::Uncompressed {
-                offset: first_offset as u64,
-            },
-        );
-        let reference_offsets = reconstructed_reference_offsets(&entries);
-
-        let (candidate, diagnostics) = find_xref_stream_trailer_candidate(
-            &bytes,
-            &entries,
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
-            &reference_offsets,
-            None,
-            None,
-        );
-
-        assert!(
-            candidate.is_none(),
-            "a null recovered from a truncated object is not an xref-stream candidate"
-        );
-        // The bounded window already reaches EOF, so no wider retry exists and
-        // this read is the single to-EOF read qpdf itself performs
-        // (`QPDF.cc:580-607`); its diagnostics are the accepted attempt's and
-        // must be reported.
-        assert!(
-            diagnostics
-                .entries()
-                .iter()
-                .any(|diagnostic| diagnostic.get_object() == b"object 1 0"),
-            "the accepted recovered-null read must keep its diagnostics: {diagnostics:?}"
-        );
-    }
-
-    #[test]
-    fn xref_candidate_scan_commits_the_wide_retry_s_recovered_null_with_its_diagnostics() {
-        let mut bytes = b"%PDF-1.4\n".to_vec();
-        let first_offset = bytes.len();
-        bytes.extend_from_slice(b"1 0 obj\n<< /Type /XRef /Info (prefix\n");
-        let false_header_offset = bytes.len();
-        bytes.extend_from_slice(b"2 0 obj\nsuffix) /Deep ");
-        bytes.extend(std::iter::repeat_n(
-            b'[',
-            crate::parser::MAX_PARSE_DEPTH + 1,
-        ));
-        bytes.extend_from_slice(b"\n%%EOF\n");
-
-        let mut entries = BTreeMap::new();
-        entries.insert(
-            ObjectRef::new(1, 0),
-            XrefEntry::Uncompressed {
-                offset: first_offset as u64,
-            },
-        );
-        entries.insert(
-            ObjectRef::new(2, 0),
-            XrefEntry::Uncompressed {
-                offset: false_header_offset as u64,
-            },
-        );
-        let reference_offsets = reconstructed_reference_offsets(&entries);
-
-        let (candidate, diagnostics) = find_xref_stream_trailer_candidate(
-            &bytes,
-            &entries,
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
-            &reference_offsets,
-            None,
-            None,
-        );
-
-        assert!(candidate.is_none());
-        // The wider retry recovers only a null again (under
-        // `RecoveryPolicy::Bounded` the over-deep array is recovered, not
-        // rejected), and that accepted read is committed with its
-        // diagnostics: qpdf warns once and caches the substituted null for a
-        // failed read (`QPDF.cc:1738-1748`) instead of dropping the object.
-        assert!(
-            diagnostics
-                .entries()
-                .iter()
-                .any(|diagnostic| diagnostic.get_object() == b"object 1 0"),
-            "a wide retry that recovers a null must keep its diagnostics: {diagnostics:?}"
-        );
-    }
-
-    #[test]
-    fn reconstruction_reference_read_retries_a_narrow_window_that_recovers_nonempty_but_truncated_data(
-    ) {
-        // A narrow window's heuristic search can accept a *non-empty* but
-        // still wrong terminator: an `endobj` keyword embedded inside the
-        // real stream payload, found only because the window happens to end
-        // right after it, well before the declared `/Length` boundary.
-        let mut bytes = b"1 0 obj\n<< /Length 40 >>\nstream\n".to_vec();
-        let header_len = bytes.len();
-        let embedded_false_terminator = b"AAAAAAAAAendobj ";
-        let mut payload = embedded_false_terminator.to_vec();
-        payload.resize(40, b'B');
-        assert_eq!(payload.len(), 40);
-        bytes.extend_from_slice(&payload);
-        bytes.extend_from_slice(b"\nendstream\nendobj\n%%EOF\n");
-
-        let first_ref = ObjectRef::new(1, 0);
-        let second_ref = ObjectRef::new(2, 0);
-        // Land the narrow window's end right after the embedded "endobj ",
-        // inside the payload and well short of its real 40-byte length.
-        let second_offset = header_len + embedded_false_terminator.len();
-        let mut entries = BTreeMap::new();
-        entries.insert(first_ref, XrefEntry::Uncompressed { offset: 0 });
-        entries.insert(
-            second_ref,
-            XrefEntry::Uncompressed {
-                offset: second_offset as u64,
-            },
-        );
-        let reference_offsets = reconstructed_reference_offsets(&entries);
-        let mut context = XrefReadContext::new(
-            &bytes,
-            XrefReadContextSpec::Reconstruction {
-                line_scan_entries: &entries,
-                reference_offsets: &reference_offsets,
-            },
-            &XrefRegistration::default(),
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
-        );
-        context.document.ensure_source_bytes(&bytes);
-
-        let (value, _, _, _) = context
-            .document
-            .read_uncompressed_object(first_ref, 0)
-            .expect("the fallback window must recover a valid stream");
-        let ObjectValue::Stream(stream) = value else {
-            panic!("expected a recovered stream, got {value:?}"); // cov:ignore: the preceding expect already guarantees a Stream value from this fixture
-        };
-        assert_eq!(
-            stream.stream_data.as_deref().map(Vec::len),
-            Some(payload.len()),
-            "a narrow window's false, non-empty terminator match must not be \
-             accepted over the wider window's real declared-length boundary"
-        );
-
-        let mut collected = Diagnostics::default();
-        context.append_diagnostics_to(&mut collected);
-        // The wider window resolves the declared 40-byte /Length exactly, so
-        // a single unbounded qpdf-style read would produce no diagnostics at
-        // all here. Any entry at all would mean the discarded narrow
-        // attempt's "expected endstream"/"attempting to recover stream
-        // length" warnings leaked through instead of being dropped with it.
-        assert!(
-            collected.entries().is_empty(),
-            "the discarded narrow attempt's recovery diagnostics must not leak \
-             once the wider retry recovers the stream cleanly: {collected:?}"
-        );
-    }
-
-    #[test]
-    fn bootstrap_read_refuses_to_invent_an_end_offset_at_eof() {
-        // qpdf scans the real file for the first non-space byte after
-        // `endobj` and raises `EOF after endobj` when the source runs out
-        // first (`libqpdf/QPDF.cc:1651-1663`); the canonical reader mirrors
-        // that in `ResolverHandle::object_end_offsets`. The bootstrap parser
-        // only sees an object-relative window, so without the source-side
-        // rescan the window's own end would masquerade as the first
-        // following byte and be cached as this object's extent -- and then
-        // propagated to every member of an object stream.
-        let bytes = b"1 0 obj\n<< /Size 1 >>\nendobj\n \n".to_vec();
-        let object_ref = ObjectRef::new(1, 0);
-        let context = XrefReadContext::new(
-            &bytes,
-            XrefReadContextSpec::ActiveSection,
-            &XrefRegistration::default(),
-            XrefLoadOptions::default(),
-        );
-        context.document.ensure_source_bytes(&bytes);
-
-        let error = context
-            .document
-            .read_uncompressed_object(object_ref, 0)
-            .expect_err("only whitespace follows endobj, so qpdf raises EOF after endobj");
-        assert!(
-            error.to_string().contains("EOF after endobj"),
-            "expected qpdf's own EOF after endobj wording, got {error}"
-        );
-    }
-
-    #[test]
-    fn bootstrap_read_reports_the_first_byte_after_the_terminator() {
-        // The counterpart of the case above: with a trailer following the
-        // object, the recorded `end_after_space` is the trailer's own offset
-        // rather than the read window's end.
-        let mut bytes = b"1 0 obj\n<< /Size 1 >>\nendobj\n\n".to_vec();
-        let trailer_offset = bytes.len();
-        bytes.extend_from_slice(b"%%EOF\n");
-        let object_ref = ObjectRef::new(1, 0);
-        let context = XrefReadContext::new(
-            &bytes,
-            XrefReadContextSpec::ActiveSection,
-            &XrefRegistration::default(),
-            XrefLoadOptions::default(),
-        );
-        context.document.ensure_source_bytes(&bytes);
-
-        let (_, _, end_before_space, end_after_space) = context
-            .document
-            .read_uncompressed_object(object_ref, 0)
-            .expect("the object is well formed and a trailer follows it");
-        assert_eq!(
-            end_before_space,
-            i64::try_from(b"1 0 obj\n<< /Size 1 >>\nendobj".len()).unwrap()
-        );
-        assert_eq!(end_after_space, i64::try_from(trailer_offset).unwrap());
-    }
-
-    #[test]
-    fn read_uncompressed_object_pushes_the_accepted_read_s_own_diagnostics() {
-        // No `/Length` at all, so recovery is unavoidable even without any
-        // window truncation (`ActiveSection` never bounds the window, so
-        // there is nothing to retry here) -- this attempt's diagnostics are
-        // the only ones that can ever exist, and they must still reach the
-        // shared diagnostics list once accepted.
-        let bytes = b"1 0 obj\n<< >>\nstream\nhello\nendstream\nendobj\n%%EOF\n".to_vec();
-        let object_ref = ObjectRef::new(1, 0);
-        let mut entries = BTreeMap::new();
-        entries.insert(object_ref, XrefEntry::Uncompressed { offset: 0 });
-        let mut context = XrefReadContext::new(
-            &bytes,
-            XrefReadContextSpec::ActiveSection,
-            &XrefRegistration::default(),
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
-        );
-        context.document.ensure_source_bytes(&bytes);
-
-        let (value, _, _, _) = context
-            .document
-            .read_uncompressed_object(object_ref, 0)
-            .expect("a missing /Length recovers through the endstream scan");
-        assert!(matches!(value, ObjectValue::Stream(_)));
-
-        let mut collected = Diagnostics::default();
-        context.append_diagnostics_to(&mut collected);
-        assert!(
-            collected.entries().iter().any(|diagnostic| diagnostic
-                .message_string()
-                .contains("stream dictionary lacks /Length key")),
-            "the accepted read's own diagnostics must reach the shared list: {collected:?}"
-        );
-    }
-
-    #[test]
-    fn direct_only_bootstrap_access_does_not_initialize_the_source_snapshot() {
-        let registration = XrefRegistration::default();
-        let mut context = XrefReadContext::new(
-            b"source bytes are not needed",
-            XrefReadContextSpec::ActiveSection,
-            &registration,
-            XrefLoadOptions::default(),
-        );
-        let dictionary =
-            ObjectHandle::dictionary(vec![(b"/Size".to_vec(), ObjectHandle::integer(7))]);
-
-        let value = context
-            .resolve_dictionary_value(&dictionary, "Size")
-            .expect("direct dictionary value");
-
-        assert_eq!(value.try_as_integer().unwrap(), Some(7));
-        assert!(context.document.bytes.get().is_none());
-        context.sync_handle_diagnostics();
-        assert!(context.diagnostics.entries().is_empty());
-
-        let input = b"1 0 obj\n<< /Root 2 0 R >>\nendobj\n%%EOF\n";
-        let mut context = XrefReadContext::new(
-            input,
-            XrefReadContextSpec::ActiveSection,
-            &registration,
-            XrefLoadOptions::default(),
-        );
-        let parsed = context
-            .read_file_object_handle(
-                input,
-                0,
-                RecoveryPolicy::RequireEndstream,
-                XrefObjectDescription::Ordinary,
-            )
-            .expect("a direct dictionary with an unused reference");
-        assert!(parsed.object.as_dictionary().is_some());
-        assert!(context.document.bytes.get().is_none());
-    }
-
-    #[test]
-    fn indirect_bootstrap_resolution_initializes_the_source_snapshot_once() {
-        let bytes = b"\n1 0 obj\n7\nendobj\n%%EOF\n";
-        let object_ref = ObjectRef::new(1, 0);
-        let mut registration = XrefRegistration::default();
-        registration.insert_xref_entry(
-            QpdfObjGen::try_from_object_ref(object_ref).unwrap(),
-            XrefEntry::Uncompressed { offset: 1 },
-        );
-        let mut context = XrefReadContext::new(
-            bytes,
-            XrefReadContextSpec::ActiveSection,
-            &registration,
-            XrefLoadOptions::default(),
-        );
-        let indirect = context.document.handle_for_reference(object_ref);
-        let dictionary = ObjectHandle::dictionary(vec![(b"/Size".to_vec(), indirect)]);
-
-        assert!(context.document.bytes.get().is_none());
-        let value = context
-            .resolve_dictionary_value(&dictionary, "Size")
-            .expect("indirect dictionary value");
-        assert_eq!(value.try_as_integer().unwrap(), Some(7));
-
-        let snapshot = context.document.bytes.get().expect("source snapshot");
-        let snapshot_ptr = Rc::as_ptr(snapshot);
-        context.document.ensure_source_bytes(b"different bytes");
-        assert_eq!(
-            Rc::as_ptr(context.document.bytes.get().unwrap()),
-            snapshot_ptr
-        );
-    }
-
-    #[test]
-    fn bootstrap_object_read_reports_an_uninitialized_source_snapshot() {
-        let entries = BTreeMap::new();
-        let document = BootstrapHandleDocument::new_with_state(
-            None,
-            XrefEntryLookup::Registration(&entries),
-            XrefLoadOptions::default(),
-            Rc::new(RefCell::new(BootstrapHandleState::default())),
-        );
-
-        let error = document
-            .read_uncompressed_object(ObjectRef::new(1, 0), 1)
-            .expect_err("a direct resolver call without a source must fail internally");
-        assert!(matches!(
-            error,
-            Error::Internal(message)
-                if message == "bootstrap resolver source bytes were not initialized"
-        ));
-    }
-
-    #[test]
-    fn indirect_stream_length_initializes_the_source_snapshot_before_resolution() {
-        let mut bytes = b"1 0 obj\n<< /Length 2 0 R >>\nstream\nabc\nendstream\nendobj\n".to_vec();
-        let object_two_offset = bytes.len();
-        bytes.extend_from_slice(b"2 0 obj\n3\nendobj\n%%EOF\n");
-        let object_one = ObjectRef::new(1, 0);
-        let object_two = ObjectRef::new(2, 0);
-        let mut entries = BTreeMap::new();
-        entries.insert(
-            object_two,
-            XrefEntry::Uncompressed {
-                offset: object_two_offset as u64,
-            },
-        );
-        let document = BootstrapHandleDocument::new_with_state(
-            None,
-            XrefEntryLookup::Registration(&entries),
-            XrefLoadOptions::default(),
-            Rc::new(RefCell::new(BootstrapHandleState::default())),
-        );
-
-        assert!(document.bytes.get().is_none());
-        let result = document
-            .read_file_object(
-                &bytes,
-                0,
-                RecoveryPolicy::RequireEndstream,
-                XrefObjectDescription::Ordinary,
-                &bytes,
-            )
-            .expect("indirect stream length should resolve");
-
-        assert_eq!(result.object_ref, object_one);
-        assert_eq!(result.object.as_stream_data().unwrap().as_slice(), b"abc");
-        assert!(document.bytes.get().is_some());
+            crate::QPDFLogger::create(),
+            true,
+            unique_id,
+        );
+        (owner, state.map(|state| state.loaded))
     }
 
     fn classic_xref_with_trailer(trailer: &str) -> (Vec<u8>, usize) {
@@ -7674,78 +3962,19 @@ mod final_handle_tests {
     }
 
     #[test]
-    fn canonical_xref_handoff_does_not_retain_a_bootstrap_cache() {
-        let (bytes, _) = classic_xref_with_trailer("<< /Size 1 >>");
-        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), false, 11);
-        let canonical =
-            load_xref_state_from_bytes(&bytes, XrefLoadOptions::default(), Some(resolver.as_ref()))
-                .expect("canonical xref loading succeeds");
-        assert!(
-            canonical.bootstrap_cache.is_none(),
-            "canonical state must leave cache ownership on ResolverHandle"
-        );
-
-        let ownerless = load_xref_state_with_options(
-            &mut std::io::Cursor::new(bytes),
-            XrefLoadOptions::default(),
-        )
-        .expect("owner-less xref loading succeeds");
-        assert!(
-            ownerless.bootstrap_cache.is_some(),
-            "standalone xref loading must retain its temporary cache"
-        );
-    }
-
-    #[test]
-    fn context_conversion_preserves_reconstruction_inputs_across_owner_routes() {
-        let entries = BTreeMap::new();
-        let reference_offsets: Rc<[u64]> = Rc::from(Vec::<u64>::new().into_boxed_slice());
-        let bootstrap_cache = empty_bootstrap_cache();
-        let source = XrefReadContextSpec::ReconstructionWithCache {
-            line_scan_entries: &entries,
-            reference_offsets: &reference_offsets,
-            bootstrap_cache: &bootstrap_cache,
-        };
-
-        let canonical = context_spec_without_bootstrap_cache(source);
-        assert!(matches!(
-            canonical,
-            XrefReadContextSpec::Reconstruction {
-                line_scan_entries,
-                reference_offsets: offsets,
-            } if std::ptr::eq(line_scan_entries, &entries)
-                && Rc::ptr_eq(offsets, &reference_offsets)
-        ));
-
-        let ownerless = context_spec_with_bootstrap_cache(source, &bootstrap_cache);
-        assert!(matches!(
-            ownerless,
-            XrefReadContextSpec::ReconstructionWithCache {
-                line_scan_entries,
-                reference_offsets: offsets,
-                bootstrap_cache: cache,
-            } if std::ptr::eq(line_scan_entries, &entries)
-                && Rc::ptr_eq(offsets, &reference_offsets)
-                && Rc::ptr_eq(cache, &bootstrap_cache)
-        ));
-    }
-
-    #[test]
-    fn canonical_nonzero_startxref_recovery_keeps_bootstrap_cache_absent() {
+    fn canonical_nonzero_startxref_recovery_rebuilds_a_direct_trailer() {
         let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n999\n%%EOF\n".to_vec();
-        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), true, 12);
-        let state = load_xref_state_from_bytes(
-            &bytes,
+        let resolver = canonical_test_resolver(bytes, BTreeMap::new(), true, 12);
+        let state = load_xref_state_from_source(
+            resolver.as_ref(),
             XrefLoadOptions {
                 allow_repair: true,
                 ..XrefLoadOptions::default()
             },
-            Some(resolver.as_ref()),
         )
         .expect("canonical recovery should rebuild a nonzero malformed startxref");
 
         assert!(state.already_reconstructed);
-        assert!(state.bootstrap_cache.is_none());
         assert_eq!(state.loaded.trailer.object_ref(), None);
     }
 
@@ -7756,18 +3985,17 @@ mod final_handle_tests {
         // stray token before `endobj`, which is exactly the shape that
         // makes a real read of it warn. qpdf's `xref_offset == 0` check
         // (`QPDF.cc:450-452`) never attempts this read at all; a canonical
-        // owner must match that, unlike the owner-less bootstrap path
+        // owner must match that; the nonzero-startxref counterpart is
         // covered by `nonzero_xref_stream_decode_warning_is_kept_before_recovery`.
         let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nextra\nendobj\n2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\ntrailer\n<< /Size 3 /Root 1 0 R >>\n%%EOF\n".to_vec();
         let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), true, 10);
-        let _state = load_xref_state_from_bytes(
-            &bytes,
+        let _state = load_xref_state_from_source(
+            resolver.as_ref(),
             XrefLoadOptions {
                 allow_repair: true,
                 description: b"canonical-offset-zero.pdf".to_vec(),
                 ..XrefLoadOptions::default()
             },
-            Some(resolver.as_ref()),
         )
         .expect("the trailer keyword is found directly, without candidate re-entry");
         // A live canonical-owner read (unlike this function's own local
@@ -7801,23 +4029,11 @@ mod final_handle_tests {
     }
 
     #[test]
-    fn classic_trailer_parse_errors_propagate_through_both_owner_routes() {
+    fn classic_trailer_parse_errors_propagate_through_the_canonical_route() {
         let (bytes, _) = classic_xref_with_trailer("<< /Size 999999999999999999999999 >>");
-        let error = load_xref_state_with_options(
-            &mut std::io::Cursor::new(bytes.clone()),
-            XrefLoadOptions::default(),
-        )
-        .expect_err("an overflowing trailer integer must fail the owner-less parser");
-        assert!(matches!(
-            error,
-            Error::System(message)
-                if message == "overflow/underflow converting 999999999999999999999999 to 64-bit integer"
-        ));
-
-        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), false, 9);
-        let error =
-            load_xref_state_from_bytes(&bytes, XrefLoadOptions::default(), Some(resolver.as_ref()))
-                .expect_err("an overflowing trailer integer must fail the canonical parser");
+        let resolver = canonical_test_resolver(bytes, BTreeMap::new(), false, 9);
+        let error = load_xref_state_from_source(resolver.as_ref(), XrefLoadOptions::default())
+            .expect_err("an overflowing trailer integer must fail the canonical parser");
         assert!(matches!(
             error,
             Error::System(message)
@@ -7835,18 +4051,20 @@ mod final_handle_tests {
         let xref = bytes.len();
         bytes.extend_from_slice(b" xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n");
         bytes.extend_from_slice(b"trailer\n<< /Size 2 /Root 1 0 R >>\n");
-        let state = load_xref_state_with_options(
-            &mut std::io::Cursor::new({
+        let (owner, result) = load_xref_state_through_canonical_owner(
+            std::io::Cursor::new({
                 let mut bytes = bytes.clone();
                 bytes.extend_from_slice(format!("startxref\n{xref}\n%%EOF\n").as_bytes());
                 bytes
             }),
             XrefLoadOptions::default(),
-        )
-        .expect("one space still leaves the table readable");
-        let messages: Vec<_> = state
-            .loaded
-            .repair_diagnostics
+            crate::QPDFLogger::create(),
+            true,
+            40,
+        );
+        result.expect("one space still leaves the table readable");
+        let owner_diagnostics = owner.repair_diagnostics();
+        let messages: Vec<_> = owner_diagnostics
             .entries()
             .iter()
             .map(|diagnostic| diagnostic.get_message_detail().to_vec())
@@ -7859,7 +4077,7 @@ mod final_handle_tests {
     }
 
     #[test]
-    fn a_non_dictionary_trailer_delivers_its_warnings_on_both_owner_routes() {
+    fn a_non_dictionary_trailer_delivers_its_warnings_before_the_terminal_error() {
         // qpdf delivers the parser warnings and then throws
         // (`QPDF.cc:565-568,894-905`). Without leading whitespace the table
         // parses far enough to reach the trailer, which is where that split
@@ -7869,35 +4087,9 @@ mod final_handle_tests {
         bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n 0000000009  00000  n \n");
         bytes.extend_from_slice(b"trailer\n42\n");
 
-        let mut registration = XrefRegistration::default();
-        let mut diagnostics = Diagnostics::default();
-        let error = parse_xref_from_start(
-            &bytes,
-            xref,
-            xref as u64,
-            "1.7",
-            XrefLoadOptions::default(),
-            &mut registration,
-            Some(&mut diagnostics),
-            XrefReadContextSpec::ActiveSection,
-            None,
-            false,
-        )
-        .expect_err("a non-dictionary trailer is terminal");
-        assert!(matches!(
-            error,
-            Error::QpdfExc(exception)
-                if exception.get_message_detail() == b"expected trailer dictionary"
-        ));
-        assert!(diagnostics
-            .entries()
-            .iter()
-            .any(|diagnostic| diagnostic.get_message_detail()
-                == b"accepting invalid xref table entry"));
-
         let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), false, 3);
         let mut registration = XrefRegistration::default();
-        parse_xref_from_start_with_owner(
+        let error = parse_xref_from_start_with_owner(
             &bytes,
             xref,
             0,
@@ -7906,12 +4098,16 @@ mod final_handle_tests {
             XrefLoadOptions::default(),
             &mut registration,
             None,
-            XrefReadContextSpec::ActiveSection,
             None,
             false,
-            Some(resolver.as_ref()),
+            resolver.as_ref(),
         )
-        .expect_err("the canonical owner sees the same terminal error");
+        .expect_err("a non-dictionary trailer is terminal");
+        assert!(matches!(
+            error,
+            Error::QpdfExc(exception)
+                if exception.get_message_detail() == b"expected trailer dictionary"
+        ));
         assert!(resolver
             .repair_diagnostics()
             .entries()
@@ -7939,14 +4135,17 @@ mod final_handle_tests {
         // A startxref past the end forces the line-scan reconstruction.
         bytes.extend_from_slice(b"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n999999\n%%EOF\n");
 
-        let state = load_xref_state_with_options(
-            &mut std::io::Cursor::new(bytes),
+        let (_owner, result) = load_xref_state_through_canonical_owner(
+            std::io::Cursor::new(bytes),
             XrefLoadOptions {
                 allow_repair: true,
                 ..XrefLoadOptions::default()
             },
-        )
-        .expect("reconstruction recovers the well-formed objects");
+            crate::QPDFLogger::create(),
+            true,
+            41,
+        );
+        let state = result.expect("reconstruction recovers the well-formed objects");
         let recovered: Vec<_> = state
             .loaded
             .entries
@@ -7990,12 +4189,15 @@ mod final_handle_tests {
                     .as_bytes(),
             );
 
-            let state = load_xref_state_with_options(
-                &mut std::io::Cursor::new(bytes),
+            let (owner, result) = load_xref_state_through_canonical_owner(
+                std::io::Cursor::new(bytes),
                 XrefLoadOptions::default(),
-            )
-            .unwrap_or_else(|error| panic!("separator {separator:?} must parse: {error:?}"));
-            let diagnostics = state.loaded.repair_diagnostics.entries().to_vec();
+                crate::QPDFLogger::create(),
+                true,
+                42,
+            );
+            result.unwrap_or_else(|error| panic!("separator {separator:?} must parse: {error:?}"));
+            let diagnostics = owner.repair_diagnostics().entries().to_vec();
             assert!(
                 diagnostics.is_empty(),
                 "separator {separator:?} must not trigger recovery: {diagnostics:?}"
@@ -8014,12 +4216,15 @@ mod final_handle_tests {
             format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
         );
 
-        let state = load_xref_state_with_options(
-            &mut std::io::Cursor::new(bytes),
+        let (owner, result) = load_xref_state_through_canonical_owner(
+            std::io::Cursor::new(bytes),
             XrefLoadOptions::default(),
-        )
-        .expect("a vertical tab is a space to qpdf");
-        let diagnostics = state.loaded.repair_diagnostics.entries().to_vec();
+            crate::QPDFLogger::create(),
+            true,
+            43,
+        );
+        result.expect("a vertical tab is a space to qpdf");
+        let diagnostics = owner.repair_diagnostics().entries().to_vec();
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
@@ -8136,11 +4341,13 @@ mod final_handle_tests {
         let mut bytes = b"%PDF-1.4\n".to_vec();
         let xref = bytes.len();
         bytes.extend_from_slice(b"  xref\n0 1\n 0000000000  65535  f \ntrailer\n42\n");
+        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), false, 60);
         let mut registration = XrefRegistration::default();
         let mut diagnostics = Diagnostics::default();
-        let error = parse_xref_from_start(
+        let error = parse_xref_from_start_with_owner(
             &bytes,
             xref,
+            0,
             xref as u64,
             "1.4",
             XrefLoadOptions {
@@ -8149,9 +4356,9 @@ mod final_handle_tests {
             },
             &mut registration,
             Some(&mut diagnostics),
-            XrefReadContextSpec::ActiveSection,
             None,
             false,
+            resolver.as_ref(),
         )
         .expect_err("a non-dictionary trailer must retain parser diagnostics");
 
@@ -8160,7 +4367,12 @@ mod final_handle_tests {
             Error::QpdfExc(exception)
                 if exception.get_message_detail() == b"xref syntax invalid"
         ));
-        let messages: Vec<_> = diagnostics
+        assert!(
+            diagnostics.entries().is_empty(),
+            "the canonical owner is the sole warning sink: {diagnostics:?}"
+        );
+        let owner_diagnostics = resolver.repair_diagnostics();
+        let messages: Vec<_> = owner_diagnostics
             .entries()
             .iter()
             .map(|diagnostic| diagnostic.get_message_detail())
@@ -8177,18 +4389,20 @@ mod final_handle_tests {
         lenient.extend_from_slice(
             b"xref\n0 2\n 0000000000  65535  f \n0000000009 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\n",
         );
-        let state = load_xref_state_with_options(
-            &mut std::io::Cursor::new({
+        let (lenient_owner, lenient_result) = load_xref_state_through_canonical_owner(
+            std::io::Cursor::new({
                 let mut bytes = lenient.clone();
                 bytes.extend_from_slice(format!("startxref\n{lenient_xref}\n%%EOF\n").as_bytes());
                 bytes
             }),
             XrefLoadOptions::default(),
-        )
-        .expect("qpdf accepts the lenient row and keeps reading");
-        let lenient_messages: Vec<_> = state
-            .loaded
-            .repair_diagnostics
+            crate::QPDFLogger::create(),
+            true,
+            44,
+        );
+        lenient_result.expect("qpdf accepts the lenient row and keeps reading");
+        let lenient_diagnostics = lenient_owner.repair_diagnostics();
+        let lenient_messages: Vec<_> = lenient_diagnostics
             .entries()
             .iter()
             .map(|diagnostic| diagnostic.get_message_detail().to_vec())
@@ -8214,10 +4428,9 @@ mod final_handle_tests {
             },
             &mut registration,
             None,
-            XrefReadContextSpec::ActiveSection,
             None,
             false,
-            Some(resolver.as_ref()),
+            resolver.as_ref(),
         )
         .expect_err("the canonical owner must retain the same diagnostics");
         assert!(matches!(
@@ -8236,10 +4449,10 @@ mod final_handle_tests {
     #[test]
     fn reconstructed_read_trailer_attributes_empty_candidate_to_trailer() {
         let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\nendobj\ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n";
-        let loaded = load_xref_snapshot(&mut std::io::Cursor::new(bytes), true)
-            .expect("the later dictionary candidate is recoverable");
-        let warning = loaded
-            .repair_diagnostics
+        let (owner, result) = load_xref_snapshot(std::io::Cursor::new(bytes.to_vec()), true, 31);
+        result.expect("the later dictionary candidate is recoverable");
+        let owner_diagnostics = owner.repair_diagnostics();
+        let warning = owner_diagnostics
             .entries()
             .iter()
             .find(|warning| warning.get_message_detail() == b"empty object treated as null")
@@ -8258,11 +4471,11 @@ mod final_handle_tests {
             )
             .as_bytes(),
         );
-        let loaded = load_xref_snapshot(&mut std::io::Cursor::new(bytes), true)
-            .expect("repair mode keeps the parsed trailer after reporting the loop");
+        let (owner, result) = load_xref_snapshot(std::io::Cursor::new(bytes), true, 32);
+        result.expect("repair mode keeps the parsed trailer after reporting the loop");
         assert_eq!(
-            loaded
-                .repair_diagnostics
+            owner
+                .repair_diagnostics()
                 .entries()
                 .iter()
                 .filter(|warning| warning.get_message_detail() == b"stream keyword found in trailer")
@@ -8295,7 +4508,6 @@ mod final_handle_tests {
             pending_reconstruction_trigger: None,
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
-            bootstrap_cache: Some(empty_bootstrap_cache()),
             header_offset: 0,
             already_reconstructed: false,
         }
@@ -8352,17 +4564,6 @@ mod final_handle_tests {
         bytes
     }
 
-    fn hybrid_xref_with_classic_live_and_builder_failure() -> Vec<u8> {
-        let mut bytes = hybrid_xref_with_classic_and_live_warning();
-        let marker = b"/W [1 2 1]";
-        let start = bytes
-            .windows(marker.len())
-            .position(|window| window == marker)
-            .expect("the hybrid xref stream has qpdf's nonzero /W");
-        bytes[start..start + marker.len()].copy_from_slice(b"/W [0 0 0]");
-        bytes
-    }
-
     fn classic_xref_with_malformed_previous() -> (Vec<u8>, usize) {
         let mut bytes = b"%PDF-1.4\n".to_vec();
         let object_offset = bytes.len();
@@ -8408,9 +4609,8 @@ mod final_handle_tests {
     fn assert_strict_classic_trailer_error(trailer: &str, message: &str) {
         let (bytes, _) = classic_xref_with_trailer(trailer);
         let offset = trailer_value_offset(&bytes);
-        let mut reader = std::io::Cursor::new(bytes);
-        let error = load_xref_snapshot(&mut reader, false)
-            .expect_err("strict classic trailer validation must reject the fixture");
+        let (_owner, result) = load_xref_snapshot(std::io::Cursor::new(bytes), false, 33);
+        let error = result.expect_err("strict classic trailer validation must reject the fixture");
 
         assert!(matches!(
             error,
@@ -8448,19 +4648,21 @@ mod final_handle_tests {
     #[test]
     fn strict_classic_validation_forwards_trailer_parser_diagnostics() {
         let (bytes, xref) = classic_xref_with_trailer("<< /Root 1 0 R /Broken >>");
+        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), false, 61);
         let mut registration = XrefRegistration::default();
         let mut diagnostics = Diagnostics::default();
-        let error = parse_xref_from_start(
+        let error = parse_xref_from_start_with_owner(
             &bytes,
             xref,
+            0,
             xref as u64,
             "1.4",
             XrefLoadOptions::default(),
             &mut registration,
             Some(&mut diagnostics),
-            XrefReadContextSpec::ActiveSection,
             None,
             true,
+            resolver.as_ref(),
         )
         .expect_err("missing /Size must remain a strict validation error");
 
@@ -8468,24 +4670,33 @@ mod final_handle_tests {
             .to_string()
             .contains("trailer dictionary lacks /Size key"));
         assert!(
-            diagnostics.entries().iter().any(|diagnostic| diagnostic
-                .message_string()
-                .contains("dictionary ended prematurely")),
-            "strict validation must forward parser diagnostics collected before the error"
+            diagnostics.entries().is_empty(),
+            "the canonical owner is the sole warning sink: {diagnostics:?}"
+        );
+        assert!(
+            resolver
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic
+                    .message_string()
+                    .contains("dictionary ended prematurely")),
+            "strict validation must deliver parser diagnostics collected before the error"
         );
 
         let mut registration = XrefRegistration::default();
-        let error = parse_xref_from_start(
+        let error = parse_xref_from_start_with_owner(
             &bytes,
             xref,
+            0,
             xref as u64,
             "1.4",
             XrefLoadOptions::default(),
             &mut registration,
             None,
-            XrefReadContextSpec::ActiveSection,
             None,
             true,
+            resolver.as_ref(),
         )
         .expect_err("the same validation error must not require a diagnostic sink");
         assert!(error
@@ -8495,16 +4706,20 @@ mod final_handle_tests {
 
     #[test]
     fn malformed_xref_stream_framing_error_is_carried_without_parser_sink() {
+        let resolver = canonical_test_resolver(
+            b"not an indirect object".to_vec(),
+            BTreeMap::new(),
+            false,
+            66,
+        );
         let mut registration = XrefRegistration::default();
         let failure = parse_xref_stream(
-            b"not an indirect object",
             0,
             0,
             "1.5".to_owned(),
             XrefLoadOptions::default(),
             &mut registration,
-            XrefReadContextSpec::ActiveSection,
-            None,
+            resolver.as_ref(),
         )
         .expect_err("a malformed xref-stream object header must fail framing");
 
@@ -8515,8 +4730,8 @@ mod final_handle_tests {
     #[test]
     fn candidate_xref_stream_wrong_size_warning_survives_later_decode_failure() {
         let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Length 4 >>\nstream\nabcd\nendstream\nendobj\n%%EOF\n";
-        let error = load_xref_snapshot(&mut std::io::Cursor::new(bytes), true)
-            .expect_err("the malformed candidate must fail after warning");
+        let (_owner, result) = load_xref_snapshot(std::io::Cursor::new(bytes.to_vec()), true, 34);
+        let error = result.expect_err("the malformed candidate must fail after warning");
         let (source, diagnostics) = error
             .open_failure()
             .expect("permissive candidate failure carries repair diagnostics");
@@ -8549,10 +4764,10 @@ mod final_handle_tests {
     #[test]
     fn nonzero_xref_stream_decode_warning_is_kept_before_recovery() {
         let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Length 4 >>\nstream\nabcd\nendstream\nendobj\nstartxref\n9\n%%EOF\n";
-        let loaded = load_xref_snapshot(&mut std::io::Cursor::new(bytes), true)
-            .expect("the reconstruction re-entry must skip the already-registered entry");
-        let messages: Vec<_> = loaded
-            .repair_diagnostics
+        let (owner, result) = load_xref_snapshot(std::io::Cursor::new(bytes.to_vec()), true, 35);
+        result.expect("the reconstruction re-entry must skip the already-registered entry");
+        let owner_diagnostics = owner.repair_diagnostics();
+        let messages: Vec<_> = owner_diagnostics
             .entries()
             .iter()
             .map(|diagnostic| String::from_utf8_lossy(diagnostic.what_bytes()).into_owned())
@@ -8576,15 +4791,12 @@ mod final_handle_tests {
             b"/Prev".to_vec(),
             ObjectHandle::string(b"bad".to_vec()),
         )]);
-        let registration = XrefRegistration::default();
+        let resolver = canonical_test_resolver(Vec::new(), BTreeMap::new(), false, 67);
         let (offset, diagnostics, error) = resolve_previous_xref_offset(
-            b"",
             XrefLoadOptions::default(),
-            &registration,
-            XrefReadContextSpec::ActiveSection,
             &trailer,
             None,
-            None,
+            resolver.as_ref(),
         )
         .expect("xref-stream /Prev validation should be non-fatal");
 
@@ -8613,10 +4825,10 @@ mod final_handle_tests {
             pending_reconstruction_trigger: None,
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
-            bootstrap_cache: Some(empty_bootstrap_cache()),
             header_offset: 0,
             already_reconstructed: false,
         };
+        let resolver = canonical_test_resolver(Vec::new(), BTreeMap::new(), false, 68);
         let mut registration = XrefRegistration::default();
 
         let error = merge_previous_xref_sections(
@@ -8627,60 +4839,60 @@ mod final_handle_tests {
             XrefLoadOptions::default(),
             &mut registration,
             None,
-            XrefReadContextSpec::ActiveSection,
-            None,
+            resolver.as_ref(),
         )
         .expect_err("an uninitialized trailer must fail at the dictionary boundary");
         assert!(matches!(error, Error::Internal(message) if message.contains("uninitialized")));
     }
 
     #[test]
-    fn previous_xref_merge_propagates_an_indirect_prev_resolution_error() {
+    fn an_indirect_prev_with_a_stale_xref_row_recovers_through_the_resolver() {
+        // The older section's `/Prev 2 0 R` points at an xref row that names
+        // object 1's header, so resolving it is the read failure qpdf turns
+        // into a reconstruction. Measured with qpdf 11.9.0 on this fixture:
+        // `file is damaged`, `(object 2 0, offset 9): expected 2 0 obj`,
+        // `Attempting to reconstruct cross-reference table`, `object 2 0 not
+        // found in file after regenerating cross reference table`, and then a
+        // fifth warning -- `reported number of objects (3) is not one plus the
+        // highest object number (1)` -- from qpdf's post-reconstruction
+        // `/Size` consistency check (`QPDF.cc:689-704`).
+        //
+        // The live resolver performs the reconstruction during `/Prev`
+        // resolution, so this route never re-enters the loader's own
+        // `recover_xref_from_linear_scan`, and that fifth warning is not
+        // reached. That gap predates the owner-less cutover: `Pdf::open` has
+        // always supplied the canonical owner here, and
+        // `CanonicalXrefContext::take_reconstruction_trigger` has always
+        // returned `None`. Pin the four warnings this route does deliver so
+        // the gap cannot widen unnoticed.
         let bytes = classic_xref_with_indirect_previous_in_older_section();
-        let current_xref = bytes
-            .windows(b"startxref\n".len())
-            .position(|window| window == b"startxref\n")
-            .expect("current xref has a startxref marker");
-        let startxref = bytes[current_xref + b"startxref\n".len()..]
-            .split(|byte| *byte == b'\n')
-            .next()
-            .and_then(|value| std::str::from_utf8(value).ok())
-            .and_then(|value| value.parse::<usize>().ok())
-            .expect("startxref contains the current xref offset");
-        let mut registration = XrefRegistration::default();
-        let mut loaded = parse_xref_from_start(
-            &bytes,
-            startxref,
-            startxref as u64,
-            "1.4",
+        let (owner, result) = load_xref_state_through_canonical_owner(
+            std::io::Cursor::new(bytes),
             XrefLoadOptions {
                 allow_repair: true,
                 ..XrefLoadOptions::default()
             },
-            &mut registration,
-            None,
-            XrefReadContextSpec::ActiveSection,
-            None,
+            crate::QPDFLogger::create(),
             true,
-        )
-        .expect("current xref section should parse before walking /Prev");
-
-        let error = merge_previous_xref_sections(
-            &bytes,
-            0,
-            "1.4",
-            &mut loaded,
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
-            &mut registration,
-            None,
-            XrefReadContextSpec::ActiveSection,
-            None,
-        )
-        .expect_err("an indirect /Prev with a stale xref row must propagate its trigger");
-        assert!(matches!(error, Error::Parse { message, .. } if message == "expected 2 0 obj"));
+            62,
+        );
+        result.expect("repair mode must survive the stale indirect /Prev");
+        let messages: Vec<_> = owner
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.message_string())
+            .collect();
+        assert_eq!(
+            messages,
+            vec![
+                "file is damaged".to_owned(),
+                "expected 2 0 obj".to_owned(),
+                "Attempting to reconstruct cross-reference table".to_owned(),
+                "object 2 0 not found in file after regenerating cross reference table".to_owned(),
+            ],
+            "{messages:?}"
+        );
     }
 
     #[test]
@@ -8708,8 +4920,7 @@ mod final_handle_tests {
             },
             &mut registration,
             None,
-            XrefReadContextSpec::ActiveSection,
-            Some(resolver.as_ref()),
+            resolver.as_ref(),
         )
         .expect("the valid hybrid /Prev section should merge");
 
@@ -8758,8 +4969,7 @@ mod final_handle_tests {
             },
             &mut registration,
             None,
-            XrefReadContextSpec::ActiveSection,
-            Some(resolver.as_ref()),
+            resolver.as_ref(),
         )
         .expect("the warning-bearing hybrid /Prev section should merge");
 
@@ -8798,6 +5008,7 @@ mod final_handle_tests {
             b"/Prev".to_vec(),
             ObjectHandle::integer(i64::try_from(previous_xref).unwrap()),
         )]));
+        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), true, 70);
         let mut registration = XrefRegistration::default();
 
         merge_previous_xref_sections(
@@ -8811,13 +5022,11 @@ mod final_handle_tests {
             },
             &mut registration,
             None,
-            XrefReadContextSpec::ActiveSection,
-            None,
+            resolver.as_ref(),
         )
         .expect("the warning-bearing previous xref stream should merge");
-        assert!(loaded
-            .loaded
-            .repair_diagnostics
+        assert!(resolver
+            .repair_diagnostics()
             .entries()
             .iter()
             .any(|diagnostic| diagnostic
@@ -8836,6 +5045,7 @@ mod final_handle_tests {
             b"/Prev".to_vec(),
             ObjectHandle::integer(i64::try_from(previous_xref).unwrap()),
         )]));
+        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), true, 71);
         let mut registration = XrefRegistration::default();
 
         let error = merge_previous_xref_sections(
@@ -8849,17 +5059,15 @@ mod final_handle_tests {
             },
             &mut registration,
             None,
-            XrefReadContextSpec::ActiveSection,
-            None,
+            resolver.as_ref(),
         )
         .expect_err("the malformed previous xref stream must fail");
         assert!(
             matches!(&error, Error::Parse { .. }),
             "unexpected error: {error:?}"
         );
-        assert!(loaded
-            .loaded
-            .repair_diagnostics
+        assert!(resolver
+            .repair_diagnostics()
             .entries()
             .iter()
             .any(|diagnostic| diagnostic
@@ -8868,79 +5076,10 @@ mod final_handle_tests {
     }
 
     #[test]
-    fn reconstruction_contexts_retain_the_precomputed_index_across_xref_routes() {
-        let mut entries = BTreeMap::new();
-        entries.insert(ObjectRef::new(1, 0), XrefEntry::Uncompressed { offset: 0 });
-        let reference_offsets = reconstructed_reference_offsets(&entries);
-
-        let mut previous_loaded = loaded_state_with_trailer(ObjectHandle::dictionary(vec![(
-            b"/Size".to_vec(),
-            ObjectHandle::integer(1),
-        )]));
-        let mut registration = XrefRegistration::default();
-        merge_previous_xref_sections(
-            b"",
-            0,
-            "1.4",
-            &mut previous_loaded,
-            XrefLoadOptions::default(),
-            &mut registration,
-            None,
-            XrefReadContextSpec::Reconstruction {
-                line_scan_entries: &entries,
-                reference_offsets: &reference_offsets,
-            },
-            None,
-        )
-        .expect("a reconstruction context without /Prev should be a no-op");
-
-        let mut hybrid_loaded = loaded_state_with_trailer(ObjectHandle::dictionary(vec![(
-            b"/XRefStm".to_vec(),
-            ObjectHandle::integer(1),
-        )]));
-        let result = merge_xref_stream_from_classic_trailer(
-            b"",
-            0,
-            &mut hybrid_loaded,
-            XrefLoadOptions::default(),
-            &mut registration,
-            None,
-            XrefReadContextSpec::Reconstruction {
-                line_scan_entries: &entries,
-                reference_offsets: &reference_offsets,
-            },
-            None,
-        );
-        assert!(matches!(result, Err(Error::Parse { .. })));
-
-        let mut cached_hybrid_loaded = loaded_state_with_trailer(ObjectHandle::dictionary(vec![(
-            b"/XRefStm".to_vec(),
-            ObjectHandle::integer(1),
-        )]));
-        let shared = empty_bootstrap_cache();
-        let result = merge_xref_stream_from_classic_trailer(
-            b"",
-            0,
-            &mut cached_hybrid_loaded,
-            XrefLoadOptions::default(),
-            &mut registration,
-            None,
-            XrefReadContextSpec::ReconstructionWithCache {
-                line_scan_entries: &entries,
-                reference_offsets: &reference_offsets,
-                bootstrap_cache: &shared,
-            },
-            None,
-        );
-        assert!(matches!(result, Err(Error::Parse { .. })));
-    }
-
-    #[test]
     fn strict_classic_xref_rejects_non_integer_previous_offset() {
         let (bytes, offset) = classic_xref_with_malformed_previous();
-        let mut reader = std::io::Cursor::new(bytes);
-        let error = load_xref_snapshot(&mut reader, false)
-            .expect_err("strict xref chain validation must reject malformed /Prev");
+        let (_owner, result) = load_xref_snapshot(std::io::Cursor::new(bytes), false, 36);
+        let error = result.expect_err("strict xref chain validation must reject malformed /Prev");
 
         assert!(matches!(
             error,
@@ -8955,11 +5094,10 @@ mod final_handle_tests {
     #[test]
     fn repair_mode_reports_classic_trailer_validation_before_recovery() {
         let (bytes, _) = classic_xref_with_trailer("<< /Root 1 0 R >>");
-        let mut reader = std::io::Cursor::new(bytes);
-        let loaded = load_xref_snapshot(&mut reader, true)
-            .expect("repair mode must recover a trailer missing /Size");
-        let messages: Vec<_> = loaded
-            .repair_diagnostics
+        let (owner, result) = load_xref_snapshot(std::io::Cursor::new(bytes), true, 37);
+        result.expect("repair mode must recover a trailer missing /Size");
+        let owner_diagnostics = owner.repair_diagnostics();
+        let messages: Vec<_> = owner_diagnostics
             .entries()
             .iter()
             .map(|diagnostic| diagnostic.message_string())
@@ -8972,27 +5110,6 @@ mod final_handle_tests {
                 "trailer dictionary lacks /Size key",
                 "Attempting to reconstruct cross-reference table",
             ]
-        );
-    }
-
-    #[test]
-    fn ordinary_classic_xref_loading_keeps_the_bootstrap_source_lazy() {
-        let (bytes, _) = classic_xref_with_trailer("<< /Size 1 /Root 1 0 R >>");
-        let mut reader = std::io::Cursor::new(bytes);
-        let state = load_xref_state_with_options(&mut reader, XrefLoadOptions::default())
-            .expect("ordinary classic xref should load");
-        let bootstrap_cache = state
-            .bootstrap_cache
-            .expect("owner-less xref state has a bootstrap cache");
-        let cache = bootstrap_cache.borrow();
-        let document = cache
-            .handle_document
-            .as_ref()
-            .expect("handle parser creates the shared bootstrap owner");
-
-        assert!(
-            document.bytes.get().is_none(),
-            "unused trailer references must not force the source snapshot"
         );
     }
 
@@ -9383,12 +5500,9 @@ mod final_handle_tests {
         ]);
         let resolver = canonical_test_resolver(bytes.clone(), entries.clone(), false, 5);
         let (candidate, diagnostics) = find_xref_stream_trailer_candidate(
-            &bytes,
             &entries,
             XrefLoadOptions::default(),
-            &Rc::from(vec![first_offset, second_offset]),
-            None,
-            Some(resolver.as_ref()),
+            resolver.as_ref(),
         );
         let candidate = candidate.expect("at least one canonical xref candidate");
         assert!(diagnostics.entries().is_empty(), "{diagnostics:?}");
@@ -9538,16 +5652,8 @@ mod final_handle_tests {
     }
 
     #[test]
-    fn canonical_trailer_candidate_uses_the_live_parser_owner() {
-        let resolver = canonical_test_resolver(Vec::new(), BTreeMap::new(), true, 24);
-        let (trailer, diagnostics) =
-            parse_trailer_candidate(b"<< /Size 1 >>", 0, b"input.pdf", Some(resolver.as_ref()));
-        assert!(trailer.is_some());
-        assert!(diagnostics.is_empty());
-    }
-
-    #[test]
     fn xref_window_and_byte_cursor_keep_their_defensive_error_boundaries() {
+        let repair_owner = canonical_test_resolver(Vec::new(), BTreeMap::new(), true, 47);
         let recovered = load_xref_state_from_window(
             &[],
             10,
@@ -9560,10 +5666,11 @@ mod final_handle_tests {
             },
             Diagnostics::default(),
             Vec::new(),
-            None,
+            repair_owner.as_ref(),
         );
         assert!(recovered.is_err());
 
+        let strict_owner = canonical_test_resolver(Vec::new(), BTreeMap::new(), false, 48);
         let strict = load_xref_state_from_window(
             &[],
             10,
@@ -9573,7 +5680,7 @@ mod final_handle_tests {
             XrefLoadOptions::default(),
             Diagnostics::default(),
             Vec::new(),
-            None,
+            strict_owner.as_ref(),
         );
         assert!(strict.is_err());
 
@@ -9583,9 +5690,14 @@ mod final_handle_tests {
             Err(Error::Parse { message, .. }) if message == "unexpected end of stream field"
         ));
 
-        let error =
-            load_xref_state_from_bytes(b"%PDF-1.4\n%%EOF\n", XrefLoadOptions::default(), None)
-                .expect_err("strict owner-less loading must reject a missing startxref");
+        let (_owner, result) = load_xref_state_through_canonical_owner(
+            std::io::Cursor::new(b"%PDF-1.4\n%%EOF\n".to_vec()),
+            XrefLoadOptions::default(),
+            crate::QPDFLogger::create(),
+            true,
+            49,
+        );
+        let error = result.expect_err("strict loading must reject a missing startxref");
         assert!(matches!(
             error,
             Error::Parse { message, .. } if message == "can't find startxref"
@@ -9645,292 +5757,21 @@ mod final_handle_tests {
     }
 
     #[test]
-    fn ownerless_hybrid_resolution_forwards_a_reconstruction_trigger() {
-        let object_ref = ObjectRef::new(1, 0);
-        let bytes = b"%pad\n2 0 obj\n0\nendobj\n";
-        let object_offset = 5;
-        let mut registration = XrefRegistration::default();
-        registration.insert_xref_entry(
-            QpdfObjGen::new(1, 0),
-            XrefEntry::Uncompressed {
-                offset: object_offset,
-            },
-        );
-        let shared = empty_bootstrap_cache();
-        let indirect = {
-            let context = XrefReadContext::new(
-                bytes,
-                XrefReadContextSpec::ActiveSectionWithCache {
-                    bootstrap_cache: &shared,
-                },
-                &registration,
-                XrefLoadOptions {
-                    allow_repair: true,
-                    ..XrefLoadOptions::default()
-                },
-            );
-            context.document.handle_for_reference(object_ref)
-        };
-        let mut loaded = loaded_state_with_trailer(ObjectHandle::dictionary(vec![(
-            b"/XRefStm".to_vec(),
-            indirect,
-        )]));
-        loaded.loaded.repair_diagnostics.push(damaged_warning(
-            b"existing.pdf",
-            b"",
-            "existing warning",
-            None,
-        ));
-        let mut sink = Diagnostics::default();
-
-        let error = merge_xref_stream_from_classic_trailer(
-            bytes,
-            0,
-            &mut loaded,
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
-            &mut registration,
-            Some(&mut sink),
-            XrefReadContextSpec::ActiveSectionWithCache {
-                bootstrap_cache: &shared,
-            },
-            None,
-        )
-        .expect_err("a stale indirect /XRefStm must trigger reconstruction");
-
-        assert!(
-            matches!(
-                &error,
-                Error::Parse { message, .. } if message == "expected 1 0 obj"
-            ),
-            "unexpected error: {error:?}"
-        );
-        assert_eq!(sink.entries().len(), 1);
-    }
-
-    #[test]
     fn hybrid_xref_stream_with_indirect_filter_loads_without_reconstruction() {
         let bytes = hybrid_xref_with_indirect_filter();
-        let mut reader = std::io::Cursor::new(bytes);
-        let state = load_xref_state_with_options(&mut reader, XrefLoadOptions::default())
-            .expect("hybrid xref with an indirect /Filter must load");
+        let (_owner, result) = load_xref_state_through_canonical_owner(
+            std::io::Cursor::new(bytes),
+            XrefLoadOptions::default(),
+            crate::QPDFLogger::create(),
+            true,
+            45,
+        );
+        let state = result.expect("hybrid xref with an indirect /Filter must load");
 
         assert!(
             !state.already_reconstructed,
             "a valid indirect /Filter on the /XRefStm stream must not force \
              cross-reference reconstruction"
-        );
-    }
-
-    #[test]
-    fn ownerless_hybrid_xref_stream_keeps_builder_diagnostics() {
-        let bytes = hybrid_xref_with_classic_live_and_builder_warning();
-        let xref_stream_pos = bytes
-            .windows(b"5 0 obj\n".len())
-            .position(|window| window == b"5 0 obj\n")
-            .expect("the hybrid fixture has its xref stream object");
-        let filter_pos = bytes
-            .windows(b"4 0 obj\n".len())
-            .position(|window| window == b"4 0 obj\n")
-            .expect("the hybrid fixture has its indirect filter object");
-        let mut loaded = loaded_state_with_trailer(ObjectHandle::dictionary(vec![(
-            b"/XRefStm".to_vec(),
-            ObjectHandle::integer(i64::try_from(xref_stream_pos).unwrap()),
-        )]));
-        let mut registration = XrefRegistration::default();
-        registration.insert_xref_entry(
-            QpdfObjGen::new(4, 0),
-            XrefEntry::Uncompressed {
-                offset: filter_pos as u64,
-            },
-        );
-        registration.insert_xref_entry(
-            QpdfObjGen::new(5, 0),
-            XrefEntry::Uncompressed {
-                offset: xref_stream_pos as u64,
-            },
-        );
-        merge_xref_stream_from_classic_trailer(
-            &bytes,
-            0,
-            &mut loaded,
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
-            &mut registration,
-            None,
-            XrefReadContextSpec::ActiveSection,
-            None,
-        )
-        .expect("the ownerless hybrid xref stream should remain recoverable");
-        let messages: Vec<_> = loaded
-            .loaded
-            .repair_diagnostics
-            .entries()
-            .iter()
-            .map(|diagnostic| diagnostic.message_string())
-            .collect();
-        assert!(
-            messages
-                .iter()
-                .any(|message| message.contains("Cross-reference stream data has the wrong size")),
-            "builder diagnostics: {messages:?}"
-        );
-    }
-
-    #[test]
-    fn ownerless_xref_stream_failure_carries_read_diagnostics_to_the_outer_sink() {
-        let bytes = hybrid_xref_with_classic_live_and_builder_failure();
-        let xref_stream_pos = bytes
-            .windows(b"5 0 obj\n".len())
-            .position(|window| window == b"5 0 obj\n")
-            .expect("the hybrid fixture has its xref stream object");
-        let filter_pos = bytes
-            .windows(b"4 0 obj\n".len())
-            .position(|window| window == b"4 0 obj\n")
-            .expect("the hybrid fixture has its indirect filter object");
-        let mut registration = XrefRegistration::default();
-        registration.insert_xref_entry(
-            QpdfObjGen::new(4, 0),
-            XrefEntry::Uncompressed {
-                offset: filter_pos as u64,
-            },
-        );
-        registration.insert_xref_entry(
-            QpdfObjGen::new(5, 0),
-            XrefEntry::Uncompressed {
-                offset: xref_stream_pos as u64,
-            },
-        );
-        let mut sink = Diagnostics::default();
-        let error = parse_xref_from_start(
-            &bytes,
-            xref_stream_pos,
-            xref_stream_pos as u64,
-            "1.5",
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
-            &mut registration,
-            Some(&mut sink),
-            XrefReadContextSpec::ActiveSection,
-            None,
-            false,
-        )
-        .expect_err("a zero-width xref stream must fail after reading its object");
-
-        assert!(matches!(
-            error,
-            Error::QpdfExc(exception)
-                if exception.get_message_detail()
-                    == b"Cross-reference stream's /W indicates entry size of 0"
-        ));
-        assert!(
-            sink.entries()
-                .iter()
-                .any(|diagnostic| diagnostic.get_message_detail() == b"expected endobj"),
-            "the outer owner-less caller must receive diagnostics from the failed stream read"
-        );
-    }
-
-    #[test]
-    fn ownerless_hybrid_failure_carries_stream_read_diagnostics() {
-        let bytes = hybrid_xref_with_classic_live_and_builder_failure();
-        let xref_stream_pos = bytes
-            .windows(b"5 0 obj\n".len())
-            .position(|window| window == b"5 0 obj\n")
-            .expect("the hybrid fixture has its xref stream object");
-        let filter_pos = bytes
-            .windows(b"4 0 obj\n".len())
-            .position(|window| window == b"4 0 obj\n")
-            .expect("the hybrid fixture has its indirect filter object");
-        let mut loaded = loaded_state_with_trailer(ObjectHandle::dictionary(vec![(
-            b"/XRefStm".to_vec(),
-            ObjectHandle::integer(i64::try_from(xref_stream_pos).unwrap()),
-        )]));
-        let mut registration = XrefRegistration::default();
-        registration.insert_xref_entry(
-            QpdfObjGen::new(4, 0),
-            XrefEntry::Uncompressed {
-                offset: filter_pos as u64,
-            },
-        );
-        registration.insert_xref_entry(
-            QpdfObjGen::new(5, 0),
-            XrefEntry::Uncompressed {
-                offset: xref_stream_pos as u64,
-            },
-        );
-        let mut sink = Diagnostics::default();
-        let error = merge_xref_stream_from_classic_trailer(
-            &bytes,
-            0,
-            &mut loaded,
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
-            &mut registration,
-            Some(&mut sink),
-            XrefReadContextSpec::ActiveSection,
-            None,
-        )
-        .expect_err("the hybrid xref stream must fail its zero-width build");
-
-        assert!(matches!(
-            error,
-            Error::QpdfExc(exception)
-                if exception.get_message_detail()
-                    == b"Cross-reference stream's /W indicates entry size of 0"
-        ));
-        assert!(
-            sink.entries()
-                .iter()
-                .any(|diagnostic| diagnostic.get_message_detail() == b"expected endobj"),
-            "the hybrid caller must receive the carrier's stream-read diagnostics"
-        );
-    }
-
-    #[test]
-    fn ownerless_xref_stream_failure_carries_a_reconstruction_trigger() {
-        let mut bytes = b"1 0 obj\n<< /Type /XRef /W [1 0 0] /Size 1 /Length 2 0 R >>\nstream\n\0\nendstream\nendobj\n".to_vec();
-        let wrong_length_offset = bytes.len();
-        bytes.extend_from_slice(b"3 0 obj\n7\nendobj\n");
-        let mut registration = XrefRegistration::default();
-        registration.insert_xref_entry(
-            QpdfObjGen::new(2, 0),
-            XrefEntry::Uncompressed {
-                offset: wrong_length_offset as u64,
-            },
-        );
-        let failure = parse_xref_stream(
-            &bytes,
-            0,
-            0,
-            "1.4".to_owned(),
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
-            &mut registration,
-            XrefReadContextSpec::ActiveSection,
-            None,
-        )
-        .expect_err("the indirect /Length header mismatch must trigger recovery");
-
-        assert!(matches!(
-            failure.error,
-            Error::Parse { message, .. } if message == "expected 2 0 obj"
-        ));
-        assert!(
-            failure.diagnostics.entries().iter().any(|diagnostic| {
-                diagnostic.get_message_detail() == b"stream dictionary lacks /Length key"
-            }),
-            "the carrier must retain diagnostics collected before the reconstruction trigger"
         );
     }
 
@@ -9951,9 +5792,8 @@ mod final_handle_tests {
             ),
             1,
         );
-        let state =
-            load_xref_state_from_bytes(&bytes, XrefLoadOptions::default(), Some(resolver.as_ref()))
-                .expect("canonical owner should load the hybrid xref stream");
+        let state = load_xref_state_from_source(resolver.as_ref(), XrefLoadOptions::default())
+            .expect("canonical owner should load the hybrid xref stream");
 
         let xref_stream = resolver.get_object_handle(ObjectRef::new(5, 0));
         let filter = resolver.get_object_handle(ObjectRef::new(4, 0));
@@ -10003,8 +5843,7 @@ mod final_handle_tests {
     #[test]
     fn canonical_owner_keeps_reconstruction_candidate_in_one_cache() {
         let bytes = hybrid_xref_with_indirect_filter();
-        let recovered = recover_xref_entries(&bytes, false, b"").expect("scan candidate entries");
-        let mut entries = recovered.entries;
+        let mut entries = recover_xref_entries(&bytes).expect("scan candidate entries");
         let mut parsed_xref_streams = BTreeMap::new();
         let mut repair_diagnostics = Diagnostics::default();
         let mut trailer_references = BTreeSet::new();
@@ -10035,8 +5874,7 @@ mod final_handle_tests {
             &mut repair_diagnostics,
             &mut trailer_references,
             None,
-            None,
-            Some(resolver.as_ref()),
+            resolver.as_ref(),
         )
         .expect("the canonical reconstruction candidate must be recoverable");
 
@@ -10052,11 +5890,11 @@ mod final_handle_tests {
     #[test]
     fn candidate_recovery_passes_one_offset_index_through_reentry_and_size() {
         let bytes = hybrid_xref_with_indirect_filter();
-        let recovered = recover_xref_entries(&bytes, false, b"").expect("scan candidate entries");
-        let mut entries = recovered.entries;
+        let mut entries = recover_xref_entries(&bytes).expect("scan candidate entries");
         let mut parsed_xref_streams = BTreeMap::new();
         let mut repair_diagnostics = Diagnostics::default();
         let mut trailer_references = BTreeSet::new();
+        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), true, 69);
 
         let recovered = recover_trailer_from_xref_stream_candidate(
             &bytes,
@@ -10070,8 +5908,7 @@ mod final_handle_tests {
             &mut repair_diagnostics,
             &mut trailer_references,
             None,
-            None,
-            None,
+            resolver.as_ref(),
         )
         .expect("the scanned xref-stream candidate must be recoverable");
 
@@ -10152,80 +5989,24 @@ mod final_handle_tests {
                 .as_bytes(),
         );
 
-        let mut reader = std::io::Cursor::new(bytes);
-        let mut initial_registration = XrefRegistration::default();
-        let mut initial_diagnostics = Diagnostics::default();
-        let mut initial_first_xref_item_offset = None;
-        let initial = parse_xref_from_start(
-            reader.get_ref(),
-            xref,
-            xref as u64,
-            "1.4",
+        let (recovered_owner, recovered_result) = load_xref_state_through_canonical_owner(
+            std::io::Cursor::new(bytes),
             XrefLoadOptions {
                 allow_repair: true,
                 ..XrefLoadOptions::default()
             },
-            &mut initial_registration,
-            Some(&mut initial_diagnostics),
-            XrefReadContextSpec::ActiveSection,
-            Some(&mut initial_first_xref_item_offset),
+            crate::QPDFLogger::create(),
             true,
-        )
-        .expect("the initial classic section must defer the stale /Size mismatch");
-        assert!(initial.pending_reconstruction_trigger.is_some());
-
-        let recovered = load_xref_state_with_options(
-            &mut reader,
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
-        )
-        .expect("repair mode must complete the recovered size revalidation");
+            46,
+        );
+        let recovered =
+            recovered_result.expect("repair mode must complete the recovered size revalidation");
         assert!(recovered.already_reconstructed);
-        assert!(recovered
-            .loaded
-            .repair_diagnostics
+        assert!(recovered_owner
+            .repair_diagnostics()
             .entries()
             .iter()
             .any(|diagnostic| diagnostic.message_string().contains("expected 2 0 obj")));
-    }
-
-    #[test]
-    fn bootstrap_trigger_and_diagnostic_append_stay_on_handle_state() {
-        let object_ref = ObjectRef::new(1, 0);
-        let mut entries = BTreeMap::new();
-        entries.insert(object_ref, XrefEntry::Uncompressed { offset: 1 });
-        let state = Rc::new(RefCell::new(BootstrapHandleState {
-            reconstruction_trigger: Some((1, "header mismatch".to_owned())),
-            ..BootstrapHandleState::default()
-        }));
-        let document = BootstrapHandleDocument::new_with_state(
-            Some(b"x"),
-            XrefEntryLookup::Registration(&entries),
-            XrefLoadOptions::default(),
-            state,
-        );
-        let handle = document.handle_for_reference(object_ref);
-        let error = <BootstrapHandleDocument as DocumentResolver>::resolve_indirect(
-            &document, object_ref, &handle,
-        )
-        .expect_err("a reconstruction trigger propagates the parse error");
-        assert!(matches!(error, Error::Parse { .. }));
-
-        let registration = XrefRegistration::default();
-        let mut context = XrefReadContext::new(
-            b"",
-            XrefReadContextSpec::ActiveSection,
-            &registration,
-            XrefLoadOptions::default(),
-        );
-        context
-            .document
-            .push_diagnostic(damaged_warning(b"", b"", "late diagnostic", None));
-        let mut diagnostics = Diagnostics::default();
-        context.append_diagnostics_to(&mut diagnostics);
-        assert_eq!(diagnostics.entries().len(), 1);
     }
 
     #[test]
@@ -10296,32 +6077,6 @@ mod final_handle_tests {
     }
 
     #[test]
-    fn xref_file_object_diagnostic_preserves_raw_tokenizer_warning_bytes() {
-        let warning = xref_file_object_diagnostic(
-            XrefObjectDescription::Ordinary,
-            ObjectRef::new(7, 0),
-            50,
-            b"input.pdf",
-            FileObjectDiagnostic {
-                kind: FileObjectDiagnosticKind::TokenizerWarning {
-                    message: b"dictionary has duplicated key /K\xff".to_vec(),
-                },
-                relative_offset: 2,
-            },
-        );
-
-        assert_eq!(
-            warning.get_message_detail(),
-            b"dictionary has duplicated key /K\xff"
-        );
-        assert_eq!(warning.get_file_position(), 52);
-        assert_eq!(
-            warning.what_bytes(),
-            b"input.pdf (object 7 0, offset 52): dictionary has duplicated key /K\xff"
-        );
-    }
-
-    #[test]
     fn trailer_hex_diagnostics_preserve_raw_invalid_bytes() {
         let diagnostics = trailer_diagnostics(
             750,
@@ -10366,42 +6121,22 @@ mod final_handle_tests {
     }
 
     #[test]
-    fn resolve_length_maps_a_reconstruction_trigger_error_to_missing() {
-        let object_ref = ObjectRef::new(1, 0);
-        let mut entries = BTreeMap::new();
-        entries.insert(object_ref, XrefEntry::Uncompressed { offset: 1 });
-        let state = Rc::new(RefCell::new(BootstrapHandleState {
-            reconstruction_trigger: Some((1, "header mismatch".to_owned())),
-            ..BootstrapHandleState::default()
-        }));
-        let document = BootstrapHandleDocument::new_with_state(
-            Some(b"x"),
-            XrefEntryLookup::Registration(&entries),
-            XrefLoadOptions::default(),
-            state,
-        );
-
-        assert_eq!(
-            document.resolve_length(object_ref),
-            ResolvedStreamLength::Missing
-        );
-    }
-
-    #[test]
     fn classic_xref_validation_covers_non_dictionary_and_invalid_hybrid_trailers() {
         let (bytes, xref) = classic_xref_with_trailer("42");
+        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), false, 64);
         let mut registration = XrefRegistration::default();
-        let error = parse_xref_from_start(
+        let error = parse_xref_from_start_with_owner(
             &bytes,
             xref,
+            0,
             xref as u64,
             "1.4",
             XrefLoadOptions::default(),
             &mut registration,
             None,
-            XrefReadContextSpec::ActiveSection,
             None,
             true,
+            resolver.as_ref(),
         )
         .expect_err("classic trailer must be a dictionary");
         assert!(matches!(
@@ -10411,25 +6146,27 @@ mod final_handle_tests {
         ));
 
         let (bytes, xref) = classic_xref_with_trailer("<< /Size 1 /XRefStm (bad) >>");
+        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), false, 65);
         let mut registration = XrefRegistration::default();
-        let error = parse_xref_from_start(
+        let error = parse_xref_from_start_with_owner(
             &bytes,
             xref,
+            0,
             xref as u64,
             "1.4",
             XrefLoadOptions::default(),
             &mut registration,
             None,
-            XrefReadContextSpec::ActiveSection,
             None,
             true,
+            resolver.as_ref(),
         )
         .expect_err("a non-integer hybrid offset is invalid");
         assert!(error.to_string().contains("invalid /XRefStm"));
     }
 
     #[test]
-    fn trailer_reference_collection_and_candidate_reader_keep_canonical_handles() {
+    fn trailer_reference_collection_keeps_indirect_stream_children() {
         let stream = ObjectHandle::stream(
             ObjectHandle::dictionary(vec![(
                 b"/Child".to_vec(),
@@ -10438,154 +6175,6 @@ mod final_handle_tests {
             Rc::new(b"data".to_vec()),
         );
         assert!(collect_trailer_references(&stream).contains(&ObjectRef::new(7, 0)));
-
-        let registration = XrefRegistration::default();
-        let bytes = b"1 0 obj\n42\nendobj\n";
-        let mut context = XrefReadContext::new(
-            bytes,
-            XrefReadContextSpec::ActiveSection,
-            &registration,
-            XrefLoadOptions::default(),
-        );
-        assert!(
-            read_xref_candidate(&mut context, bytes, 0, bytes.len(), 0, ObjectRef::new(2, 0),)
-                .is_none()
-        );
-
-        let bytes = b"1 0 obj\n42 extra\nendobj\n";
-        let mut context = XrefReadContext::new(
-            bytes,
-            XrefReadContextSpec::ActiveSection,
-            &registration,
-            XrefLoadOptions::default(),
-        );
-        let completed =
-            read_xref_candidate(&mut context, bytes, 0, bytes.len(), 0, ObjectRef::new(1, 0))
-                .expect("a well-framed object is read before it is committed");
-        assert!(context.diagnostics.entries().is_empty());
-        assert!(commit_xref_candidate(&mut context, completed, 0, ObjectRef::new(1, 0)).is_some());
-        assert!(!context.diagnostics.entries().is_empty());
-
-        let bytes = b"1 0 obj\n<< /Info (unterminated";
-        let mut context = XrefReadContext::new(
-            bytes,
-            XrefReadContextSpec::ActiveSection,
-            &registration,
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
-        );
-        let completed =
-            read_xref_candidate(&mut context, bytes, 0, bytes.len(), 0, ObjectRef::new(1, 0))
-                .expect("a truncated object is recovered as a null read");
-        assert!(is_recovered_null_candidate(&completed));
-        // qpdf caches the null it substitutes for a failed read
-        // (`QPDF.cc:1738-1748`); the recovered null stays cached so a later
-        // reference neither re-reads the object nor repeats its diagnostics.
-        let cached = commit_xref_candidate(&mut context, completed, 0, ObjectRef::new(1, 0))
-            .expect("a recovered null is still committed to the cache");
-        assert!(cached.is_null());
-        assert!(context.cache.get(&ObjectRef::new(1, 0)).is_some());
-        assert!(!context.diagnostics.entries().is_empty());
-
-        let malformed = vec![b'['; crate::parser::MAX_PARSE_DEPTH + 1];
-        let (trailer, diagnostics) = parse_trailer_candidate(&malformed, 0, b"", None);
-        assert!(trailer.is_none());
-        assert!(!diagnostics.is_empty());
-    }
-
-    #[test]
-    fn bootstrap_cache_disconnects_reference_cycles_before_drop() {
-        let first_ref = ObjectRef::new(1, 0);
-        let second_ref = ObjectRef::new(2, 0);
-        let first = ObjectHandle::new_indirect_unresolved(first_ref, -1);
-        let second = ObjectHandle::new_indirect_unresolved(second_ref, -1);
-        first.set_resolved(ObjectValue::Dictionary(BTreeMap::from([(
-            b"/next".to_vec(),
-            second.clone(),
-        )])));
-        second.set_resolved(ObjectValue::Dictionary(BTreeMap::from([(
-            b"/next".to_vec(),
-            first.clone(),
-        )])));
-
-        let cache = BootstrapCache {
-            handle_state: Rc::new(RefCell::new(BootstrapHandleState {
-                handles: BTreeMap::from([
-                    (first_ref, BootstrapCacheEntry::new(first.clone())),
-                    (second_ref, BootstrapCacheEntry::new(second.clone())),
-                ]),
-                ..BootstrapHandleState::default()
-            })),
-            handle_document: None,
-            handle_document_owners: Vec::new(),
-        };
-
-        drop(cache);
-
-        assert!(!first.is_indirect());
-        assert!(!second.is_indirect());
-    }
-
-    #[test]
-    fn bootstrap_cache_cleans_owned_states_and_detaches_stream_values() {
-        let state = Rc::new(RefCell::new(BootstrapHandleState::default()));
-        let entries = BTreeMap::new();
-        let document = BootstrapHandleDocument::new_with_state(
-            Some(b""),
-            XrefEntryLookup::Registration(&entries),
-            XrefLoadOptions::default(),
-            Rc::clone(&state),
-        );
-        let cache = BootstrapCache {
-            handle_state: state.clone(),
-            handle_document: None,
-            handle_document_owners: vec![document],
-        };
-        drop(state);
-        drop(cache);
-
-        let stream = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
-            stream_dict: ObjectHandle::dictionary(vec![(
-                b"/Length".to_vec(),
-                ObjectHandle::integer(0),
-            )]),
-            stream_data: Some(Rc::new(Vec::new())),
-            stream_provider: None,
-            filter_on_write: true,
-            stream_token_filters: Default::default(),
-            content_normalization_applied: false,
-            stream_length: 0,
-        })));
-        let detached = detach_bootstrap_handle(&stream).expect("stream detaches");
-        assert!(detached.get_filter_on_write().expect("stream flag"));
-        assert_eq!(
-            detached
-                .as_stream_dict()
-                .expect("detached stream dictionary")
-                .try_get_key(b"/Length")
-                .unwrap()
-                .as_integer(),
-            Some(0)
-        );
-    }
-
-    #[test]
-    fn bootstrap_parser_values_share_one_description_template_owner() {
-        let state = Rc::new(RefCell::new(BootstrapHandleState::default()));
-        let entries = BTreeMap::new();
-        let document = BootstrapHandleDocument::new_with_state(
-            Some(b""),
-            XrefEntryLookup::Registration(&entries),
-            XrefLoadOptions::default(),
-            state,
-        );
-        let parser = BootstrapHandleParser::new(&document, XrefObjectDescription::Ordinary);
-
-        let first = parser.description_template().expect("description template");
-        let second = parser.description_template().expect("description template");
-        assert!(Rc::ptr_eq(&first, &second));
     }
 
     #[test]
@@ -10599,29 +6188,5 @@ mod final_handle_tests {
         assert!(registration.raw_entries.is_empty());
         assert!(registration.entries.is_empty());
         assert!(registration.deleted_objects.is_empty());
-    }
-
-    #[test]
-    fn bootstrap_source_extents_ignore_unprojectable_raw_generations() {
-        let state = Rc::new(RefCell::new(BootstrapHandleState::default()));
-        let entries = BTreeMap::new();
-        let document = BootstrapHandleDocument::new_with_state(
-            Some(b""),
-            XrefEntryLookup::Registration(&entries),
-            XrefLoadOptions::default(),
-            state,
-        );
-        let raw_generation = QpdfObjGen::new(7, 65_535);
-        let extents = SourceExtents {
-            end_before_space: 10,
-            end_after_space: 12,
-        };
-
-        document.set_source_extents(raw_generation, extents);
-
-        assert_eq!(
-            document.source_extents(raw_generation),
-            SourceExtents::UNSET
-        );
     }
 }

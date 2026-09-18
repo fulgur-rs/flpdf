@@ -2088,6 +2088,7 @@ impl ObjectHandle {
     /// qpdf-native shape: upstream one `QPDF*` carries both identity and the
     /// resolver, while [`Self::new_indirect_for_qpdf_obj_gen_with_resolver`] is what a
     /// handle vended by a `Pdf` needs.
+    #[cfg(test)]
     pub(crate) fn new_indirect_with_resolver(
         object_ref: ObjectRef,
         resolver: Weak<dyn DocumentResolver>,
@@ -3001,6 +3002,7 @@ impl ObjectHandle {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn set_description(&self, description: impl AsRef<[u8]>, offset: i64) {
         self.set_shared_description(Rc::new(description.as_ref().to_vec()), offset);
     }
