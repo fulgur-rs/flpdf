@@ -170,6 +170,37 @@ fn handle_only_helpers_do_not_carry_dead_pdf_parameters() {
     }
 }
 
+/// `QPDF::readToken(input, max_len = 0)` (`libqpdf/QPDF.cc:1535-1539`) is one
+/// function; every flpdf realization that used to construct its own
+/// `Tokenizer` and call `.read_token(true, ...)` -- `ByteCursor::read_token`,
+/// the trailer's `stream`-keyword lookahead, `next_object_stream_integer`'s
+/// ObjStm header integers, the xref-reconstruction line scan, and the
+/// canonical resolve path's `endstream`/`endobj` framing checks -- now routes
+/// through `Tokenizer::read_qpdf_token`. The only direct `.read_token(true,`
+/// calls left in the crate are that method's own definition and
+/// `inline_lookahead_is_plausible`'s inline-image `EI` lookahead, which is a
+/// different qpdf owner (`QPDFTokenizer`'s own lookahead, not `QPDF`'s).
+#[test]
+fn qpdf_read_token_calls_route_through_one_allow_bad_entrypoint() {
+    let tokenizer = read_source("tokenizer.rs");
+    assert_eq!(
+        tokenizer.matches("read_token(true, ").count(),
+        2,
+        "tokenizer.rs should have exactly `read_qpdf_token`'s own call and \
+         `inline_lookahead_is_plausible`'s out-of-scope EI lookahead"
+    );
+
+    for path in ["xref.rs", "reader/resolver.rs"] {
+        let source = read_source(path);
+        assert_eq!(
+            source.matches("read_token(true, ").count(),
+            0,
+            "{path} should route every allow_bad read through \
+             Tokenizer::read_qpdf_token instead of calling read_token(true, ...) directly"
+        );
+    }
+}
+
 #[test]
 fn canonical_pdf_open_does_not_snapshot_the_complete_source_for_xref() {
     let engine = read_source("engine.rs");
