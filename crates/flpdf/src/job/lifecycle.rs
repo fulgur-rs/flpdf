@@ -25,7 +25,7 @@ use crate::linearization::{show_linearization_pdf_with_warnings, ShowLinearizati
 use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
 use crate::qutil::{qpdf_string_to_int_checked, QpdfIntParse};
 use crate::{
-    AcroFormDocumentHelper, Error, ObjectHandle, ObjectRef, ObjectStreamMode, PageDocumentHelper,
+    AcroFormDocumentHelper, Error, ObjectHandle, ObjectStreamMode, PageDocumentHelper,
     PageObjectHelper, Pdf, PdfOpenOptions, PdfVersion, PdfWriter, QPDFLogger, ReadSeek, Result,
     UsageError, WriterConfiguration,
 };
@@ -391,7 +391,18 @@ struct PageLabelSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JobObjectSelector {
     Trailer,
-    Object(ObjectRef),
+    /// qpdf's raw `int obj, int gen` object identity
+    /// (`QPDFJob::parse_object_id`, `libqpdf/QPDFJob.cc:929-940`), not the
+    /// ordinary `ObjectRef`: `gen` can exceed `u16::MAX` (`5 65536 obj` is valid
+    /// qpdf object-header syntax) and must still resolve through
+    /// `Pdf::get_object_handle_by_raw_identity`
+    /// (`QPDF::getObjectByID`, `libqpdf/QPDF.cc:1973-1977`, which builds a
+    /// `QPDFObjGen` directly from the pair without projecting through the
+    /// ordinary xref-backed reference range).
+    Object {
+        number: i32,
+        generation: i32,
+    },
     Null,
     NoObject,
 }
@@ -1189,13 +1200,18 @@ fn parse_job_object_selector(value: &[u8]) -> Result<JobObjectSelector> {
     if number <= 0 {
         return Ok(JobObjectSelector::NoObject);
     }
-    if !(0..=i32::from(u16::MAX)).contains(&generation) {
+    // qpdf's own `parse_object_id` does not clamp the generation to any
+    // range at parse time; a generation this selector cannot resolve
+    // (negative -- qpdf's ints are signed, and no in-use xref entry can
+    // ever have a negative generation) simply looks up nothing and prints
+    // qpdf's "null" (`QPDFJob::doShowObj` -> `QPDF::getObjectByID`,
+    // `libqpdf/QPDFJob.cc:809-812`). A generation beyond `u16::MAX` is not
+    // such a case: `5 65536 obj` is valid qpdf object-header syntax, so it
+    // must resolve like any other in-range identity, not fall back to null.
+    if generation < 0 {
         return Ok(JobObjectSelector::Null);
     }
-    Ok(JobObjectSelector::Object(ObjectRef::new(
-        u32::try_from(number).expect("positive i32 fits u32"),
-        u16::try_from(generation).expect("validated u16 generation"),
-    )))
+    Ok(JobObjectSelector::Object { number, generation })
 }
 
 fn parse_job_selector_integer(value: &str) -> Result<i32> {
@@ -4074,8 +4090,13 @@ impl QPDFJob {
                     )?;
                     // cov:ignore-end
                 }
-                JobObjectSelector::Object(object_ref) => {
-                    let object = pdf.get_object_handle(object_ref);
+                JobObjectSelector::Object { number, generation } => {
+                    // Raw-identity resolution, not `pdf.get_object_handle`:
+                    // qpdf's `getObjectByID` builds the `QPDFObjGen` directly
+                    // from the selector's own `(obj, gen)` pair rather than
+                    // routing it through the ordinary xref-backed `N G R`
+                    // reference range (see `JobObjectSelector::Object` doc).
+                    let object = pdf.get_object_handle_by_raw_identity(number, generation);
                     // cov:ignore-start: malformed object-report errors are covered by the public inspection route; only this propagated edge is excluded
                     self.show_object_report(
                         pdf,
@@ -7245,11 +7266,17 @@ mod tests {
         );
         assert_eq!(
             parse_job_object_selector(b"1").unwrap(),
-            JobObjectSelector::Object(ObjectRef::new(1, 0))
+            JobObjectSelector::Object {
+                number: 1,
+                generation: 0
+            }
         );
         assert_eq!(
             parse_job_object_selector(b"1,").unwrap(),
-            JobObjectSelector::Object(ObjectRef::new(1, 0))
+            JobObjectSelector::Object {
+                number: 1,
+                generation: 0
+            }
         );
         assert_eq!(
             parse_job_object_selector(b"-1").unwrap(),
@@ -7259,8 +7286,24 @@ mod tests {
             parse_job_object_selector(b"").unwrap(),
             JobObjectSelector::NoObject
         );
+        // A generation beyond `u16::MAX` is valid qpdf object-header syntax
+        // (`5 65536 obj`) and must resolve, not fall back to `Null`: qpdf's
+        // own `parse_object_id` never clamps the generation range
+        // (`libqpdf/QPDFJob.cc:929-940`).
         assert_eq!(
             parse_job_object_selector(b"1,65536").unwrap(),
+            JobObjectSelector::Object {
+                number: 1,
+                generation: 65536
+            }
+        );
+        // A negative generation can never match an in-use xref entry, so it
+        // resolves to nothing and qpdf prints "null"
+        // (`QPDFJob::doShowObj` -> `QPDF::getObjectByID`,
+        // `libqpdf/QPDFJob.cc:809-812`; observed with pinned qpdf 11.9.0:
+        // `qpdf --show-object=5,-1` prints `null` and exits 0).
+        assert_eq!(
+            parse_job_object_selector(b"1,-1").unwrap(),
             JobObjectSelector::Null
         );
         assert!(parse_job_object_selector(b"999999999999999999999").is_err());
