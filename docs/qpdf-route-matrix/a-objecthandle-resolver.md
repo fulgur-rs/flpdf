@@ -552,8 +552,8 @@ issue; commit `777bc21a8` ("keep production on canonical helper",
 2026-08-19) preceded the `.48.23` slice-naming convention and closed the
 boundary without a matching route contract or matrix note, which this slice
 adds. The production wrapper
-`get_form_xobject_for_page` (the sole non-`#[cfg(test)]` item in the module)
-makes no `ObjectHandle` accessor calls of its own: it constructs a
+`get_form_xobject_for_page` (the sole non-`#[cfg(test)]` function in the
+module) makes no `ObjectHandle` accessor calls of its own: it constructs a
 `PageObjectHelper` and delegates the whole conversion to its
 `get_form_xobject_for_page` method
 (`libqpdf/QPDFPageObjectHelper.cc:706-732`, `getFormXObjectForPage`). The
