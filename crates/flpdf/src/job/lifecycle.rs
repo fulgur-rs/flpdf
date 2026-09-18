@@ -665,8 +665,20 @@ fn validate_job_json_schema(value: &crate::json::Json) -> Result<()> {
 }
 
 fn read_job_json_file(path: &Path) -> Result<crate::json::Json> {
-    let bytes = std::fs::read(path)
-        .map_err(|error| Error::file_io("read job-json file", path.to_owned(), error))?;
+    // A nested `jobJsonFile` JSON key dispatches through the same
+    // `Config::jobJsonFile` callback as the CLI's `--job-json-file`
+    // (`libqpdf/qpdf/auto_job_json_init.hh:472-474`), which reads the file
+    // via `QUtil::read_file_into_string` -> `QUtil::safe_fopen`
+    // (`QPDFJob_config.cc:776`, `libqpdf/QUtil.cc:490-519,1167-1172`) and
+    // reports a missing/unreadable file with portable `strerror` wording, not
+    // Rust's `io::Error` text.
+    let bytes = std::fs::read(path).map_err(|error| {
+        Error::System(format!(
+            "open {}: {}",
+            path.display(),
+            crate::qutil::strerror_text(&error)
+        ))
+    })?;
     let value =
         crate::json::Json::parse(&bytes).map_err(|error| Error::System(error.to_string()))?;
     if !value.is_dictionary() {
