@@ -1116,7 +1116,7 @@ top-level object: key \"version\" is present in schema but missing in object\n"
             assert!(
                 output.status.success(),
                 "qpdf --json=2 --json-key=qpdf failed on {name}: {}",
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stderr) // cov:ignore: assertion failure message, never formatted because qpdf always succeeds here
             );
 
             let mut pdf = Pdf::open(BufReader::new(File::open(&path).unwrap())).unwrap();
