@@ -471,9 +471,9 @@ pub(crate) fn authenticate(
         // password-independent; compute it with the SAME revision-aware
         // split layer-2 uses.
         let file_key = decode_hex_file_key(raw_password)?;
-        let (encrypt_metadata, weak_crypto, id0) = if matches!(revision, 5 | 6) {
+        let (encrypt_metadata, weak_crypto, id0) = if version == 5 {
             let encrypt_metadata = encrypt_metadata_flag_from_handle(encrypt)?;
-            // Same weak-crypto classification as layer-2's R5/R6 branch.
+            // Same weak-crypto classification as layer-2's V=5 branch.
             (encrypt_metadata, revision == 5 || rc4_in_use(), None)
         } else {
             let id0 = first_file_id_handle(id)?;
@@ -493,7 +493,7 @@ pub(crate) fn authenticate(
             Vec::new(),
             id0,
         )
-    } else if matches!(revision, 5 | 6) {
+    } else if version == 5 {
         // Authentication error behavior must match qpdf:
         //
         //   1. Password authentication runs FIRST.  If neither the user nor
@@ -513,15 +513,18 @@ pub(crate) fn authenticate(
         let encrypt_metadata = encrypt_metadata_flag_from_handle(encrypt)?;
         let inputs = inputs.borrowed();
         let weak_crypto = revision == 5 || rc4_in_use();
-        let user_attempt = if revision == 5 {
-            check_user_password_r5(&password, &inputs)
-        } else {
+        // qpdf's `hash_V5` branches on `R < 6` (`QPDF_encryption.cc:240-251`),
+        // so V=5 with R=2..5 uses the single SHA-256 salt hash and only R>=6
+        // runs ISO 32000-2 Algorithm 2.B.
+        let user_attempt = if revision >= 6 {
             check_user_password_r6(&password, &inputs)
-        };
-        let owner_attempt = if revision == 5 {
-            check_owner_password_r5(&password, &inputs)
         } else {
+            check_user_password_r5(&password, &inputs)
+        };
+        let owner_attempt = if revision >= 6 {
             check_owner_password_r6(&password, &inputs)
+        } else {
+            check_owner_password_r5(&password, &inputs)
         };
         let user_password_matched = user_attempt.is_ok();
         let owner_password_matched = owner_attempt.is_ok();
@@ -618,7 +621,7 @@ fn standard_handler_inputs_from_handle(
     let filter = required_name_from_handle(encrypt, "Filter")?;
     let v = required_integer_from_handle(encrypt, "V")?;
     let r = required_integer_from_handle(encrypt, "R")?;
-    if filter != "Standard" || !matches!((v, r), (1 | 2, 2 | 3) | (4, 4)) {
+    if filter != "Standard" || !matches!(v, 1 | 2 | 4) || !(2..=6).contains(&r) {
         return Err(crate::error::EncryptedError::UnsupportedHandler {
             filter,
             v,
@@ -671,7 +674,7 @@ fn standard_handler_r5_inputs_from_handle(
     let filter = required_name_from_handle(encrypt, "Filter")?;
     let v = required_integer_from_handle(encrypt, "V")?;
     let r = required_integer_from_handle(encrypt, "R")?;
-    if filter != "Standard" || v != 5 || !matches!(r, 5 | 6) {
+    if filter != "Standard" || v != 5 || !(2..=6).contains(&r) {
         return Err(crate::error::EncryptedError::UnsupportedHandler {
             filter,
             v,
