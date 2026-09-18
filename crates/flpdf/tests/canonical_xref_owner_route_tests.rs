@@ -558,3 +558,179 @@ fn reconstruction_after_a_committed_free_row_suppresses_it_like_qpdf() {
         "flpdf's reconstructed xref table must equal qpdf 11.9.0's"
     );
 }
+
+/// Build a single-page document whose cross-reference section is a classic
+/// table, inserting `between` after the last subsection entry and writing
+/// `startxref_value` (default: the table offset) after the `startxref`
+/// keyword.
+///
+/// `between` lands exactly where qpdf's subsection loop performs its
+/// `readToken(m->file).isWord("trailer")` lookahead (`libqpdf/QPDF.cc:886-891`)
+/// and `startxref_value` lands exactly where `QPDF::findStartxref` reads its
+/// second token (`libqpdf/QPDF.cc:413-421`) -- the two places `QPDF::readToken`
+/// governs on the classic route.
+fn classic_xref_document(between: &[u8], startxref_value: Option<&[u8]>) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for object in [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".as_slice(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".as_slice(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n".as_slice(),
+    ] {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    }
+    let xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(between);
+    bytes.extend_from_slice(b"trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n");
+    match startxref_value {
+        Some(value) => bytes.extend_from_slice(value),
+        None => bytes.extend_from_slice(format!("{xref}\n").as_bytes()),
+    }
+    bytes.extend_from_slice(b"%%EOF\n");
+    bytes
+}
+
+/// A classic section that jumps straight from the `xref` keyword to
+/// `trailer`. qpdf's `while (!done)` loop always opens by reading a
+/// subsection header and only recognises `trailer` through the lookahead that
+/// closes a subsection (`libqpdf/QPDF.cc:851-890`), so a table with no
+/// subsection is `xref syntax invalid` rather than an empty table.
+fn classic_xref_without_subsection() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    for object in [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".as_slice(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".as_slice(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n".as_slice(),
+    ] {
+        bytes.extend_from_slice(object);
+    }
+    let xref = bytes.len();
+    bytes.extend_from_slice(b"xref\ntrailer\n<< /Size 4 /Root 1 0 R >>\n");
+    bytes.extend_from_slice(format!("startxref\n{xref}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+/// `QPDF::readToken` is fixed at `allow_bad = true`
+/// (`libqpdf/QPDF.cc:1535-1539`), so on the classic route a `tt_bad` token is
+/// a value the caller inspects and rejects, never a raised error. Both places
+/// that token governs are pinned here against qpdf 11.9.0: the subsection
+/// loop's `trailer` lookahead, which rewinds and re-reads the bytes as the
+/// next subsection header, and `findStartxref`, whose non-integer second
+/// token degrades to `can't find startxref` rather than surfacing the
+/// tokenizer's own diagnostic.
+#[test]
+fn classic_xref_read_token_lookahead_matches_qpdf() {
+    let directory = tempfile::tempdir().expect("create qpdf fixture directory");
+    for (name, fixture, expected) in [
+        (
+            "classic-xref-clean.pdf",
+            classic_xref_document(b"", None),
+            Vec::new(),
+        ),
+        // A `)` where the lookahead runs: `tt_bad`, so not the `trailer`
+        // keyword, so re-read as the next subsection header, which fails.
+        (
+            "classic-xref-bad-lookahead-token.pdf",
+            classic_xref_document(b")\n", None),
+            vec![
+                "file is damaged".to_owned(),
+                "(xref table, offset 275): xref syntax invalid".to_owned(),
+                "Attempting to reconstruct cross-reference table".to_owned(),
+            ],
+        ),
+        // A comment is ignorable to the tokenizer, so the lookahead reads
+        // past it and finds `trailer`: the table parses without repair.
+        (
+            "classic-xref-comment-before-trailer.pdf",
+            classic_xref_document(b"%comment\n", None),
+            Vec::new(),
+        ),
+        // The rewind target is the position the lookahead started from, not
+        // the first non-space byte, so the reported offset is the whitespace.
+        (
+            "classic-xref-bad-lookahead-after-space.pdf",
+            classic_xref_document(b"\n   )\n", None),
+            vec![
+                "file is damaged".to_owned(),
+                "(xref table, offset 276): xref syntax invalid".to_owned(),
+                "Attempting to reconstruct cross-reference table".to_owned(),
+            ],
+        ),
+        (
+            "classic-xref-without-subsection.pdf",
+            classic_xref_without_subsection(),
+            vec![
+                "file is damaged".to_owned(),
+                "(xref table, offset 191): xref syntax invalid".to_owned(),
+                "Attempting to reconstruct cross-reference table".to_owned(),
+            ],
+        ),
+        (
+            "classic-xref-bad-startxref-token.pdf",
+            classic_xref_document(b"", Some(b")\n")),
+            vec![
+                "file is damaged".to_owned(),
+                "can't find startxref".to_owned(),
+                "Attempting to reconstruct cross-reference table".to_owned(),
+            ],
+        ),
+    ] {
+        let input = directory.path().join(name);
+        fs::write(&input, &fixture).expect("write qpdf fixture");
+        let description = input.to_string_lossy().into_owned();
+        let expected: Vec<String> = expected
+            .into_iter()
+            .map(|message| {
+                format!(
+                    "{description}{}{message}",
+                    if message.starts_with('(') { " " } else { ": " }
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            canonical_open_warnings(fixture.clone(), &description),
+            expected,
+            "canonical route warnings changed for {name}"
+        );
+
+        // Every fixture resolves to the same three uncompressed entries,
+        // whether it was read from the table or reconstructed, so the
+        // warning list above is what separates the two outcomes. Pinning the
+        // entries as well keeps a fixture that stopped parsing for an
+        // unrelated reason from passing as agreement.
+        let pdf = Pdf::open_with_options(
+            Cursor::new(fixture),
+            PdfOpenOptions {
+                repair: true,
+                suppress_warnings: true,
+                description: description.as_bytes().to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("{name} must open: {error}"));
+        let table = pdf.get_xref_table();
+        for (number, offset) in [(1u32, 9u64), (2, 58), (3, 115)] {
+            assert_eq!(
+                table.get(&ObjectRef::new(number, 0)).copied(),
+                Some(XrefEntry::Uncompressed { offset }),
+                "{name} lost object {number}"
+            );
+        }
+
+        if !qpdf_available() {
+            eprintln!("qpdf 11.9.0 is not available; skipping only the oracle comparison");
+            continue;
+        }
+        assert_eq!(
+            qpdf_warnings(&input),
+            expected,
+            "qpdf 11.9.0 no longer produces the pinned sequence for {name}"
+        );
+    }
+}
