@@ -7631,7 +7631,6 @@ fn run_page_extraction(
         reject_same_job_output(primary_input, output)?;
     }
     let standard_output = prepare_page_operation_standard_output(output, page_ops)?;
-    let creates_output = standard_output.is_none();
     if page_ops.empty {
         // qpdf accepts `--empty`; ignoring it would silently change which
         // document supplies the catalog/outlines. Fail loudly instead.
@@ -7730,7 +7729,6 @@ fn run_page_extraction(
                 flatten_rotation,
                 verbose,
                 standard_output,
-                creates_output,
                 &inputs,
                 no_warn,
             ),
@@ -7754,7 +7752,6 @@ fn run_page_extraction(
                 flatten_rotation,
                 verbose,
                 standard_output,
-                creates_output,
                 &inputs,
                 no_warn,
             ),
@@ -7787,7 +7784,6 @@ fn run_page_extraction(
             verbose,
             no_warn,
             standard_output,
-            creates_output,
             inputs,
         );
     }
@@ -7812,7 +7808,6 @@ fn run_page_extraction(
         flatten_rotation,
         verbose,
         standard_output,
-        creates_output,
         &inputs,
         no_warn,
     )
@@ -7846,7 +7841,6 @@ fn run_empty_page_extraction(
     no_warn: bool,
 ) -> CliResult<()> {
     let standard_output = prepare_page_operation_standard_output(output, page_ops)?;
-    let creates_output = standard_output.is_none();
     let raw_specs = configured_page_specs(page_ops)?;
     if raw_specs
         .iter()
@@ -7941,7 +7935,6 @@ fn run_empty_page_extraction(
         linearize_pass1,
         verbose,
         standard_output,
-        creates_output,
         false,
         None,
         source_warnings,
@@ -7991,7 +7984,6 @@ fn run_page_extraction_from_multiple_sources(
     verbose: bool,
     no_warn: bool,
     standard_output: Option<PipelineWriter>,
-    creates_output: bool,
     inputs: Vec<CliInputSpec>,
 ) -> CliResult<()> {
     // qpdf inherits output encryption from the primary input for page
@@ -8124,7 +8116,6 @@ fn run_page_extraction_from_multiple_sources(
         linearize_pass1,
         verbose,
         standard_output,
-        creates_output,
         primary_encrypted,
         primary_copy_encryption,
         source_warnings,
@@ -8160,7 +8151,6 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
     flatten_rotation: bool,
     verbose: bool,
     standard_output: Option<PipelineWriter>,
-    creates_output: bool,
     inputs: &[CliInputSpec],
     no_warn: bool,
 ) -> CliResult<()> {
@@ -8214,7 +8204,6 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 linearize_pass1,
                 verbose,
                 standard_output,
-                creates_output,
                 primary_encrypted,
                 primary_copy_encryption,
                 source_warnings,
@@ -8250,7 +8239,6 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 linearize_pass1,
                 verbose,
                 standard_output,
-                creates_output,
                 primary_encrypted,
                 primary_copy_encryption,
                 source_warnings,
@@ -8283,7 +8271,6 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     linearize_pass1: Option<&Path>,
     verbose: bool,
     _standard_output: Option<PipelineWriter>,
-    _creates_output: bool,
     primary_encrypted: bool,
     primary_copy_encryption: Option<CopyEncryptionSource>,
     prior_warnings: bool,
@@ -9416,7 +9403,7 @@ fn run_show_encryption_key(
     match pdf.encryption_file_key() {
         Some(key) => {
             logger_info(format!("{}\n", hex_lower(&key)))?;
-            finish_operation_warnings(&pdf, false)
+            finish_operation_warnings(&pdf)
         }
         None if pdf.is_encrypted() => Err("invalid password".into()),
         None => Err("file is not encrypted; no encryption key to show".into()),
@@ -9889,22 +9876,19 @@ fn diagnostic_location(input: &Path, offset: Option<u64>) -> String {
 }
 
 /// Finish a successful operation after all requested output has been emitted.
-/// qpdf aggregates warnings from both open-time and lazy object resolution;
-/// the summary shape depends on whether this route created a PDF output.
-fn finish_operation_warnings<R: Read + Seek>(pdf: &Pdf<R>, creates_output: bool) -> CliResult<()> {
-    finish_operation_warnings_with_prior(pdf, creates_output, false)
+/// qpdf aggregates warnings from both open-time and lazy object resolution.
+fn finish_operation_warnings<R: Read + Seek>(pdf: &Pdf<R>) -> CliResult<()> {
+    finish_operation_warnings_with_prior(pdf, false)
 }
 
 /// Complete the warning boundary while retaining warnings observed in source
 /// documents that were merged into a fresh output PDF.
 fn finish_operation_warnings_with_prior<R: Read + Seek>(
     pdf: &Pdf<R>,
-    creates_output: bool,
     prior_warnings: bool,
 ) -> CliResult<()> {
     finish_warning_state(
         prior_warnings || !pdf.repair_diagnostics().entries().is_empty(),
-        creates_output,
         pdf.suppress_warnings(),
     )
 }
@@ -9926,7 +9910,13 @@ fn finish_job_exit_status(status: JobExitCode) -> CliResult<()> {
 
 /// Complete a standalone warning/status boundary after a report-only consumer
 /// has recorded its warning state.
-fn finish_warning_state(has_warnings: bool, creates_output: bool, no_warn: bool) -> CliResult<()> {
+///
+/// A report-only consumer never writes a PDF, so qpdf's `createsOutput()`
+/// (`libqpdf/QPDFJob.cc:528-531`) is false for every route that reaches here
+/// and the summary always takes the bare spelling. Routes that do create
+/// output complete through `QPDFJob::write_qpdf` instead, which queries the
+/// job that performed the write.
+fn finish_warning_state(has_warnings: bool, no_warn: bool) -> CliResult<()> {
     let mut job = QPDFJob::new();
     job.set_warnings_exit_zero(cli_warning_exit_zero());
     job.set_logger(cli_logger());
@@ -9936,7 +9926,7 @@ fn finish_warning_state(has_warnings: bool, creates_output: bool, no_warn: bool)
         job.record_warnings();
     }
 
-    job.complete(creates_output)?;
+    job.complete(false)?;
     finish_job_exit_status(job.get_exit_code())
 }
 
