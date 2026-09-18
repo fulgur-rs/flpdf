@@ -3324,19 +3324,26 @@ fn job_json_file_rejects_same_input_and_output_without_truncating_input() {
 /// anything is written.
 #[test]
 fn job_json_implicit_json_destination_rejects_an_input_named_dash() {
-    let directory = tempfile::tempdir().unwrap();
-    let fixture =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
-    fs::copy(fixture, directory.path().join("-")).unwrap();
-    fs::write(
-        directory.path().join("json.json"),
-        br#"{"inputFile":"-","json":"2"}"#,
-    )
-    .unwrap();
+    // Each binary gets its own working directory holding its own `-`, so
+    // neither invocation can observe or disturb what the other left behind if
+    // a future change moves the rejection later in the pipeline.
+    fn case_directory() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+        fs::copy(fixture, directory.path().join("-")).unwrap();
+        fs::write(
+            directory.path().join("json.json"),
+            br#"{"inputFile":"-","json":"2"}"#,
+        )
+        .unwrap();
+        directory
+    }
 
+    let actual_directory = case_directory();
     let assertion = Command::cargo_bin("flpdf")
         .unwrap()
-        .current_dir(directory.path())
+        .current_dir(actual_directory.path())
         .arg("--job-json-file=json.json")
         .assert()
         .code(2);
@@ -3349,20 +3356,21 @@ fn job_json_implicit_json_destination_rejects_an_input_named_dash() {
     if !qpdf_available() {
         return;
     }
+    let expected_directory = case_directory();
     let expected = ProcessCommand::new("/usr/bin/qpdf")
-        .current_dir(directory.path())
+        .current_dir(expected_directory.path())
         .arg("--job-json-file=json.json")
         .output()
         .unwrap();
     assert_eq!(
         expected.status.code(),
         Some(2),
-        "qpdf 11.9.0 must reject the aliased implicit JSON destination too"
+        "qpdf must reject the aliased implicit JSON destination too"
     );
     assert!(
         String::from_utf8_lossy(&expected.stderr)
             .contains("input file and output file are the same;"),
-        "qpdf 11.9.0 no longer reports the pinned diagnostic"
+        "qpdf no longer reports the pinned diagnostic"
     );
 }
 
