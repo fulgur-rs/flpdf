@@ -806,9 +806,17 @@ fn assert_same_json_output_is_rejected_without_modifying_input(
 
 #[test]
 fn json_output_rejects_input_path_without_modifying_input() {
-    let input = write_temp_pdf(&one_page_pdf_with_stream());
-    let path = input.path().to_str().unwrap();
-    assert_same_json_output_is_rejected_without_modifying_input(path, path, input.path(), None);
+    // `into_temp_path()` closes the underlying file handle, keeping only the
+    // path. `assert_same_json_output_is_rejected_without_modifying_input`
+    // spawns both flpdf and (as an oracle) the real qpdf binary against this
+    // same path; on Windows, `QUtil::same_file`'s `CreateFile` call for the
+    // oracle's own same-file check can lose to a `NamedTempFile`'s still-open
+    // handle, so the oracle process fails to detect the alias and overwrites
+    // the input instead of rejecting it. Closing our handle first avoids that
+    // sharing-mode race without touching qpdf's or flpdf's own logic.
+    let input = write_temp_pdf(&one_page_pdf_with_stream()).into_temp_path();
+    let path = input.to_str().unwrap();
+    assert_same_json_output_is_rejected_without_modifying_input(path, path, &input, None);
 }
 
 #[test]
