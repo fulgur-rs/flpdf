@@ -60,7 +60,7 @@
 //!
 //! Single-document only. Multi-input cross-document merge is a separate path.
 
-use crate::object_handle::ObjectHandle;
+use crate::object_handle::{ObjectHandle, ObjectValue};
 use crate::pages::tree_rebuild::RebuildResult;
 use crate::{Error, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -421,8 +421,23 @@ fn remap_goto_action<R: Read + Seek>(
 /// is never in this set and is left untouched. The subsequent subset sweep
 /// drops any nulled page that no surviving destination still references.
 fn null_removed_pages<R: Read + Seek>(pdf: &mut Pdf<R>, result: &RebuildResult) -> Result<()> {
-    for &removed in &result.removed_pages {
-        pdf.replace_object(removed, ObjectHandle::null())?;
+    if result.removed_page_objgens.is_empty() {
+        // Keep hand-built RebuildResult values used by internal callers and
+        // tests on the legacy projection while canonical rebuilds use the raw
+        // identity set below.
+        for &removed in &result.removed_pages {
+            pdf.replace_object(removed, ObjectHandle::null())?;
+        }
+        return Ok(());
+    }
+
+    for object_gen in &result.removed_page_objgens {
+        let page =
+            pdf.get_object_handle_by_raw_identity(object_gen.get_obj(), object_gen.get_gen());
+        // QPDF::replaceObject updates the shared cache slot for the exact raw
+        // QPDFObjGen. ObjectHandle::set_resolved is the same live-slot write
+        // for generations that cannot cross the N G R projection boundary.
+        page.set_resolved(ObjectValue::Null);
     }
     Ok(())
 }

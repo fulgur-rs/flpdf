@@ -309,6 +309,11 @@ impl Optimization {
         self.record(user, object);
     }
 
+    #[cfg(test)]
+    pub(crate) fn record_raw_for_test(&mut self, user: ObjectUser, object: QpdfObjGen) {
+        self.record_raw(user, object);
+    }
+
     pub(crate) fn optimize<R, F>(
         pdf: &mut Pdf<R>,
         object_stream_data: &BTreeMap<u32, u32>,

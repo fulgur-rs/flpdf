@@ -372,6 +372,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
             new_kids: Vec::new(),
             ref_map: BTreeMap::new(),
             removed_pages,
+            ..Default::default()
         })
     }
 }

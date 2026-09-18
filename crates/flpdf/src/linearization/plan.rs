@@ -1791,11 +1791,7 @@ impl LinearizationPlan {
         if let Some(refs) = pre_optimization_object_refs {
             optimization.set_pre_optimization_object_refs(refs);
         }
-        if optimization
-            .objects_for(&crate::optimization::ObjectUser::Page(0))
-            .next()
-            .is_none()
-        {
+        if !has_page_user_objects(&optimization) {
             // qpdf raises this through `stopOnError`, which builds a
             // `qpdf_e_damaged_pdf` exception carrying the input name and the
             // source's last read offset and no object description
@@ -4003,6 +3999,12 @@ fn first_page_is_private(
         && !has_root
 }
 
+fn has_page_user_objects(optimization: &crate::optimization::Optimization) -> bool {
+    !optimization
+        .raw_objects_for(&crate::optimization::ObjectUser::Page(0))
+        .is_empty()
+}
+
 fn qpdf_stop_on_error<R: Read + Seek>(pdf: &Pdf<R>, message: impl AsRef<[u8]>) -> crate::Error {
     crate::Error::QpdfExc(crate::QpdfExc::new(
         crate::QpdfErrorCode::DamagedPdf,
@@ -4218,6 +4220,7 @@ mod tests {
     use crate::object_handle::ObjectHandle;
     use crate::optimization::{ObjectUser, Optimization};
     use crate::parser::MAX_PARSE_DEPTH;
+    use crate::qpdf_obj_gen::QpdfObjGen;
     use crate::writer::{ObjectStreamMode, WriterOptions};
     use crate::{Error, ObjectRef, Pdf};
     use flate2::write::ZlibEncoder;
@@ -4255,6 +4258,14 @@ mod tests {
             ObjectRef::new(u32::MAX, 0),
             &BTreeMap::new()
         ));
+    }
+
+    #[test]
+    fn linearization_page_presence_accepts_a_raw_generation_user() {
+        let mut optimization = Optimization::default();
+        optimization.record_raw_for_test(ObjectUser::Page(0), QpdfObjGen::new(11, 65_535));
+
+        assert!(super::has_page_user_objects(&optimization));
     }
 
     #[test]
