@@ -5,14 +5,20 @@
 //! (`qpdf-ctest.c:1252-1320`) intentionally test C API lifecycles rather than
 //! requiring callers to link a C symbol. Keep this adapter at the qtest-tools
 //! process boundary; the PDF read/write responsibilities stay in the canonical
-//! `flpdf::Pdf`, `flpdf::PdfWriter`, and JSON job APIs.
+//! `flpdf::Pdf`, `flpdf::PdfWriter`, and `flpdf::document_json` APIs. JSON
+//! tests 46/47 in particular port `qpdf_write_json` (`libqpdf/qpdf-c.cc:1924-
+//! 1952`), which calls `QPDF::writeJSON` directly and never touches
+//! `QPDFJob` (`rg -n 'QPDFJob' libqpdf/qpdf-c.cc` is 0 hits) — so this
+//! adapter routes those two cases through `flpdf::document_json::write_json`
+//! rather than the `QPDFJob` JSON job API used by the `--json-output` CLI
+//! path.
 
-use flpdf::job::{JsonJobOptions, JsonJobOutput, JsonStreamData, QPDFJob};
-use flpdf::json_inspect::{DecodeLevel as JsonDecodeLevel, JsonKey};
+use flpdf::json_inspect::{DecodeLevel as JsonDecodeLevel, JsonObjectSelector, StreamDataMode};
+use flpdf::pipeline::PlOStream;
 use flpdf::{
-    DecodeLevel, EncryptMethod, EncryptParams, EncryptedError, Error, Pdf, PdfOpenOptions,
-    PdfWriter, Permissions, PermissionsConfig, PrintPermission, QpdfErrorCode, QpdfExc,
-    R2PermissionsConfig, Result,
+    document_json, DecodeLevel, EncryptMethod, EncryptParams, EncryptedError, Error, Pdf,
+    PdfOpenOptions, PdfWriter, Permissions, PermissionsConfig, PrintPermission, QpdfErrorCode,
+    QpdfExc, R2PermissionsConfig, Result,
 };
 use std::env;
 use std::fs::File;
@@ -726,40 +732,26 @@ fn run_test45(
     Ok(())
 }
 
+/// Serialize `pdf` to `output_arg` the way `qpdf_write_json`
+/// (`libqpdf/qpdf-c.cc:1924-1952`) does: a direct `QPDF::writeJSON` call,
+/// with no `QPDFJob` in the path. `document_json::write_json` walks every
+/// object (`QPDF_json.cc:900-925`), dereferencing it for the first time if
+/// unresolved, so a malformed object can raise the same lazy-resolution
+/// warning any other first resolution would; the caller drains those with
+/// [`write_pdf_diagnostics`] afterward, matching `report_errors()`
+/// (`qpdf-ctest.c:45-68`) and this file's other resolution-triggering
+/// tests (`run_test2`, `run_test10`).
 fn write_json_test_output<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     output_arg: &std::ffi::OsStr,
     decode_level: JsonDecodeLevel,
-    stream_data: JsonStreamData,
-    stream_prefix: Option<&[u8]>,
-    objects: &[String],
+    stream_mode: &StreamDataMode,
+    objects: &[JsonObjectSelector],
 ) -> Result<()> {
     let output = PathBuf::from(output_arg);
-    let mut file = File::create(&output)?;
-    let keys = [JsonKey::Qpdf];
-    let options = JsonJobOptions {
-        decode_level,
-        stream_data,
-        stream_prefix,
-        keys: &keys,
-        objects,
-    };
-    let mut job = QPDFJob::new();
-    let _status = job
-        .write_json_with_version(
-            pdf,
-            2,
-            false,
-            true,
-            false,
-            false,
-            options,
-            JsonJobOutput::File {
-                filename: &output,
-                writer: &mut file,
-            },
-        )
-        .map_err(Error::from)?;
+    let file = File::create(&output)?;
+    let mut sink = PlOStream::new("json output", file);
+    document_json::write_json(pdf, 2, &mut sink, decode_level, stream_mode, objects)?;
     Ok(())
 }
 
@@ -773,11 +765,13 @@ fn run_test46(
         &mut pdf,
         output_arg,
         JsonDecodeLevel::None,
-        JsonStreamData::Inline,
-        None,
+        &StreamDataMode::Inline,
         &[],
     )?;
-    println!("C test 46 done");
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    write_pdf_diagnostics(&pdf, &mut stdout)?;
+    writeln!(stdout, "C test 46 done")?;
     Ok(())
 }
 
@@ -788,17 +782,25 @@ fn run_test47(
     prefix_arg: &std::ffi::OsStr,
 ) -> Result<()> {
     let prefix = path_description(Path::new(prefix_arg));
-    let objects = ["4,0".to_owned(), "trailer".to_owned()];
+    let objects = [
+        JsonObjectSelector::Object {
+            number: 4,
+            generation: 0,
+        },
+        JsonObjectSelector::Trailer,
+    ];
     let mut pdf = open_input(input_arg, password_arg)?;
     write_json_test_output(
         &mut pdf,
         output_arg,
         JsonDecodeLevel::Specialized,
-        JsonStreamData::File,
-        Some(&prefix),
+        &StreamDataMode::File { prefix },
         &objects,
     )?;
-    println!("C test 47 done");
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    write_pdf_diagnostics(&pdf, &mut stdout)?;
+    writeln!(stdout, "C test 47 done")?;
     Ok(())
 }
 
