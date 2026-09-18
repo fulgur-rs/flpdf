@@ -84,6 +84,21 @@ fn is_indirect_handle(handle: &ObjectHandle) -> bool {
         .is_some_and(|object_gen| object_gen.is_indirect())
 }
 
+/// qpdf's `QPDFObjectHandle::getObjGen` returns `(0, 0)` for a direct value
+/// (`libqpdf/QPDFObjectHandle.cc:2564-2566`).
+/// Use that same key at removal boundaries, where qpdf's `std::set<QPDFObjGen>`
+/// can contain the direct-object bucket as well as raw indirect identities.
+fn qpdf_obj_gen_for_removal(handle: &ObjectHandle) -> QpdfObjGen {
+    handle.qpdf_obj_gen().unwrap_or(QpdfObjGen::new(0, 0))
+}
+
+fn direct_parent_cycle_error() -> Error {
+    // qpdf-deviation: qpdf's QPDFObjGen set never records direct handles and
+    // therefore loops on an in-memory direct /Parent cycle; return a bounded
+    // error rather than allowing the host process to hang.
+    Error::Unsupported("field tree contains a /Parent cycle of direct dictionaries".to_owned())
+}
+
 fn record_association(cache: &mut AcroFormCache, annotation: ObjectHandle, field: ObjectHandle) {
     let annotation_identity = annotation.identity_key();
     cache
@@ -220,9 +235,13 @@ pub struct AnnotationTransformResult {
     /// Newly copied top-level field handles to register in the destination
     /// AcroForm field tree.
     pub new_fields: Vec<ObjectHandle>,
-    /// Source top-level field identities to remove when replacing annotations
-    /// in the same document.
+    /// Source top-level field references to remove when replacing annotations
+    /// in the same document. This is the legacy projection; the page helper
+    /// uses the internal `old_field_objgens` set so raw qpdf identities remain
+    /// live.
     pub old_fields: BTreeSet<ObjectRef>,
+    /// Source top-level field identities in qpdf's raw `QPDFObjGen` domain.
+    pub(crate) old_field_objgens: BTreeSet<QpdfObjGen>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -686,26 +705,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         Ok(Some(cache))
     }
 
-    /// Return the distinct live handles represented by qpdf's
-    /// `field_to_annotations` map, which is the source of
-    /// `QPDFAcroFormDocumentHelper::getFormFields`
-    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:163-174`).
-    ///
-    /// The ref-valued public map is only a projection for legacy callers. A
-    /// mutating consumer must retain these canonical handles so a later edit
-    /// cannot fall back to a stale value snapshot.
-    pub(crate) fn form_field_handles(&mut self) -> Result<BTreeMap<ObjectRef, ObjectHandle>> {
-        Ok(self
-            .form_field_handles_raw()?
-            .into_iter()
-            .filter_map(|(object_gen, field)| {
-                object_gen
-                    .to_object_ref()
-                    .map(|object_ref| (object_ref, field))
-            })
-            .collect())
-    }
-
     fn form_field_handles_raw(&mut self) -> Result<BTreeMap<QpdfObjGen, ObjectHandle>> {
         self.analyze()?;
         let cache = self.cache.borrow();
@@ -787,12 +786,12 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// type resolution, live-handle mutation, and field-array update.
     pub fn disable_digital_signatures(&mut self) -> Result<()> {
         self.pdf.remove_security_restrictions()?;
-        let form_fields = self.form_field_handles()?;
+        let form_fields = self.form_field_handles_raw()?;
         let mut to_remove = BTreeSet::new();
 
-        for (field_ref, field) in form_fields {
+        for (field_object_gen, field) in form_fields {
             let field_type = {
-                let mut helper = FormFieldObjectHelper::new(field_ref, self.pdf);
+                let mut helper = FormFieldObjectHelper::from_object_handle(field.clone(), self.pdf);
                 helper.field_type()?
             };
             if field_type.as_deref() != Some(b"/Sig") {
@@ -802,7 +801,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             // qpdf records every /Sig form field before removing keys. A
             // non-terminal inherited /Sig field can therefore remain in the
             // field tree when it has no signature keys of its own.
-            to_remove.insert(field_ref);
+            to_remove.insert(field_object_gen);
 
             // qpdf's removeKey erases raw entries unconditionally, including
             // entries whose stored value is null. Do not use hasKey here,
@@ -822,7 +821,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         Ok(())
     }
 
-    fn remove_cached_fields(&mut self, to_remove: &BTreeSet<ObjectRef>) {
+    fn remove_cached_fields(&mut self, to_remove: &BTreeSet<QpdfObjGen>) {
         let mut cache_store = self.cache.borrow_mut();
         let Some(cache) = cache_store.as_mut() else {
             return;
@@ -834,10 +833,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             .values()
             .chain(cache.name_to_fields.values().flatten())
         {
-            if field
-                .object_ref()
-                .is_some_and(|field_ref| to_remove.contains(&field_ref))
-            {
+            if to_remove.contains(&qpdf_obj_gen_for_removal(field)) {
                 let identity = field.identity_key();
                 if !removed.iter().any(|candidate| candidate == &identity) {
                     removed.push(identity);
@@ -886,7 +882,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// only to propagate live-handle errors. The array handle is mutated in
     /// place. This preserves an indirect `/Fields` holder and keeps a direct
     /// array nested in an indirect `/AcroForm` object live.
-    pub(crate) fn remove_form_fields(&mut self, to_remove: &BTreeSet<ObjectRef>) -> Result<()> {
+    pub(crate) fn remove_form_fields(&mut self, to_remove: &BTreeSet<QpdfObjGen>) -> Result<()> {
         let Some(acroform) = self.canonical_acroform()? else {
             return Ok(());
         };
@@ -899,9 +895,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             .iter()
             .enumerate()
             .filter_map(|(index, item)| {
-                item.object_ref()
-                    .filter(|field_ref| to_remove.contains(field_ref))
-                    .map(|_| index)
+                to_remove
+                    .contains(&qpdf_obj_gen_for_removal(item))
+                    .then_some(index)
             })
             .collect();
         self.remove_cached_fields(to_remove);
@@ -943,6 +939,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 
             if let Some(field) = self.canonical_field_for_annotation(annotation.clone())? {
                 let top_field = self.canonical_top_level_field(field.clone())?;
+                transformed
+                    .old_field_objgens
+                    .insert(qpdf_obj_gen_for_removal(&top_field));
                 if let Some(top_ref) = top_field.object_ref() {
                     transformed.old_fields.insert(top_ref);
                 }
@@ -1737,6 +1736,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let mut parts = Vec::new();
         loop {
             if !seen.insert(current.identity_key()) {
+                if !is_indirect_handle(&current) {
+                    return Err(direct_parent_cycle_error());
+                }
                 break;
             }
             let partial = current.try_get_key(b"/T")?;
@@ -2570,7 +2572,7 @@ mod final_handle_tests {
     use super::{AcroFormDocumentHelper, ForeignResourcePlan, InheritedFieldOverrides};
     use crate::object_handle::ObjectValue;
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
-    use crate::{ObjectHandle, ObjectRef, Pdf, QPDFLogger};
+    use crate::{Error, ObjectHandle, ObjectRef, Pdf, QPDFLogger};
     use std::collections::{BTreeSet, HashMap};
     use std::io::Cursor;
     use std::sync::{Arc, Mutex};
@@ -2724,6 +2726,163 @@ mod final_handle_tests {
         assert_eq!(fields[0].object_ref(), None);
         drop(helper);
         assert!(pdf.repair_diagnostics().entries().is_empty());
+    }
+
+    #[test]
+    fn field_tree_rejects_a_reciprocal_direct_parent_cycle() {
+        let mut pdf = Pdf::empty().expect("empty PDF should open");
+        let raw_field = pdf.get_object_handle_by_raw_identity(11, 65_535);
+        let direct_a =
+            ObjectHandle::dictionary(vec![(b"/T".to_vec(), ObjectHandle::string(b"a".to_vec()))]);
+        let direct_b =
+            ObjectHandle::dictionary(vec![(b"/T".to_vec(), ObjectHandle::string(b"b".to_vec()))]);
+        direct_a
+            .replace_key(b"/Parent", direct_b.clone())
+            .expect("direct parent link");
+        direct_b
+            .replace_key(b"/Parent", direct_a.clone())
+            .expect("reciprocal direct parent link");
+        raw_field.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"/FT".to_vec(), ObjectHandle::name(b"Tx".to_vec())),
+                (b"/T".to_vec(), ObjectHandle::string(b"child".to_vec())),
+                (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+                (
+                    b"/Rect".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(10),
+                        ObjectHandle::integer(10),
+                    ]),
+                ),
+                (b"/Parent".to_vec(), direct_a),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+
+        let catalog = pdf.root_handle().expect("empty PDF has a catalog");
+        let acroform = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Fields".to_vec(),
+                ObjectHandle::array(vec![raw_field]),
+            )]))
+            .expect("AcroForm allocation");
+        catalog
+            .replace_key(b"/AcroForm", acroform)
+            .expect("install AcroForm");
+
+        let error = AcroFormDocumentHelper::new_for_field_tree(&mut pdf)
+            .err()
+            .expect("direct parent cycle must return a bounded error");
+        assert!(matches!(error, Error::Unsupported(message)
+            if message.contains("/Parent cycle of direct dictionaries")));
+
+        let mut indirect_pdf = Pdf::empty().expect("empty PDF should open");
+        let indirect_cycle = indirect_pdf.get_object_handle_by_raw_identity(12, 0);
+        indirect_cycle.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"/FT".to_vec(), ObjectHandle::name(b"Tx".to_vec())),
+                (b"/T".to_vec(), ObjectHandle::string(b"indirect".to_vec())),
+                (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+                (
+                    b"/Rect".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(10),
+                        ObjectHandle::integer(10),
+                    ]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        indirect_cycle
+            .replace_key(b"/Parent", indirect_cycle.clone())
+            .expect("indirect parent cycle link");
+        let indirect_catalog = indirect_pdf.root_handle().expect("empty PDF has a catalog");
+        let indirect_acroform = indirect_pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Fields".to_vec(),
+                ObjectHandle::array(vec![indirect_cycle]),
+            )]))
+            .expect("indirect AcroForm allocation");
+        indirect_catalog
+            .replace_key(b"/AcroForm", indirect_acroform)
+            .expect("install indirect-cycle AcroForm");
+        AcroFormDocumentHelper::new_for_field_tree(&mut indirect_pdf)
+            .expect("qpdf-compatible indirect cycle should terminate normally");
+    }
+
+    #[test]
+    fn disable_digital_signatures_removes_a_raw_generation_signature_field() {
+        let mut pdf = Pdf::empty().expect("empty PDF should open");
+        let raw_field = pdf.get_object_handle_by_raw_identity(11, 65_535);
+        raw_field.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"/FT".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+                (
+                    b"/T".to_vec(),
+                    ObjectHandle::string(b"raw-signature".to_vec()),
+                ),
+                (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+                (
+                    b"/Rect".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(10),
+                        ObjectHandle::integer(10),
+                    ]),
+                ),
+                (b"/V".to_vec(), ObjectHandle::dictionary(Vec::new())),
+                (b"/SV".to_vec(), ObjectHandle::dictionary(Vec::new())),
+                (b"/Lock".to_vec(), ObjectHandle::dictionary(Vec::new())),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+
+        let catalog = pdf.root_handle().expect("empty PDF has a catalog");
+        let acroform = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Fields".to_vec(),
+                ObjectHandle::array(vec![raw_field.clone()]),
+            )]))
+            .expect("AcroForm allocation");
+        let acroform_for_assertion = acroform.clone();
+        catalog
+            .replace_key(b"/AcroForm", acroform)
+            .expect("install AcroForm");
+
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).expect("field-tree helper");
+        helper
+            .disable_digital_signatures()
+            .expect("raw signature field should be disabled");
+        drop(helper);
+
+        for key in [b"/FT".as_slice(), b"/V", b"/SV", b"/Lock"] {
+            assert!(
+                raw_field
+                    .try_get_key(key)
+                    .expect("signature key lookup")
+                    .try_is_null()
+                    .expect("signature key null check"),
+                "qpdf removes {key:?} from a raw-generation signature field"
+            );
+        }
+        let fields = acroform_for_assertion
+            .try_get_key(b"/Fields")
+            .expect("Fields lookup")
+            .try_as_array()
+            .expect("Fields array lookup")
+            .expect("Fields must remain an array");
+        assert!(
+            fields.is_empty(),
+            "the raw signature field must leave /Fields"
+        );
     }
 
     #[test]
