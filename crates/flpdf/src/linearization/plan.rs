@@ -118,16 +118,13 @@ fn linearization_content_normalize_refs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     options: &crate::writer::WriterOptions,
     page_refs: &[ObjectRef],
-    normalized_streams_snapshot: Option<&BTreeSet<ObjectRef>>,
+    normalized_streams_snapshot: Option<&BTreeSet<QpdfObjGen>>,
 ) -> Result<BTreeSet<QpdfObjGen>> {
     if !options.content_normalization {
         return Ok(BTreeSet::new());
     }
     if let Some(snapshot) = normalized_streams_snapshot {
-        return snapshot
-            .iter()
-            .map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref))
-            .collect();
+        return Ok(snapshot.clone());
     }
     let mut refs = BTreeSet::new();
     for page_ref in page_refs {
@@ -1611,7 +1608,7 @@ impl LinearizationPlan {
         options: &crate::writer::WriterOptions,
         source_membership_snapshot: Option<&BTreeMap<u32, u32>>,
         generated_compressible_snapshot: Option<&crate::writer::object_streams::CompressiblePlan>,
-        normalized_streams_snapshot: Option<&BTreeSet<ObjectRef>>,
+        normalized_streams_snapshot: Option<&BTreeSet<QpdfObjGen>>,
     ) -> crate::Result<Self> {
         let object_stream_mode = options.object_streams;
         let use_generate_objstm = matches!(

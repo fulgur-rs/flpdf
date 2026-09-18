@@ -23,6 +23,7 @@ pub(crate) mod serialize;
 mod settings;
 #[path = "writer/write_object.rs"]
 pub(crate) mod write_object;
+use crate::qpdf_obj_gen::QpdfObjGen;
 pub(crate) use object::{ObjectWriterEmission, StreamDictionaryOptions};
 pub use object_streams::ObjectStreamMode;
 use output::{OutputSink, OutputTarget};
@@ -1787,13 +1788,14 @@ pub(crate) struct SpecialStreams {
     page_seq: HashMap<ObjectRef, u32>,
     contents_seq: HashMap<ObjectRef, u32>,
     normalized_streams: BTreeSet<ObjectRef>,
+    normalized_streams_raw: BTreeSet<QpdfObjGen>,
     pub(crate) content_container_refs: BTreeSet<ObjectRef>,
     content_container_seq: HashMap<ObjectRef, u32>,
 }
 
 impl SpecialStreams {
-    pub(crate) fn normalized_streams(&self) -> &BTreeSet<ObjectRef> {
-        &self.normalized_streams
+    pub(crate) fn normalized_streams_raw(&self) -> &BTreeSet<QpdfObjGen> {
+        &self.normalized_streams_raw
     }
 }
 
@@ -1812,6 +1814,7 @@ fn initialize_special_streams<R: Read + Seek>(
         page_seq: HashMap::with_capacity(pages.len()),
         contents_seq: HashMap::new(),
         normalized_streams: BTreeSet::new(),
+        normalized_streams_raw: BTreeSet::new(),
         content_container_refs: BTreeSet::new(),
         content_container_seq: HashMap::new(),
         pages,
@@ -1823,9 +1826,12 @@ fn initialize_special_streams<R: Read + Seek>(
             .and_then(|index| index.checked_add(1))
             .ok_or_else(|| Error::Internal("page sequence overflows u32".into()))?;
         streams.page_seq.insert(page_ref, sequence);
-        for content_ref in collect_content_stream_refs(pdf, page_ref)? {
-            streams.contents_seq.insert(content_ref, sequence);
-            streams.normalized_streams.insert(content_ref);
+        for content_gen in collect_content_stream_qpdf_obj_gens(pdf, page_ref)? {
+            if let Some(content_ref) = content_gen.to_object_ref() {
+                streams.contents_seq.insert(content_ref, sequence);
+                streams.normalized_streams.insert(content_ref);
+            }
+            streams.normalized_streams_raw.insert(content_gen);
         }
         if options.qdf || options.content_normalization {
             let mut content_containers = BTreeSet::new();
@@ -3609,10 +3615,27 @@ pub(crate) fn collect_content_stream_refs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
 ) -> Result<Vec<ObjectRef>> {
+    Ok(collect_content_stream_qpdf_obj_gens(pdf, page_ref)?
+        .into_iter()
+        .filter_map(|object_gen| object_gen.to_object_ref())
+        .collect())
+}
+
+/// Collect raw qpdf identities for page-content streams. Unlike the public
+/// ObjectRef projection, this retains valid raw generations used by the
+/// linearization normalization gate.
+fn collect_content_stream_qpdf_obj_gens<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> Result<Vec<QpdfObjGen>> {
     let page_handle = pdf.get_object_handle(page_ref);
     let contents = page_handle.try_get_key(b"/Contents")?;
     if contents.type_code()? == 10 {
-        return Ok(contents.object_ref().into_iter().collect());
+        return Ok(contents
+            .qpdf_obj_gen()
+            .filter(|object_gen| object_gen.is_indirect())
+            .into_iter()
+            .collect());
     }
 
     let Some(items) = contents.try_as_array()? else {
@@ -3621,8 +3644,11 @@ pub(crate) fn collect_content_stream_refs<R: Read + Seek>(
     let mut refs = Vec::with_capacity(items.len());
     for item in items {
         if item.type_code()? == 10 {
-            if let Some(object_ref) = item.object_ref() {
-                refs.push(object_ref);
+            if let Some(object_gen) = item
+                .qpdf_obj_gen()
+                .filter(|object_gen| object_gen.is_indirect())
+            {
+                refs.push(object_gen);
             }
         }
     }

@@ -43,4 +43,12 @@ fn special_stream_snapshot_reaches_the_linearized_plan() {
         linearization_plan.contains("normalized_streams_snapshot"),
         "the plan must consume setup normalized-stream membership"
     );
+    assert!(
+        writer.contains("normalized_streams_raw"),
+        "the setup snapshot must retain qpdf's raw object-generation identity"
+    );
+    assert!(
+        linearization_writer.contains("SpecialStreams::normalized_streams_raw"),
+        "the linearized consumer must pass the raw setup identity to the plan"
+    );
 }

@@ -3845,7 +3845,7 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
             &plan_options,
             Some(&setup.source_object_stream_data),
             setup.generated_compressible.as_ref(),
-            special_streams.map(crate::writer::SpecialStreams::normalized_streams),
+            special_streams.map(crate::writer::SpecialStreams::normalized_streams_raw),
         )?;
         // qpdf allocates generated ObjStm placeholders before it removes page
         // and Catalog members from the mapping (QPDFWriter.cc:1970-2005,
