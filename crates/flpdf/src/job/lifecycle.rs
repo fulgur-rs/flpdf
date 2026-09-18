@@ -3532,6 +3532,14 @@ impl QPDFJob {
                 }
                 Ok(())
             }
+            // A usage error belongs to qpdf's `QPDFUsage` path: `writeJSON`
+            // calls `usage()` for a stdout destination that cannot name its
+            // stream side files (`libqpdf/QPDFJob.cc:3105-3110`), and that
+            // exception passes straight through `writeOutfile`/`writeQPDF` to
+            // the CLI's `usageExit` (`qpdf/qpdf.cc:37-38`). Reporting it here
+            // would print the bare message instead of qpdf's usage block, the
+            // same reason `create_qpdf` propagates it unreported.
+            Err(error @ Error::Usage(_)) => Err(error),
             Err(error) => {
                 self.report_job_error(&error)?;
                 Err(error)
@@ -3604,6 +3612,11 @@ impl QPDFJob {
 
         let status = match self.write_qpdf(&mut pdf) {
             Ok(()) => self.get_exit_code(),
+            // qpdf's `QPDFUsage` is not caught by `run()`; it reaches the
+            // caller, which renders it through `usageExit`
+            // (`qpdf/qpdf.cc:37-38`). Every other write failure has already
+            // been reported by `writeQPDF`, so it only contributes its status.
+            Err(error @ Error::Usage(_)) => return Err(error),
             Err(_error) => JobExitCode::Error,
         };
         // The replace-input rename is `write_qpdf`'s own responsibility
@@ -4149,8 +4162,11 @@ impl QPDFJob {
         // `writeOutfile`'s rewrites, and to the save pipeline otherwise
         // (`libqpdf/QPDFJob.cc:3093-3115`).
         if let Some(path) = configuration.output_file.as_deref() {
+            // qpdf opens this destination with `QUtil::safe_fopen(..., "w")`
+            // (`libqpdf/QPDFJob.cc:3103-3104`), whose failure reads
+            // `open <path>: <strerror>` with no operation prefix.
             let mut file = File::create(path)
-                .map_err(|error| Error::file_io("open JSON output", path.to_path_buf(), error))?;
+                .map_err(|error| crate::filespec_helper::qpdf_style_open_error(path, error))?;
             return self
                 .write_json_without_completion(
                     pdf,
@@ -6675,6 +6691,99 @@ mod tests {
         assert!(
             job.creates_output(),
             "--replace-input still creates output once the name is cleared"
+        );
+    }
+
+    #[test]
+    fn write_qpdf_propagates_a_json_usage_error_without_reporting_it() {
+        // `writeJSON` calls `usage()` when file-mode stream data has no prefix
+        // and no output name to derive one from
+        // (`libqpdf/QPDFJob.cc:3105-3110`). The resulting `QPDFUsage` escapes
+        // `writeQPDF` uncaught, so the CLI renders qpdf's usage block instead
+        // of a bare error line.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/one-page.pdf");
+        let errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let logger = discarding_save_logger();
+        logger.set_error(Some(PipelineHandle::new(RecordingInfoSink {
+            bytes: std::sync::Arc::clone(&errors),
+        })));
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.set_input_file(&fixture).expect("input path");
+        job.configuration.json_version = Some(2);
+        job.configuration.json_stream_data = JsonStreamData::File;
+        job.check_configuration()
+            .expect("the implicit JSON destination is standard output");
+        let mut pdf = job
+            .create_qpdf()
+            .expect("create qpdf")
+            .expect("primary document");
+
+        let error = job
+            .write_qpdf(&mut pdf)
+            .expect_err("file-mode stream data without a prefix is a usage error");
+
+        assert!(
+            matches!(error, Error::Usage(_)),
+            "the write stage must keep qpdf's usage classification: {error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "please specify --json-stream-prefix since the input file name is unknown"
+        );
+        assert!(
+            errors.lock().unwrap().is_empty(),
+            "a usage error must not also be reported as a job error"
+        );
+    }
+
+    #[test]
+    fn run_propagates_a_json_usage_error_to_its_caller() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/one-page.pdf");
+        let mut job = QPDFJob::new();
+        job.set_logger(discarding_save_logger());
+        job.set_input_file(&fixture).expect("input path");
+        job.configuration.json_version = Some(2);
+        job.configuration.json_stream_data = JsonStreamData::File;
+
+        let error = job
+            .run()
+            .expect_err("a write-stage usage error must reach the caller");
+
+        assert!(
+            matches!(error, Error::Usage(_)),
+            "run() must not fold a usage error into an exit status: {error:?}"
+        );
+    }
+
+    #[test]
+    fn write_qpdf_reports_a_json_output_open_failure_in_qpdf_wording() {
+        // qpdf opens the JSON destination with `QUtil::safe_fopen`
+        // (`libqpdf/QPDFJob.cc:3103-3104`), whose `QPDFSystemError` reads
+        // `open <path>: <strerror>` with no operation prefix.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/one-page.pdf");
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let unwritable = directory.path().join("missing").join("out.json");
+        let mut job = QPDFJob::new();
+        job.set_logger(discarding_save_logger());
+        job.set_input_file(&fixture).expect("input path");
+        job.set_output_file(&unwritable).expect("output path");
+        job.configuration.json_version = Some(2);
+        let mut pdf = job
+            .create_qpdf()
+            .expect("create qpdf")
+            .expect("primary document");
+
+        let error = job
+            .write_qpdf(&mut pdf)
+            .expect_err("an unopenable JSON destination fails the write");
+
+        assert_eq!(
+            error.to_string(),
+            format!("open {}: No such file or directory", unwritable.display())
         );
     }
 
