@@ -2463,14 +2463,17 @@ fn qpdf_real(v: f64) -> ObjectHandle {
 }
 
 impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
-    pub(crate) fn top_level_fields(&mut self) -> Result<Vec<ObjectRef>> {
+    pub(crate) fn top_level_field_handles(&mut self) -> Result<Vec<ObjectHandle>> {
         let Some(acroform) = self.acroform_dict()? else {
             return Ok(Vec::new());
         };
-        let Some(fields) = resolve_array_value(acroform.try_get_key(b"/Fields")?)? else {
-            return Ok(Vec::new());
-        };
-        Ok(fields
+        resolve_array_value(acroform.try_get_key(b"/Fields")?)
+            .map(|fields| fields.unwrap_or_default())
+    }
+
+    pub(crate) fn top_level_fields(&mut self) -> Result<Vec<ObjectRef>> {
+        Ok(self
+            .top_level_field_handles()?
             .into_iter()
             .filter_map(|item| item.object_ref())
             .collect())

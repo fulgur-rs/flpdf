@@ -147,6 +147,42 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         self.field.try_get_key(b"/Parent")
     }
 
+    /// Return the qpdf-shaped top-level field as a live handle and whether it
+    /// differs from this field.
+    ///
+    /// Mirrors `QPDFFormFieldObjectHelper::getTopLevelField`
+    /// (`libqpdf/QPDFFormFieldObjectHelper.cc:35-46`). The raw
+    /// `QpdfObjGen` identity remains attached to the returned handle, so a
+    /// generation outside the valid `ObjectRef` projection is not turned into
+    /// an error on this canonical route.
+    pub fn get_top_level_field_handle(&mut self) -> Result<(ObjectHandle, bool)> {
+        let mut current = self.field.clone();
+        let mut seen = BTreeSet::new();
+        let mut direct_seen = Vec::new();
+        let mut is_different = false;
+
+        loop {
+            if !mark_field_node_seen(&mut seen, &current) {
+                break;
+            }
+            if !mark_direct_node_seen(&mut direct_seen, &current) {
+                return Err(direct_parent_cycle_error(
+                    self.field_ref.unwrap_or(ObjectRef::new(0, 0)),
+                ));
+            }
+
+            let node = self.dereferenced(current.clone())?;
+            let parent = self.dereferenced(node.try_get_key(b"/Parent")?)?;
+            if parent.try_is_null()? {
+                break;
+            }
+            current = parent;
+            is_different = true;
+        }
+
+        Ok((current, is_different))
+    }
+
     /// Return the top-level field and whether it differs from this field.
     ///
     /// Mirrors qpdf's `QPDFFormFieldObjectHelper::getTopLevelField`

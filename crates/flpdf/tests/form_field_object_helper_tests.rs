@@ -217,6 +217,33 @@ fn top_level_field_rejects_an_unprojectable_raw_parent_explicitly() {
 }
 
 #[test]
+fn top_level_field_handle_preserves_an_unprojectable_raw_parent_identity() {
+    let mut pdf = open(doc(vec![(10, "<< /FT /Tx >>".into())]));
+    let raw_ref = ObjectRef::new(11, 65_535);
+    pdf.replace_object(
+        raw_ref,
+        ObjectHandle::dictionary(vec![(
+            b"/T".to_vec(),
+            ObjectHandle::string(b"top".to_vec()),
+        )]),
+    )
+    .unwrap();
+    let field = pdf.get_object_handle(ObjectRef::new(10, 0));
+    field.try_is_scalar().unwrap();
+    field
+        .replace_key(b"/Parent", pdf.get_object_handle(raw_ref))
+        .unwrap();
+
+    let (top_level, is_different) = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .get_top_level_field_handle()
+        .expect("qpdf's top-level helper returns the raw live handle");
+
+    assert!(is_different);
+    assert!(top_level.object_ref().is_none());
+    assert_eq!(top_level.unparse(), b"11 65535 R");
+}
+
+#[test]
 fn field_name_accessors_follow_terminal_holder_chains() {
     let bytes = doc(vec![
         (10, "<< /T 20 0 R /TU 23 0 R /TM 26 0 R >>".into()),
@@ -296,6 +323,13 @@ fn fully_qualified_name_terminates_on_a_reciprocal_direct_parent_cycle() {
         ObjectHandle::dictionary(vec![(b"/T".to_vec(), ObjectHandle::string(b"b".to_vec()))]);
     direct_a.replace_key(b"/Parent", direct_b.clone()).unwrap();
     direct_b.replace_key(b"/Parent", direct_a.clone()).unwrap();
+
+    let mut field = FormFieldObjectHelper::new(field_ref, &mut pdf);
+    let error = field
+        .get_top_level_field_handle()
+        .expect_err("the canonical top-level walk must bound direct cycles");
+    assert!(matches!(error, Error::Unsupported(ref message)
+        if message.contains("/Parent cycle of direct dictionaries")));
 
     let mut field = FormFieldObjectHelper::new(field_ref, &mut pdf);
     let error = field
@@ -793,6 +827,11 @@ fn get_top_level_field_stops_when_a_parent_chain_returns_to_a_seen_handle() {
             .unwrap(),
         (ObjectRef::new(10, 0), true)
     );
+    let (top, is_different) = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .get_top_level_field_handle()
+        .unwrap();
+    assert_eq!(top.object_ref(), Some(ObjectRef::new(10, 0)));
+    assert!(is_different);
 }
 
 #[test]
