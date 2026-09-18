@@ -626,3 +626,107 @@ fn build_fixture(objects: &[(u32, u32, &[u8])]) -> Vec<u8> {
     );
     bytes
 }
+
+/// A classic xref table whose `/XRefStm` payload holds a free row for object 4
+/// and then an unknown entry type.
+///
+/// `QPDF::processXRefStream` commits each free row inline while it walks the
+/// payload, so object 4's tombstone is already in `m->deleted_objects` when
+/// the type-3 row throws. `read_xrefTable` does not catch that, so `read_xref`
+/// hands to `reconstruct_xref`, which keeps the tombstone for the whole line
+/// scan -- `insertReconstructedXrefEntry` therefore refuses object 4 even
+/// though `4 0 obj` is in the file. A classic table's own `f` rows cannot do
+/// this: both implementations defer them until after the `/XRefStm` read, so a
+/// failure inside the section discards them.
+///
+/// Object 6 exists so that the line scan overwrites the default type-0 row
+/// that the throwing entry left behind; without it `--show-xref` aborts on
+/// that unrenderable row instead of printing the reconstructed table.
+fn xref_stm_free_row_then_unknown_type_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.5\n".to_vec();
+    let mut offsets = [0usize; 7];
+    for (number, body) in [
+        (1usize, "<< /Type /Catalog /Pages 2 0 R >>"),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        (4, "42"),
+        (6, "43"),
+    ] {
+        offsets[number] = bytes.len();
+        bytes.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+    }
+
+    // /W [1 2 1]: object 0 free, object 4 free, object 6 unknown type 3.
+    let payload: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0];
+    offsets[5] = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "5 0 obj\n<< /Type /XRef /W [1 2 1] /Index [0 1 4 1 6 1] /Size 7 /Length {} >>\nstream\n",
+            payload.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&payload);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{:010} 00000 n \n", offsets[1]).as_bytes());
+    bytes.extend_from_slice(format!("{:010} 00000 n \n", offsets[2]).as_bytes());
+    bytes.extend_from_slice(format!("{:010} 00000 n \n", offsets[3]).as_bytes());
+    // Object 4 is free here too: a live classic row would keep
+    // `insertFreeXrefEntry` from recording the tombstone at all.
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{:010} 00000 n \n", offsets[5]).as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 6 /Root 1 0 R /XRefStm {} >>\nstartxref\n{xref}\n%%EOF\n",
+            offsets[5]
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+#[test]
+fn show_xref_suppresses_a_committed_free_row_like_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let input = temp.path().join("xref-stm-free-row-then-unknown-type.pdf");
+    std::fs::write(&input, xref_stm_free_row_then_unknown_type_pdf()).expect("write fixture");
+
+    let qpdf = run_qpdf(&input);
+    let flpdf = run_flpdf(&input);
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(
+        String::from_utf8_lossy(&flpdf.stdout),
+        String::from_utf8_lossy(&qpdf.stdout)
+    );
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    // Guard the fixture itself: the tombstone only exists because the
+    // `/XRefStm` read fails after the free row, and object 4 is only missing
+    // because that tombstone survived into reconstruction.
+    assert!(
+        String::from_utf8_lossy(&qpdf.stderr).contains("unknown xref stream entry type 3"),
+        "the fixture must fail the /XRefStm read: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    let shown = String::from_utf8_lossy(&qpdf.stdout);
+    assert!(
+        shown.contains("6/0: uncompressed"),
+        "reconstruction must have run: {shown}"
+    );
+    assert!(
+        !shown.contains("4/0:"),
+        "the committed free row must suppress object 4: {shown}"
+    );
+}
