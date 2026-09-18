@@ -4272,8 +4272,10 @@ mod tests {
 
     #[test]
     fn content_normalize_probe_walks_prepared_page_handles_without_snapshot() {
-        let mut options = WriterOptions::default();
-        options.content_normalization = true;
+        let options = WriterOptions {
+            content_normalization: true,
+            ..WriterOptions::default()
+        };
         let page = ObjectHandle::dictionary(vec![(
             b"/Contents".to_vec(),
             ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
