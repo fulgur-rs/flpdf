@@ -33,5 +33,18 @@ if [ -z "$LIB" ] || [ ! -f "$LIB" ]; then
     exit 1
 fi
 
-g++ -std=c++17 -I"$QPDF_SRC/include" "$HERE/c44_probe.cc" "$LIB" -o "$WORK/c44_probe"
+# libqpdf carries an SONAME, so naming the file on the link line only records a
+# `DT_NEEDED: libqpdf.so.29` entry -- the loader would still search the default
+# paths and could pick a different copy. Pin the directory with an RPATH and
+# then confirm what the probe itself resolves before trusting its output.
+g++ -std=c++17 -I"$QPDF_SRC/include" "$HERE/c44_probe.cc" "$LIB" \
+    -Wl,-rpath,"$(dirname "$LIB")" -o "$WORK/c44_probe"
+
+PROBE_LIB="$(ldd "$WORK/c44_probe" | awk '/libqpdf\.so/ { print $3; exit }')"
+if [ -z "$PROBE_LIB" ] || [ "$(readlink -f "$PROBE_LIB")" != "$(readlink -f "$LIB")" ]; then
+    echo "c44_probe: the probe loads $PROBE_LIB, not the validated $LIB" >&2
+    ldd "$WORK/c44_probe" >&2
+    exit 1
+fi
+
 "$WORK/c44_probe"
