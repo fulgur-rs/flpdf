@@ -74,3 +74,6 @@ done
 
 "$workdir/oracle" "$here/mini-pclm-ext-indirect-in.pdf" \
     "$here/mini-pclm-ext-indirect-objstm.pdf" pclm objstm
+
+"$workdir/oracle" "$here/mini-pclm-nondict-kid-in.pdf" \
+    "$here/mini-pclm-nondict-kid-out.pdf" pclm

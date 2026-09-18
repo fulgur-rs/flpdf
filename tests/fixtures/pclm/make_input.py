@@ -24,12 +24,14 @@ def image_object():
     )
 
 
-def build(root_entry, with_extensions=False):
+def build(root_entry, with_extensions=False, first_page=None):
     objects = {
         1: b"<< /Type /Catalog /Pages 2 0 R"
         + (b" /Extensions 11 0 R" if with_extensions else b"")
         + b" >>",
-        2: b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+        2: b"<< /Type /Pages /Kids ["
+        + (first_page if first_page is not None else b"3 0 R")
+        + b" 4 0 R] /Count 2 >>",
         3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 12 12] /Contents 5 0 R"
         b" /Resources << /XObject << /Sb 7 0 R /Sa 8 0 R >> >> >>",
         4: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 12 12] /Contents 6 0 R"
@@ -68,6 +70,8 @@ def main(directory):
         handle.write(build(b"<< /Type /Catalog /Pages 2 0 R >>"))
     with open(directory + "/mini-pclm-ext-indirect-in.pdf", "wb") as handle:
         handle.write(build(b"1 0 R", with_extensions=True))
+    with open(directory + "/mini-pclm-nondict-kid-in.pdf", "wb") as handle:
+        handle.write(build(b"1 0 R", first_page=b"42"))
 
 
 if __name__ == "__main__":

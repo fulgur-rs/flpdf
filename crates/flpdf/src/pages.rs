@@ -328,6 +328,17 @@ pub fn page_content_bytes<R: Read + Seek>(
 /// An iterator over every leaf `Page` object-reference in the document's `/Pages`
 /// tree, yielding refs in document order (ISO 32000-1 §7.7.3.2).
 ///
+/// Leaf classification for `/Kids` entries follows qpdf's
+/// `getAllPagesInternal` (`libqpdf/QPDF_pages.cc:91-131`): an entry with
+/// `/Kids` is a subtree and anything else is a page, dictionary or not. A
+/// direct entry is promoted to an indirect page object (the `/Kids` entry is
+/// rewritten) before it is yielded, which is what keeps a scalar leaf in the
+/// page list. Subtree expansion here still keys on `/Type /Pages`, and the
+/// remaining page-dictionary repair (`/Type` override, media-box default,
+/// duplicate copying, repair warnings) stays with the canonical
+/// `pages::repair` walk that [`crate::pages::page_refs`] uses when a prepared
+/// page list exists.
+///
 /// Each node is visited at most once (tracked via a `BTreeSet`) so cycles in
 /// malformed documents are silently skipped. On the first resolve failure or
 /// depth-limit breach the iterator emits `Some(Err(...))` and is then fused
@@ -355,6 +366,10 @@ pub fn page_content_bytes<R: Read + Seek>(
 enum PageNode {
     Indirect(ObjectRef),
     Direct(ObjectHandle),
+    /// A `/Kids` entry without `/Kids` of its own: qpdf's
+    /// `getAllPagesInternal` treats every such entry as a page leaf,
+    /// dictionary or not (`libqpdf/QPDF_pages.cc:91-131`).
+    Leaf(ObjectRef),
 }
 
 impl PageNode {
@@ -367,14 +382,16 @@ impl PageNode {
 
     fn handle<R: Read + Seek>(&self, pdf: &mut Pdf<R>) -> ObjectHandle {
         match self {
-            Self::Indirect(object_ref) => pdf.get_object_handle(*object_ref),
+            Self::Indirect(object_ref) | Self::Leaf(object_ref) => {
+                pdf.get_object_handle(*object_ref)
+            }
             Self::Direct(handle) => handle.clone(),
         }
     }
 
     fn object_ref(&self) -> Option<ObjectRef> {
         match self {
-            Self::Indirect(object_ref) => Some(*object_ref),
+            Self::Indirect(object_ref) | Self::Leaf(object_ref) => Some(*object_ref),
             Self::Direct(_) => None,
         }
     }
@@ -413,6 +430,19 @@ fn probe_page_kids(handle: &ObjectHandle) -> Result<()> {
     match handle.try_has_key(b"/Kids") {
         Ok(_) => Ok(()),
         Err(Error::QpdfExc(_)) if contextless => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// qpdf's `kid.hasKey("/Kids")` page-tree classification
+/// (`libqpdf/QPDF_pages.cc:91-131`). A contextless programmatic handle has no
+/// warning sink, so the type warning `try_has_key` raises there is mapped to
+/// `false` the same way [`probe_page_kids`] maps it for the sibling probes.
+fn page_kid_has_kids(handle: &ObjectHandle) -> Result<bool> {
+    let contextless = handle.context().is_none();
+    match handle.try_has_key(b"/Kids") {
+        Ok(has_kids) => Ok(has_kids),
+        Err(Error::QpdfExc(_)) if contextless => Ok(false),
         Err(error) => Err(error),
     }
 }
@@ -511,14 +541,45 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
 
         if node_type.try_as_name()?.as_deref() == Some(b"Pages") {
             let kids = node_obj.try_get_key(b"/Kids")?;
-            if let Some(kids) = kids.try_as_array()? {
-                // Push in reverse order so that the first kid is popped first.
-                for kid in kids.iter().rev() {
-                    if let Some(r) = kid.object_ref() {
-                        self.stack.push((PageNode::Indirect(r), depth + 1));
-                    } else if kid.try_is_dictionary()? {
-                        self.stack.push((PageNode::Direct(kid.clone()), depth + 1));
+            if let Some(kids_items) = kids.try_as_array()? {
+                // qpdf classifies an entry by `/Kids` containment, not
+                // `/Type`: an entry with `/Kids` is a subtree and everything
+                // else is a page leaf even when it is not a dictionary
+                // (`libqpdf/QPDF_pages.cc:91-131`). Subtree expansion itself
+                // still keys on `/Type /Pages` in `visit_node`.
+                //
+                // Classify -- and in particular promote -- in forward order.
+                // qpdf allocates each promoted leaf during its forward
+                // depth-first walk (`libqpdf/QPDF_pages.cc:95-101`), so
+                // `/Kids [42 43]` must mint the object for `42` before the one
+                // for `43`; `pages/repair.rs` does the same. Only the stack
+                // insertion is reversed afterwards, so the first kid is still
+                // popped first.
+                let mut classified = Vec::with_capacity(kids_items.len());
+                for (index, kid) in kids_items.iter().enumerate() {
+                    if page_kid_has_kids(kid)? {
+                        if let Some(r) = kid.object_ref() {
+                            classified.push(PageNode::Indirect(r));
+                        } else {
+                            classified.push(PageNode::Direct(kid.clone()));
+                        }
+                    } else if let Some(r) = kid.object_ref() {
+                        classified.push(PageNode::Leaf(r));
+                    } else {
+                        // qpdf promotes every direct kid to an indirect page
+                        // object before pushing it (`libqpdf/QPDF_pages.cc:95-101`),
+                        // which is also what keeps a non-dictionary leaf in
+                        // the page list.
+                        let promoted = self.pdf.make_indirect_object_handle(kid.clone())?;
+                        kids.set_array_item(index, promoted.clone())?;
+                        let promoted_ref = promoted
+                            .object_ref()
+                            .expect("make_indirect_object_handle returns an indirect handle");
+                        classified.push(PageNode::Leaf(promoted_ref));
                     }
+                }
+                for node in classified.into_iter().rev() {
+                    self.stack.push((node, depth + 1));
                 }
             }
             return Ok(None);
@@ -556,14 +617,20 @@ impl<'a, R: Read + Seek> Iterator for PageWalk<'a, R> {
             }
 
             let first_visit = match &node {
-                PageNode::Indirect(reference) => self.seen.insert(*reference),
+                PageNode::Indirect(reference) | PageNode::Leaf(reference) => {
+                    self.seen.insert(*reference)
+                }
                 PageNode::Direct(handle) => self.seen_direct.insert(handle.identity_key()),
             };
             if !first_visit {
                 continue; // cycle guard: already visited
             }
 
-            match self.visit_node(&node, depth) {
+            let visited = match &node {
+                PageNode::Leaf(reference) => Ok(Some(*reference)),
+                PageNode::Indirect(_) | PageNode::Direct(_) => self.visit_node(&node, depth),
+            };
+            match visited {
                 Ok(Some(page)) => return Some(Ok(page)),
                 Ok(None) => continue,
                 Err(error) => {
@@ -628,6 +695,12 @@ mod tests {
     }
 
     #[test]
+    fn page_kid_classification_propagates_uninitialized_handle_errors() {
+        let error = page_kid_has_kids(&ObjectHandle::uninitialized()).unwrap_err();
+        assert!(matches!(error, Error::Internal(_)));
+    }
+
+    #[test]
     fn explicit_page_walk_limit_remains_available() {
         let mut pdf = Pdf::empty().expect("empty PDF");
         let mut walk = PageWalk::with_max_depth(&mut pdf, 0).expect("empty pages root");
@@ -660,6 +733,108 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(page_walk_visits_for_test(), before);
+    }
+
+    #[test]
+    fn page_walk_expands_a_direct_pages_kid() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let root_pages = pdf
+            .root_handle()
+            .expect("empty catalog")
+            .try_get_key(b"/Pages")
+            .expect("empty /Pages");
+        let page = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Type".to_vec(),
+                ObjectHandle::name(b"Page".to_vec()),
+            )]))
+            .expect("indirect page");
+        let direct_subtree = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+            (b"/Kids".to_vec(), ObjectHandle::array(vec![page.clone()])),
+        ]);
+        root_pages
+            .replace_key(b"/Kids", ObjectHandle::array(vec![direct_subtree]))
+            .expect("install direct subtree");
+        root_pages
+            .replace_key(b"/Count", ObjectHandle::integer(1))
+            .expect("install count");
+
+        let refs = page_refs(&mut pdf).expect("direct subtree is expanded");
+        assert_eq!(
+            refs,
+            vec![page.object_ref().expect("indirect page identity")]
+        );
+    }
+
+    /// qpdf allocates each promoted leaf during its forward depth-first walk
+    /// (`libqpdf/QPDF_pages.cc:95-101`), so the first kid gets the lower fresh
+    /// object number. Classifying right-to-left would swap them and change the
+    /// object numbering a caller observes.
+    #[test]
+    fn direct_scalar_kids_are_promoted_in_forward_order() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let pages = pdf
+            .root_handle()
+            .expect("empty catalog")
+            .try_get_key(b"/Pages")
+            .expect("empty /Pages");
+        let kids = ObjectHandle::array(vec![ObjectHandle::integer(42), ObjectHandle::integer(43)]);
+        pages
+            .replace_key(b"/Kids", kids.clone())
+            .expect("install scalar kids");
+        pages
+            .replace_key(b"/Count", ObjectHandle::integer(2))
+            .expect("install count");
+
+        let refs = page_refs(&mut pdf).expect("two scalar leaves are two pages");
+
+        assert_eq!(refs.len(), 2);
+        assert!(
+            refs[0].number < refs[1].number,
+            "the first kid must mint the lower object number, got {refs:?}"
+        );
+        let values: Vec<_> = refs
+            .iter()
+            .map(|r| {
+                pdf.get_object_handle(*r)
+                    .try_as_integer()
+                    .expect("resolve promoted leaf")
+            })
+            .collect();
+        assert_eq!(values, vec![Some(42), Some(43)]);
+    }
+
+    #[test]
+    fn page_walk_promotes_a_direct_scalar_kid_like_qpdf() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let pages = pdf
+            .root_handle()
+            .expect("empty catalog")
+            .try_get_key(b"/Pages")
+            .expect("empty /Pages");
+        let kids = ObjectHandle::array(vec![ObjectHandle::integer(42)]);
+        pages
+            .replace_key(b"/Kids", kids.clone())
+            .expect("install scalar kid");
+        pages
+            .replace_key(b"/Count", ObjectHandle::integer(1))
+            .expect("install count");
+
+        let refs = page_refs(&mut pdf).expect("a scalar leaf is a page");
+        assert_eq!(refs.len(), 1, "qpdf counts the scalar leaf as one page");
+        assert_eq!(
+            pdf.get_object_handle(refs[0])
+                .try_as_integer()
+                .expect("resolve promoted leaf"),
+            Some(42)
+        );
+        assert!(
+            kids.try_get_array_item(0)
+                .expect("rewritten kid")
+                .is_indirect(),
+            "qpdf promotes a direct kid to an indirect page object"
+        );
     }
 
     #[test]
