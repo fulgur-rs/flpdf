@@ -475,7 +475,7 @@ mod tests {
     }
 
     fn next_object_number(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> u32 {
-        pdf.next_available_object_ref()
+        pdf.next_obj_gen()
             .expect("object-number space must have room in the test fixture")
             .number
             .checked_sub(1)
