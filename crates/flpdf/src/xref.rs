@@ -2817,12 +2817,13 @@ fn read_trailer(
         ));
     } else if trailer.try_is_dictionary()? {
         let mut tokenizer = Tokenizer::new(slice);
-        tokenizer.allow_eof();
         tokenizer
             .set_position(parsed.next_offset)
             .map_err(|error| error.rebase_offset(start))?;
+        // `QPDF::readToken(m->file)` (`libqpdf/QPDF.cc:1322`), via the
+        // shared `Tokenizer::read_qpdf_token` entrypoint.
         let token = tokenizer
-            .read_token(true, 0)
+            .read_qpdf_token(0)
             .map_err(|error| error.rebase_offset(start))?;
         if token.is_word_value(b"stream") {
             diagnostics.push(trailer_warning(
@@ -2943,10 +2944,12 @@ const XREF_RECONSTRUCTION_MAX_TOKEN_LEN: usize = 100;
 fn read_scan_token(bytes: &[u8], from: usize, limit: usize) -> Option<Token> {
     let bounded = bytes.get(..limit)?;
     let mut tokenizer = Tokenizer::new(bounded);
-    tokenizer.allow_eof();
     tokenizer.set_position(from).ok()?;
+    // `QPDF::readToken(m->file, MAX_LEN)` (`libqpdf/QPDF.cc:553,558,559`,
+    // `MAX_LEN = 100` at `:548`), via the shared `Tokenizer::read_qpdf_token`
+    // entrypoint.
     let token = tokenizer
-        .read_token(true, XREF_RECONSTRUCTION_MAX_TOKEN_LEN)
+        .read_qpdf_token(XREF_RECONSTRUCTION_MAX_TOKEN_LEN)
         .ok()?;
     (token.token_type != TokenType::Eof && token.start < limit).then_some(token)
 }
@@ -3830,15 +3833,15 @@ impl<'a> ByteCursor<'a> {
         self.pos.checked_sub(self.base)
     }
 
-    /// `QPDF::readToken` (`libqpdf/QPDF.cc:1535-1539`), which is fixed at
-    /// `allow_bad = true` and `max_len = 0` and reads from a source whose
-    /// tokenizer has `allowEOF` set (`libqpdf/QPDF.cc:208`). Bad tokens are
-    /// therefore returned to the caller as ordinary values, never raised.
+    /// `QPDF::readToken(input, max_len = 0)` (`libqpdf/QPDF.cc:1535-1539`),
+    /// via the shared [`Tokenizer::read_qpdf_token`] entrypoint. Bad tokens
+    /// are therefore returned to the caller as ordinary values, never
+    /// raised. Only the resulting token's positions are rebased by `self`;
+    /// the read itself is qpdf's `QPDF::readToken`, unmodified.
     fn read_token(&mut self) -> Result<Token> {
         let mut tokenizer = Tokenizer::new(self.bytes);
-        tokenizer.allow_eof();
         tokenizer.set_position(self.local_pos().unwrap_or(self.bytes.len()))?;
-        let mut token = tokenizer.read_token(true, 0)?;
+        let mut token = tokenizer.read_qpdf_token(0)?;
         self.pos = self.base.saturating_add(tokenizer.position());
         token.start = token.start.saturating_add(self.base);
         token.end = token.end.saturating_add(self.base);
