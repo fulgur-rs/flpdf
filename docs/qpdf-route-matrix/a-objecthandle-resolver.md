@@ -544,6 +544,37 @@ fallible resolver propagation, and the route-contract integration test fixes
 the caller-zero boundary. The separate default page-tree depth policy remains
 outside this accessor slice.
 
+### A6/A7 page-form-xobject accessor slice `flpdf-3yn9.48.181` (2026-09-19)
+
+`crates/flpdf/src/page_form_xobject.rs` already had zero production
+`.resolve(`, `resolve_handle`, or `resolve_handle_ref` callers before this
+issue; commit `777bc21a8` ("keep production on canonical helper",
+2026-08-19) preceded the `.48.23` slice-naming convention and closed the
+boundary without a matching route contract or matrix note, which this slice
+adds. The production wrapper
+`get_form_xobject_for_page` (the sole non-`#[cfg(test)]` item in the module)
+makes no `ObjectHandle` accessor calls of its own: it constructs a
+`PageObjectHelper` and delegates the whole conversion to its
+`get_form_xobject_for_page` method
+(`libqpdf/QPDFPageObjectHelper.cc:706-732`, `getFormXObjectForPage`). The
+A6/A7 accessor boundary for the box/rotate/user-unit/group/resource reads
+that conversion performs is therefore owned by
+`crates/flpdf/src/page_object_helper.rs`, closed under the
+`flpdf-3yn9.48.23.1` cohort above, not by this file.
+
+The remaining functions in this module (`effective_box_array`,
+`leaf_box_array`, `inherited_box_array`, `inherited_rotate_attribute`,
+`leaf_user_unit`, `page_group`, and friends) are `#[cfg(test)]`-only
+reimplementations kept to assert the canonical helper's output against an
+independent walk of the same qpdf fallback chains; they are not part of the
+production route. The new
+`production_page_form_xobject_uses_canonical_resolving_routes` route
+contract fixes the caller-zero boundary and asserts the delegation call
+itself, so a future change that inlines accessor logic into the wrapper
+without going through `PageObjectHelper` fails the contract. `job/overlay.rs`
+is the non-test production consumer of both the wrapper function and the
+`PageObjectHelper` method directly.
+
 ## unknown / probe
 
 本領域は 24 行すべてを source と実行済み probe で分類できたため、`unknown` に落ちた行は無い。
