@@ -134,19 +134,50 @@ pub(crate) fn build_live_object_stream_plan<R: Read + Seek>(
 
     // QPDFWriter applies output-sensitive exclusions after Preserve/Generate
     // membership is built but before constructing the reverse container map
-    // (`QPDFWriter.cc:2141-2173`). Non-linearized encryption keeps the Catalog
-    // outside ObjStm while retaining every other member and source-container
-    // identity in the planned order.
-    if options.encrypt.is_some() || options.copy_encryption.is_some() {
-        let root = pdf.root_ref();
-        plan.groups.retain_mut(|group| match group {
-            ObjectStreamGroup::SourceBacked { members, .. }
-            | ObjectStreamGroup::Generated { members, .. } => {
-                members.retain(|member| Some(*member) != root);
-                !members.is_empty()
-            }
-        });
+    // (`QPDFWriter.cc:2141-2173`). The plain pipeline never linearizes, so
+    // only the encrypted-Catalog exclusion applies here. Route it through the
+    // same `filter_objstm_batches_for_output` the specialized and linearized
+    // Preserve/Generate routes already share, instead of a plain-local retain
+    // (D23), so the three routes cannot drift on `QPDFWriter.cc:2141-2173`.
+    let output_encrypted = options.encrypt.is_some() || options.copy_encryption.is_some();
+    let mut origin_by_source: BTreeMap<ObjectRef, bool> = BTreeMap::new();
+    let mut batches: Vec<Vec<ObjectRef>> = Vec::with_capacity(plan.groups.len());
+    let mut source_containers: Vec<Option<ObjectRef>> = Vec::with_capacity(plan.groups.len());
+    for group in plan.groups.drain(..) {
+        let (source, members, is_generated) = match group {
+            ObjectStreamGroup::SourceBacked { source, members } => (source, members, false),
+            ObjectStreamGroup::Generated { source, members } => (source, members, true),
+        };
+        origin_by_source.insert(source, is_generated);
+        source_containers.push(Some(source));
+        batches.push(members);
     }
+    object_streams::filter_objstm_batches_for_output(
+        pdf,
+        &mut batches,
+        &mut source_containers,
+        false,
+        output_encrypted,
+    )?; // cov:ignore: LLVM attributes this covered multiline exclusion terminator to the call setup
+    plan.groups = batches
+        .into_iter()
+        .zip(source_containers)
+        .map(|(members, source)| {
+            let source =
+                source.expect("plain writer ObjStm group must retain its source after filtering");
+            let is_generated = origin_by_source.get(&source).copied().unwrap_or_else(|| {
+                // cov:ignore-start: filter_objstm_batches_for_output only drops entries, it
+                // never introduces a source this loop did not already record above.
+                unreachable!("plain writer ObjStm filter surfaced an untracked source container")
+                // cov:ignore-end
+            });
+            if is_generated {
+                ObjectStreamGroup::Generated { source, members }
+            } else {
+                ObjectStreamGroup::SourceBacked { source, members }
+            }
+        })
+        .collect();
 
     Ok(plan)
 }
@@ -2084,6 +2115,133 @@ mod tests {
             matches!(group, ObjectStreamGroup::Generated { source, .. }
                 if pdf.get_object_handle(*source).is_null())
         }));
+    }
+
+    /// Build the live object-stream membership for `fixture` under `mode`,
+    /// optionally with `--encrypt` set, returning the resulting groups.
+    fn build_live_plan_with_encryption(
+        fixture: &str,
+        mode: ObjectStreamMode,
+        encrypted: bool,
+    ) -> (Pdf<std::io::BufReader<std::fs::File>>, LiveObjectStreamPlan) {
+        let path = fixture_path(fixture);
+        let mut pdf =
+            Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
+        let mut source_object_stream_data = BTreeMap::new();
+        if mode == ObjectStreamMode::Preserve {
+            pdf.get_object_stream_data(&mut source_object_stream_data);
+        }
+        let compressible = if mode == ObjectStreamMode::Generate {
+            Some(object_streams::compressible_objgens_qpdf_plan(&mut pdf).unwrap())
+        } else {
+            None
+        };
+        let mut options = write_options(mode);
+        if encrypted {
+            options.encrypt = Some(crate::encryption::EncryptParams::v4_aes128(
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+        let plan = build_live_object_stream_plan(
+            &mut pdf,
+            &options,
+            &source_object_stream_data,
+            compressible.as_ref(),
+            &[],
+        )
+        .unwrap();
+        (pdf, plan)
+    }
+
+    /// qpdf keeps the root Catalog outside every ObjStm once encryption is
+    /// requested (`QPDFWriter.cc:2141-2158`), but only then — Preserve mode's
+    /// unencrypted membership packs the Catalog into its source container.
+    /// Exercises the D23 unification (`filter_objstm_batches_for_output`) on
+    /// the SourceBacked branch: the root leaves its container, every other
+    /// member (and the container's own source identity) survives, and the
+    /// group keeps its `SourceBacked` origin.
+    #[test]
+    fn live_preserve_setup_excludes_root_from_objstm_only_when_encrypted() {
+        let (pdf, plan) = build_live_plan_with_encryption(
+            "three-page-objstm.pdf",
+            ObjectStreamMode::Preserve,
+            false,
+        );
+        let root = pdf.root_ref().expect("fixture has an indirect /Root");
+        assert!(
+            plan.groups
+                .iter()
+                .any(|group| group.members().contains(&root)),
+            "unencrypted Preserve baseline must still pack the Catalog into its source ObjStm"
+        );
+        let unencrypted_member_count: usize =
+            plan.groups.iter().map(|group| group.members().len()).sum();
+
+        let (pdf, plan) = build_live_plan_with_encryption(
+            "three-page-objstm.pdf",
+            ObjectStreamMode::Preserve,
+            true,
+        );
+        let root = pdf.root_ref().expect("fixture has an indirect /Root");
+        assert!(
+            plan.groups
+                .iter()
+                .all(|group| !group.members().contains(&root)),
+            "encrypted Preserve output must exclude the Catalog from every ObjStm"
+        );
+        assert!(
+            plan.groups
+                .iter()
+                .all(|group| matches!(group, ObjectStreamGroup::SourceBacked { .. })),
+            "excluding the Catalog must not change surviving groups' SourceBacked origin"
+        );
+        let encrypted_member_count: usize =
+            plan.groups.iter().map(|group| group.members().len()).sum();
+        assert_eq!(
+            encrypted_member_count + 1,
+            unencrypted_member_count,
+            "only the Catalog itself should be removed by the encrypted exclusion"
+        );
+    }
+
+    /// Same qpdf exclusion (`QPDFWriter.cc:2141-2158`) exercised on the
+    /// `Generated` branch of the D23 unification: a freshly minted Generate
+    /// container must also lose the Catalog once encrypted, while keeping its
+    /// `Generated` origin.
+    #[test]
+    fn live_generate_setup_excludes_root_from_objstm_only_when_encrypted() {
+        let (pdf, plan) = build_live_plan_with_encryption(
+            "three-page-objstm.pdf",
+            ObjectStreamMode::Generate,
+            false,
+        );
+        let root = pdf.root_ref().expect("fixture has an indirect /Root");
+        assert!(
+            plan.groups
+                .iter()
+                .any(|group| group.members().contains(&root)),
+            "unencrypted Generate baseline must still pack the Catalog into a generated ObjStm"
+        );
+
+        let (pdf, plan) = build_live_plan_with_encryption(
+            "three-page-objstm.pdf",
+            ObjectStreamMode::Generate,
+            true,
+        );
+        let root = pdf.root_ref().expect("fixture has an indirect /Root");
+        assert!(
+            plan.groups
+                .iter()
+                .all(|group| !group.members().contains(&root)),
+            "encrypted Generate output must exclude the Catalog from every ObjStm"
+        );
+        assert!(
+            plan.groups
+                .iter()
+                .all(|group| matches!(group, ObjectStreamGroup::Generated { .. })),
+            "excluding the Catalog must not change surviving groups' Generated origin"
+        );
     }
 
     #[test]
