@@ -773,20 +773,50 @@ fn assert_same_json_output_is_rejected_without_modifying_input(
     assert_eq!(std::fs::read(input_path).unwrap(), original);
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
+    // `QPDFJob::checkConfiguration` owns this rejection and its wording
+    // (`QUtil::same_file`, `libqpdf/QPDFJob.cc:626-630`).
     assert!(
         String::from_utf8_lossy(&output.stderr).contains(
-            "input file and output file are the same; choose a different --json-output path"
+            "input file and output file are the same; use --replace-input to intentionally \
+             overwrite the input file"
         ),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    let mut qpdf = ShellCommand::new("qpdf");
+    if let Some(dir) = current_dir {
+        qpdf.current_dir(dir);
+    }
+    let expected = qpdf
+        .args(["--json-output=2", input_arg, output_arg])
+        .output()
+        .unwrap();
+    assert_eq!(std::fs::read(input_path).unwrap(), original);
+    assert_eq!(expected.status.code(), output.status.code());
+    assert_eq!(
+        String::from_utf8_lossy(&expected.stderr).replace("qpdf", "PROG"),
+        String::from_utf8_lossy(&output.stderr).replace("flpdf", "PROG"),
+        "the rejection must match qpdf 11.9.0"
     );
 }
 
 #[test]
 fn json_output_rejects_input_path_without_modifying_input() {
-    let input = write_temp_pdf(&one_page_pdf_with_stream());
-    let path = input.path().to_str().unwrap();
-    assert_same_json_output_is_rejected_without_modifying_input(path, path, input.path(), None);
+    // `into_temp_path()` closes the underlying file handle, keeping only the
+    // path. `assert_same_json_output_is_rejected_without_modifying_input`
+    // spawns both flpdf and (as an oracle) the real qpdf binary against this
+    // same path; on Windows, `QUtil::same_file`'s `CreateFile` call for the
+    // oracle's own same-file check can lose to a `NamedTempFile`'s still-open
+    // handle, so the oracle process fails to detect the alias and overwrites
+    // the input instead of rejecting it. Closing our handle first avoids that
+    // sharing-mode race without touching qpdf's or flpdf's own logic.
+    let input = write_temp_pdf(&one_page_pdf_with_stream()).into_temp_path();
+    let path = input.to_str().unwrap();
+    assert_same_json_output_is_rejected_without_modifying_input(path, path, &input, None);
 }
 
 #[test]
@@ -800,6 +830,60 @@ fn json_output_rejects_relative_alias_without_modifying_input() {
         "./input.pdf",
         &input_path,
         Some(temp.path()),
+    );
+}
+
+#[test]
+fn json_implicit_destination_rejects_an_input_named_dash() {
+    // `checkConfiguration` assigns the implicit JSON destination `-` and then
+    // compares it with the input through `QUtil::same_file`
+    // (`libqpdf/QPDFJob.cc:582-586,626-630`), so an input that really is named
+    // `-` in the working directory aliases its own destination. Reaching this
+    // rejection at all is what proves the `--json` route runs the job's
+    // configuration check instead of choosing its own destination.
+    fn case_directory() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("-"), one_page_pdf_with_stream()).unwrap();
+        directory
+    }
+
+    let directory = case_directory();
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .args(["--json", "-"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty(), "no JSON may be emitted");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains(
+            "input file and output file are the same; use --replace-input to intentionally \
+             overwrite the input file"
+        ),
+        "unexpected diagnostic: {stderr:?}"
+    );
+
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    let expected_directory = case_directory();
+    let expected = ShellCommand::new("qpdf")
+        .current_dir(expected_directory.path())
+        .args(["--json", "-"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        expected.status.code(),
+        Some(2),
+        "qpdf 11.9.0 must reject the aliased implicit JSON destination too"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&expected.stderr).replace("qpdf", "PROG"),
+        stderr.replace("flpdf", "PROG"),
+        "the diagnostics must match qpdf 11.9.0"
     );
 }
 
@@ -892,7 +976,11 @@ fn json_output_overwrites_distinct_write_only_existing_file() {
 
 #[cfg(unix)]
 #[test]
-fn json_output_reports_identity_check_io_error_without_modifying_input() {
+fn json_output_under_a_non_directory_reports_the_qpdf_open_failure() {
+    // qpdf opens the JSON destination with `QUtil::safe_fopen(..., "w")` after
+    // the document has been created (`libqpdf/QPDFJob.cc:3103-3104`), so an
+    // unusable path is reported as `open <path>: <strerror>` and the input is
+    // left alone.
     let input = write_temp_pdf(&one_page_pdf_with_stream());
     let original = std::fs::read(input.path()).unwrap();
     let temp = tempfile::tempdir().unwrap();
@@ -900,21 +988,43 @@ fn json_output_reports_identity_check_io_error_without_modifying_input() {
     std::fs::write(&non_directory, b"blocker").unwrap();
     let output_path = non_directory.join("output.json");
 
-    Command::cargo_bin("flpdf")
+    let output = Command::cargo_bin("flpdf")
         .unwrap()
         .args([
             "--json-output=2",
             input.path().to_str().unwrap(),
             output_path.to_str().unwrap(),
         ])
-        .assert()
-        .code(2)
-        .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains(
-            "unable to inspect --json-output file",
-        ));
+        .output()
+        .unwrap();
 
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains(&format!("open {}: Not a directory", output_path.display())),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(std::fs::read(input.path()).unwrap(), original);
+
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    let expected = ShellCommand::new("qpdf")
+        .args([
+            "--json-output=2",
+            input.path().to_str().unwrap(),
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(expected.status.code(), output.status.code());
+    assert_eq!(
+        String::from_utf8_lossy(&expected.stderr).replace("qpdf", "PROG"),
+        String::from_utf8_lossy(&output.stderr).replace("flpdf", "PROG"),
+        "the open failure must match qpdf 11.9.0"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2354,6 +2464,85 @@ fn json_stream_data_inline_holds_decoded_content() {
     .success()
     // Inline mode at DecodeLevel::Generalized must base64 the decoded content.
     .stdout(predicate::str::contains(base64_encode(content)));
+}
+
+#[test]
+fn json_output_rejects_version_1_like_qpdf() {
+    // qpdf's `--json-output` requires JSON version 2; version 1 has no
+    // qpdf-output schema (`QPDFJob_config.cc:312-326`).
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let directory = tempfile::tempdir().unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .args([
+            "--json-output=1",
+            input.path().to_str().unwrap(),
+            "out.json",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(
+        !directory.path().join("out.json").exists(),
+        "the destination must not be created for a rejected configuration"
+    );
+
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    let qpdf_directory = tempfile::tempdir().unwrap();
+    let expected = ShellCommand::new("qpdf")
+        .current_dir(qpdf_directory.path())
+        .args([
+            "--json-output=1",
+            input.path().to_str().unwrap(),
+            "out.json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(expected.status.code(), Some(2));
+    assert!(expected.stdout.is_empty());
+}
+
+#[test]
+fn json_decode_level_reaches_the_inline_stream_payload() {
+    // `--decode-level` feeds the job's JSON consumer, so an inline payload is
+    // decoded at the requested level rather than at the `--json` default.
+    let content = b"BT /F1 24 Tf 1 0 0 1 100 700 Tm (Decoded inline payload) Tj ET";
+    let input = write_temp_pdf(&one_page_pdf_with_flate_stream(content));
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--json",
+            "--json-stream-data=inline",
+            "--decode-level=all",
+            input.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(flpdf.status.success());
+    assert!(String::from_utf8_lossy(&flpdf.stdout).contains(&base64_encode(content)));
+
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    let expected = ShellCommand::new("qpdf")
+        .args([
+            "--json",
+            "--json-stream-data=inline",
+            "--decode-level=all",
+            input.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(expected.status.code(), flpdf.status.code());
+    assert_eq!(expected.stdout, flpdf.stdout);
 }
 
 #[test]

@@ -4634,6 +4634,77 @@ One divergence found while gating this and deliberately left open:
 object and flpdf does not. That is a page-tree walk difference shared by every
 page-consuming route, not a PCLm one.
 
+### flpdf-cli --json joins writeQPDF/writeOutfile/writeJSON (`flpdf-3yn9.48.150.3`, 2026-09-18)
+
+qpdf reaches JSON output through one structure: `createQPDF` runs
+`checkConfiguration`, which defaults the JSON destination to `-` when no output
+file was given (`libqpdf/QPDFJob.cc:428-431,582-586`); `writeQPDF` dispatches on
+`createsOutput()`; and `writeOutfile` rewrites the output name before
+`writeJSON` picks its destination from it
+(`libqpdf/QPDFJob.cc:484-489,3031-3042,3093-3115`). flpdf-cli's `--json` route
+bypassed all of it — it selected a `JsonJobOutput` itself and called
+`QPDFJob::write_json_with_version` directly, leaving `json_version` and the
+output file unset on the job, so `creates_output()` answered `false` for every
+JSON invocation. The route now configures the job (input/output file, JSON
+version and mode, keys, object selectors, stream data, stream prefix, schema
+validation, decode level), calls `QPDFJob::check_configuration`, and hands the
+created document to `QPDFJob::write_qpdf`.
+
+Two qpdf divergences on the job's own JSON arm were fixed with it, both observed
+against qpdf 11.9.0 through the job-JSON route before the cutover:
+
+* `writeJSON` opens its destination with `QUtil::safe_fopen(..., "w")`
+  (`libqpdf/QPDFJob.cc:3103-3104`), whose failure reads `open <path>:
+  <strerror>`; flpdf reported `open JSON output <path>: ...`.
+* `writeJSON` calls `usage()` when file-mode stream data has no prefix and no
+  output name to derive one from (`:3105-3110`). That `QPDFUsage` escapes
+  `writeOutfile`/`writeQPDF`/`run` uncaught and reaches the CLI's `usageExit`
+  (`qpdf/qpdf.cc:37-38`); flpdf reported it as an ordinary job error and folded
+  it into an exit status, losing qpdf's usage block. `QPDFJob::write_qpdf` and
+  `QPDFJob::run` now propagate `Error::Usage` unreported, as
+  `QPDFJob::create_qpdf` already did.
+
+Deviations recorded with the cutover:
+
+* `QPDFJobConfig`'s new JSON selectors (`json`, `json_output`, `json_key`,
+  `json_object`, `json_stream_data`, `json_stream_prefix`, `test_json_schema`,
+  `decode_level`) take parsed values where qpdf's `Config` callbacks parse
+  strings (`libqpdf/QPDFJob_config.cc:253-340,717-732`); flpdf's argv boundaries
+  own that parse and report the same messages. `decode_level` sets the JSON
+  consumer's level only, because flpdf keeps the writer's copy of qpdf's single
+  `m->decode_level` in the writer configuration. `json_key` keeps qpdf's
+  `std::set` semantics by ignoring a repeated key.
+* `job/lifecycle.rs::JobOutputWriter` batches fragments before the save
+  pipeline. Both of qpdf's JSON destinations are buffered before reaching the
+  operating system — a `FILE*` through `Pl_StdioFile` (`:3103-3104`) and the
+  C++ stream whose `stdout` the CLI puts in line-buffered mode
+  (`qpdf/qpdf.cc:30`, `libqpdf/QUtil.cc:780-784`) — and flpdf's file
+  destination already batched through `StdioBuffer`. Output bytes are
+  unchanged. flpdf-cli's own `PipelineWriter` batching, which covered only the
+  route it called directly, was removed with it.
+* `open_verified_json_output`'s file-identity comparison after the path check
+  has no qpdf counterpart and went with the CLI's destination choice. qpdf
+  compares paths with `QUtil::same_file` in `checkConfiguration`
+  (`libqpdf/QPDFJob.cc:626-630`) and then opens with `safe_fopen`, which is what
+  the job now does.
+* flpdf-cli's own `reject_same_json_output` preflight went with it, since
+  `check_configuration` performs qpdf's check at qpdf's position in the
+  sequence. Two diagnostics gained qpdf's wording: an aliased destination now
+  reports `input file and output file are the same; use --replace-input to
+  intentionally overwrite the input file` instead of `... choose a different
+  --json-output path`, and an unusable destination path now reaches
+  `safe_fopen`'s `open <path>: <strerror>` (with the create-stage warnings that
+  precede it) instead of the flpdf-only `unable to inspect --json-output file
+  <path>: ...` raised before the input was opened.
+
+One pre-existing divergence found while gating this and deliberately left open:
+`--json --split-pages` writes JSON in flpdf and splits in qpdf. `writeQPDF`
+dispatches `split_pages` ahead of `writeOutfile`, so qpdf emits `out.json-1`
+and no JSON at all (`libqpdf/QPDFJob.cc:484-489`). flpdf's `write_qpdf` has the
+same dispatch, but the CLI's JSON route does not configure `split_pages` on the
+job, so the JSON arm still wins. That is a route configuration gap, not a
+dispatch one.
+
 ### QPDFObjectHandle getValueAs family
 
 | qpdf | 行 | flpdf | 状態 |
