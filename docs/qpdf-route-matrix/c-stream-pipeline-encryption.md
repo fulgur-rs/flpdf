@@ -369,7 +369,7 @@ qtest parity harness 専用であることを注記する。
 
 | # | qpdf responsibility owner | qpdf evidence | flpdf current entrypoint | callers (prod / test) | classification | canonical owner | remaining bridge callers / notes |
 |---|---|---|---|---|---|---|---|
-| C44 | `QPDFObjectHandle::getStreamJSON` / `QPDF_Stream::getStreamJSON` の inline blob 供給（`StreamBlobProvider`） | `include/qpdf/QPDFObjectHandle.hh:1235-1240`, `libqpdf/QPDFObjectHandle.cc:1649-1657`, `libqpdf/QPDF_Stream.cc:96-107,186-204` | `crates/flpdf/src/object_handle.rs::ObjectHandle::get_stream_json`（`pub`） → canonical `write_stream_json` + lazy `Json::make_blob` | prod: 0 / test: `crates/flpdf/tests/stream_json_get_tests.rs`（none/inline/file/lifetime） | mixed | `ObjectHandle::get_stream_json` | C24 の `write_stream_json` は canonical であり二重 pipe へ変更しない。public facade は qpdf と同じ effective decode level で inline blob を遅延 pipe し、owner の `Pdf` が blob serialization まで存続する契約を持つ |
+| C44 | `QPDFObjectHandle::getStreamJSON` / `QPDF_Stream::getStreamJSON` の inline blob 供給（`StreamBlobProvider`） | `include/qpdf/QPDFObjectHandle.hh:1235-1240`, `libqpdf/QPDFObjectHandle.cc:1649-1657`, `libqpdf/QPDF_Stream.cc:96-107,186-204` | `crates/flpdf/src/object_handle.rs::ObjectHandle::get_stream_json`（`pub`） → canonical `write_stream_json` + lazy `Json::make_blob` | prod: 0 / test: `crates/flpdf/tests/stream_json_get_tests.rs`（none/inline/file/lifetime/call-count） | mixed | `ObjectHandle::get_stream_json` | C24 の `write_stream_json` は canonical であり二重 pipe へ変更しない。public facade は qpdf と同じ effective decode level で inline blob を遅延 pipe し、owner の `Pdf` が blob serialization まで存続する契約を持つ。**2026-09-18（`flpdf-3yn9.48.154`、C-U2 probe）**: `probe154/c44_probe.sh` が pinned qpdf 11.9.0 の `getStreamJSON` を直接呼び、provider-backed inline stream で provider 呼出回数 = `getStreamJSON` 直後 1 / 初回 unparse 2 / 2回目 unparse 3、`pipeStreamData(&buf, nullptr, ...)` と `&mut bool` 版が同一 bytes・同一 call 数（qpdf は `filterp == nullptr` を local `ignored` に置換する、`libqpdf/QPDF_Stream.cc:499-502`）、`/FlateDecode` stream は generalized で decode 済み payload + `/Filter` 除去、none で raw deflate + `/Filter` 維持を実測した。flpdf 側は `crates/flpdf/tests/stream_json_get_tests.rs` の追加 4 テスト（呼出回数 1/2/3、blob は serialization 時に live provider を読む、blob が stream handle を保持、flate の derived decode level）が同じ観測を固定する。provider 回数・lifetime・filter/payload に乖離なし。C44 の分類は §3 の履歴行例外（public facade と deferred blob の責務分割の追跡）のまま `mixed` とし、この probe 結果を production route 重複や全体 parity の証拠へ広げない |
 
 C44 は public facade と deferred blob provider の責務を追跡する行として保持する。
 `write_stream_json` の責務は C24 の `QPDF_Stream::writeStreamJSON` であり、qpdf 自身も
@@ -478,6 +478,11 @@ U3 は「分類は決まっているが、残る実装差と出力への影響�
 shared primitive 統合と oracle vector 検証が完了しているため、未完了 probe としては扱わない。
 旧 U2 は `writeStreamJSON` と未実装 `getStreamJSON` の責務を取り違えていたため除外した。
 C44 はその API を追跡する枠で、既存 C24 の不一致とは扱わない。`.48.47` で public `get_stream_json` と deferred blob が実装され API 欠落は解消したため、C-U2 に残るのは provider 回数と lifetime の harness probe のみである。
+2026-09-18（`flpdf-3yn9.48.154`）に `probe154/c44_probe.sh`（pinned qpdf 11.9.0 の `getStreamJSON` 直呼び）と
+`crates/flpdf/tests/stream_json_get_tests.rs` の 4 追加テストでその probe を完了した。呼出回数 1/2/3、
+`nullptr` vs `&mut` `filtering_attempted` の同一出力、flate の derived decode level、blob の live-source
+性に乖離は無い。C44 は README §3 の履歴行例外（public facade と deferred blob の責務分離の追跡）として
+`mixed` のまま維持し、probe 結果を production route 重複や全体 parity の証拠には広げない。
 
 `bridge` の判定基準は README §3 の通り **経路（route）に qpdf 対応物が無いこと** で、
 責務（responsibility）に qpdf 対応物があるかどうかとは別に問う。本領域の 2 行はこの区別で読む:
