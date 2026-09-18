@@ -1107,7 +1107,7 @@ qpdf 11.9.0とqpdf-zlib-compatでfull-byte比較する。既存のCR改行正規
 
 | 分類 | 件数 | 行 |
 |---|---|---|
-| canonical | 21 | D1, D2, D3, D4, D5, D7, D10, D12, D13, D15, D17, D18, D19, D20, D21, D22, D24, D25, D27, D29, D30 |
-| mixed | 10 | D6, D8, D9, D11, D14, D16, D23, D26, D28, D31 |
+| canonical | 22 | D1, D2, D3, D4, D5, D7, D10, D12, D13, D15, D17, D18, D19, D20, D21, D22, D23, D24, D25, D27, D29, D30 |
+| mixed | 9 | D6, D8, D9, D11, D14, D16, D26, D28, D31 |
 | bridge | 0 | — |
 | unknown | 0 | — |
