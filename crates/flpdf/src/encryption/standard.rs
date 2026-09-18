@@ -161,20 +161,19 @@ fn truncate_password_v5(password: &[u8]) -> &[u8] {
     &password[..password.len().min(127)]
 }
 
-/// Validate `inputs` fields that are in scope for V=1/V=2.
+/// Validate `inputs` fields that are in scope for V<5.
 ///
-/// Only the V/R/Length combinations that this module's Algorithms 2/6/7
-/// actually implement are accepted:
+/// qpdf's `initializeEncryption` accepts every V∈{1,2,4,5} × R∈2..=6
+/// (`QPDF_encryption.cc:787-795`); the V<5 branch handles
+/// V∈{1,2,4} × R∈2..=6 here with the R-keyed Algorithm 2/6/7 paths
+/// (`R>=3` selects the 50-iteration/20-pass form, `R>=4` adds the
+/// `/EncryptMetadata` tail). V=5 is handled by the R5/R6 functions.
 ///
-/// - V=1 ⇒ Length=40; qpdf accepts both R=2 and the observed R=3 form
-/// - V=2 ⇒ R∈{2,3} and Length∈`[40,128]` in 8-bit steps (RC4-{40..128})
-///
-/// Other handlers (V=4 CF dispatch, V=5 R=5/R=6 AES-256) belong to other
-/// subtasks. Refusing them here prevents wrong-handler inputs from
-/// silently flowing into the R≥3/R≥4 branches in `compute_file_key()`
-/// and `check_user_password()`.
+/// The effective `/Length` selection happens in
+/// [`super::state::effective_length_bits`] before this validator runs, so
+/// only the V=1 (always 40-bit) and structural `[40,128]` checks remain.
 fn validate_inputs(inputs: &StandardHandlerInputs<'_>) -> Result<usize> {
-    if inputs.v != 1 && inputs.v != 2 {
+    if !matches!(inputs.v, 1 | 2 | 4) {
         return Err(EncryptedError::UnsupportedHandler {
             filter: "Standard".into(),
             v: inputs.v,
@@ -184,7 +183,7 @@ fn validate_inputs(inputs: &StandardHandlerInputs<'_>) -> Result<usize> {
         .into());
     }
     // R must be a revision this module handles.
-    if inputs.r != 2 && inputs.r != 3 {
+    if !(2..=6).contains(&inputs.r) {
         return Err(EncryptedError::UnsupportedHandler {
             filter: "Standard".into(),
             v: inputs.v,
@@ -198,18 +197,6 @@ fn validate_inputs(inputs: &StandardHandlerInputs<'_>) -> Result<usize> {
     // V=1 value other than 40 bits is an invalid internal projection even
     // though R=3 itself is accepted.
     if inputs.v == 1 && inputs.length_bits != 40 {
-        return Err(EncryptedError::UnsupportedHandler {
-            filter: "Standard".into(),
-            v: inputs.v,
-            r: inputs.r,
-            cfm: None,
-        }
-        .into());
-    }
-    // R=2 is a 40-bit revision regardless of V; reject longer keys to keep
-    // the R=2 branch in compute_file_key/check_user_password from emitting
-    // longer-than-spec keys.
-    if inputs.r == 2 && inputs.length_bits != 40 {
         return Err(EncryptedError::UnsupportedHandler {
             filter: "Standard".into(),
             v: inputs.v,

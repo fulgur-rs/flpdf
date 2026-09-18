@@ -2106,12 +2106,19 @@ fn encryption_version_floor(options: &WriterOptions) -> Option<PdfVersion> {
             .ok()??;
         return Some(if revision >= 6 {
             PdfVersion::new(1, 7, 8)
-        } else if version >= 5 && revision >= 5 {
+        } else if revision == 5 {
             PdfVersion::new(1, 7, 3)
-        } else if version == 4 || revision >= 4 {
-            // copyEncryptionParameters forces AES for all V>=4.
-            PdfVersion::new(1, 6, 0)
-        } else if revision >= 3 || version == 2 {
+        } else if revision == 4 {
+            // `copyEncryptionParameters` forces AES for every V>=4 donor
+            // (`QPDFWriter.cc:674-679`), and
+            // `setEncryptionParametersInternal` picks 1.6 for AES and 1.5
+            // for RC4 at R=4 (`QPDFWriter.cc:806-814`).
+            if version >= 4 {
+                PdfVersion::new(1, 6, 0)
+            } else {
+                PdfVersion::new(1, 5, 0)
+            }
+        } else if revision == 3 {
             PdfVersion::new(1, 4, 0)
         } else {
             PdfVersion::new(1, 3, 0)
@@ -2211,15 +2218,19 @@ pub(crate) fn effective_pdf_version_and_ext_with_encryption<'a>(
 
     let (encryption_version, encryption_extension) = if encryption.encryption_r >= 6 {
         ("1.7", 8)
-    } else if encryption.encryption_v >= 5 && encryption.encryption_r >= 5 {
+    } else if encryption.encryption_r == 5 {
         ("1.7", 3)
-    } else if encryption.encryption_v == 4 {
+    } else if encryption.encryption_r == 4 {
+        // `setEncryptionParametersInternal` keys R=4 on the AES/RC4 choice
+        // (`libqpdf/QPDFWriter.cc:806-814`); the copy path forces AES for
+        // every V>=4 donor (`libqpdf/QPDFWriter.cc:674-679`), while an
+        // explicit V=4 RC4 method keeps 1.5.
         match encryption.cipher {
-            WriteCipher::PerObject(crate::encryption::standard::ObjectKeyAlg::Aes) => ("1.6", 0),
             WriteCipher::PerObject(crate::encryption::standard::ObjectKeyAlg::Rc4) => ("1.5", 0),
-            WriteCipher::FileKeyAes256 => ("1.7", 3),
+            WriteCipher::PerObject(crate::encryption::standard::ObjectKeyAlg::Aes)
+            | WriteCipher::FileKeyAes256 => ("1.6", 0),
         }
-    } else if encryption.encryption_v == 2 || encryption.encryption_r >= 3 {
+    } else if encryption.encryption_r == 3 {
         ("1.4", 0)
     } else {
         ("1.3", 0)
@@ -4369,7 +4380,11 @@ mod final_handle_writer_tests {
     }
 
     #[test]
-    fn malformed_v4_aes256_parameters_keep_the_aes256_extension_floor() {
+    fn malformed_v4_aes256_parameters_use_the_r4_aes_floor() {
+        // `setEncryptionParametersInternal` keys the floor on `/R`
+        // (`libqpdf/QPDFWriter.cc:806-814`): R=4 picks 1.6 for AES (which
+        // includes a malformed 256-bit key) and 1.5 for RC4. The 1.7/3
+        // extension floor belongs to R=5 only.
         let encryption = EncryptionParameters {
             encrypt_dict: ObjectHandle::dictionary(Vec::new()),
             file_key: vec![1; 32],
@@ -4390,8 +4405,54 @@ mod final_handle_writer_tests {
                 false,
                 Some(&encryption),
             ),
-            ("1.7", 3)
+            ("1.6", 0)
         );
+    }
+
+    #[test]
+    fn encryption_version_floor_is_keyed_on_revision_like_qpdf() {
+        // `setEncryptionParametersInternal` picks the floor from `/R`
+        // (`libqpdf/QPDFWriter.cc:806-814`), so the V<5 / R>3 cells the
+        // widened reader acceptance makes reachable must follow the same
+        // rule. Source 1.3 keeps the floor dominant in every case.
+        for (v, r, cipher, expected) in [
+            (1, 4, WriteCipher::PerObject(ObjectKeyAlg::Rc4), ("1.5", 0)),
+            (1, 5, WriteCipher::PerObject(ObjectKeyAlg::Rc4), ("1.7", 3)),
+            (1, 6, WriteCipher::PerObject(ObjectKeyAlg::Rc4), ("1.7", 8)),
+            (2, 4, WriteCipher::PerObject(ObjectKeyAlg::Rc4), ("1.5", 0)),
+            (4, 3, WriteCipher::PerObject(ObjectKeyAlg::Aes), ("1.4", 0)),
+            (4, 4, WriteCipher::PerObject(ObjectKeyAlg::Aes), ("1.6", 0)),
+            (4, 4, WriteCipher::PerObject(ObjectKeyAlg::Rc4), ("1.5", 0)),
+            (4, 5, WriteCipher::PerObject(ObjectKeyAlg::Aes), ("1.7", 3)),
+            (4, 6, WriteCipher::PerObject(ObjectKeyAlg::Aes), ("1.7", 8)),
+            (5, 3, WriteCipher::FileKeyAes256, ("1.4", 0)),
+            (5, 4, WriteCipher::FileKeyAes256, ("1.6", 0)),
+            (5, 5, WriteCipher::FileKeyAes256, ("1.7", 3)),
+            (5, 6, WriteCipher::FileKeyAes256, ("1.7", 8)),
+        ] {
+            let encryption = EncryptionParameters {
+                encrypt_dict: ObjectHandle::dictionary(Vec::new()),
+                file_key: vec![1; 32],
+                cipher,
+                encryption_v: v,
+                encryption_r: r,
+                id0: b"id".to_vec(),
+                static_aes_iv: true,
+                encrypt_metadata: true,
+                metadata_ref: None,
+            };
+            assert_eq!(
+                effective_pdf_version_and_ext_with_encryption(
+                    "1.3",
+                    0,
+                    &WriterOptions::default(),
+                    false,
+                    Some(&encryption),
+                ),
+                expected,
+                "V={v} R={r} must use qpdf's R-keyed floor"
+            );
+        }
     }
 
     #[test]
