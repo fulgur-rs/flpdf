@@ -28,3 +28,22 @@ fn linearization_xref_stream_has_one_canonical_owner() {
     let module_index = include_str!("../../../docs/qpdf-module-doc-index.md");
     assert!(!module_index.contains(&alias_path));
 }
+
+#[test]
+fn linearized_classic_xref_rows_use_the_shared_qpdf_owner() {
+    let writer_source = include_str!("../src/linearization/writer.rs");
+    let plain_xref_source = include_str!("../src/writer/plain/xref.rs");
+
+    assert!(
+        plain_xref_source.contains("write_xref_table_from_offsets"),
+        "the canonical xref owner must expose the linearized offset-map consumer"
+    );
+    assert!(
+        writer_source.contains("write_xref_table_from_offsets"),
+        "linearized classic xref rows must call the shared owner"
+    );
+    assert!(
+        !writer_source.contains("for number in 1..param_slot"),
+        "the linearized main xref must not retain a private row loop"
+    );
+}
