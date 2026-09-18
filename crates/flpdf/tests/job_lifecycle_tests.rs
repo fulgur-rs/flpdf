@@ -2514,6 +2514,40 @@ fn raw_argv_initializer_covers_error_and_choice_boundaries() {
     }
 }
 
+/// A missing `--job-json-file` path must render qpdf's portable
+/// `strerror`-based wording (`QUtil::safe_fopen`, `libqpdf/QUtil.cc:490-519`;
+/// `QPDFSystemError::createWhat`, `libqpdf/QPDFSystemError.cc:13-29`), not
+/// Rust's `std::io::Error` text with its `(os error N)` suffix. Confirmed
+/// against `/usr/bin/qpdf` 11.9.0:
+/// `qpdf --job-json-file=<missing> in.pdf out.pdf` prints exactly
+/// `error with job-json file <path>: open <path>: No such file or
+/// directory\nRun qpdf --job-json-help for information on the file format.`
+/// before the CLI's own `usageExit` footer is appended.
+#[test]
+fn raw_argv_missing_job_json_file_uses_qpdf_strerror_wording() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing-job.json");
+
+    let error = QPDFJob::new()
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            format!("--job-json-file={}", missing.display()).into_bytes(),
+        ])
+        .unwrap_err();
+    let Error::Usage(usage) = error else {
+        panic!("expected a usage error, got {error:?}");
+    };
+    assert_eq!(
+        usage.to_string(),
+        format!(
+            "error with job-json file {}: open {}: No such file or directory\n\
+             Run qpdfjob --job-json-help for information on the file format.",
+            missing.display(),
+            missing.display()
+        )
+    );
+}
+
 #[test]
 fn page_label_order_errors_are_not_usage_errors() {
     // qpdf raises the three order/page-count failures with
