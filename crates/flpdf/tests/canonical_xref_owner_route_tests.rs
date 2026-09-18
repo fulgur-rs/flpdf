@@ -559,6 +559,95 @@ fn reconstruction_after_a_committed_free_row_suppresses_it_like_qpdf() {
     );
 }
 
+/// A classic xref table with a broken keyword (forcing reconstruction) plus
+/// one candidate whose "generation" token is 150 digits -- well past qpdf's
+/// `readToken(m->file, MAX_LEN)` cap of 100 (`libqpdf/QPDF.cc:548,553,558,559`).
+/// qpdf's reconstruction line scan reads that field as a bad token rather
+/// than an (enormous) integer, so `t2.isInteger()` is false and the whole
+/// candidate is never registered (`QPDF.cc:557-561`).
+fn reconstruction_candidate_with_overlong_generation_token() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    for object in [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".as_slice(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".as_slice(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n".as_slice(),
+    ] {
+        bytes.extend_from_slice(object);
+    }
+    bytes.extend_from_slice(b"9 ");
+    bytes.extend(std::iter::repeat_n(b'9', 150));
+    bytes.extend_from_slice(b" obj\n<< /Bogus true >>\nendobj\n");
+    let xref = bytes.len();
+    bytes.extend_from_slice(
+        b"xreff\n0 4\n0000000000 65535 f \ntrailer\n<< /Size 4 /Root 1 0 R >>\n",
+    );
+    bytes.extend_from_slice(format!("startxref\n{xref}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+/// `Tokenizer::read_qpdf_token`'s `max_len` slot is genuinely load-bearing
+/// for the xref-reconstruction line scan, not just for the classic
+/// subsection lookahead the other tests here pin: dropping it (treating
+/// `max_len` as unbounded) would let the 150-digit "generation" token parse
+/// as one huge integer, register object 9, and diverge from qpdf.
+#[test]
+fn reconstruction_skips_a_candidate_whose_generation_token_exceeds_max_len_like_qpdf() {
+    let fixture = reconstruction_candidate_with_overlong_generation_token();
+
+    let pdf = Pdf::open_with_options(
+        Cursor::new(fixture.clone()),
+        PdfOpenOptions {
+            repair: true,
+            suppress_warnings: true,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("the reconstructed table keeps the classic trailer, so the open succeeds");
+    let table = pdf.get_xref_table();
+    assert!(
+        !table.contains_key(&ObjectRef::new(9, 0)),
+        "an over-length generation token must not register a reconstruction candidate: {:?}",
+        render_xref_table(&table)
+    );
+    let rendered = render_xref_table(&table);
+    assert_eq!(
+        rendered,
+        vec![
+            "1/0: uncompressed; offset = 9".to_owned(),
+            "2/0: uncompressed; offset = 58".to_owned(),
+            "3/0: uncompressed; offset = 115".to_owned(),
+        ],
+        "only the three well-formed objects survive reconstruction"
+    );
+
+    if !qpdf_available() {
+        eprintln!("qpdf 11.9.0 is not available; skipping only the oracle comparison");
+        return;
+    }
+    let directory = tempfile::tempdir().expect("create qpdf fixture directory");
+    let input = directory.path().join("overlong-generation-token.pdf");
+    fs::write(&input, &fixture).expect("write qpdf fixture");
+    let qpdf = Command::new("qpdf")
+        .args(["--warning-exit-0", "--show-xref"])
+        .arg(&input)
+        .output()
+        .expect("qpdf should spawn");
+    assert!(
+        qpdf.status.success(),
+        "qpdf --show-xref must render the reconstructed table: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    let shown: Vec<String> = String::from_utf8_lossy(&qpdf.stdout)
+        .lines()
+        .filter(|line| line.contains(": uncompressed;") || line.contains(": compressed;"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        rendered, shown,
+        "flpdf's reconstructed xref table must equal qpdf 11.9.0's"
+    );
+}
+
 /// Build a single-page document whose cross-reference section is a classic
 /// table, inserting `between` after the last subsection entry and writing
 /// `startxref_value` (default: the table offset) after the `startxref`
