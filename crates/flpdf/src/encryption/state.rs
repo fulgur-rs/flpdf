@@ -361,10 +361,16 @@ pub(crate) fn parse_inspection_state(encrypt: &ObjectHandle) -> Result<Encryptio
     } else {
         ("none", "none", "none")
     };
-    // Same classification `authenticate` computes per revision branch
-    // (`weak_crypto = revision == 5 || rc4_in_use()` for R5/R6, otherwise
-    // `rc4_in_use()` alone) -- password-independent, so it is available
-    // before authentication even attempts a candidate.
+    // Same classification `authenticate` computes per version branch
+    // (`weak_crypto = revision == 5 || rc4_in_use()` inside the V=5 handler,
+    // `rc4_in_use()` alone for V<5) -- password-independent, so it is
+    // available before authentication even attempts a candidate. The split is
+    // on V rather than R because the R5 weakness belongs to the V=5 AES-256
+    // key derivation; a V=4 document keeps Algorithm 2 with its /Length bits
+    // whatever R says, and qpdf accepts V=4 with any R in 2..=6
+    // (`libqpdf/QPDF_encryption.cc:787`). Splitting on R here would report a
+    // V=4/R=5 file as weak after a failed password and not weak after a
+    // successful one.
     let effective = |cf: EncryptionMode| {
         if v >= 4 {
             cf
@@ -377,7 +383,7 @@ pub(crate) fn parse_inspection_state(encrypt: &ObjectHandle) -> Result<Encryptio
         || crypt_filters
             .values()
             .any(|mode| matches!(mode, EncryptionMode::Rc4));
-    let weak_crypto = if matches!(r, 5 | 6) {
+    let weak_crypto = if v == 5 {
         r == 5 || rc4_in_use
     } else {
         rc4_in_use
@@ -1010,6 +1016,63 @@ mod tests {
         let state = parse_inspection_state(&encrypt).expect("parse encryption dictionary");
 
         assert_eq!(state.length_bits, 128);
+    }
+
+    /// qpdf accepts V=4 with any R in 2..=6 (`libqpdf/QPDF_encryption.cc:787`),
+    /// so a V=4/R=5 AES-only document is a real input. Its weak-crypto
+    /// classification has to be the V-based one `authenticate` uses, or the
+    /// same file would be reported weak after a failed password and not weak
+    /// after a successful one. The R5 weakness belongs to the V=5 AES-256 key
+    /// derivation, which a V=4 document never performs.
+    #[test]
+    fn v4_r5_aes_is_not_weak_before_authentication() {
+        let aes_filter = ObjectHandle::dictionary(vec![(
+            b"/CFM".to_vec(),
+            ObjectHandle::name(b"AESV2".to_vec()),
+        )]);
+        let encrypt = ObjectHandle::dictionary(vec![
+            (
+                b"/Filter".to_vec(),
+                ObjectHandle::name(b"Standard".to_vec()),
+            ),
+            (b"/V".to_vec(), ObjectHandle::integer(4)),
+            (b"/R".to_vec(), ObjectHandle::integer(5)),
+            (b"/P".to_vec(), ObjectHandle::integer(-4)),
+            (b"/Length".to_vec(), ObjectHandle::integer(128)),
+            (
+                b"/CF".to_vec(),
+                ObjectHandle::dictionary(vec![(b"/StdCF".to_vec(), aes_filter)]),
+            ),
+            (b"/StmF".to_vec(), ObjectHandle::name(b"StdCF".to_vec())),
+            (b"/StrF".to_vec(), ObjectHandle::name(b"StdCF".to_vec())),
+        ]);
+
+        let state = parse_inspection_state(&encrypt).expect("parse encryption dictionary");
+
+        assert_eq!((state.v, state.r), (4, 5));
+        assert!(
+            !state.weak_crypto,
+            "V=4/R=5 with AES filters must not be classified weak"
+        );
+    }
+
+    /// The V=5 handler keeps R5 marked weak: that revision's AES-256 key
+    /// derivation is the broken one.
+    #[test]
+    fn v5_r5_stays_weak_before_authentication() {
+        let encrypt = ObjectHandle::dictionary(vec![
+            (
+                b"/Filter".to_vec(),
+                ObjectHandle::name(b"Standard".to_vec()),
+            ),
+            (b"/V".to_vec(), ObjectHandle::integer(5)),
+            (b"/R".to_vec(), ObjectHandle::integer(5)),
+            (b"/P".to_vec(), ObjectHandle::integer(-4)),
+        ]);
+
+        let state = parse_inspection_state(&encrypt).expect("parse encryption dictionary");
+
+        assert!(state.weak_crypto, "V=5/R=5 must stay weak");
     }
 
     #[test]
