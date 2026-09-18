@@ -411,12 +411,27 @@ case 63 と case 76/77 に残っていた「本パスでは個別未検証」の
 する 18 件（前述 12 件 + case 12/13 が E-7 + case 45/84 が E-19 + case 83 が
 E-17 + case 14 が A17）は引き続き `mixed` のまま。
 
+上（2026-09-18 パス）の「case 75 が『`.write()` を呼びながら `canonical`』で
+本表冒頭の分類規則の**唯一の例外**」という記述も、この再分類で意味を失った
+——「D1 に触れる → `mixed`」自体がもう規則ではないので、case 75 はもはや例外
+ではなく、単に「D1 を含めどの owner にも従属しない `canonical` ケース」の 1
+つになった。
+
+ここで前提にしている本表の分類規則は「あるケースが直接呼ぶ A〜D/E
+entrypoint が `mixed`/`bridge` ならそのケースも `mixed`/`bridge`」であって、
+「そのケースの実行が内部で辿る flpdf 側のコードパス」ではない——D1
+（`PdfWriter::write`）は非常に多くのケースから直接呼ばれるためこの基準の
+対象になるが、D1 が内部で呼ぶ D2/D3/D11/D14/D16/D23 等（依然 `mixed`）は
+対象にならない。これは新しい規則ではなく、上記 case 54（`PdfWriter::new` の
+みで `.write()` を呼ばないため D1 の対象外）の扱いと同じ基準を D1 の再分類
+後に適用しているだけである。
+
 | case | qpdf test fn | flpdf owner fn | classification | A-D/E owner refs / notes |
 |---|---|---|---|---|
 | 0/1 | `qpdf/test_driver.cc:201-286` | `crates/flpdf-qtest-tools/src/driver/test_0_1.rs::run_test_0_1` | canonical | `.48.93` で raw pipe → source-read-free `stream_data_filterable` probe → canonical filtered `pipe_stream_data`/loggerへ移行。DecodeParms warning、codec failure、Crypt identity、stdout/stderr orderingを58 fixture + 11 CLI probeでqpdf 11.9.0と比較。qpdfにない `DecodeLimits`/recovering wrapperは `.48.96` で撤去済みであり、qtest callerには残らない。 |
 | 2 | `qpdf/test_driver.cc:286-308` | `crates/flpdf-qtest-tools/src/driver/test_02_09.rs::run_test_2` | canonical | qpdf の `getKey` → `unparse`（`/O`・`/U`）と `pipeStreamData`（`/Contents`）の call orderを、resolving `try_get_key` と同じpipe経路をbuffer化する canonical `get_stream_data` で再現する。`QPDFObjectHandle::unparse` は間接値を参照形のまま返すため `/O`・`/U` はcaller-side resolveを行わず、`get_stream_data` がstream自身を解決する。`.48.107` で対象関数内の `resolve_handle` 3箇所を撤去し、test 2 differential/source guardで確認。 |
 | 3 | `qpdf/test_driver.cc:311-322`; public `getArrayNItems`/`getArrayItem`: `include/qpdf/QPDFObjectHandle.hh:725-733`, `libqpdf/QPDFObjectHandle.cc:758-785` | `crates/flpdf-qtest-tools/src/driver/test_02_09.rs::run_test_3` | canonical | qpdfと同じ`getArrayNItems` → `getArrayItem`のcount/item順を、resolving `try_get_array_n_items` → `try_get_array_item`で再現する。`pipe_stream_data` は C1/C3 canonical、`STREAM_ENCODE_NORMALIZE` は qpdf の `qpdf_ef_normalize` と一致。非配列時のwarning/空反復もqpdfのcount accessorに対応する。 |
-| 4 | `qpdf/test_driver.cc:325-374` | `crates/flpdf-qtest-tools/src/driver/test_02_09.rs::run_test_4` | canonical | `try_get_key` と qpdf public `isNull()` 対応の `try_is_null()` へ移行し、caller-side `resolve_handle` と非解決 `.is_null()` は撤去済み。`make_direct`/配列 mutation 系 API に A-D 行なし（対象範囲外）。`PdfWriter::write` は D1 mixed（4 分岐 vs qpdf 2 分岐）のためcase-level分類はmixed。 **2026-09-19（`flpdf-3yn9.48.165`）**: D1（`PdfWriter::write`）が qpdf の `writeLinearized`/`writeStandard` 2 分岐＋PCLm 1 段構造へ揃い `canonical` へ再分類されたため、case-level 分類も `canonical` へ更新した。 |
+| 4 | `qpdf/test_driver.cc:325-374` | `crates/flpdf-qtest-tools/src/driver/test_02_09.rs::run_test_4` | canonical | `try_get_key` と qpdf public `isNull()` 対応の `try_is_null()` へ移行し、caller-side `resolve_handle` と非解決 `.is_null()` は撤去済み。`make_direct`/配列 mutation 系 API に A-D 行なし（対象範囲外）。記載時点の「`PdfWriter::write` は D1 mixed（4 分岐 vs qpdf 2 分岐）のためcase-level分類はmixed」は stale。 **2026-09-19（`flpdf-3yn9.48.165`）**: D1（`PdfWriter::write`）が qpdf の `writeLinearized`/`writeStandard` 2 分岐＋PCLm 1 段構造へ揃い `canonical` へ再分類されたため、case-level 分類も `canonical` へ更新した。 |
 | 5 | `qpdf/test_driver.cc:374-420` | `crates/flpdf-qtest-tools/src/driver/test_02_09.rs::run_test_5` | canonical | qpdfの`getRoot`→`getKey`→`isArray`→`getArrayNItems`/`getArrayItem`→`getUTF8Value`/`getNumericValue`の各receiver境界を、`Pdf::root_handle`→`try_get_key`→`try_is_array`→`try_get_array_n_items`/`try_get_array_item`→`try_get_utf8_value`/`try_get_numeric_value`で再現した。`.48.138`でtest5のcaller-side `resolve_handle`と非解決`as_array` snapshotを撤去し、page/image/content helper routeは既存canonical production primitiveとして保持する。 |
 | 6 | `qpdf/test_driver.cc:422-439` | `crates/flpdf-qtest-tools/src/driver/test_02_09.rs::run_test_6` | canonical | qpdfのpublic `isStream()`（`libqpdf/QPDFObjectHandle.cc:437-440`）に対応する resolving `type_code()`で`/Metadata`のstream型を確認し、`pipeStreamData(..., qpdf_dl_none)`（`libqpdf/QPDFObjectHandle.cc:1300-1341`）に対応する canonical `pipe_stream_data`へ渡す。`.48.108` でcaller-side `resolve_handle`を撤去し、DecodeLevel::Noneの「復号はするがfilterしない」契約を保持。 |
 | 7 | `qpdf/test_driver.cc:441-455` | `crates/flpdf-qtest-tools/src/driver/test_02_09.rs::run_test_7` | canonical | qpdf public `isStream()`のreceiver解決に対応する`qstream.type_code()`を直接使い、`.48.139`でcaller-side `resolve_handle`を撤去した。`replace_stream_data` は C38 canonical。`PdfWriter::write` は D1 mixed。 **2026-09-19（`flpdf-3yn9.48.165`）**: D1（`PdfWriter::write`）が qpdf の `writeLinearized`/`writeStandard` 2 分岐＋PCLm 1 段構造へ揃い `canonical` へ再分類されたため、case-level 分類も `canonical` へ更新した。 |
