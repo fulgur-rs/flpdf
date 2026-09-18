@@ -1280,16 +1280,6 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.make_indirect_from_object_handle(handle)
     }
 
-    /// Return an unused generation-zero object reference.
-    ///
-    /// Delegate allocation to qpdf's canonical object cache. The resolver
-    /// prepares dangling references and selects the next generation-zero
-    /// identity from the same map used by every other document operation.
-    #[cfg(test)]
-    pub(crate) fn next_available_object_ref(&self) -> Result<ObjectRef> {
-        self.resolver.next_obj_gen()
-    }
-
     /// This document's stable per-instance identity.
     ///
     /// This is qpdf's `QPDF::getUniqueId` (`include/qpdf/QPDF.hh:283`,
