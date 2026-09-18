@@ -162,16 +162,61 @@ impl Pipeline for JobOutputPipeline {
     }
 }
 
-struct JobOutputWriter(PipelineHandle);
+/// Batch size for job output written through the shared save pipeline.
+const JOB_OUTPUT_BUFFER_CAPACITY: usize = 4096;
+
+/// Adapt the job's save pipeline to [`Write`], batching small fragments.
+///
+/// Both of qpdf's JSON destinations are buffered before they reach the
+/// operating system: a named output file is a `FILE*` driven through
+/// `Pl_StdioFile` (`libqpdf/QPDFJob.cc:3103-3104`), and standard output is the
+/// C++ stream whose underlying `stdout` the CLI puts in line-buffered mode
+/// (`qpdf/qpdf.cc:30`, `libqpdf/QUtil.cc:780-784`). flpdf's save pipeline is a
+/// mutex-guarded handle, so the serializer's many small fragments would each
+/// take a lock and a write; the file destination already batches through
+/// `StdioBuffer`. Batching changes no output bytes.
+struct JobOutputWriter {
+    pipeline: PipelineHandle,
+    buffer: Vec<u8>,
+}
+
+impl JobOutputWriter {
+    fn new(pipeline: PipelineHandle) -> Self {
+        Self {
+            pipeline,
+            buffer: Vec::with_capacity(JOB_OUTPUT_BUFFER_CAPACITY),
+        }
+    }
+
+    /// Hand every batched byte to the pipeline.
+    fn flush_buffer(&mut self) -> std::io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let result = self
+            .pipeline
+            .write(&self.buffer)
+            .map_err(std::io::Error::other);
+        self.buffer.clear();
+        result
+    }
+}
 
 impl Write for JobOutputWriter {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.0.write(data).map_err(std::io::Error::other)?;
+        if self.buffer.len() + data.len() > JOB_OUTPUT_BUFFER_CAPACITY {
+            self.flush_buffer()?;
+        }
+        if data.len() >= JOB_OUTPUT_BUFFER_CAPACITY {
+            self.pipeline.write(data).map_err(std::io::Error::other)?;
+        } else {
+            self.buffer.extend_from_slice(data);
+        }
         Ok(data.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+        self.flush_buffer()
     }
 }
 
@@ -4184,8 +4229,8 @@ impl QPDFJob {
         }
 
         self.logger.save_to_standard_output(true)?;
-        let mut output = JobOutputWriter(self.logger.get_save()?);
-        self.write_json_without_completion(
+        let mut output = JobOutputWriter::new(self.logger.get_save()?);
+        let result = self.write_json_without_completion(
             pdf,
             version,
             configuration.test_json_schema,
@@ -4193,8 +4238,17 @@ impl QPDFJob {
             configuration.show_encryption_key,
             options,
             JsonJobOutput::Stdout(&mut output),
-        )
-        .map_err(Error::from)
+        );
+        if result.is_err() {
+            // A successful serialization already flushed through the JSON
+            // pipeline's own `finish`. A failed one has not, and qpdf keeps
+            // whatever its destination received before the failure -- its
+            // deferred `--json-object` parse can fail after earlier sections
+            // reached the output (`libqpdf/QPDFJob.cc:929-997`). A flush
+            // failure here cannot replace the error that stopped the write.
+            let _ = output.flush_buffer();
+        }
+        result.map_err(Error::from)
     }
 
     fn apply_page_label_transformations<R>(
@@ -6061,7 +6115,7 @@ mod tests {
 
     #[test]
     fn job_output_writer_forwards_bytes_and_flush() {
-        let mut writer = JobOutputWriter(PipelineHandle::new(crate::pipeline::Discard));
+        let mut writer = JobOutputWriter::new(PipelineHandle::new(crate::pipeline::Discard));
         std::io::Write::write_all(&mut writer, b"job output").unwrap();
         std::io::Write::flush(&mut writer).unwrap();
     }
