@@ -24,22 +24,29 @@ def image_object():
     )
 
 
-def build(root_entry, with_extensions=False, first_page=None):
+def build(root_entry, with_extensions=False, first_kid=None, first_page_body=None):
     """Build one input.
 
-    ``first_page`` replaces the body of object 3, the first ``/Kids`` leaf.
-    Passing a non-dictionary object such as ``b"42"`` exercises qpdf's
-    ``QPDF::getAllPagesInternal`` leaf arm, which dispatches on
-    ``kid.hasKey("/Kids")`` rather than on ``/Type`` and therefore keeps a
-    non-dictionary leaf in the page list.
+    Both optional arguments exercise qpdf's ``QPDF::getAllPagesInternal`` leaf
+    arm, which dispatches on ``kid.hasKey("/Kids")`` rather than on ``/Type``
+    and therefore keeps a non-dictionary leaf in the page list. They differ in
+    where the non-dictionary value sits:
+
+    ``first_kid`` replaces the first ``/Kids`` *entry* itself, so the leaf is a
+    direct object and qpdf promotes it to an indirect page object.
+
+    ``first_page_body`` replaces the body of object 3, the object the first
+    ``/Kids`` entry already points at, so the leaf is already indirect.
     """
     objects = {
         1: b"<< /Type /Catalog /Pages 2 0 R"
         + (b" /Extensions 11 0 R" if with_extensions else b"")
         + b" >>",
-        2: b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
-        3: first_page
-        if first_page is not None
+        2: b"<< /Type /Pages /Kids ["
+        + (first_kid if first_kid is not None else b"3 0 R")
+        + b" 4 0 R] /Count 2 >>",
+        3: first_page_body
+        if first_page_body is not None
         else b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 12 12] /Contents 5 0 R"
         b" /Resources << /XObject << /Sb 7 0 R /Sa 8 0 R >> >> >>",
         4: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 12 12] /Contents 6 0 R"
@@ -78,8 +85,10 @@ def main(directory):
         handle.write(build(b"<< /Type /Catalog /Pages 2 0 R >>"))
     with open(directory + "/mini-pclm-ext-indirect-in.pdf", "wb") as handle:
         handle.write(build(b"1 0 R", with_extensions=True))
+    with open(directory + "/mini-pclm-nondict-kid-in.pdf", "wb") as handle:
+        handle.write(build(b"1 0 R", first_kid=b"42"))
     with open(directory + "/mini-pclm-nondict-page-in.pdf", "wb") as handle:
-        handle.write(build(b"1 0 R", first_page=b"42"))
+        handle.write(build(b"1 0 R", first_page_body=b"42"))
 
 
 if __name__ == "__main__":

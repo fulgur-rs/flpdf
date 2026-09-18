@@ -15,6 +15,8 @@ const MINI_DIRECT_ROOT_INPUT: &[u8] =
     include_bytes!("../../../tests/fixtures/pclm/mini-pclm-direct-root-in.pdf");
 const MINI_EXT_INDIRECT_INPUT: &[u8] =
     include_bytes!("../../../tests/fixtures/pclm/mini-pclm-ext-indirect-in.pdf");
+const MINI_NONDICT_KID_INPUT: &[u8] =
+    include_bytes!("../../../tests/fixtures/pclm/mini-pclm-nondict-kid-in.pdf");
 const MINI_NONDICT_PAGE_INPUT: &[u8] =
     include_bytes!("../../../tests/fixtures/pclm/mini-pclm-nondict-page-in.pdf");
 
@@ -144,6 +146,20 @@ fn pclm_direct_root_matches_qpdf_11_9() {
         &actual,
         include_bytes!("../../../tests/fixtures/pclm/mini-pclm-direct-root-out.pdf"),
         "PCLm direct Catalog",
+    );
+}
+
+/// qpdf's `getAllPagesInternal` treats any `/Kids` entry without `/Kids` of
+/// its own as a page leaf even when it is not a dictionary, and promotes a
+/// direct kid to an indirect page object (`libqpdf/QPDF_pages.cc:91-131`).
+/// The first kid here is the direct integer `42`.
+#[test]
+fn pclm_non_dictionary_kid_matches_qpdf_11_9() {
+    let actual = write_pclm(MINI_NONDICT_KID_INPUT, |_| {});
+    assert_matches_golden(
+        &actual,
+        include_bytes!("../../../tests/fixtures/pclm/mini-pclm-nondict-kid-out.pdf"),
+        "PCLm non-dictionary page-tree kid",
     );
 }
 

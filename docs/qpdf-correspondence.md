@@ -336,6 +336,14 @@ qpdf 11.9.0 と full-byte 比較し、container-before-plain の part4 順序を
 container の共通 enum layout は stream subclass の 56-byte shape を inline
 で保持せず、stream value だけがその payload allocation を負担する。
 
+`flpdf-rghuz` では、`QPDFAcroFormDocumentHelper::traverseField` の分析 cacheを
+qpdfの raw identity boundaryへ寄せた。qpdf は `isIndirect()` と `QPDFObjGen::set`
+で generationを射影せず field associationを保持する
+（`QPDFAcroFormDocumentHelper.cc:235-286`）。flpdfも field-treeの visited setと
+`get_form_fields`の内部順序を`QpdfObjGen`へ寄せ、qualified-name更新は live handle
+climbを使う。direct objectだけが従来の警告対象で、generation 65535の indirect
+fieldはcacheから落とさない。公開`ObjectRef` mapは既存 projection boundaryとして残す。
+
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
 | `QPDFObjectHandle::makeResourcesIndirect` | `include/qpdf/QPDFObjectHandle.hh:789-793`; `libqpdf/QPDFObjectHandle.cc:1042-1060` | `object_handle.rs::make_resources_indirect` + `acroform_document_helper.rs::prepare_foreign_resource_plan` | ✅ direct second-level resource values are promoted in place through the canonical resolver before `mergeResources`; category dictionaries are not promoted and the walk is non-recursive. Tests cover direct/indirect categories, already-indirect values, non-dictionary top-level entries, alias identity, and the foreign AcroForm caller |
@@ -1510,6 +1518,21 @@ qpdf の未使用 `encryption_R` 引数を省略している。これは reader 
 `(obj,gen)` cache と writer の generation 0 呼び出し契約も保持する。writer state の
 `_encryption_r` は qpdf `QPDFWriter::Members` の state 対応として保持するが、鍵計算へは
 渡さない。
+
+### Reader V/R acceptance set (`flpdf-3yn9.48.163`, 2026-09-18)
+
+qpdf の `initializeEncryption` は `/R ∈ 2..=6` かつ `/V ∈ {1,2,4,5}` の全 20 通りを
+受理する（`QPDF_encryption.cc:787-795`）。flpdf は
+`(V,R) ∈ (1|2, 2|3) | (4,4) | (5,5|6)` の 7 通りに限定し、V<5 側 handler の選択も
+`V` ではなく `R∈{5,6}` で分岐していた。`encryption/state.rs` は handler 選択を
+`/V == 5` に、受理述語と `encryption/standard.rs` の validator を qpdf の 20 通りへ
+広げた（`hash_V5` の R<6 分岐に合わせ、V=5 の password 認証は R>=6 のときだけ
+Algorithm 2.B を使う）。これで到達可能になった V<5/R>=4 と V=4/R≠4 の version floor は
+qpdf と同じ `/R` keyed 規則（`QPDFWriter.cc:806-814`）に揃え、copy path の R=4 は
+`copyEncryptionParameters` の V>=4 AES 強制（`QPDFWriter.cc:674-679`）を反映する。
+`crates/flpdf-cli/tests/cmp_copy_encryption_key_derivation_tests.rs` の
+`copy_encryption_accepts_the_qpdf_vr_set` が V=4/R=3、V=4/R=5、V=2/R=4 の
+primary/copy 両 route を qpdf 11.9.0 と byte 比較する。
 
 ### Copy-encryption の V<5 鍵再導出 (`flpdf-3yn9.48.161`, 2026-09-18)
 

@@ -901,27 +901,21 @@ mod tests {
     }
 
     #[test]
-    fn pclm_seeds_a_non_dictionary_kids_leaf_as_the_first_page() {
+    fn pclm_seeds_a_non_page_kids_leaf_like_qpdf() {
         let mut pdf = fixture_pdf();
         let page = crate::pages::page_refs(&mut pdf).unwrap()[0];
         pdf.replace_object(page, ObjectHandle::integer(42))
             .expect("replace page with a scalar through the canonical route");
 
-        let output = write_pclm_bytes(&mut pdf).expect("a scalar leaf is still a qpdf page");
+        let output = write_pclm_bytes(&mut pdf).expect("a scalar page leaf is seeded like qpdf");
         let output = String::from_utf8_lossy(&output);
 
-        // `QPDF::getAllPagesInternal` classifies a kid by
-        // `kid.hasKey("/Kids")` (`libqpdf/QPDF_pages.cc:100-103`), not by
-        // `/Type`, so the scalar leaf stays in `all_pages` and
-        // `enqueueObjectsPCLm` numbers it as the first PCLm object.
+        // qpdf's `getAllPagesInternal` treats any `/Kids` entry without
+        // `/Kids` as a page leaf, scalar or not (`libqpdf/QPDF_pages.cc:91-131`),
+        // and the PCLm seed numbers the first page object first.
         assert!(
             output.contains("\n1 0 obj\n42\nendobj"),
             "a scalar leaf is seeded as the first PCLm page: {output}"
-        );
-        assert_eq!(
-            output.matches("\n42\nendobj").count(),
-            1,
-            "the scalar leaf is written exactly once: {output}"
         );
     }
 

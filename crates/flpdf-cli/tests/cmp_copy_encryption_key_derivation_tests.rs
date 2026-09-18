@@ -371,3 +371,80 @@ fn copy_encryption_rejects_an_aes_key_qpdf_would_read_out_of_bounds() {
         "flpdf must name the short AES key: {stderr}"
     );
 }
+
+/// Same-width in-place patch of an existing donor. The `/Encrypt` dictionary
+/// is never itself encrypted, so replacing a marker of identical width keeps
+/// every xref offset valid.
+fn patch_existing(directory: &Path, name: &str, source: &Path, old: &[u8], new: &[u8]) -> PathBuf {
+    assert_eq!(old.len(), new.len());
+    let path = directory.join(format!("{name}.pdf"));
+    let mut bytes = std::fs::read(source).expect("read donor");
+    let offsets: Vec<usize> = bytes
+        .windows(old.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == old).then_some(index))
+        .collect();
+    assert_eq!(
+        offsets.len(),
+        1,
+        "{name}: donor must contain exactly one {:?} marker",
+        String::from_utf8_lossy(old)
+    );
+    bytes[offsets[0]..offsets[0] + new.len()].copy_from_slice(new);
+    std::fs::write(&path, bytes).expect("write patched donor");
+    path
+}
+
+/// qpdf's `initializeEncryption` accepts the full V∈{1,2,4,5} × R∈2..=6
+/// cross product (`libqpdf/QPDF_encryption.cc:787-795`). flpdf used to refuse
+/// V=4 R=3, V=4 R=5, and V=2 R=4 outright, so a rewrite of such a document
+/// could not reach the canonical writer at all. The version floors those
+/// cells produce are keyed on `/R` (`libqpdf/QPDFWriter.cc:806-814`), which
+/// the primary route exercises through the document header.
+#[test]
+fn copy_encryption_accepts_the_qpdf_vr_set() {
+    if !qpdf_available() {
+        eprintln!("skipping qpdf differential: qpdf 11.9.0 is not available");
+        return;
+    }
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let build_donor = |name: &str, encrypt_args: &[&str]| -> PathBuf {
+        let path = directory.path().join(format!("{name}.pdf"));
+        let mut args = vec!["--static-id", "--allow-weak-crypto", "--encrypt"];
+        args.extend_from_slice(encrypt_args);
+        args.extend_from_slice(&[
+            "--",
+            PLAIN_FIXTURE,
+            path.to_str().expect("path must be UTF-8"),
+        ]);
+        run_qpdf(&args);
+        path
+    };
+    let rc4_128 = build_donor(
+        "rc4-128",
+        &[
+            "--user-password=u",
+            "--owner-password=o",
+            "--bits=128",
+            "--use-aes=n",
+        ],
+    );
+    let aes_128 = build_donor(
+        "aes-128",
+        &[
+            "--user-password=u",
+            "--owner-password=o",
+            "--bits=128",
+            "--use-aes=y",
+        ],
+    );
+
+    for (case, source, old, new) in [
+        ("v4-r3", &aes_128, &b"/R 4 /StmF"[..], &b"/R 3 /StmF"[..]),
+        ("v4-r5", &aes_128, &b"/R 4 /StmF"[..], &b"/R 5 /StmF"[..]),
+        ("v2-r4", &rc4_128, &b"/R 3 /U"[..], &b"/R 4 /U"[..]),
+    ] {
+        let patched = patch_existing(directory.path(), case, source, old, new);
+        assert_both_routes(directory.path(), case, &patched, "u");
+    }
+}
