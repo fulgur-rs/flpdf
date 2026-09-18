@@ -79,6 +79,7 @@ use crate::pages::{
     repair::{prepare_for_optimization, prepare_for_optimization_with_max_depth, PageTreeRoot},
     resolve_inherited_handle_with_max_depth,
 };
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Seek};
@@ -117,6 +118,10 @@ pub struct RebuildResult {
     /// reference. Membership is captured from the **original** tree before the
     /// rebuild reparents leaves, so it cannot be reconstructed afterwards.
     pub removed_pages: BTreeSet<ObjectRef>,
+    /// The same dropped-page set in qpdf's raw identity domain. Internal
+    /// consumers use this to null a page whose generation cannot project to a
+    /// valid PDF `N G R` reference.
+    pub(crate) removed_page_objgens: BTreeSet<QpdfObjGen>,
 }
 
 // ---------------------------------------------------------------------------
@@ -502,9 +507,10 @@ fn rebuild_page_tree_canonical<R: Read + Seek>(
     // Capture qpdf's repaired leaf order before changing /Kids or /Parent.
     // Any original leaf absent from ref_map is a removed page.
     let original_pages = prepared.pages;
-    let original_page_refs: Vec<ObjectRef> = original_pages
+    let original_page_objgens: Vec<QpdfObjGen> = original_pages
         .iter()
-        .filter_map(ObjectHandle::object_ref)
+        .filter_map(ObjectHandle::qpdf_obj_gen)
+        .filter(|object_gen| object_gen.is_indirect())
         .collect();
 
     let mut new_kids: Vec<ObjectRef> = Vec::with_capacity(selected.len());
@@ -609,15 +615,24 @@ fn rebuild_page_tree_canonical<R: Read + Seek>(
     // A removed page is an original leaf that no selection kept (absent from
     // `ref_map`). New refs minted for duplicate selections are fresh object
     // numbers, never original leaves, so they are correctly excluded.
-    let removed_pages: BTreeSet<ObjectRef> = original_page_refs
+    let retained_page_objgens: BTreeSet<QpdfObjGen> = ref_map
+        .keys()
+        .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
+        .collect();
+    let removed_page_objgens: BTreeSet<QpdfObjGen> = original_page_objgens
         .into_iter()
-        .filter(|p| !ref_map.contains_key(p))
+        .filter(|object_gen| !retained_page_objgens.contains(object_gen))
+        .collect();
+    let removed_pages = removed_page_objgens
+        .iter()
+        .filter_map(|object_gen| object_gen.to_object_ref())
         .collect();
 
     Ok(RebuildResult {
         new_kids,
         ref_map,
         removed_pages,
+        removed_page_objgens,
     })
 }
 
@@ -629,6 +644,7 @@ fn rebuild_page_tree_canonical<R: Read + Seek>(
 mod tests {
     use super::*;
     use crate::job::check_bytes_for_test;
+    use crate::object_handle::ObjectValue;
     use crate::pages::page_refs;
     use crate::pipeline::test_support::NthWriteFailure;
     use crate::pipeline::PipelineHandle;
@@ -834,6 +850,56 @@ mod tests {
         assert!(
             pdf.ever_called_get_all_pages(),
             "qpdf rebuild preparation enumerates pages through getAllPages"
+        );
+    }
+
+    #[test]
+    fn rebuild_and_nullout_keep_a_raw_removed_page_identity() {
+        let mut pdf = open(build_nested_pdf());
+        let raw_page = pdf.get_object_handle_by_raw_identity(11, 65_535);
+        let pages_root = pdf.get_object_handle(ObjectRef::new(2, 0));
+        raw_page.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+                (b"/Parent".to_vec(), pages_root.clone()),
+                (
+                    b"/MediaBox".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(612),
+                        ObjectHandle::integer(792),
+                    ]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        let mut kids = pages_root
+            .try_get_key(b"/Kids")
+            .expect("page-tree kids")
+            .try_as_array()
+            .expect("page-tree kids array")
+            .expect("page-tree kids must be an array");
+        kids.push(raw_page.clone());
+        pages_root
+            .replace_key(b"/Kids", ObjectHandle::array(kids))
+            .expect("attach raw page leaf");
+
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(4, 0)])
+            .expect("rebuild with an unselected raw page");
+        assert!(result
+            .removed_page_objgens
+            .contains(&QpdfObjGen::new(11, 65_535)));
+        assert!(result
+            .removed_pages
+            .iter()
+            .all(|object_ref| { object_ref.number != 11 || object_ref.generation != 65_535 }));
+        crate::job::remap_outline_and_dests(&mut pdf, &result).expect("raw removed page null-out");
+
+        assert!(
+            raw_page.try_is_null().expect("raw removed page null state"),
+            "the unselected raw page must be nulled by the page-driven cleanup"
         );
     }
 
