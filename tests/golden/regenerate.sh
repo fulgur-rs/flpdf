@@ -3273,6 +3273,42 @@ for stem in one-page-no-ext one-page-xyzw-only one-page-ext-indirect; do
     echo "$stem/adbe-inject.pdf"
 done
 
+# --- Generate object-stream membership is fixed in QPDFWriter::doWriteSetup
+# (QPDFWriter.cc:2125-2139), before write() calls prepareFileForWrite
+# (QPDFWriter.cc:2195) and directizes an indirect Catalog /Extensions
+# dictionary. Both fixtures below carry such a dictionary, so the object is
+# still an ObjStm member in qpdf's output even though preparation inlines the
+# Catalog reference afterwards. Encryption is what makes these routes distinct
+# from the plain --object-streams=generate goldens above. RC4-128 keeps the
+# bytes reproducible (AES would add a random IV per stream), and both option
+# sets suppress stream compression (--qdf implies it; --normalize-content=y
+# needs --compress-streams=n) so the goldens do not depend on the DEFLATE
+# backend. ---
+for stem in one-page-ext-indirect linearize-indirect-extensions; do
+    mkdir -p "$REF/$stem"
+    qpdf --allow-weak-crypto --encrypt u o 128 -- \
+        --qdf --object-streams=generate --static-id --warning-exit-0 \
+        "$FIX/$stem.pdf" "$REF/$stem/encrypt-qdf-generate.pdf"
+    echo "$stem/encrypt-qdf-generate.pdf"
+    qpdf --allow-weak-crypto --encrypt u o 128 -- \
+        --normalize-content=y --compress-streams=n --object-streams=generate \
+        --static-id --warning-exit-0 \
+        "$FIX/$stem.pdf" "$REF/$stem/encrypt-normalize-generate.pdf"
+    echo "$stem/encrypt-normalize-generate.pdf"
+done
+
+# The same route without encryption is reached through a non-empty
+# QPDFWriter::setExtraHeaderText (QPDFWriter.cc:269), which has no QPDFJob or
+# command-line binding, so this golden comes from the qpdf C++ API. The
+# generator's own self-check proves the API configuration reproduces
+# `qpdf --qdf --object-streams=generate --static-id` when the header is empty.
+"$ROOT/scripts/generate-qpdf-extra-header-golden.sh" \
+    "$FIX/one-page-ext-indirect.pdf" \
+    "$REF/one-page-ext-indirect/extra-header-qdf-generate.pdf" \
+    '%% flpdf extra header
+'
+echo "one-page-ext-indirect/extra-header-qdf-generate.pdf"
+
 echo ""
 echo "=== All references generated ==="
 

@@ -864,27 +864,20 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         // specialized emitter consumes this setup without another page walk.
         let special_streams = initialize_special_streams(self.pdf, &options)?;
         let effective_object_streams = effective_object_stream_mode(&options);
-        let plain_generate_setup = effective_object_streams == ObjectStreamMode::Generate
-            && !self.settings.linearization
-            && plain::eligible(self.pdf.is_encrypted(), &options, effective_object_streams);
-        let specialized_standard_live = effective_object_streams == options.object_streams
-            && !options.qdf
-            && !options.content_normalization
-            && !options.pclm
-            && !plain::eligible(self.pdf.is_encrypted(), &options, effective_object_streams);
-        let capture_generate_setup = effective_object_streams == ObjectStreamMode::Generate
-            && (self.settings.linearization || plain_generate_setup || specialized_standard_live);
-        if capture_generate_setup {
+        if effective_object_streams == ObjectStreamMode::Generate {
             // qpdf initializes special streams before Generate computes its
-            // compressible membership (`QPDFWriter.cc:2114-2135`). Capture
+            // compressible membership (`QPDFWriter.cc:2114-2139`). Capture
             // this snapshot at the same boundary, still before the common
             // `prepareFileForWrite` call below. Its fresh ObjStm placeholders
             // are also allocated before getObjectCount so they contribute to
             // the progress denominator (`QPDFWriter.cc:1998-2004,2189-2195`).
-            // Linearized Generate consumes this same setup-time membership
-            // after `prepareFileForWrite`; that preserves objects such as an
-            // indirect `/Extensions` dictionary that qpdf directizes during
-            // preparation but has already assigned to an ObjStm.
+            // qpdf reaches `generateObjectStreams` through a bare
+            // `switch (m->object_stream_mode)` that no QDF, encryption, PCLm,
+            // or linearization predicate guards (`QPDFWriter.cc:2125-2139`),
+            // so every Generate route captures here. That boundary is what
+            // preserves objects such as an indirect `/Extensions` dictionary:
+            // `prepareFileForWrite` directizes it afterwards, but the object
+            // has already been assigned to an ObjStm.
             let compressible = object_streams::compressible_objgens_qpdf_plan(self.pdf)?;
             let generated_object_stream_count =
                 object_streams::even_split_into_streams(&compressible.eligible).len();
@@ -3697,7 +3690,11 @@ mod final_handle_writer_tests {
     }
 
     #[test]
-    fn specialized_live_generate_can_fall_back_without_a_setup_snapshot() {
+    fn generate_planning_rejects_a_missing_setup_snapshot() {
+        // qpdf's `doWriteSetup` always runs `generateObjectStreams` before the
+        // write route is chosen (`QPDFWriter.cc:2125-2139`), so a Generate
+        // write without the setup-time membership is an internal invariant
+        // violation rather than a cue to rewalk the prepared graph.
         let mut pdf = Pdf::open(std::io::Cursor::new(
             include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
         ))
@@ -3716,14 +3713,15 @@ mod final_handle_writer_tests {
             static_id: true,
             ..WriterOptions::default()
         };
-        let mut output = Vec::new();
-        output::with_buffer_sink(&mut output, |out| {
+        let error = output::with_buffer_sink(&mut Vec::new(), |out| {
             emit_canonical_pdf_inner(&mut pdf, out, &options, None, setup)
         })
-        .expect("specialized live fallback succeeds");
-        assert!(output
-            .windows(b"/Type /ObjStm".len())
-            .any(|window| window == b"/Type /ObjStm"));
+        .expect_err("Generate planning must require the setup snapshot");
+        assert!(
+            matches!(&error, Error::Internal(message)
+                if message == "Generate object-stream planning requires the writer setup snapshot"),
+            "unexpected error: {error}"
+        );
     }
 
     struct AlwaysFailingOutput;
