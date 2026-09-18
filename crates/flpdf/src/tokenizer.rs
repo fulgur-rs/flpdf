@@ -1017,8 +1017,14 @@ impl<'a> Tokenizer<'a> {
     /// call against that persistent, EOF-enabled tokenizer: `allow_eof` is
     /// set again here rather than once at construction.
     ///
-    /// This is the single entrypoint every flpdf realization of
-    /// `QPDF::readToken` routes through: `ByteCursor::read_token`'s classic
+    /// This is the single entrypoint every *document-slice* realization of
+    /// `QPDF::readToken` routes through. Two live-`InputSource` realizations
+    /// sit outside it and cannot share a slice-based reader:
+    /// `reader::resolver::read_stream_recovery_token` (qpdf's
+    /// `findEndstream`, `QPDF.cc:1473`, owned by B11/C42) and
+    /// `reader::resolver::linearization_candidate` (qpdf's `isLinearized`
+    /// candidate scan, `QPDF_linearization.cc:120-122`). The slice readers
+    /// that do route through here are: `ByteCursor::read_token`'s classic
     /// xref subsection lookahead and `startxref` value read, the trailer's
     /// `stream`-keyword lookahead, [`Self::next_object_stream_integer`]'s ObjStm
     /// header integers, the xref-reconstruction line scan's `int int obj`
@@ -1032,9 +1038,11 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// Read one integer using qpdf's `QPDF::readToken` contract
-    /// (`QPDF.cc:1801-1814`): two [`Self::read_qpdf_token`] calls, then the
-    /// caller checks each returned token's type instead of letting the
-    /// tokenizer throw first.
+    /// (`QPDF.cc:1800-1814`): one [`Self::read_qpdf_token`] call whose
+    /// returned token the caller type-checks, instead of letting the
+    /// tokenizer throw first. qpdf reads the two ObjStm header integers with
+    /// two such calls; this helper is the single one, invoked twice by its
+    /// caller.
     pub(crate) fn next_object_stream_integer(&mut self) -> Result<i64> {
         let token = self.read_qpdf_token(0)?;
         if !token.is_integer() {
