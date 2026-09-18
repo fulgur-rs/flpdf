@@ -50,7 +50,7 @@ markdown だけを読むので `--no-qpdf`（CI の形）でも完全に動く�
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 119 | 0 | 41 | 0 | 160 |
+| 120 | 0 | 40 | 0 | 160 |
 
 ### checker logical aggregate（259 rows）
 
@@ -63,7 +63,7 @@ rowsを検証する。2026-09-18 の現行 `origin/main` (`4942e7b3f7fbeb2a2d79e
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 199 | 0 | 60 | 0 | 259 |
+| 200 | 0 | 59 | 0 | 259 |
 
 したがって、160行の領域別表と259 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
@@ -140,7 +140,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 |---|---|---|---|---|---|
 | [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 18 | 0 | 6 | 0 |
 | [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 25 | 0 | 9 | 0 |
-| [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 40 | 0 | 2 | 0 |
+| [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 41 | 0 | 1 | 0 |
 | [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 17 | 0 | 14 | 0 |
 | [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 19 | 0 | 10 | 0 |
 
@@ -182,7 +182,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 | **stream の復号は pipe 時、文字列の復号は parse 時**（`decryptStream` の呼び出し元は static `pipeStreamData` の 1 箇所だけで、`resolve` / `readStream` からは呼ばれない） | `libqpdf/QPDF.cc:2489-2492` / `libqpdf/QPDF_encryption.cc:1044-1154` / `libqpdf/QPDF_encryption.cc:976-1039` | C14 / C15 / C12 canonical。`crates/flpdf/src/reader/resolver.rs:125-129` が境界を明記 | qpdf の `getRawStreamData` 自体が復号済み・filter未decodeのbytesを返す（`libqpdf/QPDF_Stream.cc:363-375`）。復号の前倒しはoriginal sourceとpipeの責務をずらし、復号済み入力を既存decrypt段へ再投入する等の不整合を招く。rawを暗号文の意味で扱わない |
 | **byte source は 3 つで優先順位が固定**（`stream_data` buffer > `stream_provider` > original の `parsed_offset`+`length`）。`parsed_offset == 0` は「data 無し」で `std::logic_error` | `libqpdf/QPDF_Stream.cc:571-622` / `libqpdf/QPDF_Stream.cc:605-607` | C2 canonical（`crates/flpdf/src/object_handle.rs::pipe_stream_source`） | `replaceStreamData` 後も元ファイルを読み続ける、あるいは置換前の stream で「data 無し」の内部エラーが出る |
 | **provider stream の `/Length` は `Pl_Count` の実測で検証する。不一致は programmer error（`std::runtime_error`）で、`/Length` が無ければ実測値を書き戻す** | `libqpdf/QPDF_Stream.cc:594-600` / `libqpdf/QPDF_Stream.cc:601-604` / `libqpdf/QPDF_Stream.cc:678-680` | C2 canonical、C38 canonical（`crates/flpdf/src/object_handle.rs::replace_filter_data` に `/Length` 契約を集約） | provider が宣言と違うバイト数を出しても黙って通り、`/Length` と実データがずれた PDF を出力する |
-| **`willFilterStream` の判定順序**（filter-on-write veto、metadata / normalize / compress の排他 chain） | `libqpdf/QPDFWriter.cc:1254-1285,2543-2551` | C20 canonical。C22 mixed — plain の `is_data_modified()` 早期 return と linearized の事前 probe は非対称だが、plain/QDF の出力cacheと qpdf の linearize 専用 optimizer probe を含めて照合する | 非対称だけで出力不一致や早期 return 撤去を決めない。C-U3 の library harness で provider 呼出回数、filter、payload を確認する |
+| **`willFilterStream` の判定順序**（filter-on-write veto、metadata / normalize / compress の排他 chain） | `libqpdf/QPDFWriter.cc:1254-1285,2543-2551` | C20 canonical。C22 canonical — 2026-09-18（`flpdf-8od1h`）で plain の `is_data_modified()` 早期 return を撤去し、linearized の事前 probe と同じ canonical probe に統一した | 早期 return 撤去は library RED/GREEN テストと qpdf-zlib-compat byte 比較で確認済み。plain/QDF の出力 cache と linearized optimizer の callback timing の一致は別軸の残課題として C-U3 で追跡する |
 | **書き出し時に stream dict から削除するのは `/Filter` と `/DecodeParms` の 2 キーだけ** | `libqpdf/QPDFWriter.cc:1440-1486` / `libqpdf/QPDFWriter.cc:1451-1455` | C21 canonical。`crates/flpdf/src/writer/object.rs::prepare_stream_dict_entries` が qpdf の shallow-copy ownerで `/Length`・空`/DecodeParms`・`/Filter`/`/Crypt` を処理し、`/F` `/FFilter` `/FDecodeParms` はそのまま出力する。`crates/flpdf/src/writer/plain/body.rs::canonical_stream_output_with_rewrite_policy` はpipe結果と辞書方針を分離した。 | 外部ファイル参照 stream の `/F` が保持され、refilter/decode/filter-on-write veto/metadata/token-filter/provider retryの辞書と呼出順がqpdfと一致する |
 | **`compute_data_key` は読み側と書き側で同じ 1 実装を共有する** | `libqpdf/QPDF_encryption.cc:324-357`（呼び出し元は `libqpdf/QPDF_encryption.cc:963` と `libqpdf/QPDFWriter.cc:845` の 2 箇所のみ） | C17 / C18 canonical — `crates/flpdf/src/encryption/primitives.rs::compute_data_key` に統合し、reader `key_for_object` と writer `set_data_key` が共有。旧 writer 複製を削除した | V/R・key長5/16/24/32・AES/RC4・非zero generation を qpdf 11.9.0 C++ oracle vectors で固定。reader cache と writer generation 0 の call contract は各 consumer に保持 |
 | **pipe されるバイト数は常に `length`**（`recoverStreamLength` が復元した length は `endstream` 直前の改行を含み、qpdf はそれをそのまま pipe する） | `libqpdf/QPDF.cc:2496-2500` / `libqpdf/QPDF.cc:1488-1492` | C42 canonical — `crates/flpdf/src/reader/resolver.rs::pipe_stream_data_from_input` は通常・暗号化・foreign の全 route で caller の `length` を変更しない。show-objectのraw/filtered payloadもrecovered spanをtrimせず出し、表示専用の framing metadata は持たない（`flpdf-zvjf`, `flpdf-hj7v`） | `encrypted-recovered-eol.pdf` と unencrypted recovered-length fixture で qpdf と flpdf の raw bytes、recovered length、content warning、exit 3 を一致させる |
@@ -617,7 +617,7 @@ primitive新設には既存consumerのRED、dead route削除には0 callerと移
 | **D27** pre-write reachability routes (完了) | 0 / 0 | **完了。** qpdf の `QPDFWriter::enqueueObject` / `enqueueObjectsStandard` を writer の emission boundary として採用し、single-source の旧 `sweep_unreachable_objects` と multi-source `--pages` の `_except` sweep をともに撤去した。single-source の qpdf-zlib byte gate と、multi-source の preserve control を維持する | A14（`.46` で完了）、D2/D3/D11（採番・body loop）は非対象 | **完了**（§7.3） |
 | A14 `Pdf::replace_object` → `ResolverHandle::replace_object` | 0 / 0 | **完了。** qpdf の public deletion 相当 `replaceObject(og, newNull())` に route を統合し、signature value stripping は eager deletion を行わず writer の到達性に委ねる。`--remove-restrictions --preserve-unreferenced` の qpdf byte compare も GREEN | A2 / A15 / A24 / A13（legacy cache/tombstone は別 slice） | `.46` で `Pdf::delete_object` と全 production/test caller を撤去した |
 | B14 `crates/flpdf/src/xref.rs::parse_xref_from_start_with_owner` | 2 / 7 | **観測できず。** `probe:` 自分の startxref を指す `/Prev` を持つ 1 section PDF で `qpdf --check` / `flpdf --check` → 双方とも `file is damaged` / `loop detected following xref tables` / `Attempting to reconstruct cross-reference table` の 3 行・同順・exit 3。B14 が予測する診断の二重 push は現れない | なし（単一ファイル `crates/flpdf/src/xref.rs`） | 保留。RED が立たない。B-P1 は「二重 push は起きない」で決着させ、行の主張を弱める（§7.4 の後続 issue） |
-| C22 `crates/flpdf/src/writer/plain/body.rs::canonical_stream_filter_probe` | 初回2 / 0 | **観測できず（CLI 経路では）。** `probe: qpdf --static-id --normalize-content=y [--linearize] two.pdf` と flpdf 同等 → plain / `--linearize` の双方で byte 一致。早期 return を踏むには token filter 登録が要り、それは CLI から到達しない（C-U3 は library harness を要求する） | C20 canonical / C21 canonical（判定順序と責務境界を保つ） | 保留。harness を先に作る（§7.2 stream family の3） |
+| C22 `crates/flpdf/src/writer/plain/body.rs::canonical_stream_filter_probe`（完了） | 初回2 / 0 | **観測できず（CLI 経路では）。** `probe: qpdf --static-id --normalize-content=y [--linearize] two.pdf` と flpdf 同等 → plain / `--linearize` の双方で byte 一致。早期 return を踏むには token filter 登録が要り、それは CLI から到達しない。2026-09-18（`flpdf-8od1h`、PR #2127）: pinned qpdf source（`QPDFWriter.cc:1239-1314`, `QPDF_Stream.cc:488-557`）を直接引用し、token filter を登録する library RED/GREEN テストで早期 return 撤去を確認した | C20 canonical / C21 canonical（判定順序と責務境界を保つ） | **完了**。C22 は `canonical` へ再分類した。C-U3 の broader な caller timing/cache 比較は別課題として残る |
 | D3 `crates/flpdf/src/writer/rewrite_renumber.rs::CanonicalCatalogFirstRenumber` | 初回5 / 0 | `flpdf-hi08` / PR #1486のencrypted Preserve修正はmerge済み。残る先行walkとemission統合は別責務 | D2 / D5 / D6 / D11 / D12 | 初回は保留。現在はD12共有primitive等を独立sliceにできる（§7.2.5） |
 
 E-29 は `.47` で完了したため候補表から除外した。`--no-warn` の open-time delivery は
@@ -683,7 +683,7 @@ warning collectionやtoken primitiveの移植を、領域A全体の統合完了�
 
 1. **hygiene**（§7.4）— C19 の dead route 削除は `.42`、C28 の qtest test 0/1 consumer cutoverは `.48.93`、C28のqpdf-less public hardening/module撤去は `.48.96`、C23 の `pub` 撤去は `.43` で完了。
 2. ~~**C21 の辞書差**~~ — 完了。`/F` `/FFilter` `/FDecodeParms` は `writer/object.rs::prepare_stream_dict_entries`（`crates/flpdf/src/writer/object.rs:1709-1712`）が全分岐で触らない契約を doc comment（`libqpdf/QPDFWriter.cc:1440-1485` 引用）と `tests/oracle/qpdf_refiltered_stream_dictionary_probe.cc` で固定済み。行分類も canonical。
-3. **C22** — C-U3 library harnessでplain/QDF cacheとlinearized probeの挙動を照合する。非対称だけで早期return撤去を決めない。
+3. ~~**C22**~~ — 完了。2026-09-18（`flpdf-8od1h`、PR #2127）で plain 側の `is_data_modified()` 早期 return を撤去し、library RED/GREEN テストと qpdf-zlib-compat byte 比較で確認した。行分類も canonical。C-U3 が問う plain/QDF cacheとlinearized probeの callback timing 一致は別軸の残課題として残る。
 4. **C42 / B11** — recovered length を qpdf 同様に全 span で pipe する経路として完了。表示専用の EOL metadata や framing extension は持たない。前提: probe C-U1。
 5. ~~**C27**~~ — `.48.49` で canonical 化済み（§10 X-4 参照）。bootstrap-context decode は `ObjectHandle::get_stream_data(DecodeLevel::Specialized)` へ移行した。B17 の xref entry 構文処理の正本とは別責務である点は変わらない。
 6. **C44** — public `getStreamJSON` facade と deferred `StreamBlobProvider` 相当は `.48.47` で実装済み。C-U2 の provider 回数・lifetime probe は 2026-09-18（`.48.154`）に `probe154/c44_probe.sh` と flpdf 側テストで完了し、乖離なし。C44 は public facade と deferred blob の責務分離を追跡する mixed 履歴行のまま維持する。canonical C24 `write_stream_json` を二重pipeへ変更しない。
@@ -986,7 +986,7 @@ consumer全体のmixed分類は残るため、行分類の確定を全parity完�
 | B-P8 | 一部旧記述訂正 | B13/B17 | unknown xref stream entry typeは現src/testに存在する。stream keyword found in trailer等の残条件を個別fixtureで照合する。 |
 | C-U1 | 既存sliceで解決 | C42 | recovered full-length pipe と show-object raw/filtered payload を維持する。表示用の追加 framing metadata は持たない。 |
 | C-U2 | 完了（2026-09-18、`flpdf-3yn9.48.154`） | C44 | `probe154/c44_probe.sh`（pinned qpdf 11.9.0 の `getStreamJSON` 直呼び）が provider 呼出回数 1/2/3、`pipeStreamData` の `nullptr` vs `&mut filtering_attempted` の同一出力、`/FlateDecode` の derived decode level（generalized=decode 済み + `/Filter` 除去 / none=raw + `/Filter` 維持）、blob の live-source 性、および**呼出側の handle が破棄された後の serialize**（case F: nested scope で `stream` を破棄してから `unparse`。`F.calls_after_scope=1` / `F.after_handle_drop` が `"data": "cmV0YWluZWQ="` を返し、Rust 側 `get_stream_json_blob_retains_the_stream_handle` と同一）を実測した。`crates/flpdf/tests/stream_json_get_tests.rs` の4テスト（呼出回数・live provider・handle 保持・flate level）が同観測を固定し、乖離なし。C44 は public facade と deferred blob の責務分離を追跡する mixed 履歴行のまま（production route 重複や全体 parity の証拠に広げない）。canonical C24 `write_stream_json` を二重pipeへ変更しない。 |
-| C-U3 | 未観測 | C22/C39 | token filter/providerを登録したlibrary harnessでplain/QDF cacheとlinearized optimizer probeを比較する。非対称だけでbugとはしない。 |
+| C-U3 | 一部解消（2026-09-18、`flpdf-8od1h`） | C22/C39 | C22 の plain 側 `is_data_modified()` 早期 return は撤去し canonical 化した（token filter を登録した library RED/GREEN テストと qpdf-zlib-compat byte 比較で確認）。残る plain/QDF の出力 cache と linearized optimizer の事前 probe の callback timing 一致は非対称だけで bug とはしない、別軸の open question として継続する。 |
 | C-U4 | 完了 | C17/C18 | pinned qpdf headerをincludeしたC++ oracle probeと32固定vectorで、V/R・key長5/16/24/32・AES/RC4・非zero generationを確認し、単一primitiveへ統合した。 |
 | D-U1 | mixed確定・出力差を追加確認 | D6/D31 | source-index順のlinearized Preserveと共有membershipのobjgen順を比較する。既存strict Preserve byte testsを利用する。 |
 | D-U2 | sourceで解決 | D26 | `initialize_special_streams` が qpdf の setup snapshot と page/content/normalized state の owner になった。normalized_streams の適用は `normalize_content` 条件内に限定し（`libqpdf/QPDFWriter.cc:1279`）、decode-only の page修復 trigger は維持する。linearized/他 route の state consumer は後続。 |
