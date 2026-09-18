@@ -803,6 +803,60 @@ fn json_output_rejects_relative_alias_without_modifying_input() {
     );
 }
 
+#[test]
+fn json_implicit_destination_rejects_an_input_named_dash() {
+    // `checkConfiguration` assigns the implicit JSON destination `-` and then
+    // compares it with the input through `QUtil::same_file`
+    // (`libqpdf/QPDFJob.cc:582-586,626-630`), so an input that really is named
+    // `-` in the working directory aliases its own destination. Reaching this
+    // rejection at all is what proves the `--json` route runs the job's
+    // configuration check instead of choosing its own destination.
+    fn case_directory() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("-"), one_page_pdf_with_stream()).unwrap();
+        directory
+    }
+
+    let directory = case_directory();
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .args(["--json", "-"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty(), "no JSON may be emitted");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains(
+            "input file and output file are the same; use --replace-input to intentionally \
+             overwrite the input file"
+        ),
+        "unexpected diagnostic: {stderr:?}"
+    );
+
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    let expected_directory = case_directory();
+    let expected = ShellCommand::new("qpdf")
+        .current_dir(expected_directory.path())
+        .args(["--json", "-"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        expected.status.code(),
+        Some(2),
+        "qpdf 11.9.0 must reject the aliased implicit JSON destination too"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&expected.stderr).replace("qpdf", "PROG"),
+        stderr.replace("flpdf", "PROG"),
+        "the diagnostics must match qpdf 11.9.0"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn json_output_rejects_symlink_to_input_without_modifying_input() {

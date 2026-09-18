@@ -6,8 +6,8 @@ use clap::{Args as ClapArgs, CommandFactory, FromArgMatches, Parser, Subcommand,
 use flpdf::fix_qdf;
 use flpdf::job::{
     copy_duplicate_page_annotations, AttachmentAddOptions, CheckError, FlattenAnnotationsMode,
-    ImageOptimizationOptions, JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput,
-    JsonStreamData, PageSpecInput, PageSpecJobOutput, QPDFJob, RemoveUnreferencedResources,
+    ImageOptimizationOptions, JobExitCode, JsonStreamData, PageSpecInput, PageSpecJobOutput,
+    QPDFJob, RemoveUnreferencedResources,
 };
 use flpdf::pipeline::{FlateAction, Pipeline, PipelineHandle, PlFlate, PlStdioFile};
 use flpdf::qutil::same_file as qpdf_same_file;
@@ -29,8 +29,8 @@ use flpdf::{
 };
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
-use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
+use std::fs::File;
+use std::io::{BufReader, Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -56,99 +56,25 @@ impl CliInputSpec {
 
 struct PipelineWriter {
     pipeline: PipelineHandle,
-    buffered: Option<Vec<u8>>,
 }
-
-const JSON_OUTPUT_BUFFER_CAPACITY: usize = 4096;
 
 impl PipelineWriter {
     fn new(pipeline: PipelineHandle) -> Self {
-        Self {
-            pipeline,
-            buffered: None,
-        }
-    }
-
-    /// Batch JSON fragments before they reach the shared pipeline handle.
-    /// qpdf's logger still owns the complete-line stdout boundary; PDF save
-    /// routes stay immediate so their existing streaming and error timing are
-    /// unchanged.
-    fn begin_json_output_buffering(&mut self) {
-        self.buffered = Some(Vec::with_capacity(JSON_OUTPUT_BUFFER_CAPACITY));
-    }
-
-    fn flush_buffer(&mut self) -> std::io::Result<()> {
-        let Some(buffer) = self.buffered.as_mut() else {
-            return Ok(());
-        };
-        if buffer.is_empty() {
-            return Ok(());
-        }
-        let result = { self.pipeline.write(buffer).map_err(std::io::Error::other) };
-        buffer.clear();
-        result
+        Self { pipeline }
     }
 }
 
 impl Write for PipelineWriter {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        if self.buffered.is_none() {
-            self.pipeline.write(data).map_err(std::io::Error::other)?;
-            return Ok(data.len());
-        }
-
-        let mut remaining = data;
-        while !remaining.is_empty() {
-            if self
-                .buffered
-                .as_ref()
-                .is_some_and(|buffer| buffer.len() == JSON_OUTPUT_BUFFER_CAPACITY)
-            {
-                self.flush_buffer()?;
-            }
-            let capacity = JSON_OUTPUT_BUFFER_CAPACITY
-                - self
-                    .buffered
-                    .as_ref()
-                    .expect("JSON output buffering enabled")
-                    .len();
-            let count = remaining.len().min(capacity);
-            self.buffered
-                .as_mut()
-                .expect("JSON output buffering enabled")
-                .extend_from_slice(&remaining[..count]);
-            remaining = &remaining[count..];
-            if self
-                .buffered
-                .as_ref()
-                .is_some_and(|buffer| buffer.len() == JSON_OUTPUT_BUFFER_CAPACITY)
-            {
-                self.flush_buffer()?;
-            }
-        }
+        self.pipeline.write(data).map_err(std::io::Error::other)?;
         Ok(data.len())
     }
 
+    /// `Write::flush` is intentionally a no-op: the PDF writer's pipeline
+    /// lifetime is owned by its own output boundary, and the job's JSON
+    /// destinations are batched and finished inside the job itself.
     fn flush(&mut self) -> std::io::Result<()> {
-        if self.buffered.is_some() {
-            self.flush_buffer()?;
-        }
         Ok(())
-    }
-}
-
-impl PipelineWriter {
-    /// Finish the logger's save pipeline after a JSON serializer returns.
-    ///
-    /// The JSON command must flush a partial document even when qpdf's
-    /// deferred object-selector parse fails. `Write::flush` intentionally
-    /// remains a no-op for the PDF writer, whose pipeline lifetime is owned by
-    /// its own output boundary.
-    fn finish_pipeline(&mut self) -> CliResult<()> {
-        self.flush()?;
-        self.pipeline
-            .finish()
-            .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
     }
 }
 
@@ -4613,16 +4539,12 @@ fn run_json(
             }
         }
     }
-    if json_output_mode {
-        if json_version == 1 {
-            emit_logger_error("flpdf: --json-output requires JSON version 2\n");
-            std::process::exit(2);
-        }
-        // qpdf's json-output mode always selects the qpdf key in addition to
-        // any explicitly requested keys (`QPDFJob_config.cc:312-324`).
-        if !json_keys.contains(&JsonKey::Qpdf) {
-            json_keys.push(JsonKey::Qpdf);
-        }
+    // qpdf's json-output mode also always selects the qpdf key in addition to
+    // any explicitly requested keys (`QPDFJob_config.cc:312-326`); the job
+    // configuration's own `json_output` selector owns that addition.
+    if json_output_mode && json_version == 1 {
+        emit_logger_error("flpdf: --json-output requires JSON version 2\n");
+        std::process::exit(2);
     }
 
     // 2. Retain --json-object selectors in their raw qpdf spelling. qpdf
@@ -4631,16 +4553,13 @@ fn run_json(
     // stdout. The JSON job boundary owns that deferred conversion.
     let json_objects = cli.json_object.clone();
 
-    // 3. Resolve stream-data mode.
+    // 3. Parse an explicit stream-data mode.
     //
-    // Ordinary `--json` follows the inspection default of no stream payloads;
-    // qpdf's `--json-output` mode selects inline stream data unless the caller
-    // overrides it with --json-stream-data.
-    let stream_data = match cli
-        .json_stream_data
-        .as_deref()
-        .unwrap_or(if json_output_mode { "inline" } else { "none" })
-    {
+    // Ordinary `--json` follows the job configuration's default of no stream
+    // payloads; qpdf's `--json-output` mode selects inline stream data unless
+    // `--json-stream-data` was given (`QPDFJob_config.cc:312-326`), so the job
+    // configuration owns both defaults.
+    let stream_data = cli.json_stream_data.as_deref().map(|value| match value {
         "none" => JsonStreamData::None,
         "inline" => JsonStreamData::Inline,
         "file" => JsonStreamData::File,
@@ -4650,7 +4569,7 @@ fn run_json(
             ));
             std::process::exit(2);
         }
-    };
+    });
 
     // 4. Reject an output that identifies the input file before opening or
     // truncating it. qpdf performs this check in QPDFJob.cc:627-630. Path
@@ -4675,14 +4594,6 @@ fn run_json(
     {
         reject_same_json_output(input, output)?;
     }
-
-    // qpdf reserves standard output for binary/structured save data before
-    // opening the document, so warnings and later info cannot claim stdout.
-    let mut standard_output = if output_path.is_none_or(|path| path == Path::new("-")) {
-        Some(standard_save_writer()?)
-    } else {
-        None
-    };
 
     let mut job = QPDFJob::new();
     job.set_warnings_exit_zero(cli_warning_exit_zero());
@@ -4716,12 +4627,60 @@ fn run_json(
     // and the remaining create-stage transformations
     // (`libqpdf/QPDFJob.cc:466-473`). Queue the raw parameters on this job so
     // every JSON input branch observes the same canonical rotation boundary.
+    //
+    // The JSON output selectors belong to the same configuration: `writeQPDF`
+    // dispatches on `createsOutput()` and `writeOutfile` chooses `writeJSON`'s
+    // destination from the job's own output name
+    // (`libqpdf/QPDFJob.cc:484-489,3031-3042,3093-3115`), so the destination
+    // never travels as a separate argument.
     {
         let mut configuration = job.config();
         for parameter in &cli.page_ops.rotate {
             configuration.rotate(arg_parser::os_bytes(parameter.as_os_str()))?;
         }
+        if empty {
+            configuration.empty_input()?;
+        } else {
+            configuration.input_file(
+                input
+                    .expect("a non-empty JSON job has an input")
+                    .to_path_buf(),
+            )?;
+        }
+        if let Some(path) = output_path {
+            configuration.output_file(path.to_path_buf())?;
+        }
+        if json_output_mode {
+            configuration.json_output(json_version);
+        } else {
+            configuration.json(json_version);
+        }
+        for key in &json_keys {
+            configuration.json_key(*key);
+        }
+        for object in &json_objects {
+            configuration.json_object(object.clone());
+        }
+        if let Some(stream_data) = stream_data {
+            configuration.json_stream_data(stream_data);
+        }
+        if let Some(prefix) = cli.json_stream_prefix.as_deref() {
+            configuration.json_stream_prefix(arg_parser::os_bytes(prefix));
+        }
+        if cli.test_json_schema {
+            configuration.test_json_schema();
+        }
+        if let Some(decode_level) = cli.decode_level {
+            configuration.decode_level(StreamDecodeLevel::from(decode_level));
+        }
     }
+    job.set_show_encryption_key(cli.show_encryption_key);
+    // `QPDFJob::createQPDF` runs `checkConfiguration` before it opens the
+    // primary input (`libqpdf/QPDFJob.cc:428-431`). It assigns the implicit
+    // JSON destination `-` when no output file was given and reserves standard
+    // output for the JSON document, so warnings and later info cannot claim
+    // the stream the document itself needs (`:582-586,613-625`).
+    job.check_configuration()?;
 
     if empty {
         let mut pdf = create_empty_primary_document(&mut job, cli.update_from_json.as_deref())?;
@@ -4733,31 +4692,14 @@ fn run_json(
             cli.remove_restrictions,
             cli.coalesce_contents,
         )?;
-        let mut runtime = JsonJobRuntime {
-            input_identity: None,
-            output_path,
-            standard_output: &mut standard_output,
-            job: &mut job,
-        };
-        return run_json_document(
-            cli,
-            &mut runtime,
-            &mut pdf,
-            json_version,
-            cli.test_json_schema,
-            cli.show_encryption_key,
-            json_output_mode,
-            stream_data,
-            &json_keys,
-            &json_objects,
-        );
+        return run_json_document(&mut job, &mut pdf);
     }
 
     let input = input.expect("non-empty JSON route has an input");
 
-    // 5. Open the input once and retain an identity handle for the output
-    // check. JSON input uses the canonical complete-document importer; a
-    // partial update is applied immediately after creation/opening.
+    // 5. Open the input. JSON input uses the canonical complete-document
+    // importer; a partial update is applied immediately after
+    // creation/opening.
     let input_file = File::open(input).map_err(|error| {
         if cli.json_input {
             qpdf_json_input_open_error(input, error)
@@ -4765,10 +4707,6 @@ fn run_json(
             json_input_open_error(input, error)
         }
     })?;
-    let input_identity = input_file
-        .try_clone()
-        .map_err(|error| error_with_file(input, error.into()))?;
-
     if cli.json_input {
         let mut pdf = job
             .create_from_json_document(input_file, path_description(input))
@@ -4782,24 +4720,7 @@ fn run_json(
             cli.remove_restrictions,
             cli.coalesce_contents,
         )?;
-        let mut runtime = JsonJobRuntime {
-            input_identity: Some(&input_identity),
-            output_path,
-            standard_output: &mut standard_output,
-            job: &mut job,
-        };
-        run_json_document(
-            cli,
-            &mut runtime,
-            &mut pdf,
-            json_version,
-            cli.test_json_schema,
-            cli.show_encryption_key,
-            json_output_mode,
-            stream_data,
-            &json_keys,
-            &json_objects,
-        )
+        run_json_document(&mut job, &mut pdf)
     } else {
         let mut pdf =
             open_pdf_from_file(input, input_file, cli.repair, &cli.password, cli.no_warn)?;
@@ -4814,24 +4735,7 @@ fn run_json(
             cli.remove_restrictions,
             cli.coalesce_contents,
         )?;
-        let mut runtime = JsonJobRuntime {
-            input_identity: Some(&input_identity),
-            output_path,
-            standard_output: &mut standard_output,
-            job: &mut job,
-        };
-        run_json_document(
-            cli,
-            &mut runtime,
-            &mut pdf,
-            json_version,
-            cli.test_json_schema,
-            cli.show_encryption_key,
-            json_output_mode,
-            stream_data,
-            &json_keys,
-            &json_objects,
-        )
+        run_json_document(&mut job, &mut pdf)
     }
 }
 
@@ -4988,123 +4892,29 @@ fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
     }
 }
 
-/// Serialize an already-opened job document through the existing qpdf JSON
-/// output consumer. Keeping this generic preserves the same output path for
-/// file-backed PDF inputs and JSON-created documents.
-#[allow(clippy::too_many_arguments)]
-fn run_json_document<R: Read + Seek>(
-    cli: &Cli,
-    runtime: &mut JsonJobRuntime<'_>,
+/// Write one already-created job document through the job's own write stage.
+///
+/// `QPDFJob::writeQPDF` dispatches on `createsOutput()` and, for a JSON job,
+/// reaches `writeJSON` through `writeOutfile`, which picks the destination
+/// from the job's own output name (`libqpdf/QPDFJob.cc:484-489,3031-3042,
+/// 3093-3115`). The CLI therefore configures the destination and hands the
+/// document over rather than selecting an output itself.
+fn run_json_document<R: Read + Seek + 'static>(
+    job: &mut QPDFJob,
     pdf: &mut Pdf<R>,
-    json_version: i32,
-    test_json_schema: bool,
-    show_encryption_key: bool,
-    json_output_mode: bool,
-    stream_data: JsonStreamData,
-    json_keys: &[JsonKey],
-    json_objects: &[String],
 ) -> CliResult<()> {
-    // `decode_level` governs both inline `data` payloads and file-mode side
-    // files emitted by the job-owned JSON output pipeline.
-    let json_decode_level =
-        cli.decode_level
-            .map(DecodeLevel::from)
-            .unwrap_or(if json_output_mode {
-                DecodeLevel::None
-            } else {
-                DecodeLevel::Generalized
-            });
-    let output_path = runtime.output_path.filter(|path| *path != Path::new("-"));
-    if output_path.is_none() {
-        runtime
-            .standard_output
-            .as_mut()
-            .expect("stdout writer prepared for JSON stdout")
-            .begin_json_output_buffering();
+    match job.write_qpdf(pdf) {
+        Ok(()) => finish_job_exit_status(job.get_exit_code()),
+        // qpdf's `QPDFUsage` escapes `writeQPDF` uncaught and is rendered by
+        // `usageExit` (`qpdf/qpdf.cc:37-38`); `writeJSON` raises one for a
+        // stdout destination that cannot name its stream side files.
+        Err(Error::Usage(error)) => Err(Box::new(error)),
+        // Every other write failure has already been reported by the job.
+        Err(_) => Err(Box::new(CliExitError {
+            code: ExitCode::Errors,
+            message: String::new(),
+        })),
     }
-    let stream_prefix = cli.json_stream_prefix.as_deref().map(arg_parser::os_bytes);
-    let json_result = if let Some(path) = output_path {
-        let mut file = open_verified_json_output(runtime.input_identity, path)?;
-        let options = JsonJobOptions {
-            decode_level: json_decode_level,
-            stream_data,
-            stream_prefix: stream_prefix.as_deref(),
-            keys: json_keys,
-            objects: json_objects,
-        };
-        runtime.job.write_json_with_version(
-            pdf,
-            json_version,
-            test_json_schema,
-            json_output_mode,
-            show_encryption_key,
-            cli.verbose,
-            options,
-            JsonJobOutput::File {
-                filename: path,
-                writer: &mut file,
-            },
-        )
-    } else {
-        let options = JsonJobOptions {
-            decode_level: json_decode_level,
-            stream_data,
-            stream_prefix: stream_prefix.as_deref(),
-            keys: json_keys,
-            objects: json_objects,
-        };
-        runtime.job.write_json_with_version(
-            pdf,
-            json_version,
-            test_json_schema,
-            json_output_mode,
-            show_encryption_key,
-            cli.verbose,
-            options,
-            JsonJobOutput::Stdout(
-                runtime
-                    .standard_output
-                    .as_mut()
-                    .expect("stdout writer prepared for JSON stdout"),
-            ),
-        )
-    };
-    // `PipelineWriter::flush` is intentionally a no-op for the general PDF
-    // writer, but JSON's qpdf save pipeline must be finished even when its
-    // deferred object selector fails after writing a prefix.
-    let stdout_finish = if output_path.is_none() {
-        Some(
-            runtime
-                .standard_output
-                .as_mut()
-                .expect("stdout writer prepared for JSON stdout")
-                .finish_pipeline(),
-        )
-    } else {
-        None
-    };
-    match json_result {
-        Ok(JobExitCode::Success) => {}
-        Ok(JobExitCode::Error) => {
-            return Err(Box::new(CliExitError {
-                code: ExitCode::Errors,
-                message: String::new(),
-            }))
-        }
-        Ok(JobExitCode::Warning) => {
-            return Err(Box::new(CliExitError {
-                code: ExitCode::Warnings,
-                message: String::new(),
-            }));
-        }
-        Err(JsonJobError::Output(error)) => return Err(Box::new(Error::from(error))),
-        Err(JsonJobError::Usage(error)) => return Err(Box::new(error)),
-        Err(JsonJobError::Completion(error)) => return Err(Box::new(error)),
-    }
-    if let Some(result) = stdout_finish {
-        result?;
-    }
-    Ok(())
 }
 
 fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()> {
@@ -9197,32 +9007,6 @@ fn qpdf_json_input_open_error(input: &Path, error: std::io::Error) -> Box<dyn st
     Box::new(flpdf::Error::SystemBytes(raw_message))
 }
 
-fn open_verified_json_output(input: Option<&File>, output: &Path) -> CliResult<File> {
-    // qpdf opens the JSON output with `QUtil::safe_fopen(outfilename, "w")`
-    // (`libqpdf/QPDFJob.cc:3104`), so a failure reads `open <path>: <strerror>`.
-    let mut output_file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(output)
-        .map_err(|error| open_error_with_file(output, error.into()))?;
-    if let Some(input) = input {
-        let input_handle = same_file::Handle::from_file(input.try_clone()?)?;
-        let output_handle = same_file::Handle::from_file(output_file.try_clone()?)?;
-        if input_handle == output_handle {
-            return Err(
-                "input file and output file are the same; choose a different --json-output path"
-                    .into(),
-            );
-        }
-    }
-    if output_file.metadata()?.file_type().is_file() {
-        output_file.set_len(0)?;
-        output_file.seek(SeekFrom::Start(0))?;
-    }
-    Ok(output_file)
-}
-
 #[derive(Debug, Clone, Copy)]
 enum ShowObjectSelector {
     Trailer,
@@ -9750,13 +9534,6 @@ fn hex_lower(bytes: &[u8]) -> String {
 enum JobPdf {
     File(Pdf<BufReader<File>>),
     Json(Pdf<Cursor<Vec<u8>>>),
-}
-
-struct JsonJobRuntime<'a> {
-    input_identity: Option<&'a File>,
-    output_path: Option<&'a Path>,
-    standard_output: &'a mut Option<PipelineWriter>,
-    job: &'a mut QPDFJob,
 }
 
 fn apply_json_update<R: Read + Seek + 'static>(
@@ -10873,25 +10650,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pipeline_writer_batches_small_writes_until_finish() {
-        let chunks = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
-        let mut writer = PipelineWriter::new(PipelineHandle::new(ChunkRecordingSink {
-            chunks: Arc::clone(&chunks),
-        }));
-        writer.begin_json_output_buffering();
-
-        writer.write_all(b"first").unwrap();
-        writer.write_all(b" second").unwrap();
-        assert!(chunks.lock().unwrap().is_empty());
-
-        writer.finish_pipeline().unwrap();
-        assert_eq!(
-            chunks.lock().unwrap().as_slice(),
-            [b"first second".to_vec()]
-        );
-    }
-
     struct FailingPasswordNoticeSink;
 
     impl Pipeline for FailingPasswordNoticeSink {
@@ -11515,29 +11273,6 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unable to find /Root dictionary"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn verified_json_output_rejects_hardlink_swapped_after_path_check() {
-        let temp = tempfile::tempdir().unwrap();
-        let input_path = temp.path().join("input.pdf");
-        let output_path = temp.path().join("output.json");
-        let original = b"input bytes must survive".to_vec();
-        std::fs::write(&input_path, &original).unwrap();
-        std::fs::write(&output_path, b"distinct output").unwrap();
-        reject_same_json_output(&input_path, &output_path).unwrap();
-
-        std::fs::remove_file(&output_path).unwrap();
-        std::fs::hard_link(&input_path, &output_path).unwrap();
-        let input_file = File::open(&input_path).unwrap();
-
-        let error = open_verified_json_output(Some(&input_file), &output_path).unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("input file and output file are the same"));
-        assert_eq!(std::fs::read(&input_path).unwrap(), original);
     }
 
     // --- parse_overlay_segment ------------------------------------------

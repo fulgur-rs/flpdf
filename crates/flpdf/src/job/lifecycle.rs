@@ -5183,6 +5183,106 @@ impl QPDFJobConfig<'_> {
         self
     }
 
+    /// Select qpdf's JSON output at the requested version.
+    ///
+    /// This is `QPDFJob::Config::json` (`libqpdf/QPDFJob_config.cc:253-265`).
+    /// qpdf parses and range-checks the version spelling inside the callback;
+    /// the argv boundaries own that parse here, so this takes the parsed
+    /// version. `check_configuration` then defaults the destination to
+    /// standard output when no output file was given, and `write_qpdf`
+    /// dispatches JSON output through `writeOutfile`'s destination rewrite.
+    pub fn json(&mut self, version: i32) -> &mut Self {
+        self.job.configuration.json_version = Some(version);
+        self
+    }
+
+    /// Select qpdf's `--json-output` mode at the requested version.
+    ///
+    /// This is `QPDFJob::Config::jsonOutput`
+    /// (`libqpdf/QPDFJob_config.cc:312-326`): it selects JSON output, defaults
+    /// stream data to inline and the decode level to none unless either was
+    /// set explicitly, and adds the `qpdf` key.
+    pub fn json_output(&mut self, version: i32) -> &mut Self {
+        self.job.configuration.json_output = true;
+        self.json(version);
+        if !self.job.configuration.json_stream_data_set {
+            self.job.configuration.json_stream_data = JsonStreamData::Inline;
+        }
+        if !self.job.configuration.json_decode_level_set {
+            self.job.configuration.json_decode_level = crate::writer::DecodeLevel::None;
+        }
+        self.json_key(JsonKey::Qpdf);
+        self
+    }
+
+    /// Request one top-level qpdf JSON key.
+    ///
+    /// This is `QPDFJob::Config::jsonKey`
+    /// (`libqpdf/QPDFJob_config.cc:267-272`). qpdf keeps the keys in a
+    /// `std::set`, so requesting the same key twice records it once.
+    pub fn json_key(&mut self, key: JsonKey) -> &mut Self {
+        if !self.job.configuration.json_keys.contains(&key) {
+            self.job.configuration.json_keys.push(key);
+        }
+        self
+    }
+
+    /// Retain one raw `--json-object` selector.
+    ///
+    /// This is `QPDFJob::Config::jsonObject`
+    /// (`libqpdf/QPDFJob_config.cc:274-279`). qpdf stores the spelling and
+    /// parses it only while the object section is emitted
+    /// (`libqpdf/QPDFJob.cc:929-997`).
+    pub fn json_object(&mut self, selector: impl Into<String>) -> &mut Self {
+        self.job.configuration.json_objects.push(selector.into());
+        self
+    }
+
+    /// Select how stream payloads appear in JSON output.
+    ///
+    /// This is `QPDFJob::Config::jsonStreamData`
+    /// (`libqpdf/QPDFJob_config.cc:281-296`), including the explicit-selection
+    /// flag that keeps `--json-output` from defaulting the mode to inline.
+    /// qpdf parses the spelling inside the callback; the argv boundaries own
+    /// that parse here.
+    pub fn json_stream_data(&mut self, stream_data: JsonStreamData) -> &mut Self {
+        self.job.configuration.json_stream_data_set = true;
+        self.job.configuration.json_stream_data = stream_data;
+        self
+    }
+
+    /// Set the prefix for JSON stream side files.
+    ///
+    /// This is `QPDFJob::Config::jsonStreamPrefix`
+    /// (`libqpdf/QPDFJob_config.cc:298-303`).
+    pub fn json_stream_prefix(&mut self, prefix: impl Into<Vec<u8>>) -> &mut Self {
+        self.job.configuration.json_stream_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Validate generated JSON output against qpdf's own schema.
+    ///
+    /// This is `QPDFJob::Config::testJsonSchema`
+    /// (`libqpdf/QPDFJob_config.cc:335-340`).
+    pub fn test_json_schema(&mut self) -> &mut Self {
+        self.job.configuration.test_json_schema = true;
+        self
+    }
+
+    /// Set the stream decoding level used for JSON output.
+    ///
+    /// This is `QPDFJob::Config::decodeLevel`
+    /// (`libqpdf/QPDFJob_config.cc:717-732`), including the explicit-selection
+    /// flag that keeps `--json-output` from defaulting the level to none.
+    /// qpdf's single `m->decode_level` serves both the writer and JSON output;
+    /// flpdf carries the writer's copy in the writer configuration, so this
+    /// sets the JSON consumer's level only.
+    pub fn decode_level(&mut self, decode_level: crate::writer::DecodeLevel) -> &mut Self {
+        self.job.configuration.json_decode_level_set = true;
+        self.job.configuration.json_decode_level = decode_level;
+        self
+    }
+
     /// Configure qpdf's `updateFromJson` create-stage input.
     pub fn update_from_json(&mut self, path: impl Into<PathBuf>) -> &mut Self {
         self.job.configuration.update_from_json = Some(path.into());
