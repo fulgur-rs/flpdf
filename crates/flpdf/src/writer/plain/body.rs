@@ -3447,7 +3447,6 @@ mod object_emitter_tests {
                 root: None,
                 direct_root: None,
                 id: crate::writer::plain::xref::IdPlan::Materialized { value: None },
-                encrypt: None,
                 structural_filtered: false,
                 qdf: false,
             },

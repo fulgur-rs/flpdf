@@ -569,7 +569,6 @@ impl PlainWritePlan {
                 value: materialized_id_handle(&trailer_handle.try_get_key(b"/ID")?)?,
             }
         };
-        let encrypt = trailer_handle.try_get_key(b"/Encrypt")?.object_ref();
         let structural_filtered = matches!(
             crate::writer::effective_stream_policy(options),
             Some(CompressStreams::Yes)
@@ -579,7 +578,6 @@ impl PlainWritePlan {
             root,
             direct_root: direct_root.clone(),
             id,
-            encrypt,
             structural_filtered,
             qdf: options.qdf,
         };
@@ -1330,7 +1328,6 @@ mod tests {
                 root: Some(root_output),
                 direct_root: None,
                 id: IdPlan::Materialized { value: None },
-                encrypt: None,
                 structural_filtered: false,
                 qdf: false,
             },

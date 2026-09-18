@@ -328,7 +328,6 @@ fn write_plain_live<R: Read + Seek>(
         root,
         direct_root: direct_root_output,
         id,
-        encrypt: trailer_handle.try_get_key(b"/Encrypt")?.object_ref(),
         structural_filtered,
         qdf: options.qdf,
     };

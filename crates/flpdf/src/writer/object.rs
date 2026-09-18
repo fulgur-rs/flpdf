@@ -5650,10 +5650,19 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
         TrailerKind::LinearizedSecond { size } => (size, None, true),
     };
 
-    if qdf {
-        out.write_bytes(b"trailer <<\n")?;
-    } else if !xref_stream {
+    // qpdf writes the `trailer` keyword only for the classic (non-xref-stream)
+    // form, then unconditionally emits the QDF separator newline regardless of
+    // which branch ran (`if (xref_stream) {...} else {writeString("trailer
+    // <<");} writeStringQDF("\n");`, `QPDFWriter.cc:1159-1169`). Folding the
+    // `qdf` check into the same branch as `xref_stream` (as an `else if`)
+    // would drop the "trailer <<" keyword's separator on the embedded
+    // xref-stream QDF form -- the classic route's callers do not run that
+    // combination, but `xref_stream: true` from `write_xref_stream` does.
+    if !xref_stream {
         out.write_bytes(b"trailer <<")?;
+    }
+    if qdf {
+        out.write_bytes(b"\n")?;
     }
 
     // qpdf's t_lin_second form writes the writer-owned /Size before walking
