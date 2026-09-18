@@ -971,7 +971,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             let transformed = {
                 let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf)?;
                 let transformed = acroform.transform_annotations(old_annots, matrix)?;
-                acroform.remove_form_fields(&transformed.old_fields)?;
+                acroform.remove_form_fields(&transformed.old_field_objgens)?;
                 acroform.add_form_fields(transformed.new_fields.clone())?;
                 transformed
             };
