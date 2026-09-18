@@ -1,8 +1,8 @@
 # flpdf ↔ qpdf route matrix — 二重正本トラッカーの symbol manifest
 #
 # 対象: docs/qpdf-route-matrix/{a..e}-*.md の 162 行のうち、classification が
-# `bridge` または `mixed` の 97 行の「flpdf current entrypoint」に現れる flpdf symbol
-# （167 個）。`canonical` 行は対象外。bridge/mixed で entrypoint が `absent` の
+# `bridge` または `mixed` の行の「flpdf current entrypoint」に現れる flpdf symbol。
+# 2026-09-18 時点で対象行は 92 行（`bridge` 0 / `mixed` 92）。`canonical` 行は対象外。bridge/mixed で entrypoint が `absent` の
 # B29 も `unknown` なので元から対象外。B7 は `.48.14` でObjStm header用の
 # `next_object_stream_integer` consumerを追加した。
 #
@@ -77,6 +77,16 @@
 # excluded exception denominator; the normal flpdf source/test census is zero.
 
 # --- (a) deletable route ---
+# 2026-09-18 (`flpdf-3yn9.48.151`): owner-less bootstrap xref parser を撤去し、
+# `BootstrapCache` / `BootstrapHandleState` / `read_uncompressed_object` /
+# `resolve_objects_in_stream` / `parse_xref_from_start` / `parse_trailer_candidate` と
+# `crates/flpdf/src/reader/file_object.rs` 全体（`finish_file_object_handle` /
+# `recover_stream_boundary` / `parse_file_object_handle_syntax` / `RecoveryPolicy`）が
+# production・test ともに caller 0 になり、symbol 自体を削除した。これに伴い
+# A20 / B8 / B9 / B10 / B11 / B12 が `canonical` になったため、その baseline
+# denominator 行（`disconnect_all` / `ObjectHandle::disconnect` /
+# `read_object_at_offset_with_description` / `validate_stream_line_end` /
+# `resolve_object_stream_with_failure_kind`）も対象外になった。
 crates/flpdf/src/object_handle.rs::ObjectHandle::as_dictionary           # A6 非解決族
 crates/flpdf/src/object_handle.rs::ObjectHandle::as_array                # A6
 crates/flpdf/src/object_handle.rs::ObjectHandle::as_integer              # A6
@@ -92,7 +102,6 @@ crates/flpdf/src/reader.rs::Pdf::canonical_object_refs                   # A10
 crates/flpdf/src/reader.rs::Pdf::canonical_live_object_refs              # A10
 crates/flpdf/src/reader.rs::Pdf::next_available_object_ref               # A11 facade 側
 crates/flpdf/src/reader.rs::Pdf::make_indirect_object_handle             # A12 canonical public factory
-crates/flpdf/src/xref.rs::BootstrapCache                                 # A20 第 2 の teardown walk
 # --- (b) baseline denominator ---
 crates/flpdf/src/reader/resolver.rs::ResolverCore                        # A1/A24 canonical
 crates/flpdf/src/reader/resolver.rs::object_cache                        # A1（フィールド）
@@ -104,8 +113,6 @@ crates/flpdf/src/reader/resolver.rs::make_indirect_from_object_handle    # A12 c
 crates/flpdf/src/reader/resolver.rs::remove_object                       # A13 canonical（prod 1 / test 2）
 crates/flpdf/src/reader.rs::Pdf::replace_object                          # A16（facade+canonical 合流）
 crates/flpdf/src/reader.rs::Pdf::swap_objects                            # A17（facade+canonical 合流）
-crates/flpdf/src/reader/resolver.rs::disconnect_all                      # A20 canonical
-crates/flpdf/src/object_handle.rs::ObjectHandle::disconnect              # A20
 crates/flpdf/src/object_handle.rs::canonical_dictionary_key              # A23 canonical 側（legacy_dictionary_key と対）
 
 # ===========================================================================
@@ -117,26 +124,14 @@ crates/flpdf/src/object_handle.rs::canonical_dictionary_key              # A23 c
 # ContentHandleParser / content_good_count / content_give_up (B2/B4) を
 # flpdf-3yn9.48.16 (2026-09-08) で撤去済み。LiveFileParser の content_stream
 # フィールドへ統合し、parse_live_content_stream_object が唯一のconsumer。
-crates/flpdf/src/xref.rs::read_uncompressed_object                       # B8 bootstrap 側
-crates/flpdf/src/reader/file_object.rs::finish_file_object_handle        # B9/B10 legacy・bootstrap 側
-crates/flpdf/src/reader/file_object.rs::recover_stream_boundary          # B11 第 2 実装
-crates/flpdf/src/reader/file_object.rs::RecoveryPolicy                   # B11/B26 第 3 の表現
-crates/flpdf/src/xref.rs::resolve_objects_in_stream                      # B12 bootstrap 側
-crates/flpdf/src/xref.rs::parse_xref_from_start                          # B14 初段の直呼び
 crates/flpdf/src/reader/resolver.rs::reconstruct_xref_and_retry          # B22 resolve 側
 crates/flpdf/src/xref.rs::XrefLoadOptions                                # B26 open 時の第 2 表現
 crates/flpdf/src/xref.rs::LoadedXref                                     # B27 internal load state; no public export
-crates/flpdf/src/xref.rs::BootstrapHandleState                           # B27/B12 test-only bounded reconstruction scaffolding
 
 # --- (b) baseline denominator ---
 crates/flpdf/src/parser.rs::too_many_bad_tokens                          # B4 canonical
 crates/flpdf/src/tokenizer.rs::Tokenizer::next_object_stream_integer      # B7 local qpdf readToken consumer
-crates/flpdf/src/reader/resolver.rs::read_object_at_offset_with_description  # B8 canonical
-crates/flpdf/src/reader/file_object.rs::parse_file_object_handle_syntax  # B9 canonical
-crates/flpdf/src/reader/resolver.rs::validate_stream_line_end            # B10 canonical
 crates/flpdf/src/reader/resolver.rs::recover_stream_length               # B11 canonical / C42 mixed
-crates/flpdf/src/reader/resolver.rs::resolve_object_stream_with_failure_kind # B12 canonical
-crates/flpdf/src/xref.rs::parse_trailer_candidate                        # B13 canonical
 crates/flpdf/src/xref.rs::merge_previous_xref_sections_with_observer     # B14 canonical
 crates/flpdf/src/xref.rs::scan_object_header_after_first_token           # B20
 crates/flpdf/src/xref.rs::merge_recovered_qpdf_state                     # B20 事後 filter

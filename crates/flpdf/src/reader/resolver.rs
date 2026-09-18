@@ -2125,9 +2125,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         // `removeObject` is instead an exact cache/xref mutation
         // (`QPDF.cc:1996-2005`). A prior canonical removal therefore cannot
         // filter this fresh recovery scan.
-        let filename = self.core.borrow().description.clone();
-        let new_entries =
-            crate::xref::recover_xref_entries(logical_bytes, false, &filename)?.entries;
+        let new_entries = crate::xref::recover_xref_entries(logical_bytes)?;
         let new_raw_entries = new_entries
             .iter()
             .map(|(object_ref, entry)| Ok((QpdfObjGen::try_from_object_ref(*object_ref)?, *entry)))

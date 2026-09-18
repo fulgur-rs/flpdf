@@ -247,10 +247,9 @@ impl<R: Read + Seek> Pdf<R> {
             }
             Err(error) => return Err(error),
         };
-        // The production xref loader was given this resolver as its canonical
-        // owner, so xref-stream handles and all metadata they resolve are
-        // already in the live cache. The owner-less loader keeps its
-        // temporary bootstrap handoff only for its standalone API/tests.
+        // The xref loader was given this resolver as its canonical owner, so
+        // xref-stream handles and all metadata they resolve are already in the
+        // live cache.
         let parsed_xref_streams = loaded_state.parsed_xref_streams;
         let trailer_references = loaded_state.trailer_references;
         let header_offset = loaded_state.header_offset;
@@ -665,7 +664,7 @@ impl Pdf<Cursor<Vec<u8>>> {
 mod tests {
     use super::{qpdf_open_parse_error, Pdf, EMPTY_PDF_BYTES};
     use crate::reader::resolver::{ResolverHandle, ResolverWarningOptions};
-    use crate::xref::{load_xref_state_from_bytes, XrefLoadOptions};
+    use crate::xref::{load_xref_state_from_source, XrefLoadOptions};
     use crate::{Error, ObjectRef, PdfOpenOptions, QPDFLogger};
     use std::collections::BTreeMap;
     use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -683,12 +682,8 @@ mod tests {
             ResolverWarningOptions::new(QPDFLogger::default_logger(), false, Vec::new()),
             unique_id,
         );
-        let loaded = load_xref_state_from_bytes(
-            EMPTY_PDF_BYTES,
-            XrefLoadOptions::default(),
-            Some(resolver.as_ref()),
-        )
-        .expect("classic xref should load through the canonical owner");
+        let loaded = load_xref_state_from_source(resolver.as_ref(), XrefLoadOptions::default())
+            .expect("classic xref should load through the canonical owner");
 
         let trailer_root = loaded
             .loaded
@@ -710,7 +705,7 @@ mod tests {
         // cov:ignore-start: the test reader's seek always fails before any read can occur
         impl Read for SeekFails {
             fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
-                unreachable!("the bootstrap seek must fail before a read");
+                unreachable!("the initial seek must fail before a read");
             }
         }
         // cov:ignore-end

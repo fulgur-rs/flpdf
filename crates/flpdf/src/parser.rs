@@ -3,9 +3,7 @@
 //! qpdf correspondence: QPDFParser.cc live file-object parsing plus slice object/content consumer boundaries.
 //!
 use crate::object_handle::{DocumentResolver, ObjectHandle, ObjectValue, NO_PARSED_OFFSET};
-use crate::tokenizer::{
-    is_delimiter, is_ws, PushedLiveToken, PushedSimpleToken, Token, TokenType, Tokenizer,
-};
+use crate::tokenizer::{PushedLiveToken, PushedSimpleToken, Token, TokenType, Tokenizer};
 use crate::{Error, ObjectRef, QpdfErrorCode, QpdfExc, Result};
 use std::rc::{Rc, Weak};
 
@@ -2839,16 +2837,4 @@ fn qpdf_int(value: i64, offset: usize) -> Result<i32> {
             ),
         )
     })
-}
-
-pub(crate) fn keyword_token_end(input: &[u8], pos: usize, keyword: &[u8]) -> Option<usize> {
-    let end = pos.checked_add(keyword.len())?;
-    if input.get(pos..end)? != keyword {
-        return None;
-    }
-    match input.get(end) {
-        None => Some(end),
-        Some(&byte) if is_ws(byte) || is_delimiter(byte) => Some(end),
-        Some(_) => None,
-    }
 }

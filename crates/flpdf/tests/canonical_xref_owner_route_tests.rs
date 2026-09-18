@@ -162,10 +162,16 @@ fn production_open_always_supplies_the_canonical_xref_owner() {
     )
     .expect("read xref source")
     .replace("\r\n", "\n");
-    assert!(
-        xref.contains("#[cfg(test)]\npub(crate) fn load_xref_state_with_options"),
-        "the ownerless standalone xref loader must remain test-only"
-    );
+    for dead in [
+        "fn load_xref_state_with_options",
+        "fn load_xref_state_from_bytes",
+        "Option<&dyn CanonicalTrailerOwner>",
+    ] {
+        assert!(
+            !xref.contains(dead),
+            "the owner-less standalone xref route is removed; {dead} must not return"
+        );
+    }
 }
 
 #[test]

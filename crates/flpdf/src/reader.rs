@@ -2,7 +2,6 @@
 //!
 //! qpdf correspondence: QPDF.cc object resolution, recovery, diagnostics, and authentication responsibilities.
 //!
-pub(crate) mod file_object;
 pub(crate) mod resolver;
 
 use crate::encryption::password::{password_candidates_for_read, PasswordMode};
@@ -1361,8 +1360,8 @@ impl<R: Read + Seek> Pdf<R> {
         self.foreign_object_visiting.insert(source_id, visiting);
     }
 
-    /// Validate that historical xref-stream handles collected during bootstrap
-    /// are already present in the canonical resolver cache. qpdf reads each
+    /// Validate that historical xref-stream handles collected during xref
+    /// loading are already present in the canonical resolver cache. qpdf reads each
     /// xref stream before merging the next xref section and keeps the same
     /// object cache for those historical objects (`QPDF.cc:626-710,1640-1716`);
     /// this handoff must not create a second graph or provenance map.
