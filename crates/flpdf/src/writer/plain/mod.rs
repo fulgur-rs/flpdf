@@ -120,18 +120,19 @@ fn write_plain_live<R: Read + Seek>(
     let content_container_refs = special_streams
         .map(|streams| &streams.content_container_refs)
         .unwrap_or(&empty_content_containers);
-    // qpdf's writeStandard reads the page/content sequence numbers
-    // `initializeSpecialStreams` already computed at setup
-    // (`QPDFWriter.cc:1774-1781,1914-1931`) rather than re-deriving them at
-    // emission time. Mirror that here: only qdf/content-normalization ever
-    // read these maps (`QPDFWriter.cc:1277,1774-1781`), matching the trigger
-    // `initialize_special_streams` itself used to populate them.
-    let (page_sequences, contents_sequences) = if options.qdf || options.content_normalization {
+    // qpdf's writeStandard reads the page/content sequence numbers and the
+    // content-normalization membership set `initializeSpecialStreams`
+    // already computed at setup (`QPDFWriter.cc:1774-1781,1914-1931`) rather
+    // than re-deriving them at emission time. Mirror that here: only
+    // qdf/content-normalization ever read this state (`QPDFWriter.cc:1277,
+    // 1774-1781`), matching the trigger `initialize_special_streams` itself
+    // used to populate it.
+    let content_stream_state = if options.qdf || options.content_normalization {
         special_streams
-            .map(crate::writer::SpecialStreams::page_and_contents_sequences)
+            .map(crate::writer::SpecialStreams::live_content_stream_state)
             .unwrap_or_default()
     } else {
-        (BTreeMap::new(), BTreeMap::new())
+        crate::writer::LiveContentStreamState::default()
     };
     let mut body = body::emit_live(
         pdf,
@@ -144,8 +145,7 @@ fn write_plain_live<R: Read + Seek>(
         &object_streams,
         body_encryption_context.as_ref(),
         content_container_refs,
-        page_sequences,
-        contents_sequences,
+        content_stream_state,
     )?; // cov:ignore: LLVM attributes the live-body call terminator to closure cleanup.
     let body_old_to_new = body.old_to_new;
     let mut trailer_map: HashMap<ObjectRef, ObjectRef> = body_old_to_new
