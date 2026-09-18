@@ -50,7 +50,7 @@ markdown だけを読むので `--no-qpdf`（CI の形）でも完全に動く�
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 123 | 0 | 37 | 0 | 160 |
+| 128 | 0 | 32 | 0 | 160 |
 
 ### checker logical aggregate（259 rows）
 
@@ -63,7 +63,7 @@ rowsを検証する。2026-09-18 の現行 `origin/main` (`4942e7b3f7fbeb2a2d79e
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 203 | 0 | 56 | 0 | 259 |
+| 208 | 0 | 51 | 0 | 259 |
 
 したがって、160行の領域別表と259 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
@@ -138,10 +138,10 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 
 | ファイル | 行数 | canonical | bridge | mixed | unknown |
 |---|---|---|---|---|---|
-| [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 19 | 0 | 5 | 0 |
+| [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 20 | 0 | 4 | 0 |
 | [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 26 | 0 | 8 | 0 |
 | [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 41 | 0 | 1 | 0 |
-| [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 18 | 0 | 13 | 0 |
+| [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 22 | 0 | 9 | 0 |
 | [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 19 | 0 | 10 | 0 |
 
 ## 5. 責任境界と不変条件
@@ -156,7 +156,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 |---|---|---|---|
 | **`getObject` は resolve しない。resolve が起きるのはアクセサの `dereference()` からだけ**（`QPDF::resolve` を呼べるのは `QPDFObject` のみで、通常 build に public な明示 resolve facade は存在しない） | `libqpdf/QPDF.cc:1951-1959`（「This method is called by the parser and therefore must not resolve any objects.」）/ `include/qpdf/QPDF.hh:770-781`（`Resolver` の friend は `QPDFObject` 1 つ）/ `include/qpdf/QPDF.hh:1031` | A3 canonical（`crates/flpdf/src/reader.rs::Pdf::get_object_handle`）、A4 / A5 canonical。通常 build の A7 facade は `.23.10` で撤去し、qtest-driver だけは別セッションの例外境界として hidden compatibility route を保持する | parse 中に resolve が誘発されると qpdf が `std::logic_error` にする再入状態（B5）が flpdf では観測できないまま通る。通常 consumer は `try_*` accessors へ移行し、qpdf に無い `pdf.resolve(&h)?; h.as_dictionary()` の 2 段イディオムを残さない |
 | **型アクセサは必ず dereference する** — 未解決の間接 handle でも `asInteger` / `isNull` は正しい型と値を返す | `libqpdf/QPDFObjectHandle.cc:240-446` / `libqpdf/QPDFObjectHandle.cc:2375-2383` | A6 mixed。解決しない `as_*` / `is_null` 族が prod 合計 686、解決する `try_as_integer` が prod 28 | 未解決の間接 handle に `as_dictionary()` が `None`、`is_null()` が `false` を返す。`/Filter` や `/Type` の判定でこれが起きると分岐が落ち、書き出しバイトが変わる |
-| **object cache に「削除済み」の永続 tombstone は存在しない** — `removeObject` は cache cell ごと erase し、`deleted_objects` は xref 構築が終われば clear される | `libqpdf/QPDF.cc:1995-2005` / `libqpdf/QPDF.cc:706-708` / `libqpdf/QPDF.cc:575` | A2 mixed（`CacheEntry` の `Missing` / `Deleted` に qpdf 対応物なし）。A17 は tombstone を手で消す分岐を持ち、`crates/flpdf/src/reader.rs:1569-1575` のコメント自身が逸脱を明記 | `get_all_objects`（A9）と `live_object_refs`（A10）の列挙が食い違い、writer の到達性集合が経路ごとに変わる。同じ入力で出力 object 数が route 依存になる |
+| **object cache に「削除済み」の永続 tombstone は存在しない** — `removeObject` は cache cell ごと erase し、`deleted_objects` は xref 構築が終われば clear される | `libqpdf/QPDF.cc:1995-2005` / `libqpdf/QPDF.cc:706-708` / `libqpdf/QPDF.cc:575` | A2 は canonical（**2026-09-19 訂正**: `flpdf-3yn9.48.22` で qpdf に無い 6 状態の `CacheEntry` facade は削除済み。A2 行自身も `canonical` であり、この記述は cutover 前の stale だった）。A17 の tombstone 手動clear分岐は `CacheEntry` 定義元の `crates/flpdf/src/cache.rs` ごと `flpdf-3yn9.48.22` で削除済み。**ただし A17 は `mixed` のまま**（2026-09-19 訂正）——`swap_objects` は末尾で `record_allocated_object` を呼んで `allocated_object_refs` を更新するが、qpdf の `swapObjects`（`QPDF.cc:2284-2291`）は `resolve` / `resolve` / `swapWith` の 3 行だけでこの副作用に対応物がない。**marker 義務も残る**——削除されたのは旧 tombstone 分岐だけで、`reader/resolver.rs:1959-1962` の block は xref entry を持たない generation に対して今も実行される（CLAUDE.md:77-83） | `get_all_objects`（A9）と `live_object_refs`（A10）の列挙が食い違い、writer の到達性集合が経路ごとに変わる。同じ入力で出力 object 数が route 依存になる |
 | **通常の document-owned 型不一致は warning + null/false。dereference や contextless warning は throw しうる** | `libqpdf/QPDFObjectHandle.cc:2168-2189,965-989` | A8 canonical。通常 build の `try_get_key` / `try_has_key` が resolve と warning/error propagation を所有し、panic convenience は qtest-driver feature だけに隔離する | 通常の型不一致自体は panic の証拠ではない。lazy resolution・warning 配送・contextless warning の例外経路を fallible accessor へ移し、warning と例外伝播の境界を保つ |
 | **採番は `getObjectCount()+1` の 1 本**（`obj_cache` の最大 key に基づく） | `libqpdf/QPDF.cc:1872-1880` / `libqpdf/QPDF.cc:1271-1283` | A11 canonical。`flpdf-3yn9.48.171` で、canonical `next_obj_gen` への 1 行委譲に退化していた `#[cfg(test)]` 専用の重複 facade `Pdf::next_available_object_ref` を削除し、production にも公開されている同一委譲の `Pdf::next_obj_gen` に一本化した | public makeIndirect factoryは`.48.20`でcanonical採番へ移行済み。採番経路は `Pdf::get_object_count` / `Pdf::next_obj_gen` の 1 行委譲のみで、legacy-only refが採番を押し上げる経路は残らない |
 | **`makeIndirectObject` は同じ `shared_ptr` を cache に登録する（alias が保たれる）** | `libqpdf/QPDF.cc:1882-1888` / `libqpdf/QPDF.cc:1890-1897` | A12 canonical。`.48.20`で両public factoryを同じresolver promotionへ移し、共有ValueIdentityとcache lookupの再設定を接続した | promote 後に元 handle を `appendItem` / `replaceKey` しても新 object 側に反映されない。probe A-2 |
@@ -192,7 +192,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 
 | 不変条件 / 境界 | qpdf の根拠 | flpdf の現状（該当行） | 壊すと何が変わるか |
 |---|---|---|---|
-| **採番は enqueue 時に enqueue 順で行い、container-first**（ObjStm メンバーに出会ったら container を先に enqueue し、container 採番時に member 範囲を即時予約する） | `libqpdf/QPDFWriter.cc:1072-1141` / `libqpdf/QPDFWriter.cc:1057-1069` | D2/D3 は plain Disable の `writer/plain/body.rs::LiveQueue` を first consumer として導入。D11 は `writer/write_object.rs::WriteObject` と `LiveObjectEmitter` を共有。Preserve/Generate・QDF/normalize は後続 mixed consumer。specialized standard と PCLm は live consumerへ移行済み | plain Disable では pre-write Catalog walk を採番 ownerにせず、root/trailer seed と emission-time child discovery を qpdf 順で行う。ObjStm container-first と残る legacy callers は後続 sliceで移行する |
+| **採番は enqueue 時に enqueue 順で行い、container-first**（ObjStm メンバーに出会ったら container を先に enqueue し、container 採番時に member 範囲を即時予約する） | `libqpdf/QPDFWriter.cc:1072-1141` / `libqpdf/QPDFWriter.cc:1057-1069` | D2/D3 は plain Disable の `writer/plain/body.rs::LiveQueue` を first consumer として導入。D11 は `writer/write_object.rs::WriteObject` と `LiveObjectEmitter` を共有。Preserve/Generate・QDF/normalize は **2026-09-19 時点で全て `LiveQueue` に収束済み**（`flpdf-3yn9.48.166` で D2/D3 を canonical へ。旧記載の「後続 mixed consumer」はその前の状態）。specialized standard と PCLm は live consumerへ移行済み | plain Disable では pre-write Catalog walk を採番 ownerにせず、root/trailer seed と emission-time child discovery を qpdf 順で行う。ObjStm container-first と残る legacy callers は後続 sliceで移行する |
 | **standard の書き込み順は enqueue 順、linearized は専用の2 pass。両者は object emission primitive を共有する** | `libqpdf/QPDFWriter.cc:1761-1809,2537-2904,2991-3044` | D11 mixed — plain、specialized、PCLm、linearized に emission が分散する | qpdf も standard と linearized の制御ループは別であり、4ループを1本にすること自体は完了条件ではない。`writeObject` / `unparseObject` owner と standard/PCLm の enqueue 中 body loop を復元し、consumer ごとに出力順を照合する |
 | **classic xref の欠番/type≠1 は通常出力で `std::logic_error`。object 0 と pass-1 `suppress_offsets` は別分岐** | `libqpdf/QPDFWriter.cc:2343-2379` / `libqpdf/QPDFXRefEntry.cc:27-32` | D12 canonical。plain / specialized / PCLm / linearized のclassic-xref consumerは `writer/plain/xref.rs::write_xref_table` と `write_xref_table_from_offsets` の共有 row ownerを使う | shared primitiveはentry 0、type-1 offset、generation 0、range、suppress/hint補正を保持し、missing/free/type2は `Error::Internal`。正常writerのgap producer調査はD12と分離する（D-U3） |
 | **encryption dictionary は body 全 object の後・xref の直前に置く**（standard 経路。番号はその時点の `next_objid++`） | `libqpdf/QPDFWriter.cc:3017-3019` / `libqpdf/QPDFWriter.cc:2244-2256` | D15 canonical（`crates/flpdf/src/writer/encrypted_strings.rs::write_encryption_dictionary_handle`）。plain pipeline は暗号化経路を持たない（`crates/flpdf/src/writer/plain/mod.rs:50-62`）ので、暗号化された非 linearized 出力は必ず legacy coordinator を通る | `/Encrypt` の object 番号が body 中に割り込み、以降の全 object 番号と xref offset がずれる |
@@ -231,7 +231,7 @@ symbol数はmanifestの非comment・非空行から数え、行数と同一視�
 | 群 | 中身 | `--expect-zero` |
 |---|---|---|
 | **(a) deletable route** | bridge 行の entrypoint と、mixed 行のうち canonical owner に吸収されるべき側の経路。canonical owner が全 consumer に行き渡れば production caller が 0 になる | **意味を持つ。完了判定に使う** |
-| **(b) baseline denominator** | mixed 行の canonical 側 entrypoint（A1 の `ResolverCore`、D2 の `ObjectStreamRenumber` のように、entrypoint と canonical owner が同じ行）、複数行が共有する primitive、および leaf が総称的で他 symbol と衝突するもの | **当ててはいけない。** 0 になることは想定されていない。cutover 前後で数が減ったか変わらなかったかを読むための分母 |
+| **(b) baseline denominator** | mixed 行の canonical 側 entrypoint（A1 の `ResolverCore`、D2 の `LiveQueue`（**2026-09-19 訂正**: 旧記載の `ObjectStreamRenumber` は struct・impl・呼び出し元すべて `#[cfg(test)]` で、production entrypoint ではない） のように、entrypoint と canonical owner が同じ行）、複数行が共有する primitive、および leaf が総称的で他 symbol と衝突するもの | **当ててはいけない。** 0 になることは想定されていない。cutover 前後で数が減ったか変わらなかったかを読むための分母 |
 
 (b) に落ちる代表例が B32 の `Error`（同名参照が広い）と D1 の `write`で、この 2 行の
 mixed は「1 つの flpdf 経路が 2 つ以上の qpdf 責務を畳んでいる」側の mixed（§3）であり、
