@@ -125,7 +125,7 @@ fn linearization_content_normalize_refs<R: Read + Seek>(
     }
     if let Some(snapshot) = normalized_streams_snapshot {
         return Ok(snapshot.clone());
-    }
+    } // cov:ignore: LLVM attributes the executed snapshot-return block to the preceding lines.
     let mut refs = BTreeSet::new();
     for page_ref in page_refs {
         let page = pdf.get_object_handle(*page_ref);
@@ -1732,7 +1732,7 @@ impl LinearizationPlan {
             options,
             prepared_page_refs,
             normalized_streams_snapshot,
-        )?;
+        )?; // cov:ignore: LLVM attributes this executed multiline call terminator to the preceding line.
         let mut skipped_raw_stream_parameter_streams: BTreeSet<QpdfObjGen> = BTreeSet::new();
         let mut optimization = crate::optimization::Optimization::optimize(
             pdf,
