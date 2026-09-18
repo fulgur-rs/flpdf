@@ -47,3 +47,21 @@ fn linearized_classic_xref_rows_use_the_shared_qpdf_owner() {
         "the linearized main xref must not retain a private row loop"
     );
 }
+
+#[test]
+fn shared_classic_xref_rows_keep_the_stack_buffer_fast_path() {
+    let plain_xref_source = include_str!("../src/writer/plain/xref.rs");
+
+    assert!(
+        plain_xref_source.contains("fn write_fixed_xref_entry"),
+        "classic xref rows must have a shared stack-buffer encoder"
+    );
+    assert!(
+        plain_xref_source.contains("write_fixed_xref_entry(out, offset)"),
+        "the shared row owner must use the stack-buffer encoder"
+    );
+    assert!(
+        !plain_xref_source.contains(r#"format!("{offset:010} 00000 n \n")"#),
+        "classic xref rows must not allocate a temporary formatted string"
+    );
+}

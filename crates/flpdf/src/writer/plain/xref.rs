@@ -527,9 +527,29 @@ where
                     .ok_or_else(|| crate::Error::Internal("xref offset overflow".to_string()))?;
             }
         }
-        out.write_bytes(format!("{offset:010} 00000 n \n").as_bytes())?;
+        write_fixed_xref_entry(out, offset)?;
     }
     Ok(space_before_zero)
+}
+
+/// Write one classic xref entry without allocating a temporary formatted
+/// string. The width is a minimum, matching qpdf's decimal writer for offsets
+/// larger than ten digits as well.
+fn write_fixed_xref_entry(out: &mut OutputSink<'_>, offset: u64) -> crate::Result<()> {
+    let mut encoded = [b'0'; 20];
+    let mut end = encoded.len();
+    let mut value = offset;
+    loop {
+        end -= 1;
+        encoded[end] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    let width_start = encoded.len().saturating_sub(10);
+    out.write_bytes(&encoded[end.min(width_start)..])?;
+    out.write_bytes(b" 00000 n \n")
 }
 
 fn written_xref_table(
