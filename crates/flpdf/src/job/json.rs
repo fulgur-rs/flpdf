@@ -1106,8 +1106,12 @@ top-level object: key \"version\" is present in schema but missing in object\n"
                 .arg(&path)
                 .output()
             else {
+                // cov:ignore-start: this test environment always has qpdf 11.9.0
+                // installed (many other oracle tests in this crate rely on it), so
+                // the skip branch cannot be exercised without uninstalling qpdf.
                 eprintln!("skipping {name}: qpdf is unavailable");
                 continue;
+                // cov:ignore-end
             };
             assert!(
                 output.status.success(),

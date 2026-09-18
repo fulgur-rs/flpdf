@@ -8161,25 +8161,36 @@ mod tests {
 
     struct JsonFailingSink;
 
+    // `identifier`/`finish` on both sinks below are `Pipeline` trait-contract
+    // boilerplate the job's warning/info logger routes never call (warnings
+    // are forwarded by message text alone, and the logger never finishes a
+    // diagnostic sink mid-job) -- only `write` is exercised, so each is
+    // individually marked `cov:ignore`.
     impl Pipeline for JsonRecordingSink {
+        // cov:ignore-start: never called; see the block comment above.
         fn identifier(&self) -> &str {
             "json lifecycle test sink"
         }
+        // cov:ignore-end
 
         fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
             self.state.lock().unwrap().bytes.extend_from_slice(data);
             Ok(())
         }
 
+        // cov:ignore-start: never called; see the block comment above.
         fn finish(&mut self) -> PipelineResult<()> {
             Ok(())
         }
+        // cov:ignore-end
     }
 
     impl Pipeline for JsonFailingSink {
+        // cov:ignore-start: never called; see the block comment above.
         fn identifier(&self) -> &str {
             "json lifecycle failing sink"
         }
+        // cov:ignore-end
 
         fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
             Err(crate::pipeline::PipelineError::runtime(
@@ -8187,9 +8198,11 @@ mod tests {
             ))
         }
 
+        // cov:ignore-start: never called; see the block comment above.
         fn finish(&mut self) -> PipelineResult<()> {
             Ok(())
         }
+        // cov:ignore-end
     }
 
     fn json_logger_with_warning_sink(
@@ -8407,6 +8420,10 @@ mod tests {
             .output()
         {
             Ok(output) if output.status.success() => output.stdout,
+            // cov:ignore-start: this test environment always has a working qpdf
+            // 11.9.0 (many other oracle tests in this crate rely on it), so
+            // neither the failure nor the unavailable branch can be exercised
+            // without uninstalling qpdf.
             Ok(output) => panic!(
                 "qpdf JSON route failed: {}",
                 String::from_utf8_lossy(&output.stderr)
@@ -8414,7 +8431,7 @@ mod tests {
             Err(error) => {
                 eprintln!("skipping qpdf differential: {error}");
                 return;
-            }
+            } // cov:ignore-end
         };
 
         let mut job = QPDFJob::new();
