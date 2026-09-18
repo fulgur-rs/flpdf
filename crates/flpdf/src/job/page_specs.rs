@@ -500,7 +500,7 @@ fn collect_primary_fields<T: Read + Seek>(
     merged: &mut Pdf<T>,
     pages: &[ObjectRef],
 ) -> Result<Vec<ObjectHandle>> {
-    let mut field_refs = BTreeSet::new();
+    let mut field_identities = BTreeSet::<QpdfObjGen>::new();
     let mut candidate_fields = Vec::new();
     {
         let mut acroform = AcroFormDocumentHelper::new_for_field_tree(merged)?;
@@ -508,24 +508,30 @@ fn collect_primary_fields<T: Read + Seek>(
             let widgets = acroform.get_widget_annotations_for_page(page_ref)?;
             for widget in widgets {
                 let field = acroform.get_field_for_annotation_handle(widget)?;
-                if let Some(field_ref) = field.object_ref() {
-                    candidate_fields.push(field_ref);
+                if field.qpdf_obj_gen().is_some_and(QpdfObjGen::is_indirect) {
+                    candidate_fields.push(field);
                 } // cov:ignore: structural brace has no LLVM executable counter
             }
         }
     }
-    for field_ref in candidate_fields {
-        let (top_level, _) = FormFieldObjectHelper::new(field_ref, merged).get_top_level_field()?;
-        field_refs.insert(top_level);
+    for field in candidate_fields {
+        let (top_level, _) = FormFieldObjectHelper::from_object_handle(field, merged)
+            .get_top_level_field_handle()?;
+        if let Some(object_gen) = top_level.qpdf_obj_gen().filter(|gen| gen.is_indirect()) {
+            field_identities.insert(object_gen);
+        }
     }
     let primary_order = {
         let mut acroform = AcroFormDocumentHelper::new_for_field_tree(merged)?;
-        acroform.top_level_fields()?
+        acroform.top_level_field_handles()?
     };
     Ok(primary_order
         .into_iter()
-        .filter(|field_ref| field_refs.contains(field_ref))
-        .map(|field_ref| merged.get_object_handle(field_ref))
+        .filter(|field| {
+            field
+                .qpdf_obj_gen()
+                .is_some_and(|gen| gen.is_indirect() && field_identities.contains(&gen))
+        })
         .collect())
 }
 
