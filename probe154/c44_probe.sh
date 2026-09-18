@@ -21,16 +21,15 @@ if ! qpdf --version | grep -q '^qpdf version 11.9.0$'; then
     exit 1
 fi
 
-LIB=""
-for candidate in /usr/lib/x86_64-linux-gnu/libqpdf.so.29 \
-    /usr/lib/libqpdf.so.29 /usr/local/lib/libqpdf.so.29; do
-    if [ -f "$candidate" ]; then
-        LIB="$candidate"
-        break
-    fi
-done
-if [ -z "$LIB" ]; then
-    echo "c44_probe: libqpdf.so.29 not found" >&2
+# Link the library that the validated executable actually loads. A hard-coded
+# candidate list can pick an unrelated ABI-compatible libqpdf on a host with
+# more than one qpdf installed, which would attribute the observations below to
+# 11.9.0 even though another build produced them.
+QPDF_BIN="$(command -v qpdf)"
+LIB="$(ldd "$QPDF_BIN" | awk '/libqpdf\.so/ { print $3; exit }')"
+if [ -z "$LIB" ] || [ ! -f "$LIB" ]; then
+    echo "c44_probe: cannot resolve the libqpdf loaded by $QPDF_BIN" >&2
+    ldd "$QPDF_BIN" >&2
     exit 1
 fi
 

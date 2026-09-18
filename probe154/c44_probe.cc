@@ -191,5 +191,25 @@ main()
         }
     }
 
+    // F: the caller's handle is destroyed before the blob serializes. The Rust
+    // test `get_stream_json_blob_retains_the_stream_handle` drops its `stream`
+    // binding in a nested scope before calling `unparse`, so the qpdf half has
+    // to exercise the same lifetime or the comparison proves nothing.
+    {
+        QPDF pdf;
+        pdf.emptyPDF();
+        auto provider = std::make_shared<CountingProvider>("retained");
+        JSON json = [&] {
+            QPDFObjectHandle stream = new_provider_stream(pdf, provider);
+            return stream.getStreamJSON(2, qpdf_sj_inline, qpdf_dl_none, nullptr, "");
+        }();
+        std::cout << "F.calls_after_scope=" << provider->calls << "\n";
+        try {
+            std::cout << "F.after_handle_drop=" << json.unparse() << "\n";
+        } catch (std::exception const& error) {
+            std::cout << "F.after_handle_drop=exception:" << error.what() << "\n";
+        }
+    }
+
     return 0;
 }
