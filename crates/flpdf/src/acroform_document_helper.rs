@@ -72,6 +72,18 @@ impl DrMap {
     }
 }
 
+/// qpdf tests directness with `QPDFObjGen::isIndirect`
+/// (`include/qpdf/QPDFObjGen.hh:112-120`), which looks at the object number
+/// alone. `ObjectHandle::object_ref` additionally requires the identity to
+/// project onto a parser-valid `N G R` token, so it reports a raw indirect
+/// generation as if it were a direct object. Use this for every
+/// direct-vs-indirect decision in the analysis cache.
+fn is_indirect_handle(handle: &ObjectHandle) -> bool {
+    handle
+        .qpdf_obj_gen()
+        .is_some_and(|object_gen| object_gen.is_indirect())
+}
+
 fn record_association(cache: &mut AcroFormCache, annotation: ObjectHandle, field: ObjectHandle) {
     let annotation_identity = annotation.identity_key();
     cache
@@ -608,10 +620,13 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                     for annotation in widgets {
                         annotation.try_dereference()?;
                         let identity = annotation.identity_key();
-                        let already_associated = if annotation.object_ref().is_none() {
+                        let already_associated = if !is_indirect_handle(&annotation) {
                             // qpdf indexes direct objects by QPDFObjGen(0, 0),
                             // so distinct direct orphan Widgets share one
-                            // association bucket.
+                            // association bucket. Test directness the way
+                            // qpdf does -- `QPDFObjGen::isIndirect` -- so a
+                            // raw indirect identity outside the `ObjectRef`
+                            // projection keeps its own bucket.
                             cache.direct_orphan_field.is_some()
                         } else {
                             cache.annotation_to_field.contains_key(&identity)
@@ -620,7 +635,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                             annotation.warn_if_possible(
                                 "this widget annotation is not reachable from /AcroForm in the document catalog",
                             )?;
-                            if annotation.object_ref().is_none() {
+                            if !is_indirect_handle(&annotation) {
                                 cache.direct_orphan_field = Some(annotation.clone());
                             }
                             record_association(&mut cache, annotation.clone(), annotation);
@@ -1756,10 +1771,12 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let cache = cache
             .as_ref()
             .expect("analyze always installs an AcroForm cache");
-        if annotation.object_ref().is_none() {
+        if !is_indirect_handle(&annotation) {
             // qpdf's annotation_to_field map uses the shared
             // QPDFObjGen(0, 0) key for every direct orphan Widget. A later
             // direct Widget therefore resolves to the first orphan field.
+            // A raw indirect Widget is not a direct object, so it must not
+            // fall into this bucket -- it keeps its cached association.
             return Ok(cache.direct_orphan_field.clone());
         }
         Ok(cache
@@ -2607,6 +2624,59 @@ mod final_handle_tests {
             .join("../../tests/fixtures/compat")
             .join(name);
         Pdf::open(Cursor::new(std::fs::read(path).expect("fixture exists"))).expect("fixture opens")
+    }
+
+    /// A raw indirect Widget is not a direct object. qpdf tests directness
+    /// with `QPDFObjGen::isIndirect` (object number only), so such a Widget
+    /// must keep its own cached association rather than falling into the
+    /// shared `QPDFObjGen(0, 0)` direct-orphan bucket that
+    /// `ObjectHandle::object_ref() == None` would route it to.
+    #[test]
+    fn raw_generation_widget_keeps_its_own_field_association() {
+        let mut pdf = Pdf::empty().expect("empty PDF should open");
+        let raw_widget = pdf.get_object_handle_by_raw_identity(11, 65_535);
+        raw_widget.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"/FT".to_vec(), ObjectHandle::name(b"Tx".to_vec())),
+                (b"/T".to_vec(), ObjectHandle::string(b"raw".to_vec())),
+                (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+                (
+                    b"/Rect".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(10),
+                        ObjectHandle::integer(10),
+                    ]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+
+        let catalog = pdf.root_handle().expect("empty PDF has a catalog");
+        let acroform = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Fields".to_vec(),
+                ObjectHandle::array(vec![raw_widget.clone()]),
+            )]))
+            .expect("AcroForm allocation");
+        catalog
+            .replace_key(b"/AcroForm", acroform)
+            .expect("install AcroForm");
+
+        let mut helper =
+            AcroFormDocumentHelper::new_for_field_tree(&mut pdf).expect("field-tree helper");
+        let field = helper
+            .get_field_for_annotation_handle(raw_widget.clone())
+            .expect("association lookup");
+
+        assert_eq!(
+            field.qpdf_obj_gen(),
+            raw_widget.qpdf_obj_gen(),
+            "the raw Widget must resolve to its own merged field, not the direct-orphan bucket"
+        );
+        drop(helper);
     }
 
     #[test]
