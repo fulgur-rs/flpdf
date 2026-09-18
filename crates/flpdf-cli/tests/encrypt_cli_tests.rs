@@ -2838,26 +2838,126 @@ fn copy_encryption_v5_aes256_donor_succeeds() {
     );
 }
 
+/// Run a `--copy-encryption` invocation that must fail, returning its stderr.
+///
+/// qpdf opens the donor through the same `QPDFJob::processFile` boundary as
+/// the primary input (`libqpdf/QPDFJob.cc:2891-2899` vs `:434`), and the
+/// resulting exception reaches `realmain`'s single `catch`
+/// (`qpdf/qpdf.cc:36-40`) as `whoami: e.what()`. The donor therefore gets no
+/// option-specific framing: every message pinned below is the one qpdf 11.9.0
+/// prints for the same donor, with only the program name differing.
+fn copy_encryption_failure_stderr(donor: &Path, password: Option<&str>, out: &Path) -> String {
+    let mut command = Command::cargo_bin("flpdf").unwrap();
+    command.arg(format!("--copy-encryption={}", donor.display()));
+    if let Some(password) = password {
+        command.arg(format!("--encryption-file-password={password}"));
+    }
+    let assert = command
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(out)
+        .assert()
+        .failure()
+        .code(2);
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(
+        !stderr.contains("--copy-encryption:"),
+        "donor failures must not carry an option-specific prefix qpdf never \
+         emits: {stderr}"
+    );
+    stderr
+}
+
 /// `--copy-encryption` with a wrong password is rejected with an error
 /// (the donor cannot be opened with the supplied password).
+///
+/// qpdf 11.9.0: `qpdf: <donor>: invalid password`.
 #[test]
 fn copy_encryption_wrong_password_is_rejected() {
     let tmp = tempfile::tempdir().unwrap();
     let donor = make_donor_pdf(&tmp, "correctpw", "ownerpw");
     let out = tmp.path().join("out.pdf");
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .arg(format!("--copy-encryption={}", donor.display()))
-        .arg("--encryption-file-password=wrongpw")
-        .arg(fixture(UNENCRYPTED_FIXTURE))
-        .arg(&out)
-        .assert()
-        .failure()
-        // The error surfaces as either "failed to open" (wrong password
-        // rejected by the reader at open time) or "failed to recover file
-        // key" (auth passes but key recovery fails). Both include the
-        // --copy-encryption prefix, so we just pin that.
-        .stderr(predicates::str::contains("--copy-encryption"));
+    let stderr = copy_encryption_failure_stderr(&donor, Some("wrongpw"), &out);
+    assert_eq!(
+        stderr,
+        format!("flpdf: {}: invalid password\n", donor.display())
+    );
+    assert!(!out.exists());
+}
+
+/// An encrypted donor with no `--encryption-file-password` fails exactly like
+/// a wrong password, matching qpdf's empty-password attempt.
+#[test]
+fn copy_encryption_missing_password_reports_invalid_password() {
+    let tmp = tempfile::tempdir().unwrap();
+    let donor = make_donor_pdf(&tmp, "correctpw", "ownerpw");
+    let out = tmp.path().join("out.pdf");
+    let stderr = copy_encryption_failure_stderr(&donor, None, &out);
+    assert_eq!(
+        stderr,
+        format!("flpdf: {}: invalid password\n", donor.display())
+    );
+    assert!(!out.exists());
+}
+
+/// A missing donor reports qpdf's `QUtil::safe_fopen` shape
+/// (`qpdf: open <donor>: No such file or directory`), not a
+/// `--copy-encryption`-specific message.
+#[test]
+fn copy_encryption_missing_donor_reports_open_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let donor = tmp.path().join("no-such-donor.pdf");
+    let out = tmp.path().join("out.pdf");
+    let stderr = copy_encryption_failure_stderr(&donor, None, &out);
+    assert_eq!(
+        stderr,
+        format!(
+            "flpdf: open {}: No such file or directory\n",
+            donor.display()
+        )
+    );
+    assert!(!out.exists());
+}
+
+/// A donor that is not a PDF at all surfaces the reader's own recovery
+/// diagnostics and terminal message with the donor path attached, exactly as
+/// the same file would as the primary input.
+#[test]
+fn copy_encryption_non_pdf_donor_reports_recovery_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let donor = tmp.path().join("not-a-pdf.txt");
+    std::fs::write(&donor, b"this is not a PDF\n").unwrap();
+    let out = tmp.path().join("out.pdf");
+    let stderr = copy_encryption_failure_stderr(&donor, None, &out);
+    let path = donor.display().to_string();
+    assert_eq!(
+        stderr,
+        format!(
+            "WARNING: {path}: can't find PDF header\n\
+             WARNING: {path}: file is damaged\n\
+             WARNING: {path}: can't find startxref\n\
+             WARNING: {path}: Attempting to reconstruct cross-reference table\n\
+             flpdf: {path}: unable to find trailer dictionary while recovering damaged file\n"
+        )
+    );
+    assert!(!out.exists());
+}
+
+/// A donor that is a directory reports the reader's own read failure, which
+/// already carries the donor path, with no second path layer added on top.
+/// `open(2)` on a directory succeeds on Unix, so the failure lands on the
+/// first read rather than on the open.
+#[cfg(unix)]
+#[test]
+fn copy_encryption_directory_donor_reports_read_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let donor = tmp.path().join("donor-dir");
+    std::fs::create_dir(&donor).unwrap();
+    let out = tmp.path().join("out.pdf");
+    let stderr = copy_encryption_failure_stderr(&donor, None, &out);
+    assert_eq!(
+        stderr,
+        format!("flpdf: {}: read 1024 bytes\n", donor.display())
+    );
     assert!(!out.exists());
 }
 
