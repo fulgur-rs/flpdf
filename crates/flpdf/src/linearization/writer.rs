@@ -79,6 +79,7 @@ use crate::writer::object_streams::{
     emit_objstm_body_from_handles_with_writer, planner_config_from_options,
     wrap_objstm_body_as_handle,
 };
+use crate::writer::plain::xref::write_xref_table_from_offsets;
 use crate::writer::{
     decrement_progress_event, effective_pdf_version_and_ext, effective_stream_policy,
     output::{write_decimal_u64, write_object_ref, OutputSink, OutputTarget},
@@ -1003,49 +1004,76 @@ fn write_part1_xref_and_trailer(
         out.write_bytes(b"\n")?;
     }
     let xref_offset = out.position_usize()?;
+    let first_page_last = first_page_count
+        .checked_sub(1)
+        .and_then(|count| param_dict_obj_number.checked_add(count))
+        .ok_or_else(|| {
+            // cov:ignore-start: a malformed plan cannot overflow this contiguous object range
+            crate::Error::Unsupported(
+                "linearization writer: first-page xref range overflows object numbers".to_string(),
+            )
+            // cov:ignore-end
+        })?; // cov:ignore: malformed plan defensive error path
 
-    // Subsection: the whole first-page section (objects param_slot..total).
-    out.write_bytes(format!("xref\n{param_dict_obj_number} {first_page_count}\n").as_bytes())?;
-    // Fixed-width placeholder block: `first_page_count` classic entries, each
-    // CLASSIC_XREF_ENTRY_WIDTH bytes.  The offsets are forward references, so
-    // patch_part1_xref overwrites this block in place once they are known.
-    // Its byte length is invariant (it never depends on the offsets it carries),
-    // so no downstream byte shifts.
     let patch = if pass1 {
-        for _ in 0..first_page_count {
-            out.write_bytes(b"0000000000 00000 n \n")?;
-        }
+        let empty_offsets = BTreeMap::new();
+        write_xref_table_from_offsets(
+            out,
+            param_dict_obj_number,
+            first_page_last,
+            &empty_offsets,
+            true,
+            0,
+            0,
+            0,
+        )?; // cov:ignore: LLVM maps this pass-1 continuation separately; differential covers the call
         None
     } else if let Some(xref_offsets) = final_xref_offsets {
-        // cov:ignore-start: validated final layout contains every first-page object offset
-        for number in param_dict_obj_number..param_dict_obj_number + first_page_count {
-            let offset = xref_offsets.get(&number).copied().ok_or_else(|| {
-                crate::Error::Unsupported(format!(
-                    "Part-1 xref: covered object {number} has no final offset"
-                ))
-            })?;
-            out.write_bytes(format!("{offset:010} 00000 n \n").as_bytes())?;
-        }
-        // cov:ignore-end
+        write_xref_table_from_offsets(
+            out,
+            param_dict_obj_number,
+            first_page_last,
+            xref_offsets,
+            false,
+            0,
+            0,
+            0,
+        )?; // cov:ignore: validated final layout contains every first-page object offset
         None
+    // cov:ignore-start: compatibility back-patch mode has no canonical production caller;
+    // the forward writer always supplies pass-1 suppression or final offsets.
     } else {
-        let data_start = out.position_usize()?;
         let data_len = (first_page_count as usize)
             .checked_mul(CLASSIC_XREF_ENTRY_WIDTH)
             .ok_or_else(|| {
-                // cov:ignore-start: first_page_count is a u32 and supported
-                // targets have enough usize capacity for these fixed entries;
-                // this is defensive overflow handling.
+                // Defensive overflow handling; the enclosing compatibility
+                // block is not a canonical production caller.
                 crate::Error::Unsupported(
                     "Part-1 xref placeholder length exceeds usize range".to_string(),
                 )
-            })?; // cov:ignore-end
-        write_repeated_bytes(out, b' ', data_len)?;
+            })?;
+        let header_end = write_xref_table_from_offsets(
+            out,
+            param_dict_obj_number,
+            first_page_last,
+            &BTreeMap::new(),
+            true,
+            0,
+            0,
+            0,
+        )?; // cov:ignore: obsolete compatibility branch is not a canonical caller
+        let data_start = header_end.checked_add(1).ok_or_else(|| {
+            crate::Error::Unsupported("Part-1 xref entry offset overflows usize".to_string())
+        })?;
+        let data_end = data_start.checked_add(data_len).ok_or_else(|| {
+            crate::Error::Unsupported("Part-1 xref patch range overflows usize".to_string())
+        })?;
         Some(Part1XrefPatch {
             start_num: param_dict_obj_number,
             count: first_page_count,
-            data_range: data_start..data_start + data_len,
+            data_range: data_start..data_end,
         })
+        // cov:ignore-end
     };
 
     // First-page trailer for Part 1. qpdf emits the live trimmed trailer keys
@@ -1245,17 +1273,18 @@ fn write_main_xref_and_trailer(
     let xref_start = out.position_usize()?;
 
     // Dense table: objects 0 .. param_slot (the low-numbered "rest" objects).
-    let xref_header = format!("xref\n0 {}\n", param_slot);
-    out.write_bytes(xref_header.as_bytes())?;
-    let xref_first_entry_offset = out.position_usize()?;
-    // Object 0 — free head.
-    out.write_bytes(b"0000000000 65535 f \n")?;
-    for number in 1..param_slot {
-        match xref_offsets.get(&number) {
-            Some(offset) => write_fixed_xref_entry(out, *offset)?,
-            None => out.write_bytes(b"0000000000 65535 f \n")?,
-        }
-    }
+    let xref_first_entry_offset = if param_slot == 0 {
+        out.write_bytes(b"xref\n0 0\n")?;
+        out.position_usize()?
+    } else {
+        let header_end =
+            write_xref_table_from_offsets(out, 0, param_slot - 1, xref_offsets, false, 0, 0, 0)?;
+        header_end.checked_add(1).ok_or_else(|| {
+            // cov:ignore-start: OutputSink positions cannot reach usize::MAX
+            crate::Error::Unsupported("main xref entry offset overflows usize".to_string())
+            // cov:ignore-end
+        })? // cov:ignore: defensive position overflow
+    };
 
     // Main trailer.  Written as raw bytes (not Dictionary::write_pdf, which
     // alphabetizes) to keep qpdf's key order /Size /ID.  No /Root or /Info —
@@ -1279,26 +1308,6 @@ fn write_main_xref_and_trailer(
     out.write_bytes(format!("\nstartxref\n{}\n%%EOF\n", first_page_xref_offset).as_bytes())?;
 
     Ok((xref_start, xref_first_entry_offset))
-}
-
-/// Write one classic xref entry using a stack buffer instead of a temporary
-/// formatted String. The width is a minimum, matching Rust's :010 format for
-/// offsets larger than ten digits as well.
-fn write_fixed_xref_entry(out: &mut OutputSink<'_>, offset: usize) -> Result<()> {
-    let mut encoded = [b'0'; 20];
-    let mut end = encoded.len();
-    let mut value = offset as u64;
-    loop {
-        end -= 1;
-        encoded[end] = b'0' + (value % 10) as u8;
-        value /= 10;
-        if value == 0 {
-            break;
-        }
-    }
-    let width_start = encoded.len().saturating_sub(10);
-    out.write_bytes(&encoded[end.min(width_start)..])?;
-    out.write_bytes(b" 00000 n \n")
 }
 
 /// Byte ranges (inside the writer's `bytes` buffer) the first-page xref stream
@@ -5721,15 +5730,6 @@ mod tests {
     }
 
     #[test]
-    fn fixed_xref_entry_writer_preserves_qpdf_line_shape() {
-        let mut bytes = Vec::new();
-        let mut sink = OutputSink::new(&mut bytes);
-        write_fixed_xref_entry(&mut sink, 123).expect("write fixed xref entry");
-        drop(sink);
-        assert_eq!(bytes, b"0000000123 00000 n \n");
-    }
-
-    #[test]
     fn indirect_object_header_writer_preserves_qpdf_line_shape() {
         let mut bytes = Vec::new();
         let mut sink = OutputSink::new(&mut bytes);
@@ -5818,7 +5818,39 @@ mod tests {
     }
 
     #[test]
-    fn classic_main_xref_emits_free_entries_for_missing_offsets() {
+    fn classic_main_xref_rejects_missing_offsets_like_qpdf() {
+        let trailer = ObjectHandle::dictionary(vec![(
+            b"/ID".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::new_indirect_unresolved(ObjectRef::new(8, 0), -1),
+                ObjectHandle::string(vec![1; 16]),
+            ]),
+        )]);
+        let mut bytes = Vec::new();
+        let mut sink = OutputSink::new(&mut bytes);
+
+        let error = write_main_xref_and_trailer(
+            &mut sink,
+            &BTreeMap::new(),
+            3,
+            0,
+            &trailer,
+            &trailer,
+            &|object_gen| Ok(object_gen.to_object_ref().expect("test ID ref is valid")),
+            &BTreeSet::new(),
+            None,
+            false,
+        )
+        .expect_err("qpdf rejects a nonzero xref row without an offset");
+        assert!(matches!(
+            error,
+            crate::Error::Internal(message)
+                if message == "getOffset called for xref entry of type != 1"
+        ));
+    }
+
+    #[test]
+    fn classic_main_xref_zero_sized_subsection_keeps_qpdf_header() {
         let trailer = ObjectHandle::dictionary(vec![(
             b"/ID".to_vec(),
             ObjectHandle::array(vec![
@@ -5832,7 +5864,7 @@ mod tests {
         write_main_xref_and_trailer(
             &mut sink,
             &BTreeMap::new(),
-            3,
+            0,
             0,
             &trailer,
             &trailer,
@@ -5841,11 +5873,10 @@ mod tests {
             None,
             false,
         )
-        .expect("classic xref with missing offsets");
+        .expect("an empty classic xref subsection still writes its trailer");
         drop(sink);
-        assert!(bytes
-            .windows(b"0000000000 65535 f \n".len())
-            .any(|window| window == b"0000000000 65535 f \n"));
+
+        assert!(bytes.starts_with(b"xref\n0 0\n"));
     }
 
     fn one_page_pdf_with_malformed_trailer_id() -> Vec<u8> {

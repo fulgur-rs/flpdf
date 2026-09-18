@@ -433,6 +433,72 @@ pub(crate) fn write_xref_table(
     hint_offset: u64,
     hint_length: u64,
 ) -> crate::Result<usize> {
+    write_xref_table_with_offset_lookup(
+        out,
+        first,
+        last,
+        suppress_offsets,
+        hint_id,
+        hint_offset,
+        hint_length,
+        |number| match entries.get(&number) {
+            Some(XrefEntry::Uncompressed { offset }) => Ok(*offset),
+            Some(XrefEntry::Free { .. }) | Some(XrefEntry::Compressed { .. }) | None => Err(
+                crate::Error::Internal("getOffset called for xref entry of type != 1".to_string()),
+            ),
+        },
+    )
+}
+
+/// Write qpdf's classic xref rows from the linearized writer's live offset map.
+///
+/// The linearized writer records offsets in a `BTreeMap<u32, usize>` rather
+/// than the plain writer's typed [`XrefEntry`] map. Keeping this adapter here
+/// makes the row framing, generation, object-zero handling, offset suppression,
+/// and hint relocation one canonical implementation for both writer routes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_xref_table_from_offsets(
+    out: &mut OutputSink<'_>,
+    first: u32,
+    last: u32,
+    offsets: &BTreeMap<u32, usize>,
+    suppress_offsets: bool,
+    hint_id: u32,
+    hint_offset: u64,
+    hint_length: u64,
+) -> crate::Result<usize> {
+    write_xref_table_with_offset_lookup(
+        out,
+        first,
+        last,
+        suppress_offsets,
+        hint_id,
+        hint_offset,
+        hint_length,
+        |number| {
+            let offset = offsets.get(&number).copied().ok_or_else(|| {
+                crate::Error::Internal("getOffset called for xref entry of type != 1".to_string())
+            })?;
+            u64::try_from(offset)
+                .map_err(|_| crate::Error::Unsupported("xref offset does not fit u64".to_string()))
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_xref_table_with_offset_lookup<F>(
+    out: &mut OutputSink<'_>,
+    first: u32,
+    last: u32,
+    suppress_offsets: bool,
+    hint_id: u32,
+    hint_offset: u64,
+    hint_length: u64,
+    mut offset_for: F,
+) -> crate::Result<usize>
+where
+    F: FnMut(u32) -> crate::Result<u64>,
+{
     let count = last
         .checked_sub(first)
         .and_then(|count| count.checked_add(1))
@@ -454,23 +520,36 @@ pub(crate) fn write_xref_table(
 
         let mut offset = 0;
         if !suppress_offsets {
-            offset = match entries.get(&number) {
-                Some(XrefEntry::Uncompressed { offset }) => *offset,
-                Some(XrefEntry::Free { .. }) | Some(XrefEntry::Compressed { .. }) | None => {
-                    return Err(crate::Error::Internal(
-                        "getOffset called for xref entry of type != 1".to_string(),
-                    ));
-                }
-            };
+            offset = offset_for(number)?;
             if hint_id != 0 && number != hint_id && offset >= hint_offset {
                 offset = offset
                     .checked_add(hint_length)
                     .ok_or_else(|| crate::Error::Internal("xref offset overflow".to_string()))?;
             }
         }
-        out.write_bytes(format!("{offset:010} 00000 n \n").as_bytes())?;
+        write_fixed_xref_entry(out, offset)?;
     }
     Ok(space_before_zero)
+}
+
+/// Write one classic xref entry without allocating a temporary formatted
+/// string. The width is a minimum, matching qpdf's decimal writer for offsets
+/// larger than ten digits as well.
+fn write_fixed_xref_entry(out: &mut OutputSink<'_>, offset: u64) -> crate::Result<()> {
+    let mut encoded = [b'0'; 20];
+    let mut end = encoded.len();
+    let mut value = offset;
+    loop {
+        end -= 1;
+        encoded[end] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    let width_start = encoded.len().saturating_sub(10);
+    out.write_bytes(&encoded[end.min(width_start)..])?;
+    out.write_bytes(b" 00000 n \n")
 }
 
 fn written_xref_table(
