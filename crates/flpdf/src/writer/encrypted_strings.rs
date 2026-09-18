@@ -525,6 +525,7 @@ fn encrypt_string(
             encrypt_cipher_bytes(&mut bytes, StringEncryptCipher::Rc4 { key: data_key }, &iv)?;
         }
         WriteCipher::PerObject(ObjectKeyAlg::Aes) => {
+            // qpdf-deviation: qpdf hands Pl_AES_PDF the raw per-object key and its providers then read 16 bytes from a shorter buffer (undefined contents); reject instead of fabricating them
             let key: &[u8; 16] = data_key.try_into().map_err(|_| {
                 crate::Error::Unsupported("V=4 AES-128 data key is not 16 bytes".to_string())
             })?;

@@ -2757,6 +2757,9 @@ fn canonical_copy_encryption(
     let revision_i32 = i32::try_from(revision).map_err(|_| {
         crate::Error::Unsupported(format!("copy-encryption /R is out of range: {revision}"))
     })?;
+    // qpdf reads key_len as 5 for V==1 and otherwise as the donor /Length
+    // divided by eight, with no validation of either the value or the
+    // handler it belongs to (`QPDFWriter.cc:667-670`).
     let length_bits = if version == 1 {
         40
     } else if let Some(length_bits) = src.writer_length_bits {
@@ -2765,59 +2768,37 @@ fn canonical_copy_encryption(
         let key_len = copy_integer_as_int(&src.encrypt_dict, "Length")? / 8;
         key_len * 8
     };
-    if length_bits != 0 && !(40..=256).contains(&length_bits) {
-        return Err(crate::Error::Unsupported(format!(
-            "copy-encryption /Length is invalid: {length_bits} bits"
-        )));
-    }
-
-    let expected_key_len = if version >= 5 {
-        if version != 5 || !matches!(revision, 5 | 6) || !matches!(length_bits, 0 | 256) {
-            return Err(crate::Error::Unsupported(format!(
-                "unsupported copy-encryption Standard handler V={version} R={revision} Length={length_bits}"
-            )));
-        }
-        Some(32)
-    } else {
-        if !matches!(version, 1 | 2 | 4)
-            || (version == 1 && revision != 2)
-            || (version == 2 && !matches!(revision, 2 | 3))
-            || (version == 4 && revision != 4)
-        {
-            return Err(crate::Error::Unsupported(format!(
-                "unsupported copy-encryption Standard handler V={version} R={revision}"
-            )));
-        }
-        if length_bits == 0 {
-            // qpdf's copy writer derives a zero-length V<5 file key when its
-            // getIntValueAsInt fallback produces key_len == 0. This is a
-            // valid malformed-input state, not an absent-key sentinel.
-            None
-        } else {
-            // cov:ignore-start: length_bits is range-checked and divisible by eight;
-            // the supported targets can represent every resulting key length.
-            Some(usize::try_from(length_bits / 8).map_err(|_| {
-                crate::Error::Unsupported("copy-encryption key length overflows usize".into())
-            })?)
-            // cov:ignore-end
-        }
-    };
-    let file_key = if let Some(expected_key_len) = expected_key_len {
-        if src.file_key.len() != expected_key_len {
-            return Err(crate::Error::Unsupported(format!(
-                "copy-encryption V={version} R={revision} file key must be {expected_key_len} bytes; got {}",
-                src.file_key.len()
-            )));
-        }
-        src.file_key.clone()
-    } else {
-        Vec::new()
-    };
 
     let p = crate::encryption::qpdf_permission_i32(copy_integer(&src.encrypt_dict, "P")?);
     let o = copy_string(&src.encrypt_dict, "O")?;
     let u = copy_string(&src.encrypt_dict, "U")?;
     let encrypt_metadata = copy_encryption_encrypts_metadata_from_dict(&src.encrypt_dict);
+
+    // `setEncryptionParametersInternal` keeps the donor's authenticated key
+    // for V>=5 and re-derives the V<5 key from the donor's padded user
+    // password at the /Length-derived key length (`QPDFWriter.cc:832-839`).
+    // Neither branch compares the result against the key length the reader
+    // authenticated with, so a donor whose /Length disagrees with its real
+    // key is copied rather than rejected.
+    let file_key = if version >= 5 {
+        src.file_key.clone()
+    } else {
+        let o_param = crate::encryption::standard::v_lt_5_32_byte_parameter(&o);
+        let u_param = crate::encryption::standard::v_lt_5_32_byte_parameter(&u);
+        crate::encryption::standard::compute_encryption_key_from_password(
+            &src.padded_user_password,
+            &crate::encryption::standard::StandardHandlerInputs {
+                v: version,
+                r: revision,
+                length_bits,
+                p,
+                id0: &src.id0,
+                u: &u_param,
+                o: &o_param,
+                encrypt_metadata,
+            },
+        )?
+    };
 
     let mut entries = vec![
         (b"Filter".to_vec(), ObjectHandle::name(b"Standard".to_vec())),
@@ -4509,6 +4490,7 @@ mod final_handle_writer_tests {
                 ]),
                 writer_length_bits: None,
                 file_key: vec![0; 16],
+                padded_user_password: Vec::new(),
                 id0: vec![0; 16],
                 object_key_alg: ObjectKeyAlg::Rc4,
             }),
@@ -4530,6 +4512,7 @@ mod final_handle_writer_tests {
                 ]),
                 writer_length_bits: None,
                 file_key: vec![0; 16],
+                padded_user_password: Vec::new(),
                 id0: vec![0; 16],
                 object_key_alg: ObjectKeyAlg::Rc4,
             }),
@@ -4661,6 +4644,7 @@ mod final_handle_writer_tests {
             ]),
             writer_length_bits: None,
             file_key: vec![0; 16],
+            padded_user_password: Vec::new(),
             id0: vec![0; 16],
             object_key_alg: ObjectKeyAlg::Rc4,
         };
@@ -4691,6 +4675,7 @@ mod final_handle_writer_tests {
             ]),
             writer_length_bits: None,
             file_key: vec![0; 32],
+            padded_user_password: Vec::new(),
             id0: vec![0; 16],
             object_key_alg: ObjectKeyAlg::Aes,
         };

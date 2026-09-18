@@ -543,9 +543,11 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// The writer must not depend on reader implementation details such as
     /// `EncryptionState` or `EncryptionMode`. Keep that boundary here: the
-    /// helper snapshots the authenticated file key, the source `/Encrypt`
-    /// dictionary, and the permanent `/ID[0]`; the writer then applies qpdf's
-    /// canonical copy rules (including forcing AES for V>=4).
+    /// helper snapshots the authenticated file key, the padded user password
+    /// (qpdf's `getPaddedUserPassword`, from which the writer re-derives a
+    /// V<5 output key), the source `/Encrypt` dictionary, and the permanent
+    /// `/ID[0]`; the writer then applies qpdf's canonical copy rules
+    /// (including forcing AES for V>=4).
     ///
     /// `/ID[0]` is read from the value cached at authentication time, not
     /// from a fresh live-trailer lookup: for a V<5 document `file_key` is
@@ -558,13 +560,14 @@ impl<R: Read + Seek> Pdf<R> {
     /// derive `file_key` from `/ID` at all, so no cached value is available
     /// there and a live read is safe.
     pub fn writer_copy_encryption_source(&mut self) -> Result<Option<CopyEncryptionSource>> {
-        let (file_key, encryption_v, cached_id0) = {
+        let (file_key, padded_user_password, encryption_v, cached_id0) = {
             let guard = self.encryption.borrow();
             let Some(encryption) = guard.as_ref() else {
                 return Ok(None);
             };
             (
                 encryption.file_key.clone(),
+                encryption.user_password.clone(),
                 encryption.encryption_v,
                 encryption.id0.clone(),
             )
@@ -604,6 +607,7 @@ impl<R: Read + Seek> Pdf<R> {
             encrypt_dict,
             writer_length_bits,
             file_key,
+            padded_user_password,
             id0,
             // qpdf's copy path forces AES for V>=4. The field remains part of
             // the public donor surface for the explicit copy route; the

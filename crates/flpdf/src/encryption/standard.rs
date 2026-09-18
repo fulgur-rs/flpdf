@@ -128,6 +128,24 @@ fn pad_password(password: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Project a `/O` or `/U` entry onto the fixed 32-byte buffer qpdf's V<5
+/// key derivation reads.
+///
+/// qpdf stores `/O` and `/U` in `EncryptionData` as `std::string` and reads
+/// exactly `key_bytes` (32) from `c_str()` (`QPDF_encryption.cc:384-385`),
+/// so an entry longer than 32 bytes contributes only its first 32 and a
+/// shorter one is read past its end. This projection truncates the same way
+/// and NUL-pads the short case, matching the decision already recorded for
+/// the reader-side entry projection (`state.rs`'s
+/// `required_v_lt_5_32_byte_string_from_handle`, qpdf's
+/// `pad_short_parameter`, `QPDF_encryption.cc:316-321`).
+pub(crate) fn v_lt_5_32_byte_parameter(bytes: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let len = bytes.len().min(32);
+    out[..len].copy_from_slice(&bytes[..len]);
+    out
+}
+
 /// qpdf's `truncate_password_V5` (`QPDF_encryption.cc:171-174`).
 ///
 /// V=5 password truncation belongs to the reader-side authentication call
@@ -363,51 +381,88 @@ fn decrypt_r6_file_key(
 // Public API
 // ────────────────────────────────────────────────────────────────────────────
 
-/// PDF 1.7 §7.6.3.3 Algorithm 2 — Compute the file encryption key.
+/// qpdf `QPDF::compute_encryption_key_from_password`
+/// (`QPDF_encryption.cc:373-403`) — PDF 1.7 §7.6.3.3 Algorithm 2.
 ///
-/// Returns the file encryption key as a `Vec<u8>` of length `length_bits/8`.
-pub(crate) fn compute_file_key(
+/// This is the unvalidated core every V<5 key derivation shares. qpdf applies
+/// no handler validation here: the key length is `min(16, /Length / 8)` taken
+/// straight from the `EncryptionData` the caller built, so a malformed
+/// `/Length` yields a correspondingly short (or truncated) key rather than an
+/// error. `QPDFWriter::setEncryptionParametersInternal` (`QPDFWriter.cc:836`)
+/// depends on exactly that, since `copyEncryptionParameters`
+/// (`QPDFWriter.cc:668-670`) feeds it the donor's raw `/Length` value.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::System`] when `/Length` is negative, mirroring the
+/// `std::range_error` qpdf's `QIntC::to_size` / `QIntC::to_size` conversions
+/// raise for the same value (`QPDF_encryption.cc:181,402`).
+pub(crate) fn compute_encryption_key_from_password(
     password: &[u8],
     inputs: &StandardHandlerInputs<'_>,
 ) -> Result<Vec<u8>> {
-    let n = validate_inputs(inputs)?;
-
     // Step 1: Pad/truncate the password to 32 bytes.
     let padded = pad_password(password);
 
-    // Step 2: Initialise MD5 with padded_password || /O || P (LE) || /ID[0]
-    //         (and 0xFF×4 only for R≥4 && !encrypt_metadata — not applicable here).
+    // Step 2: Initialise MD5 with padded_password || /O || P (LE) || /ID[0].
     let p_le = inputs.p.to_le_bytes();
     let mut md5_input = Vec::with_capacity(32 + 32 + 4 + inputs.id0.len() + 4);
     md5_input.extend_from_slice(&padded);
     md5_input.extend_from_slice(inputs.o);
     md5_input.extend_from_slice(&p_le);
     md5_input.extend_from_slice(inputs.id0);
-    // Step 3 (R≥4 tail) — omitted for V=1/V=2.
+    // Step 3 (R≥4 tail): append 0xFF×4 when metadata is left in the clear.
     if inputs.r >= 4 && !inputs.encrypt_metadata {
         md5_input.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
     }
 
+    // qpdf's `std::min(sizeof(MD5::Digest), data.getLengthBytes())`.
+    let key_len = usize::try_from((inputs.length_bits / 8).min(16)).map_err(|_| {
+        crate::Error::System(format!(
+            "/Length {} is negative; encryption key length is out of range",
+            inputs.length_bits
+        ))
+    })?;
+
     // Step 3: Take the MD5 digest.
     let mut digest = md5(&md5_input);
 
-    // Step 4: If revision ≥ 3, do 50 iterations of MD5 on the first n bytes.
+    // Step 4: If revision ≥ 3, do 50 iterations of MD5 on the first key_len bytes.
     if inputs.r >= 3 {
         for _ in 0..50 {
-            digest = md5(&digest[..n]);
+            digest = md5(&digest[..key_len]);
         }
     }
 
-    // Step 5: Return the first n bytes as the file encryption key.
-    Ok(digest[..n].to_vec())
+    // Step 5: Return the first key_len bytes as the file encryption key.
+    Ok(digest[..key_len].to_vec())
+}
+
+/// PDF 1.7 §7.6.3.3 Algorithm 2 — Compute the V=1/V=2 file encryption key.
+///
+/// Validates the V=1/V=2 handler matrix (a flpdf-side projection of the
+/// reader checks qpdf performs in `QPDF::initializeEncryption`, not part of
+/// qpdf's derivation function) and then runs the shared core. Validation
+/// pins `/Length` to a multiple of 8 in `[40, 128]`, so
+/// `min(16, /Length / 8)` is always `/Length / 8` and the delegation is
+/// byte-for-byte what this function computed inline before.
+///
+/// Returns the file encryption key as a `Vec<u8>` of length `length_bits/8`.
+pub(crate) fn compute_file_key(
+    password: &[u8],
+    inputs: &StandardHandlerInputs<'_>,
+) -> Result<Vec<u8>> {
+    let _n = validate_inputs(inputs)?;
+    compute_encryption_key_from_password(password, inputs)
 }
 
 /// PDF 1.7 §7.6.3.3 Algorithm 2 (R=4 path) — Compute the V=4 file encryption key.
 ///
 /// This is a thin shim that validates the inputs as V=4/R=4/Length=128 and then
-/// delegates to the same MD5-based key derivation used by `compute_file_key`.
-/// The 0xFF×4 tail required by Algorithm 2 step 3 when `!encrypt_metadata && R≥4`
-/// is already handled inside `compute_file_key`'s inner loop; no new logic is needed.
+/// runs the same shared Algorithm 2 core as [`compute_file_key`], which already
+/// contains the 0xFF×4 tail Algorithm 2 step 3 requires when
+/// `!encrypt_metadata && R≥4`. Validation pins `/Length` to 128, so
+/// `min(16, /Length / 8)` is 16.
 ///
 /// Returns the 16-byte file encryption key.
 pub(crate) fn compute_file_key_v4(
@@ -416,32 +471,7 @@ pub(crate) fn compute_file_key_v4(
 ) -> Result<Vec<u8>> {
     // Validate that inputs are specifically V=4/R=4/Length=128.
     let _n = validate_v4_inputs(inputs)?;
-    // compute_file_key contains the full Algorithm 2 R=4 path (including the
-    // conditional 0xFF×4 tail for !encrypt_metadata). We invoke it directly,
-    // bypassing validate_inputs (which rejects V=4) by constructing equivalent
-    // inputs that the inner function accepts — but that would couple the two
-    // validators. Instead, inline only the algorithmic core so we stay DRY
-    // without punching a hole in validate_inputs.
-    //
-    // Algorithmic core (mirrors compute_file_key):
-    let n = 16usize; // length_bits=128 → 16 bytes
-    let padded = pad_password(password);
-    let p_le = inputs.p.to_le_bytes();
-    let mut md5_input = Vec::with_capacity(32 + 32 + 4 + inputs.id0.len() + 4);
-    md5_input.extend_from_slice(&padded);
-    md5_input.extend_from_slice(inputs.o);
-    md5_input.extend_from_slice(&p_le);
-    md5_input.extend_from_slice(inputs.id0);
-    // R=4: append 0xFF×4 when encrypt_metadata is false (Algorithm 2, step 3).
-    if !inputs.encrypt_metadata {
-        md5_input.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
-    }
-    let mut digest = md5(&md5_input);
-    // R=4 ≥ 3: 50 iterations of MD5 on the first n bytes.
-    for _ in 0..50 {
-        digest = md5(&digest[..n]);
-    }
-    Ok(digest[..n].to_vec())
+    compute_encryption_key_from_password(password, inputs)
 }
 
 /// Authenticate a user password for legacy V=5 R=5 and return the 32-byte file key.
@@ -1694,5 +1724,119 @@ mod v1_v2_reader_tests {
                 ..
             })
         ));
+    }
+}
+
+#[cfg(test)]
+mod copy_writer_key_derivation_tests {
+    use super::{
+        compute_encryption_key_from_password, v_lt_5_32_byte_parameter, StandardHandlerInputs,
+    };
+
+    /// `/O` from a V=4 donor produced by
+    /// `qpdf --static-id --encrypt --user-password=u --owner-password=o
+    /// --bits=128 --use-aes=y`.
+    const DONOR_O: [u8; 32] = [
+        0x2a, 0x2f, 0x0a, 0x19, 0x90, 0x19, 0x2c, 0x60, 0x11, 0x47, 0x30, 0xbd, 0xcd, 0x39, 0xf3,
+        0x78, 0x28, 0xa5, 0x3c, 0x89, 0xa3, 0x40, 0xdd, 0x47, 0x3c, 0x85, 0x29, 0x9d, 0xc5, 0x25,
+        0x8e, 0x1c,
+    ];
+    /// qpdf's `--static-id` `/ID[0]`.
+    const STATIC_ID0: [u8; 16] = [
+        0x31, 0x41, 0x59, 0x26, 0x53, 0x58, 0x97, 0x93, 0x23, 0x84, 0x62, 0x64, 0x33, 0x83, 0x27,
+        0x95,
+    ];
+
+    fn inputs(r: i64, length_bits: i64, encrypt_metadata: bool) -> StandardHandlerInputs<'static> {
+        static U: [u8; 32] = [0; 32];
+        StandardHandlerInputs {
+            v: 4,
+            r,
+            length_bits,
+            p: -4,
+            id0: &STATIC_ID0,
+            u: &U,
+            o: &DONOR_O,
+            encrypt_metadata,
+        }
+    }
+
+    /// Known answer taken from qpdf 11.9.0: copying that donor's encryption
+    /// after patching its `/Length` to `040` makes qpdf derive this 5-byte
+    /// key, which decrypts the content streams of qpdf's own output.
+    #[test]
+    fn short_length_matches_the_qpdf_derived_key() {
+        let key = compute_encryption_key_from_password(b"u", &inputs(4, 40, true))
+            .expect("a positive /Length derives a key");
+        assert_eq!(key, [0x46, 0x07, 0x82, 0xd6, 0x66]);
+    }
+
+    /// qpdf clamps the key length to the MD5 digest size, so any `/Length`
+    /// above 128 bits derives exactly the 128-bit key.
+    #[test]
+    fn oversized_length_is_clamped_to_the_digest_size() {
+        let clamped = compute_encryption_key_from_password(b"u", &inputs(3, 240, true))
+            .expect("an oversized /Length is clamped");
+        let digest_sized = compute_encryption_key_from_password(b"u", &inputs(3, 128, true))
+            .expect("a 128-bit /Length derives a key");
+        assert_eq!(clamped.len(), 16);
+        assert_eq!(clamped, digest_sized);
+    }
+
+    /// qpdf's `getIntValueAsInt` fallback turns a non-integer `/Length` into
+    /// zero, which derives a zero-length key rather than failing.
+    #[test]
+    fn zero_length_derives_an_empty_key() {
+        let key = compute_encryption_key_from_password(b"u", &inputs(3, 0, true))
+            .expect("a zero /Length derives an empty key");
+        assert!(key.is_empty());
+    }
+
+    /// Below R=3 qpdf skips the 50 MD5 iterations entirely.
+    #[test]
+    fn revision_two_skips_the_iteration_loop() {
+        let r2 = compute_encryption_key_from_password(b"u", &inputs(2, 40, true))
+            .expect("R=2 derives a key");
+        let r3 = compute_encryption_key_from_password(b"u", &inputs(3, 40, true))
+            .expect("R=3 derives a key");
+        assert_eq!(r2.len(), 5);
+        assert_ne!(r2, r3);
+    }
+
+    /// From R=4 on, cleartext metadata appends 0xFF x4 to the digest input.
+    #[test]
+    fn cleartext_metadata_changes_the_key_from_revision_four() {
+        let encrypted = compute_encryption_key_from_password(b"u", &inputs(4, 128, true))
+            .expect("R=4 derives a key");
+        let cleartext = compute_encryption_key_from_password(b"u", &inputs(4, 128, false))
+            .expect("R=4 derives a key");
+        assert_ne!(encrypted, cleartext);
+        // R=3 has no such tail, so the flag cannot change its key.
+        assert_eq!(
+            compute_encryption_key_from_password(b"u", &inputs(3, 128, true))
+                .expect("R=3 derives a key"),
+            compute_encryption_key_from_password(b"u", &inputs(3, 128, false))
+                .expect("R=3 derives a key")
+        );
+    }
+
+    /// qpdf's `QIntC` conversions raise a range error for a negative length.
+    #[test]
+    fn negative_length_is_out_of_range() {
+        let error = compute_encryption_key_from_password(b"u", &inputs(3, -8, true))
+            .expect_err("a negative /Length has no key length");
+        assert!(
+            matches!(&error, crate::Error::System(message) if message.contains("-8")),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The 32-byte `/O` and `/U` projection truncates and NUL-pads.
+    #[test]
+    fn parameter_projection_truncates_and_pads() {
+        assert_eq!(v_lt_5_32_byte_parameter(&[0xab; 40]), [0xab; 32]);
+        let short = v_lt_5_32_byte_parameter(&[0xcd; 3]);
+        assert_eq!(&short[..3], &[0xcd; 3]);
+        assert_eq!(&short[3..], &[0; 29]);
     }
 }

@@ -5449,38 +5449,11 @@ fn build_copy_encryption_source(
         // not a malformed donor (`QPDFWriter.cc:651-658`).
         return Ok(None);
     };
-    let length_bits = donor.encryption_length_bits().ok_or_else(|| {
-        format!(
-            "--copy-encryption: donor {:?} has no encryption key length",
-            path
-        )
-    })?;
-    let revision = donor.encryption_revision().ok_or_else(|| {
-        format!(
-            "--copy-encryption: donor {:?} has no encryption revision",
-            path
-        )
-    })?;
-
-    // qpdf's QPDFWriter::copyEncryptionParameters reads V, R, and /Length,
-    // then lets setEncryptionParametersInternal choose RC4 for V<4 and AES
-    // for V>=4. Keep this validation at the donor boundary so the writer
-    // receives a complete, authenticated qpdf-shaped source rather than a
-    // compatibility sentinel or a guessed crypt-filter method.
-    let supported = match (version, revision) {
-        (1, 2) => length_bits == 40,
-        (2, 2 | 3) => (40..=128).contains(&length_bits) && length_bits % 8 == 0,
-        (4, 4) => length_bits == 128,
-        (5, 5 | 6) => length_bits == 256,
-        _ => false,
-    };
-    if !supported {
-        return Err(format!(
-            "--copy-encryption: donor {:?} uses unsupported Standard handler V={} R={} length={}",
-            path, version, revision, length_bits,
-        )
-        .into());
-    }
+    // qpdf's QPDFWriter::copyEncryptionParameters reads V, R, and /Length and
+    // feeds them straight to setEncryptionParametersInternal, which chooses
+    // RC4 for V<4 and AES for V>=4 without validating the combination
+    // (`QPDFWriter.cc:651-702`). The donor boundary therefore checks only
+    // that the trailer has an /Encrypt dictionary at all.
 
     // Recover the donor's file key.  The error message guides the user to
     // supply the correct password via --encryption-file-password.

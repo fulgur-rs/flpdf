@@ -848,11 +848,17 @@ fn encrypted_qdf_objstm_dictionary_matches_qpdf() {
     );
 }
 
+/// qpdf's `setEncryptionParametersInternal` re-derives the V<5 output key
+/// from `getPaddedUserPassword()` and the donor `/Length`
+/// (`QPDFWriter.cc:832-839`); the key the donor actually authenticated with
+/// is never consulted and never checked for length. A short donor key must
+/// therefore produce output identical to a correct-length one, while a
+/// different padded user password must change the ciphertext.
 #[test]
-fn copy_encryption_rejects_short_public_file_key_in_compact_and_qdf() {
+fn copy_encryption_v_lt_5_rederives_the_key_from_the_padded_user_password() {
     let input = nested_string_fixture(INFO_PLAINTEXT);
 
-    for qdf in [false, true] {
+    let render = |qdf: bool, file_key: Vec<u8>, padded_user_password: Vec<u8>| -> Vec<u8> {
         let mut pdf = Pdf::open(Cursor::new(input.clone())).expect("open copy-encryption fixture");
         let mut output = Vec::new();
         let mut options = WriterTestSettings {
@@ -861,30 +867,38 @@ fn copy_encryption_rejects_short_public_file_key_in_compact_and_qdf() {
             static_aes_iv: true,
             ..WriterTestSettings::default()
         };
-        let encrypt_dict = ObjectHandle::dictionary(vec![
-            (b"/V".to_vec(), ObjectHandle::integer(4)),
-            (b"/R".to_vec(), ObjectHandle::integer(4)),
-            (b"/Length".to_vec(), ObjectHandle::integer(128)),
-        ]);
         options.copy_encryption = Some(CopyEncryptionSource {
-            encrypt_dict,
+            encrypt_dict: ObjectHandle::dictionary(vec![
+                (b"/V".to_vec(), ObjectHandle::integer(4)),
+                (b"/R".to_vec(), ObjectHandle::integer(4)),
+                (b"/Length".to_vec(), ObjectHandle::integer(128)),
+                (b"/P".to_vec(), ObjectHandle::integer(-4)),
+                (b"/O".to_vec(), ObjectHandle::string(vec![1; 32])),
+                (b"/U".to_vec(), ObjectHandle::string(vec![2; 32])),
+            ]),
             writer_length_bits: None,
-            file_key: vec![0x31; 15],
+            file_key,
+            padded_user_password,
             id0: b"0123456789abcdef".to_vec(),
             object_key_alg: ObjectKeyAlg::Aes,
         });
+        write_with_settings(&mut pdf, &mut output, &options)
+            .expect("copy-encryption must not validate the donor key length");
+        assert!(!output.is_empty());
+        output
+    };
 
-        let error = write_with_settings(&mut pdf, &mut output, &options)
-            .expect_err("short public copy-encryption key must be rejected");
-        assert!(matches!(
-            error,
-            flpdf::Error::Unsupported(message)
-                if message
-                    == "copy-encryption V=4 R=4 file key must be 16 bytes; got 15"
-        ));
-        assert!(
-            output.is_empty(),
-            "{qdf:?} copy-encryption validation must precede output emission"
+    for qdf in [false, true] {
+        let short_key = render(qdf, vec![0x31; 15], b"user".to_vec());
+        let full_key = render(qdf, vec![0x42; 16], b"user".to_vec());
+        assert_eq!(
+            short_key, full_key,
+            "{qdf:?} output must not depend on the donor's authenticated key"
+        );
+        let other_password = render(qdf, vec![0x31; 15], b"owner-recovered".to_vec());
+        assert_ne!(
+            short_key, other_password,
+            "{qdf:?} output key must come from the padded user password"
         );
     }
 }
