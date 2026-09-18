@@ -2858,7 +2858,13 @@ fn copy_encryption_failure_stderr(donor: &Path, password: Option<&str>, out: &Pa
         .assert()
         .failure()
         .code(2);
-    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    // The logger's diagnostic sink runs its stderr writes through qpdf's own
+    // Windows text-mode `\n` -> `\r\n` conversion (`crates/flpdf/src/logger.rs`
+    // `TextModeWriter`, matching `QPDFLogger.cc:43-50`'s C-runtime text
+    // stream). Collapse it the same way the existing flpdf-vs-qpdf comparisons
+    // in this file do before pinning the line against a bare `\n` literal.
+    let stderr =
+        String::from_utf8_lossy(&normalize_text_newlines(&assert.get_output().stderr)).into_owned();
     assert!(
         !stderr.contains("--copy-encryption:"),
         "donor failures must not carry an option-specific prefix qpdf never \
@@ -2930,7 +2936,7 @@ fn copy_encryption_missing_donor_reports_open_failure() {
         .failure()
         .code(2);
     assert_eq!(
-        String::from_utf8_lossy(&assert.get_output().stderr),
+        String::from_utf8_lossy(&normalize_text_newlines(&assert.get_output().stderr)),
         format!(
             "qpdf: open {}: No such file or directory\n",
             donor.display()
