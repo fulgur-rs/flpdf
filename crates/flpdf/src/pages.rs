@@ -725,6 +725,38 @@ mod tests {
     }
 
     #[test]
+    fn page_walk_expands_a_direct_pages_kid() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let root_pages = pdf
+            .root_handle()
+            .expect("empty catalog")
+            .try_get_key(b"/Pages")
+            .expect("empty /Pages");
+        let page = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Type".to_vec(),
+                ObjectHandle::name(b"Page".to_vec()),
+            )]))
+            .expect("indirect page");
+        let direct_subtree = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+            (b"/Kids".to_vec(), ObjectHandle::array(vec![page.clone()])),
+        ]);
+        root_pages
+            .replace_key(b"/Kids", ObjectHandle::array(vec![direct_subtree]))
+            .expect("install direct subtree");
+        root_pages
+            .replace_key(b"/Count", ObjectHandle::integer(1))
+            .expect("install count");
+
+        let refs = page_refs(&mut pdf).expect("direct subtree is expanded");
+        assert_eq!(
+            refs,
+            vec![page.object_ref().expect("indirect page identity")]
+        );
+    }
+
+    #[test]
     fn page_walk_promotes_a_direct_scalar_kid_like_qpdf() {
         let mut pdf = Pdf::empty().expect("empty PDF");
         let pages = pdf
