@@ -4691,6 +4691,36 @@ mod final_handle_writer_tests {
         );
     }
 
+    /// qpdf's `QIntC` conversions raise `std::range_error` when the donor
+    /// `/Length` makes `min(16, /Length / 8)` negative
+    /// (`QPDF_encryption.cc:181,402`), which reaches this crate as
+    /// [`crate::Error::System`].
+    #[test]
+    fn copied_negative_length_is_out_of_range() {
+        let source = CopyEncryptionSource {
+            encrypt_dict: ObjectHandle::dictionary(vec![
+                (b"/V".to_vec(), ObjectHandle::integer(2)),
+                (b"/R".to_vec(), ObjectHandle::integer(3)),
+                (b"/Length".to_vec(), ObjectHandle::integer(-8)),
+                (b"/P".to_vec(), ObjectHandle::integer(-4)),
+                (b"/O".to_vec(), ObjectHandle::string(vec![1; 32])),
+                (b"/U".to_vec(), ObjectHandle::string(vec![2; 32])),
+            ]),
+            writer_length_bits: None,
+            file_key: vec![0; 16],
+            padded_user_password: b"user".to_vec(),
+            id0: vec![0; 16],
+            object_key_alg: ObjectKeyAlg::Rc4,
+        };
+
+        let error = canonical_copy_encryption(&source)
+            .expect_err("a negative /Length has no valid key length");
+        assert!(
+            matches!(&error, crate::Error::System(message) if message.contains("-8")),
+            "unexpected error: {error}"
+        );
+    }
+
     #[test]
     fn copy_integer_reports_a_non_integer_or_missing_value() {
         let dictionary = ObjectHandle::dictionary(vec![(
