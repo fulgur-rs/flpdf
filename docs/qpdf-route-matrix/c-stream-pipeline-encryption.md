@@ -473,8 +473,15 @@ C10/C11 の runtime `registerStreamFilter` は、built-in lookupと同じregistr
 | bridge | 0 | — |
 | unknown | 0 | なし（C42 の pipe-side EOL subtraction は `flpdf-zvjf` と `flpdf-hj7v` で qpdf parity として解決） |
 
-2026-09-18（`flpdf-8od1h`）で C22 の plain 側早期 return は撤去され `canonical` へ
-再分類した。U3 が問う plain/QDF の出力 cache と linearized optimizer の事前 probe の
+2026-09-18（`flpdf-8od1h`）で C22 の plain 側早期 return を撤去し `canonical` へ
+再分類した。**ただし cutover はこの撤去ではない**（2026-09-19 訂正）——`canonical_stream_will_be_refiltered_with_policy` の production 呼び出し元は
+`linearization/plan.rs:214` の 1 箇所だけで、しかも `handle.is_data_modified()` の
+**`else` 分岐**にある（`plan.rs:207-216`）。早期 return は `if handle.is_data_modified()`
+だったので、この caller からは発火しえない。plain 経路の caller は
+`f8d151deb`「refactor: remove planned plain stream payloads」（2026-09-12）で
+撤去されており（`writer/plain/plan.rs` の該当呼び出しが 1→0）、早期 return は
+その時点で production 到達不能になっていた。`flpdf-8od1h` はその dead code の
+掃除であり、canonical 分類を裏づけるのは `f8d151deb` が確立した call graph の方。U3 が問う plain/QDF の出力 cache と linearized optimizer の事前 probe の
 callback timing 一致は、この早期 return とは別軸の残課題（caller 個別の cache/timing 比較）
 として C22 から独立に残る。qpdf 責務としての独立した分類を持たない open question なので
 `unknown` 行にはせず、そちらから参照する。U4 は C17/C18 の
