@@ -901,27 +901,22 @@ mod tests {
     }
 
     #[test]
-    fn pclm_does_not_seed_a_non_page_kids_leaf() {
+    fn pclm_seeds_a_non_page_kids_leaf_like_qpdf() {
         let mut pdf = fixture_pdf();
         let page = crate::pages::page_refs(&mut pdf).unwrap()[0];
         pdf.replace_object(page, ObjectHandle::integer(42))
             .expect("replace page with a scalar through the canonical route");
 
-        let output = write_pclm_bytes(&mut pdf).expect("a scalar page is skipped by the page walk");
+        let output = write_pclm_bytes(&mut pdf).expect("a scalar page leaf is seeded like qpdf");
         let output = String::from_utf8_lossy(&output);
 
-        // The scalar leaf is not a page, so the PCLm seed never numbers it
-        // first; it only reaches the file later, as an ordinary `/Kids` child
-        // discovered while the page tree is unparsed.
+        // qpdf's `getAllPagesInternal` treats any `/Kids` entry without
+        // `/Kids` as a page leaf, scalar or not (`libqpdf/QPDF_pages.cc:91-131`),
+        // and the PCLm seed numbers the first page object first.
         assert!(
-            !output.contains("\n1 0 obj\n42\nendobj"),
-            "a scalar leaf is not seeded as the first PCLm page: {output}"
+            output.contains("\n1 0 obj\n42\nendobj"),
+            "a scalar leaf is seeded as the first PCLm page: {output}"
         );
-        assert!(
-            output.contains("\n42\nendobj"),
-            "the scalar leaf still reaches the file through /Kids: {output}"
-        );
-        let _ = page;
     }
 
     #[test]
