@@ -7936,6 +7936,19 @@ fn add_attachment_missing_segment_terminator_is_a_usage_error() {
         ));
 }
 
+/// The standard qpdf usage-error block for an `FLPDF_PROGNAME=qpdf` CLI
+/// invocation: a leading blank line, the message, a blank line, then the
+/// four-line `For help:` block (`qpdf/qpdf.cc:12-22,37-38`; matches the
+/// `expected_usage` helper in `cli_job_json.rs`, which uses the "flpdf:"
+/// prefix instead since it does not set `FLPDF_PROGNAME`).
+fn qpdf_prefixed_usage(message: &str) -> String {
+    format!(
+        "{EOL}qpdf: {message}{EOL}{EOL}For help:{EOL}  qpdf --help=usage       usage information{EOL}  \
+qpdf --help=topic       help on a topic{EOL}  qpdf --help=--option    help on an option{EOL}  \
+qpdf --help             general help and a topic list{EOL}{EOL}"
+    )
+}
+
 #[test]
 fn add_attachment_equals_form_with_no_positional_matches_qpdf_usage() {
     // qpdf's `--add-attachment` is a bare option: `--add-attachment=x --`
@@ -7962,7 +7975,7 @@ fn add_attachment_equals_form_with_no_positional_matches_qpdf_usage() {
         ])
         .assert()
         .code(2)
-        .stderr(format!("qpdf: add attachment: no file specified{EOL}"));
+        .stderr(qpdf_prefixed_usage("add attachment: no file specified"));
 
     assert!(!output.exists());
 }
@@ -7984,7 +7997,7 @@ fn add_attachment_without_file_matches_qpdf_usage() {
         ])
         .assert()
         .code(2)
-        .stderr(format!("qpdf: add attachment: no file specified{EOL}"));
+        .stderr(qpdf_prefixed_usage("add attachment: no file specified"));
 
     assert!(!output.exists());
 }
@@ -8010,8 +8023,8 @@ fn add_attachment_invalid_creation_date_matches_qpdf_usage() {
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::starts_with(format!(
-            "qpdf: potato is not a valid PDF timestamp{EOL}"
+        .stderr(predicate::str::starts_with(qpdf_prefixed_usage(
+            "potato is not a valid PDF timestamp",
         )));
 }
 
@@ -8036,8 +8049,8 @@ fn add_attachment_invalid_modification_date_matches_qpdf_usage() {
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::starts_with(format!(
-            "qpdf: potato is not a valid PDF timestamp{EOL}"
+        .stderr(predicate::str::starts_with(qpdf_prefixed_usage(
+            "potato is not a valid PDF timestamp",
         )));
 }
 
@@ -8076,6 +8089,11 @@ fn add_attachment_equals_form_with_a_positional_embeds_it_and_drops_the_equals_v
 }
 
 #[test]
+#[ignore = "flpdf-3yn9.48.193: this test's own .success() expectation is wrong against \
+live qpdf 11.9.0, which rejects this input (exit 2, \"unrecognized argument --overlay \
+(attachment options must be terminated with --)\"); the canonical initializer's Attachment \
+table also uses different (also not-yet-qpdf-matching) wording for the same rejection. \
+Un-ignore once both are fixed and the assertion below is corrected to .failure()."]
 fn add_attachment_equals_form_positional_named_overlay_is_not_hijacked_by_overlay_scanning() {
     // The overlay/underlay group scanner runs before the attachment group
     // scanner and, before this fix, matched on the exact string

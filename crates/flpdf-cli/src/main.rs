@@ -4144,185 +4144,8 @@ fn create_empty_primary_document(
     Ok(pdf)
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum JobJsonCliEvent {
-    JobJsonFile(PathBuf),
-    EmptyInput,
-    Input(PathBuf),
-    Output(PathBuf),
-    ReplaceInput,
-    Password(Vec<u8>),
-    PasswordFile(PathBuf),
-    PasswordMode(PasswordMode),
-    PasswordIsHexKey,
-    SuppressPasswordRecovery,
-    SuppressRecovery,
-    IgnoreXrefStreams,
-    CheckLinearization,
-    Rotate(Vec<u8>),
-    Json(Option<Vec<u8>>),
-    JsonOutput(Option<Vec<u8>>),
-    Collate(Vec<u8>),
-    CompressionLevel(Vec<u8>),
-    ExternalizeInlineImages,
-    OptimizeImages,
-    KeepInlineImages,
-    IiMinBytes(Vec<u8>),
-    KeepFilesOpenThreshold(Vec<u8>),
-    OiMinArea(Vec<u8>),
-    OiMinHeight(Vec<u8>),
-    OiMinWidth(Vec<u8>),
-    SplitPages(Vec<u8>),
-    ShowObject(Vec<u8>),
-}
-
-fn raw_option_equals_value<'a>(argument: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
-    let option = argument.strip_prefix(b"--")?;
-    let value = option.strip_prefix(name)?.strip_prefix(b"=")?;
-    Some(value)
-}
-
-fn job_json_password_mode(value: &[u8]) -> CliResult<PasswordMode> {
-    match value {
-        b"auto" => Ok(PasswordMode::Auto),
-        b"bytes" => Ok(PasswordMode::Bytes),
-        b"hex-bytes" => Ok(PasswordMode::HexBytes),
-        b"unicode" => Ok(PasswordMode::Unicode),
-        _ => Err(Box::new(UsageError::new(
-            "invalid --password-mode value in qpdf argv",
-        ))),
-    }
-}
-
-/// Reconstruct the qpdf configuration callback sequence for the job-json
-/// route. Clap retains the final value of many options but qpdf invokes each
-/// callback while scanning argv, so the partial JSON files and their sibling
-/// selectors must be replayed from the raw residual tokens instead.
-fn qpdf_cli_events(args: &[arg_parser::RawArg]) -> CliResult<Vec<JobJsonCliEvent>> {
-    let mut events = Vec::new();
-    let mut gave_input = false;
-    let mut gave_output = false;
-    let mut index = 1;
-
-    while index < args.len() {
-        let argument = &args[index];
-        let bytes = argument.as_bytes();
-
-        if is_named_segment_option(bytes) {
-            index += 1;
-            while index < args.len() && args[index].as_bytes() != b"--" {
-                index += 1;
-            }
-            index += usize::from(index < args.len());
-            continue;
-        }
-        if bytes == b"--" {
-            index += 1;
-            continue;
-        }
-
-        if let Some(value) = raw_option_equals_value(bytes, b"job-json-file") {
-            events.push(JobJsonCliEvent::JobJsonFile(PathBuf::from(
-                arg_parser::os_string_from_bytes(value),
-            )));
-        } else if let Some(value) = raw_option_equals_value(bytes, b"compression-level") {
-            events.push(JobJsonCliEvent::CompressionLevel(value.to_vec()));
-        } else if bytes == b"--externalize-inline-images" {
-            events.push(JobJsonCliEvent::ExternalizeInlineImages);
-        } else if bytes == b"--optimize-images" {
-            events.push(JobJsonCliEvent::OptimizeImages);
-        } else if bytes == b"--keep-inline-images" {
-            events.push(JobJsonCliEvent::KeepInlineImages);
-        } else if let Some(value) = raw_option_equals_value(bytes, b"ii-min-bytes") {
-            events.push(JobJsonCliEvent::IiMinBytes(value.to_vec()));
-        } else if let Some(value) = raw_option_equals_value(bytes, b"keep-files-open-threshold") {
-            events.push(JobJsonCliEvent::KeepFilesOpenThreshold(value.to_vec()));
-        } else if let Some(value) = raw_option_equals_value(bytes, b"oi-min-area") {
-            events.push(JobJsonCliEvent::OiMinArea(value.to_vec()));
-        } else if let Some(value) = raw_option_equals_value(bytes, b"oi-min-height") {
-            events.push(JobJsonCliEvent::OiMinHeight(value.to_vec()));
-        } else if let Some(value) = raw_option_equals_value(bytes, b"oi-min-width") {
-            events.push(JobJsonCliEvent::OiMinWidth(value.to_vec()));
-        } else if let Some(value) = raw_option_equals_value(bytes, b"show-object") {
-            events.push(JobJsonCliEvent::ShowObject(value.to_vec()));
-        } else if let Some(value) = raw_option_equals_value(bytes, b"split-pages") {
-            events.push(JobJsonCliEvent::SplitPages(value.to_vec()));
-        } else if bytes == b"--split-pages" {
-            events.push(JobJsonCliEvent::SplitPages(Vec::new()));
-        } else if bytes == b"--json" {
-            events.push(JobJsonCliEvent::Json(None));
-        } else if let Some(value) = raw_option_equals_value(bytes, b"json") {
-            events.push(JobJsonCliEvent::Json(Some(value.to_vec())));
-        } else if bytes == b"--json-output" {
-            events.push(JobJsonCliEvent::JsonOutput(None));
-        } else if let Some(value) = raw_option_equals_value(bytes, b"json-output") {
-            events.push(JobJsonCliEvent::JsonOutput(Some(value.to_vec())));
-        } else if let Some(value) = raw_option_equals_value(bytes, b"rotate") {
-            events.push(JobJsonCliEvent::Rotate(value.to_vec()));
-        } else if bytes == b"--collate" {
-            events.push(JobJsonCliEvent::Collate(Vec::new()));
-        } else if let Some(value) = raw_option_equals_value(bytes, b"collate") {
-            events.push(JobJsonCliEvent::Collate(value.to_vec()));
-        } else if bytes == b"--empty" {
-            events.push(JobJsonCliEvent::EmptyInput);
-            gave_input = true;
-        } else if bytes == b"--replace-input" {
-            events.push(JobJsonCliEvent::ReplaceInput);
-            gave_output = true;
-        } else if let Some(value) = raw_option_equals_value(bytes, b"password") {
-            events.push(JobJsonCliEvent::Password(value.to_vec()));
-        } else if let Some(value) = raw_option_equals_value(bytes, b"password-file") {
-            events.push(JobJsonCliEvent::PasswordFile(PathBuf::from(
-                arg_parser::os_string_from_bytes(value),
-            )));
-        } else if let Some(value) = raw_option_equals_value(bytes, b"password-mode") {
-            events.push(JobJsonCliEvent::PasswordMode(job_json_password_mode(
-                value,
-            )?));
-        } else if bytes == b"--password-is-hex-key" {
-            events.push(JobJsonCliEvent::PasswordIsHexKey);
-        } else if bytes == b"--suppress-password-recovery" {
-            events.push(JobJsonCliEvent::SuppressPasswordRecovery);
-        } else if bytes == b"--suppress-recovery" {
-            events.push(JobJsonCliEvent::SuppressRecovery);
-        } else if bytes == b"--ignore-xref-streams" {
-            events.push(JobJsonCliEvent::IgnoreXrefStreams);
-        } else if bytes == b"--check-linearization" {
-            events.push(JobJsonCliEvent::CheckLinearization);
-        } else if bytes == b"-" || !bytes.starts_with(b"-") {
-            if !gave_input {
-                events.push(JobJsonCliEvent::Input(PathBuf::from(argument.as_os_str())));
-                gave_input = true;
-            } else if !gave_output {
-                events.push(JobJsonCliEvent::Output(PathBuf::from(argument.as_os_str())));
-                gave_output = true;
-            }
-        }
-        index += 1;
-    }
-
-    Ok(events)
-}
-
 struct QpdfCliPreflight {
     job: QPDFJob,
-}
-
-fn qpdf_optional_choice_error(
-    option: &str,
-    value: Option<&[u8]>,
-    choices: &[&str],
-) -> CliResult<()> {
-    let Some(value) = value else {
-        return Ok(());
-    };
-    if choices.iter().any(|choice| value == choice.as_bytes()) {
-        return Ok(());
-    }
-    let choices = choices.join(",");
-    Err(Box::new(UsageError::new(format!(
-        "--{option} must be given as --{option}={{{choices}}}"
-    ))))
 }
 
 /// Convert an error from a qpdf argv callback into the usage-error class used
@@ -4347,138 +4170,60 @@ fn parse_qpdf_unsigned_option(value: &[u8]) -> CliResult<usize> {
         .map_err(|error| qpdf_argv_usage_error(Box::new(error)))
 }
 
-/// Replay the qpdf callbacks whose validation must happen before clap's
-/// post-parse route selection. The prepared job is handed to the execution
-/// route so JSON and every side file it references are read exactly once.
+/// Build one canonical job from the argv/job-json boundary that qpdf's own
+/// CLI wraps directly around `QPDFJob::initializeFromArgv`
+/// (`qpdf/qpdf.cc:27-43`). Runs for every non-subcommand invocation, before
+/// clap's post-parse route selection, so qpdf's own occurrence-order
+/// immediate parameter validation (`--rotate`, `--collate`,
+/// `--compression-level`, image thresholds, `--split-pages`,
+/// `--show-object`, `--json`/`--json-output`, and every other option the
+/// canonical initializer's argv grammar covers) happens before any file is
+/// opened, matching qpdf. The prepared job becomes the real job for the
+/// `--job-json-file` route; every other route discards it after this
+/// validation pass.
+///
+/// Two flpdf-cli-only adjustments to the raw argv fed to the canonical
+/// initializer:
+/// - `--repair` (`Cli::repair`) has no qpdf counterpart (confirmed absent
+///   from `libqpdf/qpdf/auto_job_init.hh`'s 124-option registry; every other
+///   top-level `Cli` flag, including the flattened `PasswordArgs`/
+///   `PageOpArgs` fields, does have one) and is filtered out so the
+///   canonical initializer does not reject it as unrecognized.
+/// - `--password-file` is filtered out unless `--job-json-file` is also
+///   present. Its Config callback is one of only two in
+///   `libqpdf/QPDFJob_config.cc` with a discard-time file-read side effect
+///   (`passwordFile:661`, alongside `jobJsonFile:774`, confirmed by
+///   grepping that file for `read_lines_from_file`/`read_file_into_string`);
+///   running it during a validation pass whose job is later discarded would
+///   read the file (and emit its multi-line warning) a second time when the
+///   real, clap-driven non-job-json-file route processes `--password-file`
+///   again.
+///
+/// The message prefix is set from [`progname`] rather than the raw
+/// `argv[0]` element so `FLPDF_PROGNAME` keeps overriding it for the qtest
+/// harness shim: qpdf's own `getProgname()` is `argv[0]`-derived
+/// (`QPDFArgParser.cc:418-428`), but this env-var override has no qpdf
+/// counterpart and every other flpdf-cli diagnostic already goes through
+/// [`progname`] instead of the raw executable name.
 fn preflight_qpdf_cli_events(args: &[arg_parser::RawArg]) -> CliResult<QpdfCliPreflight> {
-    let events = qpdf_cli_events(args)?;
-    let has_job_json = events
+    let has_job_json = args
         .iter()
-        .any(|event| matches!(event, JobJsonCliEvent::JobJsonFile(_)));
+        .any(|argument| argument.as_bytes().starts_with(b"--job-json-file="));
+    let mut filtered: Vec<Vec<u8>> = args
+        .iter()
+        .filter(|argument| {
+            let bytes = argument.as_bytes();
+            bytes != b"--repair" && (has_job_json || !bytes.starts_with(b"--password-file="))
+        })
+        .map(|argument| argument.as_bytes().to_vec())
+        .collect();
+    if let Some(program) = filtered.first_mut() {
+        *program = progname().into_bytes();
+    }
     let mut job = QPDFJob::new();
-
-    for event in &events {
-        match event {
-            JobJsonCliEvent::JobJsonFile(path) => {
-                let json = std::fs::read(path).map_err(|error| {
-                    let error = qpdf_json_input_open_error(path, error);
-                    job_json_event_error(Some(path), error.as_ref())
-                })?;
-                job.initialize_from_json_partial_bytes(&json)
-                    .map_err(|error| job_json_event_error(Some(path), &error))?;
-            }
-            JobJsonCliEvent::EmptyInput => {
-                job.config().empty_input()?;
-            }
-            JobJsonCliEvent::Input(path) => {
-                job.set_input_file(path.clone())?;
-            }
-            JobJsonCliEvent::Output(path) => {
-                job.set_output_file(path.clone())?;
-            }
-            JobJsonCliEvent::ReplaceInput => {
-                job.config().replace_input()?;
-            }
-            JobJsonCliEvent::Password(password) => job.set_password(password.clone()),
-            JobJsonCliEvent::PasswordFile(path) if has_job_json => {
-                job.set_password(read_password_file(path)?);
-            }
-            JobJsonCliEvent::PasswordFile(_) => {}
-            JobJsonCliEvent::PasswordMode(mode) => job.set_password_mode(*mode),
-            JobJsonCliEvent::PasswordIsHexKey => job.set_password_is_hex_key(true),
-            JobJsonCliEvent::SuppressPasswordRecovery => job.set_suppress_password_recovery(true),
-            JobJsonCliEvent::SuppressRecovery => job.set_suppress_recovery(true),
-            JobJsonCliEvent::IgnoreXrefStreams => job.set_ignore_xref_streams(true),
-            JobJsonCliEvent::CheckLinearization => {
-                job.config().check_linearization();
-            }
-            JobJsonCliEvent::Rotate(parameter) => {
-                job.config().rotate(parameter)?;
-            }
-            JobJsonCliEvent::Collate(parameter) => {
-                job.config().collate(parameter)?;
-            }
-            JobJsonCliEvent::Json(value) => {
-                qpdf_optional_choice_error("json", value.as_deref(), &["1", "2", "latest"])?;
-            }
-            JobJsonCliEvent::JsonOutput(value) => {
-                qpdf_optional_choice_error("json-output", value.as_deref(), &["2", "latest"])?;
-            }
-            JobJsonCliEvent::CompressionLevel(value) => {
-                let value = String::from_utf8_lossy(value);
-                parse_compression_level(Some(value.as_ref()))
-                    .map(|_| ())
-                    .map_err(qpdf_argv_usage_error)?;
-            }
-            JobJsonCliEvent::ExternalizeInlineImages => {
-                job.config().set_externalize_inline_images();
-            }
-            JobJsonCliEvent::OptimizeImages => {
-                job.config().set_optimize_images();
-            }
-            JobJsonCliEvent::KeepInlineImages => {
-                job.config().keep_inline_images();
-            }
-            JobJsonCliEvent::IiMinBytes(value) => {
-                job.config()
-                    .ii_min_bytes(value)
-                    .map_err(|error| qpdf_argv_usage_error(Box::new(error)))?;
-            }
-            JobJsonCliEvent::OiMinArea(value) => {
-                job.config()
-                    .oi_min_area(value)
-                    .map_err(|error| qpdf_argv_usage_error(Box::new(error)))?;
-            }
-            JobJsonCliEvent::OiMinHeight(value) => {
-                job.config()
-                    .oi_min_height(value)
-                    .map_err(|error| qpdf_argv_usage_error(Box::new(error)))?;
-            }
-            JobJsonCliEvent::OiMinWidth(value) => {
-                job.config()
-                    .oi_min_width(value)
-                    .map_err(|error| qpdf_argv_usage_error(Box::new(error)))?;
-            }
-            JobJsonCliEvent::KeepFilesOpenThreshold(value) => {
-                let threshold = parse_qpdf_unsigned_option(value)?;
-                job.set_keep_files_open_threshold(threshold);
-            }
-            JobJsonCliEvent::SplitPages(value) => {
-                let value_text = String::from_utf8_lossy(value);
-                qpdf_selector_integer(value_text.as_ref()).map_err(qpdf_argv_usage_error)?;
-                job.config()
-                    .split_pages(value)
-                    .map_err(|error| qpdf_argv_usage_error(Box::new(error)))?;
-            }
-            JobJsonCliEvent::ShowObject(value) => {
-                let value = String::from_utf8_lossy(value);
-                job.config()
-                    .show_object(value.as_ref())
-                    .map_err(|error| qpdf_argv_usage_error(Box::new(error)))?;
-            }
-        }
-    }
-
+    job.initialize_from_raw_argv(&filtered)
+        .map_err(|error| qpdf_argv_usage_error(Box::new(error)))?;
     Ok(QpdfCliPreflight { job })
-}
-
-fn job_json_event_error(
-    path: Option<&Path>,
-    error: &(dyn std::error::Error + 'static),
-) -> Box<dyn std::error::Error> {
-    let error_message = find_raw_error_message(error)
-        .map_or_else(|| error.to_string().into_bytes(), ToOwned::to_owned);
-    if let Some(path) = path {
-        Box::new(CliRawExitError {
-            code: ExitCode::Errors,
-            message: format_job_json_error(path, &error_message),
-        })
-    } else {
-        Box::new(CliRawExitError {
-            code: ExitCode::Errors,
-            message: error_message,
-        })
-    }
 }
 
 fn run_job_json_files(preflight: QpdfCliPreflight, suppress_warnings: bool) -> CliResult<()> {
@@ -4502,28 +4247,6 @@ fn run_job_json_files(preflight: QpdfCliPreflight, suppress_warnings: bool) -> C
     // summary is emitted.
     job.set_message_prefix(progname());
     finish_job_exit_status(job.run()?)
-}
-
-fn format_job_json_error(path: &Path, error: &[u8]) -> Vec<u8> {
-    let who = progname();
-    let mut message = b"error with job-json file ".to_vec();
-    message.extend_from_slice(&path_description(path));
-    message.extend_from_slice(b": ");
-    message.extend_from_slice(error);
-    message.extend_from_slice(b"\nRun ");
-    message.extend_from_slice(who.as_bytes());
-    message.extend_from_slice(
-        b" --job-json-help for information on the file format.\n\nFor help:\n  ",
-    );
-    message.extend_from_slice(who.as_bytes());
-    message.extend_from_slice(b" --help=usage       usage information\n  ");
-    message.extend_from_slice(who.as_bytes());
-    message.extend_from_slice(b" --help=topic       help on a topic\n  ");
-    message.extend_from_slice(who.as_bytes());
-    message.extend_from_slice(b" --help=--option    help on an option\n  ");
-    message.extend_from_slice(who.as_bytes());
-    message.extend_from_slice(b" --help             general help and a topic list\n");
-    message
 }
 
 fn run_json(
@@ -10710,107 +10433,6 @@ mod tests {
 
     fn os_strs(v: &[&str]) -> Vec<OsString> {
         v.iter().map(|s| OsString::from(*s)).collect()
-    }
-
-    #[test]
-    fn job_json_cli_events_preserve_qpdf_callback_order() {
-        let preprocessed = preprocess_qpdf_args(strs(&[
-            "flpdf",
-            "--password=first",
-            "input.pdf",
-            "--job-json-file=job.json",
-            "--password-file=password.txt",
-            "--password-mode=hex-bytes",
-            "--password-is-hex-key",
-            "--suppress-password-recovery",
-            "--suppress-recovery",
-            "--ignore-xref-streams",
-            "--check-linearization",
-            "output.pdf",
-        ]))
-        .expect("qpdf preprocessing should preserve the top-level sequence");
-
-        assert_eq!(
-            qpdf_cli_events(&preprocessed.raw_residual_args).unwrap(),
-            vec![
-                JobJsonCliEvent::Password(b"first".to_vec()),
-                JobJsonCliEvent::Input(PathBuf::from("input.pdf")),
-                JobJsonCliEvent::JobJsonFile(PathBuf::from("job.json")),
-                JobJsonCliEvent::PasswordFile(PathBuf::from("password.txt")),
-                JobJsonCliEvent::PasswordMode(PasswordMode::HexBytes),
-                JobJsonCliEvent::PasswordIsHexKey,
-                JobJsonCliEvent::SuppressPasswordRecovery,
-                JobJsonCliEvent::SuppressRecovery,
-                JobJsonCliEvent::IgnoreXrefStreams,
-                JobJsonCliEvent::CheckLinearization,
-                JobJsonCliEvent::Output(PathBuf::from("output.pdf")),
-            ]
-        );
-        assert!(job_json_password_mode(b"invalid").is_err());
-    }
-
-    #[test]
-    fn job_json_cli_events_keep_empty_and_replace_input_selectors() {
-        let preprocessed = preprocess_qpdf_args(strs(&[
-            "flpdf",
-            "--empty",
-            "--replace-input",
-            "--job-json-file=job.json",
-        ]))
-        .expect("qpdf preprocessing should preserve empty and replace selectors");
-
-        assert_eq!(
-            qpdf_cli_events(&preprocessed.raw_residual_args).unwrap(),
-            vec![
-                JobJsonCliEvent::EmptyInput,
-                JobJsonCliEvent::ReplaceInput,
-                JobJsonCliEvent::JobJsonFile(PathBuf::from("job.json")),
-            ]
-        );
-    }
-
-    #[test]
-    fn job_json_cli_events_include_immediate_main_option_callbacks() {
-        let preprocessed = preprocess_qpdf_args(strs(&[
-            "flpdf",
-            "--compression-level=1",
-            "--ii-min-bytes=2",
-            "--keep-files-open-threshold=3",
-            "--oi-min-area=4",
-            "--oi-min-height=5",
-            "--oi-min-width=6",
-            "--show-object=7",
-            "--split-pages",
-            "--job-json-file=job.json",
-        ]))
-        .expect("qpdf preprocessing should retain callback-valued options");
-
-        assert_eq!(
-            qpdf_cli_events(&preprocessed.raw_residual_args).unwrap(),
-            vec![
-                JobJsonCliEvent::CompressionLevel(b"1".to_vec()),
-                JobJsonCliEvent::IiMinBytes(b"2".to_vec()),
-                JobJsonCliEvent::KeepFilesOpenThreshold(b"3".to_vec()),
-                JobJsonCliEvent::OiMinArea(b"4".to_vec()),
-                JobJsonCliEvent::OiMinHeight(b"5".to_vec()),
-                JobJsonCliEvent::OiMinWidth(b"6".to_vec()),
-                JobJsonCliEvent::ShowObject(b"7".to_vec()),
-                JobJsonCliEvent::SplitPages(Vec::new()),
-                JobJsonCliEvent::JobJsonFile(PathBuf::from("job.json")),
-            ]
-        );
-    }
-
-    #[test]
-    fn job_json_event_error_uses_the_latest_job_file_when_available() {
-        let source = std::io::Error::other("bad setting");
-        let error = job_json_event_error(Some(Path::new("job.json")), &source);
-        assert!(error
-            .to_string()
-            .contains("error with job-json file job.json"));
-
-        let error = job_json_event_error(None, &source);
-        assert_eq!(error.to_string(), "bad setting");
     }
 
     fn empty_page_ops() -> PageOpArgs {

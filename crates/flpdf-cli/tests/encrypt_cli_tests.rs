@@ -4114,6 +4114,10 @@ fn top_level_check_linearization_combines_with_show_encryption_like_qpdf() {
 /// silently run JSON mode and drop `--show-encryption`.
 #[test]
 fn top_level_json_conflicts_with_show_encryption() {
+    // qpdf's checkConfiguration rejects `--show-encryption`'s
+    // `require_outfile = false` once an output file is present
+    // (`QPDFJob.cc:593-594`); `--json`'s implicit destination counts as
+    // that output file. Confirmed against live qpdf 11.9.0.
     Command::cargo_bin("flpdf")
         .unwrap()
         .args(["--json", "--show-encryption"])
@@ -4121,7 +4125,9 @@ fn top_level_json_conflicts_with_show_encryption() {
         .assert()
         .failure()
         .code(2)
-        .stderr(predicate::str::contains("cannot be used with"));
+        .stderr(predicate::str::contains(
+            "no output file may be given for this option",
+        ));
 }
 
 /// `--overlay`/`--underlay` are rewrite-output modifiers; the top-level
@@ -4166,7 +4172,9 @@ fn top_level_show_encryption_rejects_output_file() {
         .assert()
         .failure()
         .code(2)
-        .stderr(predicate::str::contains("cannot be used with"));
+        .stderr(predicate::str::contains(
+            "no output file may be given for this option",
+        ));
 }
 
 /// `--update-from-json` combined with `--show-encryption` must route through

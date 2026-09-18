@@ -901,8 +901,8 @@ impl<'a> Parser<'a> {
         let path = path_from_bytes(value);
         let prefix_bytes = self.job.message_prefix_bytes.clone();
         let result = (|| {
-            let bytes = std::fs::read(&path)
-                .map_err(|error| Error::file_io("open", path.clone(), error))?;
+            let bytes =
+                std::fs::read(&path).map_err(|error| job_json_file_open_error(&path, error))?;
             self.job.initialize_from_json_partial_bytes(&bytes)
         })();
         // The public JSON entry point uses a C-wrapper-compatible
@@ -914,7 +914,13 @@ impl<'a> Parser<'a> {
             let mut message = b"error with job-json file ".to_vec();
             message.extend_from_slice(value);
             message.extend_from_slice(b": ");
-            message.extend_from_slice(error.to_string().as_bytes());
+            // Prefer the byte-preserving message when the source error
+            // carries one (e.g. a non-UTF-8 path from `job_json_file_open_error`
+            // below); `Display` alone would lossily replace those bytes.
+            match error.raw_message() {
+                Some(raw) => message.extend_from_slice(raw),
+                None => message.extend_from_slice(error.to_string().as_bytes()),
+            }
             message.extend_from_slice(b"\nRun ");
             message.extend_from_slice(&prefix_bytes);
             message.extend_from_slice(b" --job-json-help for information on the file format.");
@@ -1018,6 +1024,38 @@ fn path_description_bytes(path: &Path) -> Vec<u8> {
     {
         path.to_string_lossy().into_owned().into_bytes()
     }
+}
+
+/// Render a `--job-json-file`/`jobJsonFile` open failure with qpdf's
+/// portable wording and byte-preserving path, for
+/// [`Parser::apply_job_json_file`].
+///
+/// `QPDFSystemError::createWhat` renders `strerror(errno)`
+/// (`libqpdf/QPDFSystemError.cc:13-29`), which has no numeric suffix and is
+/// the same "No such file or directory" text on every host; Rust's
+/// `std::io::Error` Display both appends a `(os error N)` suffix and uses
+/// the native Windows wording for a missing file. `path.display()` is also
+/// lossy for a non-UTF-8 path, so this renders the byte-preserving
+/// [`path_description_bytes`] instead.
+fn job_json_file_open_error(path: &Path, error: std::io::Error) -> Error {
+    let rendered = error.to_string();
+    let message: &str = match error.kind() {
+        std::io::ErrorKind::NotFound => "No such file or directory",
+        // qpdf-deviation: qpdf 11.9.0 leaks libstdc++'s basic_string::_M_create
+        // for directory job-JSON paths; that toolchain artifact has no qpdf
+        // semantic contract to reproduce in Rust (mirrors flpdf-cli's
+        // `qpdf_json_input_open_error`, `crates/flpdf-cli/src/main.rs`).
+        std::io::ErrorKind::IsADirectory => "Is a directory",
+        _ => error
+            .raw_os_error()
+            .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
+            .unwrap_or(&rendered),
+    };
+    let mut raw = b"open ".to_vec();
+    raw.extend_from_slice(&path_description_bytes(path));
+    raw.extend_from_slice(b": ");
+    raw.extend_from_slice(message.as_bytes());
+    Error::SystemBytes(raw)
 }
 
 fn expand_arg_files(argv: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>> {
