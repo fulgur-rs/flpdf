@@ -50,7 +50,7 @@ markdown だけを読むので `--no-qpdf`（CI の形）でも完全に動く�
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 117 | 0 | 43 | 0 | 160 |
+| 118 | 0 | 42 | 0 | 160 |
 
 ### checker logical aggregate（259 rows）
 
@@ -63,7 +63,7 @@ rowsを検証する。2026-09-18 の現行 `origin/main` (`4942e7b3f7fbeb2a2d79e
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 168 | 0 | 91 | 0 | 259 |
+| 169 | 0 | 90 | 0 | 259 |
 
 したがって、160行の領域別表と259 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
@@ -139,7 +139,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 | ファイル | 行数 | canonical | bridge | mixed | unknown |
 |---|---|---|---|---|---|
 | [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 18 | 0 | 6 | 0 |
-| [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 25 | 0 | 9 | 0 |
+| [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 26 | 0 | 8 | 0 |
 | [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 40 | 0 | 2 | 0 |
 | [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 16 | 0 | 15 | 0 |
 | [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 18 | 0 | 11 | 0 |
@@ -172,7 +172,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 | **回復予算は `bool` 1 個**（2 回目の `reconstruct_xref` は引数の例外をそのまま re-throw する。残り回数カウンタは存在しない） | `libqpdf/QPDF.cc:518-522` / `include/qpdf/QPDF.hh:1480` | B25 mixed（open 時は `already_reconstructed` を経由して `ResolverCore` に転記）。B34 bridge — qpdf に対応物のない 64 回の read-to-end fallback 予算（`crates/flpdf/src/pdf.rs:148-154`） | 破損 PDF で回復の起きる回数が変わり、reconstruct の 3 連 warn（B33）が余分に出る／出ない |
 | **reconstruct が xref から消すのは type 1 entry のみ。ObjStm の内部は意図的に走査しない** | `libqpdf/QPDF.cc:532-541` / `libqpdf/QPDF.cc:618-622` | B24 canonical（**両側 absent が 1:1 対応**）。B23 canonical で scan 本体は 2 経路が共有 | 回復後に compressed entry を復元すると、qpdf が到達しない object を出力に含める。コミット `6ddb9661` で 1 度是正済みの退行そのもの |
 | **xref entry の上書き規則は 3 primitive で違う**（`insertXrefEntry` = first-seen wins、`insertFreeXrefEntry` = 未登録時のみ、`insertReconstructedXrefEntry` = 後勝ち + `deleted_objects` 抑止） | `libqpdf/QPDF.cc:1149-1184` / `libqpdf/QPDF.cc:1187-1192` / `libqpdf/QPDF.cc:1197-1210` | B19 canonical。B20 mixed — `deleted_objects` 抑止は 2026-09-18（`flpdf-3yn9.48.157`）に `recover_xref_from_linear_scan` の行スキャン直後（`crates/flpdf/src/xref.rs:2004`）へ移し、5 つの reconstruction handoff すべてに適用した。mixed が残るのは qpdf の 1 関数が guard / 後勝ち / 抑止の 3 箇所に分かれている点 | 増分更新 PDF でどの世代の object が読まれるかが変わる。`/XRefStm` が free 行の直後で壊れる入力で `qpdf --show-xref` と食い違っていた（probe B-P2 で実測・解消） |
-| **`QPDF::readToken` は `allow_bad = true` を保証するが、全token consumerがこの責務ではない** | `libqpdf/QPDF.cc:1535-1539,1801-1814,846-946` | B7 mixed。canonical/bootstrap ObjStm headerは `Tokenizer::next_object_stream_integer`、classic xrefはByteCursorを使う | ObjStm headerはqpdfの2 token読取→integer検査順を専用consumerで保持する。classic xrefはreadLine/parse_xrefEntryに対応するため、falseを一律trueへ変えない（B-P7） |
+| **`QPDF::readToken` は `allow_bad = true` を保証するが、全token consumerがこの責務ではない** | `libqpdf/QPDF.cc:1535-1539,1801-1814,846-946` | B7 canonical（`.48.175`）。5経路（classic xref subsection lookahead / `startxref` 値読み / trailerの`stream` lookahead / ObjStm header integers / reconstruct_xrefの行scan / `endstream`・`endobj` framing check）が `Tokenizer::read_qpdf_token` の1entrypointを共有する | `read_qpdf_token` が `allow_bad = true` を固定するので、falseを一律trueへ変える経路は無い。classic xrefのreadLine/parse_xrefEntry責務はByteCursorのまま維持される（B-P7） |
 | **`QPDFParser` は context があれば warn、無ければ同じ診断を例外に昇格する** | `libqpdf/QPDFParser.cc:487-498`（`libqpdf/QPDFParser.cc:496` が throw）/ `libqpdf/QPDFParser.cc:161-165` | B3 canonical（`has_context` 分岐 1 本）。B32 mixed — qpdf の 2 軸（例外クラス × `qpdf_error_code_e`）を `crates/flpdf/src/error.rs::Error` の 1 軸に畳んでいる | document なしの parse で構文エラーが黙って null になる。`Error::Parse` だけが reconstruct の trigger（`crates/flpdf/src/reader/resolver.rs:1615`）なので、振り分けを誤ると回復分岐自体が起きなくなる |
 
 ### 5.C stream data provider / decode / retry / filter / encryption / `/Length`

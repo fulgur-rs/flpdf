@@ -1000,12 +1000,43 @@ impl<'a> Tokenizer<'a> {
         byte
     }
 
-    /// Read one integer using qpdf's `QPDF::readToken` contract. The qpdf
-    /// wrapper always calls the tokenizer with `allow_bad = true`, then its
-    /// caller checks the returned token type (`QPDF.cc:1535-1539,1801-1814`)
-    /// instead of letting the tokenizer throw first.
+    /// `QPDF::readToken(input, max_len = 0)` (`libqpdf/QPDF.cc:1535-1539`):
+    /// the document-level wrapper every non-content-stream `QPDF` reader
+    /// calls instead of `QPDFTokenizer::readToken` (`read_token`, above)
+    /// directly. It fixes `allow_bad = true` and threads `max_len` through
+    /// unchanged, so a bad or malformed token comes back as an ordinary
+    /// value for the caller to inspect rather than as an error.
+    ///
+    /// `m->tokenizer.allowEOF()` is called exactly once, in the `QPDF`
+    /// constructor (`QPDF.cc:207-212`), and that single tokenizer is reused
+    /// for the document's whole lifetime regardless of which `InputSource`
+    /// a given call reads from. flpdf's `Tokenizer` folds qpdf's
+    /// `QPDFTokenizer` and the `InputSource` it reads into one type for an
+    /// already-materialized byte window, so each fresh `Tokenizer` built for
+    /// one of these reads plays the role of one `readToken(input, max_len)`
+    /// call against that persistent, EOF-enabled tokenizer: `allow_eof` is
+    /// set again here rather than once at construction.
+    ///
+    /// This is the single entrypoint every flpdf realization of
+    /// `QPDF::readToken` routes through: `ByteCursor::read_token`'s classic
+    /// xref subsection lookahead and `startxref` value read, the trailer's
+    /// `stream`-keyword lookahead, [`next_object_stream_integer`]'s ObjStm
+    /// header integers, the xref-reconstruction line scan's `int int obj`
+    /// probe, and the canonical resolve path's `endstream`/`endobj` framing
+    /// checks. `QPDFObjectHandle`'s own content-stream tokenization
+    /// (`QPDFTokenizer::readToken` called directly, without a `QPDF`) is a
+    /// different qpdf owner and does not route through this method.
+    pub(crate) fn read_qpdf_token(&mut self, max_len: usize) -> Result<Token> {
+        self.allow_eof();
+        self.read_token(true, max_len)
+    }
+
+    /// Read one integer using qpdf's `QPDF::readToken` contract
+    /// (`QPDF.cc:1801-1814`): two [`Self::read_qpdf_token`] calls, then the
+    /// caller checks each returned token's type instead of letting the
+    /// tokenizer throw first.
     pub(crate) fn next_object_stream_integer(&mut self) -> Result<i64> {
-        let token = self.read_token(true, 0)?;
+        let token = self.read_qpdf_token(0)?;
         if !token.is_integer() {
             return Err(Error::parse(
                 token.start,
