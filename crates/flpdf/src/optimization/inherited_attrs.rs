@@ -755,6 +755,13 @@ mod tests {
         )
         .expect("indirect child Pages frame");
 
+        let mut key_ancestors = BTreeMap::new();
+        let indirect_pages = pdf.get_object_handle(ObjectRef::new(3, 0));
+        let indirect_direct_frame =
+            enter_direct_frame(&mut pdf, indirect_pages, &mut key_ancestors, true, false)
+                .expect("an indirect Pages handle can exercise the direct-frame identity probe");
+        assert!(indirect_direct_frame.is_some());
+
         let direct_root = ObjectHandle::dictionary(vec![
             (b"/Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
             (
@@ -795,6 +802,17 @@ mod tests {
             false,
         )
         .expect("non-Pages direct node is skipped");
+        let mut key_ancestors = BTreeMap::new();
+        let mut visited = BTreeSet::new();
+        push_internal(
+            &mut pdf,
+            scalar,
+            &mut key_ancestors,
+            &mut visited,
+            true,
+            false,
+        )
+        .expect("a direct value is skipped by the indirect-frame identity guard");
         let catalog_handle = pdf.get_object_handle(ObjectRef::new(1, 0));
         push_internal(
             &mut pdf,

@@ -4212,7 +4212,7 @@ mod tests {
     use super::{
         collect_direct_handle_refs, collect_direct_handle_refs_with_context,
         collect_direct_handle_refs_with_stream_parameters_context, first_page_is_private,
-        LinearizationPlan, RawLinearizationPlan,
+        linearization_content_normalize_refs, LinearizationPlan, RawLinearizationPlan,
     };
     use crate::acroform_document_helper::AcroFormDocumentHelper;
     use crate::object_handle::ObjectHandle;
@@ -4268,6 +4268,21 @@ mod tests {
         };
 
         assert!(plan.has_raw_projection_gap());
+    }
+
+    #[test]
+    fn content_normalize_probe_walks_prepared_page_handles_without_snapshot() {
+        let mut options = WriterOptions::default();
+        options.content_normalization = true;
+        let page = ObjectHandle::dictionary(vec![(
+            b"/Contents".to_vec(),
+            ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
+        )]);
+
+        let refs = linearization_content_normalize_refs(&options, &[page], None)
+            .expect("live page handles should be inspected when no snapshot exists");
+
+        assert!(refs.is_empty(), "a direct stream has no indirect identity");
     }
 
     #[test]
