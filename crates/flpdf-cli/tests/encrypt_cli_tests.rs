@@ -2916,6 +2916,26 @@ fn copy_encryption_missing_donor_reports_open_failure() {
         )
     );
     assert!(!out.exists());
+
+    // qpdf renders the line as `whoami: e.what()` (`qpdf/qpdf.cc:36-40`), so
+    // the donor failure must honour the program name like every other fatal
+    // CLI error. Under the qtest shim's name the line is qpdf 11.9.0's verbatim.
+    let assert = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg(format!("--copy-encryption={}", donor.display()))
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&out)
+        .assert()
+        .failure()
+        .code(2);
+    assert_eq!(
+        String::from_utf8_lossy(&assert.get_output().stderr),
+        format!(
+            "qpdf: open {}: No such file or directory\n",
+            donor.display()
+        )
+    );
 }
 
 /// A donor that is not a PDF at all surfaces the reader's own recovery
@@ -2929,16 +2949,23 @@ fn copy_encryption_non_pdf_donor_reports_recovery_failure() {
     let out = tmp.path().join("out.pdf");
     let stderr = copy_encryption_failure_stderr(&donor, None, &out);
     let path = donor.display().to_string();
+    let lines: Vec<&str> = stderr.lines().collect();
+    let (terminal, warnings) = lines.split_last().unwrap();
     assert_eq!(
-        stderr,
-        format!(
-            "WARNING: {path}: can't find PDF header\n\
-             WARNING: {path}: file is damaged\n\
-             WARNING: {path}: can't find startxref\n\
-             WARNING: {path}: Attempting to reconstruct cross-reference table\n\
-             flpdf: {path}: unable to find trailer dictionary while recovering damaged file\n"
-        )
+        *terminal,
+        format!("flpdf: {path}: unable to find trailer dictionary while recovering damaged file")
     );
+    // The recovery diagnostics themselves belong to the reader; pin only that
+    // they are delivered for the donor (qpdf 11.9.0 prints the same four
+    // `WARNING: <donor>: ...` lines before the terminal message) rather than
+    // their wording, which reader work owns.
+    assert!(!warnings.is_empty(), "donor recovery warnings: {stderr}");
+    for warning in warnings {
+        assert!(
+            warning.starts_with(&format!("WARNING: {path}: ")),
+            "donor diagnostics must name the donor: {stderr}"
+        );
+    }
     assert!(!out.exists());
 }
 
