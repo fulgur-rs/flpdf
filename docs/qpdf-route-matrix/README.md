@@ -50,7 +50,7 @@ markdown だけを読むので `--no-qpdf`（CI の形）でも完全に動く�
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 117 | 0 | 43 | 0 | 160 |
+| 118 | 0 | 42 | 0 | 160 |
 
 ### checker logical aggregate（259 rows）
 
@@ -63,7 +63,7 @@ rowsを検証する。2026-09-18 の現行 `origin/main` (`4942e7b3f7fbeb2a2d79e
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 168 | 0 | 91 | 0 | 259 |
+| 169 | 0 | 90 | 0 | 259 |
 
 したがって、160行の領域別表と259 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
@@ -138,7 +138,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 
 | ファイル | 行数 | canonical | bridge | mixed | unknown |
 |---|---|---|---|---|---|
-| [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 18 | 0 | 6 | 0 |
+| [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 19 | 0 | 5 | 0 |
 | [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 25 | 0 | 9 | 0 |
 | [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 40 | 0 | 2 | 0 |
 | [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 16 | 0 | 15 | 0 |
@@ -158,7 +158,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 | **型アクセサは必ず dereference する** — 未解決の間接 handle でも `asInteger` / `isNull` は正しい型と値を返す | `libqpdf/QPDFObjectHandle.cc:240-446` / `libqpdf/QPDFObjectHandle.cc:2375-2383` | A6 mixed。解決しない `as_*` / `is_null` 族が prod 合計 686、解決する `try_as_integer` が prod 28 | 未解決の間接 handle に `as_dictionary()` が `None`、`is_null()` が `false` を返す。`/Filter` や `/Type` の判定でこれが起きると分岐が落ち、書き出しバイトが変わる |
 | **object cache に「削除済み」の永続 tombstone は存在しない** — `removeObject` は cache cell ごと erase し、`deleted_objects` は xref 構築が終われば clear される | `libqpdf/QPDF.cc:1995-2005` / `libqpdf/QPDF.cc:706-708` / `libqpdf/QPDF.cc:575` | A2 mixed（`CacheEntry` の `Missing` / `Deleted` に qpdf 対応物なし）。A17 は tombstone を手で消す分岐を持ち、`crates/flpdf/src/reader.rs:1569-1575` のコメント自身が逸脱を明記 | `get_all_objects`（A9）と `live_object_refs`（A10）の列挙が食い違い、writer の到達性集合が経路ごとに変わる。同じ入力で出力 object 数が route 依存になる |
 | **通常の document-owned 型不一致は warning + null/false。dereference や contextless warning は throw しうる** | `libqpdf/QPDFObjectHandle.cc:2168-2189,965-989` | A8 canonical。通常 build の `try_get_key` / `try_has_key` が resolve と warning/error propagation を所有し、panic convenience は qtest-driver feature だけに隔離する | 通常の型不一致自体は panic の証拠ではない。lazy resolution・warning 配送・contextless warning の例外経路を fallible accessor へ移し、warning と例外伝播の境界を保つ |
-| **採番は `getObjectCount()+1` の 1 本**（`obj_cache` の最大 key に基づく） | `libqpdf/QPDF.cc:1872-1880` / `libqpdf/QPDF.cc:1271-1283` | A11 mixed。facade 側 `Pdf::next_available_object_ref` は `Pdf::object_refs()`（A10、legacy cache 混じり）と canonical の max を取る | public makeIndirect factoryは`.48.20`でcanonical採番へ移行済み。残るfacade consumerではlegacy-only refが採番を押し上げる可能性が残る |
+| **採番は `getObjectCount()+1` の 1 本**（`obj_cache` の最大 key に基づく） | `libqpdf/QPDF.cc:1872-1880` / `libqpdf/QPDF.cc:1271-1283` | A11 canonical。`flpdf-3yn9.48.171` で、canonical `next_obj_gen` への 1 行委譲に退化していた `#[cfg(test)]` 専用の重複 facade `Pdf::next_available_object_ref` を削除し、production にも公開されている同一委譲の `Pdf::next_obj_gen` に一本化した | public makeIndirect factoryは`.48.20`でcanonical採番へ移行済み。採番経路は `Pdf::get_object_count` / `Pdf::next_obj_gen` の 1 行委譲のみで、legacy-only refが採番を押し上げる経路は残らない |
 | **`makeIndirectObject` は同じ `shared_ptr` を cache に登録する（alias が保たれる）** | `libqpdf/QPDF.cc:1882-1888` / `libqpdf/QPDF.cc:1890-1897` | A12 canonical。`.48.20`で両public factoryを同じresolver promotionへ移し、共有ValueIdentityとcache lookupの再設定を接続した | promote 後に元 handle を `appendItem` / `replaceKey` しても新 object 側に反映されない。probe A-2 |
 | **teardown は `xref_table.clear()` → `obj_cache` 全件 disconnect の 1 本** | `libqpdf/QPDF.cc:215-236` / `libqpdf/QPDFObject.cc:13-17` | A20 mixed。canonical `Pdf::open` の walk は `.48.15.1` で `ResolverHandle::disconnect_all` へ一本化したが、owner-less public loader/export と production caller は`.48.72`で撤去済み。`BootstrapCache::Drop` の第2 walkは bounded reconstruction test scaffolding にのみ残る | canonical teardownのclear-before-disconnect契約は固定済み。残るBootstrapCacheはqpdf parityのproduction routeではなく、test-only bounded reconstruction scaffolding。probe A-4 |
 
@@ -655,8 +655,10 @@ qpdf 呼び出し順を壊さない理由: §5.A 第 3 行（「object cache に
 1〜4 の責務を分ける。`qpdf_removed_refs` は insert 0件の空集合だったため、`flpdf-3yn9.48.21` でfield・初期化・全filter・無効なremoveを撤去した。
 qpdfのcanonical removeObject、xref/cacheの列挙と変異は既存ownerを使用する。A9/A10/A13/A16/A17に残るfacade責務は別sliceであり、分類集計はこの削除だけでは変わらない。
 このdead filter削除は、bootstrap cache / trailer child登録のowner統合から独立に進められる。§5.A 第 5 行（採番は `getObjectCount()+1` の 1 本）が
-A11 を A10 の後に置く理由で、facade の `next_available_object_ref` は A10 の結果と canonical の max を
-取るため A10 が 1 本にならないと採番が確定しない。§5.A 第 1 行・第 2 行（`getObject` は resolve しない /
+A11 を A10 の後に置いた理由で、当時の facade `Pdf::next_available_object_ref` は A10 の結果（legacy
+`Pdf::object_refs()`）と canonical の max を取っていたため、A10 が 1 本にならないと採番が確定しな
+かった。`flpdf-3yn9.48.171` でこの facade（`object_refs()` 撤去後は canonical への 1 行委譲のみの
+`#[cfg(test)]` 重複 wrapper に退化していた）を削除し、A11 は canonical になった。§5.A 第 1 行・第 2 行（`getObject` は resolve しない /
 型アクセサは必ず dereference する）が 5 の向きを決める — A6 が解決するようになって初めて
 `pdf.resolve(&h)?;` → `h.as_dictionary()` の 2 段イディオムが冗長になる。
 
