@@ -777,6 +777,7 @@ class Checker:
 
     def check_aggregate_tables(self, matrix_dir: Path) -> None:
         self._check_recording_invariant(matrix_dir)
+        self._check_classification_row_id_collisions()
         self._check_aggregate_inventory(matrix_dir)
         self._check_aggregate_row_collisions()
         handlers = {
@@ -839,6 +840,7 @@ class Checker:
                     f"table, found {found}",
                 )
         if (matrix_dir / "README.md").is_file():
+            readme = matrix_dir / "README.md"
             for kind in REPOSITORY_WIDE_KINDS:
                 found = len(self._tables_of(kind))
                 if found != 1:
@@ -847,6 +849,14 @@ class Checker:
                         f"expected exactly 1 `route-matrix-aggregate: {kind}` table, "
                         f"found {found}",
                     )
+                for table in self._tables_of(kind):
+                    if table.doc != readme:
+                        self.report.error(
+                            table.doc,
+                            table.marker_line,
+                            f"`route-matrix-aggregate: {kind}` must live in `README.md`, "
+                            f"not `{table.doc.name}`",
+                        )
         detail_documents = {
             row.doc
             for row in self.report.classification_rows
@@ -883,6 +893,23 @@ class Checker:
                         "as a classification row; the aggregate table must not sit "
                         "inside a classification table's scope",
                     )
+
+    def _check_classification_row_id_collisions(self) -> None:
+        rows_by_table: dict[tuple[Path, int, str], list[ClassificationRow]] = {}
+        for row in self.report.classification_rows:
+            key = (row.doc, row.table_index, row.row_id)
+            rows_by_table.setdefault(key, []).append(row)
+        for rows in rows_by_table.values():
+            if len(rows) < 2:
+                continue
+            first = rows[0]
+            for duplicate in rows[1:]:
+                self.report.error(
+                    duplicate.doc,
+                    duplicate.line_number,
+                    f"classification {first.table_kind} row id `{first.row_id}` "
+                    "appears more than once in the same table",
+                )
 
     def _classification_columns(self, table: AggregateTable) -> dict[str, int] | None:
         keys = [header_key(cell) for cell in table.header]
@@ -983,8 +1010,10 @@ class Checker:
                     f"{actual[name]}",
                 )
             # A zero cell carries no enumeration to compare, which also leaves
-            # room for the explanatory prose some of them hold.
-            if actual_ids is None or declared == 0:
+            # room for explanatory prose. If it does contain a parseable row
+            # id, reject it rather than letting a zero-count escape route hide
+            # an aggregate classification.
+            if actual_ids is None:
                 continue
             enumeration = parse_enumeration(remainder or "")
             if enumeration is None:
@@ -1000,6 +1029,15 @@ class Checker:
                 self.report.error(
                     table.doc, line_number, f"{context}: `{name}`: {reason}"
                 )
+                continue
+            if declared == 0:
+                if row_ids:
+                    self.report.error(
+                        table.doc,
+                        line_number,
+                        f"{context}: `{name}` is zero but enumerates row ids "
+                        f"{format_row_ids(set(row_ids))}",
+                    )
                 continue
             if not row_ids:
                 self.report.error(
@@ -1114,6 +1152,13 @@ class Checker:
                     f"per-file: `{name}` does not exist under {matrix_dir}",
                 )
                 continue
+            if target not in self._area_documents(matrix_dir):
+                self.report.error(
+                    table.doc,
+                    line_number,
+                    f"per-file: `{name}` is not an area document",
+                )
+                continue
             actual = tally(self._document_rows(target, "area"), weighted=False)
             context = f"per-file `{name}`"
             self._compare_counts(
@@ -1198,6 +1243,14 @@ class Checker:
                     f"{context}: says {declared} but the matrix has {actual[name]}",
                 )
             if declared == 0:
+                row_ids, _ = parse_row_ids(cells[ids_column])
+                if row_ids:
+                    self.report.error(
+                        table.doc,
+                        line_number,
+                        f"{context}: says 0 but enumerates row ids "
+                        f"{format_row_ids(set(row_ids))}",
+                    )
                 continue
             row_ids, reason = parse_row_ids(cells[ids_column])
             if row_ids is None:
@@ -1244,6 +1297,7 @@ class Checker:
         rows = self._document_rows(table.doc, "detail")
         by_row_id = {row.row_id: row for row in rows}
         cases_of: dict[str, set[int]] = {}
+        case_owners: dict[int, str] = {}
         for row in rows:
             cases = row_id_cases(row.row_id)
             if cases is None:
@@ -1254,6 +1308,24 @@ class Checker:
                     "so it cannot be assigned to a range bucket",
                 )
                 continue
+            overlap_owners: dict[int, str] = {}
+            for case in cases:
+                previous = case_owners.get(case)
+                if previous is not None and previous != row.row_id:
+                    overlap_owners[case] = previous
+                else:
+                    case_owners[case] = row.row_id
+            if overlap_owners:
+                owners = ", ".join(
+                    f"{owner} ({case})"
+                    for case, owner in sorted(overlap_owners.items())
+                )
+                self.report.error(
+                    table.doc,
+                    row.line_number,
+                    f"range-summary: detail row `{row.row_id}` case set overlaps "
+                    f"earlier row(s) {owners}",
+                )
             cases_of[row.row_id] = cases
 
         buckets: list[tuple[int, list[str], set[int]]] = []
