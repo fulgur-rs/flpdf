@@ -4190,7 +4190,6 @@ enum JobJsonCliEvent {
     FlattenRotation,
     GenerateAppearances,
     JsonInput,
-    Linearize,
     ListAttachments,
     Progress,
     Qdf,
@@ -4337,8 +4336,6 @@ fn qpdf_cli_events(args: &[arg_parser::RawArg]) -> CliResult<Vec<JobJsonCliEvent
             events.push(JobJsonCliEvent::GenerateAppearances);
         } else if bytes == b"--json-input" {
             events.push(JobJsonCliEvent::JsonInput);
-        } else if bytes == b"--linearize" {
-            events.push(JobJsonCliEvent::Linearize);
         } else if bytes == b"--list-attachments" {
             events.push(JobJsonCliEvent::ListAttachments);
         } else if bytes == b"--progress" {
@@ -4558,7 +4555,6 @@ fn preflight_qpdf_cli_events(args: &[arg_parser::RawArg]) -> CliResult<QpdfCliPr
             JobJsonCliEvent::JsonInput => {
                 job.config().json_input();
             }
-            JobJsonCliEvent::Linearize => job.set_linearization(true, None),
             JobJsonCliEvent::ListAttachments => {
                 job.config().list_attachments();
             }
@@ -10994,7 +10990,6 @@ mod tests {
                 JobJsonCliEvent::FlattenRotation,
                 JobJsonCliEvent::GenerateAppearances,
                 JobJsonCliEvent::JsonInput,
-                JobJsonCliEvent::Linearize,
                 JobJsonCliEvent::ListAttachments,
                 JobJsonCliEvent::Progress,
                 JobJsonCliEvent::Qdf,

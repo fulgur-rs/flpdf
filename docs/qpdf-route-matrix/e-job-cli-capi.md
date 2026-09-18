@@ -1409,7 +1409,16 @@ bare arm）であり、かつ既存の public `QPDFJob`/`Config` setter が既�
 既存橋渡しで実質的に動作済みの option は対象外。値を取る
 `addRequiredParameter`/`addOptionalParameter`/`addChoices` option と、
 public setter が存在しない残り 11 個の bare option（`--decrypt` 等）は
-`flpdf-3yn9.48.191` へ分離した——前者は `flpdf-3yn9.48.189` の regression #2
+`flpdf-3yn9.48.191` へ分離した。**2026-09-19 追記**: `--linearize` も当初この
+whitelist に入れていたが、flpdf の `set_linearization(value, pass1)` が
+`linearize` と `linearize_pass1` を同時に代入するため job JSON の
+`linearizePass1` を消す回帰になる（qpdf の `Config::linearize()` は
+`libqpdf/QPDFJob_config.cc:362-368` で `linearize` だけを立てる）。撤去して
+`flpdf-3yn9.48.191` へ移した。また `is_named_segment_option`
+（`crates/flpdf-cli/src/main.rs`）は 6 個しか持たないが、qpdf では
+`--set-page-labels` も segment opener である（`libqpdf/QPDFJob_argv.cc:377` の
+`selectOptionTable(O_SET_PAGE_LABELS)`）——この欠落は本 PR 以前からの別問題で
+`flpdf-sydkv` で追跡する——前者は `flpdf-3yn9.48.189` の regression #2
 と同型の validation-timing リスクを個別に検証する必要があり、後者は
 `crates/flpdf` への新規 public API 追加を要するため。
 
