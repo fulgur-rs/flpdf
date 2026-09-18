@@ -2514,6 +2514,84 @@ fn raw_argv_initializer_covers_error_and_choice_boundaries() {
     }
 }
 
+/// A missing `--job-json-file` path must render qpdf's portable
+/// `strerror`-based wording (`QUtil::safe_fopen`, `libqpdf/QUtil.cc:490-519`;
+/// `QPDFSystemError::createWhat`, `libqpdf/QPDFSystemError.cc:13-29`), not
+/// Rust's `std::io::Error` text with its `(os error N)` suffix. Confirmed
+/// against `/usr/bin/qpdf` 11.9.0:
+/// `qpdf --job-json-file=<missing> in.pdf out.pdf` prints exactly
+/// `error with job-json file <path>: open <path>: No such file or
+/// directory\nRun qpdf --job-json-help for information on the file format.`
+/// before the CLI's own `usageExit` footer is appended.
+#[test]
+fn raw_argv_missing_job_json_file_uses_qpdf_strerror_wording() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing-job.json");
+
+    let error = QPDFJob::new()
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            format!("--job-json-file={}", missing.display()).into_bytes(),
+        ])
+        .unwrap_err();
+    let Error::Usage(usage) = error else {
+        panic!("expected a usage error, got {error:?}");
+    };
+    assert_eq!(
+        usage.to_string(),
+        format!(
+            "error with job-json file {}: open {}: {}\n\
+             Run qpdfjob --job-json-help for information on the file format.",
+            missing.display(),
+            missing.display(),
+            missing_file_strerror_text(&missing),
+        )
+    );
+}
+
+/// Render the same platform strerror wording [`crate::qutil::strerror_text`]
+/// (private to the library crate) produces for a missing path, without
+/// hardcoding a POSIX-only message that would fail on Windows.
+fn missing_file_strerror_text(missing: &Path) -> String {
+    let io_error = std::fs::File::open(missing).expect_err("path must not exist");
+    let rendered = io_error.to_string();
+    io_error
+        .raw_os_error()
+        .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
+        .map_or(rendered.clone(), str::to_owned)
+}
+
+/// A nested `jobJsonFile` JSON key dispatches through the same
+/// `Config::jobJsonFile` callback as `--job-json-file`
+/// (`libqpdf/qpdf/auto_job_json_init.hh:472-474`), so a missing include must
+/// use the same qpdf `strerror`-based wording as
+/// `raw_argv_missing_job_json_file_uses_qpdf_strerror_wording` above.
+/// Confirmed against `/usr/bin/qpdf` 11.9.0 (nested one layer via
+/// `--job-json-file`): the inner "error with job-json file ...: open ...:
+/// No such file or directory" text is unchanged; only the outer argv-level
+/// wrapping (added by `apply_job_json_file`, not exercised by this
+/// library-level call) differs.
+#[test]
+fn nested_missing_job_json_file_uses_qpdf_strerror_wording() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing-nested.json");
+    let json = serde_json::json!({ "jobJsonFile": missing }).to_string();
+
+    let error = QPDFJob::new()
+        .initialize_from_json(&json)
+        .expect_err("a missing nested jobJsonFile include must fail");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "error with job-json file {}: open {}: {}\n\
+             Run qpdfjob json --job-json-help for information on the file format.",
+            missing.display(),
+            missing.display(),
+            missing_file_strerror_text(&missing),
+        )
+    );
+}
+
 #[test]
 fn page_label_order_errors_are_not_usage_errors() {
     // qpdf raises the three order/page-count failures with
