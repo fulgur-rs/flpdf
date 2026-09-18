@@ -3784,7 +3784,7 @@ fn json_job_rejects_same_input_output_before_truncating_a_hard_link() {
         &error,
         Error::Usage(usage)
             if usage.to_string()
-                == "input file and output file are the same; use --replace-input to intentionally overwrite the input"
+                == "input file and output file are the same; use --replace-input to intentionally overwrite the input file"
     ));
 
     let mut job = QPDFJob::new();
@@ -3798,7 +3798,7 @@ fn json_job_rejects_same_input_output_before_truncating_a_hard_link() {
         &error,
         Error::Usage(usage)
             if usage.to_string()
-                == "input file and output file are the same; use --replace-input to intentionally overwrite the input"
+                == "input file and output file are the same; use --replace-input to intentionally overwrite the input file"
     ));
     assert_eq!(std::fs::read(&input).unwrap(), before);
 }

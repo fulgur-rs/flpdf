@@ -2054,6 +2054,33 @@ show/remove は qpdf の `std::string` key（`QPDFJob_config.cc:507-547`）を
 `QPDFJob::check_configuration` でも `json_version` と出力ファイル未指定を
 実効stdoutとして扱うようにした。これにより `json=2` と非zero
 `splitPages` の組合せをwrite stageまで進めず、qpdfと同じusage errorにする。
+当初は immutable snapshot の上で `implicit_json_stdout` ローカルを合成する
+形だったが、`flpdf-3yn9.48.150.1` で qpdf の可変 `m->outfilename`
+ライフサイクルそのものを移植し、この合成は撤去した（次項）。
+
+`flpdf-3yn9.48.150.1` では、`QPDFJob::createsOutput`
+（`libqpdf/QPDFJob.cc:528-531` = `m->outfilename != nullptr || m->replace_input`）
+を `QPDFJob::creates_output` として新設し、その前提となる `m->outfilename`
+の3つの書き換えを `job/lifecycle.rs` へ移植した——
+(1) `checkConfiguration` の JSON 既定出力先 `-`（`:582-586`）、
+(2) `writeOutfile` 入口の replace-input 一時パス代入と `-` のクリア
+（`:3031-3041`）、(3) verbose `wrote file` 直後・rename 直前の再クリア
+（`:3063-3065`）。`check_configuration` は (1) のため `&mut self` になる
+（qpdf 側も非 const）。同じ述語が `writeQPDF` の dispatch（`:486`）と
+warning summary（`:497`）で異なる答えを返すのは、この書き換えの結果であり、
+stdout の bare suffix は stdout の特別扱いではない。これに伴い
+`output_destination()`（JSON→`-` フォールバックを持つ独自ヘルパー）、
+`write_qpdf` の `|| json_version.is_some()`、`write_configured_json` の
+`filter(|path| *path != "-")`、job-JSON partial init の `require_output`
+JSON 例外という4つの補償を撤去し、`configure_writer_progress` の出力名も
+qpdf と同じく書き換え後の `m->outfilename` を読む。
+`check_configuration` の `QUtil::same_file` 比較（`:627-631`）は暗黙の
+`-` も対象にするため、cwd に `-` という名前のファイルが実在すると
+input と alias して usage error になる（qpdf と同じ `stat` 比較の帰結、
+`crates/flpdf-cli/tests/cli_job_json.rs` で pin）。
+`complete()` の bool 引数撤去は `flpdf-cli` の `--json` 経路が
+`write_qpdf`/`writeOutfile` を迂回している（`flpdf-3yn9.48.150.3`）間は
+実施できないため、この issue の範囲外。
 
 `flpdf-kt4z` では、qpdfの `QPDFJob::writeOutfile` が成功write後・replace-input
 rename前に `pdf.closeInputSource()` を呼ぶ（`libqpdf/QPDFJob.cc:3068-3086`）ことを、

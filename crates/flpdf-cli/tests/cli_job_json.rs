@@ -3309,10 +3309,72 @@ fn job_json_file_rejects_same_input_and_output_without_truncating_input() {
         .assert()
         .code(2)
         .stderr(predicates::str::diff(expected_usage(
-            "input file and output file are the same; use --replace-input to intentionally overwrite the input",
+            "input file and output file are the same; use --replace-input to intentionally overwrite the input file",
         )));
 
     assert_eq!(fs::read(&input).unwrap(), before);
+}
+
+/// `checkConfiguration` assigns `-` as the JSON destination when no output
+/// file was given (`libqpdf/QPDFJob.cc:582-586`) and then compares that name
+/// with the input through `QUtil::same_file` (`:627-631`). The comparison is
+/// an ordinary `stat` of both names (`libqpdf/QUtil.cc:598-607`), so a working
+/// directory that really does contain a file called `-` makes the implicit
+/// destination alias an input of the same name, and the job is rejected before
+/// anything is written.
+#[test]
+fn job_json_implicit_json_destination_rejects_an_input_named_dash() {
+    // Each binary gets its own working directory holding its own `-`, so
+    // neither invocation can observe or disturb what the other left behind if
+    // a future change moves the rejection later in the pipeline.
+    fn case_directory() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+        fs::copy(fixture, directory.path().join("-")).unwrap();
+        fs::write(
+            directory.path().join("json.json"),
+            br#"{"inputFile":"-","json":"2"}"#,
+        )
+        .unwrap();
+        directory
+    }
+
+    let actual_directory = case_directory();
+    let assertion = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(actual_directory.path())
+        .arg("--job-json-file=json.json")
+        .assert()
+        .code(2);
+    let stderr = String::from_utf8(assertion.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains(
+            "input file and output file are the same; use --replace-input to intentionally \
+             overwrite the input file"
+        ),
+        "unexpected diagnostic: {stderr:?}"
+    );
+
+    if !qpdf_available() {
+        return;
+    }
+    let expected_directory = case_directory();
+    let expected = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(expected_directory.path())
+        .arg("--job-json-file=json.json")
+        .output()
+        .unwrap();
+    assert_eq!(
+        expected.status.code(),
+        Some(2),
+        "qpdf must reject the aliased implicit JSON destination too"
+    );
+    assert!(
+        String::from_utf8_lossy(&expected.stderr)
+            .contains("input file and output file are the same;"),
+        "qpdf no longer reports the pinned diagnostic"
+    );
 }
 
 #[test]

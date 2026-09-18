@@ -2004,18 +2004,15 @@ impl QPDFJob {
             None if self.configuration.progress => {
                 let logger = self.logger.clone();
                 let prefix = self.message_prefix_bytes.clone();
-                // `writeOutfile` swaps `m->outfilename` to the `.~qpdf-temp#`
-                // replacement target before `setWriterOptions` builds this
-                // reporter (`libqpdf/QPDFJob.cc:3033-3037` then `:2926-2935`),
-                // so the label is the effective destination, not the output
-                // slot the caller filled in.
-                let output_name = self
-                    .output_destination()
-                    .filter(|path| path.as_path() != Path::new("-"))
-                    .map_or_else(
-                        || "standard output".to_owned(),
-                        |path| path.display().to_string(),
-                    );
+                // `writeOutfile` has already swapped the output name to the
+                // `.~qpdf-temp#` replacement target, or cleared it for
+                // standard output, before `setWriterOptions` builds this
+                // reporter (`libqpdf/QPDFJob.cc:3031-3041` then `:2926-2935`),
+                // so the label is the effective destination.
+                let output_name = self.configuration.output_file.as_ref().map_or_else(
+                    || "standard output".to_owned(),
+                    |path| path.display().to_string(),
+                );
                 let callback: ProgressHandler = Box::new(move |percent| {
                     let mut message = prefix.clone();
                     message.extend_from_slice(b": ");
@@ -2191,11 +2188,7 @@ impl QPDFJob {
                 || configuration.show_attachment.is_some()
                 || configuration.show_encryption
                 || configuration.is_encrypted
-                || configuration.requires_password
-                // `--json` keeps `require_outfile` set but defaults the output
-                // name to standard output (`QPDFJob.cc:582-586`), so restoring
-                // the requirement here would reject an invocation qpdf accepts.
-                || configuration.json_version.is_some())
+                || configuration.requires_password)
             {
                 // A newly constructed QPDFJob stores the library's optional
                 // output default, but qpdf's partial job-JSON CLI boundary
@@ -3299,10 +3292,7 @@ impl QPDFJob {
     where
         R: Read + Seek + 'static,
     {
-        let creates_output = self.configuration.output_file.is_some()
-            || self.configuration.replace_input
-            || self.configuration.json_version.is_some();
-        if !creates_output {
+        if !self.creates_output() {
             let configuration = self.configuration.clone();
             if let Err(failure) = self.run_configured_inspection(pdf, &configuration) {
                 let error = match failure {
@@ -3315,21 +3305,35 @@ impl QPDFJob {
                 return Err(error);
             }
             self.drain_document_warnings(pdf);
-            self.complete(false)?;
+            self.complete(self.creates_output())?;
             if self.configuration.report_memory_usage {
                 self.report_memory_usage()?;
             }
             return Ok(());
         }
 
-        let output = self
-            .output_destination()
-            .expect("creates_output guarantees an output destination");
         // Reserving again here is a no-op once `apply_transformations` has
         // done it, matching qpdf's own second call, which its comment calls
         // "defensive and harmless" (`QPDFJob.cc:3051-3053`). It still matters
         // for callers that reach write_qpdf without the create stage.
         self.reserve_standard_output()?;
+        let splitting = self.configuration.split_pages.is_some_and(|size| size != 0);
+        if !splitting {
+            // `writeOutfile` rewrites the output name before it opens the
+            // destination (`libqpdf/QPDFJob.cc:3031-3041`): `--replace-input`
+            // writes to a temporary sibling of the input, and an explicit `-`
+            // becomes "no output name" so the writer takes the save pipeline.
+            // `doSplitPages` is the other dispatch arm and never reaches this,
+            // so it keeps the configured name for its own chunk expansion.
+            if self.configuration.replace_input {
+                self.configuration.output_file = Some(
+                    self.replace_input_path()
+                        .expect("--replace-input requires a configured input file"),
+                );
+            } else if self.configuration.output_file.as_deref() == Some(Path::new("-")) {
+                self.configuration.output_file = None;
+            }
+        }
         let mut writer_configuration = self.configuration.writer.clone();
         // qpdf keeps `normalizeContent` on the job and reapplies it from
         // `setWriterOptions` after the writer configuration has been
@@ -3365,7 +3369,6 @@ impl QPDFJob {
                 }
             }
         }
-        let splitting = self.configuration.split_pages.is_some_and(|size| size != 0);
         if self.configuration.copy_encryption.is_none()
             && !pdf.is_encrypted()
             && !splitting
@@ -3388,7 +3391,12 @@ impl QPDFJob {
                 // Keep the signed qpdf value until the split implementation has
                 // reached the same page-boundary conversion as
                 // `QIntC::to_size(m->split_pages)` (`libqpdf/QPDFJob.cc:2970`).
-                let mut split_options = SplitPageOptions::new(1, output.clone())
+                let split_output = self
+                    .configuration
+                    .output_file
+                    .clone()
+                    .expect("--split-pages requires a configured output file");
+                let mut split_options = SplitPageOptions::new(1, split_output)
                     .with_qpdf_chunk_size(split_pages)
                     .with_writer_configuration(writer_configuration.clone())
                     .with_verbose(self.configuration.verbose)
@@ -3411,11 +3419,15 @@ impl QPDFJob {
             } else {
                 (|| {
                     let mut writer = PdfWriter::new(pdf);
-                    if output == Path::new("-") {
+                    // The rewritten output name decides the destination:
+                    // `saveToStandardOutput` was already called, but qpdf
+                    // repeats it here because it is "defensive and harmless"
+                    // (`libqpdf/QPDFJob.cc:3044-3056`).
+                    if let Some(path) = self.configuration.output_file.clone() {
+                        writer.set_output_file(&path)?;
+                    } else {
                         self.logger.save_to_standard_output(true)?;
                         writer.set_output_pipeline(JobOutputPipeline(self.logger.get_save()?))?;
-                    } else {
-                        writer.set_output_file(&output)?;
                     }
                     // qpdf opens the destination before applying
                     // setWriterOptions (`QPDFJob.cc:3049-3056`). Keep
@@ -3444,12 +3456,25 @@ impl QPDFJob {
                 if pdf.any_warnings() {
                     self.record_warnings();
                 }
-                if self.configuration.verbose && output != Path::new("-") && !splitting {
-                    let mut message = self.message_prefix_bytes.clone();
-                    message.extend_from_slice(b": wrote file ");
-                    message.extend_from_slice(&path_description_bytes(&output));
-                    message.push(b'\n');
-                    self.logger.info(message)?;
+                // qpdf reports the destination it kept in the rewritten output
+                // name (`libqpdf/QPDFJob.cc:3058-3062`), which is already
+                // absent for standard output; `doSplitPages` reports each
+                // chunk from its own loop instead, so the split arm is
+                // excluded here.
+                if self.configuration.verbose && !splitting {
+                    if let Some(name) = self.configuration.output_file.clone() {
+                        let mut message = self.message_prefix_bytes.clone();
+                        message.extend_from_slice(b": wrote file ");
+                        message.extend_from_slice(&path_description_bytes(&name));
+                        message.push(b'\n');
+                        self.logger.info(message)?;
+                    }
+                }
+                // qpdf clears the output name again once the verbose report
+                // has been emitted, so the completion summary below sees only
+                // `m->replace_input` (`libqpdf/QPDFJob.cc:3063-3065`).
+                if self.configuration.replace_input {
+                    self.configuration.output_file = None;
                 }
                 // qpdf's `writeOutfile` performs the replace-input rename
                 // itself, after the verbose message and unconditionally for
@@ -3496,12 +3521,12 @@ impl QPDFJob {
                 // The drain qpdf performs after `writeOutfile` returns
                 // (`libqpdf/QPDFJob.cc:493-494`).
                 self.drain_document_warnings(pdf);
-                // qpdf's writeOutfile clears its output filename when the
-                // destination is `-` before writeQPDF emits the completion
-                // summary (`libqpdf/QPDFJob.cc:3033-3040,493-503`). Therefore
-                // stdout is an output stream for dispatch, but not a named
-                // resulting file for the warning suffix.
-                self.complete(output != Path::new("-"))?;
+                // The same predicate `writeQPDF` dispatched on, re-queried
+                // after `writeOutfile`'s rewrites (`libqpdf/QPDFJob.cc:497`).
+                // Standard output is an output destination for dispatch but
+                // not a resulting file for the warning suffix, because the
+                // name has been cleared in between.
+                self.complete(self.creates_output())?;
                 if self.configuration.report_memory_usage {
                     self.report_memory_usage()?;
                 }
@@ -3536,31 +3561,12 @@ impl QPDFJob {
         self.prepare_document_transformations(pdf, &configuration)
     }
 
-    /// The destination this job writes to, or `None` when it creates no output.
-    fn output_destination(&self) -> Option<PathBuf> {
-        self.configuration
-            .output_file
-            .clone()
-            .or_else(|| {
-                self.configuration
-                    .replace_input
-                    .then(|| self.replace_input_path())
-                    .flatten()
-            })
-            .or_else(|| {
-                self.configuration
-                    .json_version
-                    .is_some()
-                    .then(|| PathBuf::from("-"))
-            })
-    }
-
     /// Reserve the save pipeline when this job writes to standard output.
     ///
     /// `only_if_not_set` makes repeated calls idempotent, so the create and
     /// write stages can both reserve without the second one failing.
     fn reserve_standard_output(&mut self) -> Result<()> {
-        if self.output_destination().as_deref() != Some(Path::new("-")) {
+        if self.configuration.output_file.as_deref() != Some(Path::new("-")) {
             return Ok(());
         }
         if let Err(error) = self.logger.save_to_standard_output(true) {
@@ -4139,11 +4145,10 @@ impl QPDFJob {
             keys: &configuration.json_keys,
             objects: &configuration.json_objects,
         };
-        if let Some(path) = configuration
-            .output_file
-            .as_deref()
-            .filter(|path| *path != Path::new("-"))
-        {
+        // `writeJSON` writes to the output name when one survived
+        // `writeOutfile`'s rewrites, and to the save pipeline otherwise
+        // (`libqpdf/QPDFJob.cc:3093-3115`).
+        if let Some(path) = configuration.output_file.as_deref() {
             let mut file = File::create(path)
                 .map_err(|error| Error::file_io("open JSON output", path.to_path_buf(), error))?;
             return self
@@ -4295,13 +4300,18 @@ impl QPDFJob {
     /// (`libqpdf/QPDFJob.cc:567-631`): stdout is reserved before the input is
     /// opened, and `QUtil::same_file` rejects destructive aliases before the
     /// writer can truncate them.
-    pub fn check_configuration(&self) -> Result<()> {
-        // qpdf assigns the implicit JSON destination before checking
-        // split-pages/output conflicts (QPDFJob.cc:578-591). Keep that
-        // effective destination visible here even though the Rust
-        // configuration remains an immutable snapshot.
-        let implicit_json_stdout =
-            self.configuration.json_version.is_some() && self.configuration.output_file.is_none();
+    ///
+    /// The receiver is mutable because qpdf's own check is not a pure
+    /// predicate: it assigns the implicit JSON destination `-` to
+    /// `m->outfilename` when `--json` was requested without an output file
+    /// (`libqpdf/QPDFJob.cc:582-586`), and every later query of
+    /// [`Self::creates_output`] observes that assignment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Usage`] for each command-line consistency
+    /// failure qpdf reports from `checkConfiguration`.
+    pub fn check_configuration(&mut self) -> Result<()> {
         if self.configuration.input_file.is_none()
             && !self.configuration.empty_input
             && (self.configuration.require_output
@@ -4341,6 +4351,13 @@ impl QPDFJob {
                 return Err(UsageError::new("--json may not be used with --replace-input").into());
             }
         }
+        if self.configuration.json_version.is_some() && self.configuration.output_file.is_none() {
+            // The output file is optional with --json for backward
+            // compatibility and defaults to standard output
+            // (`libqpdf/QPDFJob.cc:582-586`). Every check below, and every
+            // later `creates_output` query, sees that assignment.
+            self.configuration.output_file = Some(PathBuf::from("-"));
+        }
         if self.configuration.require_output
             && self.configuration.output_file.is_none()
             && !self.configuration.replace_input
@@ -4362,12 +4379,7 @@ impl QPDFJob {
             || self.configuration.show_encryption
             || self.configuration.is_encrypted
             || self.configuration.requires_password)
-            // qpdf's JSON output defaults to stdout before this conflict
-            // check (`QPDFJob.cc:582-595`), so it is an output destination
-            // even when no explicit outputFile was supplied.
-            && (self.configuration.output_file.is_some()
-                || self.configuration.replace_input
-                || self.configuration.json_version.is_some())
+            && (self.configuration.output_file.is_some() || self.configuration.replace_input)
         {
             return Err(UsageError::new("no output file may be given for this option").into());
         }
@@ -4392,8 +4404,7 @@ impl QPDFJob {
                 }
             }
         }
-        if self.configuration.output_file.as_deref() == Some(Path::new("-")) || implicit_json_stdout
-        {
+        if self.configuration.output_file.as_deref() == Some(Path::new("-")) {
             if self.configuration.split_pages.is_some_and(|size| size != 0) {
                 return Err(UsageError::new(
                     "--split-pages may not be used when writing to standard output",
@@ -4410,12 +4421,20 @@ impl QPDFJob {
             // (`libqpdf/QPDFJob.cc:627`): a splitting write never truncates
             // the original input in place, so aliasing input and output is
             // not destructive when splitting.
+            //
+            // The destination can be the literal `-` here, either because it
+            // was given on the command line or because the JSON default above
+            // assigned it. qpdf compares that name with `QUtil::same_file`
+            // like any other (`libqpdf/QUtil.cc:574-610`), so a `-` that names
+            // no file simply fails to `stat` and the check passes; a file
+            // actually named `-` in the working directory is compared as
+            // itself and aliasing the input is rejected.
             if !self.configuration.replace_input
                 && !self.configuration.split_pages.is_some_and(|size| size != 0)
                 && crate::qutil::same_file(input, output)
             {
                 return Err(UsageError::new(
-                    "input file and output file are the same; use --replace-input to intentionally overwrite the input",
+                    "input file and output file are the same; use --replace-input to intentionally overwrite the input file",
                 )
                 .into());
             }
@@ -4901,6 +4920,27 @@ impl QPDFJob {
     /// Configure qpdf's `warnings-exit-0` behavior.
     pub fn set_warnings_exit_zero(&mut self, value: bool) {
         self.warnings_exit_zero = value;
+    }
+
+    /// Report whether this job currently creates output.
+    ///
+    /// This is `QPDFJob::createsOutput` (`libqpdf/QPDFJob.cc:528-531`), a
+    /// query over state that the job rewrites while it runs rather than a
+    /// fixed property of the configuration:
+    ///
+    /// * [`Self::check_configuration`] assigns the implicit JSON destination
+    ///   `-` when `--json` was requested without an output file;
+    /// * the write stage replaces the destination with a temporary path for
+    ///   `--replace-input`, and clears it outright when the destination is
+    ///   `-`, before it clears the temporary path again after the rename
+    ///   (`libqpdf/QPDFJob.cc:3031-3041,3063-3065`).
+    ///
+    /// The same query therefore answers differently before and after the
+    /// write: standard output is an output destination when `writeQPDF`
+    /// dispatches, but not when it selects the warning-summary spelling.
+    #[must_use]
+    pub fn creates_output(&self) -> bool {
+        self.configuration.output_file.is_some() || self.configuration.replace_input
     }
 
     /// Return qpdf's status for the current job state without logging or
@@ -6572,6 +6612,136 @@ mod tests {
         assert_eq!(
             error.to_string(),
             ".splitPages: invalid page count 2147483648"
+        );
+    }
+
+    /// A logger whose save pipeline is already claimed, so a job that writes
+    /// to standard output neither emits the document into the test harness's
+    /// own stream nor competes with another test for the process-wide one.
+    fn discarding_save_logger() -> QPDFLogger {
+        let logger = QPDFLogger::create();
+        logger
+            .set_save(Some(PipelineHandle::new(crate::pipeline::Discard)), false)
+            .expect("claim the save pipeline");
+        logger
+    }
+
+    #[test]
+    fn write_qpdf_clears_the_output_name_for_standard_output() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/one-page.pdf");
+        let mut job = QPDFJob::new();
+        job.set_input_file(&fixture).expect("input path");
+        job.set_output_file("-").expect("standard output");
+        job.set_logger(discarding_save_logger());
+        let mut pdf = job
+            .create_qpdf()
+            .expect("create qpdf")
+            .expect("primary document");
+        assert!(
+            job.creates_output(),
+            "standard output is a destination when writeQPDF dispatches"
+        );
+
+        job.write_qpdf(&mut pdf).expect("standard-output write");
+
+        assert!(
+            !job.creates_output(),
+            "the write stage clears the standard-output name before the summary"
+        );
+    }
+
+    #[test]
+    fn write_qpdf_clears_the_replace_input_temporary_name() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/one-page.pdf");
+        let tempdir = tempfile::tempdir().expect("temporary replace-input directory");
+        let primary = tempdir.path().join("primary.pdf");
+        std::fs::copy(&fixture, &primary).expect("copy fixture");
+        let mut job = QPDFJob::new();
+        job.set_input_file(&primary).expect("input path");
+        job.config().replace_input().expect("replace input");
+        let mut pdf = job
+            .create_qpdf()
+            .expect("create qpdf")
+            .expect("primary document");
+
+        job.write_qpdf(&mut pdf).expect("replace-input write");
+
+        assert_eq!(
+            job.configuration.output_file, None,
+            "the temporary replacement name must not survive the rename"
+        );
+        assert!(
+            job.creates_output(),
+            "--replace-input still creates output once the name is cleared"
+        );
+    }
+
+    #[test]
+    fn check_configuration_assigns_the_implicit_json_output_destination() {
+        let mut job = QPDFJob::new();
+        job.set_logger(discarding_save_logger());
+        job.initialize_from_json_partial(r#"{"inputFile":"input.pdf","json":"2"}"#)
+            .unwrap();
+        assert!(
+            !job.creates_output(),
+            "no destination has been assigned before the check runs"
+        );
+
+        job.check_configuration()
+            .expect("--json without an output file defaults to standard output");
+
+        assert!(
+            job.creates_output(),
+            "the implicit JSON destination must make the job an output producer"
+        );
+        assert_eq!(
+            job.configuration.output_file.as_deref(),
+            Some(Path::new("-")),
+            "qpdf assigns the literal standard-output name"
+        );
+    }
+
+    #[test]
+    fn check_configuration_keeps_an_explicit_json_output_destination() {
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(
+            r#"{"inputFile":"input.pdf","outputFile":"out.json","json":"2"}"#,
+        )
+        .unwrap();
+
+        job.check_configuration()
+            .expect("explicit JSON output file");
+
+        assert_eq!(
+            job.configuration.output_file.as_deref(),
+            Some(Path::new("out.json")),
+            "an explicit destination must not be replaced by the JSON default"
+        );
+    }
+
+    #[test]
+    fn check_configuration_compares_the_implicit_json_destination_with_the_input() {
+        // qpdf compares the assigned `-` with the input through
+        // `QUtil::same_file` like any other destination
+        // (`libqpdf/QPDFJob.cc:627-631`). A `-` that names no file in the
+        // working directory simply fails to `stat`, so the check passes.
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let input = directory.path().join("input.pdf");
+        std::fs::write(&input, b"%PDF-1.4\n").expect("input file");
+        let mut job = QPDFJob::new();
+        job.set_logger(discarding_save_logger());
+        job.set_input_file(input).expect("input path");
+        job.configuration.json_version = Some(2);
+
+        job.check_configuration()
+            .expect("a `-` that names no file cannot alias the input");
+
+        assert_eq!(
+            job.configuration.output_file.as_deref(),
+            Some(Path::new("-")),
+            "the JSON default must survive the identity check"
         );
     }
 
