@@ -1301,7 +1301,9 @@ fn write_main_xref_and_trailer(
     };
     let mut pass1_id_writer = |output: &mut OutputSink<'_>| {
         let id_value = pass1_id_value.as_ref().ok_or_else(|| {
+            // cov:ignore-start: pass1 selects the ID value before installing this callback
             crate::Error::Internal("missing pass-1 linearization ID value".to_string())
+            // cov:ignore-end
         })?;
         id_value.write_id_value_with_qpdf_obj_gen_map(output, map, removed_refs)
     };
@@ -1316,7 +1318,7 @@ fn write_main_xref_and_trailer(
         &trailer_map,
         &removed_object_refs,
         true,
-    )?;
+    )?; // cov:ignore: LLVM maps this validated trailer continuation separately
     out.write_bytes(format!("\nstartxref\n{}\n%%EOF\n", first_page_xref_offset).as_bytes())?;
 
     Ok((xref_start, xref_first_entry_offset))

@@ -4060,7 +4060,7 @@ mod final_handle_writer_tests {
                 false,
                 false,
                 None,
-                &|object_ref| Ok(object_ref),
+                &|object_ref| Ok(object_ref), // cov:ignore: direct /ID strings need no reference map
                 &BTreeSet::new(),
                 true,
             )
@@ -4068,6 +4068,25 @@ mod final_handle_writer_tests {
         .expect("linearized second trailer succeeds without source /Size");
 
         assert_eq!(output, b"trailer << /Size 9 /ID [<696430><696431>] >>");
+
+        let mut qdf_output = Vec::new();
+        output::with_buffer_sink(&mut qdf_output, |out| {
+            trailer.write_trailer_with_ref_map_and_kind(
+                out,
+                TrailerKind::LinearizedSecond { size: 9 },
+                false,
+                true,
+                None,
+                &|object_ref| Ok(object_ref), // cov:ignore: direct /ID strings need no reference map
+                &BTreeSet::new(),
+                true,
+            )
+        })
+        .expect("QDF linearized second trailer succeeds without source /Size");
+        assert_eq!(
+            qdf_output,
+            b"trailer <<\n  /Size 9\n  /ID [<696430><696431>]\n>>\n"
+        );
     }
 
     #[test]
