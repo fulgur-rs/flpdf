@@ -3011,13 +3011,13 @@ fn parse_xref_table(
     let mut entries = Vec::new();
     let mut first_xref_item_offset = 0;
     let mut table_diagnostics = Vec::new();
-    loop {
-        cursor.skip_ws();
-        let section_start = cursor.pos;
-        if cursor.peek_word(b"trailer") {
-            let _ = cursor.read_token()?;
-            break;
-        }
+    // qpdf's `while (!done)` loop always opens with a subsection header read;
+    // the `trailer` keyword is only ever recognised by the lookahead that
+    // closes a subsection (`libqpdf/QPDF.cc:851-890`). A table with no
+    // subsection at all therefore fails as `xref syntax invalid` rather than
+    // being accepted as empty.
+    let mut done = false;
+    while !done {
         let header_start = cursor.pos;
         let header = cursor.read_bytes(50);
         let (first, count, header_bytes) =
@@ -3026,7 +3026,7 @@ fn parse_xref_table(
                     QpdfErrorCode::DamagedPdf,
                     filename,
                     b"xref table",
-                    i64::try_from(section_start).unwrap_or(i64::MAX),
+                    i64::try_from(header_start).unwrap_or(i64::MAX),
                     b"xref syntax invalid",
                 ))
             })?;
@@ -3103,6 +3103,17 @@ fn parse_xref_table(
                     )))
                 } // cov:ignore-end
             }
+        }
+
+        // `QPDF::readToken` is fixed at `allow_bad = true`, so a `tt_bad`
+        // token here is a value the lookahead simply fails to match rather
+        // than an error: qpdf rewinds to the saved position and re-reads the
+        // bytes as the next subsection header (`libqpdf/QPDF.cc:886-891`).
+        let lookahead_start = cursor.pos;
+        if cursor.read_token()?.is_word_value(b"trailer") {
+            done = true;
+        } else {
+            cursor.pos = lookahead_start;
         }
     }
 
@@ -3819,37 +3830,20 @@ impl<'a> ByteCursor<'a> {
         self.pos.checked_sub(self.base)
     }
 
-    fn skip_ws(&mut self) {
-        while self
-            .local_pos()
-            .and_then(|pos| self.bytes.get(pos))
-            .copied()
-            .is_some_and(is_pdf_space)
-        {
-            self.pos += 1;
-        }
-    }
-
+    /// `QPDF::readToken` (`libqpdf/QPDF.cc:1535-1539`), which is fixed at
+    /// `allow_bad = true` and `max_len = 0` and reads from a source whose
+    /// tokenizer has `allowEOF` set (`libqpdf/QPDF.cc:208`). Bad tokens are
+    /// therefore returned to the caller as ordinary values, never raised.
     fn read_token(&mut self) -> Result<Token> {
         let mut tokenizer = Tokenizer::new(self.bytes);
         tokenizer.allow_eof();
         tokenizer.set_position(self.local_pos().unwrap_or(self.bytes.len()))?;
-        let mut token = tokenizer.read_token(false, 0)?;
+        let mut token = tokenizer.read_token(true, 0)?;
         self.pos = self.base.saturating_add(tokenizer.position());
         token.start = token.start.saturating_add(self.base);
         token.end = token.end.saturating_add(self.base);
         token.error_offset = token.error_offset.saturating_add(self.base);
         Ok(token)
-    }
-
-    fn peek_word(&self, word: &[u8]) -> bool {
-        self.local_pos()
-            .and_then(|pos| self.bytes.get(pos..))
-            .is_some_and(|tail| tail.starts_with(word))
-            && self
-                .local_pos()
-                .and_then(|pos| self.bytes.get(pos.saturating_add(word.len())))
-                .is_none_or(|byte| is_pdf_delimiter(*byte))
     }
 
     fn read_be_u64(&mut self, width: usize) -> Result<u64> {
