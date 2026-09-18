@@ -139,6 +139,12 @@ fn pad_password(password: &[u8]) -> [u8; 32] {
 /// the reader-side entry projection (`state.rs`'s
 /// `required_v_lt_5_32_byte_string_from_handle`, qpdf's
 /// `pad_short_parameter`, `QPDF_encryption.cc:316-321`).
+///
+/// Neither arm is reachable from a donor that authenticated: both readers
+/// NUL-pad a short V<5 `/O`//`U` and then require exactly 32 bytes
+/// (`QPDF_encryption.cc:805-813`), so a longer entry fails at open in qpdf
+/// and in flpdf alike. The projection matters only for a caller that builds
+/// a copy-encryption source from an arbitrary dictionary.
 pub(crate) fn v_lt_5_32_byte_parameter(bytes: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     let len = bytes.len().min(32);
@@ -1761,9 +1767,19 @@ mod copy_writer_key_derivation_tests {
         }
     }
 
-    /// Known answer taken from qpdf 11.9.0: copying that donor's encryption
-    /// after patching its `/Length` to `040` makes qpdf derive this 5-byte
-    /// key, which decrypts the content streams of qpdf's own output.
+    /// Known answer taken from qpdf 11.9.0, not from flpdf.
+    ///
+    /// Reproduce it by patching that donor's `/Length 128` to `/Length 040`
+    /// in place (same width, so every xref offset stays valid) and running
+    /// `qpdf --static-id --static-aes-iv --allow-weak-crypto --password=u
+    /// <donor> out.pdf`. qpdf exits 0. Derive the 14-byte per-object AES key
+    /// for the first content stream with `QPDF::compute_data_key` over the
+    /// 5-byte key below, extend it to 16 bytes with two zero bytes (the
+    /// bytes qpdf's crypto provider reads past the end of that buffer, see
+    /// `copy_encryption_rejects_an_aes_key_qpdf_would_read_out_of_bounds`),
+    /// and AES-128-CBC decrypt the stream with its leading 16 bytes as the
+    /// IV: the plaintext inflates to the original content stream. Only this
+    /// 5-byte key produces that result, so it is qpdf's own value.
     #[test]
     fn short_length_matches_the_qpdf_derived_key() {
         let key = compute_encryption_key_from_password(b"u", &inputs(4, 40, true))

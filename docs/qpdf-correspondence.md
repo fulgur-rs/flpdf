@@ -1527,6 +1527,13 @@ snapshot する）と、qpdf の `compute_encryption_key_from_password` を逐�
 `/O`・`/U` を 32 バイトへ射影する `v_lt_5_32_byte_parameter` は、qpdf が
 `std::string::c_str()` から 32 バイトを読む挙動（短い entry は over-read）に対し、
 reader 側 `required_v_lt_5_32_byte_string_from_handle` と同じ NUL 埋めを行う。
+なお切り詰め・NUL 埋めのどちらの arm も、認証を通った donor からは到達しない——
+qpdf も flpdf も reader が V<5 の `/O`//`U` を NUL 埋めしたうえで正確に 32 バイトを
+要求し（`QPDF_encryption.cc:805-813`）、40 バイトの `/O` を持つ donor は両者とも
+open 時点で失敗する（実測: qpdf `incorrect length for /O and/or /U in encryption
+dictionary` / flpdf `malformed /Encrypt dictionary: /O entry is not 32 bytes`、
+どちらも exit 2）。この射影が効くのは、任意の辞書から `CopyEncryptionSource` を
+直接構築するライブラリ呼び出しだけである。
 負の `/Length` は qpdf の `QIntC` 変換が投げる `std::range_error` に対応して
 `Error::System` を返す。
 
