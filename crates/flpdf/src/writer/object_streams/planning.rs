@@ -246,7 +246,13 @@ pub(crate) fn filter_objstm_batches_for_output<R: std::io::Read + std::io::Seek>
         // (QPDFWriter.cc:2125-2149). Seed or reuse the same repaired cache so
         // this output filter does not start a second PageWalk.
         crate::pages::repair::prepare_for_optimization(pdf)?
-            .map(|prepared| prepared.pages.into_iter().collect())
+            .map(|prepared| {
+                prepared
+                    .pages
+                    .into_iter()
+                    .filter_map(|page| page.object_ref())
+                    .collect()
+            })
             .unwrap_or_default()
     } else {
         BTreeSet::new()

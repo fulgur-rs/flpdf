@@ -220,7 +220,7 @@ pub(crate) fn resolve_inherited_handle_with_max_depth<R: Read + Seek>(
 pub fn page_refs<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<ObjectRef>> {
     if let Some(prepared) = pdf.cached_page_list() {
         pdf.mark_get_all_pages_called();
-        return Ok(prepared.pages);
+        return prepared.page_refs();
     }
     pdf.mark_get_all_pages_called();
     PageWalk::new(pdf)?.collect()
@@ -651,7 +651,14 @@ mod tests {
 
         let actual = page_refs(&mut pdf).expect("cached page refs");
 
-        assert_eq!(actual, prepared.pages);
+        assert_eq!(
+            actual,
+            prepared
+                .pages
+                .iter()
+                .map(|page| page.object_ref().expect("page identity"))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(page_walk_visits_for_test(), before);
     }
 

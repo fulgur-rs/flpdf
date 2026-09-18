@@ -641,6 +641,12 @@ snapshot は残らない。2026-09-18（`flpdf-3yn9.48.151`）: その ownerless
 test-only path 自体を削除し、xref loading の経路は
 `load_xref_state_from_source` の 1 本になった。
 | `QPDF_pages.cc` | 319 | `pages/repair.rs`（`QPDF_pages.cc:39-75` の `getAllPages` root correction と `:77-150` の `getAllPagesInternal` repair/enumeration を canonical `ObjectHandle` graph 上で実装） + `optimization/inherited_attrs.rs`（canonical page promotion/clone と衝突しない `Pdf::next_obj_gen` allocation） + `pages.rs` / `pages/tree_rebuild.rs`（flatten/insert/remove と legacy consumer の残り） | 🔀 `flpdf-25kg.3.7` で repair/enumeration の canonical route を追加。`.3.2.6.15` では `QPDFPageObjectHelper::getAttribute` の bottom-up `/Parent` climb（`QPDFPageObjectHelper.cc:217-263`。`QPDF_optimization.cc:121-245`/`QPDF_pages.cc:154-180,205-248` は top-down push とツリー変異のオラクル）を、共有 `PageParentCursor` / `resolve_inherited_handle_with_max_depth` として live `ObjectHandle` で切り出した。直接親の identity、間接親の canonical `ObjectRef`、null/非辞書親、cycle/depth guard をこの境界で保持し、`/Rotate` の未指定を合成しない。`.3.2.6.16` では `tree_rebuild` の単一文書 consumer を canonical handle route に切り替え、選択ページの inherited `/MediaBox`・`/CropBox`・`/Resources`・`/Rotate` を再親子付け前に push、直接 non-scalar は `make_indirect_from_object_handle` で共有 allocation を in-place 昇格、既存 indirect 値は identity を保持し、duplicate は `shallow_copy`、root `/Kids`・`/Count`・各 leaf `/Parent` は live handle を replace/remove する。qpdf の absent `/Rotate` は合成しない。`QPDFObjectHandle.cc:1199-1209,2072-2079` の live replace/remove・shallow-copy がこの consumerの mutation oracleである。`QPDFJob.cc:2360-2632` の page-selection orchestration はこの境界の外であり、`page_extract` uses canonical `copyForeignObject`/`ObjectHandle`; `page_merge` / `page_label` remain separate consumers |
+`flpdf-ihyup.2` (2026-09-18) keeps the repaired `/Pages` root and leaf sequence
+as live `ObjectHandle` values through inherited-attribute push, optimization
+object-map construction, linearization content probing, and tree rebuild. This
+matches qpdf's `m->all_pages` raw `QPDFObjGen` identity; only the existing
+public `ObjectRef` result surfaces remain explicit projection boundaries.
+
 `flpdf-mkyw` replaces the Rust recursion in the page-tree repair, inherited-attribute,
 and tree-rebuild walks with explicit heap frames. This is category (B): qpdf's
 child order, global visited/seen behavior, repair/mutation order, inherited-key
@@ -680,9 +686,12 @@ writer-side QDF/decode triggers already seed the cache in
 `initialize_special_streams`. This preserves qpdf's direct-outline and
 `optimize` call order (`QPDFWriter.cc:1911-1935,2114-2116`). The linearized
 page-dictionary filter likewise obtains its sequence through the repair/cache
-boundary after object-stream setup (`QPDFWriter.cc:2125-2149`). The Rust
-consumer still receives an owned `Vec<ObjectRef>` projection rather than qpdf's
-const vector reference; no second page-tree traversal is performed, and
+boundary after object-stream setup (`QPDFWriter.cc:2125-2149`). Internal
+optimization, linearization, and tree-rebuild consumers now retain the prepared
+`ObjectHandle` sequence rather than re-projecting and re-looking up each page;
+the public `pages::page_refs` / `PageDocumentHelper::get_all_pages` surfaces
+still expose their owned `Vec<ObjectRef>` contract. No second page-tree
+traversal is performed, and
 `update_all_pages_cache`/tree-rebuild/page-splice invalidation remains authoritative
 (`QPDF_pages.cc:39-75,141-150`).
 

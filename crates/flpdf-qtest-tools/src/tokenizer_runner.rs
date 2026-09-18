@@ -7,7 +7,7 @@ use std::path::Path;
 use flpdf::pages::repair::prepare_for_optimization;
 use flpdf::tokenizer::{TokenType, Tokenizer};
 use flpdf::{
-    DecodeLevel, Error, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, Pipeline, PipelineResult,
+    DecodeLevel, Error, ObjectHandle, Pdf, PdfOpenOptions, Pipeline, PipelineResult,
     Result as FlpdfResult,
 };
 
@@ -247,9 +247,9 @@ fn process(
         .map_err(|e| e.to_string())?
         .map(|prepared| prepared.pages)
         .unwrap_or_default();
-    for (pageno, page_ref) in page_refs.iter().enumerate() {
+    for (pageno, page) in page_refs.iter().enumerate() {
         let content =
-            canonical_page_content_bytes(&mut pdf, *page_ref).map_err(|e| e.to_string())?;
+            canonical_page_content_bytes(&mut pdf, page.clone()).map_err(|e| e.to_string())?;
         let label = format!("PAGE {}", pageno + 1);
         dump_tokens(
             &content,
@@ -375,10 +375,13 @@ fn process(
 /// API and a second time while classifying object streams.
 fn canonical_page_content_bytes<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
+    page: ObjectHandle,
 ) -> FlpdfResult<Vec<u8>> {
-    let page = pdf.get_object_handle(page_ref);
     pdf.resolve(&page)?;
+    let page_description = page.object_ref().map_or_else(
+        || "raw page object".to_owned(),
+        |page_ref| page_ref.to_string(),
+    );
     if !page.has_key(b"/Contents") {
         return Ok(Vec::new());
     }
@@ -399,7 +402,7 @@ fn canonical_page_content_bytes<R: Read + Seek>(
         return Ok(Vec::new());
     }
     let mut streams = Vec::new();
-    collect_canonical_content_streams(pdf, &contents, page_ref, &mut streams, true)?;
+    collect_canonical_content_streams(pdf, &contents, &page_description, &mut streams, true)?;
 
     let mut output = Vec::new();
     let mut need_newline = false;
@@ -417,7 +420,7 @@ fn canonical_page_content_bytes<R: Read + Seek>(
 fn collect_canonical_content_streams<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     value: &ObjectHandle,
-    page_ref: ObjectRef,
+    page_description: &str,
     streams: &mut Vec<ObjectHandle>,
     allow_array: bool,
 ) -> FlpdfResult<()> {
@@ -438,7 +441,7 @@ fn collect_canonical_content_streams<R: Read + Seek>(
             return Ok(());
         }
         for item in items {
-            collect_canonical_content_streams(pdf, &item, page_ref, streams, false)?;
+            collect_canonical_content_streams(pdf, &item, page_description, streams, false)?;
         }
         return Ok(());
     }
@@ -449,7 +452,7 @@ fn collect_canonical_content_streams<R: Read + Seek>(
         return Ok(());
     }
     Err(Error::Unsupported(format!(
-        "/Contents on page {page_ref} is not a stream or array"
+        "/Contents on page {page_description} is not a stream or array"
     )))
 }
 
