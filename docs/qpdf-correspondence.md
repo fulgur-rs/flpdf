@@ -2286,6 +2286,19 @@ boundaryとして公開した。各thresholdは `QUtil::string_to_uint` 相当�
 configuration consumerの合成入口として残り、別のargv parserやimage pipelineは
 追加しない。
 
+`flpdf-uwu7` では、qpdfの `Config::jobJsonFile` が同じ Config に
+`initializeFromJson(..., true)` を重ねた後、後続の argv callback を同じ stateへ
+適用する責務（`QPDFJob_config.cc:774-784,422-447`）を、CLIの既存
+`qpdf_cli_events` replayへ接続した。`--externalize-inline-images`、
+`--optimize-images`、`--keep-inline-images` は既存のJSON threshold/policyを
+上書きしない個別flag setter (`QPDFJobConfig::set_externalize_inline_images`,
+`set_optimize_images`, `keep_inline_images`)を出現順に呼び、`--ii-min-bytes` /
+`--oi-min-*` は同じConfigのthreshold setterへ直ちに渡す。これにより
+`QPDFJob::handleTransformations` の外部化→最適化順序
+（`QPDFJob.cc:2151-2174`）を保ったまま、job JSON後の画像argv layeringを
+qpdfと同じ共有Jobで実行する。`job_json_image_optimization.rs` は、JSON後の
+externalize/optimize/keepとthresholdの3組をqpdf 11.9.0と比較する。
+
 `flpdf-w2fk` で、top-level の inspection route（`run_check` / `run_show_*` /
 `--json` 経路）へ image option を配線し、report の前に変換を実行するようにした。
 ただし `--show-encryption` は例外で、認証に失敗した入力では変換を行わない —

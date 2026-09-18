@@ -4152,6 +4152,9 @@ enum JobJsonCliEvent {
     JsonOutput(Option<Vec<u8>>),
     Collate(Vec<u8>),
     CompressionLevel(Vec<u8>),
+    ExternalizeInlineImages,
+    OptimizeImages,
+    KeepInlineImages,
     IiMinBytes(Vec<u8>),
     KeepFilesOpenThreshold(Vec<u8>),
     OiMinArea(Vec<u8>),
@@ -4212,6 +4215,12 @@ fn qpdf_cli_events(args: &[arg_parser::RawArg]) -> CliResult<Vec<JobJsonCliEvent
             )));
         } else if let Some(value) = raw_option_equals_value(bytes, b"compression-level") {
             events.push(JobJsonCliEvent::CompressionLevel(value.to_vec()));
+        } else if bytes == b"--externalize-inline-images" {
+            events.push(JobJsonCliEvent::ExternalizeInlineImages);
+        } else if bytes == b"--optimize-images" {
+            events.push(JobJsonCliEvent::OptimizeImages);
+        } else if bytes == b"--keep-inline-images" {
+            events.push(JobJsonCliEvent::KeepInlineImages);
         } else if let Some(value) = raw_option_equals_value(bytes, b"ii-min-bytes") {
             events.push(JobJsonCliEvent::IiMinBytes(value.to_vec()));
         } else if let Some(value) = raw_option_equals_value(bytes, b"keep-files-open-threshold") {
@@ -4389,11 +4398,34 @@ fn preflight_qpdf_cli_events(args: &[arg_parser::RawArg]) -> CliResult<QpdfCliPr
                     .map(|_| ())
                     .map_err(qpdf_argv_usage_error)?;
             }
-            JobJsonCliEvent::IiMinBytes(value)
-            | JobJsonCliEvent::OiMinArea(value)
-            | JobJsonCliEvent::OiMinHeight(value)
-            | JobJsonCliEvent::OiMinWidth(value) => {
-                parse_qpdf_unsigned_option(value)?;
+            JobJsonCliEvent::ExternalizeInlineImages => {
+                job.config().set_externalize_inline_images();
+            }
+            JobJsonCliEvent::OptimizeImages => {
+                job.config().set_optimize_images();
+            }
+            JobJsonCliEvent::KeepInlineImages => {
+                job.config().keep_inline_images();
+            }
+            JobJsonCliEvent::IiMinBytes(value) => {
+                job.config()
+                    .ii_min_bytes(value)
+                    .map_err(|error| qpdf_argv_usage_error(Box::new(error)))?;
+            }
+            JobJsonCliEvent::OiMinArea(value) => {
+                job.config()
+                    .oi_min_area(value)
+                    .map_err(|error| qpdf_argv_usage_error(Box::new(error)))?;
+            }
+            JobJsonCliEvent::OiMinHeight(value) => {
+                job.config()
+                    .oi_min_height(value)
+                    .map_err(|error| qpdf_argv_usage_error(Box::new(error)))?;
+            }
+            JobJsonCliEvent::OiMinWidth(value) => {
+                job.config()
+                    .oi_min_width(value)
+                    .map_err(|error| qpdf_argv_usage_error(Box::new(error)))?;
             }
             JobJsonCliEvent::KeepFilesOpenThreshold(value) => {
                 let threshold = parse_qpdf_unsigned_option(value)?;

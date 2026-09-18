@@ -5487,10 +5487,24 @@ impl QPDFJobConfig<'_> {
         self
     }
 
+    /// Enable qpdf's inline-image externalization flag without changing the
+    /// separately configured `iiMinBytes` threshold.
+    pub fn set_externalize_inline_images(&mut self) -> &mut Self {
+        self.job.configuration.externalize_inline_images = true;
+        self
+    }
+
     /// Configure qpdf's image optimization phase and its thresholds.
     pub fn optimize_images(&mut self, options: ImageOptimizationOptions) -> &mut Self {
         self.job.configuration.optimize_images = true;
         self.job.configuration.image_options = options;
+        self
+    }
+
+    /// Enable qpdf's image optimization flag without changing its thresholds
+    /// or the inline-image policy already layered into the configuration.
+    pub fn set_optimize_images(&mut self) -> &mut Self {
+        self.job.configuration.optimize_images = true;
         self
     }
 
