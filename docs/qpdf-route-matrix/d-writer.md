@@ -519,6 +519,14 @@ other writer cohorts remain explicit follow-up scope. This preserves qpdf's
 accessor ordering (`libqpdf/QPDFObjectHandle.cc:240-446,965-989`) without a
 workspace-wide mechanical conversion.
 
+**D26 bounded consumer (2026-09-18, `flpdf-ymuj.68`):** the linearized
+planner now accepts the setup-owned `SpecialStreams.normalized_streams`
+snapshot from `PdfWriter::write` instead of rewalking each page's `/Contents`
+array. This matches qpdf's single `initializeSpecialStreams` state
+(`libqpdf/QPDFWriter.cc:1912-1936,2113-2116`) while preserving the existing
+content-normalization gate and test-only direct-plan fallback. D26 remains mixed
+because specialized and linearized physical consumers are still distinct.
+
 **D14 bounded consumer (2026-09-18, `flpdf-ymuj.67`):** the linearized
 classic main trailer now uses `TrailerKind::LinearizedSecond` through the
 canonical `write_trailer_with_ref_map_and_kind` owner. The owner synthesizes

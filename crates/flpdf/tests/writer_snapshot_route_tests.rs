@@ -22,3 +22,25 @@ fn preserve_membership_snapshot_reaches_every_planned_writer_consumer() {
     assert!(linearization_writer.contains("source_container_by_member"));
     assert!(!linearization_writer.contains("source_xref_entries()"));
 }
+
+#[test]
+fn special_stream_snapshot_reaches_the_linearized_plan() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let writer = std::fs::read_to_string(root.join("writer.rs")).unwrap();
+    let linearization_plan = std::fs::read_to_string(root.join("linearization/plan.rs")).unwrap();
+    let linearization_writer =
+        std::fs::read_to_string(root.join("linearization/writer.rs")).unwrap();
+
+    assert!(
+        writer.contains("special_streams.as_ref()"),
+        "the setup-owned special-stream snapshot must cross the linearized writer boundary"
+    );
+    assert!(
+        linearization_writer.contains("special_streams: Option"),
+        "the linearized writer must accept the setup snapshot"
+    );
+    assert!(
+        linearization_plan.contains("normalized_streams_snapshot"),
+        "the plan must consume setup normalized-stream membership"
+    );
+}

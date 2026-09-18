@@ -3828,6 +3828,7 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
     options: &WriterOptions,
     pass1_path: Option<&Path>,
     setup: crate::writer::WriterSetupState,
+    special_streams: Option<&crate::writer::SpecialStreams>,
     output: &mut dyn OutputTarget,
 ) -> Result<WriterResult> {
     let plan_result = (|| {
@@ -3844,6 +3845,7 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
             &plan_options,
             Some(&setup.source_object_stream_data),
             setup.generated_compressible.as_ref(),
+            special_streams.map(crate::writer::SpecialStreams::normalized_streams),
         )?;
         // qpdf allocates generated ObjStm placeholders before it removes page
         // and Catalog members from the mapping (QPDFWriter.cc:1970-2005,
@@ -5544,6 +5546,7 @@ mod tests {
             &options,
             Some(&setup.source_object_stream_data),
             None,
+            None,
         )
         .expect("build Preserve linearization plan");
 
@@ -5925,7 +5928,7 @@ mod tests {
         };
         let setup = crate::writer::build_writer_setup(&mut pdf, &options).unwrap();
         let mut bytes = Vec::new();
-        write_linearized_for_pdf_writer(&mut pdf, &options, None, setup, &mut bytes)
+        write_linearized_for_pdf_writer(&mut pdf, &options, None, setup, None, &mut bytes)
             .expect("a malformed present /ID warns instead of aborting the write");
 
         assert!(
@@ -6010,7 +6013,7 @@ mod tests {
         // from the production path, which always supplies one for Generate.
         let setup = crate::writer::build_writer_setup(&mut pdf, &options).unwrap();
         let mut bytes = Vec::new();
-        write_linearized_for_pdf_writer(&mut pdf, &options, None, setup, &mut bytes)
+        write_linearized_for_pdf_writer(&mut pdf, &options, None, setup, None, &mut bytes)
             .expect("linearized Generate fallback succeeds");
         assert!(bytes
             .windows(b"/Type /ObjStm".len())
@@ -6034,8 +6037,9 @@ mod tests {
         };
         let setup = crate::writer::build_writer_setup(&mut pdf, &options).unwrap();
         let mut bytes = Vec::new();
-        let error = write_linearized_for_pdf_writer(&mut pdf, &options, None, setup, &mut bytes)
-            .expect_err("canonical progress reporter failure must abort writing");
+        let error =
+            write_linearized_for_pdf_writer(&mut pdf, &options, None, setup, None, &mut bytes)
+                .expect_err("canonical progress reporter failure must abort writing");
         assert!(
             error.to_string().contains("test progress failure"),
             "unexpected writer error: {error}"

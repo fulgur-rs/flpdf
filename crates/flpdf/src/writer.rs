@@ -945,6 +945,7 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
                 &options,
                 pass1_path,
                 setup,
+                special_streams.as_ref(),
                 &mut target,
             ) {
                 Ok(result) => result,
@@ -1788,6 +1789,12 @@ pub(crate) struct SpecialStreams {
     normalized_streams: BTreeSet<ObjectRef>,
     pub(crate) content_container_refs: BTreeSet<ObjectRef>,
     content_container_seq: HashMap<ObjectRef, u32>,
+}
+
+impl SpecialStreams {
+    pub(crate) fn normalized_streams(&self) -> &BTreeSet<ObjectRef> {
+        &self.normalized_streams
+    }
 }
 
 /// Build qpdf's page/content maps once for the writer setup trigger.
