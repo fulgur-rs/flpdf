@@ -50,7 +50,7 @@ markdown だけを読むので `--no-qpdf`（CI の形）でも完全に動く�
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 117 | 0 | 43 | 0 | 160 |
+| 118 | 0 | 42 | 0 | 160 |
 
 ### checker logical aggregate（259 rows）
 
@@ -63,7 +63,7 @@ rowsを検証する。2026-09-18 の現行 `origin/main` (`4942e7b3f7fbeb2a2d79e
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 168 | 0 | 91 | 0 | 259 |
+| 169 | 0 | 90 | 0 | 259 |
 
 したがって、160行の領域別表と259 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
@@ -138,7 +138,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 
 | ファイル | 行数 | canonical | bridge | mixed | unknown |
 |---|---|---|---|---|---|
-| [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 18 | 0 | 6 | 0 |
+| [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 19 | 0 | 5 | 0 |
 | [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 25 | 0 | 9 | 0 |
 | [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 40 | 0 | 2 | 0 |
 | [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 16 | 0 | 15 | 0 |
