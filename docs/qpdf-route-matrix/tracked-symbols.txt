@@ -2,7 +2,9 @@
 #
 # 対象: docs/qpdf-route-matrix/{a..e}-*.md の 162 行のうち、classification が
 # `bridge` または `mixed` の行の「flpdf current entrypoint」に現れる flpdf symbol。
-# 2026-09-18 時点で対象行は 92 行（`bridge` 0 / `mixed` 92）。`canonical` 行は対象外。bridge/mixed で entrypoint が `absent` の
+# 2026-09-18 時点で対象行は 92 行（`bridge` 0 / `mixed` 92）。`flpdf-3yn9.48.171`（A11
+# next_available_object_ref facade 撤去、mixed→canonical）で対象行は 91 行（`bridge` 0 /
+# `mixed` 91）になった。`canonical` 行は対象外。bridge/mixed で entrypoint が `absent` の
 # B29 も `unknown` なので元から対象外。B7 は `.48.14` でObjStm header用の
 # `next_object_stream_integer` consumerを追加した。
 #
@@ -100,15 +102,12 @@ crates/flpdf/src/object_handle.rs::ObjectHandle::has_key                 # A8 qt
 crates/flpdf/src/reader.rs::Pdf::get_all_objects                         # A9
 crates/flpdf/src/reader.rs::Pdf::canonical_object_refs                   # A10
 crates/flpdf/src/reader.rs::Pdf::canonical_live_object_refs              # A10
-crates/flpdf/src/reader.rs::Pdf::next_available_object_ref               # A11 facade 側
 crates/flpdf/src/reader.rs::Pdf::make_indirect_object_handle             # A12 canonical public factory
 # --- (b) baseline denominator ---
 crates/flpdf/src/reader/resolver.rs::ResolverCore                        # A1/A24 canonical
 crates/flpdf/src/reader/resolver.rs::object_cache                        # A1（フィールド）
 crates/flpdf/src/object_handle.rs::ObjectHandle::try_as_integer          # A6 canonical
 crates/flpdf/src/object_handle.rs::ObjectHandle::try_get_key             # A8 canonical
-crates/flpdf/src/reader/resolver.rs::get_object_count                    # A11 canonical count owner
-crates/flpdf/src/reader/resolver.rs::next_obj_gen                        # A11 canonical
 crates/flpdf/src/reader/resolver.rs::make_indirect_from_object_handle    # A12 canonical
 crates/flpdf/src/reader/resolver.rs::remove_object                       # A13 canonical（prod 1 / test 2）
 crates/flpdf/src/reader.rs::Pdf::replace_object                          # A16（facade+canonical 合流）
