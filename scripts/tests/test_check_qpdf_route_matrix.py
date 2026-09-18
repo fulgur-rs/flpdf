@@ -900,6 +900,127 @@ class AggregateTableTests(unittest.TestCase):
                 result.stdout,
             )
 
+    def test_repository_wide_aggregate_must_live_in_readme(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write_matrix()
+            area_total = (
+                "<!-- route-matrix-aggregate: area-total unit=area-physical -->\n\n"
+                "| canonical | bridge | mixed | unknown | 合計 |\n"
+                "|---|---|---|---|---|\n"
+                "| 2 | 0 | 2 | 0 | 4 |\n"
+            )
+            repo.write("README.md", README_DOCUMENT.replace(area_total, ""))
+            repo.write("a-x.md", A_DOCUMENT + "\n" + area_total)
+
+            result = repo.check()
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("area-total", result.stdout)
+            self.assertIn("README.md", result.stdout)
+
+    def test_zero_document_tally_cell_must_not_enumerate_a_row_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write_matrix()
+            repo.write(
+                "a-x.md",
+                A_DOCUMENT.replace("| bridge | 0 | — |", "| bridge | 0 | A1 |")
+            )
+
+            result = repo.check()
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("document-tally `bridge`", result.stdout)
+            self.assertIn("says 0", result.stdout)
+
+    def test_zero_range_summary_cell_must_not_enumerate_a_row_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write_matrix()
+            repo.write(
+                "b-x.md",
+                B_DOCUMENT.replace(
+                    "| 0/1, 2 | 2 | 1（0/1） | 1（2） | 0（—） | 0（—） |",
+                    "| 0/1, 2 | 2 | 1（0/1） | 1（2） | 0（0/1） | 0（—） |",
+                ),
+            )
+
+            result = repo.check()
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("range-summary", result.stdout)
+            self.assertIn("zero", result.stdout)
+
+    def test_per_file_link_must_target_an_area_document(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write_matrix()
+            repo.write(
+                "README.md",
+                README_DOCUMENT
+                + "| [outside](README.md) | 0 | 0 | 0 | 0 | 0 |\n",
+            )
+
+            result = repo.check()
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("per-file", result.stdout)
+            self.assertIn("area document", result.stdout)
+
+    def test_duplicate_area_row_id_is_error_even_when_aggregate_counts_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write_matrix()
+            duplicate_a = A_DOCUMENT.replace(
+                area_row("A3", "canonical"),
+                area_row("A3", "canonical") + area_row("A1", "canonical"),
+            ).replace("| canonical | 2 | A1, A3 |", "| canonical | 3 | A1, A3 |")
+            repo.write("a-x.md", duplicate_a)
+            repo.write(
+                "README.md",
+                README_DOCUMENT.replace("| 2 | 0 | 2 | 0 | 4 |", "| 3 | 0 | 2 | 0 | 5 |")
+                .replace("| 5 | 0 | 3 | 0 | 8 |", "| 6 | 0 | 3 | 0 | 9 |")
+                .replace(
+                    "| [A. ObjectHandle](a-x.md) | 3 | 2 | 0 | 1 | 0 |",
+                    "| [A. ObjectHandle](a-x.md) | 4 | 3 | 0 | 1 | 0 |",
+                ),
+            )
+
+            result = repo.check()
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("row id `A1` appears more than once", result.stdout)
+
+    def test_overlapping_detail_case_sets_are_error_even_when_range_counts_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write_matrix()
+            duplicate_b = B_DOCUMENT.replace(
+                detail_row("2", "mixed"),
+                detail_row("2", "mixed") + detail_row("2/2", "mixed"),
+            )
+            duplicate_b = duplicate_b.replace(
+                "| 0/1, 2 | 2 | 1（0/1） | 1（2） | 0（—） | 0（—） |",
+                "| 0/1, 2 | 3 | 1（0/1） | 2（2, 2/2） | 0（—） | 0（—） |",
+            ).replace(
+                "| **合計（物理行）** | **3** | **2** | **1** | **0** | **0** |",
+                "| **合計（物理行）** | **4** | **2** | **2** | **0** | **0** |",
+            ).replace(
+                "| **合計（論理ケース）** | **4** | **3** | **1** | **0** | **0** |",
+                "| **合計（論理ケース）** | **5** | **3** | **2** | **0** | **0** |",
+            )
+            repo.write("b-x.md", duplicate_b)
+            repo.write(
+                "README.md",
+                README_DOCUMENT.replace("| 5 | 0 | 3 | 0 | 8 |", "| 5 | 0 | 4 | 0 | 9 |"),
+            )
+
+            result = repo.check()
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("case set", result.stdout)
+
     def test_range_summary_buckets_must_partition_the_detail_rows(self) -> None:
         # Two detail rows with the same case number are covered by the bucket's
         # case set while leaving one physical row unaccounted for.
