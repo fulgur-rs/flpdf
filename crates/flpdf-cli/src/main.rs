@@ -3623,73 +3623,85 @@ fn main() {
     };
 
     if let Err(error) = result {
-        let _ = cli_logger().flush();
-        if let Some(exit_err) = error.downcast_ref::<CliRawExitError>() {
-            if !exit_err.message.is_empty() {
-                let mut line = format!("\n{}: ", progname()).into_bytes();
-                line.extend_from_slice(&exit_err.message);
-                line.push(b'\n');
-                emit_logger_error(line);
-            }
-            std::process::exit(exit_err.code.as_i32());
-        }
-        // If the error carries an explicit exit code (e.g. from run_check),
-        // honour it.  Unknown/generic errors fall back to exit 2 (qpdf
-        // convention for "error", unchanged from before this change).
-        if let Some(exit_err) = error.downcast_ref::<CliExitError>() {
-            // Only print a message when there is one; the caller may have
-            // already printed its own summary (e.g. run_check prints the qpdf
-            // "checking" block before returning exit 3 for warnings, and its
-            // exit-2 path passes an empty message because the error diagnostics
-            // were already printed in qpdf shape).
-            if !exit_err.message.is_empty() {
-                emit_logger_error(format!("\n{}: {}\n", progname(), exit_err.message));
-            }
-            std::process::exit(exit_err.code.as_i32());
-        }
-        if let Some(usage_error) = find_usage_error(error.as_ref()) {
-            usage_exit(usage_error);
-        }
-        if let Some(message) = find_raw_error_message(error.as_ref()) {
-            let mut line = progname().into_bytes();
-            line.extend_from_slice(b": ");
-            line.extend_from_slice(message);
+        exit_with_cli_error(error);
+    }
+}
+
+/// Render a fatal CLI error in qpdf's `realmain` shape and exit.
+///
+/// qpdf catches every fatal job failure in one place (`qpdf/qpdf.cc:36-40`),
+/// which prints `whoami: e.what()` and returns `EXIT_ERROR`. Routing every
+/// fatal CLI error through a single renderer keeps a failure raised while
+/// configuring the writer -- the `--copy-encryption` donor open reached from
+/// `QPDFJob::setWriterOptions` (`libqpdf/QPDFJob.cc:2891-2899`) -- framed
+/// exactly like a primary-input failure, as it is in qpdf.
+fn exit_with_cli_error(error: Box<dyn std::error::Error>) -> ! {
+    let _ = cli_logger().flush();
+    if let Some(exit_err) = error.downcast_ref::<CliRawExitError>() {
+        if !exit_err.message.is_empty() {
+            let mut line = format!("\n{}: ", progname()).into_bytes();
+            line.extend_from_slice(&exit_err.message);
             line.push(b'\n');
             emit_logger_error(line);
-            std::process::exit(2);
         }
-        if let Some(flpdf::Error::FileIo {
-            operation: "open",
-            path,
-            source,
-        }) = error.downcast_ref::<flpdf::Error>()
-        {
-            let mut line = progname().into_bytes();
-            line.extend_from_slice(b": open ");
-            line.extend_from_slice(&path_description(path));
-            line.extend_from_slice(b": ");
-            line.extend_from_slice(qpdf_open_io_error_message(source).as_bytes());
-            line.push(b'\n');
-            emit_logger_error(line);
-            std::process::exit(2);
+        std::process::exit(exit_err.code.as_i32());
+    }
+    // If the error carries an explicit exit code (e.g. from run_check),
+    // honour it.  Unknown/generic errors fall back to exit 2 (qpdf
+    // convention for "error", unchanged from before this change).
+    if let Some(exit_err) = error.downcast_ref::<CliExitError>() {
+        // Only print a message when there is one; the caller may have
+        // already printed its own summary (e.g. run_check prints the qpdf
+        // "checking" block before returning exit 3 for warnings, and its
+        // exit-2 path passes an empty message because the error diagnostics
+        // were already printed in qpdf shape).
+        if !exit_err.message.is_empty() {
+            emit_logger_error(format!("\n{}: {}\n", progname(), exit_err.message));
         }
-        if let Some(path_error) = error.downcast_ref::<CliPathError>() {
-            let mut line = progname().into_bytes();
-            line.extend_from_slice(b": ");
-            if let Some(operation) = path_error.operation {
-                line.extend_from_slice(operation.as_bytes());
-                line.push(b' ');
-            }
-            line.extend_from_slice(&path_error.path);
-            line.extend_from_slice(b": ");
-            line.extend_from_slice(path_error.message.as_bytes());
-            line.push(b'\n');
-            emit_logger_error(line);
-            std::process::exit(2);
-        }
-        emit_logger_error(format!("{}: {error}\n", progname()));
+        std::process::exit(exit_err.code.as_i32());
+    }
+    if let Some(usage_error) = find_usage_error(error.as_ref()) {
+        usage_exit(usage_error);
+    }
+    if let Some(message) = find_raw_error_message(error.as_ref()) {
+        let mut line = progname().into_bytes();
+        line.extend_from_slice(b": ");
+        line.extend_from_slice(message);
+        line.push(b'\n');
+        emit_logger_error(line);
         std::process::exit(2);
     }
+    if let Some(flpdf::Error::FileIo {
+        operation: "open",
+        path,
+        source,
+    }) = error.downcast_ref::<flpdf::Error>()
+    {
+        let mut line = progname().into_bytes();
+        line.extend_from_slice(b": open ");
+        line.extend_from_slice(&path_description(path));
+        line.extend_from_slice(b": ");
+        line.extend_from_slice(qpdf_open_io_error_message(source).as_bytes());
+        line.push(b'\n');
+        emit_logger_error(line);
+        std::process::exit(2);
+    }
+    if let Some(path_error) = error.downcast_ref::<CliPathError>() {
+        let mut line = progname().into_bytes();
+        line.extend_from_slice(b": ");
+        if let Some(operation) = path_error.operation {
+            line.extend_from_slice(operation.as_bytes());
+            line.push(b' ');
+        }
+        line.extend_from_slice(&path_error.path);
+        line.extend_from_slice(b": ");
+        line.extend_from_slice(path_error.message.as_bytes());
+        line.push(b'\n');
+        emit_logger_error(line);
+        std::process::exit(2);
+    }
+    emit_logger_error(format!("{}: {error}\n", progname()));
+    std::process::exit(2);
 }
 
 fn find_usage_error<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a UsageError> {
@@ -5314,11 +5326,12 @@ struct EncryptionCliOptions<'a> {
 }
 
 /// Wire the final qpdf encryption mode onto `options`, shared by the
-/// top-level and `rewrite` surfaces. A `--encrypt` parse error or a
-/// `--copy-encryption`
-/// donor-open/validation error prints a `flpdf:`-prefixed diagnostic and exits
-/// 2, matching the surrounding option parsers. qpdf's Config setters clear
-/// the other modes, so only the last mode in argv order is applied.
+/// top-level and `rewrite` surfaces. A `--encrypt` parse error prints a
+/// `progname:`-prefixed diagnostic and exits 2, matching the surrounding
+/// option parsers; a `--copy-encryption` donor-open/validation failure goes
+/// through [`exit_with_cli_error`] so it is framed exactly like the
+/// primary-input failure it is in qpdf. qpdf's Config setters clear the other
+/// modes, so only the last mode in argv order is applied.
 fn apply_encryption_options(options: &mut WriterOptions, inputs: EncryptionCliOptions<'_>) {
     let EncryptionCliOptions {
         encrypt,
@@ -5394,10 +5407,7 @@ fn apply_encryption_options(options: &mut WriterOptions, inputs: EncryptionCliOp
                             options.preserve_encryption = false;
                         }
                     }
-                    Err(e) => {
-                        emit_logger_error(format!("flpdf: {e}\n"));
-                        std::process::exit(2);
-                    }
+                    Err(error) => exit_with_cli_error(error),
                 }
             }
         }
@@ -5410,7 +5420,8 @@ fn apply_encryption_options(options: &mut WriterOptions, inputs: EncryptionCliOp
 /// (`--copy-encryption`).
 ///
 /// Returns the donor's [`CopyEncryptionSource`], or `None` for qpdf's explicit
-/// plaintext-donor no-op, or an error string suitable for printing to stderr
+/// plaintext-donor no-op, or the open failure in the same shape the
+/// primary-input open boundary produces, for [`exit_with_cli_error`] to render
 /// before `exit(2)`.
 ///
 /// The accepted Standard-handler matrix is V=1/V=2 RC4, V=4 canonicalized to
@@ -5421,25 +5432,27 @@ fn build_copy_encryption_source(
     password_args: &PasswordArgs,
     suppress_warnings: bool,
 ) -> CliResult<Option<CopyEncryptionSource>> {
-    let file =
-        File::open(path).map_err(|e| format!("--copy-encryption: cannot open {:?}: {e}", path))?;
+    // qpdf opens the donor through the same `QPDFJob::processFile` boundary as
+    // the primary input (`libqpdf/QPDFJob.cc:2891-2899` vs `:434`), so a donor
+    // failure carries no option-specific framing: it reaches `realmain`'s one
+    // `catch` as `whoami: e.what()` exactly like a primary-input failure.
+    let file = File::open(path).map_err(|error| open_error_with_file(path, error.into()))?;
     let reader = BufReader::new(file);
 
     let mut donor_password = password_args.clone();
     donor_password.set_password_bytes(password.map(ToOwned::to_owned));
     donor_password.password_file = None;
-    let opts = pdf_open_options(true, &donor_password)
-        .map_err(|error| format!("--copy-encryption: failed to configure {:?}: {error}", path))?;
+    let opts = pdf_open_options(true, &donor_password)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(suppress_warnings);
     let mut donor = job
         .open_with_description(reader, path_description(path), opts)
-        .map_err(|e| format!("--copy-encryption: failed to open {:?}: {e}", path))?;
+        .map_err(|error| error_with_file(path, actionable_password_error(error)))?;
     donor
         .root_handle()
-        .map_err(|e| format!("--copy-encryption: failed to open {:?}: {e}", path))?;
+        .map_err(|error| error_with_file(path, actionable_password_error(error)))?;
 
     // Validate the donor is encrypted using qpdf's individual encryption
     // projections rather than a crate-specific aggregate information object.
