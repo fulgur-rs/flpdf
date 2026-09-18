@@ -6221,6 +6221,121 @@ mod tests {
     }
 
     #[test]
+    fn job_output_writer_batches_fragments_until_the_buffer_is_full() {
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut writer = JobOutputWriter::new(PipelineHandle::new(RecordingInfoSink {
+            bytes: std::sync::Arc::clone(&bytes),
+        }));
+
+        std::io::Write::write_all(&mut writer, b"first").unwrap();
+        std::io::Write::write_all(&mut writer, b" second").unwrap();
+        assert!(
+            bytes.lock().unwrap().is_empty(),
+            "small fragments wait for the buffer"
+        );
+
+        std::io::Write::flush(&mut writer).unwrap();
+        assert_eq!(bytes.lock().unwrap().as_slice(), b"first second");
+    }
+
+    #[test]
+    fn job_output_writer_passes_oversized_fragments_straight_through() {
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut writer = JobOutputWriter::new(PipelineHandle::new(RecordingInfoSink {
+            bytes: std::sync::Arc::clone(&bytes),
+        }));
+        let payload = vec![b'x'; JOB_OUTPUT_BUFFER_CAPACITY + 1];
+
+        std::io::Write::write_all(&mut writer, b"prefix").unwrap();
+        std::io::Write::write_all(&mut writer, &payload).unwrap();
+
+        let recorded = bytes.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            b"prefix".len() + payload.len(),
+            "a fragment larger than the buffer is written without being copied into it"
+        );
+        assert!(recorded.starts_with(b"prefix"));
+        std::io::Write::flush(&mut writer).unwrap();
+        assert_eq!(bytes.lock().unwrap().len(), recorded.len());
+    }
+
+    #[test]
+    fn json_config_selectors_follow_qpdf_json_output_defaults() {
+        let mut job = QPDFJob::new();
+        {
+            let mut configuration = job.config();
+            configuration.json_key(JsonKey::Pages);
+            configuration.json_output(2);
+            configuration.json_object("trailer");
+        }
+
+        assert_eq!(job.configuration.json_version, Some(2));
+        assert!(job.configuration.json_output);
+        assert_eq!(
+            job.configuration.json_keys,
+            vec![JsonKey::Pages, JsonKey::Qpdf],
+            "--json-output adds the qpdf key once, like qpdf's std::set"
+        );
+        assert_eq!(job.configuration.json_objects, vec!["trailer".to_owned()]);
+        assert_eq!(job.configuration.json_stream_data, JsonStreamData::Inline);
+        assert_eq!(
+            job.configuration.json_decode_level,
+            crate::writer::DecodeLevel::None
+        );
+
+        // Re-adding a key qpdf already selected leaves one entry behind.
+        job.config().json_key(JsonKey::Qpdf);
+        assert_eq!(
+            job.configuration.json_keys,
+            vec![JsonKey::Pages, JsonKey::Qpdf]
+        );
+    }
+
+    #[test]
+    fn explicit_json_selectors_survive_the_json_output_defaults() {
+        let mut job = QPDFJob::new();
+        {
+            let mut configuration = job.config();
+            configuration.json_stream_data(JsonStreamData::None);
+            configuration.decode_level(crate::writer::DecodeLevel::All);
+            configuration.json_stream_prefix(b"side".to_vec());
+            configuration.test_json_schema();
+            configuration.json_output(2);
+        }
+
+        assert_eq!(
+            job.configuration.json_stream_data,
+            JsonStreamData::None,
+            "an explicit --json-stream-data keeps --json-output from selecting inline"
+        );
+        assert_eq!(
+            job.configuration.json_decode_level,
+            crate::writer::DecodeLevel::All,
+            "an explicit --decode-level keeps --json-output from selecting none"
+        );
+        assert_eq!(
+            job.configuration.json_stream_prefix.as_deref(),
+            Some(b"side".as_slice())
+        );
+        assert!(job.configuration.test_json_schema);
+    }
+
+    #[test]
+    fn json_selector_records_the_requested_version() {
+        let mut job = QPDFJob::new();
+        job.config().json(1);
+
+        assert_eq!(job.configuration.json_version, Some(1));
+        assert!(!job.configuration.json_output);
+        assert_eq!(
+            job.configuration.json_stream_data,
+            JsonStreamData::None,
+            "plain --json keeps the configuration's own stream-data default"
+        );
+    }
+
+    #[test]
     fn write_qpdf_reports_verbose_auto_password_conversion() {
         let tempdir = tempfile::tempdir().expect("temporary output directory");
         let output = tempdir.path().join("output.pdf");

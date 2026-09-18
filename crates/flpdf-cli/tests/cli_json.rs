@@ -2411,6 +2411,85 @@ fn json_stream_data_inline_holds_decoded_content() {
 }
 
 #[test]
+fn json_output_rejects_version_1_like_qpdf() {
+    // qpdf's `--json-output` requires JSON version 2; version 1 has no
+    // qpdf-output schema (`QPDFJob_config.cc:312-326`).
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let directory = tempfile::tempdir().unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .args([
+            "--json-output=1",
+            input.path().to_str().unwrap(),
+            "out.json",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(
+        !directory.path().join("out.json").exists(),
+        "the destination must not be created for a rejected configuration"
+    );
+
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    let qpdf_directory = tempfile::tempdir().unwrap();
+    let expected = ShellCommand::new("qpdf")
+        .current_dir(qpdf_directory.path())
+        .args([
+            "--json-output=1",
+            input.path().to_str().unwrap(),
+            "out.json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(expected.status.code(), Some(2));
+    assert!(expected.stdout.is_empty());
+}
+
+#[test]
+fn json_decode_level_reaches_the_inline_stream_payload() {
+    // `--decode-level` feeds the job's JSON consumer, so an inline payload is
+    // decoded at the requested level rather than at the `--json` default.
+    let content = b"BT /F1 24 Tf 1 0 0 1 100 700 Tm (Decoded inline payload) Tj ET";
+    let input = write_temp_pdf(&one_page_pdf_with_flate_stream(content));
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--json",
+            "--json-stream-data=inline",
+            "--decode-level=all",
+            input.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(flpdf.status.success());
+    assert!(String::from_utf8_lossy(&flpdf.stdout).contains(&base64_encode(content)));
+
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    let expected = ShellCommand::new("qpdf")
+        .args([
+            "--json",
+            "--json-stream-data=inline",
+            "--decode-level=all",
+            input.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(expected.status.code(), flpdf.status.code());
+    assert_eq!(expected.stdout, flpdf.stdout);
+}
+
+#[test]
 fn json_output_pages_selection_rebuilds_the_live_page_tree() {
     let input = write_temp_pdf(&duplicate_page_inherited_pdf());
     let directory = tempfile::tempdir().unwrap();
