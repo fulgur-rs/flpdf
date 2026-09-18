@@ -471,7 +471,7 @@ C10/C11 の runtime `registerStreamFilter` は、built-in lookupと同じregistr
 | canonical | 41 | C1, C2, C3, C4, C5, C6, C7, C8, C9, C10, C11, C12, C13, C14, C15, C16, C17, C18, C20, C21, C22, C24, C25, C26, C27, C28, C29, C30, C31, C32, C33, C34, C35, C36, C37, C38, C39, C40, C41, C42, C43 |
 | mixed | 1 | C44 |
 | bridge | 0 | — |
-| unknown | 0 | なし（C42 の pipe-side EOL subtraction は `flpdf-zvjf` と `flpdf-hj7v` で qpdf parity として解決） |
+| unknown | 0 | — |
 
 2026-09-18（`flpdf-8od1h`）で C22 の plain 側早期 return を撤去し `canonical` へ
 再分類した。**ただし cutover はこの撤去ではない**（2026-09-19 訂正）——`canonical_stream_will_be_refiltered_with_policy` の production 呼び出し元は
