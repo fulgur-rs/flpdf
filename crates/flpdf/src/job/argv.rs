@@ -1405,10 +1405,29 @@ impl AttachmentState {
     }
 
     fn unknown(&self, argument: &[u8]) -> UsageError {
-        let mut message = b"--add-attachment: unknown sub-flag or unexpected token ".to_vec();
-        message.extend_from_slice(argument);
-        UsageError::new(message)
+        qpdf_subparser_unrecognized_argument(argument, b"attachment")
     }
+}
+
+/// Build qpdf's generic sub-parser rejection for a token the active option
+/// table does not recognize (`QPDFArgParser::parseArgs`,
+/// `libqpdf/QPDFArgParser.cc:498-500`): `unrecognized argument <token> (<table
+/// name> options must be terminated with --)`, where `<token>` is the raw
+/// argv token exactly as given (qpdf captures `o_arg` before stripping
+/// leading dashes or splitting on `=`) and `<table name>` is the sub-parser's
+/// name as registered by `QPDFArgParser::registerOptionTable`
+/// (`libqpdf/qpdf/auto_job_init.hh:174,183`: `"attachment"` for
+/// `--add-attachment`, `"copy attachment"` for `--copy-attachments-from`).
+/// This is not an attachment-specific message; every qpdf sub-parser (pages,
+/// underlay/overlay, encryption, ...) shares it, parameterized only by table
+/// name.
+fn qpdf_subparser_unrecognized_argument(argument: &[u8], table: &[u8]) -> UsageError {
+    let mut message = b"unrecognized argument ".to_vec();
+    message.extend_from_slice(argument);
+    message.extend_from_slice(b" (");
+    message.extend_from_slice(table);
+    message.extend_from_slice(b" options must be terminated with --)");
+    UsageError::new(message)
 }
 
 fn parse_pdf_date(value: &[u8]) -> Result<Vec<u8>> {
@@ -1473,10 +1492,7 @@ impl CopyAttachmentState {
     }
 
     fn unknown(&self, argument: &[u8]) -> UsageError {
-        let mut message =
-            b"--copy-attachments-from: unknown sub-flag or unexpected token ".to_vec();
-        message.extend_from_slice(argument);
-        UsageError::new(message)
+        qpdf_subparser_unrecognized_argument(argument, b"copy attachment")
     }
 }
 
@@ -2599,6 +2615,76 @@ mod tests {
         assert_eq!(
             version_output(b"custom-\xff"),
             b"custom-\xff version 11.9.0\nRun custom-\xff --copyright to see copyright and license information.\n"
+        );
+    }
+
+    #[test]
+    fn add_attachment_rejects_an_unrecognized_dashed_token_with_qpdf_wording() {
+        // Confirmed live: `qpdf in.pdf --add-attachment=x --overlay -- out.pdf`
+        // prints exactly this message (flpdf-3yn9.48.193). `--overlay` is not
+        // a registered `--add-attachment` sub-flag, and unlike a bare
+        // positional token it is not accepted as an opaque attachment
+        // filename either -- qpdf's generic sub-parser rejects any dashed
+        // token that isn't a known sub-flag name.
+        let mut job = QPDFJob::new();
+        let error = job
+            .initialize_from_raw_argv(&[
+                b"qpdf".to_vec(),
+                b"in.pdf".to_vec(),
+                b"--add-attachment=x".to_vec(),
+                b"--overlay".to_vec(),
+                b"--".to_vec(),
+                b"out.pdf".to_vec(),
+            ])
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unrecognized argument --overlay (attachment options must be terminated with --)"
+        );
+    }
+
+    #[test]
+    fn add_attachment_rejects_an_unrecognized_named_sub_flag_with_the_full_token() {
+        // Confirmed live: `qpdf in.pdf --add-attachment=x --bogus=1 -- out.pdf`
+        // prints the *complete* original token, `=1` included -- qpdf
+        // captures `o_arg` before splitting on `=` (flpdf-3yn9.48.193).
+        let mut job = QPDFJob::new();
+        let error = job
+            .initialize_from_raw_argv(&[
+                b"qpdf".to_vec(),
+                b"in.pdf".to_vec(),
+                b"--add-attachment=x".to_vec(),
+                b"--bogus=1".to_vec(),
+                b"--".to_vec(),
+                b"out.pdf".to_vec(),
+            ])
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unrecognized argument --bogus=1 (attachment options must be terminated with --)"
+        );
+    }
+
+    #[test]
+    fn copy_attachments_from_rejects_an_unrecognized_dashed_token_with_qpdf_wording() {
+        // Confirmed live: `qpdf in.pdf --copy-attachments-from=x --overlay --
+        // out.pdf` prints this message, with "copy attachment" (not
+        // "attachment") naming the sub-parser table
+        // (`libqpdf/qpdf/auto_job_init.hh:183`, flpdf-3yn9.48.193).
+        let mut job = QPDFJob::new();
+        let error = job
+            .initialize_from_raw_argv(&[
+                b"qpdf".to_vec(),
+                b"in.pdf".to_vec(),
+                b"--copy-attachments-from=x".to_vec(),
+                b"--overlay".to_vec(),
+                b"--".to_vec(),
+                b"out.pdf".to_vec(),
+            ])
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unrecognized argument --overlay (copy attachment options must be terminated with --)"
         );
     }
 }
