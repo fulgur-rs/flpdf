@@ -326,6 +326,13 @@ fn fully_qualified_name_terminates_on_a_reciprocal_direct_parent_cycle() {
 
     let mut field = FormFieldObjectHelper::new(field_ref, &mut pdf);
     let error = field
+        .get_top_level_field_handle()
+        .expect_err("the canonical top-level walk must bound direct cycles");
+    assert!(matches!(error, Error::Unsupported(ref message)
+        if message.contains("/Parent cycle of direct dictionaries")));
+
+    let mut field = FormFieldObjectHelper::new(field_ref, &mut pdf);
+    let error = field
         .fully_qualified_name()
         .expect_err("a reciprocal direct /Parent cycle must not loop forever");
     assert!(matches!(error, Error::Unsupported(ref message)
@@ -820,6 +827,11 @@ fn get_top_level_field_stops_when_a_parent_chain_returns_to_a_seen_handle() {
             .unwrap(),
         (ObjectRef::new(10, 0), true)
     );
+    let (top, is_different) = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .get_top_level_field_handle()
+        .unwrap();
+    assert_eq!(top.object_ref(), Some(ObjectRef::new(10, 0)));
+    assert!(is_different);
 }
 
 #[test]
