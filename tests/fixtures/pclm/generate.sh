@@ -75,5 +75,14 @@ done
 "$workdir/oracle" "$here/mini-pclm-ext-indirect-in.pdf" \
     "$here/mini-pclm-ext-indirect-objstm.pdf" pclm objstm
 
+# Two shapes of a /Kids leaf that is not a dictionary. QPDF::getAllPagesInternal
+# dispatches on kid.hasKey("/Kids"), not on /Type, so qpdf keeps the integer in
+# the page list and enqueueObjectsPCLm numbers it as the first PCLm object. The
+# -kid- input puts the integer directly in /Kids (qpdf promotes it to an
+# indirect page object); the -page- input puts it in the object /Kids already
+# points at, so the leaf is indirect from the start.
 "$workdir/oracle" "$here/mini-pclm-nondict-kid-in.pdf" \
     "$here/mini-pclm-nondict-kid-out.pdf" pclm
+
+"$workdir/oracle" "$here/mini-pclm-nondict-page-in.pdf" \
+    "$here/mini-pclm-nondict-page-out.pdf" pclm

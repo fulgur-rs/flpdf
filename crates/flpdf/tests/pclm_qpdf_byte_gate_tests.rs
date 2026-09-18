@@ -17,6 +17,8 @@ const MINI_EXT_INDIRECT_INPUT: &[u8] =
     include_bytes!("../../../tests/fixtures/pclm/mini-pclm-ext-indirect-in.pdf");
 const MINI_NONDICT_KID_INPUT: &[u8] =
     include_bytes!("../../../tests/fixtures/pclm/mini-pclm-nondict-kid-in.pdf");
+const MINI_NONDICT_PAGE_INPUT: &[u8] =
+    include_bytes!("../../../tests/fixtures/pclm/mini-pclm-nondict-page-in.pdf");
 
 fn write_pclm(
     input: &[u8],
@@ -158,5 +160,23 @@ fn pclm_non_dictionary_kid_matches_qpdf_11_9() {
         &actual,
         include_bytes!("../../../tests/fixtures/pclm/mini-pclm-nondict-kid-out.pdf"),
         "PCLm non-dictionary page-tree kid",
+    );
+}
+
+/// A `/Kids` leaf that is not a dictionary stays in the page list.
+///
+/// `QPDF::getAllPagesInternal` classifies a kid by `kid.hasKey("/Kids")`
+/// (`libqpdf/QPDF_pages.cc:100-103`), so an integer leaf takes the leaf arm and
+/// is pushed into `all_pages` unchanged — the `/MediaBox` default and the
+/// `/Type` override it attempts are both "ignoring key replacement request"
+/// no-ops on a non-dictionary receiver. `enqueueObjectsPCLm` then numbers it
+/// as the first PCLm object (`1 0 obj\n42\nendobj`).
+#[test]
+fn pclm_non_dictionary_page_leaf_matches_qpdf_11_9() {
+    let actual = write_pclm(MINI_NONDICT_PAGE_INPUT, |_| {});
+    assert_matches_golden(
+        &actual,
+        include_bytes!("../../../tests/fixtures/pclm/mini-pclm-nondict-page-out.pdf"),
+        "PCLm non-dictionary page leaf",
     );
 }
