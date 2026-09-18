@@ -5494,6 +5494,40 @@ impl QPDFJobConfig<'_> {
         self
     }
 
+    /// Enable qpdf's `keepInlineImages` option in the shared job configuration.
+    pub fn keep_inline_images(&mut self) -> &mut Self {
+        self.job.configuration.image_options.keep_inline_images = true;
+        self
+    }
+
+    /// Set qpdf's unsigned `iiMinBytes` threshold at the configuration boundary.
+    pub fn ii_min_bytes(&mut self, value: impl AsRef<[u8]>) -> Result<&mut Self> {
+        self.job.configuration.image_options.inline_min_bytes =
+            parse_qpdf_collate_uint(value.as_ref())?;
+        Ok(self)
+    }
+
+    /// Set qpdf's unsigned `oiMinWidth` threshold at the configuration boundary.
+    pub fn oi_min_width(&mut self, value: impl AsRef<[u8]>) -> Result<&mut Self> {
+        self.job.configuration.image_options.min_width =
+            parse_qpdf_collate_uint(value.as_ref())? as u32;
+        Ok(self)
+    }
+
+    /// Set qpdf's unsigned `oiMinHeight` threshold at the configuration boundary.
+    pub fn oi_min_height(&mut self, value: impl AsRef<[u8]>) -> Result<&mut Self> {
+        self.job.configuration.image_options.min_height =
+            parse_qpdf_collate_uint(value.as_ref())? as u32;
+        Ok(self)
+    }
+
+    /// Set qpdf's unsigned `oiMinArea` threshold at the configuration boundary.
+    pub fn oi_min_area(&mut self, value: impl AsRef<[u8]>) -> Result<&mut Self> {
+        self.job.configuration.image_options.min_area =
+            parse_qpdf_collate_uint(value.as_ref())? as u32;
+        Ok(self)
+    }
+
     /// Queue an overlay source for qpdf's create-stage underlay/overlay pass.
     pub fn overlay(
         &mut self,
@@ -5701,6 +5735,36 @@ mod tests {
         job.config().verbose();
 
         assert!(job.verbose());
+    }
+
+    #[test]
+    fn config_image_setters_layer_individual_options_on_partial_job_json_state() {
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(
+            r#"{"keepInlineImages":"","iiMinBytes":"7","oiMinWidth":"8"}"#,
+        )
+        .expect("job JSON image options parse");
+
+        {
+            let mut config = job.config();
+            config.keep_inline_images();
+            config.ii_min_bytes("+42").expect("qpdf unsigned threshold");
+            config.oi_min_width("43").expect("qpdf width threshold");
+            config.oi_min_height("44").expect("qpdf height threshold");
+            config.oi_min_area("45").expect("qpdf area threshold");
+        }
+
+        assert!(job.configuration.image_options.keep_inline_images);
+        assert_eq!(job.configuration.image_options.inline_min_bytes, 42);
+        assert_eq!(job.configuration.image_options.min_width, 43);
+        assert_eq!(job.configuration.image_options.min_height, 44);
+        assert_eq!(job.configuration.image_options.min_area, 45);
+
+        let mut invalid = QPDFJob::new();
+        assert!(matches!(
+            invalid.config().ii_min_bytes("-1"),
+            Err(Error::System(message)) if message.contains("underflow")
+        ));
     }
 
     #[test]

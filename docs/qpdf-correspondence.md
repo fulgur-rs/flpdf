@@ -2276,6 +2276,16 @@ code）は変換結果を反映する。実測でも
 `qpdf --show-npages --optimize-images qtest/qpdf/bad-data.pdf` は変換由来の
 warning を出して exit 3 になる（変換なしなら exit 0）。
 
+`flpdf-uwu7.1` では、この同じ Config state をjob-json後のargv layeringから
+変更できるよう、`QPDFJobConfig::keep_inline_images` と
+`ii_min_bytes`/`oi_min_width`/`oi_min_height`/`oi_min_area` を個別のmutation
+boundaryとして公開した。各thresholdは `QUtil::string_to_uint` 相当の
+`parse_qpdf_collate_uint`を通り、partial JSONで既に設定された他のimage stateを
+保持する（`QPDFJob_config.cc:176-180,232-235,422-447,774-784`）。既存の
+`externalize_inline_images(min_bytes)` と `optimize_images(options)` は通常の
+configuration consumerの合成入口として残り、別のargv parserやimage pipelineは
+追加しない。
+
 `flpdf-w2fk` で、top-level の inspection route（`run_check` / `run_show_*` /
 `--json` 経路）へ image option を配線し、report の前に変換を実行するようにした。
 ただし `--show-encryption` は例外で、認証に失敗した入力では変換を行わない —

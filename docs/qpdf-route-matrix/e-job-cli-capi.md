@@ -1162,7 +1162,8 @@ check-linearizationをoccurrence順に同じ `QPDFJob`へ適用する。partial 
 `cli_job_json.rs` の5つのorder regressionと、lifecycleの
 `partial_job_json_preserves_preconfigured_qpdf_state`が qpdf 11.9.0 の
 status/stdout/stderrおよびConfig layeringを固定する。image transformation setter
-の未接続は別issue `flpdf-uwu7.1`の責務であり、このsliceには含めない。
+のjob-json後argv layering実行経路は親issue `flpdf-uwu7`に残るが、
+`flpdf-uwu7.1`で`QPDFJobConfig`のkeep/threshold mutation boundaryは追加済み。
 
 ### E-12 follow-up: job-json selector usage attribution (`flpdf-n9q36`, 2026-09-16)
 
