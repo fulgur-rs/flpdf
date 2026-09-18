@@ -3315,6 +3315,57 @@ fn job_json_file_rejects_same_input_and_output_without_truncating_input() {
     assert_eq!(fs::read(&input).unwrap(), before);
 }
 
+/// `checkConfiguration` assigns `-` as the JSON destination when no output
+/// file was given (`libqpdf/QPDFJob.cc:582-586`) and then compares that name
+/// with the input through `QUtil::same_file` (`:627-631`). The comparison is
+/// an ordinary `stat` of both names (`libqpdf/QUtil.cc:598-607`), so a working
+/// directory that really does contain a file called `-` makes the implicit
+/// destination alias an input of the same name, and the job is rejected before
+/// anything is written.
+#[test]
+fn job_json_implicit_json_destination_rejects_an_input_named_dash() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    fs::copy(fixture, directory.path().join("-")).unwrap();
+    fs::write(
+        directory.path().join("json.json"),
+        br#"{"inputFile":"-","json":"2"}"#,
+    )
+    .unwrap();
+
+    let assertion = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=json.json")
+        .assert()
+        .code(2);
+    let stderr = String::from_utf8(assertion.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("input file and output file are the same;"),
+        "unexpected diagnostic: {stderr:?}"
+    );
+
+    if !qpdf_available() {
+        return;
+    }
+    let expected = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg("--job-json-file=json.json")
+        .output()
+        .unwrap();
+    assert_eq!(
+        expected.status.code(),
+        Some(2),
+        "qpdf 11.9.0 must reject the aliased implicit JSON destination too"
+    );
+    assert!(
+        String::from_utf8_lossy(&expected.stderr)
+            .contains("input file and output file are the same;"),
+        "qpdf 11.9.0 no longer reports the pinned diagnostic"
+    );
+}
+
 #[test]
 fn job_json_file_dash_output_is_written_to_stdout() {
     let directory = tempfile::tempdir().unwrap();
