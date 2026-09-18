@@ -33,44 +33,6 @@ use crate::{Error, Result};
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Legacy structured endpoint vocabulary for a page-range entry.
-///
-/// The canonical [`PageRange`] route now retains the raw qpdf expression and
-/// delegates both parsing and resolution to [`crate::qutil::parse_numrange`].
-/// This public vocabulary remains as a separate visibility/API cleanup surface.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Endpoint {
-    /// Absolute 1-based page number. Must be ≥ 1.
-    Num(u32),
-    /// The last page (`z`).
-    Z,
-    /// N-th page from the end (`rN`); `r1` = last, `r2` = second-to-last.
-    /// Must be ≥ 1.
-    FromEnd(u32),
-}
-
-/// Legacy structured representation of a final-position filter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Parity {
-    /// Keep positions 1, 3, 5, … (`:odd`).
-    Odd,
-    /// Keep positions 2, 4, 6, … (`:even`).
-    Even,
-}
-
-/// Legacy structured representation of one page-range group.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PageRangeEntry {
-    /// Whether this group excludes pages from the preceding positive group.
-    pub exclude: bool,
-    /// Start of the range (or the single page).
-    pub start: Endpoint,
-    /// End of the range, if this is a range rather than a single page.
-    pub end: Option<Endpoint>,
-    /// Optional final parity suffix retained on the last entry.
-    pub parity: Option<Parity>,
-}
-
 /// A qpdf page-range expression, ready to be resolved against a page count.
 ///
 /// Constructed via [`PageRange::parse_numrange`].

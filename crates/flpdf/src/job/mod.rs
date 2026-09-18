@@ -58,7 +58,7 @@ pub use overlay::{
     OverlayVerboseSource,
 };
 pub use page_merge::{merge_documents, MergeInput};
-pub use page_range::{Endpoint, PageRange, PageRangeEntry, Parity};
+pub use page_range::PageRange;
 pub use page_specs::{copy_duplicate_page_annotations, PageSpecInput, PageSpecJobOutput};
 pub use resource_pruning::RemoveUnreferencedResources;
 pub use rotate::flatten_rotation_on_pages;
