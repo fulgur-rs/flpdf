@@ -22,7 +22,9 @@ use crate::writer::{
     serialize, CompressStreams, ObjectWriterEmission, StreamDictionaryOptions, PCLM_HEADER_MARKER,
     QPDF_BINARY_MARKER,
 };
-use crate::{ObjectHandle, ObjectRef, PageDocumentHelper, Pdf};
+#[cfg(test)]
+use crate::PageDocumentHelper;
+use crate::{ObjectHandle, ObjectRef, Pdf};
 
 /// The qpdf standard-writer queue for plain Disable, Preserve, Generate, and
 /// QDF output. [`LiveQueue::register_object_streams`] installs any setup-time
@@ -535,6 +537,8 @@ fn emit_live_body<R: Read + Seek + 'static>(
     object_streams: &[crate::writer::object_streams::ObjectStreamGroup],
     encryption_context: Option<&crate::writer::EncryptionContext>,
     content_container_refs: &BTreeSet<ObjectRef>,
+    page_sequences: BTreeMap<ObjectRef, usize>,
+    contents_sequences: BTreeMap<ObjectRef, usize>,
 ) -> crate::Result<LiveBodyOutput> {
     out.write_bytes(format!("%PDF-{version}\n").as_bytes())?;
     // `QPDFWriter::writeHeader` selects the PCLm version marker in place of
@@ -544,11 +548,6 @@ fn emit_live_body<R: Read + Seek + 'static>(
     } else {
         out.write_bytes(QPDF_BINARY_MARKER)?;
     }
-    let (page_sequences, contents_sequences) = if options.qdf || options.content_normalization {
-        qdf_page_context(pdf)?
-    } else {
-        (BTreeMap::new(), BTreeMap::new())
-    };
     // qpdf initializes page/content-stream state before generating ObjStm
     // membership and before enqueueing any standard-writer seed
     // (`QPDFWriter.cc:2114-2140,2907-2925`). `getAllPages()` may repair the
@@ -639,6 +638,8 @@ pub(crate) fn emit_live<R: Read + Seek + 'static>(
     object_streams: &[crate::writer::object_streams::ObjectStreamGroup],
     encryption_context: Option<&crate::writer::EncryptionContext>,
     content_container_refs: &BTreeSet<ObjectRef>,
+    page_sequences: BTreeMap<ObjectRef, usize>,
+    contents_sequences: BTreeMap<ObjectRef, usize>,
 ) -> crate::Result<LiveBodyOutput> {
     emit_live_body(
         pdf,
@@ -651,9 +652,18 @@ pub(crate) fn emit_live<R: Read + Seek + 'static>(
         object_streams,
         encryption_context,
         content_container_refs,
+        page_sequences,
+        contents_sequences,
     )
 }
 
+/// Test-only re-derivation of the page/content sequence maps that
+/// [`crate::writer::SpecialStreams::page_and_contents_sequences`] now owns in
+/// production. Kept so existing unit tests that call [`emit_live`] directly
+/// (bypassing [`crate::writer::PdfWriter::write`]'s setup) can still exercise
+/// a populated map without duplicating the setup-time walk in production
+/// code; see D26 in `docs/qpdf-route-matrix/d-writer.md`.
+#[cfg(test)]
 fn qdf_page_context<R: Read + Seek>(
     pdf: &mut Pdf<R>,
 ) -> crate::Result<(BTreeMap<ObjectRef, usize>, BTreeMap<ObjectRef, usize>)> {
@@ -787,6 +797,10 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
 ) -> crate::Result<LiveBodyOutput> {
     validate_objstm_member_bodies(pdf, plan)?;
     let groups = planned_object_stream_groups(plan)?;
+    // This historical-plan adapter's one caller never sets qdf/content
+    // normalization, so it has no setup-owned `SpecialStreams` snapshot to
+    // read from (unlike `write_plain_live`); pass empty maps rather than
+    // add an untested re-derivation branch here.
     emit_live_body(
         pdf,
         out,
@@ -798,6 +812,8 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
         &groups,
         None,
         &BTreeSet::new(),
+        BTreeMap::new(),
+        BTreeMap::new(),
     )
 }
 
@@ -3647,6 +3663,11 @@ mod object_emitter_tests {
                 compress_streams: CompressStreams::No,
                 ..WriterOptions::default()
             };
+            let (page_sequences, contents_sequences) = if qdf {
+                qdf_page_context(&mut pdf)?
+            } else {
+                (BTreeMap::new(), BTreeMap::new())
+            };
             let mut output = Vec::new();
             crate::writer::output::with_buffer_sink(&mut output, |out| {
                 emit_live(
@@ -3660,6 +3681,8 @@ mod object_emitter_tests {
                     &[],
                     Some(&encryption_context()),
                     &BTreeSet::new(),
+                    page_sequences,
+                    contents_sequences,
                 )
             })
             .expect("encrypted live body");
@@ -3698,6 +3721,8 @@ mod object_emitter_tests {
                 &[],
                 Some(&encryption_context()),
                 &[root_source].into_iter().collect(),
+                BTreeMap::new(),
+                BTreeMap::new(),
             )
         })
         .expect("encrypted live content container");
@@ -3735,6 +3760,8 @@ mod object_emitter_tests {
                 &[],
                 None,
                 &[root_source].into_iter().collect(),
+                BTreeMap::new(),
+                BTreeMap::new(),
             )
         })?;
 
@@ -3762,6 +3789,7 @@ mod object_emitter_tests {
             ..WriterOptions::default()
         };
         let mut output = Vec::new();
+        let (page_sequences, contents_sequences) = qdf_page_context(&mut pdf)?;
 
         crate::writer::output::with_buffer_sink(&mut output, |out| {
             emit_live(
@@ -3775,12 +3803,62 @@ mod object_emitter_tests {
                 &[],
                 None,
                 &BTreeSet::new(),
+                page_sequences,
+                contents_sequences,
             )
         })?;
 
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains("/PlainObject"));
         assert!(text.contains("qdf-object-secret"));
+        Ok(())
+    }
+
+    /// `initialize_special_streams` computes `page_seq`/`contents_seq` once at
+    /// writer setup (`QPDFWriter.cc:1774-1781,1914-1931`); the plain live QDF
+    /// route must read that snapshot rather than re-deriving it by walking
+    /// the page tree again at emission time (D26,
+    /// `docs/qpdf-route-matrix/d-writer.md`). Supply a sequence number no
+    /// page-tree walk of this one-page fixture could ever produce, so the
+    /// assertion only passes if the caller-supplied snapshot is what actually
+    /// reaches the marker text.
+    #[test]
+    fn qdf_live_body_reads_the_caller_supplied_page_sequence_snapshot() -> crate::Result<()> {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        ))?; // cov:ignore: LLVM attributes the executed multiline Pdf::open call terminator to an unhit continuation line.
+        let root_source = pdf.root_ref();
+        let page_ref = PageDocumentHelper::new(&mut pdf).get_all_pages()?[0];
+        let options = WriterOptions {
+            qdf: true,
+            compress_streams: CompressStreams::No,
+            ..WriterOptions::default()
+        };
+        let page_sequences: BTreeMap<ObjectRef, usize> = [(page_ref, 99)].into_iter().collect();
+        let mut output = Vec::new();
+
+        crate::writer::output::with_buffer_sink(&mut output, |out| {
+            emit_live(
+                &mut pdf,
+                out,
+                &options,
+                "1.4",
+                0,
+                root_source,
+                BTreeSet::new(),
+                &[],
+                None,
+                &BTreeSet::new(),
+                page_sequences,
+                BTreeMap::new(),
+            )
+        })?;
+
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("%% Page 99"),
+            "QDF page marker must reflect the caller-supplied snapshot, not a fresh page walk: {text}"
+        );
         Ok(())
     }
 
@@ -3815,6 +3893,8 @@ mod object_emitter_tests {
                 &[],
                 Some(&context),
                 &BTreeSet::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
             )
         })?;
 
@@ -3899,6 +3979,8 @@ mod object_emitter_tests {
                 &[],
                 None,
                 &BTreeSet::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
             )
         })?; // cov:ignore: LLVM attributes the live-body test call terminator to callback cleanup.
         assert!(!bytes.is_empty());
@@ -4125,6 +4207,8 @@ mod object_emitter_tests {
                 &object_streams,
                 None,
                 &BTreeSet::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
             )
         })?; // cov:ignore: LLVM attributes the live-body test call terminator to callback cleanup.
         assert!(bytes
@@ -4170,6 +4254,8 @@ mod object_emitter_tests {
                 &object_streams,
                 None,
                 &BTreeSet::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
             )
         })?; // cov:ignore: LLVM attributes the live-body test call terminator to callback cleanup.
         let predecessor_output = body
@@ -4219,6 +4305,7 @@ mod object_emitter_tests {
             };
             let context = encryption_context();
             let mut bytes = Vec::new();
+            let (page_sequences, contents_sequences) = qdf_page_context(&mut pdf)?;
 
             crate::writer::output::with_buffer_sink(&mut bytes, |out| {
                 emit_live(
@@ -4232,6 +4319,8 @@ mod object_emitter_tests {
                     &object_streams,
                     encrypted.then_some(&context),
                     &BTreeSet::new(),
+                    page_sequences,
+                    contents_sequences,
                 )
             })?;
 
@@ -4271,6 +4360,7 @@ mod object_emitter_tests {
             ..WriterOptions::default()
         };
         let mut bytes = Vec::new();
+        let (page_sequences, contents_sequences) = qdf_page_context(&mut pdf)?;
 
         crate::writer::output::with_buffer_sink(&mut bytes, |out| {
             emit_live(
@@ -4284,6 +4374,8 @@ mod object_emitter_tests {
                 &object_streams,
                 None,
                 &BTreeSet::new(),
+                page_sequences,
+                contents_sequences,
             )
         })?;
 
@@ -4315,6 +4407,7 @@ mod object_emitter_tests {
             ..WriterOptions::default()
         };
         let mut output = Vec::new();
+        let (page_sequences, contents_sequences) = qdf_page_context(&mut pdf)?;
 
         crate::writer::output::with_buffer_sink(&mut output, |out| {
             emit_live(
@@ -4328,6 +4421,8 @@ mod object_emitter_tests {
                 &object_streams,
                 None,
                 &BTreeSet::new(),
+                page_sequences,
+                contents_sequences,
             )
         })?;
 
@@ -4362,6 +4457,7 @@ mod object_emitter_tests {
             ..WriterOptions::default()
         };
         let mut output = Vec::new();
+        let (page_sequences, contents_sequences) = qdf_page_context(&mut pdf)?;
 
         let result = crate::writer::output::with_buffer_sink(&mut output, |out| {
             emit_live(
@@ -4375,6 +4471,8 @@ mod object_emitter_tests {
                 &object_streams,
                 None,
                 &BTreeSet::new(),
+                page_sequences,
+                contents_sequences,
             )
         });
         let error = match result {
