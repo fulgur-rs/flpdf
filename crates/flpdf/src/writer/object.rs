@@ -5649,10 +5649,26 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
         TrailerKind::LinearizedFirst { size, prev } => (size, Some(prev), false),
         TrailerKind::LinearizedSecond { size } => (size, None, true),
     };
+
     if qdf {
         out.write_bytes(b"trailer <<\n")?;
     } else if !xref_stream {
         out.write_bytes(b"trailer <<")?;
+    }
+
+    // qpdf's t_lin_second form writes the writer-owned /Size before walking
+    // the trimmed source trailer, so it is present even when the input
+    // trailer had no literal /Size key (QPDFWriter.cc:1170-1172).
+    if second_half {
+        if qdf {
+            out.write_bytes(b"  /Size ")?;
+        } else {
+            out.write_bytes(b" /Size ")?;
+        }
+        write_decimal_i64(out, size)?;
+        if qdf {
+            out.write_bytes(b"\n")?;
+        }
     }
 
     let mut id_value: Option<&ObjectHandle> = None;
@@ -5670,6 +5686,7 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
                 continue;
             }
             b"/Prev" => continue,
+            _ if second_half && key.as_slice() == b"/Size" => continue,
             _ if second_half && key.as_slice() != b"/Size" => continue,
             _ => {}
         }

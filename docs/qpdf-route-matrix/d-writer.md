@@ -519,6 +519,15 @@ other writer cohorts remain explicit follow-up scope. This preserves qpdf's
 accessor ordering (`libqpdf/QPDFObjectHandle.cc:240-446,965-989`) without a
 workspace-wide mechanical conversion.
 
+**D14 bounded consumer (2026-09-18, `flpdf-ymuj.67`):** the linearized
+classic main trailer now uses `TrailerKind::LinearizedSecond` through the
+canonical `write_trailer_with_ref_map_and_kind` owner. The owner synthesizes
+`/Size` before walking source trailer keys, matching
+`libqpdf/QPDFWriter.cc:1160-1236` even when the source trailer has no literal
+`/Size`; the xref keyword, `/Prev`-free second-half framing, `startxref`, and
+pass-1 live `/ID` warning boundary remain consumer-owned. D14 stays mixed until
+the remaining route-specific trailer framing is migrated.
+
 ## WriterOptions と route の対応
 
 dispatch は 2 段。まず `PdfWriter::write`（`crates/flpdf/src/writer.rs:719-798`）が

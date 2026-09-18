@@ -4048,6 +4048,29 @@ mod final_handle_writer_tests {
     }
 
     #[test]
+    fn linearized_second_trailer_synthesizes_a_missing_size_like_qpdf() {
+        let (_pdf, trailer, _root_ref, _encrypt_ref) = shared_trailer_contract_fixture();
+        trailer.remove_key(b"/Size");
+
+        let mut output = Vec::new();
+        output::with_buffer_sink(&mut output, |out| {
+            trailer.write_trailer_with_ref_map_and_kind(
+                out,
+                TrailerKind::LinearizedSecond { size: 9 },
+                false,
+                false,
+                None,
+                &|object_ref| Ok(object_ref),
+                &BTreeSet::new(),
+                true,
+            )
+        })
+        .expect("linearized second trailer succeeds without source /Size");
+
+        assert_eq!(output, b"trailer << /Size 9 /ID [<696430><696431>] >>");
+    }
+
+    #[test]
     fn shared_trailer_contract_preserves_writer_owned_keys_and_id_writer() {
         let (_pdf, trailer, root_ref, encrypt_ref) = shared_trailer_contract_fixture();
         let map = |object_ref: ObjectRef| -> Result<ObjectRef> {

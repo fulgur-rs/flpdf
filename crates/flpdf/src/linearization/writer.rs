@@ -75,6 +75,7 @@ use crate::linearization::renumber::{ObjStmRelocation, RenumberMap, SecondHalfCo
 use crate::pipeline::stdio_file::StdioBuffer;
 use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::writer::encrypted_strings::EncryptedStringEmitter;
+use crate::writer::object::TrailerKind;
 use crate::writer::object_streams::{
     emit_objstm_body_from_handles_with_writer, planner_config_from_options,
     wrap_objstm_body_as_handle,
@@ -1267,7 +1268,6 @@ fn write_main_xref_and_trailer(
     live_trailer: &ObjectHandle,
     map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
     removed_refs: &BTreeSet<QpdfObjGen>,
-    id_writer: Option<crate::pdf_syntax::ReborrowableIdWriter>,
     pass1: bool,
 ) -> Result<(usize, usize)> {
     let xref_start = out.position_usize()?;
@@ -1286,25 +1286,37 @@ fn write_main_xref_and_trailer(
         })? // cov:ignore: defensive position overflow
     };
 
-    // Main trailer.  Written as raw bytes (not Dictionary::write_pdf, which
-    // alphabetizes) to keep qpdf's key order /Size /ID.  No /Root or /Info —
-    // qpdf omits both from the main trailer of a classic linearized file.
-    out.write_bytes(b"trailer << ")?;
-    out.write_bytes(format!("/Size {} ", param_slot).as_bytes())?;
-    // /ID — emit the file-scoped identifier verbatim (the same value the
-    // Part-1 trailer carries), so the trailer a reader resolves via the
-    // trailing `startxref` advertises the identifier.
-    out.write_bytes(b"/ID ")?;
-    let id_value = if pass1 {
-        linearization_pass1_id_from_live_trailer(live_trailer)?
+    // qpdf's t_lin_second trailer is the canonical owner of /Size, /ID, and
+    // the omission of /Encrypt. Convert the raw ObjGen map at this boundary
+    // so the shared ObjectHandle serializer owns the trailer spelling.
+    let trailer_map = |object_ref: ObjectRef| map(QpdfObjGen::try_from_object_ref(object_ref)?);
+    let removed_object_refs: BTreeSet<ObjectRef> = removed_refs
+        .iter()
+        .filter_map(|object_gen| object_gen.to_object_ref())
+        .collect();
+    let pass1_id_value = if pass1 {
+        Some(linearization_pass1_id_from_live_trailer(live_trailer)?)
     } else {
-        source_trailer.try_get_key(b"/ID")?
+        None
     };
-    match id_writer {
-        Some(write_id) => write_id(out),
-        None => id_value.write_id_value_with_qpdf_obj_gen_map(out, map, removed_refs),
-    }?; // cov:ignore: direct trailer ID serialization is validated by canonical handle tests
-    out.write_bytes(b" >>")?;
+    let mut pass1_id_writer = |output: &mut OutputSink<'_>| {
+        let id_value = pass1_id_value.as_ref().ok_or_else(|| {
+            crate::Error::Internal("missing pass-1 linearization ID value".to_string())
+        })?;
+        id_value.write_id_value_with_qpdf_obj_gen_map(output, map, removed_refs)
+    };
+    source_trailer.write_trailer_with_ref_map_and_kind(
+        out,
+        TrailerKind::LinearizedSecond {
+            size: i64::from(param_slot),
+        },
+        false,
+        false,
+        pass1.then_some(&mut pass1_id_writer as _),
+        &trailer_map,
+        &removed_object_refs,
+        true,
+    )?;
     out.write_bytes(format!("\nstartxref\n{}\n%%EOF\n", first_page_xref_offset).as_bytes())?;
 
     Ok((xref_start, xref_first_entry_offset))
@@ -3084,8 +3096,6 @@ fn do_write_pass<R: Read + Seek>(
             &pdf.trailer(),
             &trailer_map,
             raw_removed_refs,
-            // Last use of `id_writer` — move it (no reborrow needed).
-            id_writer,
             pass1_digest,
         )?; // cov:ignore: the validated linearization plan makes this serializer error path defensive.
         id_ranges.push(main_section_start..output.position_usize()?);
@@ -5838,7 +5848,6 @@ mod tests {
             &trailer,
             &|object_gen| Ok(object_gen.to_object_ref().expect("test ID ref is valid")),
             &BTreeSet::new(),
-            None,
             false,
         )
         .expect_err("qpdf rejects a nonzero xref row without an offset");
@@ -5870,7 +5879,6 @@ mod tests {
             &trailer,
             &|object_gen| Ok(object_gen.to_object_ref().expect("test ID ref is valid")),
             &BTreeSet::new(),
-            None,
             false,
         )
         .expect("an empty classic xref subsection still writes its trailer");
