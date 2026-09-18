@@ -8165,7 +8165,7 @@ mod tests {
     // boilerplate the job's warning/info logger routes never call (warnings
     // are forwarded by message text alone, and the logger never finishes a
     // diagnostic sink mid-job) -- only `write` is exercised, so each is
-    // individually marked `cov:ignore`.
+    // individually excluded from coverage below.
     impl Pipeline for JsonRecordingSink {
         // cov:ignore-start: never called; see the block comment above.
         fn identifier(&self) -> &str {
