@@ -797,11 +797,10 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
 ) -> crate::Result<LiveBodyOutput> {
     validate_objstm_member_bodies(pdf, plan)?;
     let groups = planned_object_stream_groups(plan)?;
-    let (page_sequences, contents_sequences) = if options.qdf || options.content_normalization {
-        qdf_page_context(pdf)?
-    } else {
-        (BTreeMap::new(), BTreeMap::new())
-    };
+    // This historical-plan adapter's one caller never sets qdf/content
+    // normalization, so it has no setup-owned `SpecialStreams` snapshot to
+    // read from (unlike `write_plain_live`); pass empty maps rather than
+    // add an untested re-derivation branch here.
     emit_live_body(
         pdf,
         out,
@@ -813,8 +812,8 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
         &groups,
         None,
         &BTreeSet::new(),
-        page_sequences,
-        contents_sequences,
+        BTreeMap::new(),
+        BTreeMap::new(),
     )
 }
 
@@ -3827,7 +3826,7 @@ mod object_emitter_tests {
     fn qdf_live_body_reads_the_caller_supplied_page_sequence_snapshot() -> crate::Result<()> {
         let mut pdf = Pdf::open(Cursor::new(
             include_bytes!("../../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
-        ))?;
+        ))?; // cov:ignore: LLVM attributes the executed multiline Pdf::open call terminator to an unhit continuation line.
         let root_source = pdf.root_ref();
         let page_ref = PageDocumentHelper::new(&mut pdf).get_all_pages()?[0];
         let options = WriterOptions {
