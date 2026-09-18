@@ -123,6 +123,34 @@ qpdf/flpdf output bytes and warning status.
 `enqueueObjectsPCLm`（`libqpdf/QPDFWriter.cc:2928-2954`）は page → `/Contents` →
 `/Resources /XObject` の各 strip とその直後に新規 `q /image Do Q\n` stream → 最後に `/Root`。
 
+**PCLm seed の page 列は `QPDF::getAllPages` の `/Kids` dispatch（`flpdf-3yn9.48.160`, 2026-09-18）:**
+`enqueueObjectsPCLm` の最初の入力は `m->pdf.getAllPages()` で、qpdf は kid が interior node か
+leaf page かを `kid.hasKey("/Kids")` で判定し（`libqpdf/QPDF_pages.cc:100-103`）、leaf 側は
+dictionary でなくても `all_pages` に push する（`libqpdf/QPDF_pages.cc:104-135`。leaf arm の
+`/MediaBox` 既定値と `/Type` 上書きは非 dictionary 受信側では
+`libqpdf/QPDFObjectHandle.cc:1199-1208` の "ignoring key replacement request" no-op になるため、
+object の bytes は変わらない）。root 側も `if (pages.hasKey("/Kids"))` を通ったときだけ
+recursion に入る（`libqpdf/QPDF_pages.cc:69-71`）。
+`crates/flpdf/src/pages.rs::PageWalk` は prepared page cache が空のときに
+`crates/flpdf/src/writer/plain/body.rs::enqueue_objects_pclm` へ page 列を供給する
+非修復 walk だが、`/Type` で dispatch していたため非 dictionary leaf を落とし、
+`/Type /Page` と書かれた `/Pages` root を 1 ページとして返していた。両方を qpdf の
+`/Kids` dispatch に揃え、`tests/fixtures/pclm/mini-pclm-nondict-page-out.pdf`（qpdf 11.9.0
+oracle golden、`1 0 obj\n42\nendobj` が先頭）で完全な出力バイトを pin した。
+CLI 経路（plain / `--qdf` / `--linearize` / ObjStm / `--pages` / `--split-pages` / overlay /
+`--json-output` / `rewrite` ほか）は同じ入力で出力バイト・stdout・stderr・exit code とも
+修正前と変わらない——これらは `PageDocumentHelper::get_all_pages` →
+`crates/flpdf/src/pages/repair.rs::prepare_for_optimization` を通り、そちらは既に qpdf の
+leaf dispatch と修復を実装している。唯一変わるのは multi-source `--pages`
+（`--empty --pages in.pdf 1-z --` / `--collate`、source の page 列を `page_refs` から直接取る）の
+診断文言で、qpdf が warning 付きで書き出す（exit 3）のに対し flpdf は修正前も後も拒否する
+（exit 2、出力なし）が、leaf を落としたことによる件数不一致
+（`--pages: merge produced 1 pages for 2 selected pages`）から、page 列が qpdf 通りになった結果の
+`object 3 0 R is not a page dictionary or Form XObject` へ移った。dictionary leaf に対して
+qpdf の修復が実際に効くケース（`/Type` も `/Kids` も無い kid、`/Type /Page` かつ `/Kids` を持つ
+kid、direct な非 dictionary kid）は `PageWalk` 側では未対応のまま残り、`docs/qpdf-correspondence.md`
+に実測付きで記録した。解消には `page_refs` を修復 walk 側へ寄せる統合が要る。
+
 ### D-2. object universe（reachable set vs `getAllObjects`）
 
 - 非 linearized・`preserve_unreferenced=false`: universe は **trailer から `enqueueObject` で到達した

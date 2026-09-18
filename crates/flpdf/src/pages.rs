@@ -3,10 +3,12 @@
 //! qpdf correspondence: QPDF_pages.cc traversal responsibilities shared with page-tree rebuild and linearization repair.
 //!
 //! Iterates the document's `/Pages` tree in the order described by ISO 32000-1 §7.7.3.2
-//! and yields the `ObjectRef` of every leaf `Page` node. The walker tolerates broken
-//! cycles (each node is visited at most once). An explicit depth limit remains
-//! available for callers that request a bounded walk; the default qpdf-shaped
-//! walk has no arbitrary depth cap.
+//! and yields the `ObjectRef` of every leaf node. A node counts as an interior
+//! page-tree node when it carries `/Kids` and as a leaf page otherwise, which is
+//! how `QPDF::getAllPagesInternal` classifies it; a leaf that is not a dictionary
+//! is still a page. The walker tolerates broken cycles (each node is visited at
+//! most once). An explicit depth limit remains available for callers that request
+//! a bounded walk; the default qpdf-shaped walk has no arbitrary depth cap.
 
 #[cfg(not(feature = "qtest-driver"))]
 pub(crate) mod repair;
@@ -197,7 +199,11 @@ pub(crate) fn resolve_inherited_handle_with_max_depth<R: Read + Seek>(
     resolve_inherited_handle_from_node_with_max_depth(pdf, page, key, max_depth)
 }
 
-/// Return every `Page` object in document order using qpdf's unbounded default walk.
+/// Return every page object in document order using qpdf's unbounded default walk.
+///
+/// A `/Kids` entry is an interior page-tree node when it carries `/Kids` of its
+/// own and a leaf page otherwise, matching `QPDF::getAllPagesInternal`. A leaf
+/// that is not a dictionary is reported as a page just the same.
 ///
 /// # Errors
 ///
@@ -408,12 +414,34 @@ pub struct PageWalk<'a, R: Read + Seek + 'static> {
 /// programmatic null into a hard error. Parsed document handles have a warning
 /// sink and propagate sink failures; direct nulls created without a document
 /// retain the pre-existing page-classification behavior.
-fn probe_page_kids(handle: &ObjectHandle) -> Result<()> {
+///
+/// The answer is qpdf's page-tree dispatch: `QPDF::getAllPages` enters
+/// `getAllPagesInternal` only for a `/Pages` root that reports `/Kids`
+/// (`libqpdf/QPDF_pages.cc:69-71`), and `getAllPagesInternal` recurses into a
+/// kid only when that kid reports `/Kids` (`libqpdf/QPDF_pages.cc:100-103`).
+/// A contextless handle that cannot raise the warning answers `false`, which
+/// is what `QPDFObjectHandle::hasKey` returns for a non-dictionary receiver
+/// (`libqpdf/QPDFObjectHandle.cc:966-976`).
+fn probe_page_kids(handle: &ObjectHandle) -> Result<bool> {
     let contextless = handle.context().is_none();
     match handle.try_has_key(b"/Kids") {
-        Ok(_) => Ok(()),
-        Err(Error::QpdfExc(_)) if contextless => Ok(()),
+        Ok(has_kids) => Ok(has_kids),
+        Err(Error::QpdfExc(_)) if contextless => Ok(false),
         Err(error) => Err(error),
+    }
+}
+
+/// Seed the traversal stack the way `QPDF::getAllPages` enters its recursion.
+///
+/// qpdf calls `getAllPagesInternal(pages, ...)` only inside
+/// `if (pages.hasKey("/Kids"))` (`libqpdf/QPDF_pages.cc:69-71`), so a `/Pages`
+/// root without `/Kids` — including a non-dictionary one — enumerates no
+/// pages at all instead of being classified as a leaf.
+fn page_walk_stack(pages: ObjectHandle) -> Result<Vec<(PageNode, usize)>> {
+    if probe_page_kids(&pages)? {
+        Ok(vec![(PageNode::from_handle(pages), 0)])
+    } else {
+        Ok(Vec::new())
     }
 }
 
@@ -447,10 +475,9 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
             probe_page_kids(&pages)?;
             return Err(Error::Missing("/Pages"));
         }
-        let pages = PageNode::from_handle(pages);
         Ok(PageWalk {
             pdf,
-            stack: vec![(pages, 0)],
+            stack: page_walk_stack(pages)?,
             seen: BTreeSet::new(),
             seen_direct: HashSet::new(),
             max_depth: None,
@@ -487,10 +514,9 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
             probe_page_kids(&pages)?;
             return Err(Error::Missing("/Pages"));
         }
-        let pages = PageNode::from_handle(pages);
         Ok(PageWalk {
             pdf,
-            stack: vec![(pages, 0)],
+            stack: page_walk_stack(pages)?,
             seen: BTreeSet::new(),
             seen_direct: HashSet::new(),
             max_depth: Some(max_depth),
@@ -503,8 +529,18 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
         node_obj.try_dereference()?;
 
         if !node_obj.try_is_dictionary()? {
+            // qpdf classifies a kid by `kid.hasKey("/Kids")`
+            // (`libqpdf/QPDF_pages.cc:100-103`), not by `/Type`. A
+            // non-dictionary kid reports no `/Kids`, so it takes the leaf arm
+            // and `getAllPagesInternal` pushes it into `all_pages` unchanged
+            // (`libqpdf/QPDF_pages.cc:104-135`): every repair that arm
+            // attempts — the `/MediaBox` default and the `/Type` override —
+            // is an "ignoring key replacement request" no-op on a
+            // non-dictionary receiver (`libqpdf/QPDFObjectHandle.cc:1199-1208`).
+            // The probe keeps the containment type warning qpdf's dispatch
+            // itself emits.
             probe_page_kids(&node_obj)?;
-            return Ok(None); // non-dictionary: skip silently
+            return Ok(node.object_ref());
         }
 
         let node_type = node_obj.try_get_key(b"/Type")?;
@@ -622,6 +658,15 @@ mod tests {
     }
 
     #[test]
+    fn page_kids_probe_answers_false_for_a_contextless_non_dictionary() {
+        // The containment answer decides whether a node is an interior
+        // page-tree node or a leaf page, so a handle with no warning sink has
+        // to reach the same `false` qpdf's `hasKey` returns for a
+        // non-dictionary receiver instead of failing the walk.
+        assert!(!probe_page_kids(&ObjectHandle::null()).expect("a contextless probe must not fail"));
+    }
+
+    #[test]
     fn page_kids_probe_propagates_uninitialized_handle_errors() {
         let error = probe_page_kids(&ObjectHandle::uninitialized()).unwrap_err();
         assert!(matches!(error, Error::Internal(_)));
@@ -660,6 +705,73 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(page_walk_visits_for_test(), before);
+    }
+
+    #[test]
+    fn page_refs_keeps_a_non_dictionary_kids_leaf() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let leaf = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(42))
+            .expect("indirect integer leaf");
+        let leaf_ref = leaf.object_ref().expect("indirect leaf identity");
+        pdf.root_handle()
+            .expect("empty catalog")
+            .try_get_key(b"/Pages")
+            .expect("page tree root")
+            .replace_key(b"/Kids", ObjectHandle::array(vec![leaf]))
+            .expect("attach the non-dictionary leaf");
+
+        assert_eq!(page_refs(&mut pdf).expect("page refs"), vec![leaf_ref]);
+        let messages: Vec<_> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| entry.message_string())
+            .collect();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains(
+            "operation for dictionary attempted on object of type integer: returning false for a key containment request"
+        ));
+    }
+
+    #[test]
+    fn page_refs_skips_a_pages_root_without_kids() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let pages = pdf
+            .root_handle()
+            .expect("empty catalog")
+            .try_get_key(b"/Pages")
+            .expect("page tree root");
+        pages
+            .replace_key(b"/Type", ObjectHandle::name(b"Page".to_vec()))
+            .expect("relabel the page tree root");
+        pages.remove_key(b"/Kids");
+
+        assert!(page_refs(&mut pdf).expect("page refs").is_empty());
+    }
+
+    #[test]
+    fn page_refs_skips_a_non_dictionary_pages_root() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let root = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(42))
+            .expect("indirect integer page tree root");
+        pdf.root_handle()
+            .expect("empty catalog")
+            .replace_key(b"/Pages", root)
+            .expect("attach the non-dictionary page tree root");
+
+        assert!(page_refs(&mut pdf).expect("page refs").is_empty());
+        let messages: Vec<_> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| entry.message_string())
+            .collect();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains(
+            "operation for dictionary attempted on object of type integer: returning false for a key containment request"
+        ));
     }
 
     #[test]

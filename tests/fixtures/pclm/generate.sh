@@ -74,3 +74,9 @@ done
 
 "$workdir/oracle" "$here/mini-pclm-ext-indirect-in.pdf" \
     "$here/mini-pclm-ext-indirect-objstm.pdf" pclm objstm
+
+# A /Kids leaf that is not a dictionary. QPDF::getAllPagesInternal dispatches
+# on kid.hasKey("/Kids"), not on /Type, so qpdf keeps the integer object in the
+# page list and enqueueObjectsPCLm numbers it as the first PCLm object.
+"$workdir/oracle" "$here/mini-pclm-nondict-page-in.pdf" \
+    "$here/mini-pclm-nondict-page-out.pdf" pclm
