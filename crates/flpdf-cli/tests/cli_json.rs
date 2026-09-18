@@ -773,12 +773,34 @@ fn assert_same_json_output_is_rejected_without_modifying_input(
     assert_eq!(std::fs::read(input_path).unwrap(), original);
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
+    // `QPDFJob::checkConfiguration` owns this rejection and its wording
+    // (`QUtil::same_file`, `libqpdf/QPDFJob.cc:626-630`).
     assert!(
         String::from_utf8_lossy(&output.stderr).contains(
-            "input file and output file are the same; choose a different --json-output path"
+            "input file and output file are the same; use --replace-input to intentionally \
+             overwrite the input file"
         ),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    let mut qpdf = ShellCommand::new("qpdf");
+    if let Some(dir) = current_dir {
+        qpdf.current_dir(dir);
+    }
+    let expected = qpdf
+        .args(["--json-output=2", input_arg, output_arg])
+        .output()
+        .unwrap();
+    assert_eq!(std::fs::read(input_path).unwrap(), original);
+    assert_eq!(expected.status.code(), output.status.code());
+    assert_eq!(
+        String::from_utf8_lossy(&expected.stderr).replace("qpdf", "PROG"),
+        String::from_utf8_lossy(&output.stderr).replace("flpdf", "PROG"),
+        "the rejection must match qpdf 11.9.0"
     );
 }
 
@@ -946,7 +968,11 @@ fn json_output_overwrites_distinct_write_only_existing_file() {
 
 #[cfg(unix)]
 #[test]
-fn json_output_reports_identity_check_io_error_without_modifying_input() {
+fn json_output_under_a_non_directory_reports_the_qpdf_open_failure() {
+    // qpdf opens the JSON destination with `QUtil::safe_fopen(..., "w")` after
+    // the document has been created (`libqpdf/QPDFJob.cc:3103-3104`), so an
+    // unusable path is reported as `open <path>: <strerror>` and the input is
+    // left alone.
     let input = write_temp_pdf(&one_page_pdf_with_stream());
     let original = std::fs::read(input.path()).unwrap();
     let temp = tempfile::tempdir().unwrap();
@@ -954,21 +980,43 @@ fn json_output_reports_identity_check_io_error_without_modifying_input() {
     std::fs::write(&non_directory, b"blocker").unwrap();
     let output_path = non_directory.join("output.json");
 
-    Command::cargo_bin("flpdf")
+    let output = Command::cargo_bin("flpdf")
         .unwrap()
         .args([
             "--json-output=2",
             input.path().to_str().unwrap(),
             output_path.to_str().unwrap(),
         ])
-        .assert()
-        .code(2)
-        .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains(
-            "unable to inspect --json-output file",
-        ));
+        .output()
+        .unwrap();
 
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains(&format!("open {}: Not a directory", output_path.display())),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(std::fs::read(input.path()).unwrap(), original);
+
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    let expected = ShellCommand::new("qpdf")
+        .args([
+            "--json-output=2",
+            input.path().to_str().unwrap(),
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(expected.status.code(), output.status.code());
+    assert_eq!(
+        String::from_utf8_lossy(&expected.stderr).replace("qpdf", "PROG"),
+        String::from_utf8_lossy(&output.stderr).replace("flpdf", "PROG"),
+        "the open failure must match qpdf 11.9.0"
+    );
 }
 
 // ---------------------------------------------------------------------------

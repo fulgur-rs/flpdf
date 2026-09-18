@@ -4687,13 +4687,23 @@ Deviations recorded with the cutover:
   compares paths with `QUtil::same_file` in `checkConfiguration`
   (`libqpdf/QPDFJob.cc:626-630`) and then opens with `safe_fopen`, which is what
   the job now does.
+* flpdf-cli's own `reject_same_json_output` preflight went with it, since
+  `check_configuration` performs qpdf's check at qpdf's position in the
+  sequence. Two diagnostics gained qpdf's wording: an aliased destination now
+  reports `input file and output file are the same; use --replace-input to
+  intentionally overwrite the input file` instead of `... choose a different
+  --json-output path`, and an unusable destination path now reaches
+  `safe_fopen`'s `open <path>: <strerror>` (with the create-stage warnings that
+  precede it) instead of the flpdf-only `unable to inspect --json-output file
+  <path>: ...` raised before the input was opened.
 
-One pre-existing divergence found while gating this and left open: the CLI's
-`reject_same_json_output` runs before `check_configuration` and reports `input
-file and output file are the same; choose a different --json-output path`
-where qpdf reports `... use --replace-input to intentionally overwrite the
-input file`. Removing the CLI-side check would hand the message to
-`check_configuration`, which already carries qpdf's wording.
+One pre-existing divergence found while gating this and deliberately left open:
+`--json --split-pages` writes JSON in flpdf and splits in qpdf. `writeQPDF`
+dispatches `split_pages` ahead of `writeOutfile`, so qpdf emits `out.json-1`
+and no JSON at all (`libqpdf/QPDFJob.cc:484-489`). flpdf's `write_qpdf` has the
+same dispatch, but the CLI's JSON route does not configure `split_pages` on the
+job, so the JSON arm still wins. That is a route configuration gap, not a
+dispatch one.
 
 ### QPDFObjectHandle getValueAs family
 

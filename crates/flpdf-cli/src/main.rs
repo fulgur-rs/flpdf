@@ -4571,12 +4571,11 @@ fn run_json(
         }
     });
 
-    // 4. Reject an output that identifies the input file before opening or
-    // truncating it. qpdf performs this check in QPDFJob.cc:627-630. Path
-    // spelling alone is insufficient: relative aliases, symlinks, and hard
-    // links can all name the same underlying file. With --empty, the first
+    // 4. Resolve the input and output positions. With --empty, the first
     // positional is the output rather than an input because qpdf already has
-    // its primary input from Config::emptyInput.
+    // its primary input from `Config::emptyInput`. An output that identifies
+    // the input is rejected by `check_configuration` below, where qpdf rejects
+    // it (`QUtil::same_file`, `libqpdf/QPDFJob.cc:626-630`).
     let input = if empty {
         None
     } else {
@@ -4590,11 +4589,6 @@ fn run_json(
     } else {
         cli.output.as_deref()
     };
-    if let (Some(input), Some(output)) = (input, output_path.filter(|path| *path != Path::new("-")))
-    {
-        reject_same_json_output(input, output)?;
-    }
-
     let mut job = QPDFJob::new();
     job.set_warnings_exit_zero(cli_warning_exit_zero());
     job.set_logger(cli_logger());
@@ -8915,15 +8909,6 @@ fn run_zlib_flate(args: &[OsString], whoami: &str, usage_name: &str) -> CliResul
         }));
     }
     Ok(())
-}
-
-fn reject_same_json_output(input: &Path, output: &Path) -> CliResult<()> {
-    reject_same_file(
-        input,
-        output,
-        "input file and output file are the same; choose a different --json-output path",
-        "--json-output",
-    )
 }
 
 /// Reject a job whose main input and output resolve to the same file
