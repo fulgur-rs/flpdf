@@ -2540,12 +2540,25 @@ fn raw_argv_missing_job_json_file_uses_qpdf_strerror_wording() {
     assert_eq!(
         usage.to_string(),
         format!(
-            "error with job-json file {}: open {}: No such file or directory\n\
+            "error with job-json file {}: open {}: {}\n\
              Run qpdfjob --job-json-help for information on the file format.",
             missing.display(),
-            missing.display()
+            missing.display(),
+            missing_file_strerror_text(&missing),
         )
     );
+}
+
+/// Render the same platform strerror wording [`crate::qutil::strerror_text`]
+/// (private to the library crate) produces for a missing path, without
+/// hardcoding a POSIX-only message that would fail on Windows.
+fn missing_file_strerror_text(missing: &Path) -> String {
+    let io_error = std::fs::File::open(missing).expect_err("path must not exist");
+    let rendered = io_error.to_string();
+    io_error
+        .raw_os_error()
+        .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
+        .map_or(rendered.clone(), str::to_owned)
 }
 
 /// A nested `jobJsonFile` JSON key dispatches through the same
@@ -2570,10 +2583,11 @@ fn nested_missing_job_json_file_uses_qpdf_strerror_wording() {
     assert_eq!(
         error.to_string(),
         format!(
-            "error with job-json file {}: open {}: No such file or directory\n\
+            "error with job-json file {}: open {}: {}\n\
              Run qpdfjob json --job-json-help for information on the file format.",
             missing.display(),
-            missing.display()
+            missing.display(),
+            missing_file_strerror_text(&missing),
         )
     );
 }
