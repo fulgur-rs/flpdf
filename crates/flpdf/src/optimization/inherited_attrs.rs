@@ -266,13 +266,10 @@ fn enter_direct_frame<R: Read + Seek>(
     if !is_pages_dictionary(&dict)? {
         return Ok(None);
     }
-    warn_skipped_pages_keys(
-        pdf,
-        &dict,
-        warn_skipped_keys,
-        dict.qpdf_obj_gen()
-            .filter(|object_gen| object_gen.is_indirect()),
-    )?;
+    let node_ref = dict
+        .qpdf_obj_gen()
+        .filter(|object_gen| object_gen.is_indirect());
+    warn_skipped_pages_keys(pdf, &dict, warn_skipped_keys, node_ref)?;
     let own_keys = push_node_attributes(pdf, &dict, key_ancestors, allow_changes)?;
     let kids = dict
         .try_get_key(b"/Kids")?
