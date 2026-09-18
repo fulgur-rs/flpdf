@@ -4696,6 +4696,16 @@ other standard consumers. The new `mini-pclm-ext-indirect-objstm.pdf` golden
 and `pclm_qpdf_byte_gate_tests.rs` compare the complete output bytes against a
 pinned qpdf 11.9.0 C++ oracle. No qpdf-deviation marker is added.
 
+`flpdf-3yn9.48.164` (2026-09-18) superseded those three predicates entirely.
+The qdf, content-normalization, encryption, copied-encryption, encrypted-source
+and extra-header-text routes reached the same post-`prepareFileForWrite` rewalk
+that PCLm did, so the capture is now gated on nothing but
+`effective_object_stream_mode(&options) == Generate`, matching qpdf's bare
+`switch (m->object_stream_mode)` (`libqpdf/QPDFWriter.cc:2125-2139`). The
+`plain::eligible` route predicate had no qpdf counterpart and was removed with
+them, and `build_live_object_stream_plan` now requires the setup snapshot on
+its Generate arm instead of rewalking the prepared graph.
+
 ### flpdf-cli --json joins writeQPDF/writeOutfile/writeJSON (`flpdf-3yn9.48.150.3`, 2026-09-18)
 
 qpdf reaches JSON output through one structure: `createQPDF` runs
