@@ -704,6 +704,44 @@ fn standalone_inspection_reports_invalid_rotation_before_input_open() {
     }
 }
 
+/// qpdf's `doInspection` (`libqpdf/QPDFJob.cc:1645-1693`) always dispatches
+/// through the same `initializeFromArgv`/`run()`/`getExitCode` lifecycle
+/// regardless of how many inspection flags are selected -- there is no
+/// separate qpdf structure for "exactly one flag". flpdf-cli's own top-level
+/// single-flag dispatch used to bypass the combined `job.config()`/
+/// `job.run()` route (`run_combined_top_level_inspection`) with a per-flag
+/// standalone consumer; `flpdf-3yn9.48.186` deleted that standalone dispatch
+/// for the nine flags below and routes them through the combined lifecycle
+/// unconditionally. Lock the byte-identical qpdf parity for each flag alone
+/// (no `--pages`/overlay/attachment-mutation companion, which already forced
+/// the combined route before this change) so a future regression in the
+/// widened `top_level_inspection_combination_requested` gate is caught here.
+///
+/// `--show-object` is deliberately excluded: it still uses the standalone
+/// `run_show_object` consumer for a solo selection, tracked by
+/// `flpdf-t3as9` (raw-identity object addressing beyond generation 65535,
+/// which the shared `JobObjectSelector` parser does not yet support).
+#[test]
+fn single_inspection_flag_routes_through_the_combined_job_lifecycle() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let three_page = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/compat/three-page.pdf"
+    );
+    for flag in ["--check", "--show-npages", "--show-pages", "--show-xref"] {
+        assert_matches_qpdf(&[flag], three_page);
+    }
+    for flag in ["--check-linearization", "--show-linearization"] {
+        assert_matches_qpdf(&[flag], LINEARIZED);
+    }
+    assert_matches_qpdf(&["--show-encryption"], FXO_RED);
+    assert_matches_qpdf(&["--list-attachments"], ATTACHMENT);
+    assert_matches_qpdf(&["--show-attachment=attachment.txt"], ATTACHMENT);
+}
+
 #[test]
 fn overlay_inspection_uses_segment_password_options_for_the_donor() {
     if !qpdf_available() {
