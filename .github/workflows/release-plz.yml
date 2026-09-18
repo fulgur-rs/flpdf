@@ -328,6 +328,16 @@ jobs:
           shared-key: release-plz
           save-if: false
 
+      # release-plz v0.5.136 runs cargo-semver-checks, which builds rustdoc
+      # for flpdf with every feature enabled. That pulls in
+      # qpdf-libjpeg-compat -> flpdf-libjpeg-compat/system-libjpeg, whose
+      # build script compiles csrc/jpeg_compat.c against the system
+      # jpeglib.h. The runner image does not ship that header, so the
+      # rustdoc build fails before any semver comparison happens. ci.yml
+      # installs it the same way for the feature's own jobs.
+      - name: Install libjpeg development headers
+        run: bash scripts/ci-apt-install.sh libjpeg-dev
+
       - name: Run release-plz release-pr
         uses: release-plz/action@a80d79efe0a195618acb02a4089d55fe74d2505f  # v0.5.136
         with:
