@@ -2653,13 +2653,7 @@ mod final_handle_tests {
         assert_eq!(fields[0].qpdf_obj_gen(), raw_field.qpdf_obj_gen());
         assert_eq!(fields[0].object_ref(), None);
         drop(helper);
-        assert!(pdf
-            .repair_diagnostics()
-            .entries()
-            .iter()
-            .all(|diagnostic| !diagnostic
-                .message_string()
-                .contains("encountered a direct object as a field")));
+        assert!(pdf.repair_diagnostics().entries().is_empty());
     }
 
     #[test]
