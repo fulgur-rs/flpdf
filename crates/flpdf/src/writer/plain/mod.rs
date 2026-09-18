@@ -9,7 +9,7 @@ use crate::writer::plain::xref::{IdPlan, TrailerPlan};
 use crate::writer::ObjectWriterEmission;
 use crate::writer::WriterOptions;
 use crate::writer::WriterResult;
-use crate::{CompressStreams, ObjectRef, ObjectStreamMode, Pdf, XrefForm};
+use crate::{CompressStreams, ObjectRef, Pdf, XrefForm};
 use std::collections::{BTreeMap, HashMap};
 
 pub(crate) mod body;
@@ -413,16 +413,4 @@ fn assign_late_references<R: Read + Seek>(
         })?; // cov:ignore: the supported writer object-number domain cannot exhaust u32.
     }
     Ok(next)
-}
-
-pub(crate) fn eligible(
-    pdf_is_encrypted: bool,
-    options: &WriterOptions,
-    mode: ObjectStreamMode,
-) -> bool {
-    mode == options.object_streams
-        && options.extra_header_text.is_empty()
-        && options.encrypt.is_none()
-        && options.copy_encryption.is_none()
-        && !pdf_is_encrypted
 }

@@ -92,11 +92,19 @@ pub(crate) fn build_live_object_stream_plan<R: Read + Seek>(
             }
         }
         ObjectStreamMode::Generate => {
-            let compressible = if let Some(snapshot) = generated_compressible {
-                snapshot.clone()
-            } else {
-                object_streams::compressible_objgens_qpdf_plan(pdf)?
-            };
+            // qpdf fixes Generate membership in `doWriteSetup`, before
+            // `prepareFileForWrite` runs (`QPDFWriter.cc:2125-2139,2195`).
+            // Recomputing it here would observe the post-preparation graph and
+            // drop objects such as an indirect `/Extensions` dictionary that
+            // preparation has since directized, so the setup snapshot is the
+            // only accepted source of membership on this route.
+            let compressible = generated_compressible
+                .ok_or_else(|| {
+                    crate::Error::Internal(
+                        "Generate object-stream planning requires the writer setup snapshot".into(),
+                    )
+                })?
+                .clone();
             let mut eligible = compressible.eligible;
             let removed_refs = compressible.removed_refs;
             eligible.retain(|member| !removed_refs.contains(member));
@@ -2058,8 +2066,18 @@ mod tests {
         let mut pdf =
             Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
         let options = write_options(ObjectStreamMode::Generate);
-        let plan =
-            build_live_object_stream_plan(&mut pdf, &options, &BTreeMap::new(), None, &[]).unwrap();
+        // Generate membership now always arrives as the writer's setup-time
+        // snapshot; only the container identities are left for the planner to
+        // mint when the caller supplies none.
+        let compressible = object_streams::compressible_objgens_qpdf_plan(&mut pdf).unwrap();
+        let plan = build_live_object_stream_plan(
+            &mut pdf,
+            &options,
+            &BTreeMap::new(),
+            Some(&compressible),
+            &[],
+        )
+        .unwrap();
 
         assert!(!plan.groups.is_empty());
         assert!(plan.groups.iter().all(|group| {
