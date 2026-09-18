@@ -118,10 +118,14 @@ fn linearization_content_normalize_refs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     options: &crate::writer::WriterOptions,
     page_refs: &[ObjectRef],
+    normalized_streams_snapshot: Option<&BTreeSet<QpdfObjGen>>,
 ) -> Result<BTreeSet<QpdfObjGen>> {
     if !options.content_normalization {
         return Ok(BTreeSet::new());
     }
+    if let Some(snapshot) = normalized_streams_snapshot {
+        return Ok(snapshot.clone());
+    } // cov:ignore: LLVM attributes the executed snapshot-return block to the preceding lines.
     let mut refs = BTreeSet::new();
     for page_ref in page_refs {
         let page = pdf.get_object_handle(*page_ref);
@@ -1595,7 +1599,7 @@ impl LinearizationPlan {
         pdf: &mut Pdf<R>,
         options: &crate::writer::WriterOptions,
     ) -> crate::Result<Self> {
-        Self::from_pdf_with_writer_options_and_source_membership(pdf, options, None, None)
+        Self::from_pdf_with_writer_options_and_source_membership(pdf, options, None, None, None)
     }
 
     #[inline(never)]
@@ -1604,6 +1608,7 @@ impl LinearizationPlan {
         options: &crate::writer::WriterOptions,
         source_membership_snapshot: Option<&BTreeMap<u32, u32>>,
         generated_compressible_snapshot: Option<&crate::writer::object_streams::CompressiblePlan>,
+        normalized_streams_snapshot: Option<&BTreeSet<QpdfObjGen>>,
     ) -> crate::Result<Self> {
         let object_stream_mode = options.object_streams;
         let use_generate_objstm = matches!(
@@ -1722,8 +1727,12 @@ impl LinearizationPlan {
         } else {
             &[][..]
         };
-        let content_normalize_refs =
-            linearization_content_normalize_refs(pdf, options, prepared_page_refs)?;
+        let content_normalize_refs = linearization_content_normalize_refs(
+            pdf,
+            options,
+            prepared_page_refs,
+            normalized_streams_snapshot,
+        )?; // cov:ignore: LLVM attributes this executed multiline call terminator to the preceding line.
         let mut skipped_raw_stream_parameter_streams: BTreeSet<QpdfObjGen> = BTreeSet::new();
         let mut optimization = crate::optimization::Optimization::optimize(
             pdf,
