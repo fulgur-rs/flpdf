@@ -230,33 +230,41 @@ impl EncryptParams {
 /// an `EncryptionContext` directly, bypassing the normal
 /// password-derivation path.
 ///
-/// The writer accepts the Standard handler matrix qpdf's copy path accepts:
-/// V=1/V=2 RC4, V=4 (canonicalized to AESV2 even when the donor used RC4),
-/// and V=5 R=5/R=6 AESV3. The donor dictionary is an input snapshot; the
-/// writer rebuilds qpdf's canonical `/Encrypt` dictionary rather than copying
-/// arbitrary crypt-filter entries verbatim.
+/// The writer applies qpdf's copy rules without re-validating the donor's
+/// handler: V<4 stays RC4, V=4 is canonicalized to AESV2 even when the donor
+/// used RC4, and V>=5 becomes AESV3. The donor dictionary is an input
+/// snapshot; the writer rebuilds qpdf's canonical `/Encrypt` dictionary
+/// rather than copying arbitrary crypt-filter entries verbatim.
 #[derive(Debug, Clone)]
 pub struct CopyEncryptionSource {
     /// The donor's `/Encrypt` dictionary, copied verbatim.  The writer emits
     /// it as a new indirect object in the output, referencing it from the
     /// trailer's `/Encrypt` entry.
     pub encrypt_dict: ObjectHandle,
-    /// The donor's recovered file encryption key (from
-    /// [`crate::Pdf::encryption_file_key`]).  The writer uses it directly
-    /// instead of re-deriving a key from a password, so that encrypted strings
-    /// and streams are consistent with the copied `/O` / `/U` / `/P` entries.
-    /// Its required length is validated against the donor's `/V`, `/R`, and
-    /// `/Length` before output emission (5/16 bytes for supported valid V<5
-    /// handlers, 32 bytes for V=5). qpdf's writer-side non-integer or
-    /// missing V<5 `/Length` can intentionally produce a zero-length key;
-    /// the writer derives that state from the donor dictionary rather than
-    /// treating this field as absent.
-    ///
     /// `Some(0)` is the actual qpdf writer result for a non-integer or missing
     /// V>1 `/Length`. `None` means the source was constructed without a live
     /// donor snapshot and the writer must read the dictionary itself.
     pub writer_length_bits: Option<i64>,
+    /// The donor's recovered file encryption key (from
+    /// [`crate::Pdf::encryption_file_key`]).
+    ///
+    /// Only the V=5 handler emits this key: qpdf's
+    /// `QPDFWriter::setEncryptionParametersInternal` keeps the donor key for
+    /// V>=5 and re-derives the V<5 key from [`Self::padded_user_password`]
+    /// and the donor's `/Length`, without checking either against the key the
+    /// reader actually authenticated with.
     pub file_key: Vec<u8>,
+    /// The donor's padded user password (qpdf `QPDF::getPaddedUserPassword`,
+    /// `QPDF_encryption.cc:1206-1210`).
+    ///
+    /// For a V<5 donor the writer runs PDF 1.7 §7.6.3.3 Algorithm 2 over
+    /// these bytes to obtain the output file key, exactly as qpdf's
+    /// `copyEncryptionParameters` does. It is the recovered 32-byte padded
+    /// password when the donor was opened with its owner password, the
+    /// supplied password when it was opened with its user password, and
+    /// empty when neither matched (raw-key opens, and V>=5 owner-only
+    /// opens, which do not consume it).
+    pub padded_user_password: Vec<u8>,
     /// The donor's `/ID[0]` bytes.  Copied into the output trailer's `/ID[0]`
     /// position; Algorithm 2 key derivation is pinned to this value.
     pub id0: Vec<u8>,

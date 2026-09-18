@@ -1502,9 +1502,59 @@ qpdf の未使用 `encryption_R` 引数を省略している。これは reader 
 `_encryption_r` は qpdf `QPDFWriter::Members` の state 対応として保持するが、鍵計算へは
 渡さない。
 
+### Copy-encryption の V<5 鍵再導出 (`flpdf-3yn9.48.161`, 2026-09-18)
+
+qpdf の `QPDFWriter::copyEncryptionParameters` は donor の `/V`・`/R`・`/Length`
+（V==1 は固定の 5 バイト）と、`QPDF::getPaddedUserPassword()`
+（`QPDF_encryption.cc:1206-1210`）を `setEncryptionParametersInternal` へ渡す
+（`QPDFWriter.cc:651-702`）。そこでは V>=5 のみ `getEncryptionKey()` の認証済み鍵を
+そのまま使い、V<5 は `QPDF::compute_encryption_key(user_password, EncryptionData(V, R,
+/Length / 8, …))` で鍵を **再導出** する（`QPDFWriter.cc:832-839`、
+`QPDF_encryption.cc:360-403`）。鍵長は `min(16, /Length / 8)` で、donor の handler
+組み合わせも、reader が実際に認証で使った鍵長との整合も、一切検査しない。
+preserve-encryption（primary input）も同じ関数を通る（`QPDFWriter.cc:2099-2101`）。
+
+flpdf は以前 canonical copy builder と `--copy-encryption` の donor 境界
+（`flpdf-cli/src/main.rs`）で `/Length` のレンジ・V/R handler 組み合わせ・
+`file_key.len() == /Length / 8` を検証しており、qpdf に対応物のない独自述語だった。
+この 3 つを撤去し、`CopyEncryptionSource::padded_user_password`
+（`Pdf::writer_copy_encryption_source` が `EncryptionState::user_password` から
+snapshot する）と、qpdf の `compute_encryption_key_from_password` を逐語訳した
+`encryption/standard.rs::compute_encryption_key_from_password` に置き換えた。
+既存の `compute_file_key` / `compute_file_key_v4` は flpdf 側の handler 検証
+（qpdf は reader の `initializeEncryption` で行う）を保ったままこの共有 core へ
+委譲する。検証済み `/Length` は常に `min(16, n) == n` を満たすため出力は不変。
+`/O`・`/U` を 32 バイトへ射影する `v_lt_5_32_byte_parameter` は、qpdf が
+`std::string::c_str()` から 32 バイトを読む挙動（短い entry は over-read）に対し、
+reader 側 `required_v_lt_5_32_byte_string_from_handle` と同じ NUL 埋めを行う。
+なお切り詰め・NUL 埋めのどちらの arm も、認証を通った donor からは到達しない——
+qpdf も flpdf も reader が V<5 の `/O`//`U` を NUL 埋めしたうえで正確に 32 バイトを
+要求し（`QPDF_encryption.cc:805-813`）、40 バイトの `/O` を持つ donor は両者とも
+open 時点で失敗する（実測: qpdf `incorrect length for /O and/or /U in encryption
+dictionary` / flpdf `malformed /Encrypt dictionary: /O entry is not 32 bytes`、
+どちらも exit 2）。この射影が効くのは、任意の辞書から `CopyEncryptionSource` を
+直接構築するライブラリ呼び出しだけである。
+負の `/Length` は qpdf の `QIntC` 変換が投げる `std::range_error` に対応して
+`Error::System` を返す。
+
+`flpdf-cli/tests/cmp_copy_encryption_key_derivation_tests.rs`（whole-file
+`qpdf-zlib-compat` gate、CI 列挙済み）が malformed `/Length`（V2R3 032 / V2R3 240 /
+V5R6 128）と `--password-is-hex-key`（4 長）を `--copy-encryption` / preserve
+両経路で qpdf 11.9.0 と byte 比較する。hex-key 経路では `getPaddedUserPassword()` が
+空のままなので qpdf は空パスワードから鍵を導出し、qpdf 自身の出力が qpdf 自身の
+`--check` を通らなくなるが、CLAUDE.md の oracle 方針に従い flpdf もその出力を再現する。
+
+**残る逸脱**: V=4 donor の `/Length 040` は 5 バイトの file key、すなわち 14 バイトの
+per-object AES key を生む。qpdf はそのバッファを crypto provider に渡し、provider は
+24/32 以外の長さを AES-128 に写して 16 バイトを読む（`QPDFCrypto_gnutls.cc:197-213`、
+`QPDFCrypto_openssl.cc:225-241`）ため、末尾 2 バイトは未定義の over-read になる。
+flpdf は既存方針どおりこれを捏造せず拒否する（`pipeline/aes.rs` と
+`writer/encrypted_strings.rs` の `qpdf-deviation` マーカー、および本節下表の
+`QPDF_encryption.cc` 行の記載）。この 1 形状だけ exit code が qpdf と異なる。
+
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDF_encryption.cc` | 1410 | `encryption.rs` (facade) + `encryption/state.rs` + `encryption/crypt_filters.rs` + `encryption/keys.rs` + `encryption/standard.rs`(1879) + `encryption/permissions.rs`(206) + `encryption/password.rs`(380: `password_bytes_for_read` + `password_candidates_for_read` — qpdf `QPDFJob.cc:1734-1790` の read-side hex decode、raw-byte pass-through、alternate encoding retry と suppress gate、`QUtil.cc:1821-1900` の PDFDoc/WinAnsi/MacRoman candidates、V=5 の 127-byte 切り詰めは Standard handler が担当。`--password-is-hex-key` は `QPDF_encryption.cc:933-934` の通り decoded key に通常の 32-byte 上限を適用せず、`QPDFJob.cc:1245-1252` の JSON bits も実 key 長を報告する。AES provider は 16/24/32 以外の鍵長を AES-128（先頭 16 バイト、`QPDFCrypto_gnutls.cc:197-213` / `QPDFCrypto_openssl.cc:225-244` の default arm）へ投影し、24 バイトは AES-192 を選ぶ。16 バイト未満は qpdf が鍵バッファを over-read する未定義挙動のため flpdf は拒否する（`qpdf-deviation` マーカー）) | 🔀 |
+| `QPDF_encryption.cc` | 1410 | `encryption.rs` (facade) + `encryption/state.rs` + `encryption/crypt_filters.rs` + `encryption/keys.rs` + `encryption/standard.rs`(1879) + `encryption/permissions.rs`(206) + `encryption/password.rs`(380: `password_bytes_for_read` + `password_candidates_for_read` — qpdf `QPDFJob.cc:1734-1790` の read-side hex decode、raw-byte pass-through、alternate encoding retry と suppress gate、`QUtil.cc:1821-1900` の PDFDoc/WinAnsi/MacRoman candidates、V=5 の 127-byte 切り詰めは Standard handler が担当。`--password-is-hex-key` は `QPDF_encryption.cc:933-934` の通り decoded key に通常の 32-byte 上限を適用せず、`QPDFJob.cc:1245-1252` の JSON bits も実 key 長を報告する。AES provider は 16/24/32 以外の鍵長を AES-128（先頭 16 バイト、`QPDFCrypto_gnutls.cc:197-213` / `QPDFCrypto_openssl.cc:225-244` の default arm）へ投影し、24 バイトは AES-192 を選ぶ。16 バイト未満は qpdf が鍵バッファを over-read する未定義挙動のため flpdf は拒否する（reader 側 `encryption/state.rs::aes128_object_key` と writer 側 `writer/encrypted_strings.rs` / `pipeline/aes.rs` の `qpdf-deviation` マーカー。writer 側は copy-encryption の V=4 `/Length 040` donor から到達する）) | 🔀 |
 | `rijndael.cc` / `AES_PDF_native` / `MD5_native` / `SHA2_native` | 1668 | `encryption/primitives.rs`(106: AES single-block ECB と MD5) + `pipeline/sha2.rs` の `Sha2Digest`(SHA2)（外部 crate）。AES-CBC は `pipeline/aes.rs` の `PlAesPdf` に一本化済みで、`encryption/primitives.rs` には V=5 R=6 Algorithm 10/13 の single-block ECB だけが残る。qpdf は `SHA2_native` へ `Pl_SHA2` 経由でしか到達しない（`QPDF_encryption.cc:246,296` が唯一の production 利用）ため、RustCrypto の SHA-2 hasher も `Pl_SHA2` 移植の内部に閉じている。`encryption/primitives.rs` の一括 `sha256`/`sha384`/`sha512` wrapper は consumer cutover で削除済み | ⚪ |
 | `RC4.cc` / `RC4_native.cc` | 63 | `encryption/rc4.rs`(80)（明示長キー / C-string キー、state 保持、separate / in-place processing） | ✅ |
 | `QPDFCryptoProvider.cc` / `QPDFCrypto_*` | 774 | provider 抽象が無い | ⚪ |

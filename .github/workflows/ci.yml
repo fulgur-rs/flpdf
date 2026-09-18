@@ -397,6 +397,13 @@ jobs:
           # plain `cargo test` step above runs this same file under default
           # features, where those two tests are compiled out.
           cargo test -p flpdf-cli --features qpdf-zlib-compat --test encrypt_cli_tests
+          # Pins the V<5 copy-encryption key re-derivation
+          # (setEncryptionParametersInternal re-derives from
+          # getPaddedUserPassword() at the donor /Length, QPDFWriter.cc:832-839)
+          # for malformed /Length donors and --password-is-hex-key, on both the
+          # --copy-encryption and preserve-encryption routes. Whole-file gated
+          # on qpdf-zlib-compat; must be run explicitly here.
+          cargo test -p flpdf-cli --features qpdf-zlib-compat --test cmp_copy_encryption_key_derivation_tests
           # Pins the `flpdf rewrite --static-id` baseline snapshot vs qpdf
           # goldens. Gated behind qpdf-zlib-compat so the golden reflects
           # true qpdf byte-parity; under the default miniz backend the test
