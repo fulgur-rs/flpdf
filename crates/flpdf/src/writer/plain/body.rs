@@ -2383,11 +2383,10 @@ pub(crate) fn canonical_stream_will_be_refiltered_with_policy(
     apply_full_rewrite_metadata_policy: bool,
     normalize_content: bool,
 ) -> crate::Result<bool> {
-    // Token filters are stateful qpdf ValueSetter-style consumers. Modified
-    // streams are handled by the explicitly linearized-only probe below.
-    if handle.is_data_modified() {
-        return Ok(false);
-    }
+    // Token filters are stateful qpdf ValueSetter-style consumers. The plain
+    // and linearized callers must share the same qpdf-shaped probe so a
+    // modified stream still crosses the pipe/retry boundary before the
+    // caller observes the `filtered` result.
     canonical_stream_filter_probe(
         handle,
         options,
@@ -3077,9 +3076,9 @@ mod final_handle_tests {
     }
 
     #[test]
-    fn modified_streams_bypass_the_linearization_refilter_probe() -> crate::Result<()> {
-        // cov:ignore-start: the filter only marks the stream as modified; the
-        // probe returns before qpdf would invoke the token callback.
+    fn modified_streams_use_the_canonical_refilter_probe() -> crate::Result<()> {
+        // cov:ignore-start: the filter marks the stream as modified; this
+        // fixture exists to exercise the writer's probe boundary.
         struct PassThrough;
         impl TokenFilter for PassThrough {
             fn handle_token(
@@ -3092,15 +3091,22 @@ mod final_handle_tests {
         }
         // cov:ignore-end
 
-        let pdf = crate::Pdf::empty()?;
-        let stream = pdf.new_stream_with_data(Rc::new(b"q Q".to_vec()))?;
+        let mut pdf = crate::Pdf::open(std::io::Cursor::new(unfiltered_stream_probe_pdf()))?;
+        let stream = pdf.get_object_handle(ObjectRef::new(4, 0));
+        stream.try_dereference()?;
         stream.add_token_filter(Rc::new(RefCell::new(PassThrough)))?;
+        let before = pdf.source_last_offset();
         assert!(!super::canonical_stream_will_be_refiltered_with_policy(
             &stream,
             &WriterOptions::default(),
             true,
             false,
         )?); // cov:ignore: the probe's boolean result is the assertion under test.
+        assert_ne!(
+            pdf.source_last_offset(),
+            before,
+            "the canonical modified-stream probe must pipe once before returning false"
+        );
         Ok(())
     }
 
