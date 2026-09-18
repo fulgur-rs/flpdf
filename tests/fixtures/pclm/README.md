@@ -17,6 +17,7 @@ The goldens are qpdf 11.9.0 output with `setStaticID(true)`:
 | `mini-pclm-qdf.pdf` | `setPCLm(true)` + `setQDFMode(true)` |
 | `mini-pclm-objstm.pdf` | `setPCLm(true)` + `setObjectStreamMode(qpdf_o_generate)` |
 | `mini-pclm-direct-root-out.pdf` | `setPCLm(true)`, direct-Catalog input |
+| `mini-pclm-ext-indirect-objstm.pdf` | `setPCLm(true)` + `setObjectStreamMode(qpdf_o_generate)`, indirect Catalog `/Extensions` |
 
 qpdf's CLI has no `--pclm` flag, so `generate.sh` builds a small C++ oracle
 against the pinned qpdf headers and the system `libqpdf.so.29`, and self-checks

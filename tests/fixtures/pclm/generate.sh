@@ -71,3 +71,6 @@ done
 
 "$workdir/oracle" "$here/mini-pclm-direct-root-in.pdf" \
     "$here/mini-pclm-direct-root-out.pdf" pclm
+
+"$workdir/oracle" "$here/mini-pclm-ext-indirect-in.pdf" \
+    "$here/mini-pclm-ext-indirect-objstm.pdf" pclm objstm
