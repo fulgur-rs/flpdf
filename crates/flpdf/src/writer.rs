@@ -1788,6 +1788,24 @@ impl SpecialStreams {
     pub(crate) fn normalized_streams_raw(&self) -> &BTreeSet<QpdfObjGen> {
         &self.normalized_streams_raw
     }
+
+    /// qpdf's `initializeSpecialStreams` builds `page_to_seq`/`object_to_seq`
+    /// once, before either output route runs (`QPDFWriter.cc:1774-1781,
+    /// 1914-1931`). The plain live QDF/normalize route's marker text
+    /// (`%% Page N` / `%% Contents for page N`) and content-normalization
+    /// membership gate must read this same setup-time snapshot rather than
+    /// repeat the page walk at emission time, so a page-tree mutation
+    /// between setup and body emission cannot make the two disagree.
+    pub(crate) fn page_and_contents_sequences(
+        &self,
+    ) -> (BTreeMap<ObjectRef, usize>, BTreeMap<ObjectRef, usize>) {
+        let to_btreemap = |map: &HashMap<ObjectRef, u32>| -> BTreeMap<ObjectRef, usize> {
+            map.iter()
+                .map(|(&object_ref, &sequence)| (object_ref, sequence as usize))
+                .collect()
+        };
+        (to_btreemap(&self.page_seq), to_btreemap(&self.contents_seq))
+    }
 }
 
 /// Build qpdf's page/content maps once for the writer setup trigger.
@@ -3594,6 +3612,13 @@ fn collect_content_container_refs<R: Read + Seek>(
 /// the writer pre-scan deliberately does not issue the `getPageContents`
 /// damage warning for a non-stream array member, because qpdf's writer
 /// pre-scan only asks each child whether it is a stream.
+///
+/// Production now reads the equivalent `ObjectRef` set from
+/// [`SpecialStreams::page_and_contents_sequences`], computed once at setup;
+/// this projection remains only for the `#[cfg(test)]`
+/// `writer::plain::body::qdf_page_context` helper that re-derives the same
+/// maps for unit tests calling `emit_live` directly.
+#[cfg(test)]
 pub(crate) fn collect_content_stream_refs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
