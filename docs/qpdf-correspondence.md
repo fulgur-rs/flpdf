@@ -2272,6 +2272,25 @@ range errors は
 `Endpoint` / `PageRangeEntry` / `Parity` の public visibility debt、qtest
 exceptions、overlay 全体の owner cutoverはこの限定sliceの対象外である。
 
+2026-09-19（`flpdf-3yn9.48.179`）で、上記の `Endpoint` / `PageRangeEntry` /
+`Parity` visibility debt を解消した。3型は `PageRange` が `raw: Vec<u8>` へ
+一本化される前の構造化endpoint語彙の名残で、qpdf 側に対応物が無く
+（`QUtil::parse_numrange` は `std::vector<int>` を返すのみ）、
+`.claude/rules/qpdf-port-design-patterns.md` 8 の rule-8 4根拠
+（qpdf 側 public 対応／`QPDFJob` public method 経由／crate doc 明記／
+legitimate な pub シグネチャの支援型）をいずれも満たさず、かつ
+re-export chain 以外にクレート内の呼び出しが一切無かった（`pub(crate)` に
+狭めるプローブで `-D warnings` 下の `dead_code` エラー 3 件を実測し、
+narrowing では閉じられないことを確認した）ため、3型と `job/mod.rs` /
+`lib.rs` の re-export を削除した。page-operation/overlay の owner closure も
+併せて確認した：overlay の `--from`/`--to`/`--repeat` は `QPDFJob.cc:
+1827,1837,1839` と同じ page count（source/dest/source）で
+`PageRange::resolve` を呼び、page-operation の `PagePlan::build` も
+`QPDFJob.cc:266` と同じく source 自身の page count で呼んでおり、qpdf との
+不整合は無い。`qutil::parse_numrange` 自体は rotation parser／lifecycle／
+CLI から直接到達する複数 entrypoint が残るため、E-15 行の分類は `mixed`
+のまま。
+
 rotationのpage countは`QPDFJob::handleRotations` (`QPDFJob.cc:2638`) の`QIntC::to_int(size_t)`に合わせ、共有`qutil::qpdf_size_to_int`でchecked narrowingする。empty documentでも`parse_numrange(range, 0)`とsigned `pageno` filterを通過させ、先行empty guardや飽和値は置かない。
 
 `flpdf-nv86` では、`--empty --is-encrypted` / `--empty --requires-password` を qpdf 11.9.0 と同じく「空 document は unencrypted」として無言の exit 2 にする。`run_encryption_status` は input filename を要求する前に empty-input の status resultを返し、通常の file-backed status queryの open/error/report境界は変更しない (`QPDFJob.cc:429-456,535-557`)。

@@ -50,7 +50,7 @@ markdown だけを読むので `--no-qpdf`（CI の形）でも完全に動く�
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 118 | 0 | 42 | 0 | 160 |
+| 119 | 0 | 41 | 0 | 160 |
 
 ### checker logical aggregate（259 rows）
 
@@ -63,7 +63,7 @@ rowsを検証する。2026-09-18 の現行 `origin/main` (`4942e7b3f7fbeb2a2d79e
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 199 | 0 | 60 | 0 | 259 |
+| 200 | 0 | 59 | 0 | 259 |
 
 したがって、160行の領域別表と259 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
@@ -142,7 +142,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 | [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 25 | 0 | 9 | 0 |
 | [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 40 | 0 | 2 | 0 |
 | [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 17 | 0 | 14 | 0 |
-| [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 18 | 0 | 11 | 0 |
+| [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 19 | 0 | 10 | 0 |
 
 ## 5. 責任境界と不変条件
 
