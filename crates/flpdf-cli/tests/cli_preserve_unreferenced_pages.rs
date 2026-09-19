@@ -7,6 +7,7 @@
 //! those objects as well.
 
 use assert_cmd::Command;
+use predicates::prelude::*;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command as ShellCommand;
@@ -382,6 +383,62 @@ fn multi_source_rewrite_pages_collate_matches_qpdf() {
         flpdf_qdf, qpdf_qdf,
         "rewrite --pages --collate multi-source output must match qpdf's collate order and structure"
     );
+}
+
+/// `run_page_extraction_from_multiple_sources` reports a missing primary
+/// through `QPDFJob::create_qpdf`'s canonical `report_job_error` path (the
+/// `None` arm) now, rather than the CLI-local `open_page_source`'s own error
+/// formatting. qpdf's own wording for a missing input is `open <path>: No
+/// such file or directory` (`libqpdf/QPDFJob.cc:2129-2130`, `QUtil::strerror`)
+/// -- pinned here byte-for-byte against the real qpdf 11.9.0 binary.
+#[test]
+fn multi_source_rewrite_pages_missing_primary_matches_qpdf_open_wording() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("qpdf 11.9.0 is required for this parity test on CI");
+        }
+        eprintln!("skipping: qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let secondary = fixture("one-page.pdf");
+    let missing = temp.path().join("does-not-exist.pdf");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+
+    let qpdf_result = run_qpdf(&[
+        "--pages",
+        ".",
+        "1",
+        secondary.to_str().unwrap(),
+        "1",
+        "--",
+        missing.to_str().unwrap(),
+        qpdf_output.to_str().unwrap(),
+    ]);
+    assert!(
+        !qpdf_result.status.success(),
+        "qpdf is expected to reject a missing primary input"
+    );
+    let qpdf_stderr = String::from_utf8_lossy(&qpdf_result.stderr).into_owned();
+    assert!(
+        qpdf_stderr.contains("No such file or directory"),
+        "unexpected qpdf stderr for a missing primary: {qpdf_stderr}"
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--pages", "."])
+        .arg("1")
+        .arg(&secondary)
+        .arg("1")
+        .arg("--")
+        .arg(&missing)
+        .arg(temp.path().join("flpdf.pdf"))
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("No such file or directory"));
 }
 
 /// A preserved orphan may reference the primary's own structural roots
