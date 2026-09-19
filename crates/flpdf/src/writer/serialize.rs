@@ -260,16 +260,14 @@ pub(crate) mod xref_stream {
     //! feature). The structural encoding (rows, predictor, key order, field widths)
     //! is backend-independent.
 
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
 
     use crate::pipeline::buffer::Buffer;
     use crate::pipeline::flate::{Flate, FlateAction, DEFAULT_OUT_BUFFER_SIZE};
     use crate::pipeline::png_filter::{PngFilter, PngFilterAction};
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
 
-    use crate::writer::object::ObjectWriterEmission;
     use crate::writer::output::{decimal_u64_len, write_decimal_u64, write_object_ref, OutputSink};
-    use crate::ObjectHandle;
     use crate::ObjectRef;
     use crate::Result;
 
@@ -460,25 +458,26 @@ pub(crate) mod xref_stream {
         /// `/Root` reference, when present (omitted on the main xref stream, which
         /// is reached only via the first-page stream's `/Prev` chain).
         pub root: Option<ObjectRef>,
-        /// Pre-serialized direct `/Root` value retained by the legacy
-        /// linearized/fallback callers. Plain output uses `live_root_value`.
+        /// Pre-serialized direct `/Root` value for the linearized/fallback
+        /// callers below that use this struct's `canonical_entries` shape.
+        /// The plain (non-linearized) writer's xref-stream route reaches its
+        /// live direct `/Root` through
+        /// `crate::writer::object::write_trailer_with_ref_map_and_kind_and_direct_root`
+        /// instead (D14: the classic table and xref-stream routes share that
+        /// one trailer owner rather than each holding a live-handle field
+        /// here).
         pub root_value: Option<&'a [u8]>,
-        /// Live direct `/Root` value for the plain non-linearized route.
-        pub live_root_value: Option<&'a ObjectHandle>,
         /// `/Size` — the highest object number plus one.
         pub size: u32,
         /// `/Prev` byte offset of the previous xref stream (left-justified in a
         /// [`PREV_FIELD_WIDTH`] field); `None` on the chain's final (main) stream.
         pub prev: Option<u64>,
-        /// Canonical entries from a live ObjectHandle trailer. Keys are decoded
-        /// and values are already serialized with the writer reference map, so
-        /// the xref route does not reconstruct trailer data from a stale
+        /// Pre-serialized trailer entries from a live ObjectHandle trailer.
+        /// Keys are decoded and values are already serialized with the
+        /// writer reference map, so this struct does not itself hold a live
+        /// trailer handle: the linearized writer builds these bytes in a
+        /// separate two-pass pipeline before reaching this dictionary.
         pub canonical_entries: Option<&'a [(Vec<u8>, Vec<u8>)]>,
-        /// Live trailer metadata for the plain non-linearized route. Values
-        /// are serialized directly to `OutputSink` in sorted key order.
-        pub live_trailer: Option<&'a ObjectHandle>,
-        pub live_map: Option<&'a dyn Fn(ObjectRef) -> Result<ObjectRef>>,
-        pub live_removed_refs: Option<&'a BTreeSet<ObjectRef>>,
         /// Trailer `/ID` as two raw byte strings, serialized as `<hex><hex>`.
         pub id: Option<(&'a [u8], &'a [u8])>,
         /// Trailer `/Encrypt` reference. qpdf emits this after `/ID` on the
@@ -496,17 +495,24 @@ pub(crate) mod xref_stream {
         Ok(())
     }
 
-    /// Write the xref-stream object header and every dictionary key up to (but not
-    /// including) `/ID`, in qpdf's fixed order: `/Type /Length /Filter /DecodeParms
-    /// /W [/Index]`, then the sorted trimmed trailer entries (including generated
-    /// `/Root` and `/Size`, with `/Prev` immediately after `/Size`). The caller
-    /// appends `/ID` (concrete or inline-written) and the stream framing. QDF uses
-    /// qpdf's newline-plus-two-space layout; `/Index` remains on the `/W` line,
-    /// matching `QPDFWriter::writeXRefStream`.
-    fn write_object_dict_prefix(
+    /// Write the fixed xref-stream dictionary header — the object header line
+    /// through `/W [...]` and the optional `/Index [...]` — in qpdf's fixed
+    /// key order: `/Type /Length /Filter /DecodeParms /W [/Index]`
+    /// (`QPDFWriter::writeXRefStream`, `libqpdf/QPDFWriter.cc:2465-2481`).
+    ///
+    /// This is exactly the part of the xref-stream dictionary that precedes
+    /// qpdf's `writeTrailer(which, size, xref_stream=true, ...)` call
+    /// (`QPDFWriter.cc:2481`): the caller supplies the trailer keys, `/ID`,
+    /// `/Encrypt`, and the closing `>>` through that single trailer owner
+    /// (`crate::writer::object::write_trailer_with_ref_map_and_kind`/
+    /// `_and_direct_root`), then appends the stream framing. QDF uses qpdf's
+    /// newline-plus-two-space layout.
+    pub(crate) fn write_xref_stream_dict_header(
         out: &mut OutputSink<'_>,
         object: ObjectRef,
-        dict: &XrefStreamDict,
+        filtered: bool,
+        widths: XrefWidths,
+        index: Option<(u32, u32)>,
         payload_len: usize,
         qdf: bool,
     ) -> Result<()> {
@@ -523,7 +529,7 @@ pub(crate) mod xref_stream {
             out.write_bytes(b" /Length ")?;
             write_decimal_u64(out, payload_len as u64)?;
         }
-        if dict.filtered {
+        if filtered {
             if qdf {
                 // cov:ignore-start: qpdf never filters a QDF structural stream
                 out.write_bytes(b"\n  /Filter /FlateDecode /DecodeParms << /Columns ")?;
@@ -531,7 +537,7 @@ pub(crate) mod xref_stream {
             } else {
                 out.write_bytes(b" /Filter /FlateDecode /DecodeParms << /Columns ")?;
             }
-            write_decimal_u64(out, columns(dict.widths) as u64)?;
+            write_decimal_u64(out, columns(widths) as u64)?;
             out.write_bytes(b" /Predictor 12 >>")?;
         }
         if qdf {
@@ -539,60 +545,81 @@ pub(crate) mod xref_stream {
         } else {
             out.write_bytes(b" /W [ ")?;
         }
-        write_decimal_u64(out, u64::from(dict.widths[0]))?;
+        write_decimal_u64(out, u64::from(widths[0]))?;
         out.write_bytes(b" ")?;
-        write_decimal_u64(out, u64::from(dict.widths[1]))?;
+        write_decimal_u64(out, u64::from(widths[1]))?;
         out.write_bytes(b" ")?;
-        write_decimal_u64(out, u64::from(dict.widths[2]))?;
+        write_decimal_u64(out, u64::from(widths[2]))?;
         out.write_bytes(b" ]")?; // cov:ignore: LLVM maps the covered xref width write continuation to this line
-        if let Some((start, count)) = dict.index {
+        if let Some((start, count)) = index {
             out.write_bytes(b" /Index [ ")?;
             write_decimal_u64(out, u64::from(start))?;
             out.write_bytes(b" ")?;
             write_decimal_u64(out, u64::from(count))?;
             out.write_bytes(b" ]")?;
         }
-        if let Some(trailer) = dict.live_trailer {
-            let map = dict.live_map.ok_or_else(|| {
-                crate::Error::Internal(
-                    "plain writer live trailer is missing its reference map".to_string(),
-                )
-            })?;
-            let removed_refs = dict.live_removed_refs.ok_or_else(|| {
-                crate::Error::Internal(
-                    "plain writer live trailer is missing its removed-reference set".to_string(),
-                )
-            })?;
-            write_live_trailer_entries(out, trailer, dict, qdf, map, removed_refs)?;
-        } else {
-            let mut entries = dict
-                .canonical_entries
-                .map_or_else(Vec::new, ToOwned::to_owned);
-            if let Some(info) = dict.info {
-                entries.push((
-                    b"/Info".to_vec(),
-                    format!("{} {} R", info.number, info.generation).into_bytes(),
-                ));
-            }
-            if let Some(root) = dict.root {
-                entries.push((
-                    b"/Root".to_vec(),
-                    format!("{} {} R", root.number, root.generation).into_bytes(),
-                ));
-            } else if let Some(root) = dict.root_value {
-                entries.push((b"/Root".to_vec(), root.to_vec()));
-            }
-            entries.push((b"/Size".to_vec(), dict.size.to_string().into_bytes()));
-            entries.sort_by(|left, right| left.0.cmp(&right.0));
-            for (key, value) in entries {
-                write_xref_dictionary_entry_prefix(out, qdf, &key)?;
-                out.write_bytes(&value)?;
-                if key == b"/Size" {
-                    if let Some(prev) = dict.prev {
-                        out.write_bytes(b" /Prev ")?;
-                        write_decimal_u64(out, prev)?;
-                        push_spaces(out, PREV_FIELD_WIDTH.saturating_sub(decimal_u64_len(prev)))?;
-                    }
+        Ok(())
+    }
+
+    /// Write the xref-stream object header and every dictionary key up to (but not
+    /// including) `/ID`, in qpdf's fixed order: `/Type /Length /Filter /DecodeParms
+    /// /W [/Index]`, then the sorted trimmed trailer entries (including generated
+    /// `/Root` and `/Size`, with `/Prev` immediately after `/Size`). The caller
+    /// appends `/ID` (concrete or inline-written) and the stream framing.
+    ///
+    /// The canonical (pre-serialized `canonical_entries`) shape below is the
+    /// linearization writer's route, which assembles trailer bytes in a
+    /// separate two-pass pipeline that never holds a live `ObjectHandle`
+    /// trailer at this call site. The plain (non-linearized) writer's
+    /// xref-stream route instead calls [`write_xref_stream_dict_header`]
+    /// directly and reaches the trailer through
+    /// `crate::writer::object::write_trailer_with_ref_map_and_kind`/
+    /// `_and_direct_root` with `xref_stream: true` — the same owner the
+    /// classic table route uses — so this function only ever needs the
+    /// canonical form.
+    fn write_object_dict_prefix(
+        out: &mut OutputSink<'_>,
+        object: ObjectRef,
+        dict: &XrefStreamDict,
+        payload_len: usize,
+        qdf: bool,
+    ) -> Result<()> {
+        write_xref_stream_dict_header(
+            out,
+            object,
+            dict.filtered,
+            dict.widths,
+            dict.index,
+            payload_len,
+            qdf,
+        )?; // cov:ignore: covered multiline call; LLVM attributes this terminator to the call setup
+        let mut entries = dict
+            .canonical_entries
+            .map_or_else(Vec::new, ToOwned::to_owned);
+        if let Some(info) = dict.info {
+            entries.push((
+                b"/Info".to_vec(),
+                format!("{} {} R", info.number, info.generation).into_bytes(),
+            ));
+        }
+        if let Some(root) = dict.root {
+            entries.push((
+                b"/Root".to_vec(),
+                format!("{} {} R", root.number, root.generation).into_bytes(),
+            ));
+        } else if let Some(root) = dict.root_value {
+            entries.push((b"/Root".to_vec(), root.to_vec()));
+        }
+        entries.push((b"/Size".to_vec(), dict.size.to_string().into_bytes()));
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        for (key, value) in entries {
+            write_xref_dictionary_entry_prefix(out, qdf, &key)?;
+            out.write_bytes(&value)?;
+            if key == b"/Size" {
+                if let Some(prev) = dict.prev {
+                    out.write_bytes(b" /Prev ")?;
+                    write_decimal_u64(out, prev)?;
+                    push_spaces(out, PREV_FIELD_WIDTH.saturating_sub(decimal_u64_len(prev)))?;
                 }
             }
         }
@@ -618,110 +645,6 @@ pub(crate) mod xref_stream {
             out.write_bytes(b" ")?;
         }
         Ok(())
-    }
-
-    fn write_live_trailer_entries(
-        out: &mut OutputSink<'_>,
-        trailer: &ObjectHandle,
-        dict: &XrefStreamDict<'_>,
-        qdf: bool,
-        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
-        removed_refs: &BTreeSet<ObjectRef>,
-    ) -> Result<()> {
-        let entries = trailer.try_as_dictionary()?.unwrap_or_default();
-        let mut keys = BTreeSet::new();
-        for key in entries.keys() {
-            if !is_writer_owned_trailer_key(key) {
-                keys.insert(key.clone());
-            }
-        }
-        if dict.root.is_some() || dict.live_root_value.is_some() {
-            keys.insert(b"/Root".to_vec());
-        }
-        // qpdf's normal writeTrailer path emits the computed `/Size` only when
-        // the input trailer already had that literal key. The linearized
-        // second-half `/Size`-only form is a separate caller and does not use
-        // this live plain-trailer helper (`QPDFWriter.cc:1170-1172,1174-1192`).
-        // `contains_key` is not the same predicate: qpdf's `getKeys()` omits a
-        // key whose value is null (`QPDF_Dictionary.cc:getKeys`), so a trailer
-        // carrying `/Size null` has no visible `/Size` and gets no computed one.
-        if trailer.try_has_key(b"/Size")? {
-            keys.insert(b"/Size".to_vec());
-        }
-
-        for key in keys {
-            if key == b"/Root" {
-                write_xref_dictionary_entry_prefix(out, qdf, &key)?;
-                if let Some(root) = dict.root {
-                    let mapped = root;
-                    write_object_ref(out, mapped)?; // cov:ignore: LLVM maps the covered mapped-root xref dictionary call continuation to this line
-                } else if let Some(root) = dict.live_root_value {
-                    if qdf {
-                        root.write_object_qdf_with_ref_map_and_removed(out, 0, map, removed_refs)?;
-                    } else {
-                        crate::writer::object::write_object_with_ref_map_and_direct_streams(
-                            root,
-                            out,
-                            map,
-                            removed_refs,
-                            false,
-                        )?; // cov:ignore: live-root serialization is exercised by the direct-root differential; LLVM maps this continuation to the call setup.
-                    }
-                } // cov:ignore: LLVM maps the covered live-root branch exit to this line
-                continue; // cov:ignore: every emitted live-root key is handled before the next key
-            }
-            if key == b"/Size" {
-                write_xref_dictionary_entry_prefix(out, qdf, &key)?;
-                write_decimal_u64(out, u64::from(dict.size))?;
-                if let Some(prev) = dict.prev {
-                    out.write_bytes(b" /Prev ")?;
-                    write_decimal_u64(out, prev)?;
-                    push_spaces(out, PREV_FIELD_WIDTH.saturating_sub(decimal_u64_len(prev)))?;
-                }
-                continue;
-            }
-
-            let Some(value) = entries.get(&key) else {
-                continue; // cov:ignore: the key set is derived from the same trailer entry map
-            };
-            if value.object_ref().is_some_and(|object_ref| {
-                object_ref.number == 0 || removed_refs.contains(&object_ref)
-            }) || value.try_is_null()?
-            {
-                continue;
-            }
-            write_xref_dictionary_entry_prefix(out, qdf, &key)?;
-            if let Some(object_ref) = value.object_ref() {
-                let mapped = map(object_ref).map_err(|_| {
-                    crate::Error::Unsupported(format!(
-                        "plain writer: trailer /{} reference {object_ref} absent from renumber map",
-                        String::from_utf8_lossy(key.strip_prefix(b"/").unwrap_or(&key))
-                    ))
-                })?;
-                write_object_ref(out, mapped)?;
-            } else {
-                value.write_object_with_ref_map_and_removed(out, map, removed_refs)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn is_writer_owned_trailer_key(key: &[u8]) -> bool {
-        matches!(
-            key,
-            b"/ID"
-                | b"/Encrypt"
-                | b"/Prev"
-                | b"/Root"
-                | b"/Size"
-                | b"/Type"
-                | b"/W"
-                | b"/Index"
-                | b"/Length"
-                | b"/Filter"
-                | b"/DecodeParms"
-                | b"/XRefStm"
-        )
     }
 
     fn write_qpdf_dictionary_key(out: &mut OutputSink<'_>, key: &[u8]) -> Result<()> {
@@ -1175,13 +1098,9 @@ pub(crate) mod xref_stream {
                 info: None,
                 root: None,
                 root_value: None,
-                live_root_value: None,
                 size: 2,
                 prev: None,
                 canonical_entries: None,
-                live_trailer: None,
-                live_map: None,
-                live_removed_refs: None,
                 id: None,
                 encrypt: None,
             }
@@ -1297,36 +1216,15 @@ pub(crate) mod xref_stream {
             assert_eq!(max_offset_for_range(&offsets, 0, 2), 65_536);
         }
 
+        // D14: the plain (non-linearized) writer's xref-stream route no
+        // longer holds a live ObjectHandle trailer in this dictionary — it
+        // reaches trailer keys, /ID, /Encrypt, and the closing `>>` through
+        // `crate::writer::object::write_trailer_with_ref_map_and_kind_and_direct_root`
+        // instead, the same owner the classic table route uses. That
+        // direct-root + qdf coverage now lives with its production caller:
+        // `writer::plain::xref::tests::xref_stream_direct_root_shares_the_classic_trailer_owner`.
         #[test]
-        fn live_xref_trailer_requires_both_reference_policy_inputs() {
-            let trailer = ObjectHandle::dictionary(Vec::new());
-            let mut output = Vec::new();
-            let mut dict = XrefStreamDict {
-                live_trailer: Some(&trailer),
-                ..base_dict()
-            };
-            let error = crate::writer::output::with_buffer_sink(&mut output, |out| {
-                write_object(out, ObjectRef::new(2, 0), &dict, b"xref")
-            })
-            .expect_err("live trailer without a map must fail");
-            assert!(
-                matches!(error, crate::Error::Internal(message) if message.contains("reference map"))
-            );
-
-            let map = |object_ref| Ok(object_ref);
-            dict.live_map = Some(&map);
-            output.clear();
-            let error = crate::writer::output::with_buffer_sink(&mut output, |out| {
-                write_object(out, ObjectRef::new(2, 0), &dict, b"xref")
-            })
-            .expect_err("live trailer without removed-reference policy must fail");
-            assert!(
-                matches!(error, crate::Error::Internal(message) if message.contains("removed-reference set"))
-            );
-        }
-
-        #[test]
-        fn xref_dictionary_covers_canonical_and_live_direct_root_layouts() {
+        fn xref_dictionary_covers_the_canonical_index_root_size_prev_and_encrypt_layout() {
             let canonical = XrefStreamDict {
                 index: Some((3, 2)),
                 info: Some(ObjectRef::new(7, 0)),
@@ -1346,43 +1244,6 @@ pub(crate) mod xref_stream {
             assert!(text.contains("/Root << /Type /Catalog >>"));
             assert!(text.contains("/Size 2 /Prev 41"));
             assert!(text.contains("/Encrypt 8 0 R"));
-
-            let direct_root = ObjectHandle::dictionary(vec![(
-                b"/Type".to_vec(),
-                ObjectHandle::name(b"Catalog".to_vec()),
-            )]);
-            let trailer = ObjectHandle::dictionary(vec![
-                (b"/Custom".to_vec(), ObjectHandle::integer(9)),
-                (b"/Null".to_vec(), ObjectHandle::null()),
-                (b"/Size".to_vec(), ObjectHandle::integer(99)),
-            ]);
-            let map = |object_ref| Ok(object_ref);
-            let removed = BTreeSet::new();
-            for qdf in [false, true] {
-                let dict = XrefStreamDict {
-                    live_root_value: Some(&direct_root),
-                    live_trailer: Some(&trailer),
-                    live_map: Some(&map),
-                    live_removed_refs: Some(&removed),
-                    prev: Some(17),
-                    ..base_dict()
-                };
-                let layout = XrefStreamLayout {
-                    widths: dict.widths,
-                    payload: b"xref".to_vec(),
-                };
-                let mut output = Vec::new();
-                crate::writer::output::with_buffer_sink(&mut output, |out| {
-                    write_xref_stream(out, ObjectRef::new(2, 0), &dict, &layout, qdf, None)
-                })
-                .expect("live direct-root xref dictionary");
-                let text = String::from_utf8(output).unwrap();
-                assert!(text.contains("/Root"));
-                assert!(text.contains("/Type /Catalog"));
-                assert!(text.contains("/Custom 9"));
-                assert!(text.contains("/Size 2 /Prev 17"));
-                assert!(!text.contains("/Null"));
-            }
         }
     }
 }

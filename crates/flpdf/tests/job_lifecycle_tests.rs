@@ -4866,6 +4866,29 @@ fn inspection_completes_through_the_shared_warning_boundary() {
     );
 }
 
+/// `complete_report` is the same `writeQPDF` completion tail as
+/// [`inspection_completes_through_the_shared_warning_boundary`]'s
+/// `inspect(pdf, |_| Ok(()))`, factored out for a report-only consumer that
+/// has already recorded its own warning state and has no document (or a
+/// document from a different job) to hand `inspect` for the drain step.
+#[test]
+fn complete_report_completes_through_the_shared_warning_boundary() {
+    let mut job = QPDFJob::new();
+    let (logger, state) = logger_with_warning_sink();
+    job.set_logger(logger);
+    job.record_warnings();
+
+    let status = job
+        .complete_report()
+        .expect("report-only completion succeeds");
+
+    assert_eq!(status, JobExitCode::Warning);
+    assert_eq!(
+        state.lock().unwrap().bytes,
+        b"qpdf: operation succeeded with warnings\n"
+    );
+}
+
 #[test]
 fn registered_progress_reporter_is_attached_to_each_writer() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
