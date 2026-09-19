@@ -3109,6 +3109,7 @@ fn main() {
     let mut args = cli_parse_from_mode(residual_args, native_subcommand_mode);
     apply_raw_overrides(&mut args, raw_overrides);
     let _ = CLI_WARNING_EXIT_ZERO.set(args.warning_exit_zero);
+    let _ = CLI_REPORT_MEMORY_USAGE.set(args.report_memory_usage);
     // qpdf keeps --verbose on QPDFJob rather than on the password parser, but
     // the reader owns the authentication retry boundary in flpdf. Carry the
     // job policy through the existing PasswordArgs copy used by every open
@@ -3700,6 +3701,7 @@ fn new_cli_job(suppress_warnings: bool) -> QPDFJob {
     job.set_message_prefix(progname());
     job.set_suppress_warnings(suppress_warnings);
     job.set_warnings_exit_zero(cli_warning_exit_zero());
+    job.set_report_memory_usage(cli_report_memory_usage());
     job
 }
 
@@ -4281,6 +4283,10 @@ fn run_json(
     };
     let mut job = QPDFJob::new();
     job.set_warnings_exit_zero(cli_warning_exit_zero());
+    // This route builds its job directly rather than through `new_cli_job`,
+    // so it needs the same carry (`QPDFJob.cc:505-509` prints from whichever
+    // job finished the run, and `--json` finishes one like any other route).
+    job.set_report_memory_usage(cli_report_memory_usage());
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(cli.no_warn);
@@ -4499,6 +4505,10 @@ fn run_json_input_inspection(
     let input = cli.input.as_ref().ok_or_else(missing_input_usage_error)?;
     let mut job = QPDFJob::new();
     job.set_warnings_exit_zero(cli_warning_exit_zero());
+    // This route builds its job directly rather than through `new_cli_job`,
+    // so it needs the same carry (`QPDFJob.cc:505-509` prints from whichever
+    // job finished the run, and `--json` finishes one like any other route).
+    job.set_report_memory_usage(cli_report_memory_usage());
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(cli.no_warn);
@@ -9121,6 +9131,18 @@ fn cli_warning_exit_zero() -> bool {
     CLI_WARNING_EXIT_ZERO.get().copied().unwrap_or(false)
 }
 
+/// qpdf's `--report-memory-usage` sets one `m->report_mem_usage` bit on the
+/// `QPDFJob` the run uses, and every route that finishes a run prints the
+/// line from it (`QPDFJob.cc:505-509`) -- writes and inspections alike.
+/// Every job this CLI builds goes through `new_cli_job`, so carrying the flag
+/// the same way `--warning-exit-0` is carried reaches all of them, rather
+/// than only the routes that happen to thread `WriterOptions` through.
+static CLI_REPORT_MEMORY_USAGE: OnceLock<bool> = OnceLock::new();
+
+fn cli_report_memory_usage() -> bool {
+    CLI_REPORT_MEMORY_USAGE.get().copied().unwrap_or(false)
+}
+
 fn standard_save_writer() -> CliResult<PipelineWriter> {
     standard_save_writer_for(&cli_logger())
 }
@@ -9247,6 +9269,10 @@ fn finish_job_exit_status(status: JobExitCode) -> CliResult<()> {
 fn finish_warning_state(has_warnings: bool, no_warn: bool) -> CliResult<()> {
     let mut job = QPDFJob::new();
     job.set_warnings_exit_zero(cli_warning_exit_zero());
+    // This route builds its job directly rather than through `new_cli_job`,
+    // so it needs the same carry (`QPDFJob.cc:505-509` prints from whichever
+    // job finished the run, and `--json` finishes one like any other route).
+    job.set_report_memory_usage(cli_report_memory_usage());
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(no_warn);
