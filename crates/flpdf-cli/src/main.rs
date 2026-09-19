@@ -30,7 +30,7 @@ use flpdf::{
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{BufReader, Cursor, Read, Seek, Write};
+use std::io::{BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -5257,8 +5257,6 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         &cmd.output,
                         cmd.repair,
                         &cmd.password,
-                        false,
-                        None,
                         &cmd.page_ops,
                         overlay_specs,
                         remove_unref,
@@ -7667,24 +7665,29 @@ fn validate_keep_files_open_threshold(page_ops: &PageOpArgs) -> CliResult<()> {
 /// Run the `--pages` extraction pipeline.
 ///
 /// Processing order is fixed as follows:
-///   1. `QPDFJob::handle_page_specs` resolves and copies every `--pages`
-///      specification, including repeated occurrences of one source
+///   1. every `--pages` specification is resolved and copied, including
+///      repeated occurrences of one source
 ///   2. apply the shared post-copy page-operation consumers
 ///   3. write (or split_pages when --split-pages is set)
 ///
 /// qpdf 11.9.0 always enters `QPDFJob::handlePageSpecs` when page
-/// specifications exist (`libqpdf/QPDFJob.cc:466-470`). Both the single-source
-/// and multi-source CLI paths therefore use the same fresh primary-based job
-/// document before the shared rotate, navigation, annotation, and writer
-/// completion boundary.
+/// specifications exist (`libqpdf/QPDFJob.cc:466-470`). The single-source
+/// branch below configures those specifications on `QPDFJob::create_qpdf`'s
+/// canonical page-spec lifecycle (the same boundary
+/// [`run_empty_page_extraction`] and the top-level `--pages` route already
+/// use), matching qpdf's `createQPDF` → `handlePageSpecs` call order; the
+/// multi-source branch still opens sources directly and calls
+/// `QPDFJob::handle_page_specs` itself, a known remaining gap.
+///
+/// The `--json-input`/`--update-from-json` combination with `--pages` has no
+/// grammar on the `rewrite` subcommand (this function's only caller): those
+/// flags are `--json-input`-route-only and never reach this pipeline.
 #[allow(clippy::too_many_arguments)]
 fn run_page_extraction(
     primary_input: &std::path::Path,
     output: &std::path::Path,
     repair: bool,
     password: &PasswordArgs,
-    json_input: bool,
-    update_from_json: Option<&Path>,
     page_ops: &PageOpArgs,
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
@@ -7720,122 +7723,9 @@ fn run_page_extraction(
         );
     }
 
-    let specs = configured_page_specs(page_ops)?;
-    let mut inputs = resolve_page_specs(&specs, primary_input)?;
+    let raw_specs = configured_page_specs(page_ops)?;
+    let inputs = resolve_page_specs(&raw_specs, primary_input)?;
     let has_external_source = inputs.iter().any(|spec| spec.path != primary_input);
-
-    // The in-place single-document planner must use the top-level password
-    // for the already-authenticated primary when `--pages . ...` carries no
-    // segment password. The multi-source QPDFJob route opens the primary
-    // separately and must leave secondary credentials segment-local: qpdf does
-    // not fall back to the primary password for a distinct source
-    // (QPDFJob.cc:2400-2412).
-    if !has_external_source {
-        if let Some(top_pw) = password.password_bytes() {
-            for spec in &mut inputs {
-                if spec.password.is_none() {
-                    spec.password = Some(top_pw.clone());
-                }
-            }
-        }
-    }
-
-    // Keep the canonicalized path set for the JSON-input guard and the
-    // single-source verbose route. Ordinary page operations below use the
-    // literal qpdf filename identity: two spellings of the same file may be
-    // distinct QPDF sources, as documented by qpdf's page-spec API.
-    let mut distinct: Vec<std::path::PathBuf> = Vec::new();
-    for spec in &inputs {
-        // Source inputs must exist to be opened; if canonicalization fails
-        // fall back to the literal path (the open will surface a clear error).
-        let key = std::fs::canonicalize(&spec.path).unwrap_or_else(|_| spec.path.clone());
-        if !distinct.contains(&key) {
-            distinct.push(key);
-        }
-    }
-    if json_input || update_from_json.is_some() {
-        // `run_page_extraction_from_single_source` below applies every spec's
-        // range to the single already-opened job document; it has no way to
-        // honor a `spec.path` that names a genuinely different file. The
-        // `distinct.len() > 1` check above only catches this
-        // when two *explicit* paths disagree with each other -- a lone
-        // explicit source (e.g. `--pages other.pdf 1`, no `.` segment) never
-        // puts `primary_input` itself into `distinct`, so it silently
-        // resolves to a single-element `distinct` and slips past. Comparing
-        // every resolved spec path against `primary_input`'s own canonical
-        // path here closes that gap without touching the ordinary branch's
-        // (already correct) handling of a genuinely different single source.
-        let primary_canonical =
-            std::fs::canonicalize(primary_input).unwrap_or_else(|_| primary_input.to_path_buf());
-        if distinct.iter().any(|path| *path != primary_canonical) {
-            return Err(
-                "--pages: cross-document page merge is not supported at this layer \
-                 (an explicit --pages source differs from the --json-input/\
-                 --update-from-json primary input). Single-document extraction \
-                 ('.' or the primary input's own path) is supported; cross-doc \
-                 merge with a JSON-created/updated primary is tracked in a \
-                 separate issue."
-                    .into(),
-            );
-        }
-        let opened = open_job_pdf(
-            primary_input,
-            repair,
-            password,
-            json_input,
-            update_from_json,
-            false,
-            no_warn,
-        )?;
-        return match opened {
-            JobPdf::File(pdf) => run_page_extraction_from_single_source(
-                pdf,
-                primary_input,
-                output,
-                password,
-                page_ops,
-                overlay_specs,
-                remove_unref,
-                remove_restrictions,
-                decrypt,
-                options,
-                linearize,
-                linearize_pass1,
-                image_options,
-                coalesce_contents,
-                generate_appearances,
-                flatten_annotations_mode,
-                flatten_rotation,
-                verbose,
-                standard_output,
-                &inputs,
-                no_warn,
-            ),
-            JobPdf::Json(pdf) => run_page_extraction_from_single_source(
-                pdf,
-                primary_input,
-                output,
-                password,
-                page_ops,
-                overlay_specs,
-                remove_unref,
-                remove_restrictions,
-                decrypt,
-                options,
-                linearize,
-                linearize_pass1,
-                image_options,
-                coalesce_contents,
-                generate_appearances,
-                flatten_annotations_mode,
-                flatten_rotation,
-                verbose,
-                standard_output,
-                &inputs,
-                no_warn,
-            ),
-        };
-    }
 
     // qpdf's ordinary page-spec job owns every page-spec selection, whether
     // the segment names one source or several. Distinct input documents are
@@ -7868,11 +7758,12 @@ fn run_page_extraction(
     }
 
     run_page_extraction_from_single_source(
-        open_pdf_with_suppression(&primary_input.to_path_buf(), repair, password, no_warn)?,
         primary_input,
         output,
+        repair,
         password,
         page_ops,
+        raw_specs,
         overlay_specs,
         remove_unref,
         remove_restrictions,
@@ -7886,8 +7777,6 @@ fn run_page_extraction(
         flatten_annotations_mode,
         flatten_rotation,
         verbose,
-        standard_output,
-        &inputs,
         no_warn,
     )
 }
@@ -8209,13 +8098,23 @@ fn run_page_extraction_from_multiple_sources(
     )
 }
 
+/// Run the single-source (in-place) `--pages` extraction through
+/// `QPDFJob::create_qpdf`'s canonical page-spec lifecycle, the same job/CLI
+/// boundary [`run_empty_page_extraction`] and the top-level `--pages` route
+/// (`run_page_operations_with_qpdf_job`) already use. This matches qpdf's own
+/// `createQPDF` → `handlePageSpecs` call order (`QPDFJob.cc:428-467`): the
+/// primary is opened by the job itself, and `create_qpdf` resolves and
+/// copies every page spec (including qpdf's in-place resource-pruning
+/// decision, `QPDFJob.cc:2452-2455`) before returning, so no separate
+/// `handle_page_specs` call or rebuild is needed here.
 #[allow(clippy::too_many_arguments)]
-fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
-    mut pdf: Pdf<R>,
+fn run_page_extraction_from_single_source(
     primary_input: &Path,
     output: &Path,
+    repair: bool,
     password: &PasswordArgs,
     page_ops: &PageOpArgs,
+    raw_specs: Vec<PageSegmentSpec>,
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
     remove_restrictions: bool,
@@ -8229,109 +8128,77 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
     flatten_annotations_mode: Option<CliFlattenMode>,
     flatten_rotation: bool,
     verbose: bool,
-    standard_output: Option<PipelineWriter>,
-    inputs: &[CliInputSpec],
     no_warn: bool,
 ) -> CliResult<()> {
+    let mut job = new_cli_job(no_warn);
+    job.set_input_file(primary_input.to_path_buf())?;
+    job.set_suppress_recovery(password.recovery.suppress_recovery);
+    job.set_ignore_xref_streams(password.recovery.ignore_xref_streams);
+    job.set_password_mode(password.password_mode.into());
+    job.set_password_is_hex_key(password.password_is_hex_key);
+    job.set_suppress_password_recovery(password.suppress_password_recovery);
+    job.set_verbose(verbose);
+    let input_options = pdf_open_options(repair, password)?;
+    job.set_password(input_options.password);
+    configure_keep_files_open(&mut job, page_ops)?;
+    {
+        let mut configuration = job.config();
+        for spec in raw_specs {
+            let spec_password = spec.raw_password.or_else(|| {
+                spec.password
+                    .as_ref()
+                    .map(|password| arg_parser::os_bytes(password))
+            });
+            configuration.add_page_spec(
+                PathBuf::from(spec.file_token),
+                &spec.range,
+                spec_password,
+            )?;
+        }
+        for parameter in &page_ops.collate {
+            configuration.collate(parameter.as_bytes())?;
+        }
+        configuration.remove_unreferenced_resources(remove_unref.into());
+    }
+
+    let mut pdf = match job.create_qpdf()? {
+        Some(pdf) => pdf,
+        None => {
+            return Err(Box::new(CliExitError {
+                code: ExitCode::Errors,
+                message: String::new(),
+            }))
+        }
+    };
+    pdf.set_suppress_warnings(no_warn);
     let primary_encrypted = pdf.is_encrypted();
     let primary_copy_encryption = pdf.writer_copy_encryption_source()?;
-    let specs: Vec<PageSpecInput> = inputs
-        .iter()
-        .map(|input| PageSpecInput::new(0, input.range.clone()))
-        .collect();
-    let mut job = QPDFJob::new();
-    job.set_warnings_exit_zero(cli_warning_exit_zero());
-    job.set_logger(cli_logger());
-    job.set_message_prefix(progname());
-    job.set_verbose(verbose);
-    job.set_suppress_warnings(no_warn);
-    configure_keep_files_open(&mut job, page_ops)?;
-    job.report_page_spec_selection(&specs)?;
+    let source_warnings = job.has_warnings();
 
-    let collate = parse_collate_values(&page_ops.collate)?;
-    let mut sources = vec![pdf];
-    let before_warnings = job.has_warnings();
-    let page_output = job.handle_page_specs(
-        &mut sources,
-        &specs,
-        collate.as_deref(),
-        remove_unref.into(),
-        options.preserve_unreferenced_objects,
-    )?;
-    let source_warnings = before_warnings || job.has_warnings();
-
-    match page_output {
-        PageSpecJobOutput::InPlace {
-            pdf,
-            result,
-            prune_mode,
-        } => {
-            let selected_pages = result.new_kids.clone();
-
-            run_page_extraction_after_plan(
-                pdf,
-                output,
-                primary_input,
-                password,
-                page_ops,
-                overlay_specs,
-                remove_unref,
-                remove_restrictions,
-                decrypt,
-                options,
-                linearize,
-                linearize_pass1,
-                verbose,
-                standard_output,
-                primary_encrypted,
-                primary_copy_encryption,
-                source_warnings,
-                Some((result, prune_mode)),
-                selected_pages,
-                image_options,
-                coalesce_contents,
-                generate_appearances,
-                flatten_annotations_mode,
-                flatten_rotation,
-                no_warn,
-            )
-        }
-        PageSpecJobOutput::Merged(mut merged) => {
-            let selected_pages = pages::page_refs(&mut merged)?;
-
-            run_page_extraction_after_plan(
-                &mut merged,
-                output,
-                primary_input,
-                password,
-                page_ops,
-                overlay_specs,
-                // QPDFJob has already applied the page-copy resource policy
-                // to each source page. Retain the original mode only for the
-                // later doSplitPages preflight; post-copy completion remains
-                // a no-op for resource pruning.
-                remove_unref,
-                remove_restrictions,
-                decrypt,
-                options,
-                linearize,
-                linearize_pass1,
-                verbose,
-                standard_output,
-                primary_encrypted,
-                primary_copy_encryption,
-                source_warnings,
-                None,
-                selected_pages,
-                image_options,
-                coalesce_contents,
-                generate_appearances,
-                flatten_annotations_mode,
-                flatten_rotation,
-                no_warn,
-            )
-        }
-    }
+    finish_page_extraction(
+        &mut pdf,
+        output,
+        primary_input,
+        password,
+        page_ops,
+        overlay_specs,
+        remove_unref,
+        remove_restrictions,
+        decrypt,
+        options,
+        linearize,
+        linearize_pass1,
+        verbose,
+        primary_encrypted,
+        primary_copy_encryption,
+        source_warnings,
+        image_options,
+        coalesce_contents,
+        generate_appearances,
+        flatten_annotations_mode,
+        flatten_rotation,
+        no_warn,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8382,6 +8249,63 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     };
     QPDFJob::complete_in_place_page_selection(pdf, &result, prune_mode)?;
 
+    finish_page_extraction(
+        pdf,
+        output,
+        input_path,
+        password,
+        page_ops,
+        overlay_specs,
+        remove_unref,
+        remove_restrictions,
+        decrypt,
+        options,
+        linearize,
+        linearize_pass1,
+        verbose,
+        primary_encrypted,
+        primary_copy_encryption,
+        prior_warnings,
+        image_options,
+        coalesce_contents,
+        generate_appearances,
+        flatten_annotations_mode,
+        flatten_rotation,
+        no_warn,
+    )
+}
+
+/// Shared writer/transform completion for a fully page-selected document:
+/// preserve-encryption/copy-encryption policy, the transform job (rotate,
+/// overlay/underlay, image, appearance, annotation, coalesce, flatten), and
+/// the final split or ordinary write. Called once page selection (rebuild and
+/// `QPDFJob::complete_in_place_page_selection`, or `create_qpdf`'s equivalent
+/// internal step for the single-source route) has already finished.
+#[allow(clippy::too_many_arguments)]
+fn finish_page_extraction<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    output: &Path,
+    input_path: &Path,
+    password: &PasswordArgs,
+    page_ops: &PageOpArgs,
+    overlay_specs: &[OverlaySpec],
+    remove_unref: CliRemoveUnreferencedResources,
+    remove_restrictions: bool,
+    decrypt: bool,
+    options: WriterOptions,
+    linearize: bool,
+    linearize_pass1: Option<&Path>,
+    verbose: bool,
+    primary_encrypted: bool,
+    primary_copy_encryption: Option<CopyEncryptionSource>,
+    prior_warnings: bool,
+    image_options: ImageTransformOptions,
+    coalesce_contents: bool,
+    generate_appearances: bool,
+    flatten_annotations_mode: Option<CliFlattenMode>,
+    flatten_rotation: bool,
+    no_warn: bool,
+) -> CliResult<()> {
     let mut options = options;
     let split_pages = page_ops
         .split_pages
@@ -9524,30 +9448,6 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-/// Main-input variants accepted by the qpdf-shaped job boundary.
-///
-/// The JSON importer owns a `Pdf<Cursor<Vec<u8>>>` because its rootless seed
-/// is an in-memory PDF. Ordinary files keep the existing buffered-file reader.
-/// The enum is intentionally confined to this CLI boundary; every downstream
-/// consumer still receives its normal generic `Pdf<R>` and therefore uses the
-/// canonical resolver/object-handle route.
-enum JobPdf {
-    File(Pdf<BufReader<File>>),
-    Json(Pdf<Cursor<Vec<u8>>>),
-}
-
-fn apply_json_update<R: Read + Seek + 'static>(
-    pdf: &mut Pdf<R>,
-    update_from_json: Option<&Path>,
-) -> CliResult<()> {
-    if let Some(path) = update_from_json {
-        let source = File::open(path).map_err(|error| qpdf_json_input_open_error(path, error))?;
-        pdf.update_from_json(source, path_description(path))
-            .map_err(|error| json_error_with_file(path, Box::new(error)))?;
-    }
-    Ok(())
-}
-
 fn apply_json_update_with_job<R: Read + Seek + 'static>(
     job: &mut QPDFJob,
     pdf: &mut Pdf<R>,
@@ -9559,59 +9459,6 @@ fn apply_json_update_with_job<R: Read + Seek + 'static>(
             .map_err(|error| json_error_with_file(path, Box::new(error)))?;
     }
     Ok(())
-}
-
-/// Open the main qpdf job input and apply `--update-from-json` at the same
-/// point qpdf's `QPDFJob::createQPDF` does: immediately after input creation,
-/// before page specifications, rotations, overlays, or serialization.
-/// `check_inspection` applies `run_check`'s warning-aggregation policy (see
-/// [`open_pdf_for_check_inspection`]) to the
-/// non-`--json-input` (`--update-from-json` only) branch. It has no effect
-/// on the `--json-input` branch: [`Pdf::create_from_json`] always seeds from
-/// the fixed, never-encrypted rootless bootstrap document, so this policy
-/// only matters for a real encrypted PDF opened through
-/// `--update-from-json`.
-fn open_job_pdf(
-    input: &Path,
-    repair: bool,
-    password: &PasswordArgs,
-    json_input: bool,
-    update_from_json: Option<&Path>,
-    check_inspection: bool,
-    suppress_warnings: bool,
-) -> CliResult<JobPdf> {
-    if json_input {
-        Ok(JobPdf::Json(open_json_pdf(
-            input,
-            update_from_json,
-            suppress_warnings,
-        )?))
-    } else {
-        let mut pdf = if check_inspection {
-            open_pdf_for_check_inspection(&input.to_path_buf(), repair, password)?
-        } else {
-            open_pdf_with_suppression(&input.to_path_buf(), repair, password, suppress_warnings)?
-        };
-        apply_json_update(&mut pdf, update_from_json)?;
-        Ok(JobPdf::File(pdf))
-    }
-}
-
-fn open_json_pdf(
-    input: &Path,
-    update_from_json: Option<&Path>,
-    suppress_warnings: bool,
-) -> CliResult<Pdf<Cursor<Vec<u8>>>> {
-    let source = File::open(input).map_err(|error| qpdf_json_input_open_error(input, error))?;
-    let mut job = QPDFJob::new();
-    job.set_logger(cli_logger());
-    job.set_message_prefix(progname());
-    job.set_suppress_warnings(suppress_warnings);
-    let mut pdf = job
-        .create_from_json(source, path_description(input))
-        .map_err(|error| json_error_with_file(input, Box::new(error)))?;
-    apply_json_update(&mut pdf, update_from_json)?;
-    Ok(pdf)
 }
 
 fn open_pdf_with_suppression(
@@ -9668,24 +9515,6 @@ fn open_pdf_for_inspection(
 ) -> CliResult<Pdf<BufReader<File>>> {
     let file = File::open(input).map_err(|error| open_error_with_file(input, error.into()))?;
     open_pdf_file_impl(input, file, repair, password, false, true)
-}
-
-/// Open for `--update-from-json --check`'s generic job-inspection route.
-///
-/// Mirrors `run_check`'s own inspection policy, plus `suppress_warnings` so
-/// open/update-time repair diagnostics are collected
-/// rather than delivered live, since the qpdf-shaped job check re-emits the
-/// same diagnostics from the document after its check banner -- without
-/// this, a `--repair`-triggered warning prints twice). `--show-npages`/
-/// `--show-pages` do not need either policy: like their non-JSON siblings
-/// `run_show_npages`/`run_show_pages`, they use the plain [`open_pdf`]
-/// path via [`open_job_pdf`]'s `check_inspection` parameter.
-fn open_pdf_for_check_inspection(
-    input: &PathBuf,
-    repair: bool,
-    password: &PasswordArgs,
-) -> CliResult<Pdf<BufReader<File>>> {
-    open_pdf_impl(input, repair, password, true)
 }
 
 fn open_pdf_impl(

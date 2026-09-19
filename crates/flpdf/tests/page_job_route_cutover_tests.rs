@@ -1,13 +1,33 @@
+// flpdf-3yn9.48.187 moved the single-source `--pages` route from a direct
+// `QPDFJob::handle_page_specs` call to `QPDFJob::create_qpdf`'s canonical
+// page-spec lifecycle -- the same job/CLI boundary `run_empty_page_extraction`
+// and the top-level `--pages` route already use, matching qpdf's own
+// `createQPDF` -> `handlePageSpecs` call order. This test now pins that
+// boundary instead of the direct call it replaced.
 #[test]
-fn single_source_pages_use_the_qpdf_job_page_specs_route() {
+fn single_source_pages_use_the_qpdf_job_create_qpdf_route() {
     let source = include_str!("../../flpdf-cli/src/main.rs");
     let start = source
         .find("fn run_page_extraction_from_single_source")
         .expect("single-source job route must have a named production function");
-    let body = &source[start..];
+    let rest = &source[start..];
+    // Bound the scan to this one function: stop at the next top-level `fn`
+    // (this function has no nested `fn`, so the first one after its own
+    // signature always belongs to the next item).
+    let end = rest[1..]
+        .find("\nfn ")
+        .map(|offset| offset + 1)
+        .unwrap_or(rest.len());
+    let body = &rest[..end];
     assert!(
-        body.contains("handle_page_specs("),
-        "single-source --pages must use QPDFJob::handle_page_specs"
+        body.contains("create_qpdf()"),
+        "single-source --pages must use QPDFJob::create_qpdf, the same job/CLI \
+         boundary run_empty_page_extraction and the top-level --pages route use"
+    );
+    assert!(
+        !body.contains(".handle_page_specs("),
+        "single-source --pages must not call QPDFJob::handle_page_specs directly \
+         any more; create_qpdf's prepare_document owns that call internally"
     );
     assert!(
         !body.contains("CombinedPlan::build_repeated"),
