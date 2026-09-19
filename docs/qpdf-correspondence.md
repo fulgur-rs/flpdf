@@ -685,16 +685,23 @@ throw sites, e.g. `libqpdf/QPDF.cc:481,1231`, `libqpdf/QPDFParser.cc:163`,
 `libqpdf/QPDFTokenizer.cc:241,248,770`, `libqpdf/QPDFLogger.cc:200,252`, and
 `libqpdf/QPDF.cc:1101` for `std::range_error`) and, only for `QPDFExc`, its independent
 `qpdf_error_code_e` (`include/qpdf/Constants.h:84-95`). `crates/flpdf/src/error.rs::Error`
-folds both axes into one flat Rust variant set instead of mirroring the C++
-class-plus-side-enum shape; its doc comment (`crates/flpdf/src/error.rs:209-239`, the
-deviation statement itself at `:233-239`) records the resulting per-variant meaning, and
+carries axis 1 as variants instead of mirroring the C++ class hierarchy. **Axis 2 is not
+folded away**: `Error::QpdfExc` wraps `QpdfExc`, which stores `error_code: QpdfErrorCode`
+and exposes it through `QpdfExc::get_error_code` (`crates/flpdf/src/error.rs:95,148`), so
+production callers match on both layers exactly as qpdf's own callers do — only the legacy
+variants that predate `QpdfExc` carry their classification in the variant alone. The code
+takes no part in rendering: `QpdfExc::new` passes only filename, object, offset, and message
+to `create_what` (`crates/flpdf/src/error.rs:112-123`), matching `QPDFExc::createWhat`, so
+two otherwise identical exceptions with different codes render identically — as in qpdf.
+The module documentation (`crates/flpdf/src/error.rs`, the `//!` header) records this
+deviation as CLAUDE.md category (B) condition 3 requires, and
 `Internal`/`System` are the 1:1 projection of axis 1 onto `std::logic_error`/
 `std::runtime_error` (`crates/flpdf/src/error.rs:223-224`). This satisfies CLAUDE.md
 deviation category (B): the fold changes only the Rust "container" a caller matches on —
 where qpdf's own callers instead dispatch by C++ class and by `getErrorCode()` — not the
-classification's meaning. Condition 1 (no output-byte impact) does not need a
-`qpdf-zlib-compat` gated byte test the way a serialization-layer substitution (e.g.
-`InputSource`/`Pipeline`) does: `Error` values are never themselves written into a PDF
+classification's meaning. Condition 1 (no output-byte impact) is discharged by the boundary itself rather than by a
+`qpdf-zlib-compat` gated byte test, unlike a serialization-layer substitution (e.g.
+`InputSource`/`Pipeline`) where the substituted container sits on the write path: `Error` values are never themselves written into a PDF
 file, only returned to a caller or rendered as diagnostic text, so the container shape
 carries no *additional* byte risk beyond whether each call site is assigned the same
 classification qpdf's two axes would assign it — and that per-call-site accuracy is
