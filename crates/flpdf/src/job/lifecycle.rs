@@ -1158,9 +1158,18 @@ fn parse_job_split_pages(value: &[u8]) -> Result<i32> {
         // `libqpdf/QPDFJob.cc:2970`). Preserve the signed value here so the
         // split path can reproduce that late conversion error.
         QpdfIntParse::Value(count) => Ok(count),
-        QpdfIntParse::Overflow(_) => Err(Error::Usage(UsageError::new(format!(
-            ".splitPages: invalid page count {text}"
-        )))),
+        // `Config::splitPages` (`libqpdf/QPDFJob_config.cc:604-609`) does not
+        // wrap this failure in any option-specific wording -- it calls
+        // `QUtil::string_to_int` directly and lets the C++ exception (whose
+        // message `qpdf_string_to_int_checked` already reproduces for both
+        // the 64-bit and i32-narrowing stages) propagate verbatim to the
+        // usage boundary, exactly like `parse_job_compression_level` below.
+        // Confirmed live: `qpdf --split-pages=<64-bit overflow>` prints
+        // "overflow/underflow converting ... to 64-bit integer" and
+        // `qpdf --split-pages=2147483648` prints "integer out of range
+        // converting 2147483648 from a 8-byte signed type to a 4-byte
+        // signed type", neither prefixed with ".splitPages:".
+        QpdfIntParse::Overflow(message) => Err(Error::System(message)),
     }
 }
 
@@ -7045,10 +7054,25 @@ mod tests {
 
     #[test]
     fn job_json_split_pages_rejects_an_i32_overflow_at_the_qpdf_boundary() {
+        // Confirmed live: `qpdf --split-pages=2147483648` prints this exact
+        // message with no ".splitPages:" prefix (flpdf-3yn9.48.193).
         let error = parse_job_split_pages(b"2147483648").expect_err("i32 overflow must fail");
         assert_eq!(
             error.to_string(),
-            ".splitPages: invalid page count 2147483648"
+            "integer out of range converting 2147483648 from a 8-byte signed type to a 4-byte signed type"
+        );
+    }
+
+    #[test]
+    fn job_json_split_pages_rejects_a_64_bit_overflow_at_the_qpdf_boundary() {
+        // Confirmed live: `qpdf --split-pages=99999999999999999999` prints
+        // this exact message with no ".splitPages:" prefix
+        // (flpdf-3yn9.48.193).
+        let error =
+            parse_job_split_pages(b"99999999999999999999").expect_err("64-bit overflow must fail");
+        assert_eq!(
+            error.to_string(),
+            "overflow/underflow converting 99999999999999999999 to 64-bit integer"
         );
     }
 
