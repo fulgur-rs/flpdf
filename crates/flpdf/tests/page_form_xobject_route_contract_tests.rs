@@ -48,32 +48,40 @@ fn the_production_wrapper_delegates_without_inspecting_handles() {
         audit.visit_stmt(statement);
     }
 
-    // The A6 boundary belongs to `page_object_helper.rs` because this wrapper
-    // performs no type inspection of its own. Each of these is a non-resolving
-    // accessor the matrix classifies under A6, or a resolving route under A7.
-    for forbidden in [
-        "resolve",
-        "resolve_handle",
-        "resolve_handle_ref",
-        "as_dictionary",
-        "as_array",
-        "as_integer",
-        "as_name",
-        "is_null",
-        "as_string",
-        "as_real",
-        "as_boolean",
-        "as_real_literal",
-        "as_number",
-        "as_rectangle",
-        "as_stream_dict",
-    ] {
-        assert!(
-            !audit.non_helper_calls.contains(forbidden),
-            "the wrapper must not call {forbidden} itself: {:?}",
-            audit.non_helper_calls
-        );
-    }
+    // An allowlist rather than a ban list. Enumerating forbidden accessors
+    // can only ever be as complete as the last review pass -- each round
+    // found another spelling, another alias, another resolving variant. The
+    // wrapper is eight lines and makes six calls, so stating what it may call
+    // is both shorter and closed: any new call fails until someone adds it
+    // here deliberately, whether it resolves or not.
+    //
+    // qpdf's `getFormXObjectForPage` (`libqpdf/QPDFPageObjectHelper.cc:706-732`)
+    // owns the conversion; this wrapper hands the page over and returns the
+    // new object's identity.
+    let permitted: std::collections::BTreeSet<String> = [
+        // The canonical construction and delegation.
+        "PageObjectHelper::new",
+        "get_form_xobject_for_page",
+        // Returning the new object's identity, and the allocation guard.
+        "object_ref",
+        "ok_or_else",
+        "Error::Internal",
+        "to_owned",
+    ]
+    .iter()
+    .map(|name| (*name).to_owned())
+    .collect();
+    let unexpected: Vec<&String> = audit
+        .calls
+        .iter()
+        .filter(|call| !permitted.contains(*call))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "the wrapper may only call {permitted:?}; it also calls {unexpected:?}. \
+         If this is a deliberate change, add the call here and say why the \
+         wrapper needs it."
+    );
 
     // Exactly one conversion, with qpdf's `handle_transformations = true`. A
     // second call would convert the page again, which qpdf's
@@ -140,19 +148,31 @@ struct WrapperAudit {
     helper_conversions: Vec<bool>,
     /// Bindings this body obtained from `PageObjectHelper::new(...)`.
     helper_bindings: Vec<String>,
-    /// Methods called on anything that is not one of those bindings, plus
-    /// every free or qualified call.
-    non_helper_calls: std::collections::BTreeSet<String>,
+    /// Every call the body makes: methods by name, free and qualified calls
+    /// by their last two path segments when qualified.
+    calls: std::collections::BTreeSet<String>,
     saw_macro: bool,
 }
 
 impl WrapperAudit {
     /// A `let` inside a block is scoped to that block: a shadowing binding
     /// must not survive it, and a helper constructed inside must not leak out.
+    /// Drop every name a pattern binds from both provenance sets.
+    fn shadow_pattern(&mut self, pat: &syn::Pat) {
+        let mut bound = Vec::new();
+        collect_pattern_idents(pat, &mut bound);
+        self.helper_bindings
+            .retain(|binding| !bound.contains(binding));
+        self.live_parameters
+            .retain(|parameter| !bound.contains(parameter));
+    }
+
     fn walk_block_scoped<F: FnOnce(&mut Self)>(&mut self, walk: F) {
-        let outer = self.helper_bindings.clone();
+        let outer_bindings = self.helper_bindings.clone();
+        let outer_parameters = self.live_parameters.clone();
         walk(self);
-        self.helper_bindings = outer;
+        self.helper_bindings = outer_bindings;
+        self.live_parameters = outer_parameters;
     }
 }
 
@@ -186,15 +206,37 @@ impl<'ast> Visit<'ast> for WrapperAudit {
             .retain(|parameter| !bound.contains(parameter));
         // `let mut helper: PageObjectHelper<'_, R> = ...` is a `Pat::Type`.
         if let Some(name) = binding_ident(&local.pat) {
-            if local
-                .init
-                .as_ref()
-                .is_some_and(|init| self.constructs_helper(&init.expr))
-            {
-                self.helper_bindings.push(name);
+            if let Some(init) = local.init.as_ref() {
+                // Either a fresh construction, or a move of one this body
+                // already recognizes -- `let helper2 = helper;` keeps the
+                // provenance the contract cares about.
+                let moved_helper = matches!(
+                    unwrap_transparent(&init.expr),
+                    syn::Expr::Path(path)
+                        if path.path.get_ident().is_some_and(|ident| {
+                            self.helper_bindings.contains(&unraw(ident))
+                        })
+                );
+                if self.constructs_helper(&init.expr) || moved_helper {
+                    self.helper_bindings.push(name);
+                }
             }
         }
         self.visit_pat(&local.pat);
+    }
+
+    /// A `&mut` borrow of a parameter can change it in place, which ends the
+    /// guarantee that it still holds the wrapper's input.
+    fn visit_expr_reference(&mut self, reference: &'ast syn::ExprReference) {
+        if reference.mutability.is_some() {
+            if let syn::Expr::Path(path) = unwrap_transparent(&reference.expr) {
+                if let Some(ident) = path.path.get_ident() {
+                    let name = unraw(ident);
+                    self.live_parameters.retain(|parameter| parameter != &name);
+                }
+            }
+        }
+        syn::visit::visit_expr_reference(self, reference);
     }
 
     /// `helper = PageObjectHelper::new(other_page, pdf)` rebinds without a
@@ -231,6 +273,33 @@ impl<'ast> Visit<'ast> for WrapperAudit {
         self.live_parameters = outer_parameters;
     }
 
+    /// `if let Some(helper) = ...`, `while let`, and `for helper in ...` all
+    /// bind names for the duration of their body.
+    fn visit_expr_if(&mut self, expression: &'ast syn::ExprIf) {
+        self.walk_block_scoped(|audit| {
+            if let syn::Expr::Let(binding) = expression.cond.as_ref() {
+                audit.shadow_pattern(&binding.pat);
+            }
+            syn::visit::visit_expr_if(audit, expression);
+        });
+    }
+
+    fn visit_expr_while(&mut self, expression: &'ast syn::ExprWhile) {
+        self.walk_block_scoped(|audit| {
+            if let syn::Expr::Let(binding) = expression.cond.as_ref() {
+                audit.shadow_pattern(&binding.pat);
+            }
+            syn::visit::visit_expr_while(audit, expression);
+        });
+    }
+
+    fn visit_expr_for_loop(&mut self, expression: &'ast syn::ExprForLoop) {
+        self.walk_block_scoped(|audit| {
+            audit.shadow_pattern(&expression.pat);
+            syn::visit::visit_expr_for_loop(audit, expression);
+        });
+    }
+
     fn visit_field_value(&mut self, field: &'ast syn::FieldValue) {
         if is_test_only(&field.attrs) {
             return;
@@ -258,25 +327,16 @@ impl<'ast> Visit<'ast> for WrapperAudit {
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         let method = unraw(&call.method);
         let on_helper = receiver_is_helper(&call.receiver, &self.helper_bindings);
-        if on_helper {
-            if method == WRAPPER {
-                self.helper_conversions.push(passes_true(call));
-            }
-        } else {
-            // Receiver matters: an unrelated type's `as_dictionary()` is not
-            // an A6 inspection of `Pdf`/`ObjectHandle`, but neither is it
-            // something this wrapper needs, so it is recorded and the
-            // assertion above explains what it means.
-            self.non_helper_calls.insert(method);
+        if on_helper && method == WRAPPER {
+            self.helper_conversions.push(passes_true(call));
         }
+        self.calls.insert(method);
         syn::visit::visit_expr_method_call(self, call);
     }
 
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
         if let syn::Expr::Path(path) = call.func.as_ref() {
-            if let Some(last) = path.path.segments.last() {
-                self.non_helper_calls.insert(unraw(&last.ident));
-            }
+            self.calls.insert(qualified_name(&path.path));
         }
         syn::visit::visit_expr_call(self, call);
     }
@@ -322,9 +382,7 @@ impl<'ast> Visit<'ast> for WrapperAudit {
     /// (single segment) is just a variable and is left alone.
     fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
         if path.path.segments.len() > 1 {
-            if let Some(last) = path.path.segments.last() {
-                self.non_helper_calls.insert(unraw(&last.ident));
-            }
+            self.calls.insert(qualified_name(&path.path));
         }
         syn::visit::visit_expr_path(self, path);
     }
@@ -482,6 +540,19 @@ fn passes_true(call: &syn::ExprMethodCall) -> bool {
     )
 }
 
+/// The last two segments of a path, so `PageObjectHelper::new` and
+/// `Error::Internal` stay distinguishable from any other `new` or `Internal`.
+fn qualified_name(path: &syn::Path) -> String {
+    let segments: Vec<String> = path
+        .segments
+        .iter()
+        .rev()
+        .take(2)
+        .map(|segment| unraw(&segment.ident))
+        .collect();
+    segments.into_iter().rev().collect::<Vec<_>>().join("::")
+}
+
 fn unraw(ident: &syn::Ident) -> String {
     let text = ident.to_string();
     text.strip_prefix("r#").unwrap_or(&text).to_owned()
@@ -583,8 +654,10 @@ fn cfg_requires_test(meta: &syn::Meta) -> bool {
             .map(|metas| metas.iter().any(cfg_requires_test))
             .unwrap_or(false),
         // `any(...)` is test-only exactly when every alternative is.
+        // `any(...)` is test-only when every alternative is; the empty
+        // `any()` is false in every build, so the item is never production.
         syn::Meta::List(list) if list.path.is_ident("any") => nested(list)
-            .map(|metas| !metas.is_empty() && metas.iter().all(cfg_requires_test))
+            .map(|metas| metas.is_empty() || metas.iter().all(cfg_requires_test))
             .unwrap_or(false),
         // `not(not(test))` is still test-only; `not(test)` is not.
         syn::Meta::List(list) if list.path.is_ident("not") => nested(list)
