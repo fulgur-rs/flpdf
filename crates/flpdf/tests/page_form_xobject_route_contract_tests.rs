@@ -19,21 +19,21 @@ use syn::visit::Visit;
 fn production_source() -> std::collections::BTreeSet<String> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/page_form_xobject.rs");
     let source = fs::read_to_string(path).expect("page_form_xobject.rs must be readable");
-    production_identifiers(&source)
+    production_calls(&source)
 }
 
 /// Collect every identifier that appears in an item which is not gated
 /// test-only.
-fn production_identifiers(source: &str) -> std::collections::BTreeSet<String> {
+fn production_calls(source: &str) -> std::collections::BTreeSet<String> {
     let file = syn::parse_file(source).expect("page_form_xobject.rs must parse as Rust");
     let mut collector = ProductionCollector::default();
     collector.visit_file(&file);
-    collector.identifiers
+    collector.calls
 }
 
 #[derive(Default)]
 struct ProductionCollector {
-    identifiers: std::collections::BTreeSet<String>,
+    calls: std::collections::BTreeSet<String>,
 }
 
 impl<'ast> Visit<'ast> for ProductionCollector {
@@ -83,11 +83,21 @@ impl<'ast> Visit<'ast> for ProductionCollector {
     /// inside `dbg!(handle.as_dictionary())` would never reach `visit_ident`.
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         syn::visit::visit_macro(self, mac);
-        collect_token_identifiers(mac.tokens.clone(), &mut self.identifiers);
+        collect_token_calls(mac.tokens.clone(), &mut self.calls);
     }
 
-    fn visit_ident(&mut self, ident: &'ast syn::Ident) {
-        self.identifiers.insert(unraw(ident));
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        self.calls.insert(unraw(&call.method));
+        syn::visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = call.func.as_ref() {
+            if let Some(last) = path.path.segments.last() {
+                self.calls.insert(unraw(&last.ident));
+            }
+        }
+        syn::visit::visit_expr_call(self, call);
     }
 }
 
@@ -101,18 +111,26 @@ fn unraw(ident: &syn::Ident) -> String {
     text.strip_prefix("r#").unwrap_or(&text).to_owned()
 }
 
-fn collect_token_identifiers(
+fn collect_token_calls(
     tokens: proc_macro2::TokenStream,
-    identifiers: &mut std::collections::BTreeSet<String>,
+    calls: &mut std::collections::BTreeSet<String>,
 ) {
-    for token in tokens {
+    let trees: Vec<proc_macro2::TokenTree> = tokens.into_iter().collect();
+    for (index, token) in trees.iter().enumerate() {
         match token {
             proc_macro2::TokenTree::Ident(ident) => {
-                let text = ident.to_string();
-                identifiers.insert(text.strip_prefix("r#").unwrap_or(&text).to_owned());
+                let followed_by_parens = matches!(
+                    trees.get(index + 1),
+                    Some(proc_macro2::TokenTree::Group(group))
+                        if group.delimiter() == proc_macro2::Delimiter::Parenthesis
+                );
+                if followed_by_parens {
+                    let text = ident.to_string();
+                    calls.insert(text.strip_prefix("r#").unwrap_or(&text).to_owned());
+                }
             }
             proc_macro2::TokenTree::Group(group) => {
-                collect_token_identifiers(group.stream(), identifiers);
+                collect_token_calls(group.stream(), calls);
             }
             _ => {}
         }
@@ -306,13 +324,30 @@ fn delegates_to_helper(source: &str) -> bool {
 
 #[derive(Default)]
 struct DelegationProbe {
+    /// Bindings constructed from `PageObjectHelper::new(...)` in the function
+    /// currently being walked. A file-wide set would let a `helper` built in
+    /// some other production function stand in for one the wrapper never
+    /// constructed, so each function starts empty and a shadowing `let`
+    /// removes the name again.
     helper_bindings: std::collections::BTreeSet<String>,
     delegating_call_seen: bool,
+}
+
+impl DelegationProbe {
+    fn walk_scoped<F: FnOnce(&mut Self)>(&mut self, walk: F) {
+        let outer = std::mem::take(&mut self.helper_bindings);
+        walk(self);
+        self.helper_bindings = outer;
+    }
 }
 
 impl<'ast> Visit<'ast> for DelegationProbe {
     fn visit_item(&mut self, item: &'ast syn::Item) {
         if is_test_only(item_attrs(item)) {
+            return;
+        }
+        if matches!(item, syn::Item::Fn(_)) {
+            self.walk_scoped(|probe| syn::visit::visit_item(probe, item));
             return;
         }
         syn::visit::visit_item(self, item);
@@ -322,6 +357,10 @@ impl<'ast> Visit<'ast> for DelegationProbe {
         if is_test_only(impl_item_attrs(item)) {
             return;
         }
+        if matches!(item, syn::ImplItem::Fn(_)) {
+            self.walk_scoped(|probe| syn::visit::visit_impl_item(probe, item));
+            return;
+        }
         syn::visit::visit_impl_item(self, item);
     }
 
@@ -329,7 +368,16 @@ impl<'ast> Visit<'ast> for DelegationProbe {
         if is_test_only(trait_item_attrs(item)) {
             return;
         }
+        if matches!(item, syn::TraitItem::Fn(_)) {
+            self.walk_scoped(|probe| syn::visit::visit_trait_item(probe, item));
+            return;
+        }
         syn::visit::visit_trait_item(self, item);
+    }
+
+    /// A closure body is its own scope for this purpose.
+    fn visit_expr_closure(&mut self, closure: &'ast syn::ExprClosure) {
+        self.walk_scoped(|probe| syn::visit::visit_expr_closure(probe, closure));
     }
 
     fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
@@ -337,11 +385,17 @@ impl<'ast> Visit<'ast> for DelegationProbe {
             return;
         }
         // `let <name> = PageObjectHelper::new(...)` names the receiver the
-        // delegating call has to use.
+        // delegating call has to use; any other `let <name>` shadows it.
         if let syn::Stmt::Local(local) = stmt {
-            if let (syn::Pat::Ident(pat), Some(init)) = (&local.pat, &local.init) {
-                if constructs_helper(&init.expr) {
+            if let syn::Pat::Ident(pat) = &local.pat {
+                let constructed = local
+                    .init
+                    .as_ref()
+                    .is_some_and(|init| constructs_helper(&init.expr));
+                if constructed {
                     self.helper_bindings.insert(unraw(&pat.ident));
+                } else {
+                    self.helper_bindings.remove(&unraw(&pat.ident));
                 }
             }
         }
@@ -411,7 +465,7 @@ fn read_module() -> String {
 
 #[test]
 fn parsing_drops_every_test_only_gate_shape() {
-    let stripped = production_identifiers(
+    let stripped = production_calls(
         r##"
         use core::fmt;
         #[cfg(test)]
@@ -443,8 +497,10 @@ fn parsing_drops_every_test_only_gate_shape() {
         }
         "##,
     );
-    assert!(stripped.contains("shipped"), "stripped: {stripped:?}");
-    assert!(stripped.contains("also_shipped"), "stripped: {stripped:?}");
+    // The set holds calls, not declarations, so the shipped functions appear
+    // through what they call.
+    assert!(stripped.contains("keep_me"), "stripped: {stripped:?}");
+    assert!(stripped.contains("keep_me_too"), "stripped: {stripped:?}");
     assert!(!stripped.contains("dropped_a"), "stripped: {stripped:?}");
     assert!(!stripped.contains("dropped_b"), "stripped: {stripped:?}");
     assert!(!stripped.contains("BTreeSet"), "stripped: {stripped:?}");
