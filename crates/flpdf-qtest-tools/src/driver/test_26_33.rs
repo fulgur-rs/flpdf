@@ -911,6 +911,27 @@ logic error: Attempting to add an object from a different QPDF. Use QPDF::copyFo
             .expect("read copied O3 page /Type");
         assert_eq!(o3_type, b"/Page", "copied /QTest/O3 must still be a page");
 
+        // The donor gives `/O3` an `/OtherPage 4 0 R` reference to a second
+        // page (`3 0 obj ... /OtherPage 4 0 R`). qpdf's `copyForeignObject`
+        // stops at page boundaries, so the copy that lands under `/QTest`
+        // must not carry that reference across -- which is the behavior this
+        // test is named for, and which every other assertion here would pass
+        // without checking. Measured: the key resolves to null and has no
+        // object reference of its own.
+        let other_page = o3
+            .try_get_key(b"/OtherPage")
+            .expect("resolve copied /QTest/O3/OtherPage");
+        assert!(
+            other_page.object_ref().is_none(),
+            "the foreign-page copy must not carry /OtherPage's reference across the page boundary"
+        );
+        assert!(
+            other_page
+                .try_is_null()
+                .expect("resolve copied /OtherPage value"),
+            "/OtherPage must be absent or null in the copied /QTest/O3"
+        );
+
         assert!(
             stdout.is_empty(),
             "test 26 stdout should be empty: {stdout:?}"

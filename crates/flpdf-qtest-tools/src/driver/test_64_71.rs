@@ -642,6 +642,29 @@ mod tests {
                 RUN_LENGTH_ENCODED_AAAAAA.as_slice(),
                 "{key:?} must keep its original run-length-encoded bytes"
             );
+            // Preserved payload bytes alone would also be satisfied by a
+            // writer that dropped or rewrote `/Filter`, which would leave a
+            // consumer reading the encoded bytes as the content. Pin the
+            // filter and the decoded round-trip too.
+            // Preserved payload bytes alone would also be satisfied by a
+            // writer that dropped or rewrote `/Filter`, which would leave a
+            // consumer reading the encoded bytes as the content. Decoding
+            // after the reopen pins the filter too: without an intact
+            // `/RunLengthDecode` this yields the encoded bytes, not "AAAAAA".
+            let decoded = handle
+                .get_stream_data(flpdf::DecodeLevel::Specialized)
+                .unwrap_or_else(|error| panic!("decode {key:?} after reopen: {error}"));
+            assert_eq!(
+                decoded.as_ref().as_slice(),
+                b"AAAAAA",
+                "{key:?} must still decode to its original content, so its preserved \
+                 bytes stay readable rather than being reinterpreted as raw content"
+            );
+            assert_ne!(
+                decoded.as_ref().as_slice(),
+                RUN_LENGTH_ENCODED_AAAAAA.as_slice(),
+                "{key:?} decoding to the encoded bytes would mean the filter was lost"
+            );
         }
         let s3 = written.trailer_key_handle(b"S3");
         let s3_raw = s3

@@ -428,7 +428,7 @@ entrypoint が `mixed`/`bridge` ならそのケースも `mixed`/`bridge`」で�
 
 **2026-09-19（`flpdf-3yn9.48.207`）**: 上のパスが「実装 cutover なので本パス
 では行わない」と留保していた qtest-driver hidden feature 12 件
-（case 20/24/25/26/27/30/64/65/66/67/70/80）の cutover を実施した。
+（case 20/24/25/26/27/30/64/65/66/67/70/80）の cutover を実施した。**2026-09-19 訂正**: これを「hidden surface に紐づく残り全件」と読める書き方をしていたが、誤り——`driver/test_34_41.rs::resolved_key`（`:71-82`）と `driver/test_88_98.rs::resolved_key`（`:37-45`）が同じ bridge を内部で使っており、case 35/36 と 90/94 がそこを通る。これらは main 時点で既に `canonical` 判定なのでこの PR は分類を変えていないが、判定基準との食い違いとして `flpdf-j4n3a` で追跡する。本パスが cutover したのは上記 12 件である。
 `ObjectHandle::get_key` は resolving `try_get_key` へ機械的に置換できた（**2026-09-19 訂正**: ここを当初「非解決 `get_key`」と書いたのは誤り。`get_key`（`object_handle.rs:4649-4652`）は `try_get_key` に委譲するので receiver は解決する。変わるのは `#[doc(hidden)]` な hidden surface か公開 `try_*` かという露出と、panic か `Result` 伝播かというエラー処理だけで、解決の有無ではない）。一方、明示 `Pdf::resolve`（case 24/25/80）は内部で呼ぶ
 `ObjectHandle::try_dereference` 自体が `pub(crate)` で crate 外の
 qtest-tools からは直接呼べないため、単純な関数置換にはならなかった:
