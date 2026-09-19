@@ -35,9 +35,9 @@
 //! `prepend_repair_diagnostics`, `merge_recovered_qpdf_state`, and every
 //! `mem::take` on these fields thread the pieces back together in qpdf's
 //! `warn()` call order and always reach `deliver_canonical_diagnostics` --
-//! none is reordered or dropped (see `docs/qpdf-correspondence.md`'s
-//! `flpdf-77kv` table for the call-site trace). No source-level deviation
-//! marker applies to these fields.
+//! none is reordered or dropped (see the deviation-marker audit table in
+//! `docs/qpdf-correspondence.md` for the call-site trace). No source-level
+//! deviation marker applies to these fields.
 use crate::object_handle::ObjectValue;
 use crate::parser::{
     parse_qpdf_file_object_handle_with_diagnostics, HandleResolver, ParserDiagnostic,
