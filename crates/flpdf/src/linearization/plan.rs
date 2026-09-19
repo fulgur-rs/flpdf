@@ -198,26 +198,16 @@ fn stream_parameters_removed_for_linearization(
 ) -> Result<bool> {
     // qpdf's linearization optimizer probes a token-filtered stream even when
     // its /Filter and /DecodeParms entries are direct. That probe is
-    // observable because ValueSetter is stateful; use the linearization probe
-    // for modified streams so the first body pass sees qpdf's already-consumed
-    // filter. Unmodified streams use the linearized writer-policy probe below
-    // to decide whether parameter edges disappear.
+    // observable because ValueSetter is stateful, so every stream shares the
+    // same writer-policy probe below regardless of isDataModified().
     let normalize_content =
         stream_ref.is_some_and(|object_gen| content_normalize_refs.contains(&object_gen));
-    if handle.is_data_modified() {
-        crate::writer::plain::body::canonical_stream_filter_probe_for_linearization(
-            handle,
-            options,
-            normalize_content,
-        ) // cov:ignore: LLVM attributes the covered qpdf probe continuation to the call opening line
-    } else {
-        crate::writer::plain::body::canonical_stream_will_be_refiltered_with_policy(
-            handle,
-            options,
-            true,
-            normalize_content,
-        ) // cov:ignore: LLVM attributes the covered qpdf probe continuation to the call opening line
-    }
+    crate::writer::plain::body::canonical_stream_will_be_refiltered_with_policy(
+        handle,
+        options,
+        true,
+        normalize_content,
+    ) // cov:ignore: LLVM attributes the covered qpdf probe continuation to the call opening line
 }
 
 /// Collect indirect references from a live qpdf-shaped handle graph without

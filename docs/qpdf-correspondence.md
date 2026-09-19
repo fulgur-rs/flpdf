@@ -4023,13 +4023,21 @@ flpdfのlinearization probeはこの境界で早期return・warning抑止をし�
 early return自体を`canonical_stream_will_be_refiltered_with_policy`から撤去し、
 canonical `canonical_stream_filter_probe`へ統一した。**この撤去は production 挙動を
 変えていない**（2026-09-19 追記）——当該 wrapper の production 呼び出し元は
-`linearization/plan.rs:214` のみで `is_data_modified()` の `else` 分岐にあり、
-早期 return（`if handle.is_data_modified()`）は到達しない。plain 経路の caller は
+`linearization/plan.rs`の`is_data_modified()`の`else`分岐（collapse前の行番号は
+`:214`。`flpdf-3yn9.48.184`でこの分岐自体を撤去したため現在は該当行が存在しない）
+のみにあり、早期 return（`if handle.is_data_modified()`）は到達しない。plain 経路の caller は
 `f8d151deb`（2026-09-12）で既に撤去済みで、そこが実際の cutover。qpdfの`willFilterStream`
 （`QPDFWriter.cc:1254`）は`isDataModified() || compress_streams || stream_decode_level`
 をfilterフラグへ畳むだけで早期returnを持たない。modified streamを含むlibrary
 RED/GREENテスト（`modified_streams_use_the_canonical_refilter_probe`）と
 qpdf-zlib-compat byte比較で検証済み（route matrix C22 は `canonical` へ再分類）。
+
+2026-09-19（`flpdf-3yn9.48.184`）: 上記で到達不能と確認した
+`linearization/plan.rs`側の`is_data_modified()`分岐（両アームが同じ実引数の
+呼び出しに収束済みで vestigial）自体を撤去し、
+`canonical_stream_will_be_refiltered_with_policy(handle, options, true,
+normalize_content)`の単一呼び出しへ一本化した。出力バイトへの影響は無い
+（`cargo test -p flpdf`と`qpdf-zlib-compat`のbyte-identicalテストで確認済み）。
 
 ### Linearization stop diagnostics retain qpdf source state (`flpdf-qlwe5`, 2026-09-17)
 
