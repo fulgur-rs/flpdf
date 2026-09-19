@@ -143,7 +143,7 @@ C44は public facade と deferred blob の責務分離を追跡する mixed owne
 | [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 20 | 0 | 4 | 0 |
 | [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 27 | 0 | 7 | 0 |
 | [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 42 | 0 | 0 | 0 |
-| [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 24 | 0 | 7 | 0 |
+| [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 25 | 0 | 6 | 0 |
 | [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 21 | 0 | 8 | 0 |
 
 ## 5. 責任境界と不変条件
