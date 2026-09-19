@@ -535,7 +535,10 @@ pub enum JsonStreamData {
 /// [`crate::job::QPDFJob::write_json`] resolves [`JsonStreamData::File`] without an explicit
 /// non-empty [`stream_prefix`](Self::stream_prefix) from a file output name
 /// when one is available. An empty prefix is treated as absent.
-pub struct JsonJobOptions<'a> {
+// `pub(crate)`: a support type for `QPDFJob::write_json`/`write_json_with_version`
+// (both `pub(crate)`; see their doc comments in `job/lifecycle.rs`), which has
+// no independent rule-8 ground of its own.
+pub(crate) struct JsonJobOptions<'a> {
     /// Level of PDF stream decoding before JSON serialization.
     pub decode_level: DecodeLevel,
     /// How stream payloads are represented in the JSON output.
@@ -555,7 +558,8 @@ pub struct JsonJobOptions<'a> {
 }
 
 /// Destination for JSON output at the command boundary.
-pub enum JsonJobOutput<'a> {
+// `pub(crate)`: same support-type rationale as `JsonJobOptions` above.
+pub(crate) enum JsonJobOutput<'a> {
     /// Standard output, whose writer is finished by the JSON serializer.
     Stdout(&'a mut dyn Write),
     /// A named top-level output file.
@@ -568,8 +572,9 @@ pub enum JsonJobOutput<'a> {
 }
 
 /// Failure while resolving command-level JSON options or writing JSON output.
+// `pub(crate)`: same support-type rationale as `JsonJobOptions` above.
 #[derive(Debug, thiserror::Error)]
-pub enum JsonJobError {
+pub(crate) enum JsonJobError {
     /// An invalid command-level option combination.
     #[error(transparent)]
     Usage(#[from] UsageError),
@@ -881,5 +886,263 @@ top-level object: key \"version\" is present in schema but missing in object\n"
         )
         .unwrap();
         output_schema(2, true, &[]).unwrap();
+    }
+
+    // `write_json_with_version_with_logger` is the layer that actually owns
+    // stream-prefix selection and qpdf-key selection; the tests below moved
+    // in-crate alongside `QPDFJob::write_json`/`write_json_with_version`
+    // narrowing to `pub(crate)` (`flpdf-3yn9.48.182`), since neither the
+    // stream-prefix usage-error behavior nor the key-selection oracle
+    // comparison need the enclosing job's warning/completion/exit-code
+    // lifecycle that `QPDFJob::write_json` adds.
+
+    fn write_json_default<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        options: JsonJobOptions<'_>,
+        output: JsonJobOutput<'_>,
+    ) -> Result<(), JsonJobError> {
+        write_json_with_version_with_logger(
+            pdf,
+            2,
+            false,
+            false,
+            false,
+            options,
+            output,
+            &QPDFLogger::create(),
+        )
+    }
+
+    fn stream_options<'a>(
+        stream_data: JsonStreamData,
+        stream_prefix: Option<&'a [u8]>,
+    ) -> JsonJobOptions<'a> {
+        JsonJobOptions {
+            decode_level: DecodeLevel::Generalized,
+            stream_data,
+            stream_prefix,
+            keys: &[],
+            objects: &[],
+        }
+    }
+
+    fn stream_side_file(prefix: &Path) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("{}-7", prefix.display()))
+    }
+
+    #[test]
+    fn stdout_file_mode_without_prefix_is_usage_error() {
+        let mut pdf = Pdf::open(BufReader::new(File::open(fixture()).unwrap())).unwrap();
+        let mut bytes = Vec::new();
+
+        let error = write_json_default(
+            &mut pdf,
+            stream_options(JsonStreamData::File, None),
+            JsonJobOutput::Stdout(&mut bytes),
+        )
+        .expect_err("file stream data without a prefix on stdout must be a usage error");
+
+        assert!(matches!(error, JsonJobError::Usage(_)));
+        assert_eq!(
+            error.to_string(),
+            "please specify --json-stream-prefix since the input file name is unknown"
+        );
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn stdout_file_mode_empty_prefix_is_usage_error() {
+        let mut pdf = Pdf::open(BufReader::new(File::open(fixture()).unwrap())).unwrap();
+        let mut bytes = Vec::new();
+        let keys = [JsonKey::Pages];
+        let options = JsonJobOptions {
+            decode_level: DecodeLevel::Generalized,
+            stream_data: JsonStreamData::File,
+            stream_prefix: Some(b""),
+            keys: &keys,
+            objects: &[],
+        };
+
+        let error = write_json_default(&mut pdf, options, JsonJobOutput::Stdout(&mut bytes))
+            .expect_err("an empty file-stream prefix on stdout must be a usage error");
+
+        assert!(matches!(error, JsonJobError::Usage(_)));
+        assert_eq!(
+            error.to_string(),
+            "please specify --json-stream-prefix since the input file name is unknown"
+        );
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn stdout_file_mode_uses_explicit_prefix() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let prefix = tempdir.path().join("explicit-stream");
+        let expected_side_file = stream_side_file(&prefix);
+        let mut pdf = Pdf::open(BufReader::new(File::open(fixture()).unwrap())).unwrap();
+        let mut bytes = Vec::new();
+
+        write_json_default(
+            &mut pdf,
+            stream_options(JsonStreamData::File, prefix.to_str().map(str::as_bytes)),
+            JsonJobOutput::Stdout(&mut bytes),
+        )
+        .unwrap();
+
+        let output: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            output["qpdf"][1]["obj:7 0 R"]["stream"]["datafile"],
+            expected_side_file.to_string_lossy().as_ref()
+        );
+        assert!(expected_side_file.exists());
+    }
+
+    #[test]
+    fn file_output_file_mode_defaults_prefix_to_output_filename() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let output_path = tempdir.path().join("output.json");
+        let expected_side_file = stream_side_file(&output_path);
+        let mut pdf = Pdf::open(BufReader::new(File::open(fixture()).unwrap())).unwrap();
+        let mut bytes = Vec::new();
+
+        write_json_default(
+            &mut pdf,
+            stream_options(JsonStreamData::File, None),
+            JsonJobOutput::File {
+                filename: &output_path,
+                writer: &mut bytes,
+            },
+        )
+        .unwrap();
+
+        let output: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            output["qpdf"][1]["obj:7 0 R"]["stream"]["datafile"],
+            expected_side_file.to_string_lossy().as_ref()
+        );
+        assert!(expected_side_file.exists());
+    }
+
+    #[test]
+    fn file_output_file_mode_empty_prefix_defaults_to_output_filename() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let output_path = tempdir.path().join("output.json");
+        let expected_side_file = stream_side_file(&output_path);
+        let mut pdf = Pdf::open(BufReader::new(File::open(fixture()).unwrap())).unwrap();
+        let mut bytes = Vec::new();
+
+        write_json_default(
+            &mut pdf,
+            stream_options(JsonStreamData::File, Some(b"")),
+            JsonJobOutput::File {
+                filename: &output_path,
+                writer: &mut bytes,
+            },
+        )
+        .unwrap();
+
+        let output: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            output["qpdf"][1]["obj:7 0 R"]["stream"]["datafile"],
+            expected_side_file.to_string_lossy().as_ref()
+        );
+        assert!(expected_side_file.exists());
+    }
+
+    #[test]
+    fn none_and_inline_modes_do_not_require_prefix() {
+        let mut none_pdf = Pdf::open(BufReader::new(File::open(fixture()).unwrap())).unwrap();
+        let mut none_bytes = Vec::new();
+        write_json_default(
+            &mut none_pdf,
+            stream_options(JsonStreamData::None, None),
+            JsonJobOutput::Stdout(&mut none_bytes),
+        )
+        .unwrap();
+
+        let mut inline_pdf = Pdf::open(BufReader::new(File::open(fixture()).unwrap())).unwrap();
+        let mut inline_bytes = Vec::new();
+        write_json_default(
+            &mut inline_pdf,
+            stream_options(JsonStreamData::Inline, None),
+            JsonJobOutput::Stdout(&mut inline_bytes),
+        )
+        .unwrap();
+
+        let none_output = String::from_utf8(none_bytes).unwrap();
+        let inline_output = String::from_utf8(inline_bytes).unwrap();
+        assert!(!none_output.contains("\"datafile\""));
+        assert!(inline_output.contains("\"data\""));
+    }
+
+    /// `--json=2 --json-key=qpdf` parity for the job's key-selection route.
+    ///
+    /// This is the in-progress-dictionary `"qpdf"`-key-only form that the job
+    /// selects via `JsonKey::Qpdf`, exercised through
+    /// `write_json_with_version_with_logger` -- the same serializer
+    /// `QPDFJob::write_json` delegates to -- rather than through
+    /// `document_json::write_json_key`'s single-key overload, which is a
+    /// separate `QPDF::writeJSON` overload with its own oracle test.
+    #[test]
+    fn qpdf_key_selection_matches_qpdf_json_key_bytes() {
+        const ORACLE_FIXTURES: &[&str] = &[
+            "one-page.pdf",
+            "no-stream-one-page.pdf",
+            "multi-stream-one-page.pdf",
+            "inherited-resources-one-page.pdf",
+            "attachment-two-page.pdf",
+            "linearized-one-page.pdf",
+            "objstm-lin-firstpage-private-before-shared.pdf",
+            "qdf-contents-ref-array.pdf",
+        ];
+
+        for name in ORACLE_FIXTURES {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/compat")
+                .join(name);
+            assert!(path.is_file(), "missing fixture: {}", path.display());
+            let Ok(output) = std::process::Command::new("qpdf")
+                .args(["--json=2", "--json-key=qpdf"])
+                .arg(&path)
+                .output()
+            else {
+                // cov:ignore-start: this test environment always has qpdf 11.9.0
+                // installed (many other oracle tests in this crate rely on it), so
+                // the skip branch cannot be exercised without uninstalling qpdf.
+                eprintln!("skipping {name}: qpdf is unavailable");
+                continue;
+                // cov:ignore-end
+            };
+            assert!(
+                output.status.success(),
+                "qpdf --json=2 --json-key=qpdf failed on {name}: {}",
+                String::from_utf8_lossy(&output.stderr) // cov:ignore: assertion failure message, never formatted because qpdf always succeeds here
+            );
+
+            let mut pdf = Pdf::open(BufReader::new(File::open(&path).unwrap())).unwrap();
+            let keys = [JsonKey::Qpdf];
+            let actual = {
+                let mut bytes = Vec::new();
+                write_json_default(
+                    &mut pdf,
+                    JsonJobOptions {
+                        decode_level: DecodeLevel::Generalized,
+                        stream_data: JsonStreamData::None,
+                        stream_prefix: None,
+                        keys: &keys,
+                        objects: &[],
+                    },
+                    JsonJobOutput::Stdout(&mut bytes),
+                )
+                .expect("qpdf JSON must be written");
+                bytes
+            };
+
+            assert_eq!(
+                String::from_utf8_lossy(&actual),
+                String::from_utf8_lossy(&output.stdout),
+                "{name}"
+            );
+        }
     }
 }

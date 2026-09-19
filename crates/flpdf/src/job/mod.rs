@@ -49,7 +49,7 @@ pub use attachments::{
 pub(crate) use check::check_bytes_for_test;
 pub use check::CheckError;
 pub use image_optimization::{optimize_images, ImageOptimizationOptions};
-pub use json::{JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData};
+pub use json::JsonStreamData;
 pub(crate) use json_sections::checksum_to_hex;
 pub use lifecycle::{FlattenAnnotationsMode, JobDocument, JobExitCode, QPDFJob, QPDFJobConfig};
 pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};
