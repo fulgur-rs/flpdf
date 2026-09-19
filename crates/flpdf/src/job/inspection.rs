@@ -124,22 +124,26 @@ impl QPDFJob {
 
 fn emit_xref<R: Read + Seek>(pdf: &mut Pdf<R>, logger: &crate::QPDFLogger) -> Result<()> {
     for (object_ref, entry) in pdf.get_raw_xref_table() {
+        // qpdf writes `og.unparse('/') << ": "` unconditionally before
+        // switching on the entry type (`QPDF.cc:1219-1220`), so that partial
+        // prefix reaches stdout even for the `default` arm's
+        // `std::logic_error` below -- it is not held back until a complete
+        // line is ready.
+        logger.info(format!(
+            "{}/{}: ",
+            object_ref.get_obj(),
+            object_ref.get_gen()
+        ))?; // cov:ignore: multiline call terminator has no executable coverage region
         let line = match entry {
             XrefEntry::Free { .. } => {
                 return Err(Error::Internal(
                     "unknown cross-reference table type while showing xref_table".to_owned(),
                 ));
             }
-            XrefEntry::Uncompressed { offset } => format!(
-                "{}/{}: uncompressed; offset = {offset}\n",
-                object_ref.get_obj(),
-                object_ref.get_gen()
-            ),
-            XrefEntry::Compressed { stream, index } => format!(
-                "{}/{}: compressed; stream = {stream}, index = {index}\n",
-                object_ref.get_obj(),
-                object_ref.get_gen()
-            ),
+            XrefEntry::Uncompressed { offset } => format!("uncompressed; offset = {offset}\n"),
+            XrefEntry::Compressed { stream, index } => {
+                format!("compressed; stream = {stream}, index = {index}\n")
+            }
         };
         logger.info(line)?;
     }
@@ -346,5 +350,64 @@ mod tests {
             Error::Internal(message)
                 if message == "unknown cross-reference table type while showing xref_table"
         ));
+    }
+
+    struct RecordingInfoSink {
+        bytes: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl crate::pipeline::Pipeline for RecordingInfoSink {
+        // cov:ignore-start: the logger never queries an info sink's identifier
+        fn identifier(&self) -> &str {
+            "recording info sink"
+        }
+        // cov:ignore-end
+
+        fn write(&mut self, data: &[u8]) -> crate::pipeline::PipelineResult<()> {
+            self.bytes.lock().unwrap().extend_from_slice(data);
+            Ok(())
+        }
+
+        // cov:ignore-start: the logger does not finish an info sink during show_xref
+        fn finish(&mut self) -> crate::pipeline::PipelineResult<()> {
+            Ok(())
+        }
+        // cov:ignore-end
+    }
+
+    #[test]
+    fn show_xref_writes_the_partial_entry_prefix_before_rejecting_a_type_zero_entry() {
+        // qpdf's `showXRefTable` writes `og.unparse('/') << ": "`
+        // unconditionally before its type switch, so a `default` arm
+        // (`std::logic_error`) still leaves that partial prefix on stdout
+        // (`QPDF.cc:1219-1233`). Reproduces the `issue-143.pdf` divergence:
+        // qpdf prints `0/0: ` with no trailing newline before erroring;
+        // flpdf used to print nothing at all.
+        let mut pdf = recovered_pdf();
+        pdf.resolver
+            .insert_default_xref_entry_for_test(ObjectRef::new(99, 0));
+
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let logger = crate::QPDFLogger::create();
+        logger.set_info(Some(crate::pipeline::PipelineHandle::new(
+            RecordingInfoSink {
+                bytes: std::sync::Arc::clone(&bytes),
+            },
+        )));
+        logger.set_warn(Some(logger.discard()));
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+
+        let error = job
+            .show_xref(&mut pdf)
+            .expect_err("qpdf rejects a type-zero entry while showing xref");
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "unknown cross-reference table type while showing xref_table"
+        ));
+        // The offending entry's prefix must reach stdout with no trailing
+        // newline before the error, like qpdf.
+        assert!(bytes.lock().unwrap().ends_with(b"99/0: "));
     }
 }
