@@ -104,16 +104,26 @@ pub fn safe_fopen(filename: &str, mode: &str) -> crate::Result<File> {
     }
 
     options.open(filename).map_err(|error| {
-        // `QPDFSystemError::createWhat` renders `strerror(errno)`
-        // (`libqpdf/QPDFSystemError.cc:13-29`); drop Rust's numeric
-        // `(os error N)` suffix so the text matches qpdf's.
-        let rendered = error.to_string();
-        let message = error
-            .raw_os_error()
-            .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
-            .unwrap_or(&rendered);
-        crate::Error::System(format!("open {filename}: {message}"))
+        crate::Error::System(format!("open {filename}: {}", strerror_text(&error)))
     })
+}
+
+/// Render an [`std::io::Error`] using qpdf's portable `strerror`-based
+/// wording instead of Rust's own `Display`.
+///
+/// `QPDFSystemError::createWhat` (`libqpdf/QPDFSystemError.cc:13-29`) formats
+/// every qpdf filesystem failure as `strerror(errno)`. Rust's `io::Error`
+/// `Display` already reproduces that same POSIX text on Unix hosts but
+/// appends a `(os error N)` suffix `strerror` does not produce, so strip it
+/// here. Any qpdf-compatible caller that reports a raw filesystem failure
+/// (not just [`safe_fopen`]) should route it through this instead of
+/// `io::Error`'s own `Display`.
+pub(crate) fn strerror_text(error: &std::io::Error) -> String {
+    let rendered = error.to_string();
+    error
+        .raw_os_error()
+        .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
+        .map_or(rendered.clone(), str::to_owned)
 }
 
 /// Format a signed integer using qpdf's supported bases and width rules.
@@ -769,8 +779,9 @@ const MAC_ROMAN_TO_UNICODE: [u32; 128] = [
 mod tests {
     use super::{
         int_to_string_base, parse_numrange, qpdf_size_to_int, qpdf_string_to_int_checked,
-        safe_fopen, same_file, to_utf8, utf8_to_ascii, utf8_to_ascii_checked, utf8_to_mac_roman,
-        utf8_to_pdf_doc, utf8_to_pdf_doc_checked, utf8_to_win_ansi, QpdfIntParse,
+        safe_fopen, same_file, strerror_text, to_utf8, utf8_to_ascii, utf8_to_ascii_checked,
+        utf8_to_mac_roman, utf8_to_pdf_doc, utf8_to_pdf_doc_checked, utf8_to_win_ansi,
+        QpdfIntParse,
     };
     use std::io::{Read, Write};
 
@@ -830,6 +841,16 @@ mod tests {
             matches!(&error, crate::Error::System(message) if message == "open /definitely/not/a/flpdf/file: No such file or directory"),
             "qpdf renders strerror without Rust's os-error suffix: {error:?}"
         );
+    }
+
+    /// `strerror_text` only strips Rust's `(os error N)` suffix when the
+    /// failure carries a raw OS error code (`raw_os_error()`); a
+    /// constructed [`std::io::Error`] without one (e.g. `Error::other`) has
+    /// no such suffix to strip, and the text must pass through unchanged.
+    #[test]
+    fn strerror_text_passes_through_an_error_without_a_raw_os_code() {
+        let error = std::io::Error::other("custom failure");
+        assert_eq!(strerror_text(&error), "custom failure");
     }
 
     #[test]
