@@ -44,8 +44,106 @@ impl<'ast> Visit<'ast> for ProductionCollector {
         syn::visit::visit_item(self, item);
     }
 
+    fn visit_field(&mut self, field: &'ast syn::Field) {
+        if is_test_only(&field.attrs) {
+            return;
+        }
+        syn::visit::visit_field(self, field);
+    }
+
+    fn visit_variant(&mut self, variant: &'ast syn::Variant) {
+        if is_test_only(&variant.attrs) {
+            return;
+        }
+        syn::visit::visit_variant(self, variant);
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        if is_test_only(impl_item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_impl_item(self, item);
+    }
+
+    fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+        if is_test_only(trait_item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_trait_item(self, item);
+    }
+
+    fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
+        if is_test_only(stmt_attrs(stmt)) {
+            return;
+        }
+        syn::visit::visit_stmt(self, stmt);
+    }
+
+    /// `Visit` treats a macro's token stream as opaque, so a forbidden call
+    /// inside `dbg!(handle.as_dictionary())` would never reach `visit_ident`.
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        syn::visit::visit_macro(self, mac);
+        collect_token_identifiers(mac.tokens.clone(), &mut self.identifiers);
+    }
+
     fn visit_ident(&mut self, ident: &'ast syn::Ident) {
         self.identifiers.insert(ident.to_string());
+    }
+}
+
+fn collect_token_identifiers(
+    tokens: proc_macro2::TokenStream,
+    identifiers: &mut std::collections::BTreeSet<String>,
+) {
+    for token in tokens {
+        match token {
+            proc_macro2::TokenTree::Ident(ident) => {
+                identifiers.insert(ident.to_string());
+            }
+            proc_macro2::TokenTree::Group(group) => {
+                collect_token_identifiers(group.stream(), identifiers);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn impl_item_attrs(item: &syn::ImplItem) -> &[syn::Attribute] {
+    match item {
+        syn::ImplItem::Const(i) => &i.attrs,
+        syn::ImplItem::Fn(i) => &i.attrs,
+        syn::ImplItem::Type(i) => &i.attrs,
+        syn::ImplItem::Macro(i) => &i.attrs,
+        _ => &[],
+    }
+}
+
+fn trait_item_attrs(item: &syn::TraitItem) -> &[syn::Attribute] {
+    match item {
+        syn::TraitItem::Const(i) => &i.attrs,
+        syn::TraitItem::Fn(i) => &i.attrs,
+        syn::TraitItem::Type(i) => &i.attrs,
+        syn::TraitItem::Macro(i) => &i.attrs,
+        _ => &[],
+    }
+}
+
+fn stmt_attrs(stmt: &syn::Stmt) -> &[syn::Attribute] {
+    match stmt {
+        syn::Stmt::Local(local) => &local.attrs,
+        syn::Stmt::Item(item) => item_attrs(item),
+        syn::Stmt::Expr(expr, _) => expr_attrs(expr),
+        syn::Stmt::Macro(mac) => &mac.attrs,
+    }
+}
+
+fn expr_attrs(expr: &syn::Expr) -> &[syn::Attribute] {
+    match expr {
+        syn::Expr::Call(e) => &e.attrs,
+        syn::Expr::MethodCall(e) => &e.attrs,
+        syn::Expr::Macro(e) => &e.attrs,
+        syn::Expr::Block(e) => &e.attrs,
+        _ => &[],
     }
 }
 
@@ -94,8 +192,14 @@ fn cfg_requires_test(meta: &syn::Meta) -> bool {
             )
             .map(|nested| nested.iter().any(cfg_requires_test))
             .unwrap_or(false),
-        // `any(test, ...)` does not make the item test-only, and `not(test)`
-        // makes it production-only; neither should be dropped here.
+        // `any(...)` is test-only exactly when every alternative is.
+        syn::Meta::List(list) if list.path.is_ident("any") => list
+            .parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            )
+            .map(|nested| !nested.is_empty() && nested.iter().all(cfg_requires_test))
+            .unwrap_or(false),
+        // `not(test)` makes the item production-only; never drop it here.
         _ => false,
     }
 }
@@ -124,15 +228,65 @@ fn production_page_form_xobject_uses_canonical_resolving_routes() {
             "page_form_xobject production retains non-canonical route {forbidden}"
         );
     }
+    // Identifier presence alone is satisfied by the wrapper's own declaration
+    // (it has the same name) and by the `PageObjectHelper` import, so the
+    // delegation is checked as an actual method call instead.
     assert!(
-        production.contains("PageObjectHelper"),
-        "the production wrapper must construct the canonical PageObjectHelper"
+        delegates_to_helper(&read_module()),
+        "the production wrapper must call helper.get_form_xobject_for_page(true) \
+         on a PageObjectHelper it constructed, not resolve handles itself"
     );
-    assert!(
-        production.contains("get_form_xobject_for_page"),
-        "the production wrapper must delegate to the canonical \
-         PageObjectHelper::get_form_xobject_for_page instead of resolving handles itself"
-    );
+}
+
+/// True when a non-test-only function calls `get_form_xobject_for_page` as a
+/// method and constructs a `PageObjectHelper`.
+fn delegates_to_helper(source: &str) -> bool {
+    let file = syn::parse_file(source).expect("page_form_xobject.rs must parse as Rust");
+    let mut probe = DelegationProbe::default();
+    probe.visit_file(&file);
+    probe.calls_helper_method && probe.constructs_helper
+}
+
+#[derive(Default)]
+struct DelegationProbe {
+    calls_helper_method: bool,
+    constructs_helper: bool,
+}
+
+impl<'ast> Visit<'ast> for DelegationProbe {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if is_test_only(item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_item(self, item);
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if call.method == "get_form_xobject_for_page" {
+            self.calls_helper_method = true;
+        }
+        syn::visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = call.func.as_ref() {
+            let segments: Vec<String> = path
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect();
+            if segments == ["PageObjectHelper", "new"] {
+                self.constructs_helper = true;
+            }
+        }
+        syn::visit::visit_expr_call(self, call);
+    }
+}
+
+fn read_module() -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/page_form_xobject.rs");
+    fs::read_to_string(path).expect("page_form_xobject.rs must be readable")
 }
 
 #[test]
