@@ -95,6 +95,7 @@ struct WriterOptions {
     recompress_flate: bool,
     compression_level: Option<i32>,
     progress: bool,
+    report_memory_usage: bool,
     static_id: bool,
     deterministic_id: bool,
     static_aes_iv: bool,
@@ -216,6 +217,7 @@ impl Default for WriterOptions {
             recompress_flate: false,
             compression_level: None,
             progress: false,
+            report_memory_usage: false,
             static_id: false,
             deterministic_id: false,
             static_aes_iv: false,
@@ -318,6 +320,7 @@ fn top_level_writer_options(
         no_original_object_ids: args.no_original_object_ids,
         preserve_unreferenced_objects: args.preserve_unreferenced,
         progress: args.progress,
+        report_memory_usage: args.report_memory_usage,
         recompress_flate: args.recompress_flate,
         compression_level,
         object_streams: args.object_streams.into(),
@@ -1372,6 +1375,10 @@ struct Cli {
     #[arg(long = "progress")]
     progress: bool,
 
+    /// Report the maximum amount of memory used (qpdf --report-memory-usage).
+    #[arg(long = "report-memory-usage")]
+    report_memory_usage: bool,
+
     /// Extract an attachment by key (qpdf --show-attachment compatible).
     ///
     /// KEY is the name-tree key used when the attachment was added. The raw
@@ -2191,6 +2198,10 @@ struct RewriteCommand {
     /// Report approximate write progress (qpdf --progress).
     #[arg(long = "progress")]
     progress: bool,
+
+    /// Report the maximum amount of memory used (qpdf --report-memory-usage).
+    #[arg(long = "report-memory-usage")]
+    report_memory_usage: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -3411,6 +3422,7 @@ fn main() {
             no_original_object_ids: args.no_original_object_ids,
             preserve_unreferenced_objects: args.preserve_unreferenced,
             progress: args.progress,
+            report_memory_usage: args.report_memory_usage,
             recompress_flate: args.recompress_flate,
             compression_level: top_level_compression_level,
             object_streams: args.object_streams.into(),
@@ -4700,6 +4712,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 no_original_object_ids: cmd.no_original_object_ids,
                 preserve_unreferenced_objects: cmd.preserve_unreferenced,
                 progress: cmd.progress,
+                report_memory_usage: cmd.report_memory_usage,
                 // `--qdf` and `--deterministic-id` configure the canonical writer's
                 // output preparation directly.
                 qdf: cmd.qdf,
@@ -6246,6 +6259,7 @@ fn configure_rewrite_job(
     job.set_allow_insecure(options.allow_insecure);
     job.set_verbose(verbose);
     job.set_progress(options.progress);
+    job.set_report_memory_usage(options.report_memory_usage);
     job.set_linearization(linearize, linearize_pass1.map(Path::to_path_buf));
 
     {
@@ -8024,6 +8038,7 @@ fn finish_page_extraction<R: Read + Seek + 'static>(
         split_job.set_output_file(output.to_path_buf())?;
         split_job.set_verbose(verbose);
         split_job.set_progress(split_progress);
+        split_job.set_report_memory_usage(options.report_memory_usage);
         split_job.set_password_mode(options.password_mode);
         split_job.set_allow_weak_crypto(options.allow_weak_crypto);
         split_job.set_allow_insecure(options.allow_insecure);
@@ -8068,6 +8083,7 @@ fn finish_page_extraction<R: Read + Seek + 'static>(
         write_job.set_output_file(output.to_path_buf())?;
         write_job.set_verbose(verbose);
         write_job.set_progress(options.progress);
+        write_job.set_report_memory_usage(options.report_memory_usage);
         write_job.set_password_mode(options.password_mode);
         write_job.set_allow_weak_crypto(options.allow_weak_crypto);
         write_job.set_allow_insecure(options.allow_insecure);
@@ -9657,6 +9673,7 @@ fn configure_attachment_job(
     job.set_allow_weak_crypto(writer_options.allow_weak_crypto);
     job.set_allow_insecure(writer_options.allow_insecure);
     job.set_progress(writer_options.progress);
+    job.set_report_memory_usage(writer_options.report_memory_usage);
     job.set_verbose(verbose);
     job.set_linearization(linearize, linearize_pass1.map(Path::to_path_buf));
     configure_top_level_inspection_transformations(

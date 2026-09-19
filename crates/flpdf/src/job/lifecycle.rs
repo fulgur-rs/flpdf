@@ -1783,6 +1783,14 @@ impl QPDFJob {
         self.configuration.progress = value;
     }
 
+    /// Request qpdf's maximum-memory-usage diagnostic report.
+    ///
+    /// Corresponds to `QPDFJob::Config::reportMemoryUsage`
+    /// (`libqpdf/QPDFJob_config.cc:521-524`).
+    pub fn set_report_memory_usage(&mut self, value: bool) {
+        self.configuration.report_memory_usage = value;
+    }
+
     /// Enable qpdf's verbose job diagnostics.
     ///
     /// Corresponds to `QPDFJob::Config::verbose` (`libqpdf/QPDFJob_config.cc:
