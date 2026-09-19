@@ -671,14 +671,11 @@ fn read_job_json_file(path: &Path) -> Result<crate::json::Json> {
     // via `QUtil::read_file_into_string` -> `QUtil::safe_fopen`
     // (`QPDFJob_config.cc:776`, `libqpdf/QUtil.cc:490-519,1167-1172`) and
     // reports a missing/unreadable file with portable `strerror` wording, not
-    // Rust's `io::Error` text.
-    let bytes = std::fs::read(path).map_err(|error| {
-        Error::System(format!(
-            "open {}: {}",
-            path.display(),
-            crate::qutil::strerror_text(&error)
-        ))
-    })?;
+    // Rust's `io::Error` text. Both routes share one owner for that rendering:
+    // `strerror_text` alone keeps Rust's Display, which on Windows is "The
+    // system cannot find the file specified." rather than qpdf's
+    // `strerror(ENOENT)`.
+    let bytes = std::fs::read(path).map_err(|error| argv::job_json_file_open_error(path, error))?;
     let value =
         crate::json::Json::parse(&bytes).map_err(|error| Error::System(error.to_string()))?;
     if !value.is_dictionary() {

@@ -1037,7 +1037,7 @@ fn path_description_bytes(path: &Path) -> Vec<u8> {
 /// the native Windows wording for a missing file. `path.display()` is also
 /// lossy for a non-UTF-8 path, so this renders the byte-preserving
 /// [`path_description_bytes`] instead.
-fn job_json_file_open_error(path: &Path, error: std::io::Error) -> Error {
+pub(crate) fn job_json_file_open_error(path: &Path, error: std::io::Error) -> Error {
     let rendered = error.to_string();
     let message: &str = match error.kind() {
         std::io::ErrorKind::NotFound => "No such file or directory",
