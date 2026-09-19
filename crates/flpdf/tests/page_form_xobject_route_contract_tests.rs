@@ -173,6 +173,16 @@ impl<'ast> Visit<'ast> for WrapperAudit {
         syn::visit::visit_stmt(self, stmt);
     }
 
+    /// An attributed expression can sit at any depth -- inside a `let`, a
+    /// tuple, an array, a call argument -- so the gate is checked on every
+    /// expression rather than only on whole statements.
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        if is_test_only(expr_attrs(expr)) {
+            return;
+        }
+        syn::visit::visit_expr(self, expr);
+    }
+
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         let method = unraw(&call.method);
         let on_helper = receiver_is_helper(&call.receiver, &self.helper_bindings);

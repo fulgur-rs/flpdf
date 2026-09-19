@@ -572,7 +572,7 @@ The remaining functions in this module (`effective_box_array`,
 reimplementations kept to assert the canonical helper's output against an
 independent walk of the same qpdf fallback chains; they are not part of the
 production route. The new
-`production_page_form_xobject_uses_canonical_resolving_routes` route
+`the_production_wrapper_delegates_without_inspecting_handles` route
 contract fixes the caller-zero boundary and asserts the delegation call
 itself, so a future change that inlines accessor logic into the wrapper
 without going through `PageObjectHelper` fails the contract. `job/overlay.rs`
