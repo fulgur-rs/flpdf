@@ -118,3 +118,58 @@ fn without_the_flag_no_memory_usage_line_is_printed() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
 }
+
+/// qpdf prints the line from whichever job finished the run
+/// (`QPDFJob.cc:505-509`), so inspection routes report it just like writes.
+/// Measured against pinned qpdf 11.9.0: each of these emits exactly one
+/// `qpdf-max-memory-usage` line on stderr.
+#[test]
+fn report_memory_usage_reaches_the_inspection_routes() {
+    let input = fixture("one-page.pdf");
+
+    for flag in [
+        "--show-npages",
+        "--check",
+        "--show-xref",
+        "--show-pages",
+        "--show-encryption",
+        "--list-attachments",
+        "--json",
+    ] {
+        let output = Command::cargo_bin("flpdf")
+            .expect("flpdf binary")
+            .arg("--report-memory-usage")
+            .arg(flag)
+            .arg(&input)
+            .output()
+            .unwrap_or_else(|error| panic!("flpdf invocation for {flag}: {error}"));
+
+        let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+        assert!(
+            memory_usage_line_pattern().is_match(&stderr),
+            "{flag} must report memory usage like qpdf; stderr was {stderr:?}"
+        );
+    }
+}
+
+/// The same routes stay silent without the flag, so the line is attributable
+/// to `--report-memory-usage` rather than to inspection output in general.
+#[test]
+fn inspection_routes_stay_silent_without_the_flag() {
+    let input = fixture("one-page.pdf");
+
+    for flag in ["--show-npages", "--check", "--show-xref", "--json"] {
+        let output = Command::cargo_bin("flpdf")
+            .expect("flpdf binary")
+            .arg(flag)
+            .arg(&input)
+            .output()
+            .unwrap_or_else(|error| panic!("flpdf invocation for {flag}: {error}"));
+
+        let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+        assert!(
+            !memory_usage_line_pattern().is_match(&stderr),
+            "{flag} must not report memory usage without the flag; stderr was {stderr:?}"
+        );
+    }
+}
