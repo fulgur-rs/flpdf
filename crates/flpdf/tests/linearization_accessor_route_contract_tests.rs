@@ -171,8 +171,7 @@ fn linearization_writer_target_consumers_use_resolving_accessor_routes() {
     let source = production_source("src/linearization/writer.rs");
     let target_functions = [
         "append_objstm_container_object",
-        "append_body_object",
-        "append_body_object_for_ref",
+        "unparse_object",
         "compute_outline_hint_info",
     ];
     let target = target_functions
@@ -203,7 +202,7 @@ fn linearization_writer_target_consumers_use_resolving_accessor_routes() {
         "linearization writer target must use canonical resolving accessors"
     );
 
-    for function_name in ["append_objstm_container_object", "append_body_object"] {
+    for function_name in ["append_objstm_container_object", "unparse_object"] {
         let body = function_body(&source, function_name);
         let stream_offset = body
             .find("as_stream_dict(")

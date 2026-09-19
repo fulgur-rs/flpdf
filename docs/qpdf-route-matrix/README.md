@@ -50,7 +50,7 @@ markdown だけを読むので `--no-qpdf`（CI の形）でも完全に動く�
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 134 | 0 | 26 | 0 | 160 |
+| 135 | 0 | 25 | 0 | 160 |
 
 ### checker logical aggregate（259 rows）
 
@@ -63,7 +63,7 @@ rowsを検証する。2026-09-18 の現行 `origin/main` (`4942e7b3f7fbeb2a2d79e
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 214 | 0 | 45 | 0 | 259 |
+| 215 | 0 | 44 | 0 | 259 |
 
 したがって、160行の領域別表と259 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
@@ -143,7 +143,7 @@ C44は public facade と deferred blob の責務分離を追跡する mixed owne
 | [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 20 | 0 | 4 | 0 |
 | [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 26 | 0 | 8 | 0 |
 | [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 42 | 0 | 0 | 0 |
-| [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 25 | 0 | 6 | 0 |
+| [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 26 | 0 | 5 | 0 |
 | [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 21 | 0 | 8 | 0 |
 
 ## 5. 責任境界と不変条件
@@ -195,7 +195,7 @@ C44は public facade と deferred blob の責務分離を追跡する mixed owne
 | 不変条件 / 境界 | qpdf の根拠 | flpdf の現状（該当行） | 壊すと何が変わるか |
 |---|---|---|---|
 | **採番は enqueue 時に enqueue 順で行い、container-first**（ObjStm メンバーに出会ったら container を先に enqueue し、container 採番時に member 範囲を即時予約する） | `libqpdf/QPDFWriter.cc:1072-1141` / `libqpdf/QPDFWriter.cc:1057-1069` | D2/D3 は plain Disable の `writer/plain/body.rs::LiveQueue` を first consumer として導入。D11 は `writer/write_object.rs::WriteObject` と `LiveObjectEmitter` を共有。Preserve/Generate・QDF/normalize は **2026-09-19 時点で全て `LiveQueue` に収束済み**（`flpdf-3yn9.48.166` で D2/D3 を canonical へ。旧記載の「後続 mixed consumer」はその前の状態）。specialized standard と PCLm は live consumerへ移行済み | plain Disable では pre-write Catalog walk を採番 ownerにせず、root/trailer seed と emission-time child discovery を qpdf 順で行う。ObjStm container-first と残る legacy callers は後続 sliceで移行する |
-| **standard の書き込み順は enqueue 順、linearized は専用の2 pass。両者は object emission primitive を共有する** | `libqpdf/QPDFWriter.cc:1761-1809,2537-2904,2991-3044` | D11 mixed — plain、specialized、PCLm、linearized に emission が分散する | qpdf も standard と linearized の制御ループは別であり、4ループを1本にすること自体は完了条件ではない。`writeObject` / `unparseObject` owner と standard/PCLm の enqueue 中 body loop を復元し、consumer ごとに出力順を照合する |
+| **standard の書き込み順は enqueue 順、linearized は専用の2 pass。両者は object emission primitive を共有する** | `libqpdf/QPDFWriter.cc:1761-1809,2537-2904,2991-3044` | D11 canonical（**2026-09-19 訂正、`flpdf-3yn9.48.203`**: 旧記載「mixed — plain、specialized、PCLm、linearized に emission が分散する」は解消済み。linearized 独自の `append_body_object_with_raw_identity`/`append_object` を撤去し、`WriteObject` を実装する `LinearizedObjectEmitter` へ統合した。`specialized` は現ソースに存在せず、PCLm と 非 linearized の全 mode は `LiveObjectEmitter` を通る） | qpdf も standard と linearized の制御ループは別であり、4ループを1本にすること自体は完了条件ではない——この行が問うのは emission primitive を共有するかどうかで、`writeObject` owner を両者が共有した時点で満たされる。残る照合は consumer ごとの出力順で、D2 の byte-identical 実測がこれを担う |
 | **classic xref の欠番/type≠1 は通常出力で `std::logic_error`。object 0 と pass-1 `suppress_offsets` は別分岐** | `libqpdf/QPDFWriter.cc:2343-2379` / `libqpdf/QPDFXRefEntry.cc:27-32` | D12 canonical。plain / specialized / PCLm / linearized のclassic-xref consumerは `writer/plain/xref.rs::write_xref_table` と `write_xref_table_from_offsets` の共有 row ownerを使う | shared primitiveはentry 0、type-1 offset、generation 0、range、suppress/hint補正を保持し、missing/free/type2は `Error::Internal`。正常writerのgap producer調査はD12と分離する（D-U3） |
 | **encryption dictionary は body 全 object の後・xref の直前に置く**（standard 経路。番号はその時点の `next_objid++`） | `libqpdf/QPDFWriter.cc:3017-3019` / `libqpdf/QPDFWriter.cc:2244-2256` | D15 canonical（`crates/flpdf/src/writer/encrypted_strings.rs::write_encryption_dictionary_handle`）。plain pipeline は暗号化経路を持たない（`crates/flpdf/src/writer/plain/mod.rs:50-62`）ので、暗号化された非 linearized 出力は必ず legacy coordinator を通る | `/Encrypt` の object 番号が body 中に割り込み、以降の全 object 番号と xref offset がずれる |
 | **xref / trailer を書く実装は qpdf 全体で 1 組**（standard / pclm / linearized が同じ `writeXRefTable` / `writeXRefStream` / `writeTrailer` を共有する） | `libqpdf/QPDFWriter.cc:2343-2379` / `libqpdf/QPDFWriter.cc:2392-2495` / `libqpdf/QPDFWriter.cc:1160-1236` | D12 は canonical、**D14 は `mixed`**（**2026-09-19 訂正**: ここが D14 を canonical としていたのは誤り。`d-writer.md` の D14 行は trailer walk が 2 本残ること——`canonical_linearization_trailer_entries`（`linearization/writer.rs`）と `unparse_trailer_entries_with_ref_map_and_kind`（`writer/object.rs`）——を根拠に `mixed` のまま。この行の末尾が述べる「別の入口を保つ」がまさにその 2 本目）。D12のclassic rowは `crates/flpdf/src/writer/plain/xref.rs::write_xref_table` に、D13のxref-stream layout・payload policyは `crates/flpdf/src/writer/serialize.rs::xref_stream` にcanonical化し、plain / specialized / PCLm / linearized のconsumerが共有する。`getTrimmedTrailer` 相当（`crates/flpdf/src/writer.rs::build_writer_trailer_handle` の除去key集合 `crates/flpdf/src/writer/object.rs::TRIMMED_TRAILER_KEYS`）は classic / xref-stream / 線形化2パスの3経路が共有する1本（2026-09-19、`flpdf-3yn9.48.183`） | trailer keyの順序・`/Size` の差し替え・`/ID` の扱いが経路ごとに変わる。線形化2パスは物理レイアウト確定前にbyte列を確定する必要があるため、framingとentryをOutputSinkへ直接書くD14の共有ownerとは別の入口（`canonical_linearization_trailer_entries`）を保つが、除去key集合と値シリアライズ分岐は共有する |
