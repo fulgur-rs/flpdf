@@ -50,7 +50,7 @@ markdown だけを読むので `--no-qpdf`（CI の形）でも完全に動く�
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 130 | 0 | 30 | 0 | 160 |
+| 131 | 0 | 29 | 0 | 160 |
 
 ### checker logical aggregate（259 rows）
 
@@ -63,7 +63,7 @@ rowsを検証する。2026-09-18 の現行 `origin/main` (`4942e7b3f7fbeb2a2d79e
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 210 | 0 | 49 | 0 | 259 |
+| 211 | 0 | 48 | 0 | 259 |
 
 したがって、160行の領域別表と259 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
@@ -128,8 +128,10 @@ done | sort | uniq -c
 の259 logical rowsと混同しない。分類別の内訳は §1 の 2 表と §4 だけに書く
 （実測は `scripts/check-qpdf-route-matrix.py --stats` で出せる）。
 
-履歴行の例外: C44はpublic facadeとdeferred blobの責務を分離したmixed ownerとして追跡する。
-D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は当該pre-write sweep撤去完了としてcanonicalに分類する。
+履歴行の例外: D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は当該pre-write sweep撤去完了としてcanonicalに分類する。
+C44は public facade と deferred blob の責務分離を追跡する mixed owner の履歴行だったが、
+`flpdf-3yn9.48.154` の probe で乖離ゼロが確定し、単一 entrypoint が単一 qpdf 責務に対応する
+（`mixed` 定義のいずれの分岐にも該当しない）ことを確認したため `flpdf-3yn9.48.196` で canonical に再分類した。
 この例外をproduction routeの重複や全体parityの証拠に広げない。
 
 ## 4. 領域別 matrix
@@ -140,7 +142,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 |---|---|---|---|---|---|
 | [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 20 | 0 | 4 | 0 |
 | [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 26 | 0 | 8 | 0 |
-| [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 41 | 0 | 1 | 0 |
+| [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 42 | 0 | 0 | 0 |
 | [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 22 | 0 | 9 | 0 |
 | [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 21 | 0 | 8 | 0 |
 
@@ -689,7 +691,7 @@ warning collectionやtoken primitiveの移植を、領域A全体の統合完了�
 3. ~~**C22**~~ — 完了。2026-09-18（`flpdf-8od1h`、PR #2127）で plain 側の `is_data_modified()` 早期 return を撤去し、library RED/GREEN テストと qpdf-zlib-compat byte 比較で確認した。行分類も canonical。C-U3 が問う plain/QDF cacheとlinearized probeの callback timing 一致は別軸の残課題として残る。
 4. **C42 / B11** — recovered length を qpdf 同様に全 span で pipe する経路として完了。表示専用の EOL metadata や framing extension は持たない。前提: probe C-U1。
 5. ~~**C27**~~ — `.48.49` で canonical 化済み（§10 X-4 参照）。bootstrap-context decode は `ObjectHandle::get_stream_data(DecodeLevel::Specialized)` へ移行した。B17 の xref entry 構文処理の正本とは別責務である点は変わらない。
-6. **C44** — public `getStreamJSON` facade と deferred `StreamBlobProvider` 相当は `.48.47` で実装済み。C-U2 の provider 回数・lifetime probe は 2026-09-18（`.48.154`）に `probe154/c44_probe.sh` と flpdf 側テストで完了し、乖離なし。C44 は public facade と deferred blob の責務分離を追跡する mixed 履歴行のまま維持する。canonical C24 `write_stream_json` を二重pipeへ変更しない。
+6. ~~**C44**~~ — 完了。public `getStreamJSON` facade と deferred `StreamBlobProvider` 相当は `.48.47` で実装済み。C-U2 の provider 回数・lifetime probe は 2026-09-18（`.48.154`）に `probe154/c44_probe.sh` と flpdf 側テストで完了し、乖離なし。`.48.196`（2026-09-19）で、単一 entrypoint が単一 qpdf 責務に対応し `mixed` 定義に該当しないことを確認し、README §3 の履歴行例外から canonical へ再分類した。canonical C24 `write_stream_json` を二重pipeへ変更しない。
  7. **C4 / C8 / C9 / C25〜C29、E-27 / E-28** — provider/copy/decodeの不足primitiveを明示し、xrefとdriver test 0/1など既知consumerからbounded cutoverする。C28 の test 0/1 cutoverとqpdf-less public hardening/module撤去は `.48.93` / `.48.96` で完了した。C43 の qpdf-less public wrapperとinternal label helperは `.48.91` / `.48.95` で撤去した。E-28のtest 2/3/6/11/19 caller-side resolve/accessor bridgeは `.48.107` / `.48.108` / `.48.109` / `.48.110` / `.48.111`、test21/test17のshallowCopy・root/array accessor bridgeは `.48.112` / `.48.113` / `.48.114`、test73の`resolve_once` bridgeは `.48.115`、test87のdirect-only key enumeration bridgeは `.48.116`、test97のarray-count bridgeは `.48.117`、test92のdestroyed-handle accessor bridgeは `.48.118`、test85のwarning-free getValueAs consumer bridgeは `.48.120`、test86のUnicode string handle accessor bridgeは `.48.121`、test50のresource-merge accessor bridgeは `.48.122`、test71のpage-object accessor bridgeは `.48.123`、test72のpage/form accessor bridgeは `.48.125`、test52のform-field handle bridgeは `.48.136` でcase52固有の共有helperを撤去し、test4のnull-predicate bridgeは `.48.137`、test5のarray-accessor bridgeは `.48.138` でcaller-zero化した（共有`resolve_handle`はtest7-9のため保持）。
 
  2026-09-17（`.48.139`）: test7/8の`resolve_handle` caller-side stream predicate bridgeを撤去し、qpdf public `isStream()`対応のresolving `type_code()`へ移行した。test9の別責務のroot resolutionは保持する。
@@ -986,7 +988,7 @@ consumer全体のmixed分類は残るため、行分類の確定を全parity完�
 | B-P7 | owner対応確認済み | B7 | ObjStm headerの2 token読取をQPDF::readTokenへ対応付ける。classic xrefのByteCursorはreadLine/parse_xrefEntry責務であり一律trueへ変えない。 |
 | B-P8 | 一部旧記述訂正 | B13/B17 | unknown xref stream entry typeは現src/testに存在する。stream keyword found in trailer等の残条件を個別fixtureで照合する。 |
 | C-U1 | 既存sliceで解決 | C42 | recovered full-length pipe と show-object raw/filtered payload を維持する。表示用の追加 framing metadata は持たない。 |
-| C-U2 | 完了（2026-09-18、`flpdf-3yn9.48.154`） | C44 | `probe154/c44_probe.sh`（pinned qpdf 11.9.0 の `getStreamJSON` 直呼び）が provider 呼出回数 1/2/3、`pipeStreamData` の `nullptr` vs `&mut filtering_attempted` の同一出力、`/FlateDecode` の derived decode level（generalized=decode 済み + `/Filter` 除去 / none=raw + `/Filter` 維持）、blob の live-source 性、および**呼出側の handle が破棄された後の serialize**（case F: nested scope で `stream` を破棄してから `unparse`。`F.calls_after_scope=1` / `F.after_handle_drop` が `"data": "cmV0YWluZWQ="` を返し、Rust 側 `get_stream_json_blob_retains_the_stream_handle` と同一）を実測した。`crates/flpdf/tests/stream_json_get_tests.rs` の4テスト（呼出回数・live provider・handle 保持・flate level）が同観測を固定し、乖離なし。C44 は public facade と deferred blob の責務分離を追跡する mixed 履歴行のまま（production route 重複や全体 parity の証拠に広げない）。canonical C24 `write_stream_json` を二重pipeへ変更しない。 |
+| C-U2 | 完了（2026-09-18、`flpdf-3yn9.48.154`） | C44 | `probe154/c44_probe.sh`（pinned qpdf 11.9.0 の `getStreamJSON` 直呼び）が provider 呼出回数 1/2/3、`pipeStreamData` の `nullptr` vs `&mut filtering_attempted` の同一出力、`/FlateDecode` の derived decode level（generalized=decode 済み + `/Filter` 除去 / none=raw + `/Filter` 維持）、blob の live-source 性、および**呼出側の handle が破棄された後の serialize**（case F: nested scope で `stream` を破棄してから `unparse`。`F.calls_after_scope=1` / `F.after_handle_drop` が `"data": "cmV0YWluZWQ="` を返し、Rust 側 `get_stream_json_blob_retains_the_stream_handle` と同一）を実測した。`crates/flpdf/tests/stream_json_get_tests.rs` の4テスト（呼出回数・live provider・handle 保持・flate level）が同観測を固定し、乖離なし。**2026-09-19（`.48.196`）**: 単一 entrypoint が単一 qpdf 責務に対応し `mixed` 定義に該当しないことを確認し、README §3 の履歴行例外から canonical へ再分類した（production route 重複や全体 parity の証拠には広げない）。canonical C24 `write_stream_json` を二重pipeへ変更しない。 |
 | C-U3 | 一部解消（2026-09-18、`flpdf-8od1h`） | C22/C39 | C22 の plain 側 `is_data_modified()` 早期 return は撤去し canonical 化した（token filter を登録した library RED/GREEN テストと qpdf-zlib-compat byte 比較で確認）。残る plain/QDF の出力 cache と linearized optimizer の事前 probe の callback timing 一致は非対称だけで bug とはしない、別軸の open question として継続する。 |
 | C-U4 | 完了 | C17/C18 | pinned qpdf headerをincludeしたC++ oracle probeと32固定vectorで、V/R・key長5/16/24/32・AES/RC4・非zero generationを確認し、単一primitiveへ統合した。 |
 | D-U1 | mixed確定・出力差を追加確認 | D6/D31 | source-index順のlinearized Preserveと共有membershipのobjgen順を比較する。既存strict Preserve byte testsを利用する。 |
