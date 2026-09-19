@@ -677,7 +677,7 @@ and `createWhat` formatting. `QpdfExc::what_bytes()` intentionally exposes the o
 NUL-terminated `what()` bytes; getters retain complete fields. Resolver/diagnostic consumer
 cutover and removal of duplicate formatters remain in the follow-up `.48.27` layers.
 
-⚪ **(B) `Error`'s exception-class × `qpdf_error_code_e` fold** (route matrix B32,
+⚪ **(B) `Error` carries qpdf's exception-class axis as variants** (route matrix B32,
 `docs/qpdf-route-matrix/b-parser-recovery-diagnostics.md`): qpdf classifies a raised
 error along two independent axes — which C++ exception class carries it (`QPDFExc`,
 or a bare `std::logic_error`/`std::runtime_error`/`std::range_error`; B32 cites concrete

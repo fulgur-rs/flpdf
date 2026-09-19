@@ -265,9 +265,6 @@ impl std::error::Error for QpdfExc {}
 /// `QPDFExc::createWhat` (`libqpdf/QPDFExc.cc:26-49`), so two otherwise
 /// identical exceptions with different codes render identically — as they do
 /// in qpdf.
-///
-/// See the module documentation above and `docs/qpdf-correspondence.md` for
-/// the deviation record.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("I/O error: {0}")]
