@@ -1929,7 +1929,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
         // writes that value; here it returns `Unsupported` and writes
         // nothing. It is an unresolved behavioral divergence, kept marked so
         // a later audit finds it rather than mistaking it for sanctioned
-        // scaffolding. Route matrix A17 tracks it.
+        // scaffolding. Route matrix A16 tracks it (A17 is `swap_objects`,
+        // which has no such guard).
         if !replacement.belongs_exclusively_to_pdf(self.pdf_unique_id.get()) {
             return Err(Error::Unsupported(
                 "Attempting to add an object from a different QPDF. Use QPDF::copyForeignObject to add objects from another file.".to_string(),
