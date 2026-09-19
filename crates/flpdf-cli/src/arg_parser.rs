@@ -293,11 +293,14 @@ impl SegmentKind {
         }
     }
 
-    fn retain_in_residual(self, first_add_attachment: bool) -> bool {
+    fn retain_in_residual(self) -> bool {
         match self {
             Self::Overlay => false,
-            Self::AddAttachment => first_add_attachment,
-            Self::Encrypt | Self::Pages | Self::CopyAttachments | Self::PageLabels => true,
+            Self::Encrypt
+            | Self::Pages
+            | Self::AddAttachment
+            | Self::CopyAttachments
+            | Self::PageLabels => true,
         }
     }
 }
@@ -378,7 +381,6 @@ impl ArgParser {
         let mut residual_args = vec![program.clone()];
         let mut original_residual_args = vec![program];
         let mut named_segments = Vec::new();
-        let mut first_add_attachment = true;
         let mut first_unknown_option = None;
         // qpdf's input and output selectors reject a second occurrence: the
         // first one already chose the input or output
@@ -570,10 +572,7 @@ impl ArgParser {
 
             let segment = RawNamedSegment { option, tokens };
             let option = segment.option.as_str();
-            let retain = kind.retain_in_residual(first_add_attachment);
-            if kind == SegmentKind::AddAttachment {
-                first_add_attachment = false;
-            }
+            let retain = kind.retain_in_residual();
             if retain {
                 let marker = RawArg::from_bytes(format!("--{option}").into_bytes());
                 residual_args.push(marker.clone());
