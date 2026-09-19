@@ -429,8 +429,7 @@ entrypoint が `mixed`/`bridge` ならそのケースも `mixed`/`bridge`」で�
 **2026-09-19（`flpdf-3yn9.48.207`）**: 上のパスが「実装 cutover なので本パス
 では行わない」と留保していた qtest-driver hidden feature 12 件
 （case 20/24/25/26/27/30/64/65/66/67/70/80）の cutover を実施した。
-非解決 `ObjectHandle::get_key` は resolving `try_get_key` へ機械的に置換
-できたが、明示 `Pdf::resolve`（case 24/25/80）は内部で呼ぶ
+`ObjectHandle::get_key` は resolving `try_get_key` へ機械的に置換できた（**2026-09-19 訂正**: ここを当初「非解決 `get_key`」と書いたのは誤り。`get_key`（`object_handle.rs:4649-4652`）は `try_get_key` に委譲するので receiver は解決する。変わるのは `#[doc(hidden)]` な hidden surface か公開 `try_*` かという露出と、panic か `Result` 伝播かというエラー処理だけで、解決の有無ではない）。一方、明示 `Pdf::resolve`（case 24/25/80）は内部で呼ぶ
 `ObjectHandle::try_dereference` 自体が `pub(crate)` で crate 外の
 qtest-tools からは直接呼べないため、単純な関数置換にはならなかった:
 case 24 は qpdf の `res1.getArrayItem(0).getArrayItem(1).getIntValueAsInt()`
@@ -442,9 +441,13 @@ resolving チェーンへ書き換え、case 25/80 は直後の呼び出し
 明示 resolve を持たないことと一致する）。全 12 件を qpdf 11.9.0 の実機出力
 （`/usr/bin/qpdf` 11.9.0、pinned source と同一バージョン）と exit
 status・stdout/stderr・生成 PDF のバイト列で比較し byte-identical を確認した。
-12 件を `canonical` へ再分類し、E-28 自身の集計は `canonical` 93 /
-`mixed` 6（論理ケース）になった。残る 6 件（case 12/13 が E-7、case 14 が
-A17、case 45/84 が E-19、case 83 が E-17）はこのパスの対象外。
+12 件を `canonical` へ再分類し、E-28 自身の集計は `canonical` 92 /
+`mixed` 7（論理ケース。0/1 統合で表は 98 行）になった。残る 7 件は
+case 12/13 が E-7、case 14 が A17、case 45/84 が E-19、case 63 が D1/D16、
+case 83 が E-17 で、いずれもこのパスの対象外（**2026-09-19 訂正**: 当初
+93/6 と書き case 63 を落としていたが、詳細表の case 63 行は D16 依存を
+理由に `mixed` のままで、表を数え直すと mixed は 12/13/14/45/63/83/84 の
+7 件）。
 
 | case | qpdf test fn | flpdf owner fn | classification | A-D/E owner refs / notes |
 |---|---|---|---|---|

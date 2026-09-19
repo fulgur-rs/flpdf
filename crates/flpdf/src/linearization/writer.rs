@@ -75,12 +75,14 @@ use crate::linearization::renumber::{ObjStmRelocation, RenumberMap, SecondHalfCo
 use crate::pipeline::stdio_file::StdioBuffer;
 use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::writer::encrypted_strings::EncryptedStringEmitter;
+use crate::writer::encryption_state::WriterEncryptionState;
 use crate::writer::object::TrailerKind;
 use crate::writer::object_streams::{
     emit_objstm_body_from_handles_with_writer, planner_config_from_options,
     wrap_objstm_body_as_handle,
 };
 use crate::writer::plain::xref::write_xref_table_from_offsets;
+use crate::writer::write_object::WriteObject;
 use crate::writer::{
     decrement_progress_event, effective_pdf_version_and_ext, effective_stream_policy,
     output::{write_decimal_u64, write_object_ref, OutputSink, OutputTarget},
@@ -651,160 +653,273 @@ pub(crate) const PREV_PLACEHOLDER_WIDTH: usize = 22;
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Append `N G obj\n<object>\nendobj\n` to `bytes` and return the offset of the
-/// `N G obj` header (i.e. the start of the object).
-///
-/// When `encrypted_string_emitter` is `Some`, strings are encrypted from the
-/// writer's per-object emission state without mutating `object`. The
-/// `/Encrypt` dictionary never reaches this helper: [`do_write_pass`] emits it
-/// directly through
-/// [`write_encryption_dictionary_handle`](crate::writer::encrypted_strings::write_encryption_dictionary_handle)
-/// so it remains plaintext.
-fn append_object(
-    out: &mut OutputSink<'_>,
-    new_ref: ObjectRef,
-    object: &ObjectHandle,
-    map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
-    removed_refs: &BTreeSet<QpdfObjGen>,
-    encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
-) -> Result<usize> {
-    let offset = out.position_usize()?;
-    write_indirect_object_header(out, new_ref)?;
-    if let Some(emitter) = encrypted_string_emitter {
-        emitter.write_handle_object_with_qpdf_obj_gen_map_and_mode(
-            out,
-            new_ref,
-            None,
-            object,
-            false,
-            map,
-            removed_refs,
-        )?; // cov:ignore: canonical handle emission only errors for an invalid source graph.
-    } else {
-        object.write_object_with_qpdf_obj_gen_map_and_removed(out, map, removed_refs)?;
-    }
-    out.write_bytes(b"\nendobj\n")?;
-    Ok(offset)
-}
-
-/// Append one live-handle body object in output-number space.
-#[allow(clippy::too_many_arguments)]
-fn append_body_object_with_raw_identity(
-    out: &mut OutputSink<'_>,
-    new_ref: ObjectRef,
-    original_ref: QpdfObjGen,
-    object: &ObjectHandle,
-    options: &WriterOptions,
+/// Build the [`WriterEncryptionState`] a [`LinearizedObjectEmitter`] carries
+/// for trait conformance. qpdf's `setDataKey`/`cur_data_key` lifecycle
+/// (`QPDFWriter.cc:842-847`) runs unconditionally around every object, so
+/// this is constructed the same way regardless of whether `encrypt_ctx` is
+/// `Some` — matching the canonical live writer's own inert copy of this state
+/// (`LiveObjectEmitter`'s `encryption` field,
+/// `crates/flpdf/src/writer/plain/body.rs:578-587`). String encryption itself
+/// goes through `encrypted_string_emitter`'s own per-call key derivation
+/// instead of this state (see [`LinearizedObjectEmitter::encryption`]'s doc).
+fn writer_encryption_state_for(
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
-    encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
-    renumber: &RenumberMap,
-    removed_refs: &BTreeSet<QpdfObjGen>,
-    content_normalize_refs: &BTreeSet<QpdfObjGen>,
-) -> Result<usize> {
-    object.try_dereference()?;
-    let map = |object_gen| {
-        renumber.new_for_raw(object_gen).ok_or_else(|| {
-            // cov:ignore-start: every serialized body identity comes from the same raw RenumberMap that assigned its slot
-            crate::Error::Unsupported(format!(
-                "linearization writer: raw reference {} {} has no renumber entry",
-                object_gen.get_obj(),
-                object_gen.get_gen()
-            ))
-        })
-        // cov:ignore-end
-    };
-
-    if object.as_stream_dict().is_none() {
-        return append_object(
-            out,
-            new_ref,
-            object,
-            &map,
-            removed_refs,
-            encrypted_string_emitter,
-        );
-    }
-
-    let (stream_dict, data, dictionary_options) =
-        crate::writer::plain::body::canonical_stream_output_for_linearization(
-            object,
-            options,
-            options.content_normalization && content_normalize_refs.contains(&original_ref),
-        )?; // cov:ignore: LLVM maps this covered stream-output call terminator to a zero-count continuation region
-    let payload_ctx = encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref);
-    let is_metadata_stream = stream_dict.try_is_dictionary_of_type(b"Metadata", b"")?;
-    let cleartext_metadata =
-        payload_ctx.is_some_and(|ctx| !ctx.encrypt_metadata && is_metadata_stream);
-    // qpdf clears the active data key for cleartext metadata and leaves the
-    // stream dictionary's ordinary filter policy to `unparseObject`; it does
-    // not inject a synthetic `/Crypt /Identity` stage here
-    // (`QPDFWriter.cc:1539-1546`).
-
-    let mut payload_length = data.len();
-    if let Some(ctx) = payload_ctx.filter(|_| !cleartext_metadata) {
-        crate::writer::adjust_aes_stream_length(&mut payload_length, ctx, true)?;
-    }
-    let offset = out.position_usize()?;
-    write_indirect_object_header(out, new_ref)?;
-    if let Some(emitter) = encrypted_string_emitter {
-        // The encrypted string emitter currently owns a dictionary-handle
-        // callback, so retain this compatibility-shaped copy only on the
-        // encrypted branch. The ordinary linearized route below writes the
-        // source dictionary through the live length-override primitive.
-        let mut entries = stream_dict.try_as_dictionary()?.unwrap_or_default();
-        entries.insert(
-            b"/Length".to_vec(),
-            ObjectHandle::integer(i64::try_from(payload_length).unwrap_or(i64::MAX)),
-        );
-        let dict = ObjectHandle::dictionary(entries.into_iter().collect());
-        if dict.context().is_none() && object.context().is_some() {
-            dict.set_child_description(object, b" -> stream dictionary", b"");
-        }
-        emitter.write_handle_stream_dict_with_qpdf_obj_gen_map(
-            out,
-            new_ref,
-            None,
-            &dict,
-            crate::writer::encrypted_strings::StreamDictOptions::new(
-                false,
-                dictionary_options,
-                true,
-            ),
-            &map,
-            removed_refs,
-            None,
-        )?; // cov:ignore: canonical stream-dictionary emission only errors for an invalid source graph.
-    } else {
-        stream_dict.write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
-            out,
-            dictionary_options,
-            &map,
-            removed_refs,
-            payload_length,
-        )?; // cov:ignore: the unencrypted linearized route normally uses the shared string emitter; this direct owner call is validated by the compact writer tests
-    }
-
-    if let Some(ctx) = payload_ctx.filter(|_| !cleartext_metadata) {
-        crate::writer::write_stream_payload_with_pipeline(
-            out,
-            &data,
-            options.newline_before_endstream,
-            new_ref,
-            ctx,
-            true,
-            None,
-        )?; // cov:ignore: stream payload encryption is a validated in-memory writer boundary.
-    } else {
-        crate::writer::serialize::write_stream_payload(
-            out,
-            &data,
-            options.newline_before_endstream,
-        )?; // cov:ignore: plain linearized stream payload failure is a defensive pipeline continuation
-    }
-    out.write_bytes(b"\nendobj\n")?;
-    Ok(offset)
+) -> WriterEncryptionState {
+    WriterEncryptionState::new(
+        encrypt_ctx.is_some(),
+        encrypt_ctx
+            .map(|ctx| ctx.file_key.clone())
+            .unwrap_or_default(),
+        encrypt_ctx.is_some_and(|ctx| crate::writer::cipher_needs_aes_iv(ctx.cipher)),
+        encrypt_ctx.map_or(0, |ctx| ctx.encryption_v),
+        encrypt_ctx.map_or(0, |ctx| ctx.encryption_r),
+    )
 }
 
+/// Adapter routing linearized body-object emission through the shared
+/// [`WriteObject::write_object`] primitive — qpdf's own
+/// `QPDFWriter::writeObject`/`openObject`/`closeObject`
+/// (`libqpdf/QPDFWriter.cc:1036-1054,1761-1809`), which `writeLinearized`
+/// calls from the exact same function `writeStandard` uses
+/// (`QPDFWriter.cc:2792,3013`).
+///
+/// Linearization forces `qdf_mode = false` before either write route runs
+/// (`QPDFWriter::doWriteSetup`, `QPDFWriter.cc:2068-2070`), so
+/// `direct_stream_lengths` keeps qpdf's default `true` (only qdf mode clears
+/// it, `QPDFWriter.cc:2118-2122`) — the trait's `qdf_object_info`/
+/// `indirect_stream_length` defaults already match this route without an
+/// override.
+///
+/// Object-stream container membership is resolved by the planner before this
+/// adapter ever runs (`objstm_layout`), and every part loop dispatches a
+/// container to [`append_objstm_container_object`] before reaching a plain
+/// body object, so [`Self::object_stream_container`] always returns `None`
+/// here — the redirect qpdf's `writeObject` performs internally
+/// (`QPDFWriter.cc:1765-1769`) happens earlier in this writer's call graph
+/// instead, with the same net effect (a documented dispatch-location
+/// difference, not a behavior difference).
+struct LinearizedObjectEmitter<'a, 'sink> {
+    out: &'a mut OutputSink<'sink>,
+    options: &'a WriterOptions,
+    encrypt_ctx: Option<&'a crate::writer::EncryptionContext>,
+    encrypted_string_emitter: Option<&'a mut EncryptedStringEmitter>,
+    renumber: &'a RenumberMap,
+    removed_refs: &'a BTreeSet<QpdfObjGen>,
+    content_normalize_refs: &'a BTreeSet<QpdfObjGen>,
+    /// Raw identity of the document root, when this emitter writes it.
+    /// [`Self::unparse_object`] applies qpdf's output-time ADBE/Extensions
+    /// reconciliation only when the object being written has this identity,
+    /// matching `LiveObjectEmitter::unparse_object`'s own `root_source`
+    /// comparison (`crates/flpdf/src/writer/plain/body.rs:1061`) — the copy
+    /// happens *inside* `unparse_object`, after `write_object`'s wrapper has
+    /// already derived the object number from the real (pre-copy) identity.
+    root_source: Option<QpdfObjGen>,
+    final_pdf_version: &'a str,
+    final_extension_level: i64,
+    /// Faithful port of qpdf's unconditional `setDataKey`/`cur_data_key`
+    /// state (`QPDFWriter.cc:842-847`, built by
+    /// [`writer_encryption_state_for`]). Never read here: string encryption
+    /// goes through `encrypted_string_emitter`'s own per-call key derivation
+    /// keyed by the emitted object number, the same split the canonical
+    /// `LiveObjectEmitter` already uses for the plain live route
+    /// (`crates/flpdf/src/writer/plain/body.rs:1021-1023`,
+    /// `crates/flpdf/src/writer/encrypted_strings.rs:96`).
+    encryption: WriterEncryptionState,
+    xref: BTreeMap<u32, (u16, usize)>,
+    lengths: BTreeMap<u32, usize>,
+}
+
+impl WriteObject for LinearizedObjectEmitter<'_, '_> {
+    type ObjectStreamContainer = ();
+
+    fn object_stream_container(&self, _object: QpdfObjGen) -> Option<()> {
+        None
+    }
+
+    // cov:ignore-start: every ObjStm container is pre-dispatched to
+    // append_objstm_container_object by the caller before this adapter's
+    // loop runs (object_stream_container always returns None above), so
+    // qpdf's in-writeObject container redirect (QPDFWriter.cc:1765-1769)
+    // is unreachable through this adapter — the whole function, including
+    // its signature and closing brace, never executes.
+    fn write_object_stream(&mut self, _object: &ObjectHandle, (): ()) -> Result<()> {
+        Err(crate::Error::Internal(
+            "linearized body-object emitter: unreachable object-stream redirect".to_string(),
+        ))
+    }
+    // cov:ignore-end
+
+    fn indicate_progress(&mut self) -> Result<()> {
+        report_progress_event(self.options)
+    }
+
+    fn output_number(&self, object: QpdfObjGen) -> Result<u32> {
+        self.renumber
+            .new_for_raw(object)
+            .map(|new_ref| new_ref.number)
+            .ok_or_else(|| {
+                // cov:ignore-start: every emitted identity comes from the same raw RenumberMap that assigned its slot.
+                crate::Error::Unsupported(format!(
+                    "linearization writer: raw reference {} {} has no renumber entry",
+                    object.get_obj(),
+                    object.get_gen()
+                ))
+            })
+        // cov:ignore-end
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        self.out.write_bytes(bytes)
+    }
+
+    fn output_count(&self) -> Result<usize> {
+        self.out.position_usize()
+    }
+
+    fn xref(&mut self) -> &mut BTreeMap<u32, (u16, usize)> {
+        &mut self.xref
+    }
+
+    fn lengths(&mut self) -> &mut BTreeMap<u32, usize> {
+        &mut self.lengths
+    }
+
+    fn encryption_state(&mut self) -> &mut WriterEncryptionState {
+        &mut self.encryption
+    }
+
+    fn unparse_object(&mut self, object: &ObjectHandle, _in_object_stream: bool) -> Result<()> {
+        object.try_dereference()?;
+        let original_ref = object.qpdf_obj_gen().unwrap_or(QpdfObjGen::new(0, 0));
+        let root_copy;
+        let object: &ObjectHandle = if self.root_source == Some(original_ref) {
+            root_copy = object.output_root_copy_with_adbe(
+                self.final_pdf_version,
+                self.final_extension_level,
+                true,
+            )?; // cov:ignore: the planner's root identity always resolves to a live Catalog handle.
+            &root_copy
+        } else {
+            object
+        };
+
+        let renumber = self.renumber;
+        let map = move |object_gen: QpdfObjGen| {
+            renumber.new_for_raw(object_gen).ok_or_else(|| {
+                // cov:ignore-start: every serialized body identity comes from the same raw RenumberMap that assigned its slot
+                crate::Error::Unsupported(format!(
+                    "linearization writer: raw reference {} {} has no renumber entry",
+                    object_gen.get_obj(),
+                    object_gen.get_gen()
+                ))
+            })
+            // cov:ignore-end
+        };
+        let new_ref = ObjectRef::new(self.output_number(original_ref)?, 0);
+        let removed_refs = self.removed_refs;
+        let out = &mut *self.out;
+
+        if object.as_stream_dict().is_none() {
+            return match self.encrypted_string_emitter.as_deref_mut() {
+                Some(emitter) => emitter.write_handle_object_with_qpdf_obj_gen_map_and_mode(
+                    out,
+                    new_ref,
+                    None,
+                    object,
+                    false,
+                    &map,
+                    removed_refs,
+                ), // cov:ignore: canonical handle emission only errors for an invalid source graph.
+                None => {
+                    object.write_object_with_qpdf_obj_gen_map_and_removed(out, &map, removed_refs)
+                }
+            };
+        }
+
+        let (stream_dict, data, dictionary_options) =
+            crate::writer::plain::body::canonical_stream_output_for_linearization(
+                object,
+                self.options,
+                self.options.content_normalization
+                    && self.content_normalize_refs.contains(&original_ref),
+            )?; // cov:ignore: LLVM maps this covered stream-output call terminator to a zero-count continuation region
+        let payload_ctx = self.encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref);
+        let is_metadata_stream = stream_dict.try_is_dictionary_of_type(b"Metadata", b"")?;
+        let cleartext_metadata =
+            payload_ctx.is_some_and(|ctx| !ctx.encrypt_metadata && is_metadata_stream);
+        // qpdf clears the active data key for cleartext metadata and leaves the
+        // stream dictionary's ordinary filter policy to `unparseObject`; it does
+        // not inject a synthetic `/Crypt /Identity` stage here
+        // (`QPDFWriter.cc:1539-1546`).
+
+        let mut payload_length = data.len();
+        if let Some(ctx) = payload_ctx.filter(|_| !cleartext_metadata) {
+            crate::writer::adjust_aes_stream_length(&mut payload_length, ctx, true)?;
+        }
+        if let Some(emitter) = self.encrypted_string_emitter.as_deref_mut() {
+            // The encrypted string emitter currently owns a dictionary-handle
+            // callback, so retain this compatibility-shaped copy only on the
+            // encrypted branch. The ordinary linearized route below writes the
+            // source dictionary through the live length-override primitive.
+            let mut entries = stream_dict.try_as_dictionary()?.unwrap_or_default();
+            entries.insert(
+                b"/Length".to_vec(),
+                ObjectHandle::integer(i64::try_from(payload_length).unwrap_or(i64::MAX)),
+            );
+            let dict = ObjectHandle::dictionary(entries.into_iter().collect());
+            if dict.context().is_none() && object.context().is_some() {
+                dict.set_child_description(object, b" -> stream dictionary", b"");
+            }
+            emitter.write_handle_stream_dict_with_qpdf_obj_gen_map(
+                out,
+                new_ref,
+                None,
+                &dict,
+                crate::writer::encrypted_strings::StreamDictOptions::new(
+                    false,
+                    dictionary_options,
+                    true,
+                ),
+                &map,
+                removed_refs,
+                None,
+            )?; // cov:ignore: canonical stream-dictionary emission only errors for an invalid source graph.
+        } else {
+            stream_dict
+                .write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
+                    out,
+                    dictionary_options,
+                    &map,
+                    removed_refs,
+                    payload_length,
+                )?; // cov:ignore: the unencrypted linearized route normally uses the shared string emitter; this direct owner call is validated by the compact writer tests
+        }
+
+        if let Some(ctx) = payload_ctx.filter(|_| !cleartext_metadata) {
+            crate::writer::write_stream_payload_with_pipeline(
+                out,
+                &data,
+                self.options.newline_before_endstream,
+                new_ref,
+                ctx,
+                true,
+                None,
+            )?; // cov:ignore: stream payload encryption is a validated in-memory writer boundary.
+        } else {
+            crate::writer::serialize::write_stream_payload(
+                out,
+                &data,
+                self.options.newline_before_endstream,
+            )?; // cov:ignore: plain linearized stream payload failure is a defensive pipeline continuation
+        }
+        Ok(())
+    }
+}
+
+/// Write one live-handle body object addressed by a checked `ObjectRef`,
+/// through [`LinearizedObjectEmitter`]. `new_ref` is the caller's own
+/// renumber-map lookup for `original_ref`; this returns the same offset
+/// [`LinearizedObjectEmitter::xref`] records for it during the call.
 #[allow(clippy::too_many_arguments)]
 fn append_body_object_for_ref<R: Read + Seek>(
     out: &mut OutputSink<'_>,
@@ -819,58 +934,29 @@ fn append_body_object_for_ref<R: Read + Seek>(
     content_normalize_refs: &BTreeSet<QpdfObjGen>,
 ) -> Result<usize> {
     let object = pdf.get_object_handle(original_ref);
-    append_body_object_with_raw_identity(
+    let mut emitter = LinearizedObjectEmitter {
         out,
-        new_ref,
-        QpdfObjGen::try_from_object_ref(original_ref)?,
-        &object,
         options,
         encrypt_ctx,
         encrypted_string_emitter,
         renumber,
         removed_refs,
         content_normalize_refs,
-    )
+        root_source: None,
+        final_pdf_version: "",
+        final_extension_level: 0,
+        encryption: writer_encryption_state_for(encrypt_ctx),
+        xref: BTreeMap::new(),
+        lengths: BTreeMap::new(),
+    };
+    emitter.write_object(&object, None)?;
+    Ok(emitter.xref[&new_ref.number].1)
 }
 
-/// Compatibility adapter for the test-only helper surface and callers that
-/// already own a checked `ObjectRef`. The linearization production path uses
-/// [`append_body_object_with_raw_identity`] so its removed set is prepared at
-/// the writer boundary rather than rebuilt for each object.
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn append_body_object(
-    out: &mut OutputSink<'_>,
-    new_ref: ObjectRef,
-    original_ref: ObjectRef,
-    object: &ObjectHandle,
-    options: &WriterOptions,
-    encrypt_ctx: Option<&crate::writer::EncryptionContext>,
-    encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
-    renumber: &RenumberMap,
-    removed_refs: &BTreeSet<ObjectRef>,
-    content_normalize_refs: &BTreeSet<ObjectRef>,
-) -> Result<usize> {
-    let raw_removed_refs =
-        crate::writer::object::qpdf_obj_gen_set_from_object_ref_set(removed_refs)?;
-    let raw_content_normalize_refs = content_normalize_refs
-        .iter()
-        .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
-        .collect();
-    append_body_object_with_raw_identity(
-        out,
-        new_ref,
-        QpdfObjGen::try_from_object_ref(original_ref)?,
-        object,
-        options,
-        encrypt_ctx,
-        encrypted_string_emitter,
-        renumber,
-        &raw_removed_refs,
-        &raw_content_normalize_refs,
-    )
-}
-
+/// Write one live-handle body object addressed by qpdf's raw
+/// (possibly non-`N G R`-representable) identity, through
+/// [`LinearizedObjectEmitter`]. See [`append_body_object_for_ref`] for the
+/// checked-`ObjectRef` sibling.
 #[allow(clippy::too_many_arguments)]
 fn append_body_object_for_raw<R: Read + Seek>(
     out: &mut OutputSink<'_>,
@@ -886,18 +972,64 @@ fn append_body_object_for_raw<R: Read + Seek>(
 ) -> Result<usize> {
     let object =
         pdf.get_object_handle_by_raw_identity(original_gen.get_obj(), original_gen.get_gen());
-    append_body_object_with_raw_identity(
+    let mut emitter = LinearizedObjectEmitter {
         out,
-        new_ref,
-        original_gen,
-        &object,
         options,
         encrypt_ctx,
         encrypted_string_emitter,
         renumber,
         removed_refs,
         content_normalize_refs,
-    )
+        root_source: None,
+        final_pdf_version: "",
+        final_extension_level: 0,
+        encryption: writer_encryption_state_for(encrypt_ctx),
+        xref: BTreeMap::new(),
+        lengths: BTreeMap::new(),
+    };
+    emitter.write_object(&object, None)?;
+    Ok(emitter.xref[&new_ref.number].1)
+}
+
+/// Write the document root (qpdf `lc_root`) through
+/// [`LinearizedObjectEmitter`], applying qpdf's output-time ADBE/Extensions
+/// reconciliation inside [`LinearizedObjectEmitter::unparse_object`] rather
+/// than pre-copying the handle at the call site — see
+/// [`LinearizedObjectEmitter::root_source`].
+#[allow(clippy::too_many_arguments)]
+fn append_root_object<R: Read + Seek>(
+    out: &mut OutputSink<'_>,
+    pdf: &mut Pdf<R>,
+    new_ref: ObjectRef,
+    root_ref: ObjectRef,
+    options: &WriterOptions,
+    encrypt_ctx: Option<&crate::writer::EncryptionContext>,
+    encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
+    renumber: &RenumberMap,
+    removed_refs: &BTreeSet<QpdfObjGen>,
+    content_normalize_refs: &BTreeSet<QpdfObjGen>,
+    final_pdf_version: &str,
+    final_extension_level: i64,
+) -> Result<usize> {
+    let object = pdf.get_object_handle(root_ref);
+    let root_source = QpdfObjGen::try_from_object_ref(root_ref)?;
+    let mut emitter = LinearizedObjectEmitter {
+        out,
+        options,
+        encrypt_ctx,
+        encrypted_string_emitter,
+        renumber,
+        removed_refs,
+        content_normalize_refs,
+        root_source: Some(root_source),
+        final_pdf_version,
+        final_extension_level,
+        encryption: writer_encryption_state_for(encrypt_ctx),
+        xref: BTreeMap::new(),
+        lengths: BTreeMap::new(),
+    };
+    emitter.write_object(&object, None)?;
+    Ok(emitter.xref[&new_ref.number].1)
 }
 
 /// Write repeated padding through the counted output boundary without creating
@@ -2011,7 +2143,9 @@ fn next_test_hint_stream_aes_iv(default: [u8; 16]) -> [u8; 16] {
 /// `BTreeMap`-ordered stream serializer cannot reproduce. This
 /// emitter writes the dict literal by hand (via [`hint_stream_dict_prefix`]) to
 /// match that order; the surrounding framing (`N G obj\n` … `\nstream\n` …
-/// `\nendstream\nendobj\n`) is byte-identical to [`append_object`]. The newline
+/// `\nendstream\nendobj\n`) is byte-identical to the shared
+/// [`WriteObject`]-driven body-object framing
+/// ([`LinearizedObjectEmitter`]'s `open_object`/`close_object`). The newline
 /// before `endstream` is written only when the payload does not already end in
 /// one (qpdf, QPDFWriter.cc:2327). This deliberately does not use the global
 /// `newline_before_endstream` option: qpdf's hint-stream helper has this
@@ -2025,8 +2159,9 @@ fn next_test_hint_stream_aes_iv(default: [u8; 16]) -> [u8; 16] {
 /// number) is always distinct from `ctx.encrypt_ref` — the `/Encrypt` dict's
 /// slot is reserved by inserting immediately before the (then-current) hint
 /// slot and shifting the latter by one (`RenumberMap::reserve_encrypt_dict_slot`)
-/// — so no self-skip check is needed here, unlike [`append_object`] and
-/// [`append_body_object_with_raw_identity`].
+/// — so no self-skip check is needed here, unlike [`LinearizedObjectEmitter`]'s
+/// body-object route, which filters its own payload key against
+/// `ctx.encrypt_ref`.
 ///
 /// `hint_stream_aes_iv` is used only while constructing this one complete
 /// buffer. qpdf encrypts the hint stream once and replays the exact framed
@@ -2540,23 +2675,22 @@ fn do_write_pass<R: Read + Seek>(
                 .contains_key(&catalog_orig),
             "planner invariant: /Catalog is never an ObjStm member"
         );
-        // QPDFWriter::writeObject reports progress before unparseObject
-        // mutates shared Extensions (QPDFWriter.cc:1773,1794).
-        report_progress_event(options)?;
-        let catalog = pdf
-            .get_object_handle(catalog_orig)
-            .output_root_copy_with_adbe(final_pdf_version, final_extension_level, true)?;
-        let offset = append_body_object_with_raw_identity(
+        // WriteObject::write_object reports progress before unparse_object
+        // mutates shared Extensions, matching qpdf's writeObject
+        // (QPDFWriter.cc:1771,1791-1794).
+        let offset = append_root_object(
             output,
+            pdf,
             catalog_new_ref,
-            QpdfObjGen::try_from_object_ref(catalog_orig)?,
-            &catalog,
+            catalog_orig,
             options,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
             renumber,
             raw_removed_refs,
             raw_content_normalize_refs,
+            final_pdf_version,
+            final_extension_level,
         )?; // cov:ignore: planner-produced Catalog references are valid by construction.
         xref_offsets.insert(catalog_new_ref.number, offset);
         catalog_emitted_early = true;
@@ -2662,7 +2796,6 @@ fn do_write_pass<R: Read + Seek>(
                     raw_content_normalize_refs,
                 )?; // cov:ignore: planner-produced open-document references are valid by construction.
                 xref_offsets.insert(new_ref.number, offset);
-                report_progress_event(options)?;
             }
             OpenDocumentEmit::Raw { original, new_ref } => {
                 let offset = append_body_object_for_raw(
@@ -2678,7 +2811,6 @@ fn do_write_pass<R: Read + Seek>(
                     raw_content_normalize_refs,
                 )?; // cov:ignore: planner-produced raw open-document identities are valid by construction.
                 xref_offsets.insert(new_ref.number, offset);
-                report_progress_event(options)?;
             }
             OpenDocumentEmit::Container(container) => {
                 let offset = append_objstm_container_object(
@@ -2842,7 +2974,6 @@ fn do_write_pass<R: Read + Seek>(
                     raw_content_normalize_refs,
                 )?; // cov:ignore: planner-produced first-page references are valid by construction.
                 xref_offsets.insert(new_ref.number, offset);
-                report_progress_event(options)?;
             }
             FirstPageEmit::Raw(original_gen) => {
                 let new_ref = renumber
@@ -2861,7 +2992,6 @@ fn do_write_pass<R: Read + Seek>(
                     raw_content_normalize_refs,
                 )?; // cov:ignore: planner-produced raw first-page identities are valid by construction.
                 xref_offsets.insert(new_ref.number, offset);
-                report_progress_event(options)?;
             }
             FirstPageEmit::Container(container) => {
                 let offset = append_objstm_container_object(
@@ -2983,7 +3113,6 @@ fn do_write_pass<R: Read + Seek>(
                     raw_content_normalize_refs,
                 )?; // cov:ignore: planner-produced Part-4 references are valid by construction.
                 xref_offsets.insert(new_ref.number, offset);
-                report_progress_event(options)?;
             }
             Part4Emit::Raw(original_gen) => {
                 let new_ref = renumber
@@ -3002,7 +3131,6 @@ fn do_write_pass<R: Read + Seek>(
                     raw_content_normalize_refs,
                 )?; // cov:ignore: planner-produced raw Part-4 identities are valid by construction.
                 xref_offsets.insert(new_ref.number, offset);
-                report_progress_event(options)?;
             }
             Part4Emit::Container(container) => {
                 let offset = append_objstm_container_object(
@@ -5740,18 +5868,30 @@ mod tests {
 
     #[test]
     fn linearization_body_stream_and_objstm_paths_write_through_output_sink() {
-        let stream = ObjectHandle::stream(
-            ObjectHandle::dictionary(Vec::new()),
-            Rc::new(b"stream-data".to_vec()),
-        );
-        let renumber = RenumberMap::from_plan(&LinearizationPlan::default());
+        let mut pdf = Pdf::empty().expect("empty PDF for stream/ObjStm output");
+        let stream_handle = pdf
+            .make_indirect_from_object_handle(ObjectHandle::stream(
+                ObjectHandle::dictionary(Vec::new()),
+                Rc::new(b"stream-data".to_vec()),
+            ))
+            .expect("indirect stream handle");
+        let stream_ref = stream_handle.object_ref().expect("stream is indirect");
+        let plan = LinearizationPlan {
+            part4_rest: vec![stream_ref],
+            total_object_count: 1,
+            ..Default::default()
+        };
+        let renumber = RenumberMap::from_plan(&plan);
+        let new_ref = renumber
+            .new_for_original(stream_ref)
+            .expect("stream ref is in the renumber map");
         let mut plain_bytes = Vec::new();
         let mut plain_sink = OutputSink::new(&mut plain_bytes);
-        append_body_object(
+        append_body_object_for_ref(
             &mut plain_sink,
-            ObjectRef::new(1, 0),
-            ObjectRef::new(1, 0),
-            &stream,
+            &mut pdf,
+            new_ref,
+            stream_ref,
             &WriterOptions::default(),
             None,
             None,
@@ -5770,7 +5910,6 @@ mod tests {
             source_container: None,
             members: Vec::new(),
         };
-        let mut pdf = Pdf::empty().expect("empty PDF for ObjStm output");
         let mut plain_objstm_bytes = Vec::new();
         let mut plain_objstm_sink = OutputSink::new(&mut plain_objstm_bytes);
         append_objstm_container_object(
@@ -6030,23 +6169,35 @@ mod tests {
     #[test]
     fn body_object_append_propagates_member_resolution_errors() {
         let unresolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(91, 0), -1);
-        let plan = LinearizationPlan::default();
+        let plan = LinearizationPlan {
+            part4_rest: vec![ObjectRef::new(91, 0)],
+            total_object_count: 1,
+            ..Default::default()
+        };
         let renumber = RenumberMap::from_plan(&plan);
         let mut bytes = Vec::new();
         let mut sink = OutputSink::new(&mut bytes);
-        let error = append_body_object(
-            &mut sink,
-            ObjectRef::new(1, 0),
-            ObjectRef::new(91, 0),
-            &unresolved,
-            &WriterOptions::default(),
-            None,
-            None,
-            &renumber,
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-        )
-        .expect_err("body-object emission must propagate member resolution errors");
+        let options = WriterOptions::default();
+        let removed_refs = BTreeSet::new();
+        let content_normalize_refs = BTreeSet::new();
+        let mut emitter = LinearizedObjectEmitter {
+            out: &mut sink,
+            options: &options,
+            encrypt_ctx: None,
+            encrypted_string_emitter: None,
+            renumber: &renumber,
+            removed_refs: &removed_refs,
+            content_normalize_refs: &content_normalize_refs,
+            root_source: None,
+            final_pdf_version: "",
+            final_extension_level: 0,
+            encryption: writer_encryption_state_for(None),
+            xref: BTreeMap::new(),
+            lengths: BTreeMap::new(),
+        };
+        let error = emitter
+            .write_object(&unresolved, None)
+            .expect_err("body-object emission must propagate member resolution errors");
         assert!(matches!(
             error,
             crate::Error::Internal(message) if message == "object 91 0 belongs to a dropped PDF"

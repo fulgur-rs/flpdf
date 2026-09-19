@@ -10,7 +10,7 @@ use common::{
 };
 use flpdf::{
     CompressStreams, NewlineBeforeEndstream, ObjectHandle, ObjectRef, ObjectStreamMode, Pdf,
-    PdfOpenOptions, StreamDataMode,
+    PdfOpenOptions, StreamDataMode, XrefEntry,
 };
 use std::fs::File;
 use std::io::{BufReader, Cursor};
@@ -565,6 +565,74 @@ fn linearize_preserve_source_objstm_removes_only_stale_generation() {
             ObjectStreamMode::Preserve,
         ),
         "null-visible-stale-generation-objstm/linearize-objstm-preserve.pdf",
+    );
+}
+
+/// D-U1 probe (`docs/qpdf-route-matrix/README.md` D-U1 row; D6/D31 in
+/// `docs/qpdf-route-matrix/d-writer.md`): qpdf's `writeLinearized` consumes a
+/// preserved source ObjStm's members in ascending SOURCE OBJECT NUMBER order
+/// (`QPDFWriter.cc:2164-2170` inserts into `object_stream_to_objects[stream]`,
+/// a `std::set<QPDFObjGen>`), never in the ObjStm's own source-declaration
+/// index order (`QPDF::getObjectStreamData`, `QPDF.cc:2381-2390`, never reads
+/// the xref entry's `getObjStreamIndex()`). The fixture's source ObjStm
+/// declares object 6 at index 0 and object 5 at index 1 (reversed from
+/// ascending object-number order) — the same shape as
+/// `nonmonotonic-objstm-index.pdf` (see
+/// `cmp_diff_zero_tests.rs::preserve_nonmonotonic_source_indices_match_qpdf_source_number_order`
+/// for the non-linearized counterpart), but with a real page so `--linearize`
+/// is possible.
+#[test]
+fn linearize_preserve_nonmonotonic_source_indices_match_qpdf_source_number_order() {
+    let fixture = "nonmonotonic-objstm-index-linearizable.pdf";
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let source = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    let source_pdf = Pdf::open(Cursor::new(source)).unwrap();
+    let source_xref = source_pdf.get_xref_table();
+    assert_eq!(
+        source_xref.get(&ObjectRef::new(6, 0)),
+        Some(&XrefEntry::Compressed {
+            stream: 7,
+            index: 0,
+        }),
+        "fixture precondition: object 6 must be declared first in the source ObjStm"
+    );
+    assert_eq!(
+        source_xref.get(&ObjectRef::new(5, 0)),
+        Some(&XrefEntry::Compressed {
+            stream: 7,
+            index: 1,
+        }),
+        "fixture precondition: object 5 must be declared second in the source ObjStm"
+    );
+
+    let actual = linearize_mode(fixture, ObjectStreamMode::Preserve);
+    assert_golden(
+        &actual,
+        "nonmonotonic-objstm-index-linearizable/linearize-objstm-preserve.pdf",
+    );
+
+    // Ascending source-object-number order (5 before 6) places source object 5
+    // at output index 0 and source object 6 at output index 1 -- the reverse
+    // of the source ObjStm's own declaration order asserted above.
+    let output_pdf = Pdf::open(Cursor::new(actual)).unwrap();
+    let output_xref = output_pdf.get_xref_table();
+    assert_eq!(
+        output_xref.get(&ObjectRef::new(10, 0)),
+        Some(&XrefEntry::Compressed {
+            stream: 9,
+            index: 0,
+        }),
+        "source object 5 (Helvetica) must land at output index 0"
+    );
+    assert_eq!(
+        output_xref.get(&ObjectRef::new(11, 0)),
+        Some(&XrefEntry::Compressed {
+            stream: 9,
+            index: 1,
+        }),
+        "source object 6 (Courier) must land at output index 1"
     );
 }
 

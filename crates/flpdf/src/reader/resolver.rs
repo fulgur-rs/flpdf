@@ -2042,9 +2042,20 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
     /// Remove the exact source row, nullify retained aliases, then erase the cache slot.
     ///
-    /// Matches `QPDF::removeObject` (`libqpdf/QPDF.cc:1996-2005`). Removing a
-    /// cached object does not invalidate qpdf's already-completed dangling
-    /// reference preparation. No resolver borrow spans value destruction.
+    /// Matches `QPDF::removeObject` (`libqpdf/QPDF.cc:1996-2005`): that single
+    /// C++ function erases exactly two qpdf fields, `m->xref_table` and
+    /// `m->obj_cache`. The first two removals below are the faithful
+    /// translation of `m->xref_table.erase(og)`, not a second, extra map:
+    /// flpdf represents that one qpdf map as two disjoint collections, since
+    /// a given `og` is in at most one of them at a time —
+    /// [`ResolverCore::raw_source_xref_entries`] for the live type-1/type-2
+    /// rows, and [`ResolverCore::default_xref_entries`] for the transient
+    /// type-0 rows `m->xref_table[og]` default-constructs as a side effect of
+    /// `operator[]` while inspecting an ObjStm header (`QPDF.cc:1823`) — so
+    /// erasing `og` from qpdf's map means erasing it from whichever of the
+    /// two flpdf collections currently holds it. Removing a cached object
+    /// does not invalidate qpdf's already-completed dangling reference
+    /// preparation. No resolver borrow spans value destruction.
     pub(crate) fn remove_object(&self, object_ref: ObjectRef) -> Result<()> {
         let object_gen = QpdfObjGen::try_from_object_ref(object_ref)?;
         let cached = {
@@ -2052,6 +2063,17 @@ impl<R: Read + Seek> ResolverHandle<R> {
             // `QPDF::removeObject` erases the one raw-keyed row every consumer reads.
             core.raw_source_xref_entries.remove(&object_gen);
             core.default_xref_entries.remove(&object_gen);
+            // qpdf-deviation: qpdf carries no "was this default row's warning
+            // already delivered" field to erase here -- `warn_default_xref_entries`
+            // derives that fact from `default_xref_warnings`, a bookkeeping set
+            // that exists only because flpdf caches the delivery instead of
+            // qpdf's per-call recomputation. Leaving a stale entry here would
+            // suppress a warning qpdf would still emit if the same
+            // object/generation pair later gets a fresh default row (another
+            // ObjStm header inspection, `QPDF.cc:1823`). `discard_cached_generations`
+            // below already clears this same set for its own xref-load cleanup
+            // path; this keeps `remove_object` symmetric with it.
+            core.default_xref_warnings.remove(&object_gen);
             core.object_cache
                 .get(&object_gen)
                 .map(|entry| entry.handle.clone())
@@ -2060,6 +2082,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
             handle.remove_from_document();
             self.core.borrow_mut().object_cache.remove(&object_gen);
         }
+        // qpdf-deviation: qpdf carries no "was this object/generation pair
+        // allocated rather than resolved" field to erase here -- `allocated_object_refs`
+        // is flpdf-only provenance (`flpdf-uwn0`, `docs/qpdf-correspondence.md:400`)
+        // that exists only because `ResolverCore`'s split complete/live object-ref
+        // views need it. Leaving a stale entry here would let a later reuse of
+        // this exact pair (qpdf's `nextObjGen` can reissue a just-removed
+        // number, `QPDF.cc:1272-1283`) inherit an allocation flag that does not
+        // belong to its new occupant.
         self.core
             .borrow_mut()
             .allocated_object_refs
@@ -11525,6 +11555,51 @@ mod tests {
         assert!(pdf.dangling_references_fixed());
         pdf.resolver.remove_object(object_ref).unwrap();
         assert!(pdf.dangling_references_fixed());
+    }
+
+    #[test]
+    fn remove_object_clears_default_xref_warning_delivery_bookkeeping() {
+        // `default_xref_warnings` has no qpdf counterpart at all (qpdf
+        // re-derives "already warned" dynamically instead of caching it), but
+        // `discard_cached_generations` already clears it alongside
+        // `default_xref_entries` for its own xref-load cleanup path. This
+        // pins `remove_object` to the same symmetry: once object 0's default
+        // row is removed, a later default row for the same object/generation
+        // pair (an ObjStm header inspection can recreate one, `QPDF.cc:1823`)
+        // must warn again rather than silently inherit the earlier
+        // delivery's stale bookkeeping.
+        let resolver = bare_resolver();
+        let object_ref = ObjectRef::new(0, 0);
+        resolver.insert_default_xref_entry_for_test(object_ref);
+        resolver.warn_default_xref_entries().unwrap();
+        assert_eq!(
+            resolver
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message_string())
+                .collect::<Vec<_>>(),
+            vec!["object 0/0 has unexpected xref entry type"]
+        );
+
+        resolver.remove_object(object_ref).unwrap();
+        resolver.insert_default_xref_entry_for_test(object_ref);
+        resolver.warn_default_xref_entries().unwrap();
+
+        assert_eq!(
+            resolver
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "object 0/0 has unexpected xref entry type",
+                "object 0/0 has unexpected xref entry type",
+            ],
+            "a default row recreated after removal must be warned about again, \
+             not suppressed by warning-delivery bookkeeping the removal left stale"
+        );
     }
 
     #[test]
