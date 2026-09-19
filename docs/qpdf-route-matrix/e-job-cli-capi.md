@@ -1385,9 +1385,14 @@ flpdf-cli の他の192箇所超の setter 呼び出しは未移行。ただし
 汎用 "cannot be used with" や不完全な usage-error blockを assertしていた
 （実際のqpdf 11.9.0は "no output file may be given for this option" や
 先頭空行+完全な "For help:" blockを返す）既存の逸脱で、これも修正した。
-残る2件の argv.rs wording gap（split-pages の64-bit overflow、Attachment
-tableのunrecognized-token）はこのissueのスコープ外として
-`flpdf-3yn9.48.193` へ分離した。
+残る argv.rs wording gap は Attachment table の unrecognized-token の 1 件で、
+このissueのスコープ外として `flpdf-3yn9.48.193` へ分離した。
+**2026-09-19 更新**: 当初ここに併記していた split-pages の overflow wording は
+本 PR で解消済み——`parse_job_split_pages` が `qpdf_string_to_int_checked` の
+メッセージを捨てて独自文字列に差し替えていたのを、30 行下の
+`parse_job_compression_level` と同形（`Overflow(message) => Err(Error::System(message))`）
+に揃え、i32/i64 両方の overflow を qpdf 実測文言で固定するテストを追加した。
+`cli_job_json.rs` の `split-pages-before-job-json` skip も撤去済み。
 
 ### E-12 follow-up: job-json directory read diagnostic (`flpdf-jhaqf`, 2026-09-16)
 
