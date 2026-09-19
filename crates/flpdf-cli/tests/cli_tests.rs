@@ -75,6 +75,24 @@ fn normalized_os_message(error: &std::io::Error) -> String {
         .to_owned()
 }
 
+/// Mirror `crate::json_inspect::side_file_io_error`
+/// (`crates/flpdf/src/json_inspect.rs:370-389`), which renders a JSON
+/// side-file open failure through `std::io::Error`'s platform-native
+/// `Display` (with the "(os error N)" suffix stripped) rather than through
+/// `qpdf_file_io_source_message`'s fixed qpdf-strerror mapping that
+/// [`normalized_os_message`] mirrors. The two production error paths use
+/// different renderings (a pre-existing inconsistency, unrelated to this
+/// PR), so this test oracle must match the one the side-file path actually
+/// takes.
+fn normalized_side_file_os_message(error: &std::io::Error) -> String {
+    let message = error.to_string();
+    error
+        .raw_os_error()
+        .and_then(|code| message.strip_suffix(&format!(" (os error {code})")))
+        .unwrap_or(&message)
+        .to_owned()
+}
+
 fn json_qpdf_metadata(json: &serde_json::Value) -> &serde_json::Value {
     &json["qpdf"][0]
 }
@@ -4566,7 +4584,7 @@ fn json_side_file_error_emits_recorded_warning_after_partial_json_before_fatal_e
     let open_error = std::fs::File::create(&side_path).unwrap_err();
     let expected_fatal = format!(
         "flpdf: open {side_path}: {}",
-        normalized_os_message(&open_error)
+        normalized_side_file_os_message(&open_error)
     );
     assert_eq!(
         stderr.lines().last(),
