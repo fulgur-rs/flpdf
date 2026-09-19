@@ -30,7 +30,18 @@ const WRAPPER: &str = "get_form_xobject_for_page";
 #[test]
 fn the_production_wrapper_delegates_without_inspecting_handles() {
     let wrapper = production_wrapper();
-    let mut audit = WrapperAudit::default();
+    let mut audit = WrapperAudit {
+        live_parameters: wrapper
+            .sig
+            .inputs
+            .iter()
+            .filter_map(|input| match input {
+                syn::FnArg::Typed(typed) => binding_ident(&typed.pat),
+                syn::FnArg::Receiver(_) => None,
+            })
+            .collect(),
+        ..WrapperAudit::default()
+    };
     // Walk the statements directly: `visit_block` opens a scope, and the
     // wrapper's own body is the outermost one.
     for statement in &wrapper.block.stmts {
@@ -64,10 +75,14 @@ fn the_production_wrapper_delegates_without_inspecting_handles() {
         );
     }
 
-    assert!(
-        audit.delegates,
-        "the wrapper must call get_form_xobject_for_page(true) on a \
-         PageObjectHelper it constructed: {audit:?}"
+    // Exactly one conversion, with qpdf's `handle_transformations = true`. A
+    // second call would convert the page again, which qpdf's
+    // `getFormXObjectForPage` caller never does.
+    assert_eq!(
+        audit.helper_conversions,
+        vec![true],
+        "the wrapper must call get_form_xobject_for_page(true) exactly once \
+         on a PageObjectHelper it constructed: {audit:?}"
     );
 
     // A macro would hide its expansion from this audit. The wrapper uses none,
@@ -115,12 +130,19 @@ fn production_wrapper() -> syn::ItemFn {
 /// What the wrapper's body does, as far as this contract cares.
 #[derive(Default, Debug)]
 struct WrapperAudit {
+    /// Parameter names that still resolve to the wrapper's own inputs. A
+    /// rebinding of the same name means the constructor would receive
+    /// something else.
+    live_parameters: Vec<String>,
+    /// Every `get_form_xobject_for_page` call on a recognized helper, with
+    /// whether it passed `true`. One canonical call is the contract; a second
+    /// conversion is not.
+    helper_conversions: Vec<bool>,
     /// Bindings this body obtained from `PageObjectHelper::new(...)`.
     helper_bindings: Vec<String>,
     /// Methods called on anything that is not one of those bindings, plus
     /// every free or qualified call.
     non_helper_calls: std::collections::BTreeSet<String>,
-    delegates: bool,
     saw_macro: bool,
 }
 
@@ -160,23 +182,53 @@ impl<'ast> Visit<'ast> for WrapperAudit {
         collect_pattern_idents(&local.pat, &mut bound);
         self.helper_bindings
             .retain(|binding| !bound.contains(binding));
-        if let syn::Pat::Ident(pat) = &local.pat {
+        self.live_parameters
+            .retain(|parameter| !bound.contains(parameter));
+        // `let mut helper: PageObjectHelper<'_, R> = ...` is a `Pat::Type`.
+        if let Some(name) = binding_ident(&local.pat) {
             if local
                 .init
                 .as_ref()
-                .is_some_and(|init| constructs_helper(&init.expr))
+                .is_some_and(|init| self.constructs_helper(&init.expr))
             {
-                self.helper_bindings.push(unraw(&pat.ident));
+                self.helper_bindings.push(name);
             }
         }
         self.visit_pat(&local.pat);
+    }
+
+    /// `helper = PageObjectHelper::new(other_page, pdf)` rebinds without a
+    /// `let`, and `helper = something_else` ends the provenance entirely.
+    fn visit_expr_assign(&mut self, assign: &'ast syn::ExprAssign) {
+        syn::visit::visit_expr_assign(self, assign);
+        if let syn::Expr::Path(path) = assign.left.as_ref() {
+            if let Some(ident) = path.path.get_ident() {
+                let name = unraw(ident);
+                self.helper_bindings.retain(|binding| binding != &name);
+                self.live_parameters.retain(|parameter| parameter != &name);
+                if self.constructs_helper(&assign.right) {
+                    self.helper_bindings.push(name);
+                }
+            }
+        }
     }
 
     fn visit_arm(&mut self, arm: &'ast syn::Arm) {
         if is_test_only(&arm.attrs) {
             return;
         }
+        // An arm's pattern binds inside the arm only.
+        let outer_bindings = self.helper_bindings.clone();
+        let outer_parameters = self.live_parameters.clone();
+        let mut bound = Vec::new();
+        collect_pattern_idents(&arm.pat, &mut bound);
+        self.helper_bindings
+            .retain(|binding| !bound.contains(binding));
+        self.live_parameters
+            .retain(|parameter| !bound.contains(parameter));
         syn::visit::visit_arm(self, arm);
+        self.helper_bindings = outer_bindings;
+        self.live_parameters = outer_parameters;
     }
 
     fn visit_field_value(&mut self, field: &'ast syn::FieldValue) {
@@ -207,8 +259,8 @@ impl<'ast> Visit<'ast> for WrapperAudit {
         let method = unraw(&call.method);
         let on_helper = receiver_is_helper(&call.receiver, &self.helper_bindings);
         if on_helper {
-            if method == WRAPPER && passes_true(call) {
-                self.delegates = true;
+            if method == WRAPPER {
+                self.helper_conversions.push(passes_true(call));
             }
         } else {
             // Receiver matters: an unrelated type's `as_dictionary()` is not
@@ -235,9 +287,9 @@ impl<'ast> Visit<'ast> for WrapperAudit {
     /// delegation assertion.
     fn visit_expr_closure(&mut self, closure: &'ast syn::ExprClosure) {
         let outer_bindings = self.helper_bindings.clone();
-        let outer_delegates = self.delegates;
+        let outer_conversions = self.helper_conversions.clone();
         syn::visit::visit_expr_closure(self, closure);
-        self.delegates = outer_delegates;
+        self.helper_conversions = outer_conversions;
         self.helper_bindings = outer_bindings;
     }
 
@@ -246,9 +298,9 @@ impl<'ast> Visit<'ast> for WrapperAudit {
     /// converting the page.
     fn visit_expr_async(&mut self, block: &'ast syn::ExprAsync) {
         let outer_bindings = self.helper_bindings.clone();
-        let outer_delegates = self.delegates;
+        let outer_conversions = self.helper_conversions.clone();
         syn::visit::visit_expr_async(self, block);
-        self.delegates = outer_delegates;
+        self.helper_conversions = outer_conversions;
         self.helper_bindings = outer_bindings;
     }
 
@@ -258,9 +310,9 @@ impl<'ast> Visit<'ast> for WrapperAudit {
             return;
         }
         let outer_bindings = std::mem::take(&mut self.helper_bindings);
-        let outer_delegates = self.delegates;
+        let outer_conversions = self.helper_conversions.clone();
         syn::visit::visit_item(self, item);
-        self.delegates = outer_delegates;
+        self.helper_conversions = outer_conversions;
         self.helper_bindings = outer_bindings;
     }
 
@@ -334,16 +386,26 @@ fn unwrap_transparent(expr: &syn::Expr) -> &syn::Expr {
     }
 }
 
-/// `PageObjectHelper::new(<page>, <pdf>)`, however the path is spelled, where
-/// the arguments are the wrapper's own parameters.
-///
-/// qpdf's helper is constructed on the page the caller asked about
-/// (`QPDFPageObjectHelper(oh)`); handing it a different page would convert
-/// the wrong one while leaving the call shape intact.
-fn constructs_helper(expr: &syn::Expr) -> bool {
+impl WrapperAudit {
+    /// `PageObjectHelper::new(<page>, <pdf>)`, however the path is spelled,
+    /// where the arguments still resolve to the wrapper's own parameters.
+    ///
+    /// qpdf's helper is constructed on the page the caller asked about
+    /// (`QPDFPageObjectHelper(oh)`); handing it a different page would
+    /// convert the wrong one while leaving the call shape intact. Comparing
+    /// spellings alone would accept a `page_ref` that an earlier `let`
+    /// rebound, so the name has to still be live.
+    fn constructs_helper(&self, expr: &syn::Expr) -> bool {
+        constructs_helper_shape(expr)
+            .is_some_and(|args| args.iter().all(|arg| self.live_parameters.contains(arg)))
+    }
+}
+
+/// The constructor's argument names, when the call has the right shape.
+fn constructs_helper_shape(expr: &syn::Expr) -> Option<Vec<String>> {
     let expr = unwrap_transparent(expr);
     let syn::Expr::Call(call) = expr else {
-        return false;
+        return None;
     };
     let argument_names: Vec<String> = call
         .args
@@ -366,10 +428,10 @@ fn constructs_helper(expr: &syn::Expr) -> bool {
         })
         .collect();
     if argument_names != ["page_ref", "pdf"] {
-        return false;
+        return None;
     }
     let syn::Expr::Path(path) = call.func.as_ref() else {
-        return false;
+        return None;
     };
     let mut tail = path
         .path
@@ -379,7 +441,20 @@ fn constructs_helper(expr: &syn::Expr) -> bool {
         .map(|segment| unraw(&segment.ident));
     // Matching the tail accepts `crate::page_object_helper::PageObjectHelper::new`
     // as readily as the imported `PageObjectHelper::new`.
-    tail.next().as_deref() == Some("new") && tail.next().as_deref() == Some("PageObjectHelper")
+    if tail.next().as_deref() == Some("new") && tail.next().as_deref() == Some("PageObjectHelper") {
+        Some(argument_names)
+    } else {
+        None
+    }
+}
+
+/// The name a `let` pattern binds, seeing through an explicit type.
+fn binding_ident(pat: &syn::Pat) -> Option<String> {
+    match pat {
+        syn::Pat::Ident(ident) => Some(unraw(&ident.ident)),
+        syn::Pat::Type(typed) => binding_ident(&typed.pat),
+        _ => None,
+    }
 }
 
 fn receiver_is_helper(receiver: &syn::Expr, bindings: &[String]) -> bool {
