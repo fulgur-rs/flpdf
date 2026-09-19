@@ -40,15 +40,13 @@ type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
 /// it is not a library-facing page-plan type.
 struct CliInputSpec {
     path: PathBuf,
-    password: Option<Vec<u8>>,
     range: PageRange,
 }
 
 impl CliInputSpec {
-    fn new(path: impl Into<PathBuf>, password: Option<Vec<u8>>, range: PageRange) -> Self {
+    fn new(path: impl Into<PathBuf>, range: PageRange) -> Self {
         Self {
             path: path.into(),
-            password,
             range,
         }
     }
@@ -111,6 +109,7 @@ struct WriterOptions {
     preserve_encryption: bool,
     password_mode: PasswordMode,
     allow_weak_crypto: bool,
+    allow_insecure: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -231,6 +230,7 @@ impl Default for WriterOptions {
             preserve_encryption: true,
             password_mode: PasswordMode::default(),
             allow_weak_crypto: false,
+            allow_insecure: false,
         }
     }
 }
@@ -5075,6 +5075,7 @@ fn apply_encryption_options(options: &mut WriterOptions, inputs: EncryptionCliOp
                         progname()
                     ));
                 }
+                options.allow_insecure = parsed.allow_insecure;
                 options.encrypt = Some(parsed.params);
             }
         }
@@ -5218,6 +5219,12 @@ fn parse_perm_yn(flag: &str, val: &str) -> CliResult<bool> {
 struct ParsedEncryptSegment {
     params: EncryptParams,
     accessibility_warning: bool,
+    /// qpdf keeps `--allow-insecure` on the job
+    /// (`QPDFJob::EncConfig::allowInsecure`,
+    /// `libqpdf/QPDFJob_config.cc:1171-1174`) so `QPDFJob.cc:601`'s refusal
+    /// can see it. The CLI parses the flag here, so it must travel to the job
+    /// rather than being consumed by this segment alone.
+    allow_insecure: bool,
 }
 
 trait RawCliArg {
@@ -5726,6 +5733,7 @@ fn finish_encrypt_segment(
 
     Ok(ParsedEncryptSegment {
         params,
+        allow_insecure,
         accessibility_warning: accessibility_explicitly_disabled
             && matches!(
                 method,
@@ -6253,6 +6261,7 @@ fn configure_rewrite_job(
     job.set_password_is_hex_key(password.password_is_hex_key);
     job.set_suppress_password_recovery(password.suppress_password_recovery);
     job.set_allow_weak_crypto(options.allow_weak_crypto);
+    job.set_allow_insecure(options.allow_insecure);
     job.set_verbose(verbose);
     job.set_progress(options.progress);
     job.set_linearization(linearize, linearize_pass1.map(Path::to_path_buf));
@@ -6667,15 +6676,10 @@ fn resolve_page_specs(
                 Box::new(Error::SystemBytes(what)) as Box<dyn std::error::Error>
             })?
         };
-        out.push(CliInputSpec::new(
-            path,
-            s.raw_password.clone().or_else(|| {
-                s.password
-                    .as_ref()
-                    .map(|password| arg_parser::os_bytes(password))
-            }),
-            range,
-        ));
+        // The per-segment password now travels on the job's page-spec
+        // configuration (`QPDFJob::add_page_spec`), matching qpdf's
+        // `handlePageSpecs`, so this CLI-local spec no longer carries it.
+        out.push(CliInputSpec::new(path, range));
     }
     Ok(out)
 }
@@ -7273,9 +7277,10 @@ fn validate_keep_files_open_threshold(page_ops: &PageOpArgs) -> CliResult<()> {
 /// branch below configures those specifications on `QPDFJob::create_qpdf`'s
 /// canonical page-spec lifecycle (the same boundary
 /// [`run_empty_page_extraction`] and the top-level `--pages` route already
-/// use), matching qpdf's `createQPDF` → `handlePageSpecs` call order; the
-/// multi-source branch still opens sources directly and calls
-/// `QPDFJob::handle_page_specs` itself, a known remaining gap.
+/// use), matching qpdf's `createQPDF` → `handlePageSpecs` call order. The
+/// multi-source branch reaches the same boundary as of
+/// `flpdf-3yn9.48.192`; it no longer opens sources or calls
+/// `QPDFJob::handle_page_specs` itself.
 ///
 /// The `--json-input`/`--update-from-json` combination with `--pages` has no
 /// grammar on the `rewrite` subcommand (this function's only caller): those
@@ -7336,6 +7341,7 @@ fn run_page_extraction(
             repair,
             password,
             page_ops,
+            raw_specs,
             overlay_specs,
             remove_unref,
             remove_restrictions,
@@ -7351,7 +7357,6 @@ fn run_page_extraction(
             verbose,
             no_warn,
             standard_output,
-            inputs,
         );
     }
 
@@ -7428,6 +7433,7 @@ fn run_empty_page_extraction(
     job.set_password_is_hex_key(password.password_is_hex_key);
     job.set_suppress_password_recovery(password.suppress_password_recovery);
     job.set_allow_weak_crypto(options.allow_weak_crypto);
+    job.set_allow_insecure(options.allow_insecure);
     job.set_verbose(verbose);
     configure_keep_files_open(&mut job, page_ops)?;
     {
@@ -7462,6 +7468,10 @@ fn run_empty_page_extraction(
         linearize,
         linearize_pass1,
     )?);
+    // `check_configuration` runs inside `create_qpdf`, so the create-stage
+    // job needs the flag too -- the writer configuration above carries the
+    // encryption parameters it gates on.
+    job.set_allow_insecure(options.allow_insecure);
 
     let mut merged = match job.create_qpdf()? {
         Some(pdf) => pdf,
@@ -7520,14 +7530,25 @@ fn run_empty_page_extraction(
     result
 }
 
-/// Run qpdf's ordinary multi-source page-spec path.
+/// Run qpdf's ordinary multi-source page-spec path through
+/// `QPDFJob::create_qpdf`'s canonical page-spec lifecycle, the same job/CLI
+/// boundary [`run_empty_page_extraction`] and the top-level `--pages` route
+/// (`run_page_operations_with_qpdf_job`) already use. This matches qpdf's own
+/// `createQPDF` → `handlePageSpecs` call order (`QPDFJob.cc:428-467`): the
+/// primary and every distinct secondary source are opened by the job itself,
+/// keyed by literal filename exactly as qpdf's page heap is, and
+/// `prepare_document` resolves and copies every page spec (including qpdf's
+/// resource-pruning decision) into a fresh merged target before returning.
 ///
-/// The primary document is retained at source index zero even when no page
-/// spec selects it. Every other literal filename is opened once and reused by
-/// the job-level page-spec planner, matching qpdf's page heap keyed by the
-/// filename token. The resulting fresh merged document is then passed through
-/// the same rotate/structure/overlay/write completion boundary as a
-/// single-document extraction.
+/// The merge always produces a fresh, unencrypted target
+/// (`docs/qpdf-correspondence.md`, `flpdf-clq9`), unlike qpdf's own
+/// `handlePageSpecs`, which mutates the primary `QPDF` in place
+/// (`libqpdf/QPDFJob.cc:2359-2362`) and so never needs to answer the
+/// primary's encryption after the fact. `QPDFJob::encryption_status`/
+/// `take_primary_copy_encryption` recover that pre-merge snapshot, needed
+/// here because the final write below completes on a separate `QPDFJob`
+/// instance (see [`run_page_extraction_after_plan`]) rather than this job's
+/// own `write_qpdf`.
 #[allow(clippy::too_many_arguments)]
 fn run_page_extraction_from_multiple_sources(
     primary_input: &Path,
@@ -7535,6 +7556,7 @@ fn run_page_extraction_from_multiple_sources(
     repair: bool,
     password: &PasswordArgs,
     page_ops: &PageOpArgs,
+    raw_specs: Vec<PageSegmentSpec>,
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
     remove_restrictions: bool,
@@ -7550,110 +7572,83 @@ fn run_page_extraction_from_multiple_sources(
     verbose: bool,
     no_warn: bool,
     standard_output: Option<PipelineWriter>,
-    inputs: Vec<CliInputSpec>,
 ) -> CliResult<()> {
-    // qpdf inherits output encryption from the primary input for page
-    // operations. Keep this probe separate from the mutable source vector so
-    // source opening below can use the same top-level password policy.
-    let primary_encrypted = open_page_source(
-        &primary_input.to_path_buf(),
-        repair,
-        password,
-        true,
-        no_warn,
-    )?
-    .is_encrypted();
-
-    // Build literal-path source identity and one qpdf page specification per
-    // occurrence. `.` was already normalized to primary_input by
-    // resolve_page_specs; path equality therefore preserves qpdf's documented
-    // distinction between two different spellings of the same file.
-    let mut source_paths = vec![primary_input.to_path_buf()];
-    let mut source_passwords: Vec<Option<Vec<u8>>> = vec![None];
-    let mut specs = Vec::with_capacity(inputs.len());
-    for input in inputs {
-        let source_index = if input.path == primary_input {
-            0
-        } else if let Some(index) = source_paths.iter().position(|path| path == &input.path) {
-            index
-        } else {
-            let index = source_paths.len();
-            source_paths.push(input.path.clone());
-            source_passwords.push(input.password.clone());
-            index
-        };
-        specs.push(PageSpecInput::new(source_index, input.range));
-    }
-
-    let mut sources = Vec::with_capacity(source_paths.len());
-    let mut job = QPDFJob::new();
-    job.set_warnings_exit_zero(cli_warning_exit_zero());
-    job.set_logger(cli_logger());
-    job.set_message_prefix(progname());
+    let mut job = new_cli_job(no_warn);
+    job.set_input_file(primary_input.to_path_buf())?;
+    job.set_suppress_recovery(password.recovery.suppress_recovery);
+    job.set_ignore_xref_streams(password.recovery.ignore_xref_streams);
+    job.set_password_mode(password.password_mode.into());
+    job.set_password_is_hex_key(password.password_is_hex_key);
+    job.set_suppress_password_recovery(password.suppress_password_recovery);
     job.set_verbose(verbose);
-    job.set_suppress_warnings(no_warn);
+    let input_options = pdf_open_options(repair, password)?;
+    job.set_password(input_options.password);
     configure_keep_files_open(&mut job, page_ops)?;
-    let keep_files_open = job.keep_files_open_for_page_specs(&specs);
-    job.report_page_spec_selection(&specs)?;
-    sources.push(open_page_source(
-        &primary_input.to_path_buf(),
-        repair,
-        password,
-        true,
-        no_warn,
+    {
+        let mut configuration = job.config();
+        for spec in raw_specs {
+            let spec_password = spec.raw_password.or_else(|| {
+                spec.password
+                    .as_ref()
+                    .map(|password| arg_parser::os_bytes(password))
+            });
+            configuration.add_page_spec(
+                PathBuf::from(spec.file_token),
+                &spec.range,
+                spec_password,
+            )?;
+        }
+        for parameter in &page_ops.collate {
+            configuration.collate(parameter.as_bytes())?;
+        }
+        configuration.remove_unreferenced_resources(remove_unref.into());
+    }
+    // `prepare_document`'s merge branch reads the writer's
+    // `preserve_unreferenced_objects` bit directly (`lifecycle.rs`'s
+    // `configuration.writer.preserves_unreferenced_objects()`) to decide
+    // whether the primary's page-tree-unreferenced objects survive the copy,
+    // so it must be set before `create_qpdf` runs (mirrors
+    // `run_empty_page_extraction`, the other create-stage-then-separate-write
+    // multi-source route). The rest of this writer configuration is unused by
+    // `create_qpdf`/`prepare_document` and is superseded by the separate
+    // writer configuration `run_page_extraction_after_plan` builds for the
+    // actual write.
+    job.set_writer_configuration(writer_configuration_unnormalized(
+        &options,
+        linearize,
+        linearize_pass1,
     )?);
-    for (source_index, path) in source_paths.iter().enumerate().skip(1) {
-        let mut source_password = password.clone();
-        // qpdf opens each secondary with only the password attached to its
-        // page specification (QPDFJob.cc:2400-2412). The primary password is
-        // not a fallback for a secondary with no segment password; retain the
-        // global interpretation/policy flags, but replace both credential
-        // fields with the per-source value, including an explicit empty value.
-        source_password.set_password_bytes(source_passwords[source_index].clone());
-        source_password.password_file = None;
-        job.report_page_source_processing(path_description(path))?;
-        sources.push(open_page_source(
-            path,
-            repair,
-            &source_password,
-            keep_files_open,
-            no_warn,
-        )?);
-    }
+    // `check_configuration` runs inside `create_qpdf`, so the create-stage
+    // job needs the flag too -- the writer configuration above carries the
+    // encryption parameters it gates on.
+    job.set_allow_insecure(options.allow_insecure);
 
-    // qpdf raises the writer floor from every input processed by the job
-    // (`QPDFJob.cc:1714-1715`) and applies that floor before explicit
-    // --min-version/--force-version settings
-    // (`QPDFJob.cc:2847-2918`). The merged fresh document starts at its
-    // baseline version, so carry the source floor explicitly through the
-    // multi-source consumer boundary without rewriting the raw minimum.
-    let mut options = options;
-    for source in &mut sources {
-        update_input_version_floor(&mut options.input_version_floor, source)?;
-    }
-
-    let primary_copy_encryption = sources
-        .first_mut()
-        .ok_or("--pages: primary input was not opened")?
-        .writer_copy_encryption_source()?;
-
-    let collate = parse_collate_values(&page_ops.collate)?;
-    let source_warnings = job.has_warnings();
-    let page_output = job.handle_page_specs(
-        &mut sources,
-        &specs,
-        collate.as_deref(),
-        remove_unref.into(),
-        options.preserve_unreferenced_objects,
-    )?;
-    let source_warnings = source_warnings || job.has_warnings();
-
-    let mut merged = match page_output {
-        PageSpecJobOutput::Merged(merged) => merged,
-        PageSpecJobOutput::InPlace { .. } => {
-            return Err("--pages: multiple-source job returned an in-place result".into());
+    let mut merged = match job.create_qpdf()? {
+        Some(pdf) => pdf,
+        None => {
+            return Err(Box::new(CliExitError {
+                code: ExitCode::Errors,
+                message: String::new(),
+            }))
         }
     };
+    let (primary_encrypted, _) = job.encryption_status();
+    let primary_copy_encryption = job.take_primary_copy_encryption();
+    let source_warnings = job.has_warnings();
+    // qpdf raises the writer floor from every input processed by the job
+    // (`QPDFJob.cc:1714-1715`) and applies that floor before explicit
+    // --min-version/--force-version settings (`QPDFJob.cc:2847-2918`).
+    // `create_qpdf` already accumulated it from the primary and every
+    // secondary source opened by `prepare_document`; carry that snapshot
+    // into the separate post-plan writer without reopening any source.
+    let mut options = options;
+    if let Some(floor) = job.input_version_floor() {
+        options.input_version_floor = Some(
+            options
+                .input_version_floor
+                .map_or(floor, |current| current.max(floor)),
+        );
+    }
 
     // The merge job has already rebuilt the target page tree and copied the
     // primary document-level structures. Represent its current output pages
@@ -7662,7 +7657,7 @@ fn run_page_extraction_from_multiple_sources(
     // reintroducing source-document ObjectRefs.
     let selected_pages = pages::page_refs(&mut merged)?;
 
-    run_page_extraction_after_plan(
+    let result = run_page_extraction_after_plan(
         &mut merged,
         output,
         primary_input,
@@ -7693,7 +7688,13 @@ fn run_page_extraction_from_multiple_sources(
         flatten_annotations_mode,
         flatten_rotation,
         no_warn,
-    )
+    );
+    // The create-stage job retains page-source providers through the later
+    // post-plan writer. Drop it only after that writer has consumed the
+    // merged document, matching qpdf's page-heap lifetime at write time (see
+    // run_empty_page_extraction).
+    drop(job);
+    result
 }
 
 /// Run the single-source (in-place) `--pages` extraction through
@@ -8043,6 +8044,7 @@ fn finish_page_extraction<R: Read + Seek + 'static>(
         split_job.set_progress(split_progress);
         split_job.set_password_mode(options.password_mode);
         split_job.set_allow_weak_crypto(options.allow_weak_crypto);
+        split_job.set_allow_insecure(options.allow_insecure);
         split_job.set_linearization(linearize, linearize_pass1.map(std::path::Path::to_path_buf));
         {
             let mut configuration = split_job.config();
@@ -8086,6 +8088,7 @@ fn finish_page_extraction<R: Read + Seek + 'static>(
         write_job.set_progress(options.progress);
         write_job.set_password_mode(options.password_mode);
         write_job.set_allow_weak_crypto(options.allow_weak_crypto);
+        write_job.set_allow_insecure(options.allow_insecure);
         write_job.set_linearization(linearize, linearize_pass1.map(std::path::Path::to_path_buf));
         write_job.set_writer_configuration(writer_configuration_unnormalized(
             &options,
@@ -9068,26 +9071,6 @@ fn open_pdf_with_suppression(
     open_pdf_impl(input, repair, password, suppress_warnings)
 }
 
-/// Open a secondary page-spec source through the same file-backed reader
-/// boundary as qpdf's `QPDFJob::handlePageSpecs`.
-fn open_page_source(
-    input: &PathBuf,
-    repair: bool,
-    password: &PasswordArgs,
-    stay_open: bool,
-    suppress_warnings: bool,
-) -> CliResult<Pdf<Box<dyn flpdf::ReadSeek>>> {
-    let mut options = pdf_open_options(repair, password)?;
-    configure_document_logger(&mut options, input);
-    options.suppress_warnings = suppress_warnings;
-    let mut pdf = Pdf::<Box<dyn flpdf::ReadSeek>>::open_file_with_options(input, options)
-        .map_err(|error| open_error_with_file(input, actionable_password_error(error)))?;
-    pdf.root_handle()
-        .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
-    pdf.set_input_source_stay_open(stay_open);
-    Ok(pdf)
-}
-
 fn open_pdf_from_file(
     input: &Path,
     file: File,
@@ -9290,11 +9273,6 @@ fn emit_logger_error(data: impl AsRef<[u8]>) {
     if let Err(error) = cli_logger().error(data) {
         eprintln!("flpdf: unable to write diagnostic: {error}"); // cov:ignore: last-resort path after the standard error sink itself fails
     }
-}
-
-fn configure_document_logger(options: &mut PdfOpenOptions, input: &Path) {
-    options.logger = Some(cli_logger());
-    options.description = path_description(input);
 }
 
 #[cfg(unix)]
@@ -9798,6 +9776,7 @@ fn configure_attachment_job(
     job.set_suppress_recovery(password.recovery.suppress_recovery);
     job.set_ignore_xref_streams(password.recovery.ignore_xref_streams);
     job.set_allow_weak_crypto(writer_options.allow_weak_crypto);
+    job.set_allow_insecure(writer_options.allow_insecure);
     job.set_progress(writer_options.progress);
     job.set_verbose(verbose);
     job.set_linearization(linearize, linearize_pass1.map(Path::to_path_buf));
