@@ -99,10 +99,14 @@ pub(crate) fn run_test_80<R: Read + Seek>(
         .into_iter()
         .next()
         .ok_or_else(|| Error::Internal("test 80 requires a first page".to_owned()))?;
+    // qpdf's `page1.getKey("/Annots")` (test_driver.cc:2775) resolves page1
+    // as `getKey`'s own first step, with no separate explicit resolve
+    // beforehand. `try_get_key` below does the same, and
+    // `transform_annotations`'s own resolving `try_as_array` step resolves
+    // `old_annots` in turn, so no standalone resolve is needed for either
+    // handle.
     let page1 = pdf.get_object_handle(page1_ref);
-    pdf.resolve(&page1)?;
     let old_annots = page1.try_get_key(b"/Annots")?;
-    pdf.resolve(&old_annots)?;
 
     let mut first_matrix = Matrix::default();
     first_matrix.translate(306.0, 396.0);
