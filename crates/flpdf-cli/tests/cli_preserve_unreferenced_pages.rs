@@ -301,6 +301,89 @@ fn multi_source_preserve_objstm_members_follow_source_objgen_order() {
     );
 }
 
+/// `rewrite --pages`'s multi-source route (`run_page_extraction_from_multiple_sources`)
+/// queues `--collate` on the same `QPDFJobConfig` boundary the top-level
+/// `--pages` route uses (`QPDFJob.cc:2251-2337`'s collate grouping, applied
+/// inside `prepare_document`'s merge branch). Byte-identity here pins that
+/// this `rewrite`-specific consumer of `create_qpdf` reaches the same
+/// collate behavior as the already-covered top-level route.
+#[test]
+fn multi_source_rewrite_pages_collate_matches_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("qpdf 11.9.0 is required for this parity test on CI");
+        }
+        eprintln!("skipping: qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let primary = fixture("one-page.pdf");
+    let secondary = fixture("two-page.pdf");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+
+    let qpdf_result = run_qpdf(&[
+        "--static-id",
+        primary.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1",
+        secondary.to_str().unwrap(),
+        "1-2",
+        "--",
+        "--collate",
+        qpdf_output.to_str().unwrap(),
+    ]);
+    assert!(
+        qpdf_result.status.success(),
+        "qpdf multi-source --pages --collate failed: {}",
+        String::from_utf8_lossy(&qpdf_result.stderr)
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--pages", "."])
+        .arg("1")
+        .arg(&secondary)
+        .arg("1-2")
+        .args(["--", "--static-id", "--collate"])
+        .arg(&primary)
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    // Compare through qpdf's own `--qdf --static-id` normalization
+    // (uncompressed streams, deterministic /ID) rather than raw bytes: this
+    // route is not `qpdf-zlib-compat` gated, so a default (miniz_oxide)
+    // build's DEFLATE bytes differ from qpdf's zlib output (CLAUDE.md
+    // deviation (A)) even when page selection/order match, and a plain
+    // `normalize_qdf` re-randomizes `/ID` on every call.
+    let normalize = |input: &Path, output: &Path| -> Vec<u8> {
+        let result = run_qpdf(&[
+            "--qdf",
+            "--object-streams=disable",
+            "--no-original-object-ids",
+            "--static-id",
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+        ]);
+        assert!(
+            result.status.success(),
+            "qpdf QDF normalization failed for {}: {}",
+            input.display(),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        std::fs::read(output).expect("normalized QDF should be readable")
+    };
+    let qpdf_qdf = normalize(&qpdf_output, &temp.path().join("qpdf.qdf.pdf"));
+    let flpdf_qdf = normalize(&flpdf_output, &temp.path().join("flpdf.qdf.pdf"));
+    assert_eq!(
+        flpdf_qdf, qpdf_qdf,
+        "rewrite --pages --collate multi-source output must match qpdf's collate order and structure"
+    );
+}
+
 /// A preserved orphan may reference the primary's own structural roots
 /// directly (here, the Catalog via `/Owner`). qpdf keeps the primary `QPDF`
 /// in place, so that reference always resolves to the document's one true
