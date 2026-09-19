@@ -1378,6 +1378,60 @@ raw `\\xff\\xfe` pathを qpdf 11.9.0 と比較し、status/stdout/stderr全体�
 確認する。通常の `CliExitError` callers、parser、bridge、deviation markerは
 変更しない。
 
+### E-17 / E-21 job-json-file bare main-table option whitelist (`flpdf-3yn9.48.190`, 2026-09-19)
+
+qpdf の main option table は多数の bare（値なし）callback を `addBare` で
+登録し（`libqpdf/qpdf/auto_job_init.hh:30-95`）、`QPDFArgParser::parseArgs`
+は `--job-json-file` の有無に関わらず、同じ 1 回の左→右 argv scan の中で
+各 callback をその出現位置で実行する（`libqpdf/QPDFArgParser.cc:433-555`,
+`libqpdf/QPDFJob_argv.cc`）。例えば `qpdf --empty --qdf
+--job-json-file=job.json out.pdf` は `qpdf --empty --qdf out.pdf` と同じ
+`%QDF-1.0` マーカーを書く（11.9.0 実機で確認済み）。
+
+`main.rs` は `--job-json-file` 経路専用に `qpdf_cli_events`/
+`preflight_qpdf_cli_events`（前掲の E-12 follow-up 群）で raw residual argv
+から別の `QPDFJob` を組み立てており、clap が解釈済みの `Cli` フィールド
+（`args.qdf` 等）はこの経路では一切参照されない（`args.no_warn` と
+`warning-exit-0` グローバルの 2 つだけが値渡しで例外的に橋渡しされており、
+いずれも「on にしか倒せない」単調な OR として安全）。`qpdf_cli_events` の
+whitelist はこの bare callback のうち 24 個を欠いており、`--job-json-file`
+と組み合わせると無言で drop されていた（`flpdf-3yn9.48.190`、`--qdf` が
+確認済みの再現例）。
+
+flpdf は、qpdf callback が副作用のない純粋な `QPDFJob` configuration 代入
+（`crates/flpdf/src/job/argv.rs::Parser::parse_main_argument` の main-table
+bare arm）であり、かつ既存の public `QPDFJob`/`Config` setter が既にある
+24 option を `qpdf_cli_events`/`preflight_qpdf_cli_events` に追加した
+（`crates/flpdf` 側の新規 public API は追加していない）。named-segment opener
+（`--pages`/`--overlay`/`--encrypt`/`--add-attachment`/
+`--copy-attachments-from`/`--underlay`、`is_named_segment_option` が別途
+処理）、既存 whitelist 済み option、`args.no_warn`/`warning-exit-0` の
+既存橋渡しで実質的に動作済みの option は対象外。値を取る
+`addRequiredParameter`/`addOptionalParameter`/`addChoices` option と、
+public setter が存在しない残り 11 個の bare option（`--decrypt` 等）は
+`flpdf-3yn9.48.191` へ分離した。**2026-09-19 追記**: `--linearize` も当初この
+whitelist に入れていたが、flpdf の `set_linearization(value, pass1)` が
+`linearize` と `linearize_pass1` を同時に代入するため job JSON の
+`linearizePass1` を消す回帰になる（qpdf の `Config::linearize()` は
+`libqpdf/QPDFJob_config.cc:362-368` で `linearize` だけを立てる）。撤去して
+`flpdf-3yn9.48.191` へ移した。また `is_named_segment_option`
+（`crates/flpdf-cli/src/main.rs`）は 6 個しか持たないが、qpdf では
+`--set-page-labels` も segment opener である（`libqpdf/QPDFJob_argv.cc:377` の
+`selectOptionTable(O_SET_PAGE_LABELS)`）——この欠落は本 PR 以前からの別問題で
+`flpdf-sydkv` で追跡する——前者は `flpdf-3yn9.48.189` の regression #2
+と同型の validation-timing リスクを個別に検証する必要があり、後者は
+`crates/flpdf` への新規 public API 追加を要するため。
+
+`main.rs::tests::job_json_file_route_applies_qdf_like_the_ordinary_route`
+（issue の再現例そのもの、`%QDF-1.0` マーカーの有無を byte 比較）と
+`::job_json_file_route_applies_deterministic_id_like_the_ordinary_route`
+（`--deterministic-id` の効果を 2 回の独立実行の byte 一致/不一致で観測）が
+実際の wiring を検証する。`qpdf_cli_events`/`preflight_qpdf_cli_events`は
+main.rs private のため、これらのテストは `crates/flpdf-cli/src/main.rs`
+自身の `#[cfg(test)] mod tests` に置く（`cli_job_json.rs` 等の別ファイル
+統合テストからは到達できない）。新しい bridge や deviation marker は
+追加しない。
+
 ## E-10 primary document graph retention in distinct-secondary `--pages` (`flpdf-lrm3u`, 2026-09-15)
 
 qpdf keeps the primary `QPDF` as the page-job base while

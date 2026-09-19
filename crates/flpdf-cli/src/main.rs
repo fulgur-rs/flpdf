@@ -4174,6 +4174,37 @@ enum JobJsonCliEvent {
     OiMinWidth(Vec<u8>),
     SplitPages(Vec<u8>),
     ShowObject(Vec<u8>),
+    // The following are bare (no-value) qpdf main-table options whose flpdf
+    // counterpart is a side-effect-free `QPDFJob` configuration assignment
+    // (`libqpdf/qpdf/auto_job_init.hh:30-95`'s `addBare` entries, excluding
+    // named-segment openers already stripped by `is_named_segment_option`
+    // and options already covered above). Unlike `--rotate`/`--collate`/etc,
+    // qpdf's callback for each of these is a bare setter with no occurrence-
+    // order-sensitive state, so a missing-from-preflight entry silently drops
+    // the option instead of misordering it (`flpdf-3yn9.48.190`).
+    AllowWeakCrypto,
+    Check,
+    CoalesceContents,
+    DeterministicId,
+    FilteredStreamData,
+    FlattenRotation,
+    GenerateAppearances,
+    JsonInput,
+    ListAttachments,
+    Progress,
+    Qdf,
+    RawStreamData,
+    RemovePageLabels,
+    RemoveRestrictions,
+    ShowEncryption,
+    ShowEncryptionKey,
+    ShowLinearization,
+    ShowNpages,
+    ShowPages,
+    ShowXref,
+    TestJsonSchema,
+    Verbose,
+    WithImages,
 }
 
 fn raw_option_equals_value<'a>(argument: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
@@ -4289,6 +4320,52 @@ fn qpdf_cli_events(args: &[arg_parser::RawArg]) -> CliResult<Vec<JobJsonCliEvent
             events.push(JobJsonCliEvent::IgnoreXrefStreams);
         } else if bytes == b"--check-linearization" {
             events.push(JobJsonCliEvent::CheckLinearization);
+        } else if bytes == b"--allow-weak-crypto" {
+            events.push(JobJsonCliEvent::AllowWeakCrypto);
+        } else if bytes == b"--check" {
+            events.push(JobJsonCliEvent::Check);
+        } else if bytes == b"--coalesce-contents" {
+            events.push(JobJsonCliEvent::CoalesceContents);
+        } else if bytes == b"--deterministic-id" {
+            events.push(JobJsonCliEvent::DeterministicId);
+        } else if bytes == b"--filtered-stream-data" {
+            events.push(JobJsonCliEvent::FilteredStreamData);
+        } else if bytes == b"--flatten-rotation" {
+            events.push(JobJsonCliEvent::FlattenRotation);
+        } else if bytes == b"--generate-appearances" {
+            events.push(JobJsonCliEvent::GenerateAppearances);
+        } else if bytes == b"--json-input" {
+            events.push(JobJsonCliEvent::JsonInput);
+        } else if bytes == b"--list-attachments" {
+            events.push(JobJsonCliEvent::ListAttachments);
+        } else if bytes == b"--progress" {
+            events.push(JobJsonCliEvent::Progress);
+        } else if bytes == b"--qdf" {
+            events.push(JobJsonCliEvent::Qdf);
+        } else if bytes == b"--raw-stream-data" {
+            events.push(JobJsonCliEvent::RawStreamData);
+        } else if bytes == b"--remove-page-labels" {
+            events.push(JobJsonCliEvent::RemovePageLabels);
+        } else if bytes == b"--remove-restrictions" {
+            events.push(JobJsonCliEvent::RemoveRestrictions);
+        } else if bytes == b"--show-encryption" {
+            events.push(JobJsonCliEvent::ShowEncryption);
+        } else if bytes == b"--show-encryption-key" {
+            events.push(JobJsonCliEvent::ShowEncryptionKey);
+        } else if bytes == b"--show-linearization" {
+            events.push(JobJsonCliEvent::ShowLinearization);
+        } else if bytes == b"--show-npages" {
+            events.push(JobJsonCliEvent::ShowNpages);
+        } else if bytes == b"--show-pages" {
+            events.push(JobJsonCliEvent::ShowPages);
+        } else if bytes == b"--show-xref" {
+            events.push(JobJsonCliEvent::ShowXref);
+        } else if bytes == b"--test-json-schema" {
+            events.push(JobJsonCliEvent::TestJsonSchema);
+        } else if bytes == b"--verbose" {
+            events.push(JobJsonCliEvent::Verbose);
+        } else if bytes == b"--with-images" {
+            events.push(JobJsonCliEvent::WithImages);
         } else if bytes == b"-" || !bytes.starts_with(b"-") {
             if !gave_input {
                 events.push(JobJsonCliEvent::Input(PathBuf::from(argument.as_os_str())));
@@ -4456,6 +4533,69 @@ fn preflight_qpdf_cli_events(args: &[arg_parser::RawArg]) -> CliResult<QpdfCliPr
                     .show_object(value.as_ref())
                     .map_err(|error| qpdf_argv_usage_error(Box::new(error)))?;
             }
+            JobJsonCliEvent::AllowWeakCrypto => job.set_allow_weak_crypto(true),
+            JobJsonCliEvent::Check => {
+                job.config().check();
+            }
+            JobJsonCliEvent::CoalesceContents => {
+                job.config().coalesce_contents();
+            }
+            JobJsonCliEvent::DeterministicId => {
+                job.config().deterministic_id();
+            }
+            JobJsonCliEvent::FilteredStreamData => {
+                job.config().filtered_stream_data();
+            }
+            JobJsonCliEvent::FlattenRotation => {
+                job.config().flatten_rotation();
+            }
+            JobJsonCliEvent::GenerateAppearances => {
+                job.config().generate_appearances();
+            }
+            JobJsonCliEvent::JsonInput => {
+                job.config().json_input();
+            }
+            JobJsonCliEvent::ListAttachments => {
+                job.config().list_attachments();
+            }
+            JobJsonCliEvent::Progress => {
+                job.config().progress();
+            }
+            JobJsonCliEvent::Qdf => {
+                job.config().qdf();
+            }
+            JobJsonCliEvent::RawStreamData => {
+                job.config().raw_stream_data();
+            }
+            JobJsonCliEvent::RemovePageLabels => {
+                job.config().remove_page_labels();
+            }
+            JobJsonCliEvent::RemoveRestrictions => {
+                job.config().remove_restrictions();
+            }
+            JobJsonCliEvent::ShowEncryption => {
+                job.config().show_encryption();
+            }
+            JobJsonCliEvent::ShowEncryptionKey => job.set_show_encryption_key(true),
+            JobJsonCliEvent::ShowLinearization => {
+                job.config().show_linearization();
+            }
+            JobJsonCliEvent::ShowNpages => {
+                job.config().show_npages();
+            }
+            JobJsonCliEvent::ShowPages => {
+                job.config().show_pages();
+            }
+            JobJsonCliEvent::ShowXref => {
+                job.config().show_xref();
+            }
+            JobJsonCliEvent::TestJsonSchema => {
+                job.config().test_json_schema();
+            }
+            JobJsonCliEvent::Verbose => {
+                job.config().verbose();
+            }
+            JobJsonCliEvent::WithImages => job.set_with_images(true),
         }
     }
 
@@ -10798,6 +10938,215 @@ mod tests {
                 JobJsonCliEvent::SplitPages(Vec::new()),
                 JobJsonCliEvent::JobJsonFile(PathBuf::from("job.json")),
             ]
+        );
+    }
+
+    #[test]
+    fn job_json_cli_events_include_bare_main_option_callbacks() {
+        // qpdf's main option table has many bare (no-value) callbacks besides
+        // the ones already covered above (`libqpdf/qpdf/auto_job_init.hh`'s
+        // `addBare` entries). Before `flpdf-3yn9.48.190` these fell through
+        // every branch and were silently dropped when combined with
+        // `--job-json-file`, unlike the ordinary (non-job-json) route where
+        // clap parses them onto `Cli` directly.
+        let preprocessed = preprocess_qpdf_args(strs(&[
+            "flpdf",
+            "--allow-weak-crypto",
+            "--check",
+            "--coalesce-contents",
+            "--deterministic-id",
+            "--filtered-stream-data",
+            "--flatten-rotation",
+            "--generate-appearances",
+            "--json-input",
+            "--linearize",
+            "--list-attachments",
+            "--progress",
+            "--qdf",
+            "--raw-stream-data",
+            "--remove-page-labels",
+            "--remove-restrictions",
+            "--show-encryption",
+            "--show-encryption-key",
+            "--show-linearization",
+            "--show-npages",
+            "--show-pages",
+            "--show-xref",
+            "--test-json-schema",
+            "--verbose",
+            "--with-images",
+            "--job-json-file=job.json",
+        ]))
+        .expect("qpdf preprocessing should retain the bare main-table options");
+
+        assert_eq!(
+            qpdf_cli_events(&preprocessed.raw_residual_args).unwrap(),
+            vec![
+                JobJsonCliEvent::AllowWeakCrypto,
+                JobJsonCliEvent::Check,
+                JobJsonCliEvent::CoalesceContents,
+                JobJsonCliEvent::DeterministicId,
+                JobJsonCliEvent::FilteredStreamData,
+                JobJsonCliEvent::FlattenRotation,
+                JobJsonCliEvent::GenerateAppearances,
+                JobJsonCliEvent::JsonInput,
+                JobJsonCliEvent::ListAttachments,
+                JobJsonCliEvent::Progress,
+                JobJsonCliEvent::Qdf,
+                JobJsonCliEvent::RawStreamData,
+                JobJsonCliEvent::RemovePageLabels,
+                JobJsonCliEvent::RemoveRestrictions,
+                JobJsonCliEvent::ShowEncryption,
+                JobJsonCliEvent::ShowEncryptionKey,
+                JobJsonCliEvent::ShowLinearization,
+                JobJsonCliEvent::ShowNpages,
+                JobJsonCliEvent::ShowPages,
+                JobJsonCliEvent::ShowXref,
+                JobJsonCliEvent::TestJsonSchema,
+                JobJsonCliEvent::Verbose,
+                JobJsonCliEvent::WithImages,
+                JobJsonCliEvent::JobJsonFile(PathBuf::from("job.json")),
+            ]
+        );
+    }
+
+    #[test]
+    fn preflight_qpdf_cli_events_applies_every_bare_main_option_without_error() {
+        // Each event from the table above must reach a `QPDFJob` setter
+        // (`preflight_qpdf_cli_events`'s match) rather than only being
+        // recognized by the parser. `--empty` keeps this an inspection-only
+        // job (several of these options clear `require_output`), so no
+        // output path is needed.
+        let directory = tempfile::tempdir().expect("create job-json directory");
+        let job_json = directory.path().join("job.json");
+        std::fs::write(&job_json, b"{}").expect("write empty job-json file");
+
+        let mut args: Vec<OsString> = strs(&[
+            "flpdf",
+            "--empty",
+            "--allow-weak-crypto",
+            "--check",
+            "--coalesce-contents",
+            "--deterministic-id",
+            "--filtered-stream-data",
+            "--flatten-rotation",
+            "--generate-appearances",
+            "--json-input",
+            "--linearize",
+            "--list-attachments",
+            "--progress",
+            "--qdf",
+            "--raw-stream-data",
+            "--remove-page-labels",
+            "--remove-restrictions",
+            "--show-encryption",
+            "--show-encryption-key",
+            "--show-linearization",
+            "--show-npages",
+            "--show-pages",
+            "--show-xref",
+            "--test-json-schema",
+            "--verbose",
+            "--with-images",
+        ])
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        args.push(OsString::from(format!(
+            "--job-json-file={}",
+            job_json.display()
+        )));
+        let preprocessed = preprocess_qpdf_args(args)
+            .expect("qpdf preprocessing should retain the bare main-table options");
+
+        preflight_qpdf_cli_events(&preprocessed.raw_residual_args)
+            .expect("every bare main-table option should reach a QPDFJob setter");
+    }
+
+    #[test]
+    fn job_json_file_route_applies_qdf_like_the_ordinary_route() {
+        // Reproduction from `flpdf-3yn9.48.190`: `--qdf` combined with
+        // `--job-json-file` must still write the `%QDF-1.0` marker
+        // (`crates/flpdf/src/writer/plain/body.rs`), matching qpdf's single
+        // left-to-right argv scan (`libqpdf/QPDFJob_argv.cc`) where every
+        // option's callback runs at its occurrence regardless of whether
+        // `--job-json-file` also appears.
+        let directory = tempfile::tempdir().expect("create job-json directory");
+        let job_json = directory.path().join("job.json");
+        std::fs::write(&job_json, b"{}").expect("write empty job-json file");
+
+        let run_with_qdf = |qdf: bool| -> Vec<u8> {
+            let output = directory
+                .path()
+                .join(if qdf { "qdf.pdf" } else { "plain.pdf" });
+            let mut args = vec![OsString::from("flpdf"), OsString::from("--empty")];
+            if qdf {
+                args.push(OsString::from("--qdf"));
+            }
+            args.push(OsString::from(format!(
+                "--job-json-file={}",
+                job_json.display()
+            )));
+            args.push(OsString::from(&output));
+            let preprocessed =
+                preprocess_qpdf_args(args).expect("qpdf preprocessing should succeed");
+            let preflight = preflight_qpdf_cli_events(&preprocessed.raw_residual_args)
+                .expect("preflight should build a job from --empty and --job-json-file");
+            run_job_json_files(preflight, false).expect("the empty job should write successfully");
+            std::fs::read(&output).expect("the job must have written its output file")
+        };
+
+        let plain = run_with_qdf(false);
+        let qdf = run_with_qdf(true);
+        assert!(!plain.windows(9).any(|window| window == b"%QDF-1.0\n"));
+        assert!(qdf.windows(9).any(|window| window == b"%QDF-1.0\n"));
+    }
+
+    #[test]
+    fn job_json_file_route_applies_deterministic_id_like_the_ordinary_route() {
+        // A second, differently-shaped bare option than `--qdf`: this one
+        // reaches `QPDFJob::set_linearization`-style writer state through
+        // `job.config().deterministic_id()` instead of a top-level `set_*`
+        // method. Its effect is only observable by comparing two independent
+        // runs, since the default (non-deterministic) `/ID` is drawn from a
+        // random source (see the `flpdf-cli e2e` static-id note in project
+        // memory) rather than embedding a fixed marker byte sequence.
+        let directory = tempfile::tempdir().expect("create job-json directory");
+        let job_json = directory.path().join("job.json");
+        std::fs::write(&job_json, b"{}").expect("write empty job-json file");
+
+        let run = |deterministic_id: bool, output_name: &str| -> Vec<u8> {
+            let output = directory.path().join(output_name);
+            let mut args = vec![OsString::from("flpdf"), OsString::from("--empty")];
+            if deterministic_id {
+                args.push(OsString::from("--deterministic-id"));
+            }
+            args.push(OsString::from(format!(
+                "--job-json-file={}",
+                job_json.display()
+            )));
+            args.push(OsString::from(&output));
+            let preprocessed =
+                preprocess_qpdf_args(args).expect("qpdf preprocessing should succeed");
+            let preflight = preflight_qpdf_cli_events(&preprocessed.raw_residual_args)
+                .expect("preflight should build a job from --empty and --job-json-file");
+            run_job_json_files(preflight, false).expect("the empty job should write successfully");
+            std::fs::read(&output).expect("the job must have written its output file")
+        };
+
+        let deterministic_first = run(true, "deterministic-1.pdf");
+        let deterministic_second = run(true, "deterministic-2.pdf");
+        assert_eq!(
+            deterministic_first, deterministic_second,
+            "--deterministic-id must make repeated job-json-file runs byte-identical"
+        );
+
+        let random_first = run(false, "random-1.pdf");
+        let random_second = run(false, "random-2.pdf");
+        assert_ne!(
+            random_first, random_second,
+            "without --deterministic-id the /ID must still vary between runs, \
+             or the deterministic-id comparison above would be meaningless"
         );
     }
 
