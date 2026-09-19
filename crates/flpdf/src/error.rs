@@ -8,7 +8,8 @@
 //! `QPDFExc`, or a bare `std::logic_error`/`std::runtime_error`/
 //! `std::range_error`. Rust has no exception hierarchy to mirror, so [`enum@Error`]
 //! carries that axis as variants instead: `Internal` projects
-//! `std::logic_error`, `System` projects `std::runtime_error`, and
+//! `std::logic_error`; `System` and its byte-preserving counterpart
+//! [`Error::SystemBytes`] project `std::runtime_error`; and
 //! [`Error::QpdfExc`] carries a `QPDFExc`.
 //!
 //! This substitutes the container, not the classification. qpdf's second axis,
@@ -19,9 +20,6 @@
 //! output-byte risk of its own; whether each call site is assigned the
 //! classification qpdf would assign is a separate question, tracked as route
 //! matrix B32's `mixed` status.
-//!
-//! Recorded in `docs/qpdf-correspondence.md` as required by CLAUDE.md
-//! category (B) condition 3.
 //!
 use crate::encryption::primitives::PrimitiveError;
 use thiserror::Error;
