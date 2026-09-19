@@ -2586,6 +2586,94 @@ fn json_output_pages_selection_rebuilds_the_live_page_tree() {
         .is_some());
 }
 
+/// Regression coverage for flpdf-3yn9.48.194: `--empty --json=2 --pages
+/// <file> N` used to silently drop the page selection (the JSON route's
+/// `apply_json_page_specs` only ever ran on the non-empty/plain branch), so
+/// `"pages"` came back empty instead of matching qpdf's selected page count.
+#[test]
+fn json_output_empty_input_with_pages_selects_the_requested_page() {
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/one-page.pdf");
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("empty-pages.json");
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--empty", "--json=2", "--pages"])
+        .arg(&source)
+        .arg("1")
+        .arg("--")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        flpdf.status.success(),
+        "flpdf failed: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+    let pages = json["pages"].as_array().expect("pages array");
+    assert_eq!(
+        pages.len(),
+        1,
+        "qpdf selects exactly one page for --empty --pages <file> 1, got: {json}"
+    );
+}
+
+/// Regression coverage for flpdf-3yn9.48.194: multi-source `--pages` used to
+/// be explicitly rejected on the JSON route ("--pages: JSON output currently
+/// accepts only the primary input source") where qpdf 11.9.0 accepts it.
+/// The merged object graph itself still diverges from qpdf in a known way
+/// (`flpdf-3yn9.48.210`), so this only pins the page count and exit status,
+/// not byte-for-byte JSON equality.
+#[test]
+fn json_output_multi_source_pages_is_no_longer_rejected() {
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    let primary = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/one-page.pdf");
+    let secondary = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/three-page.pdf");
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("multi-source-pages.json");
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json=2", "--pages"])
+        .arg(&primary)
+        .arg("1")
+        .arg(&secondary)
+        .arg("1")
+        .arg("--")
+        .arg(&primary)
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        flpdf.status.success(),
+        "flpdf failed: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&flpdf.stderr)
+            .contains("JSON output currently accepts only the primary input source"),
+        "the multi-source restriction must be gone"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+    let pages = json["pages"].as_array().expect("pages array");
+    assert_eq!(
+        pages.len(),
+        2,
+        "one page from each of the two sources, got: {json}"
+    );
+}
+
 /// `QPDFJob::checkConfiguration` rejects a `--json-key` that does not belong to
 /// the selected JSON version (`QPDFJob.cc:633-641`), and the argument parser
 /// rejects a `--json-output` outside its registered choices
@@ -2644,4 +2732,100 @@ fn json_usage_errors_match_qpdf_usage_exit() {
             "{args:?}: stderr must match qpdf byte for byte"
         );
     }
+}
+
+/// The JSON route runs its page selection through `create_qpdf`, so the job
+/// configuration qpdf consults inside `createQPDF` has to reach it. Four
+/// settings were measured against pinned qpdf 11.9.0 and are pinned here:
+/// the file-lifetime policy, the resource-pruning policy, the
+/// copy-encryption donor password fallback, and the empty-selection case
+/// that must not flatten the target's page tree.
+#[test]
+fn json_page_selection_honors_the_create_stage_job_configuration() {
+    if !is_qpdf_available() {
+        return;
+    }
+
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().expect("tempdir");
+
+    // `--keep-files-open=n` has to reach the job that runs the merge, or it
+    // holds every donor open at once. Measured with an fd limit of 32 and 40
+    // sources: without the setting this fails with "Too many open files"
+    // around the 30th donor, where qpdf succeeds. The limit itself is not
+    // portable to set from a test, so the file count stands in for it --
+    // this pins that the option reaches the route, which is what was missing.
+    let sources = tempdir.path().join("sources");
+    std::fs::create_dir_all(&sources).expect("source directory");
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "--verbose".into(),
+        "--keep-files-open=n".into(),
+        "--json=2".into(),
+        "--pages".into(),
+    ];
+    for index in 0..8 {
+        let path = sources.join(format!("p{index}.pdf"));
+        std::fs::copy(&fixture, &path).expect("copy source");
+        args.push(path.into_os_string());
+        args.push("1".into());
+    }
+    args.push("--".into());
+    args.push(fixture.clone().into_os_string());
+    args.push(tempdir.path().join("keep.json").into_os_string());
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(&args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "multi-source JSON merge must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("selecting --keep-open-files"),
+        "an explicit --keep-files-open must not be re-derived: {stderr}"
+    );
+
+    // An explicit --remove-unreferenced-resources must change the result;
+    // leaving the job at Auto makes both spellings identical.
+    let mut rendered = Vec::new();
+    for value in ["yes", "no"] {
+        let path = tempdir.path().join(format!("res-{value}.json"));
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .arg(format!("--remove-unreferenced-resources={value}"))
+            .args(["--json=2", "--pages"])
+            .arg(&fixture)
+            .args(["1", "--"])
+            .arg(&fixture)
+            .arg(&path)
+            .assert()
+            .success();
+        rendered.push(std::fs::read(&path).expect("read json output"));
+    }
+    assert_ne!(
+        rendered[0], rendered[1],
+        "an explicit resource policy must reach the create stage"
+    );
+
+    // A selection that resolves to no pages makes zero insertPage calls in
+    // qpdf, so the target's inherited-attribute flag stays false.
+    let empty_path = tempdir.path().join("empty.json");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--empty", "--json=2", "--pages"])
+        .arg(&fixture)
+        .args(["1,x1", "--"])
+        .arg(&empty_path)
+        .assert()
+        .success();
+    let empty_json = std::fs::read_to_string(&empty_path).expect("read empty json");
+    assert!(
+        empty_json.contains("\"pushedinheritedpageresources\": false"),
+        "an empty selection must not flatten the target page tree: {empty_json}"
+    );
 }
