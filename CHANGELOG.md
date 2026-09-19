@@ -232,6 +232,239 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/fulgur-rs/flpdf/compare/v0.6.0...v0.7.0) - 2026-09-19
+
+### Added
+
+- *(job)* expose image config setters for json layering
+- *(xref)* add load_xref_state_through_canonical_owner primitive
+
+### Fixed
+
+- *(xref)* keep undelivered warnings pending when the sink fails
+- *(xref)* unify insertReconstructedXrefEntry guard/insert/suppress (B20)
+- *(pages)* promote direct kids in forward order like qpdf
+- *(pages)* keep non-dictionary /Kids leaves in the page walk like qpdf
+- *(xref)* apply the reconstruction free-row filter on every recovery handoff
+- *(cli)* layer image options after job JSON
+- *(writer)* capture PCLm Generate ObjStm membership during setup
+- *(writer)* retain clippy-clean xref callback ownership
+- *(job)* restore the qpdf same-file usage message's trailing word
+- *(linearization)* resolve an indirect stream dictionary before the live walk
+- *(job)* restart lifecycle state and classify argv callback failures
+- select the crypto provider registry per target
+- preserve raw argv bytes across job diagnostics
+- preserve raw argv diagnostic bytes
+- preserve raw argv diagnostic bytes
+- match qpdf completion and crypto provider semantics
+- defer JSON crypto checks and honor provider environment
+- complete qpdf help and JSON callback parity
+- isolate JSON R2 permissions from R3 state
+- mirror generated qpdf help and R2 state
+- preserve inherited R2 JSON permissions
+- preserve AES across JSON encryption groups
+- complete qpdf argv help and encryption defaults
+- satisfy help registry clippy checks
+- align raw argv help and JSON encryption state
+- finish raw argv qpdf configuration parity
+- satisfy clippy for inherited encryption state
+- align raw argv final qpdf semantics
+- *(writer)* keep object-zero children off the direct-scalar fast path
+- *(writer)* preserve encryption callback in scalar fast path
+- *(resolver)* drop the spent read buffer before the fallible refill
+- *(resolver)* flush the live input after a trailing-token error too
+- flush live input after header errors
+- open ordinary output before writer validation
+- *(qtest)* isolate concurrent logger captures
+- *(logger)* key error captures by thread instead of one slot
+- scope qtest default error captures by thread
+- preserve canonical trailer value descriptions
+- align linearization diagnostic state
+- *(linearization)* read the permanent /ID through the live trailer
+- preserve qpdf accessor warning chains
+- *(writer)* treat a null trailer /Size as absent in both serializers
+- preserve missing trailer size key
+- *(reader)* gate every offset read, not just the type-1 and raw-xref ones
+- *(reader)* keep a nested resolution's value instead of overwriting it
+- *(linearize)* write /Size in the first-page trailer only when the input has it
+- *(linearize)* rank preserved plain Part-9 objects by their folded category
+- *(linearize)* follow qpdf's zero default for a dangling ObjStm /Extends
+- preserve linearized ObjStm extends
+- *(flate)* bound the initialized-output view to its buffer
+- *(flate)* report zlib's detail text on the default inflate backend
+- *(writer)* bound ObjStm visited storage
+- *(logger)* avoid buffered partial lines in default logger
+- *(logger)* bound line-buffered stdout writes
+- stop linearization on shared first page
+- align JSON object generations with qpdf
+- *(check)* reject unfilterable page content streams
+- *(job)* let a page-selection usage error reach the CLI's usage exit
+- *(cli)* keep --json's implicit output across a later partial job JSON
+- *(cli)* preserve job-json argv ordering
+- *(linearization)* keep the part-9 head group in source order
+- *(linearization)* pick the greatest qualifying container predecessor
+- *(linearization)* promote only page-tree-only objects to the part-9 head
+- *(linearization)* keep the page tree at the head of part 9
+- *(linearization)* anchor generated ObjStm containers by route
+- sync the writer flag at the job-JSON copy-encryption sites
+- keep donor credentials when a later mode owns the output
+
+### Other
+
+- Keep B25 mixed: the guard is armed after the scan, not before it
+- write-through reconstructed_xref via CanonicalTrailerOwner (flpdf-3yn9.48.176, B25)
+- Merge pull request #2201 from fulgur-rs/mixed/flpdf-3yn9-48-206
+- Merge pull request #2200 from fulgur-rs/mixed/flpdf-3yn9-48-205
+- Merge pull request #2199 from fulgur-rs/mixed/flpdf-3yn9-48-204
+- keep the audit out of published rustdoc and fix the shifted citations
+- Merge remote-tracking branch 'origin/main' into HEAD
+- correct the B27 audit to what the code actually does
+- *(xref)* drop internal issue-ID reference from published module doc
+- *(xref)* record B27 repair_diagnostics buffer as (B), not (C)
+- Merge remote-tracking branch 'origin/main' into HEAD
+- allowlist the wrapper's calls instead of banning accessors
+- count conversions, and track helper and parameter provenance
+- cover async blocks, destructuring shadows, and the constructor's inputs
+- fix the shadowing false positive and four traversal gaps
+- gate attributed expressions at any depth, and fix the cited test name
+- judge only the wrapper the contract is about
+- Merge remote-tracking branch 'origin/main' into HEAD
+- match forbidden calls, and scope helper bindings per function
+- check the delegated call's shape and normalize raw identifiers
+- Merge remote-tracking branch 'origin/main' into HEAD
+- close four more gaps in the route contract's traversal
+- Merge remote-tracking branch 'origin/main' into HEAD
+- Merge pull request #2183 from fulgur-rs/mixed/flpdf-3yn9-48-189
+- Merge pull request #2180 from fulgur-rs/mixed/flpdf-3yn9-48-187
+- Merge pull request #2186 from fulgur-rs/mixed/flpdf-3yn9-48-193
+- describe the linearized normalize set as the raw set it is
+- Merge remote-tracking branch 'origin/main' into HEAD
+- Merge pull request #2181 from fulgur-rs/mixed/flpdf-3yn9-48-183
+- Merge pull request #2177 from fulgur-rs/mixed/flpdf-3yn9-48-188
+- Merge pull request #2182 from fulgur-rs/mixed/flpdf-3yn9-48-182
+- Merge main into the branch for #2182
+- mark the last uncovered line in the moved qpdf-key oracle test
+- fix cov:ignore marker false-positive in explanatory prose
+- mark genuinely uncovered lines in the moved JSON tests
+- narrow QPDFJob::write_json(_with_version) to pub(crate)
+- Merge pull request #2171 from fulgur-rs/mixed/flpdf-3yn9-48-168
+- Merge pull request #2170 from fulgur-rs/mixed/flpdf-3yn9-48-167
+- Merge main into the branch for #2170
+- unify plain writer ObjStm exclusion into filter_objstm_batches_for_output (D23)
+- remove Endpoint/PageRangeEntry/Parity pub debt (E-15)
+- Merge pull request #2159 from fulgur-rs/mixed/flpdf-6j90n-current
+- Merge pull request #2158 from fulgur-rs/mixed/flpdf-b0cjh-current
+- Merge main into the nondict-leaf branch, keeping both oracle fixtures
+- Merge pull request #2156 from fulgur-rs/flpdf-3yn9.48.160-page-refs-leaf
+- *(pages)* cover a direct /Kids-bearing kid in the page walk
+- Merge pull request #2151 from fulgur-rs/mixed/flpdf-ihyup-2-current
+- *(pages)* satisfy strict lint for coverage probe
+- *(pages)* keep coverage mapping on live frame call
+- *(pages)* cover live handle boundary branches
+- *(pages)* retain repaired page handles through optimization
+- Merge pull request #2140 from fulgur-rs/flpdf-3yn9.48.164-cutover
+- *(object)* route string callers through asString
+- Merge pull request #2138 from fulgur-rs/perf/flpdf-xom94
+- document linearization coverage attribution
+- *(writer)* retain raw content identities in linearization snapshot
+- *(writer)* reuse special-stream setup in linearized planning
+- Merge pull request #2132 from fulgur-rs/perf/flpdf-ymuj-67
+- *(writer)* mark D14 pass1 callback boundary
+- *(writer)* cover D14 trailer branches
+- *(writer)* share linearized second trailer owner
+- *(writer)* normalize coverage markers
+- *(writer)* cover linearized xref edge branches
+- *(writer)* keep xref row encoding allocation-free
+- *(writer)* share classic xref rows with linearized route
+- *(xref)* [**breaking**] remove the owner-less bootstrap xref parser
+- *(xref)* move loader tests onto the canonical owner primitive
+- Merge pull request #2128 from fulgur-rs/flpdf-3yn9.48.150.1-outfilename-lifecycle
+- port qpdf's mutable m->outfilename lifecycle and add creates_output()
+- *(writer)* avoid linearized stream dictionary snapshots
+- Merge pull request #2125 from fulgur-rs/perf/flpdf-ymuj-63
+- Merge pull request #2124 from fulgur-rs/flpdf-3yn9.48.152-livequeue-seed
+- Merge pull request #2123 from fulgur-rs/perf/flpdf-ymuj-62-followup
+- *(linearization)* walk plan containers without snapshots
+- *(linearization)* stream mapped containers and object headers
+- *(linearization)* avoid missing-type context snapshots
+- cover dictionary traversal warning boundaries
+- *(linearization)* emit fixed xref rows without format allocations
+- *(linearization)* avoid context snapshots for page probes
+- *(linearization)* reuse visible child handles
+- *(linearization)* avoid dictionary map snapshots in null walk
+- Merge pull request #2118 from fulgur-rs/flpdf-3yn9.48.151.1-canonical-owner-primitive
+- exclude impossible copyright asset fallback
+- cover completion environment conversion
+- satisfy argv clippy checks
+- keep argv coverage helper minimal
+- cover argv diagnostics branches
+- follow argv program name in diagnostics
+- tolerate platform crypto provider lists
+- cover help provider and generated table paths
+- cover generated help fallback boundary
+- keep generated qpdf help outside source coverage
+- format inherited encryption test
+- cover inherited job JSON encryption settings
+- document remaining coverage mappings
+- cover raw argv help and JSON slot boundaries
+- document llvm coverage mapping for argv diagnostics
+- cover remaining raw argv config branches
+- cover persistent AES encryption defaults
+- keep invalid byte pathname cases on Linux
+- normalize cross-platform text output
+- limit invalid byte filenames to Linux
+- compile raw argv coverage on every Unix host
+- complete qpdf job raw argv boundary
+- *(writer)* exercise the string callback in the object-zero regression
+- Revert "perf(linearization): avoid duplicate production page preparation"
+- *(linearization)* avoid duplicate production page preparation
+- reuse the exercised string callback
+- cover warning-context and signature fallbacks
+- cover resolved and scalar writer branches
+- reduce writer and linearization traversal overhead
+- Merge pull request #2110 from fulgur-rs/fix/flpdf-msrut-linearize-direct-root
+- Merge pull request #2108 from fulgur-rs/fix/flpdf-3yn9-48-144-page-write
+- Merge pull request #2102 from fulgur-rs/fix/flpdf-p570e-linearization-id-warning-count
+- Merge pull request #2103 from fulgur-rs/fix/flpdf-3yn9-48-142-split-write
+- *(logger)* cover nested capture restoration
+- Merge remote-tracking branch 'origin/main' into HEAD
+- *(logger)* mark the thread-scoped error overlay as a qpdf deviation
+- Merge pull request #2096 from fulgur-rs/fix/flpdf-svhr3-linearization-plan-order
+- Merge pull request #2095 from fulgur-rs/perf/flpdf-ymuj-52
+- Merge pull request #2089 from fulgur-rs/fix/flpdf-q2nka-linearize-stream-probe
+- Merge pull request #2088 from fulgur-rs/perf/flpdf-ymuj-51
+- *(object)* guard the indirect filter in every teardown-child arm
+- Merge pull request #2085 from fulgur-rs/fix/flpdf-5jcwv-trailer-size
+- Merge origin/main into fix/flpdf-64dx9-persistent-loop-null
+- Merge pull request #2079 from fulgur-rs/fix/flpdf-67h8d-copy-encryption-length
+- Merge pull request #2077 from fulgur-rs/fix/flpdf-043td-linearize-version-floor
+- Merge pull request #2072 from fulgur-rs/fix/flpdf-eetrz-linearized-extends
+- Merge pull request #2071 from fulgur-rs/fix/flpdf-7ss5w-slice-lifetime
+- Merge pull request #2066 from fulgur-rs/fix/flpdf-psgss-preserve-part9-order
+- *(writer)* cover sparse visited storage
+- normalize source-shape snapshots on Windows
+- *(flate)* terminate qpdf correspondence classification
+- *(parser)* drop stale conflict import
+- Revert perf(tokenizer): consume object-stream header integers from live buffers
+- *(tokenizer)* consume object-stream header integers from live buffers
+- move live parser token values
+- combine live token compact extraction
+- compact live scalar tokens and skip redundant drops
+- upgrade cached resolver without cloning weak state
+- cover flate codec invariant
+- reuse flate output storage across small writes
+- converge qpdf writer and parser hot paths
+- clarify flpdf module responsibilities
+- Merge pull request #2038 from fulgur-rs/fix/flpdf-u40ck-job-json-order
+- *(encryption)* describe the deviation by the key that reaches the provider
+- *(encryption)* record the short-raw-key deviation in the module doc
+- *(linearization)* pin the part-9 head anchor against qpdf
+- Merge pull request #2028 from fulgur-rs/fix/flpdf-5h1ru-part9-pages-head-rank
+- preserve ObjStm Flate route guard
+- *(linearization)* share ObjStm payload ownership
+- Merge pull request #2017 from fulgur-rs/perf/flpdf-ymuj-6-40-type-predicate
+- Merge pull request #2013 from fulgur-rs/fix/flpdf-0nlqs-attachment-page-ops
+
 ## [0.6.0](https://github.com/fulgur-rs/flpdf/compare/v0.5.1...v0.6.0) - 2026-09-15
 
 ### Added
