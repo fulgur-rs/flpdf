@@ -1038,19 +1038,12 @@ fn path_description_bytes(path: &Path) -> Vec<u8> {
 /// lossy for a non-UTF-8 path, so this renders the byte-preserving
 /// [`path_description_bytes`] instead.
 pub(crate) fn job_json_file_open_error(path: &Path, error: std::io::Error) -> Error {
-    let rendered = error.to_string();
-    let message: &str = match error.kind() {
-        std::io::ErrorKind::NotFound => "No such file or directory",
-        // qpdf-deviation: qpdf 11.9.0 leaks libstdc++'s basic_string::_M_create
-        // for directory job-JSON paths; that toolchain artifact has no qpdf
-        // semantic contract to reproduce in Rust (mirrors flpdf-cli's
-        // `qpdf_json_input_open_error`, `crates/flpdf-cli/src/main.rs`).
-        std::io::ErrorKind::IsADirectory => "Is a directory",
-        _ => error
-            .raw_os_error()
-            .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
-            .unwrap_or(&rendered),
-    };
+    // qpdf-deviation: qpdf 11.9.0 leaks libstdc++'s basic_string::_M_create for
+    // directory job-JSON paths; that toolchain artifact has no qpdf semantic
+    // contract to reproduce in Rust. `qpdf_file_io_source_message` maps
+    // `IsADirectory` to qpdf's `strerror(EISDIR)` spelling, which is what the
+    // non-leaking hosts print.
+    let message = super::qpdf_file_io_source_message(&error);
     let mut raw = b"open ".to_vec();
     raw.extend_from_slice(&path_description_bytes(path));
     raw.extend_from_slice(b": ");
