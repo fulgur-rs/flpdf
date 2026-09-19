@@ -132,9 +132,7 @@ crates/flpdf/src/parser.rs::too_many_bad_tokens                          # B4 ca
 crates/flpdf/src/tokenizer.rs::Tokenizer::next_object_stream_integer      # B7 local qpdf readToken consumer
 crates/flpdf/src/reader/resolver.rs::recover_stream_length               # B11 canonical / C42 mixed
 crates/flpdf/src/xref.rs::merge_previous_xref_sections_with_observer     # B14 canonical
-crates/flpdf/src/xref.rs::scan_object_header_after_first_token           # B20
-crates/flpdf/src/xref.rs::merge_recovered_qpdf_state                     # B20 recovered/accumulated merge
-crates/flpdf/src/xref.rs::recover_xref_from_linear_scan                  # B20 deleted_objects 抑止 / B22 canonical
+crates/flpdf/src/xref.rs::recover_xref_from_linear_scan                  # B22 canonical
 crates/flpdf/src/reader/resolver.rs::reconstructed_xref                  # B25 canonical
 crates/flpdf/src/reader/resolver.rs::attempt_recovery                    # B26 canonical
 crates/flpdf/src/reader/resolver.rs::repair_diagnostics                  # B27 単一 sink

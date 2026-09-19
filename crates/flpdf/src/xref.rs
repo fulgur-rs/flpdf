@@ -1985,23 +1985,22 @@ fn recover_xref_from_linear_scan(
         canonical_trailer_owner,
         fallback_trailer.is_none(),
         &options.description,
+        deleted_objects,
     )
     .map_err(|error| {
         // cov:ignore-start: defensive open-failure wrapper after a line-scan parser error; the live sink boundary is covered by Pdf open failure tests
         with_xref_open_diagnostics(error, canonical_trailer_owner)
     })?;
     // cov:ignore-end
-    let mut entries = recovered.entries;
     // qpdf's third `insertReconstructedXrefEntry` condition
     // (`QPDF.cc:1204-1209`): a scanned row whose object number a free row
     // already registered is never written to `m->xref_table`, and
     // `reconstruct_xref` clears that filter only after the scan completes
-    // (`QPDF.cc:575`). The rows this scan produced are exactly the
-    // `insertReconstructedXrefEntry` calls qpdf would make, so applying the
-    // filter here -- before the preexisting rows are merged back and before
-    // the candidate re-entry reads the table -- suppresses the same object
-    // numbers qpdf suppresses, on every reconstruction handoff alike.
-    entries.retain(|object_ref, _| !deleted_objects.contains(&object_ref.number));
+    // (`QPDF.cc:575`). `recover_xref_entries_from_source` now applies this
+    // suppression per row, inside the scan itself (via
+    // `insert_reconstructed_xref_entry`), which is qpdf's own call site for
+    // it; the rows in `recovered.entries` already reflect it.
+    let mut entries = recovered.entries;
     // qpdf removes only type-1 rows before its reconstruction scan
     // (`QPDF.cc:516-575`). A failed xref-stream insertion can leave a default
     // type-0 row in the table, and compressed rows survive as well. Carry those
@@ -2214,6 +2213,31 @@ pub(crate) struct RecoveredXref {
     pub(crate) trailer_diagnostics: Vec<QpdfExc>,
 }
 
+/// qpdf's `QPDF::insertReconstructedXrefEntry` overwrite step
+/// (`libqpdf/QPDF.cc:1197-1210`), applied to a line-scan match whose
+/// `obj > 0 && 0 <= gen < 65535` guard (`QPDF.cc:1199-1202`) has already been
+/// enforced by [`scan_object_header_after_first_token`]'s own explicit range
+/// check before it constructs the `ObjectRef` this function receives. The
+/// remaining behavior -- the last occurrence in the file wins, unless the
+/// object's plain number
+/// is registered in `deleted_objects` -- is shared verbatim by every caller
+/// of this scan, whether it runs at document-open time (a real,
+/// possibly-nonempty `deleted_objects` inherited from the xref parse that
+/// just failed) or at resolve time ([`recover_xref_entries`] always passes
+/// an empty set here, because qpdf's own `m->deleted_objects` is guaranteed
+/// clear by the time a resolved document can retry `readObjectAtOffset`;
+/// see that function's doc comment).
+fn insert_reconstructed_xref_entry(
+    entries: &mut BTreeMap<ObjectRef, XrefEntry>,
+    object_ref: ObjectRef,
+    offset: u64,
+    deleted_objects: &BTreeSet<u32>,
+) {
+    if !deleted_objects.contains(&object_ref.number) {
+        entries.insert(object_ref, XrefEntry::Uncompressed { offset });
+    }
+}
+
 /// Replay only the object-offset half of qpdf's `reconstruct_xref` line scan
 /// over a byte buffer, for the resolver's own xref rescan.
 ///
@@ -2223,7 +2247,19 @@ pub(crate) struct RecoveredXref {
 /// reaches both halves from the same function; this buffer entry point is the
 /// one `ResolverHandle` uses when it re-scans a source whose trailer it
 /// already holds.
+///
+/// qpdf's `m->deleted_objects` is populated only while a normal xref
+/// table/stream chain is being registered (`insertFreeXrefEntry`,
+/// `QPDF.cc:1186-1192`) and is cleared once that registration finishes
+/// (`QPDF.cc:686-708`). The resolve-time retry this function serves
+/// (`QPDF::readObjectAtOffset`'s catch at `QPDF.cc:1614-1637`) runs strictly
+/// after the document's own open-time xref registration has already
+/// completed and cleared it, and performs no xref registration of its own
+/// before reaching this scan, so `m->deleted_objects` is always empty here
+/// -- this passes that empty set explicitly via
+/// [`insert_reconstructed_xref_entry`] rather than omitting the check.
 pub(crate) fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, XrefEntry>> {
+    let no_deleted_objects = BTreeSet::new();
     let mut entries = BTreeMap::new();
     let mut line_start = 0usize;
     while line_start < bytes.len() {
@@ -2232,7 +2268,12 @@ pub(crate) fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, X
             if let Some((object_ref, offset)) =
                 scan_object_header_after_first_token(bytes, &first_token)?
             {
-                entries.insert(object_ref, XrefEntry::Uncompressed { offset });
+                insert_reconstructed_xref_entry(
+                    &mut entries,
+                    object_ref,
+                    offset,
+                    &no_deleted_objects,
+                );
             }
         }
         line_start = next_line_start;
@@ -2240,10 +2281,19 @@ pub(crate) fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, X
     Ok(entries)
 }
 
+/// Applies qpdf's `insertReconstructedXrefEntry` suppression
+/// (`libqpdf/QPDF.cc:1204-1209`) via [`insert_reconstructed_xref_entry`]
+/// during the scan itself, using the caller's `deleted_objects` snapshot --
+/// qpdf's `m->deleted_objects` exists for the whole `QPDF` read (see
+/// `load_xref_state_from_window`'s doc comment), so `reconstruct_xref`'s
+/// scan (`QPDF.cc:549-574`) consults whatever that set already holds from
+/// an earlier, incompletely registered xref table/stream, without touching
+/// it itself.
 fn recover_xref_entries_from_source(
     owner: &dyn CanonicalTrailerOwner,
     capture_trailer: bool,
     filename: &[u8],
+    deleted_objects: &BTreeSet<u32>,
 ) -> Result<RecoveredXref> {
     let source_length = owner.source_length()?;
     owner.source_seek(0)?;
@@ -2288,11 +2338,11 @@ fn recover_xref_entries_from_source(
         } else if let Some((object_ref, offset)) =
             scan_object_header_after_first_token(line, &first_token)?
         {
-            entries.insert(
+            insert_reconstructed_xref_entry(
+                &mut entries,
                 object_ref,
-                XrefEntry::Uncompressed {
-                    offset: line_start.saturating_add(offset),
-                },
+                line_start.saturating_add(offset),
+                deleted_objects,
             );
         }
         Ok(())
@@ -5641,9 +5691,72 @@ mod final_handle_tests {
     fn live_recovery_source_parses_a_trailer_candidate() {
         let bytes = b"trailer\n<< /Size 1 >>\n".to_vec();
         let resolver = canonical_test_resolver(bytes, BTreeMap::new(), true, 23);
-        let recovered = recover_xref_entries_from_source(resolver.as_ref(), true, b"input.pdf")
-            .expect("live reconstruction scanner should parse the trailer");
+        let recovered = recover_xref_entries_from_source(
+            resolver.as_ref(),
+            true,
+            b"input.pdf",
+            &BTreeSet::new(),
+        )
+        .expect("live reconstruction scanner should parse the trailer");
         assert!(recovered.trailer.is_some());
+    }
+
+    /// Direct unit coverage of qpdf's `insertReconstructedXrefEntry`
+    /// overwrite-or-suppress step (`libqpdf/QPDF.cc:1197-1210`), now shared
+    /// by both [`recover_xref_entries`] (resolve time) and
+    /// [`recover_xref_entries_from_source`] (open time) through
+    /// [`insert_reconstructed_xref_entry`].
+    #[test]
+    fn insert_reconstructed_xref_entry_overwrites_unless_deleted() {
+        let mut entries = BTreeMap::new();
+        let object_ref = ObjectRef::new(4, 0);
+        let deleted = BTreeSet::from([4u32]);
+
+        // qpdf's `m->deleted_objects.count(obj)` guard: a tombstoned object
+        // number is never (re)written, matching flpdf-3yn9.48.157's fixture.
+        insert_reconstructed_xref_entry(&mut entries, object_ref, 100, &deleted);
+        assert!(entries.is_empty());
+
+        // Not deleted: the row is written.
+        insert_reconstructed_xref_entry(&mut entries, object_ref, 100, &BTreeSet::new());
+        assert_eq!(
+            entries.get(&object_ref),
+            Some(&XrefEntry::Uncompressed { offset: 100 })
+        );
+
+        // A later occurrence of the same object/generation in the file
+        // overwrites the earlier one -- qpdf's plain `xref_table[...] = ...`
+        // assignment, not `try_emplace`.
+        insert_reconstructed_xref_entry(&mut entries, object_ref, 200, &BTreeSet::new());
+        assert_eq!(
+            entries.get(&object_ref),
+            Some(&XrefEntry::Uncompressed { offset: 200 })
+        );
+    }
+
+    /// [`recover_xref_entries_from_source`]'s own `deleted_objects` filter,
+    /// exercised directly against the scan (rather than through the full
+    /// `Pdf::open` recovery pipeline that
+    /// `reconstruction_after_a_committed_free_row_suppresses_it_like_qpdf`,
+    /// in `tests/canonical_xref_owner_route_tests.rs`, already covers
+    /// end-to-end).
+    #[test]
+    fn live_recovery_source_suppresses_a_tombstoned_object_number() {
+        let bytes = b"1 0 obj\n<< >>\nendobj\n2 0 obj\n<< >>\nendobj\n".to_vec();
+        let resolver = canonical_test_resolver(bytes, BTreeMap::new(), true, 79);
+        let deleted_objects = BTreeSet::from([1u32]);
+        let recovered = recover_xref_entries_from_source(
+            resolver.as_ref(),
+            false,
+            b"input.pdf",
+            &deleted_objects,
+        )
+        .expect("live reconstruction scanner should scan both object headers");
+        assert!(
+            !recovered.entries.contains_key(&ObjectRef::new(1, 0)),
+            "a tombstoned object number must not be resurrected by the scan"
+        );
+        assert!(recovered.entries.contains_key(&ObjectRef::new(2, 0)));
     }
 
     #[test]
