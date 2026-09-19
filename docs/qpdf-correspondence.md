@@ -677,6 +677,40 @@ and `createWhat` formatting. `QpdfExc::what_bytes()` intentionally exposes the o
 NUL-terminated `what()` bytes; getters retain complete fields. Resolver/diagnostic consumer
 cutover and removal of duplicate formatters remain in the follow-up `.48.27` layers.
 
+⚪ **(B) `Error`'s exception-class × `qpdf_error_code_e` fold** (route matrix B32,
+`docs/qpdf-route-matrix/b-parser-recovery-diagnostics.md`): qpdf classifies a raised
+error along two independent axes — which C++ exception class carries it (`QPDFExc`,
+or a bare `std::logic_error`/`std::runtime_error`/`std::range_error`; B32 cites concrete
+throw sites, e.g. `libqpdf/QPDF.cc:481,1231`, `libqpdf/QPDFParser.cc:163`,
+`libqpdf/QPDFTokenizer.cc:241,248,770`, `libqpdf/QPDFLogger.cc:200,252`, and
+`libqpdf/QPDF.cc:1101` for `std::range_error`) and, only for `QPDFExc`, its independent
+`qpdf_error_code_e` (`include/qpdf/Constants.h:84-95`). `crates/flpdf/src/error.rs::Error`
+folds both axes into one flat Rust variant set instead of mirroring the C++
+class-plus-side-enum shape; its doc comment (`crates/flpdf/src/error.rs:209-239`, the
+deviation statement itself at `:233-239`) records the resulting per-variant meaning, and
+`Internal`/`System` are the 1:1 projection of axis 1 onto `std::logic_error`/
+`std::runtime_error` (`crates/flpdf/src/error.rs:223-224`). This satisfies CLAUDE.md
+deviation category (B): the fold changes only the Rust "container" a caller matches on —
+where qpdf's own callers instead dispatch by C++ class and by `getErrorCode()` — not the
+classification's meaning. Condition 1 (no output-byte impact) does not need a
+`qpdf-zlib-compat` gated byte test the way a serialization-layer substitution (e.g.
+`InputSource`/`Pipeline`) does: `Error` values are never themselves written into a PDF
+file, only returned to a caller or rendered as diagnostic text, so the container shape
+carries no *additional* byte risk beyond whether each call site is assigned the same
+classification qpdf's two axes would assign it — and that per-call-site accuracy is
+exactly the open question B32's `mixed` status already tracks (see below), not something
+this container-design note independently proves. Where a variant does render
+qpdf-observable text, the byte-identical rendering is owned by `QpdfExc::what_bytes`/
+`create_what` (B30 above, already qpdf-verified byte-for-byte), keyed off the stored
+`QpdfErrorCode`, not off which `Error` variant wraps it. This entry is the
+`docs/qpdf-correspondence.md` half of condition 3's required two-location record; the
+module-doc half is the deviation statement at `crates/flpdf/src/error.rs:233-239`. It does
+not change B32's `mixed` classification or resolve its open correctness questions: whether
+each existing per-code call site (`Parse` for `qpdf_e_damaged_pdf`, `Pages` for
+`qpdf_e_pages`, etc.) is populated the way qpdf's `qpdf_error_code_e` would assign it, and
+whether the reconstruction-trigger guard at `crates/flpdf/src/reader/resolver.rs:2062-2079`
+matches qpdf's `catch (QPDFExc&)` (`libqpdf/QPDF.cc:1614`) for every producer, remain open.
+
 `flpdf-15qk` completes the `QPDF_pages.cc` cache boundary: `Pdf::page_list_cache`
 stores the prepared root and ordered leaf identities after the canonical repair
 walk, `PageDocumentHelper` consumers reuse it across JSON sections, and

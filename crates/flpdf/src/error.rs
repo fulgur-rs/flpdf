@@ -229,6 +229,14 @@ impl std::error::Error for QpdfExc {}
 /// [`Error::open_failure`]. A strict open wraps its failure the same way once
 /// any diagnostic has been collected, so the wrapper is not exclusive to
 /// permissive opens.
+///
+/// This enum deliberately folds qpdf's two independent classification axes —
+/// which C++ exception class is thrown, and, only for `QPDFExc`, its
+/// `qpdf_error_code_e` — into a single flat Rust variant set instead of
+/// mirroring the C++ class hierarchy plus a side enum. This is a CLAUDE.md
+/// deviation category (B) container substitution: only the "container"
+/// changes, not the classification's meaning; see `docs/qpdf-correspondence.md`
+/// for the full rationale.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("I/O error: {0}")]
