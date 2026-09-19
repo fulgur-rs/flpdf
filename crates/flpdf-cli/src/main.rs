@@ -10980,6 +10980,48 @@ mod tests {
     }
 
     #[test]
+    fn every_migrated_inspection_flag_requests_the_combined_route_on_its_own() {
+        // qpdf uses one `run()` call sequence for every flag combination
+        // (`qpdf/qpdf.cc:26-44`), so each of these flags must reach the
+        // canonical job route even when it is the only one given. The
+        // end-to-end oracle tests compare output; this pins the predicate
+        // itself, which is what decides the route.
+        for flag in [
+            "--check",
+            "--show-npages",
+            "--show-pages",
+            "--show-xref",
+            "--check-linearization",
+            "--show-linearization",
+            "--show-encryption",
+            "--list-attachments",
+            "--show-attachment=attachment.txt",
+        ] {
+            let args = cli_parse_from(vec![
+                OsString::from("flpdf"),
+                OsString::from(flag),
+                OsString::from("in.pdf"),
+            ]);
+            assert!(
+                top_level_inspection_combination_requested(&args, false, false),
+                "{flag} alone must route through the combined job lifecycle"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_invocation_does_not_request_the_combined_route() {
+        let args = cli_parse_from(vec![
+            OsString::from("flpdf"),
+            OsString::from("in.pdf"),
+            OsString::from("out.pdf"),
+        ]);
+        assert!(!top_level_inspection_combination_requested(
+            &args, false, false
+        ));
+    }
+
+    #[test]
     fn cli_parse_from_builds_on_a_small_stack() {
         let args = std::thread::Builder::new()
             .name("small-stack-cli-parse".to_owned())
