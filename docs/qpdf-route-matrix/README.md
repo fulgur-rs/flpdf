@@ -50,22 +50,22 @@ markdown だけを読むので `--no-qpdf`（CI の形）でも完全に動く�
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 137 | 0 | 23 | 0 | 160 |
+| 138 | 0 | 23 | 0 | 161 |
 
-### checker logical aggregate（259 rows）
+### checker logical aggregate（260 rows）
 
-`scripts/check-qpdf-route-matrix.py --check` は、A〜E の160行に加えて
-E の qtest exception 表（物理98行を論理99ケースとして数える）を含む259 logical
-rowsを検証する。2026-09-18 の現行 `origin/main` (`4942e7b3f7fbeb2a2d79e771c55f7dff3f4eca58`) を基準に、
-今回の変更を適用した tree での集計は次のとおり。
+`scripts/check-qpdf-route-matrix.py --check` は、A〜E の161行に加えて
+E の qtest exception 表（物理98行を論理99ケースとして数える）を含む260 logical
+rowsを検証する。2026-09-20（`flpdf-ycb6l`、`QPDF::isLinearized` のB35追加）を
+基準に、今回の変更を適用した tree での集計は次のとおり。
 
 <!-- route-matrix-aggregate: logical-total unit=logical -->
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 228 | 0 | 31 | 0 | 259 |
+| 229 | 0 | 31 | 0 | 260 |
 
-したがって、160行の領域別表と259 logical rowsの checker 分母は異なる。どちらも
+したがって、161行の領域別表と260 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
 
 2026-09-18（`flpdf-3yn9.48.148`）: 上の 2 表・§3 の再掲・§4 の領域別表・§6 の
@@ -141,7 +141,7 @@ C44は public facade と deferred blob の責務分離を追跡する mixed owne
 | ファイル | 行数 | canonical | bridge | mixed | unknown |
 |---|---|---|---|---|---|
 | [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 20 | 0 | 4 | 0 |
-| [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 28 | 0 | 6 | 0 |
+| [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 35 | 29 | 0 | 6 | 0 |
 | [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 42 | 0 | 0 | 0 |
 | [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 26 | 0 | 5 | 0 |
 | [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 21 | 0 | 8 | 0 |
