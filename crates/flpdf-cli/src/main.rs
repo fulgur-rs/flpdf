@@ -7468,6 +7468,10 @@ fn run_empty_page_extraction(
         linearize,
         linearize_pass1,
     )?);
+    // `check_configuration` runs inside `create_qpdf`, so the create-stage
+    // job needs the flag too -- the writer configuration above carries the
+    // encryption parameters it gates on.
+    job.set_allow_insecure(options.allow_insecure);
 
     let mut merged = match job.create_qpdf()? {
         Some(pdf) => pdf,
@@ -7614,6 +7618,10 @@ fn run_page_extraction_from_multiple_sources(
         linearize,
         linearize_pass1,
     )?);
+    // `check_configuration` runs inside `create_qpdf`, so the create-stage
+    // job needs the flag too -- the writer configuration above carries the
+    // encryption parameters it gates on.
+    job.set_allow_insecure(options.allow_insecure);
 
     let mut merged = match job.create_qpdf()? {
         Some(pdf) => pdf,
