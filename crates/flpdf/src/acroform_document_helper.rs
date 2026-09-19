@@ -223,11 +223,13 @@ pub(crate) struct AcroFormCache {
 /// `QPDFAcroFormDocumentHelper::transformAnnotations`
 /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:699-1014`).
 ///
-/// `old_fields` identifies source top-level fields that must be removed before
-/// the transformed copies are installed. `new_fields` contains the copied
-/// top-level fields that the caller adds to the destination AcroForm. The
-/// annotation vector is kept separate because qpdf installs it on the page
-/// independently of the field-tree update.
+/// `old_field_objgens` identifies source top-level fields that must be
+/// removed before the transformed copies are installed, matching qpdf's own
+/// out-parameter type (`std::set<QPDFObjGen>`,
+/// `include/qpdf/QPDFAcroFormDocumentHelper.hh:187-194`). `new_fields`
+/// contains the copied top-level fields that the caller adds to the
+/// destination AcroForm. The annotation vector is kept separate because qpdf
+/// installs it on the page independently of the field-tree update.
 #[derive(Debug, Default)]
 pub struct AnnotationTransformResult {
     /// Newly copied and transformed annotation handles to append to a page.
@@ -235,11 +237,6 @@ pub struct AnnotationTransformResult {
     /// Newly copied top-level field handles to register in the destination
     /// AcroForm field tree.
     pub new_fields: Vec<ObjectHandle>,
-    /// Source top-level field references to remove when replacing annotations
-    /// in the same document. This is the legacy projection; the page helper
-    /// uses the internal `old_field_objgens` set so raw qpdf identities remain
-    /// live.
-    pub old_fields: BTreeSet<ObjectRef>,
     /// Source top-level field identities in qpdf's raw `QPDFObjGen` domain.
     pub(crate) old_field_objgens: BTreeSet<QpdfObjGen>,
 }
@@ -942,9 +939,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 transformed
                     .old_field_objgens
                     .insert(qpdf_obj_gen_for_removal(&top_field));
-                if let Some(top_ref) = top_field.object_ref() {
-                    transformed.old_fields.insert(top_ref);
-                }
                 if copied_field_trees.insert(top_field.identity_key()) {
                     let copied_top = self.copy_field_tree(&top_field, &mut orig_to_copy)?;
                     if let Some(copied_ref) = copied_top.object_ref() {

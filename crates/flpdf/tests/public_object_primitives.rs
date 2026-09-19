@@ -82,7 +82,6 @@ fn acroform_transform_and_rename_boundaries_are_public() {
 
     assert!(transformed.new_annotations.is_empty());
     assert!(transformed.new_fields.is_empty());
-    assert!(transformed.old_fields.is_empty());
     helper
         .add_and_rename_form_fields(transformed.new_fields)
         .unwrap();
