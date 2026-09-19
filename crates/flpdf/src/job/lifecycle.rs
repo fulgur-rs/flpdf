@@ -5095,6 +5095,24 @@ impl QPDFJob {
 
         Ok(())
     }
+
+    /// Complete the shared warning/status boundary for a report-only
+    /// consumer that neither dispatches through [`Self::write_qpdf`] nor
+    /// [`Self::inspect_configured`]/[`Self::inspect`].
+    ///
+    /// qpdf's `writeQPDF` always ends every dispatch branch (`doInspection`,
+    /// `doSplitPages`, `writeOutfile`) with the same tail: the warning
+    /// summary, then the caller queries `getExitCode` once
+    /// (`libqpdf/QPDFJob.cc:483-511,535-564`). This is that tail —
+    /// [`Self::complete`] with `creates_output = false`, then
+    /// [`Self::get_exit_code`] — factored out so a caller that already
+    /// recorded the document's (or a prior job's) warnings through
+    /// [`Self::record_document_warnings`]/[`Self::record_warnings`] does not
+    /// assemble the same two calls itself.
+    pub fn complete_report(&self) -> Result<JobExitCode> {
+        self.complete(false)?;
+        Ok(self.get_exit_code())
+    }
 }
 
 /// Render a filesystem error at qpdf's `QPDFSystemError::createWhat` boundary.
@@ -6310,6 +6328,33 @@ mod tests {
             job.inspect_configured(&mut pdf)
                 .expect("configured inspection succeeds"),
             JobExitCode::Success
+        );
+    }
+
+    #[test]
+    fn complete_report_returns_success_with_no_recorded_warnings() {
+        let logger = QPDFLogger::create();
+        logger.set_warn(Some(PipelineHandle::new(crate::pipeline::Discard)));
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+
+        assert_eq!(
+            job.complete_report().expect("no warnings to report"),
+            JobExitCode::Success
+        );
+    }
+
+    #[test]
+    fn complete_report_returns_warning_after_record_warnings() {
+        let logger = QPDFLogger::create();
+        logger.set_warn(Some(PipelineHandle::new(crate::pipeline::Discard)));
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.record_warnings();
+
+        assert_eq!(
+            job.complete_report().expect("warning summary is reported"),
+            JobExitCode::Warning
         );
     }
 

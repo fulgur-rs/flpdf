@@ -9641,8 +9641,7 @@ fn finish_show_encryption<R: Read + Seek>(
 ) -> CliResult<()> {
     job.show_encryption(pdf, password_is_hex_key)?;
     job.record_document_warnings(pdf);
-    job.complete(false)?;
-    finish_job_exit_status(job.get_exit_code())
+    finish_job_exit_status(job.complete_report()?)
 }
 
 /// Lowercase hex encoding (qpdf `--show-encryption-key` format).
@@ -10084,8 +10083,7 @@ fn finish_warning_state(has_warnings: bool, no_warn: bool) -> CliResult<()> {
         job.record_warnings();
     }
 
-    job.complete(false)?;
-    finish_job_exit_status(job.get_exit_code())
+    finish_job_exit_status(job.complete_report()?)
 }
 
 fn emit_content_normalization_warnings(
