@@ -215,7 +215,6 @@ impl<R: Read + Seek> Pdf<R> {
         let loaded_state = match load_xref_state_from_source(
             resolver.as_ref(),
             XrefLoadOptions {
-                allow_repair: options.repair,
                 ignore_xref_streams: options.ignore_xref_streams,
                 description: options.description.clone(),
             },

@@ -89,6 +89,12 @@ pub(crate) trait CanonicalTrailerOwner {
     /// candidate-xref re-entry does re-enter recovery while the scan is
     /// running.
     fn set_reconstructed_xref(&self);
+    /// qpdf's `m->attempt_recovery` (`QPDF.hh:1461`), consulted at parse
+    /// entry (`QPDF.cc:463`) and during the resolve-time retry
+    /// (`QPDF.cc:1614-1637`) against the same `QPDF` instance. Xref loading
+    /// reads this from the owner instead of carrying its own copy through
+    /// `XrefLoadOptions`.
+    fn attempt_recovery(&self) -> bool;
     /// qpdf's live `m->file` source boundary (`QPDF.hh:67-97,1453-1457`).
     /// Xref loading uses these operations instead of a complete input
     /// snapshot.
@@ -167,6 +173,10 @@ impl<R: Read + Seek + 'static> CanonicalTrailerOwner for ResolverHandle<R> {
 
     fn set_reconstructed_xref(&self) {
         ResolverHandle::set_reconstructed_xref(self, true);
+    }
+
+    fn attempt_recovery(&self) -> bool {
+        ResolverHandle::attempt_recovery(self)
     }
 
     fn read_object_at_offset(
@@ -424,11 +434,14 @@ fn discard_trailer_references(
 
 /// The `QPDF::Members` settings the cross-reference loader consults, carried
 /// together the way qpdf keeps them on `m` rather than as parallel arguments.
+///
+/// `m->attempt_recovery` is not carried here: xref loading reads it from the
+/// `CanonicalTrailerOwner` (`attempt_recovery()`), matching qpdf's single
+/// `m->attempt_recovery` consulted from both `parse()` and the resolve-time
+/// retry against the same `QPDF` instance, rather than a copy threaded
+/// through this options struct.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct XrefLoadOptions {
-    /// qpdf `m->attempt_recovery`: run the reconstruction pass when the strict
-    /// parse fails.
-    pub(crate) allow_repair: bool,
     /// qpdf `m->ignore_xref_streams` (`QPDF::setIgnoreXRefStreams`): never read
     /// a cross-reference stream.
     pub(crate) ignore_xref_streams: bool,
@@ -782,12 +795,12 @@ fn read_live_xref_window(owner: &dyn CanonicalTrailerOwner, offset: u64) -> Resu
 /// parser context `QPDF::readTrailer` passes as `this`
 /// (`libqpdf/QPDF.cc:1317`; `libqpdf/QPDFParser.cc:34`).
 ///
-/// `attempt_recovery` and the resolver's warning `description` are both
-/// derived from `options` rather than taken as separate parameters, the same
+/// `attempt_recovery` is set once on the owner at construction, the same
 /// single source `Pdf::open_with_repair_mode_as` uses for `options.repair`
-/// and `options.description` (`crates/flpdf/src/engine.rs:196-217`) -- qpdf
-/// has one `m->attempt_recovery` bit, and this crate keeps only one input
-/// for it (B26).
+/// (`crates/flpdf/src/engine.rs:196-217`) -- qpdf has one
+/// `m->attempt_recovery` bit, and xref loading reads it back from the owner
+/// (`attempt_recovery()`, B26) rather than a copy carried through
+/// `XrefLoadOptions`.
 ///
 /// The owner is returned alongside the result, not inside `Ok`, because
 /// handles in `LoadedXrefState` borrow their identity from it, and because a
@@ -797,6 +810,7 @@ fn read_live_xref_window(owner: &dyn CanonicalTrailerOwner, offset: u64) -> Resu
 #[cfg(test)]
 pub(crate) fn load_xref_state_through_canonical_owner<R: Read + Seek + 'static>(
     reader: R,
+    allow_repair: bool,
     options: XrefLoadOptions,
     logger: crate::QPDFLogger,
     suppress_warnings: bool,
@@ -811,7 +825,7 @@ pub(crate) fn load_xref_state_through_canonical_owner<R: Read + Seek + 'static>(
         reader,
         0,
         BTreeMap::new(),
-        options.allow_repair,
+        allow_repair,
         false,
         Diagnostics::default(),
         warning_options,
@@ -863,7 +877,7 @@ pub(crate) fn load_xref_state_from_source(
     let tail = read_live_source_range(owner, tail_start, tail_length)?;
     let startxref = match parse_startxref(&tail) {
         Ok(offset) => offset,
-        Err(error) if options.allow_repair => {
+        Err(error) if owner.attempt_recovery() => {
             // The canonical recovery scanner reads the same live source in
             // chunks. Keep no complete input snapshot merely because qpdf's
             // `read_xref` handoff failed at `startxref`.
@@ -917,7 +931,7 @@ pub(crate) fn load_xref_state_from_source(
                 .windows(b"/Type /XRef".len())
                 .any(|bytes| bytes == b"/Type /XRef")
         });
-    if options.allow_repair && !starts_classic_xref && !looks_like_xref_stream {
+    if owner.attempt_recovery() && !starts_classic_xref && !looks_like_xref_stream {
         // qpdf's outer parse does not make a speculative live object read when
         // the startxref bytes are visibly neither a classic table nor an xref
         // stream. Enter the one recovery path directly so its diagnostics are
@@ -960,7 +974,7 @@ fn load_xref_state_from_window(
     mut parse_errors: Vec<Error>,
     canonical_trailer_owner: &dyn CanonicalTrailerOwner,
 ) -> Result<LoadedXrefState> {
-    let allow_repair = options.allow_repair;
+    let allow_repair = canonical_trailer_owner.attempt_recovery();
     let xref_pos = match startxref
         .checked_sub(source_base)
         .and_then(|offset| usize::try_from(offset).ok())
@@ -3991,10 +4005,8 @@ mod final_handle_tests {
     ) -> (Rc<ResolverHandle<R>>, Result<LoadedXref>) {
         let (owner, state) = load_xref_state_through_canonical_owner(
             reader,
-            XrefLoadOptions {
-                allow_repair,
-                ..XrefLoadOptions::default()
-            },
+            allow_repair,
+            XrefLoadOptions::default(),
             crate::QPDFLogger::create(),
             true,
             unique_id,
@@ -4024,6 +4036,7 @@ mod final_handle_tests {
             + b"stream".len();
         let (owner, result) = load_xref_state_through_canonical_owner(
             std::io::Cursor::new(bytes),
+            false,
             XrefLoadOptions {
                 description: b"stream-trailer.pdf".to_vec(),
                 ..XrefLoadOptions::default()
@@ -4053,14 +4066,8 @@ mod final_handle_tests {
     fn canonical_nonzero_startxref_recovery_rebuilds_a_direct_trailer() {
         let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n999\n%%EOF\n".to_vec();
         let resolver = canonical_test_resolver(bytes, BTreeMap::new(), true, 12);
-        let state = load_xref_state_from_source(
-            resolver.as_ref(),
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
-        )
-        .expect("canonical recovery should rebuild a nonzero malformed startxref");
+        let state = load_xref_state_from_source(resolver.as_ref(), XrefLoadOptions::default())
+            .expect("canonical recovery should rebuild a nonzero malformed startxref");
 
         assert!(resolver.reconstructed_xref());
         assert_eq!(state.loaded.trailer.object_ref(), None);
@@ -4080,7 +4087,6 @@ mod final_handle_tests {
         let _state = load_xref_state_from_source(
             resolver.as_ref(),
             XrefLoadOptions {
-                allow_repair: true,
                 description: b"canonical-offset-zero.pdf".to_vec(),
                 ..XrefLoadOptions::default()
             },
@@ -4145,6 +4151,7 @@ mod final_handle_tests {
                 bytes.extend_from_slice(format!("startxref\n{xref}\n%%EOF\n").as_bytes());
                 bytes
             }),
+            false,
             XrefLoadOptions::default(),
             crate::QPDFLogger::create(),
             true,
@@ -4225,10 +4232,8 @@ mod final_handle_tests {
 
         let (_owner, result) = load_xref_state_through_canonical_owner(
             std::io::Cursor::new(bytes),
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
+            true,
+            XrefLoadOptions::default(),
             crate::QPDFLogger::create(),
             true,
             41,
@@ -4279,6 +4284,7 @@ mod final_handle_tests {
 
             let (owner, result) = load_xref_state_through_canonical_owner(
                 std::io::Cursor::new(bytes),
+                false,
                 XrefLoadOptions::default(),
                 crate::QPDFLogger::create(),
                 true,
@@ -4306,6 +4312,7 @@ mod final_handle_tests {
 
         let (owner, result) = load_xref_state_through_canonical_owner(
             std::io::Cursor::new(bytes),
+            false,
             XrefLoadOptions::default(),
             crate::QPDFLogger::create(),
             true,
@@ -4391,6 +4398,7 @@ mod final_handle_tests {
 
         let (_owner, result) = load_xref_state_through_canonical_owner(
             std::io::Cursor::new(bytes),
+            false,
             XrefLoadOptions {
                 description: b"bad5.pdf".to_vec(),
                 ..XrefLoadOptions::default()
@@ -4483,6 +4491,7 @@ mod final_handle_tests {
                 bytes.extend_from_slice(format!("startxref\n{lenient_xref}\n%%EOF\n").as_bytes());
                 bytes
             }),
+            false,
             XrefLoadOptions::default(),
             crate::QPDFLogger::create(),
             true,
@@ -4954,10 +4963,8 @@ mod final_handle_tests {
         let bytes = classic_xref_with_indirect_previous_in_older_section();
         let (owner, result) = load_xref_state_through_canonical_owner(
             std::io::Cursor::new(bytes),
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
+            true,
+            XrefLoadOptions::default(),
             crate::QPDFLogger::create(),
             true,
             62,
@@ -5000,10 +5007,7 @@ mod final_handle_tests {
             0,
             "1.5",
             &mut loaded,
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
+            XrefLoadOptions::default(),
             &mut registration,
             None,
             resolver.as_ref(),
@@ -5049,10 +5053,7 @@ mod final_handle_tests {
             0,
             "1.5",
             &mut loaded,
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
+            XrefLoadOptions::default(),
             &mut registration,
             None,
             resolver.as_ref(),
@@ -5102,10 +5103,7 @@ mod final_handle_tests {
             0,
             "1.4",
             &mut loaded,
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
+            XrefLoadOptions::default(),
             &mut registration,
             None,
             resolver.as_ref(),
@@ -5139,10 +5137,7 @@ mod final_handle_tests {
             0,
             "1.4",
             &mut loaded,
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
+            XrefLoadOptions::default(),
             &mut registration,
             None,
             resolver.as_ref(),
@@ -5342,6 +5337,10 @@ mod final_handle_tests {
         fn set_header_offset(&self, _offset: usize) {}
 
         fn set_reconstructed_xref(&self) {} // cov:ignore: failure-injection owner never reaches a successful reconstruction
+
+        fn attempt_recovery(&self) -> bool {
+            false
+        }
 
         fn source_seek(&self, _offset: u64) -> Result<()> {
             Ok(())
@@ -5587,10 +5586,7 @@ mod final_handle_tests {
             xref_pos,
             xref_pos as u64,
             "1.4".to_owned(),
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
+            XrefLoadOptions::default(),
             &mut registration,
             resolver.as_ref(),
         )
@@ -5665,6 +5661,7 @@ mod final_handle_tests {
             let _ = owner.direct_handle(ObjectValue::Integer(1));
             owner.install_xref_entries(BTreeMap::new());
             owner.set_header_offset(0);
+            assert!(!owner.attempt_recovery());
             owner.source_seek(0).expect("synthetic source seek");
             assert_eq!(owner.source_tell().expect("synthetic source tell"), 0);
             assert_eq!(owner.source_length().expect("synthetic source length"), 0);
@@ -5839,14 +5836,8 @@ mod final_handle_tests {
     fn canonical_source_window_retries_a_failed_repair_window() {
         let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /XRef /W [0 0 0] /Size 1 /Length 1 >>\nstream\n\x00\nendstream\nendobj\nstartxref\n9\n%%EOF\n".to_vec();
         let resolver = canonical_test_resolver(bytes, BTreeMap::new(), true, 27);
-        let error = load_xref_state_from_source(
-            resolver.as_ref(),
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
-        )
-        .expect_err("a failed xref-stream repair must reach the live retry");
+        let error = load_xref_state_from_source(resolver.as_ref(), XrefLoadOptions::default())
+            .expect_err("a failed xref-stream repair must reach the live retry");
         assert!(error.to_string().contains("recovering damaged file"));
     }
 
@@ -5859,10 +5850,7 @@ mod final_handle_tests {
             "1.4".to_owned(),
             0,
             5,
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
+            XrefLoadOptions::default(),
             Diagnostics::default(),
             Vec::new(),
             repair_owner.as_ref(),
@@ -5891,6 +5879,7 @@ mod final_handle_tests {
 
         let (_owner, result) = load_xref_state_through_canonical_owner(
             std::io::Cursor::new(b"%PDF-1.4\n%%EOF\n".to_vec()),
+            false,
             XrefLoadOptions::default(),
             crate::QPDFLogger::create(),
             true,
@@ -5960,6 +5949,7 @@ mod final_handle_tests {
         let bytes = hybrid_xref_with_indirect_filter();
         let (owner, result) = load_xref_state_through_canonical_owner(
             std::io::Cursor::new(bytes),
+            false,
             XrefLoadOptions::default(),
             crate::QPDFLogger::create(),
             true,
@@ -6064,10 +6054,7 @@ mod final_handle_tests {
         recover_trailer_from_xref_stream_candidate(
             &bytes,
             "1.5",
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
+            XrefLoadOptions::default(),
             &mut entries,
             &mut parsed_xref_streams,
             &mut repair_diagnostics,
@@ -6098,10 +6085,7 @@ mod final_handle_tests {
         let recovered = recover_trailer_from_xref_stream_candidate(
             &bytes,
             "1.5",
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
+            XrefLoadOptions::default(),
             &mut entries,
             &mut parsed_xref_streams,
             &mut repair_diagnostics,
@@ -6190,10 +6174,8 @@ mod final_handle_tests {
 
         let (recovered_owner, recovered_result) = load_xref_state_through_canonical_owner(
             std::io::Cursor::new(bytes),
-            XrefLoadOptions {
-                allow_repair: true,
-                ..XrefLoadOptions::default()
-            },
+            true,
+            XrefLoadOptions::default(),
             crate::QPDFLogger::create(),
             true,
             46,
