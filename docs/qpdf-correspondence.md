@@ -1914,14 +1914,24 @@ option callbackをその場で呼ぶ（`libqpdf/QPDFArgParser.cc:433-555`）。
 （`libqpdf/QPDFJob.cc:428-480,513-520`）。
 
 flpdf は `arg_parser.rs` が保持する raw residual argv を
-`main.rs::qpdf_cli_events` として投影し、`run_job_json_files` が
-`JobJsonFile`、empty/input/output/replace-input、password/password-file、
-password interpretation、recovery、check-linearizationを同じ `QPDFJob` へ
-左から適用する。`QPDFJob::initialize_from_json_partial_bytes` も partial 呼出し
-の既存configurationを保持し、qpdfの共有Config責務を維持する
-（`crates/flpdf-cli/src/main.rs::qpdf_cli_events` / `run_job_json_files`、
-`crates/flpdf/src/job/lifecycle.rs::initialize_from_json_with_partial`）。
-新しいargv parser、JSON schema、qpdf非対応bridgeは追加していない。
+`main.rs::preflight_qpdf_cli_events` から
+`QPDFJob::initialize_from_raw_argv`（`crates/flpdf/src/job/argv.rs`、
+qpdfの`QPDFArgParser::parseArgs`本体の移植）へ直接渡し、`run_job_json_files`
+がそのjobをそのまま`run()`する。`JobJsonFile`、empty/input/output/
+replace-input、password/password-file、password interpretation、recovery、
+check-linearizationはすべて`initialize_from_raw_argv`内部の同じargv scanが
+左から適用し、`main.rs`側の個別event再構築は行わない
+（`crates/flpdf-cli/src/main.rs::preflight_qpdf_cli_events` / `run_job_json_files`、
+`crates/flpdf/src/job/argv.rs::initialize`）。新しいargv parser、JSON schema、
+qpdf非対応bridgeは追加していない。2026-09-19（`flpdf-3yn9.48.189`）で、旧来の
+手書きイベント列挙（`main.rs::qpdf_cli_events`/`JobJsonCliEvent`、curated 26
+optionのみ認識）をこの直接呼び出しへ置き換えた——`--repair`
+（qpdf非対応の唯一のtop-levelフラグ、`libqpdf/qpdf/auto_job_init.hh`の124
+option registryに存在しないことを確認済み）のみargvから除外し、
+`--password-file`は`--job-json-file`不在時のみ除外する（そのConfig
+callbackはargv scan中に即座にファイルを読む2つの副作用持ちcallbackの一つ、
+もう一つは`jobJsonFile`自身——discardされる検証passで実行すると、後段の
+clap駆動経路が同じファイルを再度読み、警告が二重出力される）。
 
 `crates/flpdf-cli/tests/cli_job_json.rs` の
 `job_json_file_password_follows_argv_order`、
@@ -2052,6 +2062,19 @@ permissionなど qpdfが意図している通常の strerror wordingはこの扱
 `cli_job_json.rs::job_json_file_directory_keeps_the_portable_flpdf_diagnostic`
 は Linuxで qpdfの artifactとflpdfの安定したportable診断をcharacterizeし、
 両者のstatus/stdoutと各内側メッセージを検証する。新しいparserやbridgeは追加しない。
+
+2026-09-19（`flpdf-3yn9.48.189`）: `crates/flpdf-cli/src/main.rs::preflight_qpdf_cli_events`
+が `QPDFJob::initialize_from_raw_argv`（`crates/flpdf/src/job/argv.rs`）へ
+直接委譲するようになったため、`--job-json-file` の open failureは
+`main.rs::qpdf_json_input_open_error` ではなく
+`crates/flpdf/src/job/argv.rs::job_json_file_open_error`を通る。同じ
+理由（qpdf 11.9.0 の `basic_string::_M_create` toolchain artifactは再現
+対象外）で同じ `IsADirectory` → `"Is a directory"` の `qpdf-deviation`
+markerをこちらにも複製した——1つの deviationに対応する実装が2箇所に
+分かれた状態で、片方だけ記録すると対応表が stale になるため
+（CLAUDE.md 分類 (C) の記録条件）。上記のtestはこの新しいcode pathも
+経由して検証する。
+
 ### job-json non-UTF-8 fatal path boundary (`flpdf-ktd5p`, 2026-09-16)
 
 qpdf の `QPDFJob::Config::jobJsonFile` は、argv から受け取った raw

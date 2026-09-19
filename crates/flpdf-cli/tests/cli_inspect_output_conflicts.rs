@@ -10,12 +10,19 @@ fn assert_rejects_output(flag_args: &[&str]) {
         "../../tests/fixtures/minimal.pdf",
         output.to_str().expect("UTF-8 temporary path"),
     ]);
+    // qpdf's checkConfiguration rejects an output file for these
+    // `require_outfile = false` options with a fixed message
+    // (`QPDFJob.cc:593-594`), confirmed against live qpdf 11.9.0 for every
+    // flag exercised below. This is not clap's generic "cannot be used
+    // with" conflict text.
     command
         .assert()
         .failure()
         .code(2)
         .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains("cannot be used with"));
+        .stderr(predicate::str::contains(
+            "no output file may be given for this option",
+        ));
     assert!(!output.exists(), "inspection must not create output");
 }
 

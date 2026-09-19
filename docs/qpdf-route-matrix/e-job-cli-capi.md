@@ -1345,6 +1345,55 @@ conversionを使う。split/threshold/show-objectの状態はprepared jobへ保�
 status/stdout/stderrを比較する。新しい parser、bridge、side-file cache、
 deviation markerは追加しない。
 
+### E-17 preflight canonical initializer cutover (`flpdf-3yn9.48.189`, 2026-09-19)
+
+`main.rs::preflight_qpdf_cli_events`（当時 `qpdf_cli_events` という26variant
+event enumの手書き再実装、上記2セクションが記録した curated subsetのみ認識）を、
+`QPDFJob::initialize_from_raw_argv`（`flpdf-3yn9.48.147`）への直接呼び出しへ
+置き換えた。qpdfの `initializeFromArgv → run → getExitCode`
+（`qpdf/qpdf.cc:27-43`）と同じ境界で、non-subcommand invocation全てに対し
+unconditionalに（clapより前の元の位置のまま）実行する。
+
+先行する2回の同種の置き換え試行（`flpdf-nx50y`）はいずれもgreenなtest suiteを
+regressionさせてrevertされ、その実証的証拠が本issueに記録されていた——
+本swapが実証したのは、その entanglement が **one-way**（2方向ではない）
+だったという点: 先行試行の Direction B（`--repair` filter + `--job-json-file`
+gatingの両方を同時に変更）が示した2つ目のregression
+（`standalone_inspection_reports_invalid_rotation_before_input_open`相当）は
+gating単体が原因であり、`--repair` filterとは独立していた。`--repair`
+filterのみを適用しgatingなしでunconditional呼び出しのままにしたところ、
+先行試行が壊した3つのtest fileすべてがgreenになった。
+
+flpdf-cli固有のargv調整は2つのみ: (1) `--repair`は
+`libqpdf/qpdf/auto_job_init.hh`の124option registryに存在しない唯一の
+top-level flag（`PasswordArgs`/`PageOpArgs`のflattened fieldを含め全field
+監査済み）としてargvから除外する。(2) `--password-file`は
+`--job-json-file`不在時のみ除外する——そのConfig callbackは
+`libqpdf/QPDFJob_config.cc`中でargv scan中に即座にファイルを読む唯一2つの
+callback（`passwordFile:661`、`jobJsonFile:774`）の一つで、discardされる
+検証passで実行すると後段のclap駆動経路が同じファイルを再度読み警告が
+二重出力される。message prefixは raw argv[0] ではなく `progname()` から
+設定し、`FLPDF_PROGNAME`（qtest harness shim、qpdf非対応）を引き続き
+尊重する。
+
+この swap 自体で E-17/E-21 の分類は変わらない（`mixed` のまま）——
+flpdf-cli の他の192箇所超の setter 呼び出しは未移行。ただし
+`crates/flpdf/src/job/argv.rs::apply_job_json_file` の open-error rendering
+（non-UTF-8 pathでlossy、Rustの `(os error N)` suffix付き、CLI側の
+既存修正済み `qpdf_json_input_open_error` と不一致）という新規bugを
+本番経路が初めて通ったことで発見・修正した。約12件のtestが clap の
+汎用 "cannot be used with" や不完全な usage-error blockを assertしていた
+（実際のqpdf 11.9.0は "no output file may be given for this option" や
+先頭空行+完全な "For help:" blockを返す）既存の逸脱で、これも修正した。
+残る argv.rs wording gap は Attachment table の unrecognized-token の 1 件で、
+このissueのスコープ外として `flpdf-3yn9.48.193` へ分離した。
+**2026-09-19 更新**: 当初ここに併記していた split-pages の overflow wording は
+本 PR で解消済み——`parse_job_split_pages` が `qpdf_string_to_int_checked` の
+メッセージを捨てて独自文字列に差し替えていたのを、30 行下の
+`parse_job_compression_level` と同形（`Overflow(message) => Err(Error::System(message))`）
+に揃え、i32/i64 両方の overflow を qpdf 実測文言で固定するテストを追加した。
+`cli_job_json.rs` の `split-pages-before-job-json` skip も撤去済み。
+
 ### E-12 follow-up: job-json directory read diagnostic (`flpdf-jhaqf`, 2026-09-16)
 
 qpdf の `Config::jobJsonFile` は `read_file_into_string` の例外を job-json
