@@ -255,19 +255,38 @@ fn wire_primary_trailer<RS: Read + Seek, RT: Read + Seek>(
 /// Preserve planner runs (`QPDFWriter.cc:1939-1967`). The placeholder stream
 /// carries only the source `/Extends` chain; the writer rebuilds its body from
 /// the copied member handles, as qpdf does (`QPDFWriter.cc:1621-1740`).
+///
+/// `source_object_stream_membership` is the source's own
+/// `QPDF::getObjectStreamData` snapshot (`crates/flpdf/src/reader.rs::
+/// Pdf::get_object_stream_data`), taken at the same pre-mutation instant as
+/// `source_xref_entries`; it drives which members belong to which container.
+/// `source_xref_entries` is consulted only for each member's stream `index`,
+/// a field `getObjectStreamData`'s own `std::map<int, int>` does not carry
+/// (`libqpdf/QPDF.cc:2381-2390`) and which the writer recomputes from its own
+/// object-stream-to-objects order rather than reading back
+/// (`QPDFWriter.cc:2163-2168`); reusing the source's original value here
+/// keeps the placeholder row's shape faithful to a real type-2 entry without
+/// fabricating one.
 fn install_primary_object_stream_membership<RS: Read + Seek, RT: Read + Seek>(
     source: &mut Pdf<RS>,
     target: &mut Pdf<RT>,
+    source_object_stream_membership: &BTreeMap<u32, u32>,
     source_xref_entries: &BTreeMap<ObjectRef, XrefEntry>,
     copied: &BTreeMap<ObjectRef, ObjectRef>,
 ) -> Result<()> {
     let mut target_containers = BTreeMap::new();
-    for (&source_member, entry) in source_xref_entries {
-        let XrefEntry::Compressed { stream, index } = *entry else {
-            continue;
-        };
+    for (&source_member_number, &stream) in source_object_stream_membership {
+        // A type-2 xref row is always registered at generation 0
+        // (`crates/flpdf/src/xref.rs`'s xref-stream parser maps object type
+        // `0 | 2` to generation 0), matching qpdf's own compressed-object
+        // invariant, so `source_xref_entries` always has an entry at this key.
+        let source_member = ObjectRef::new(source_member_number, 0);
         let Some(&target_member) = copied.get(&source_member) else {
             continue;
+        };
+        let Some(XrefEntry::Compressed { index, .. }) = source_xref_entries.get(&source_member)
+        else {
+            continue; // cov:ignore: source_object_stream_membership is derived from source_xref_entries, so this row is always Compressed
         };
         let target_container = ensure_object_stream_container(
             source,
@@ -276,7 +295,7 @@ fn install_primary_object_stream_membership<RS: Read + Seek, RT: Read + Seek>(
             &mut target_containers,
             copied,
         )?; // cov:ignore: malformed source ObjStm container errors propagate at this boundary
-        target.install_object_stream_member(target_member, target_container, index);
+        target.install_object_stream_member(target_member, target_container, *index);
     }
     Ok(())
 }
@@ -1235,6 +1254,18 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
         } else {
             BTreeMap::new()
         };
+        // Same snapshot instant as `primary_source_xref_entries`: qpdf's own
+        // `QPDF::getObjectStreamData` (`libqpdf/QPDF.cc:2381-2390`) member ->
+        // container mapping, taken before page mutation for the same reason.
+        // `install_primary_object_stream_membership` derives its member set
+        // from this canonical map instead of re-matching `XrefEntry::
+        // Compressed` rows itself.
+        let mut primary_object_stream_membership = BTreeMap::new();
+        if is_primary {
+            input
+                .source
+                .get_object_stream_data(&mut primary_object_stream_membership);
+        }
         let source_has_object_streams = primary_source_xref_entries
             .values()
             .any(|entry| matches!(entry, XrefEntry::Compressed { .. }));
@@ -1499,6 +1530,7 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
             install_primary_object_stream_membership(
                 input.source,
                 &mut target,
+                &primary_object_stream_membership,
                 &primary_source_xref_entries,
                 &map,
             )?; // cov:ignore: malformed source xref errors propagate at this boundary
@@ -1789,6 +1821,8 @@ mod tests {
         .expect("open ObjStm source");
         let mut target = Pdf::empty().expect("empty target");
         let source_xref_entries = source.source_xref_entries();
+        let mut source_object_stream_membership = BTreeMap::new();
+        source.get_object_stream_data(&mut source_object_stream_membership);
         let mut copied = BTreeMap::new();
         for source_member in [ObjectRef::new(2, 0), ObjectRef::new(3, 0)] {
             let copied_handle = target
@@ -1800,6 +1834,7 @@ mod tests {
         install_primary_object_stream_membership(
             &mut source,
             &mut target,
+            &source_object_stream_membership,
             &source_xref_entries,
             &copied,
         )
@@ -1855,6 +1890,45 @@ mod tests {
             production.matches("resolve_borrowed").count(),
             0,
             "page_merge production must use the canonical ObjectHandle resolver"
+        );
+    }
+
+    #[test]
+    fn install_primary_object_stream_membership_routes_through_get_object_stream_data() {
+        let production = include_str!("page_merge.rs")
+            .split_once("#[cfg(test)]")
+            .expect("page_merge test module marker")
+            .0;
+        let body = production
+            .split_once("fn install_primary_object_stream_membership")
+            .expect("install_primary_object_stream_membership signature")
+            .1
+            .split_once("\nfn ")
+            .expect("next production fn boundary")
+            .0;
+        // route matrix D9 (`docs/qpdf-route-matrix/d-writer.md`): the
+        // member -> container mapping must come from the same
+        // `get_object_stream_data` (`QPDF::getObjectStreamData`,
+        // `libqpdf/QPDF.cc:2381-2390`) call every other Preserve consumer
+        // uses, not a private re-match of `XrefEntry::Compressed` rows.
+        assert!(
+            body.contains("in source_object_stream_membership"),
+            "install_primary_object_stream_membership must iterate the \
+             canonical get_object_stream_data snapshot (route matrix D9) \
+             rather than reconstructing member -> container itself"
+        );
+        assert!(
+            !body.contains("for (&source_member, entry) in source_xref_entries"),
+            "install_primary_object_stream_membership must not re-match \
+             XrefEntry::Compressed rows off the raw xref table to find \
+             membership itself; that computation belongs to \
+             get_object_stream_data alone (route matrix D9)"
+        );
+        assert!(
+            production.contains("get_object_stream_data(&mut primary_object_stream_membership)"),
+            "the primary's get_object_stream_data snapshot feeding \
+             install_primary_object_stream_membership must actually be \
+             computed by calling get_object_stream_data (route matrix D9)"
         );
     }
 
