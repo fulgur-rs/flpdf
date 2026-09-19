@@ -393,13 +393,13 @@ pub(crate) fn run_test_25<R: Read + Seek + 'static>(
         let trailer = pdf.trailer();
         trailer.replace_key(b"/QTest", copied)?;
 
-        // qpdf's oldpdf.getRoot().getKey("/Pages") first obtains the live root
-        // handle and then asks for its Pages child. trailer_key_handle lifts
-        // only /Root (still possibly unresolved), and the resolving
-        // `try_get_key` below resolves that handle as its own first step
-        // before reading /Pages, reproducing qpdf's root dereference without
-        // a separate explicit-resolve call.
-        let oldpdf_root = oldpdf.trailer_key_handle(b"Root");
+        // qpdf's `oldpdf.getRoot().getKey("/Pages")` (test_driver.cc:967) goes
+        // through `QPDF::getRoot` (`QPDF.cc:2354-2368`), which raises
+        // `unable to find /Root dictionary` when the trailer's `/Root` is
+        // absent or not a dictionary. Lifting `/Root` off the trailer and
+        // relying on the dictionary accessor's own null/type-warning fallback
+        // would skip that gate, so this uses the ported one.
+        let oldpdf_root = oldpdf.root_handle()?;
         let pages = oldpdf_root.try_get_key(b"/Pages")?;
         let copied_pages = pdf.copy_foreign_object(&pages)?;
         assert!(copied_pages.is_null());
