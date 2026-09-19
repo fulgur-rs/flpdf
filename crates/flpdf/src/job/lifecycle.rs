@@ -25,7 +25,7 @@ use crate::linearization::{show_linearization_pdf_with_warnings, ShowLinearizati
 use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
 use crate::qutil::{qpdf_string_to_int_checked, QpdfIntParse};
 use crate::{
-    AcroFormDocumentHelper, Error, ObjectHandle, ObjectRef, ObjectStreamMode, PageDocumentHelper,
+    AcroFormDocumentHelper, Error, ObjectHandle, ObjectStreamMode, PageDocumentHelper,
     PageObjectHelper, Pdf, PdfOpenOptions, PdfVersion, PdfWriter, QPDFLogger, ReadSeek, Result,
     UsageError, WriterConfiguration,
 };
@@ -5814,7 +5814,7 @@ fn parse_object_stream_mode(value: &str) -> Result<ObjectStreamMode> {
 mod tests {
     use super::*;
     use crate::job::overlay::OverlayVerboseSource;
-    use crate::{Error, ObjectHandle, PageDocumentHelper, PageInput, PdfOpenOptions};
+    use crate::{Error, ObjectHandle, ObjectRef, PageDocumentHelper, PageInput, PdfOpenOptions};
     use std::io::Cursor;
 
     #[test]
