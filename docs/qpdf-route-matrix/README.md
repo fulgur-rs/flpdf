@@ -50,7 +50,7 @@ markdown だけを読むので `--no-qpdf`（CI の形）でも完全に動く�
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 131 | 0 | 29 | 0 | 160 |
+| 133 | 0 | 27 | 0 | 160 |
 
 ### checker logical aggregate（259 rows）
 
@@ -63,7 +63,7 @@ rowsを検証する。2026-09-18 の現行 `origin/main` (`4942e7b3f7fbeb2a2d79e
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 211 | 0 | 48 | 0 | 259 |
+| 213 | 0 | 46 | 0 | 259 |
 
 したがって、160行の領域別表と259 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
@@ -143,7 +143,7 @@ C44は public facade と deferred blob の責務分離を追跡する mixed owne
 | [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 20 | 0 | 4 | 0 |
 | [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 26 | 0 | 8 | 0 |
 | [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 42 | 0 | 0 | 0 |
-| [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 22 | 0 | 9 | 0 |
+| [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 24 | 0 | 7 | 0 |
 | [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 21 | 0 | 8 | 0 |
 
 ## 5. 責任境界と不変条件
@@ -201,7 +201,7 @@ C44は public facade と deferred blob の責務分離を追跡する mixed owne
 | **xref / trailer を書く実装は qpdf 全体で 1 組**（standard / pclm / linearized が同じ `writeXRefTable` / `writeXRefStream` / `writeTrailer` を共有する） | `libqpdf/QPDFWriter.cc:2343-2379` / `libqpdf/QPDFWriter.cc:2392-2495` / `libqpdf/QPDFWriter.cc:1160-1236` | D12 は canonical、D14 は mixed。D12のclassic rowは `crates/flpdf/src/writer/plain/xref.rs::write_xref_table` に、D13のxref-stream layout・payload policyは `crates/flpdf/src/writer/serialize.rs::xref_stream` にcanonical化し、plain / specialized / PCLm / linearized のconsumerが共有する。`getTrimmedTrailer` 相当（`crates/flpdf/src/writer.rs::build_writer_trailer_handle`）は既に1本 | trailer keyの順序・`/Size` の差し替え・`/ID` の扱いが経路ごとに変わる。tableとtrailerの残るroute分岐は後続consumer sliceで揃える |
 | **`prepareFileForWrite` は `write()` が linearized / standard に分岐する前に 1 度だけ走る** | `libqpdf/QPDFWriter.cc:2036-2056` / `libqpdf/QPDFWriter.cc:2187-2213` | D25 mixed。`crates/flpdf/src/writer.rs::prepare_file_for_write`（`:1628`）を `PdfWriter::write`（`:777`）の共通境界へ移し、`fixDanglingReferences` と `/Extensions` `/ADBE` の direct 化を一度だけ実行。ADBEの追加削除と既存のsnapshot/restore（`:2181`、`:2204`、`:3445`）は QDF/normalize を含む残る specialized consumerの後続責務として残る | graph preparation が route 共通になり、write後のlive Catalog identity/direct化が標準・linearizedで揃う。残る出力専用ADBE mutationは後続sliceでroot unparseへ移行する |
 | **linearize は pass1 → hint 1 回計算 → pass2 で、収束ループは無い**（pass 2 が pass 1 の padding に収まらなければ `std::logic_error` で失敗する設計） | `libqpdf/QPDFWriter.cc:2656-2904` / `libqpdf/QPDFWriter.cc:2864-2884` / `libqpdf/QPDFWriter.cc:2498-2507` | D20 canonical — `write_linearized_impl` に layout pass をまたぐループは無い。ただし収束ループ前提の stale コメントが `crates/flpdf/src/linearization/hint_shared.rs:1081` ほか 4 箇所に残る | D-U6はsourceで確認済み。`SharedObjectHintTable::from_plan` がmember/container mapから最終番号を算出し、writerはlocationを更新する。残るconvergenceコメントはstale docで、番号producer不在のbugではない |
-| **ObjStm 候補集合は trailer 起点の LIFO DFS の訪問順で決まる**（dict key は `rbegin()` の逆順 push、array は末尾から push。stream 自身 / `/Sig` / encryption dict は除外、`/Length` edge は辿らない） | `libqpdf/QPDF.cc:2393-2474` | D8 mixed — 入口が 2 つあり、`get_compressible_objgens`（薄い側）を linearized 経路だけが使う。D6 mixed — Preserve batch の導出が 3 実装（plain / legacy coordinator / linearized） | どの object が ObjStm に入るか、container 内の member 順、stale generation の除去が経路ごとに変わる。linearized Preserve は source-index 順を保持する独自導出、plain は compressible 集合との intersection と objgen sort。D31 は mixed と確定した（D-U1） |
+| **ObjStm 候補集合は trailer 起点の LIFO DFS の訪問順で決まる**（dict key は `rbegin()` の逆順 push、array は末尾から push。stream 自身 / `/Sig` / encryption dict は除外、`/Length` edge は辿らない） | `libqpdf/QPDF.cc:2393-2474` | D8 mixed — 入口が 2 つあり、`get_compressible_objgens`（薄い側）を linearized 経路だけが使う。D6/D31 canonical（**2026-09-19 訂正、D-U1解決**: 旧記載「Preserve batch の導出が 3 実装（plain / legacy coordinator / linearized）」は stale — `legacy coordinator` は現ソースに存在せず（D6 行参照）、linearized も plain と同じ D6 共有 planner を呼ぶ） | どの object が ObjStm に入るか、stale generation の除去が経路ごとに変わる。**2026-09-19 訂正**: container 内の member 順は qpdf 自身が standard/linearized で共有する ObjGen 昇順（`object_stream_to_objects`、`std::set<QPDFObjGen>`）で、「linearized Preserve が source-index 順を保持する独自導出」という旧記載は誤りだった（D-U1、解決済み）。plain は compressible 集合との intersection と同じ ObjGen sort |
 
 ### 5.E QPDFJob / CLI / C API
 
@@ -991,7 +991,7 @@ consumer全体のmixed分類は残るため、行分類の確定を全parity完�
 | C-U2 | 完了（2026-09-18、`flpdf-3yn9.48.154`） | C44 | `probe154/c44_probe.sh`（pinned qpdf 11.9.0 の `getStreamJSON` 直呼び）が provider 呼出回数 1/2/3、`pipeStreamData` の `nullptr` vs `&mut filtering_attempted` の同一出力、`/FlateDecode` の derived decode level（generalized=decode 済み + `/Filter` 除去 / none=raw + `/Filter` 維持）、blob の live-source 性、および**呼出側の handle が破棄された後の serialize**（case F: nested scope で `stream` を破棄してから `unparse`。`F.calls_after_scope=1` / `F.after_handle_drop` が `"data": "cmV0YWluZWQ="` を返し、Rust 側 `get_stream_json_blob_retains_the_stream_handle` と同一）を実測した。`crates/flpdf/tests/stream_json_get_tests.rs` の4テスト（呼出回数・live provider・handle 保持・flate level）が同観測を固定し、乖離なし。**2026-09-19（`.48.196`）**: 単一 entrypoint が単一 qpdf 責務に対応し `mixed` 定義に該当しないことを確認し、README §3 の履歴行例外から canonical へ再分類した（production route 重複や全体 parity の証拠には広げない）。canonical C24 `write_stream_json` を二重pipeへ変更しない。 |
 | C-U3 | 一部解消（2026-09-18、`flpdf-8od1h`） | C22/C39 | C22 の plain 側 `is_data_modified()` 早期 return は撤去し canonical 化した（token filter を登録した library RED/GREEN テストと qpdf-zlib-compat byte 比較で確認）。残る plain/QDF の出力 cache と linearized optimizer の事前 probe の callback timing 一致は非対称だけで bug とはしない、別軸の open question として継続する。 |
 | C-U4 | 完了 | C17/C18 | pinned qpdf headerをincludeしたC++ oracle probeと32固定vectorで、V/R・key長5/16/24/32・AES/RC4・非zero generationを確認し、単一primitiveへ統合した。 |
-| D-U1 | mixed確定・出力差を追加確認 | D6/D31 | source-index順のlinearized Preserveと共有membershipのobjgen順を比較する。既存strict Preserve byte testsを利用する。 |
+| D-U1 | **解決（2026-09-19、`flpdf-3yn9.48.201`）** | D6/D31 | 前提（linearized Preserveがsource-index順で消費する）が誤りだった。`QPDF::getObjectStreamData`はxref entryのindexを読まず、`doWriteSetup`が構築する`object_stream_to_objects`（ObjGen昇順の`std::set<QPDFObjGen>`）をstandard/linearized共通で消費する。`nonmonotonic-objstm-index-linearizable.pdf`でqpdf 11.9.0実機と比較し、乖離なしを確認した（`cmp_null_visibility_tests.rs::linearize_preserve_nonmonotonic_source_indices_match_qpdf_source_number_order`）。D6/D31ともcanonicalへ再分類した。 |
 | D-U2 | sourceで解決 | D26 | `initialize_special_streams` が qpdf の setup snapshot と page/content/normalized state の owner になった。normalized_streams の適用は `normalize_content` 条件内に限定し（`libqpdf/QPDFWriter.cc:1279`）、decode-only の page修復 trigger は維持する。linearized/他 route の state consumer は後続。 |
 | D-U3 | oracle契約確定 | D12 | 欠番/type≠1をError::Internalにするprimitive testとproducerの欠番到達調査を分ける。fake free rowの選択問題ではない。 |
 | D-U4 | scaffoldingとして判定済み | D19/D30 | canonical writerに委譲するbyte-neutral test helper。D19のback-patch前観測点を保持し、削除専用issueは不要。 |
