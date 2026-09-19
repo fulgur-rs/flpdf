@@ -3194,23 +3194,14 @@ fn build_writer_trailer_handle<R: Read + Seek>(
     generated_id: Option<&ObjectHandle>,
 ) -> Result<ObjectHandle> {
     let trailer = pdf.trailer().unsafe_shallow_copy()?;
-    for key in [b"/ID".as_slice(), b"/Encrypt", b"/Prev"] {
-        trailer.remove_key(key);
-    }
-    // qpdf's getTrimmedTrailer removes every key that may describe an input
-    // cross-reference stream, even when the input's active xref section is a
-    // classic table with a hybrid /XRefStm link
-    // (`libqpdf/QPDFWriter.cc:2009-2031`). These are writer-owned structural
-    // values, not source trailer metadata to preserve.
-    for key in [
-        b"/Type".as_slice(),
-        b"/W",
-        b"/Index",
-        b"/Length",
-        b"/Filter",
-        b"/DecodeParms",
-        b"/XRefStm",
-    ] {
+    // qpdf's getTrimmedTrailer removes encryption/modification metadata plus
+    // every key that may describe an input cross-reference stream, even when
+    // the input's active xref section is a classic table with a hybrid
+    // /XRefStm link (`libqpdf/QPDFWriter.cc:2009-2031`). These are
+    // writer-owned structural values, not source trailer metadata to
+    // preserve. `linearization::writer::canonical_linearization_trailer_entries`
+    // shares this same removal set for the linearized route.
+    for key in crate::writer::object::TRIMMED_TRAILER_KEYS {
         trailer.remove_key(key);
     }
     // qpdf's writeTrailer substitutes the computed size only for a literal
