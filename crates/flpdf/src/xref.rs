@@ -27,37 +27,14 @@
 //! `reconstruct_xref` chooses the effective occurrence
 //! (`libqpdf/QPDF.cc:450-469,516-531`).
 //!
-//! `LoadedXref::repair_diagnostics` holds diagnostics that Rust's function
-//! boundaries force this module to produce in separate pieces (one candidate
-//! parse, one recovery attempt) instead of qpdf's single push_back-only
-//! `m->warnings` (`libqpdf/QPDF.cc:487-494`). For that field this is a
-//! container substitute, not an algorithmic deviation:
-//! `merge_recovered_qpdf_state` (`:2160`) concatenates the recovered and
-//! accumulated pieces in `warn()` call order, and the `mem::take` handoffs at
-//! `:1052` and `:1141` carry a whole piece to the next stage without
-//! reordering it.
-//!
-//! Two related mechanisms do *not* support that classification, and are
-//! recorded here rather than claimed as evidence for it:
-//!
-//! - `XrefStreamFailure::diagnostics` never holds anything. Its only
-//!   constructor fills it with `Diagnostics::default()` (`:3315`), nothing
-//!   appends to it, and the two consumers iterate an always-empty set. It is
-//!   redundant state, not a warning-preserving buffer.
-//! - `prepend_repair_diagnostics` (`:2149`) is the one place that would
-//!   reorder pieces, and on the production route it never runs: its sole
-//!   caller (`:1041`) passes an `initial_diagnostics` that
-//!   `deliver_canonical_diagnostics` has already drained (`:840`), and every
-//!   other caller of `load_xref_state_from_window` passes a fresh default, so
-//!   the helper always takes its empty-input early return.
-//!
-//! Delivery is also not loss-free in one direction:
-//! `deliver_canonical_diagnostics` (`:184`) drains the whole buffer before it
-//! starts pushing, so if the owner's warning sink fails partway through a
-//! batch, the warnings after the failing one are gone. That path changes
-//! which warnings a caller sees, never the written bytes.
-//!
-//! No source-level deviation marker applies to these fields.
+//! Warnings produced while loading the cross-reference table are buffered in
+//! `LoadedXref::repair_diagnostics` and delivered in `warn()` call order,
+//! matching qpdf's single push_back-only `m->warnings`
+//! (`libqpdf/QPDF.cc:487-494`). The buffer exists because Rust's function
+//! boundaries make this module produce those warnings in separate pieces --
+//! one per candidate parse or recovery attempt -- where qpdf appends to one
+//! member as it goes. It is a container substitute that does not change the
+//! order warnings are reported in, or the bytes written.
 use crate::object_handle::ObjectValue;
 use crate::parser::{
     parse_qpdf_file_object_handle_with_diagnostics, HandleResolver, ParserDiagnostic,
