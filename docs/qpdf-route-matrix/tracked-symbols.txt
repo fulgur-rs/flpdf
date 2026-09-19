@@ -191,7 +191,7 @@ crates/flpdf/src/writer.rs::EncryptionContext                            # D16
 crates/flpdf/src/writer/object_streams/planning.rs::filter_objstm_batches_for_output       # D23 canonical
 crates/flpdf/src/writer/plain/body.rs::enqueue_objects_pclm              # D24
 crates/flpdf/src/writer/plain/body.rs::enqueue_objects_standard            # D24
-crates/flpdf/src/writer/plain/plan.rs::retain_reachable_object_stream_members              # D28
+crates/flpdf/src/writer/object_streams/eligibility.rs::compressible_objgens_qpdf_plan      # D28
 
 # ===========================================================================
 # E. QPDFJob / CLI / C API
