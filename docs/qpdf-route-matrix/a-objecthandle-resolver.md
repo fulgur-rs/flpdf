@@ -553,7 +553,11 @@ issue; commit `777bc21a8` ("keep production on canonical helper",
 boundary without a matching route contract or matrix note, which this slice
 adds. The production wrapper
 `get_form_xobject_for_page` (the sole non-`#[cfg(test)]` function in the
-module) makes no `ObjectHandle` accessor calls of its own: it constructs a
+module) makes no A6 non-resolving **type inspection** of its own（**2026-09-19 訂正**:
+「accessor calls を一切しない」は言い過ぎだった——`form.object_ref()` を
+`page_form_xobject.rs:90` で呼んでいる。ただしこれは helper が返した handle の
+identity 取得であって、A6 が対象とする `as_dictionary`/`as_array`/`as_integer`/
+`as_name`/`as_string`/`as_real`/`is_null` のような型検査ではない）: it constructs a
 `PageObjectHelper` and delegates the whole conversion to its
 `get_form_xobject_for_page` method
 (`libqpdf/QPDFPageObjectHelper.cc:706-732`, `getFormXObjectForPage`). The
