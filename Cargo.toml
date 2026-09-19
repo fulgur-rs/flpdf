@@ -25,6 +25,10 @@ rust-version = "1.89"
 
 [workspace.dependencies]
 thiserror = "2"
+# Test-only: the page-form-xobject route contract parses the module with a
+# real Rust parser instead of scanning text for `#[cfg(test)]` boundaries.
+syn = { version = "2", features = ["full", "parsing", "visit", "extra-traits"] }
+proc-macro2 = "1"
 flate2 = "1"
 zlib-rs = "0.6.7"
 clap = { version = "4", features = ["derive"] }

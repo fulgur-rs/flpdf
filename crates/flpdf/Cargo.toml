@@ -41,6 +41,8 @@ windows-sys = { workspace = true, features = ["Win32_System_SystemInformation", 
 
 [dev-dependencies]
 tempfile.workspace = true
+syn.workspace = true
+proc-macro2.workspace = true
 flate2.workspace = true
 serde_json.workspace = true
 
