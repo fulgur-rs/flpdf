@@ -347,6 +347,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "stacker",
+ "syn 2.0.117",
  "tempfile",
  "thiserror",
  "windows-sys",

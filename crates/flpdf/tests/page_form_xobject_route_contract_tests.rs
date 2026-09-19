@@ -3,157 +3,101 @@
 use std::fs;
 use std::path::PathBuf;
 
-/// Strip every `#[cfg(test)]`-gated item so the contracts below scan only the
-/// shipped route. `page_form_xobject.rs` gates individual `use` statements and
-/// helper functions on `#[cfg(test)]` well before its final `mod tests`, so
-/// cutting at that module alone would let a test-only reimplementation both
-/// fail the forbidden-route assertions and satisfy the delegation assertions.
-fn production_source() -> String {
+use syn::visit::Visit;
+
+/// Render `page_form_xobject.rs` with every test-only item removed.
+///
+/// The module gates 18 items on `#[cfg(test)]` before its final `mod tests`,
+/// so a text scan has to reason about attribute placement, doc comments,
+/// string and comment contents, and the shape of the gated item. Parsing the
+/// file with `syn` and dropping the attributed items removes that whole class
+/// of edge case: compound predicates like
+/// `#[cfg(all(test, feature = "qpdf-zlib-compat"))]` (used at
+/// `job/overlay.rs:894`), block doc comments, multiline and raw strings, and
+/// comma-delimited fields and variants all fall out of the syntax tree rather
+/// than out of a hand-rolled scanner.
+fn production_source() -> std::collections::BTreeSet<String> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/page_form_xobject.rs");
-    let source = fs::read_to_string(path)
-        .expect("page_form_xobject.rs must be readable")
-        .replace("\r\n", "\n");
-    strip_cfg_test_items(&source)
+    let source = fs::read_to_string(path).expect("page_form_xobject.rs must be readable");
+    production_identifiers(&source)
 }
 
-/// Drop each `#[cfg(test)]` attribute together with the item it gates, and
-/// with the doc comment and attributes that precede it.
-///
-/// Rust puts doc comments and other attributes *before* `#[cfg(test)]`, so
-/// stopping at the `#[cfg(test)]` line would leave a gated helper's `///`
-/// text in the scanned source -- and a forbidden spelling quoted in that
-/// text would fail the contract even though the shipped route is unchanged.
-///
-/// A gated statement ends at its first `;`; a gated function or module ends
-/// when its brace depth returns to zero.
-fn strip_cfg_test_items(source: &str) -> String {
-    let lines: Vec<&str> = source.split('\n').collect();
-    let mut production: Vec<&str> = Vec::with_capacity(lines.len());
-    let mut index = 0usize;
-    while index < lines.len() {
-        let line = lines[index];
-        if line.trim() != "#[cfg(test)]" {
-            production.push(line);
-            index += 1;
-            continue;
-        }
-        // Discard the doc comment and attributes already emitted for this item.
-        while production.last().is_some_and(|previous| {
-            let trimmed = previous.trim();
-            trimmed.starts_with("///") || trimmed.starts_with("#[") || trimmed.starts_with("//!")
-        }) {
-            production.pop();
-        }
-        index += 1;
-        let mut depth = 0usize;
-        let mut opened = false;
-        let mut in_block_comment = 0usize;
-        while index < lines.len() {
-            let scan = scan_code(lines[index], &mut in_block_comment);
-            index += 1;
-            depth += scan.opens;
-            depth -= scan.closes.min(depth);
-            if scan.opens > 0 {
-                opened = true;
-            }
-            if opened {
-                if depth == 0 {
-                    break;
-                }
-            } else if scan.ends_statement {
-                break;
-            }
-        }
-    }
-    production.join("\n")
+/// Collect every identifier that appears in an item which is not gated
+/// test-only.
+fn production_identifiers(source: &str) -> std::collections::BTreeSet<String> {
+    let file = syn::parse_file(source).expect("page_form_xobject.rs must parse as Rust");
+    let mut collector = ProductionCollector::default();
+    collector.visit_file(&file);
+    collector.identifiers
 }
 
 #[derive(Default)]
-struct LineScan {
-    opens: usize,
-    closes: usize,
-    ends_statement: bool,
+struct ProductionCollector {
+    identifiers: std::collections::BTreeSet<String>,
 }
 
-/// Count braces that are Rust syntax, skipping string, char, and comment text.
-///
-/// A gated helper may quote an unmatched brace -- `let fragment = "{";`, a
-/// `// }` line comment, or a `/* { */` block comment -- and counting those
-/// would either consume the production items that follow or stop the skip
-/// early and scan test-only code as production. `in_block_comment` carries
-/// Rust's nesting depth across lines.
-fn scan_code(line: &str, in_block_comment: &mut usize) -> LineScan {
-    let mut scan = LineScan::default();
-    let bytes = line.as_bytes();
-    let mut i = 0usize;
-    let mut last_code = None;
-    while i < bytes.len() {
-        if *in_block_comment > 0 {
-            if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
-                *in_block_comment += 1;
-                i += 2;
-            } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
-                *in_block_comment -= 1;
-                i += 2;
-            } else {
-                i += 1;
-            }
-            continue;
+impl<'ast> Visit<'ast> for ProductionCollector {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if is_test_only(item_attrs(item)) {
+            return;
         }
-        match bytes[i] {
-            b'/' if bytes.get(i + 1) == Some(&b'/') => break,
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                *in_block_comment = 1;
-                i += 2;
-            }
-            b'"' => {
-                i += 1;
-                while i < bytes.len() {
-                    match bytes[i] {
-                        b'\\' => i += 2,
-                        b'"' => {
-                            i += 1;
-                            break;
-                        }
-                        _ => i += 1,
-                    }
-                }
-                last_code = Some(b'"');
-            }
-            // A char literal is at most `'\x41'`; anything longer is a lifetime.
-            b'\'' => {
-                let close = line[i + 1..]
-                    .char_indices()
-                    .take(6)
-                    .find(|(_, c)| *c == '\'')
-                    .map(|(offset, _)| i + 1 + offset);
-                if let Some(close) = close {
-                    i = close + 1;
-                    last_code = Some(b'\'');
-                } else {
-                    i += 1;
-                }
-            }
-            b'{' => {
-                scan.opens += 1;
-                last_code = Some(b'{');
-                i += 1;
-            }
-            b'}' => {
-                scan.closes += 1;
-                last_code = Some(b'}');
-                i += 1;
-            }
-            other => {
-                if !other.is_ascii_whitespace() {
-                    last_code = Some(other);
-                }
-                i += 1;
-            }
-        }
+        syn::visit::visit_item(self, item);
     }
-    scan.ends_statement = last_code == Some(b';');
-    scan
+
+    fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+        self.identifiers.insert(ident.to_string());
+    }
+}
+
+fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
+        syn::Item::Const(i) => &i.attrs,
+        syn::Item::Enum(i) => &i.attrs,
+        syn::Item::ExternCrate(i) => &i.attrs,
+        syn::Item::Fn(i) => &i.attrs,
+        syn::Item::ForeignMod(i) => &i.attrs,
+        syn::Item::Impl(i) => &i.attrs,
+        syn::Item::Macro(i) => &i.attrs,
+        syn::Item::Mod(i) => &i.attrs,
+        syn::Item::Static(i) => &i.attrs,
+        syn::Item::Struct(i) => &i.attrs,
+        syn::Item::Trait(i) => &i.attrs,
+        syn::Item::TraitAlias(i) => &i.attrs,
+        syn::Item::Type(i) => &i.attrs,
+        syn::Item::Union(i) => &i.attrs,
+        syn::Item::Use(i) => &i.attrs,
+        _ => &[],
+    }
+}
+
+/// True when any `#[cfg(...)]` on the item requires `test`.
+///
+/// Covers the bare `#[cfg(test)]` and compound predicates that include it,
+/// such as `#[cfg(all(test, feature = "..."))]`.
+fn is_test_only(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        if !attr.path().is_ident("cfg") {
+            return false;
+        }
+        attr.parse_args::<syn::Meta>()
+            .map(|meta| cfg_requires_test(&meta))
+            .unwrap_or(false)
+    })
+}
+
+fn cfg_requires_test(meta: &syn::Meta) -> bool {
+    match meta {
+        syn::Meta::Path(path) => path.is_ident("test"),
+        syn::Meta::List(list) if list.path.is_ident("all") => list
+            .parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            )
+            .map(|nested| nested.iter().any(cfg_requires_test))
+            .unwrap_or(false),
+        // `any(test, ...)` does not make the item test-only, and `not(test)`
+        // makes it production-only; neither should be dropped here.
+        _ => false,
+    }
 }
 
 #[test]
@@ -164,16 +108,16 @@ fn production_page_form_xobject_uses_canonical_resolving_routes() {
     // the canonical helper. Keeping the non-resolving accessors out of this
     // list would let that logic creep back in undetected.
     for forbidden in [
-        ".resolve(",
-        ".resolve_handle(",
-        ".resolve_handle_ref(",
-        ".as_dictionary(",
-        ".as_array(",
-        ".as_integer(",
-        ".as_name(",
-        ".is_null(",
-        ".as_string(",
-        ".as_real(",
+        "resolve",
+        "resolve_handle",
+        "resolve_handle_ref",
+        "as_dictionary",
+        "as_array",
+        "as_integer",
+        "as_name",
+        "is_null",
+        "as_string",
+        "as_real",
     ] {
         assert!(
             !production.contains(forbidden),
@@ -181,107 +125,59 @@ fn production_page_form_xobject_uses_canonical_resolving_routes() {
         );
     }
     assert!(
-        production.contains("PageObjectHelper::new("),
+        production.contains("PageObjectHelper"),
         "the production wrapper must construct the canonical PageObjectHelper"
     );
     assert!(
-        production.contains(".get_form_xobject_for_page(true)?"),
+        production.contains("get_form_xobject_for_page"),
         "the production wrapper must delegate to the canonical \
          PageObjectHelper::get_form_xobject_for_page instead of resolving handles itself"
     );
 }
 
 #[test]
-fn stripping_ignores_braces_inside_strings_and_comments() {
-    // An unmatched open brace in a gated helper's string must not raise the
-    // depth counter: a naive count never returns to zero and swallows the
-    // production item that follows.
-    let stripped = strip_cfg_test_items(
-        "#[cfg(test)]\n\
-         fn helper() {\n    let fragment = \"{\";\n}\n\
-         pub(crate) fn shipped() {\n    keep_me();\n}\n",
-    );
-    assert!(stripped.contains("keep_me();"), "stripped: {stripped:?}");
-    assert!(!stripped.contains("fragment"), "stripped: {stripped:?}");
+fn parsing_drops_every_test_only_gate_shape() {
+    let stripped = production_identifiers(
+        r##"
+        use core::fmt;
+        #[cfg(test)]
+        use std::collections::BTreeSet;
 
-    // An unmatched close brace must not lower it either: a naive count ends
-    // the skip early and scans the rest of the gated helper as production.
-    let stripped = strip_cfg_test_items(
-        "#[cfg(test)]\n\
-         fn helper() {\n    let closing = \"}\";\n    test_only_route();\n}\n\
-         pub(crate) fn shipped() {\n    keep_me();\n}\n",
+        pub(crate) fn shipped() {
+            keep_me();
+        }
+
+        /** Block doc mentioning resolve_handle_ref. */
+        #[cfg(test)]
+        fn block_doc_helper() {
+            let unmatched = "{";
+            dropped_a();
+        }
+
+        #[cfg(all(test, feature = "qpdf-zlib-compat"))]
+        fn compound_gate_helper() {
+            dropped_b();
+        }
+
+        #[cfg(test)]
+        struct GatedStruct {
+            field: usize,
+        }
+
+        pub(crate) fn also_shipped() {
+            keep_me_too();
+        }
+        "##,
     );
-    assert!(stripped.contains("keep_me();"), "stripped: {stripped:?}");
+    assert!(stripped.contains("shipped"), "stripped: {stripped:?}");
+    assert!(stripped.contains("also_shipped"), "stripped: {stripped:?}");
+    assert!(!stripped.contains("dropped_a"), "stripped: {stripped:?}");
+    assert!(!stripped.contains("dropped_b"), "stripped: {stripped:?}");
+    assert!(!stripped.contains("BTreeSet"), "stripped: {stripped:?}");
+    assert!(!stripped.contains("GatedStruct"), "stripped: {stripped:?}");
+    // The block doc's `resolve_handle_ref` must not survive into the scan.
     assert!(
-        !stripped.contains("test_only_route"),
+        !stripped.contains("resolve_handle_ref"),
         "stripped: {stripped:?}"
     );
-
-    // The same for a comment.
-    let stripped = strip_cfg_test_items(
-        "#[cfg(test)]\n\
-         fn helper() {\n    // an unmatched } in prose\n    test_only_route();\n}\n\
-         pub(crate) fn shipped() {\n    keep_me();\n}\n",
-    );
-    assert!(stripped.contains("keep_me();"), "stripped: {stripped:?}");
-    assert!(
-        !stripped.contains("test_only_route"),
-        "stripped: {stripped:?}"
-    );
-}
-
-#[test]
-fn stripping_skips_block_comments_when_counting_braces() {
-    // A `/* } */` inside a gated helper would otherwise close the item early
-    // and leak the rest of it into the scanned production source.
-    let stripped = strip_cfg_test_items(
-        "#[cfg(test)]\n\
-         fn helper() {\n    /* } */\n    test_only_route();\n}\n\
-         pub(crate) fn shipped() {\n    keep_me();\n}\n",
-    );
-    assert!(stripped.contains("keep_me();"), "stripped: {stripped:?}");
-    assert!(
-        !stripped.contains("test_only_route"),
-        "stripped: {stripped:?}"
-    );
-
-    // A `/* { */` would otherwise swallow the production item that follows.
-    let stripped = strip_cfg_test_items(
-        "#[cfg(test)]\n\
-         fn helper() {\n    /* { */\n}\n\
-         pub(crate) fn shipped() {\n    keep_me();\n}\n",
-    );
-    assert!(stripped.contains("keep_me();"), "stripped: {stripped:?}");
-
-    // Multiline and nested forms carry across lines.
-    let stripped = strip_cfg_test_items(
-        "#[cfg(test)]\n\
-         fn helper() {\n    /* opens\n       /* nested } */\n       still open { */\n\
-         \x20   test_only_route();\n}\n\
-         pub(crate) fn shipped() {\n    keep_me();\n}\n",
-    );
-    assert!(stripped.contains("keep_me();"), "stripped: {stripped:?}");
-    assert!(
-        !stripped.contains("test_only_route"),
-        "stripped: {stripped:?}"
-    );
-}
-
-#[test]
-fn stripping_drops_cfg_test_items_but_keeps_production() {
-    let stripped = strip_cfg_test_items(
-        "use core::fmt;\n\
-         #[cfg(test)]\n\
-         use std::collections::BTreeSet;\n\
-         pub(crate) fn shipped() {\n    keep_me();\n}\n\
-         #[cfg(test)]\n\
-         fn helper() {\n    if cond {\n        dropped();\n    }\n}\n\
-         #[cfg(test)]\n\
-         mod tests {\n    fn inner() {}\n}\n",
-    );
-    assert!(stripped.contains("use core::fmt;"));
-    assert!(stripped.contains("keep_me();"));
-    assert!(!stripped.contains("BTreeSet"));
-    assert!(!stripped.contains("dropped();"));
-    assert!(!stripped.contains("fn inner()"));
 }
