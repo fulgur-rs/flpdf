@@ -1918,6 +1918,14 @@ impl QPDFJob {
         self.configuration.allow_weak_crypto = value;
     }
 
+    /// Set qpdf's `--allow-insecure` policy for the 256-bit empty-owner-password
+    /// refusal (`QPDFJob::EncConfig::allowInsecure`,
+    /// `libqpdf/QPDFJob_config.cc:1171-1174`; the check itself is
+    /// `QPDFJob.cc:601`).
+    pub fn set_allow_insecure(&mut self, value: bool) {
+        self.configuration.encryption_defaults.allow_insecure = value;
+    }
+
     /// Configure qpdf's linearization writer mode and optional pass-one file.
     pub fn set_linearization(&mut self, value: bool, pass1: Option<PathBuf>) {
         self.configuration.linearize = value;
@@ -2959,9 +2967,23 @@ impl QPDFJob {
         Ok(pdf)
     }
 
+    /// Discard the encryption snapshots a previous document left behind.
+    ///
+    /// qpdf holds nothing to go stale here: `handlePageSpecs` mutates the
+    /// primary `QPDF` in place (`libqpdf/QPDFJob.cc:2359-2362`), so a later
+    /// creation can never observe an earlier document's `/Encrypt` state.
+    /// These fields exist only because flpdf's merge builds a fresh target,
+    /// and `finish_created_document` clears them only after a successful
+    /// open -- so every creation entry point clears them on the way in.
+    fn reset_encryption_snapshots(&mut self) {
+        self.primary_copy_encryption = None;
+        self.encryption_status = EncryptionStatus::default();
+    }
+
     /// Create qpdf's canonical empty document through the same job document
     /// boundary as file and JSON input.
     pub fn create_empty_document(&mut self) -> Result<JobDocument> {
+        self.reset_encryption_snapshots();
         // qpdf's `Config::emptyInput` uses the empty string as the page-spec
         // source-map key while `QPDF::emptyPDF` names the diagnostic source
         // "empty PDF" (`libqpdf/QPDFJob_config.cc:27-38`;
@@ -3021,6 +3043,7 @@ impl QPDFJob {
     where
         S: Read + Seek + 'static,
     {
+        self.reset_encryption_snapshots();
         let input_name = input_name.as_ref().to_vec();
         self.set_input_name_bytes(&input_name);
         // See `create_empty_document`: qpdf applies `noWarn` to every
@@ -3250,6 +3273,7 @@ impl QPDFJob {
     /// error reporting for a missing or malformed input.
     pub fn create_qpdf(&mut self) -> Result<Option<JobDocument>> {
         self.create_qpdf_succeeded_without_document = false;
+        self.reset_encryption_snapshots();
         match self.check_configuration() {
             Ok(()) => {}
             Err(error @ Error::Usage(_)) => return Err(error),
@@ -3363,6 +3387,54 @@ impl QPDFJob {
                 Ok(None)
             }
         }
+    }
+
+    /// Return the primary document's encryption status captured by the last
+    /// `create_qpdf` (or `create_from_json_document`/`create_empty_document`).
+    ///
+    /// This is qpdf's own `QPDFJob::getEncryptionStatus`
+    /// (`include/qpdf/QPDFJob.hh:400-402`, `libqpdf/QPDFJob.cc:645-648`),
+    /// which returns a bitwise-OR of `qpdf_encryption_status_e` values set by
+    /// the `pdf.isEncrypted()` check inside `createQPDF`
+    /// (`libqpdf/QPDFJob.cc:449-453`). The pair returned here (`encrypted`,
+    /// `password_incorrect`) carries the same two bits as an idiomatic Rust
+    /// tuple instead of a C-style bitmask.
+    ///
+    /// A multi-source page-spec merge replaces `create_qpdf`'s returned
+    /// document with a fresh, unencrypted target
+    /// (`docs/qpdf-correspondence.md`, `flpdf-clq9`), so a caller that still
+    /// needs the primary's own encryption bits after `create_qpdf` returns
+    /// cannot read them back from that document; this snapshot, captured
+    /// before the merge, is the only remaining source.
+    #[must_use]
+    pub fn encryption_status(&self) -> (bool, bool) {
+        (
+            self.encryption_status.encrypted,
+            self.encryption_status.password_incorrect,
+        )
+    }
+
+    /// Take the copy-encryption donor snapshot captured when a multi-source
+    /// page-spec merge replaced the primary with a fresh target.
+    ///
+    /// qpdf's `handlePageSpecs` mutates the primary `QPDF` object in place
+    /// instead of building a fresh merged document
+    /// (`libqpdf/QPDFJob.cc:2359-2362`), so `writeQPDF` simply reads the
+    /// still-live primary's `/Encrypt` state directly and has no counterpart
+    /// accessor for this. flpdf's canonical multi-source merge necessarily
+    /// creates a fresh target instead (`docs/qpdf-correspondence.md`,
+    /// `flpdf-clq9`): [`Self::write_qpdf`] already consumes this snapshot
+    /// internally (via the same field) when it writes through *this* job. A
+    /// caller that completes the write on a *different* `QPDFJob` instance
+    /// must take the snapshot here first, before configuring that instance.
+    // qpdf-deviation: qpdf's `handlePageSpecs` mutates the primary `QPDF` in
+    // place (`libqpdf/QPDFJob.cc:2359-2362`), so `writeQPDF` reads the still-live
+    // primary's `/Encrypt` state and qpdf has no accessor to correspond to. This
+    // snapshot exists only because flpdf's canonical multi-source merge builds a
+    // fresh target (`flpdf-clq9`); it is CLAUDE.md deviation class (C), not (B),
+    // since there is no qpdf concept whose container is being substituted.
+    pub fn take_primary_copy_encryption(&mut self) -> Option<crate::CopyEncryptionSource> {
+        self.primary_copy_encryption.take()
     }
 
     /// Write a created document through the configured qpdf writer and

@@ -39,6 +39,39 @@ fn single_source_pages_use_the_qpdf_job_create_qpdf_route() {
     );
 }
 
+/// flpdf-3yn9.48.192 moved the multi-source `--pages` route from a direct
+/// `QPDFJob::handle_page_specs` call (which manually opened every source and
+/// built its own `PageSpecInput` vector) to `QPDFJob::create_qpdf`'s
+/// canonical page-spec lifecycle -- the same job/CLI boundary
+/// `run_empty_page_extraction` and the top-level `--pages` route already
+/// use, matching qpdf's own `createQPDF` -> `handlePageSpecs` call order.
+#[test]
+fn multi_source_pages_use_the_qpdf_job_create_qpdf_route() {
+    let source = include_str!("../../flpdf-cli/src/main.rs");
+    let start = source
+        .find("fn run_page_extraction_from_multiple_sources")
+        .expect("multi-source job route must have a named production function");
+    let rest = &source[start..];
+    // Bound the scan to this one function: stop at the next top-level `fn`
+    // (this function has no nested `fn`, so the first one after its own
+    // signature always belongs to the next item).
+    let end = rest[1..]
+        .find("\nfn ")
+        .map(|offset| offset + 1)
+        .unwrap_or(rest.len());
+    let body = &rest[..end];
+    assert!(
+        body.contains("create_qpdf()"),
+        "multi-source --pages must use QPDFJob::create_qpdf, the same job/CLI \
+         boundary run_empty_page_extraction and the top-level --pages route use"
+    );
+    assert!(
+        !body.contains(".handle_page_specs("),
+        "multi-source --pages must not call QPDFJob::handle_page_specs directly \
+         any more; create_qpdf's prepare_document owns that call internally"
+    );
+}
+
 #[test]
 fn in_place_page_specs_share_the_qpdf_completion_boundary() {
     let cli_source = include_str!("../../flpdf-cli/src/main.rs");
