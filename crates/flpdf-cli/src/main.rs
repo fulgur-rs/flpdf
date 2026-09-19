@@ -4123,10 +4123,26 @@ fn preflight_qpdf_cli_events(args: &[arg_parser::RawArg]) -> CliResult<QpdfCliPr
     let has_job_json = args
         .iter()
         .any(|argument| argument.as_bytes().starts_with(b"--job-json-file="));
+    // These two are CLI-only spellings with no qpdf main-table entry, so they
+    // must not reach `initialize_from_raw_argv`. Drop them only while scanning
+    // the main table: inside a named segment qpdf's sub-parser owns the token
+    // and rejects it as `unrecognized argument <token> (<table> options must
+    // be terminated with --)`, which a byte-only filter would silence.
+    let mut in_segment = false;
     let mut filtered: Vec<Vec<u8>> = args
         .iter()
         .filter(|argument| {
             let bytes = argument.as_bytes();
+            if in_segment {
+                if bytes == b"--" {
+                    in_segment = false;
+                }
+                return true;
+            }
+            if is_named_segment_option(bytes) {
+                in_segment = true;
+                return true;
+            }
             bytes != b"--repair" && (has_job_json || !bytes.starts_with(b"--password-file="))
         })
         .map(|argument| argument.as_bytes().to_vec())
