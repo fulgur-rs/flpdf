@@ -83,6 +83,8 @@ fn production_page_form_xobject_uses_canonical_resolving_routes() {
         ".as_integer(",
         ".as_name(",
         ".is_null(",
+        ".as_string(",
+        ".as_real(",
     ] {
         assert!(
             !production.contains(forbidden),
