@@ -48,23 +48,95 @@ fn strip_cfg_test_items(source: &str) -> String {
         let mut depth = 0usize;
         let mut opened = false;
         while index < lines.len() {
-            let gated = lines[index];
+            let scan = scan_code(lines[index]);
             index += 1;
-            depth += gated.matches('{').count();
-            depth -= gated.matches('}').count().min(depth);
-            if gated.contains('{') {
+            depth += scan.opens;
+            depth -= scan.closes.min(depth);
+            if scan.opens > 0 {
                 opened = true;
             }
             if opened {
                 if depth == 0 {
                     break;
                 }
-            } else if gated.trim_end().ends_with(';') {
+            } else if scan.ends_statement {
                 break;
             }
         }
     }
     production.join("\n")
+}
+
+#[derive(Default)]
+struct LineScan {
+    opens: usize,
+    closes: usize,
+    ends_statement: bool,
+}
+
+/// Count braces that are Rust syntax, skipping string, char, and comment text.
+///
+/// A gated helper may quote an unmatched brace -- `let fragment = "{";`, or a
+/// comment mentioning `}` -- and counting those would either consume the
+/// production items that follow or stop the skip early and scan test-only
+/// code as production.
+fn scan_code(line: &str) -> LineScan {
+    let mut scan = LineScan::default();
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    let mut last_code = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => break,
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                last_code = Some(b'"');
+                continue;
+            }
+            // A char literal is at most `'\x41'`; anything longer is a lifetime.
+            b'\'' => {
+                let close = line[i + 1..]
+                    .char_indices()
+                    .take(6)
+                    .find(|(_, c)| *c == '\'')
+                    .map(|(offset, _)| i + 1 + offset);
+                if let Some(close) = close {
+                    i = close + 1;
+                    last_code = Some(b'\'');
+                    continue;
+                }
+                i += 1;
+            }
+            b'{' => {
+                scan.opens += 1;
+                last_code = Some(b'{');
+                i += 1;
+            }
+            b'}' => {
+                scan.closes += 1;
+                last_code = Some(b'}');
+                i += 1;
+            }
+            other => {
+                if !other.is_ascii_whitespace() {
+                    last_code = Some(other);
+                }
+                i += 1;
+            }
+        }
+    }
+    scan.ends_statement = last_code == Some(b';');
+    scan
 }
 
 #[test]
@@ -99,6 +171,45 @@ fn production_page_form_xobject_uses_canonical_resolving_routes() {
         production.contains(".get_form_xobject_for_page(true)?"),
         "the production wrapper must delegate to the canonical \
          PageObjectHelper::get_form_xobject_for_page instead of resolving handles itself"
+    );
+}
+
+#[test]
+fn stripping_ignores_braces_inside_strings_and_comments() {
+    // An unmatched open brace in a gated helper's string must not raise the
+    // depth counter: a naive count never returns to zero and swallows the
+    // production item that follows.
+    let stripped = strip_cfg_test_items(
+        "#[cfg(test)]\n\
+         fn helper() {\n    let fragment = \"{\";\n}\n\
+         pub(crate) fn shipped() {\n    keep_me();\n}\n",
+    );
+    assert!(stripped.contains("keep_me();"), "stripped: {stripped:?}");
+    assert!(!stripped.contains("fragment"), "stripped: {stripped:?}");
+
+    // An unmatched close brace must not lower it either: a naive count ends
+    // the skip early and scans the rest of the gated helper as production.
+    let stripped = strip_cfg_test_items(
+        "#[cfg(test)]\n\
+         fn helper() {\n    let closing = \"}\";\n    test_only_route();\n}\n\
+         pub(crate) fn shipped() {\n    keep_me();\n}\n",
+    );
+    assert!(stripped.contains("keep_me();"), "stripped: {stripped:?}");
+    assert!(
+        !stripped.contains("test_only_route"),
+        "stripped: {stripped:?}"
+    );
+
+    // The same for a comment.
+    let stripped = strip_cfg_test_items(
+        "#[cfg(test)]\n\
+         fn helper() {\n    // an unmatched } in prose\n    test_only_route();\n}\n\
+         pub(crate) fn shipped() {\n    keep_me();\n}\n",
+    );
+    assert!(stripped.contains("keep_me();"), "stripped: {stripped:?}");
+    assert!(
+        !stripped.contains("test_only_route"),
+        "stripped: {stripped:?}"
     );
 }
 
