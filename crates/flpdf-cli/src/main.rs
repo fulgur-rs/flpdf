@@ -3331,100 +3331,6 @@ fn main() {
             top_level_inspection_transform_options,
             args.verbose,
         )
-    } else if args.show_npages {
-        run_show_npages(
-            args.input,
-            args.repair,
-            &args.password,
-            args.no_warn,
-            args.page_ops.empty,
-            top_level_inspection_transform_options,
-            args.verbose,
-        )
-    } else if args.show_pages {
-        run_show_pages(
-            args.input,
-            args.repair,
-            &args.password,
-            args.with_images,
-            args.no_warn,
-            args.page_ops.empty,
-            top_level_inspection_transform_options,
-            args.verbose,
-        )
-    } else if args.show_xref {
-        run_show_xref(
-            args.input,
-            args.repair,
-            &args.password,
-            args.no_warn,
-            args.page_ops.empty,
-            top_level_inspection_transform_options,
-            args.verbose,
-        )
-    } else if args.check_linearization {
-        run_check_linearization(
-            args.input,
-            args.repair,
-            &args.password,
-            args.no_warn,
-            args.page_ops.empty,
-            top_level_inspection_transform_options,
-            args.verbose,
-        )
-    } else if args.show_linearization {
-        run_show_linearization(
-            args.input,
-            args.repair,
-            &args.password,
-            args.no_warn,
-            args.page_ops.empty,
-            top_level_inspection_transform_options,
-            args.verbose,
-        )
-    } else if args.show_encryption {
-        run_show_encryption(
-            args.input,
-            args.repair,
-            &args.password,
-            args.no_warn,
-            args.show_encryption_key,
-            args.page_ops.empty,
-            top_level_inspection_transform_options,
-            args.verbose,
-        )
-    } else if args.check {
-        run_check(
-            args.input,
-            args.repair,
-            &args.password,
-            args.no_warn,
-            args.show_encryption_key,
-            args.page_ops.empty,
-            top_level_inspection_transform_options,
-            args.verbose,
-        )
-    } else if args.list_attachments {
-        run_list_attachments(
-            args.input,
-            args.repair,
-            &args.password,
-            args.verbose,
-            args.no_warn,
-            args.page_ops.empty,
-            top_level_inspection_transform_options,
-        )
-    } else if let Some(key) = args.show_attachment {
-        run_show_attachment(
-            args.input,
-            args.repair,
-            &args.password,
-            &key,
-            args.verbose,
-            args.no_warn,
-            args.page_ops.empty,
-            top_level_inspection_transform_options,
-        )
     } else if attachment_mutation_requested {
         let options = top_level_writer_options(
             &args,
@@ -3827,33 +3733,41 @@ fn top_level_inspection_combination_requested(
     .filter(|selected| *selected)
     .count();
 
-    if overlay_requested && inspection_count > 0 {
-        return true;
-    }
-    if inspection_count > 1
-        || (inspection_count == 1 && !args.page_ops.pages.is_empty())
-        || (inspection_count == 1 && (args.remove_restrictions || args.coalesce_contents))
-        || (inspection_count == 1 && attachment_mutation_requested)
-    {
+    // qpdf's `doInspection` (`libqpdf/QPDFJob.cc:1645-1693`) always runs
+    // every selected inspection branch through the same
+    // `initializeFromArgv`/`run()`/`getExitCode` dispatch, independent of how
+    // many branches are selected -- there is no separate qpdf code path for
+    // "exactly one inspection flag". Route every one of these nine flags
+    // through the combined job lifecycle unconditionally, matching that
+    // structure. `--show-object` is excluded: its sole-flag CLI selector
+    // accepts a raw (number, generation) pair beyond generation 65535 and
+    // resolves it through `Pdf::get_object_handle_by_raw_identity` (bypassing
+    // the ordinary xref-backed lookup, since qpdf's own parser nulls
+    // references at that generation), while the shared
+    // `JobObjectSelector`/`configuration.show_object` path this function
+    // would otherwise route through has no such bypass yet
+    // (`crates/flpdf/src/job/lifecycle.rs::parse_job_object_selector` clamps
+    // the generation to `u16`). Tracked by `flpdf-t3as9`.
+    let migrated_flag_selected = args.check
+        || args.show_npages
+        || args.show_pages
+        || args.show_xref
+        || args.check_linearization
+        || args.show_linearization
+        || args.show_encryption
+        || args.list_attachments
+        || args.show_attachment.is_some();
+    if migrated_flag_selected {
         return true;
     }
 
-    // These qpdf settings are accepted together with --check-linearization.
-    // The writer-only settings have no effect when doInspection is selected,
-    // while remove-restrictions/coalesce-contents are applied by the
-    // create-stage transformation boundary below.
-    args.check_linearization
-        && (args.linearize
-            || args.static_id
-            || args.deterministic_id
-            || args.static_aes_iv
-            || args.preserve_unreferenced
-            || args.decrypt
-            || args.qdf
-            || args.coalesce_contents
-            || args.remove_restrictions
-            || !args.page_ops.rotate.is_empty()
-            || !args.page_ops.collate.is_empty())
+    if overlay_requested && inspection_count > 0 {
+        return true;
+    }
+    inspection_count > 1
+        || (inspection_count == 1 && !args.page_ops.pages.is_empty())
+        || (inspection_count == 1 && (args.remove_restrictions || args.coalesce_contents))
+        || (inspection_count == 1 && attachment_mutation_requested)
 }
 
 fn configure_top_level_inspection_job(job: &mut QPDFJob, args: &Cli) -> CliResult<()> {
@@ -5415,6 +5329,11 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
     }
 }
 
+/// `flpdf check FILE`: the flpdf-native subcommand. This has no qpdf argv
+/// counterpart -- qpdf has no subcommand grammar -- so it is not part of the
+/// top-level `--check` inspection dispatch and keeps its own standalone
+/// document-open/run sequence rather than routing through
+/// [`run_combined_top_level_inspection`].
 #[allow(clippy::too_many_arguments)]
 fn run_check(
     input: Option<PathBuf>,
@@ -5457,6 +5376,8 @@ fn run_check(
     finish_job_exit_status(job.run()?)
 }
 
+/// `flpdf check-linearization FILE`: the flpdf-native subcommand
+/// counterpart of `run_check` above -- same qpdf-grammar-free scope.
 fn run_check_linearization(
     input: Option<PathBuf>,
     repair: bool,
@@ -9205,6 +9126,9 @@ fn run_show_object(
     )?)
 }
 
+/// `flpdf pages FILE --show-npages`: the flpdf-native subcommand form. No
+/// qpdf argv counterpart (qpdf has no subcommand grammar), so it keeps its
+/// own standalone document-open/report sequence.
 fn run_show_npages(
     input: Option<PathBuf>,
     repair: bool,
@@ -9228,6 +9152,8 @@ fn run_show_npages(
     finish_job_exit_status(job.show_npages(&mut pdf)?)
 }
 
+/// `flpdf pages FILE` (default, without `--show-npages`): the flpdf-native
+/// subcommand form -- same qpdf-grammar-free scope as `run_show_npages`.
 #[allow(clippy::too_many_arguments)]
 fn run_show_pages(
     input: Option<PathBuf>,
@@ -9253,59 +9179,6 @@ fn run_show_pages(
     job.set_with_images(with_images);
     apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
     finish_job_exit_status(job.show_pages(&mut pdf)?)
-}
-
-fn run_show_xref(
-    input: Option<PathBuf>,
-    repair: bool,
-    password: &PasswordArgs,
-    suppress_warnings: bool,
-    empty: bool,
-    transform_options: InspectionTransformOptions<'_>,
-    verbose: bool,
-) -> CliResult<()> {
-    if empty {
-        reject_empty_inspection_output(input.as_deref())?;
-        let mut job = new_cli_job(suppress_warnings);
-        let mut pdf = create_empty_primary_document(&mut job, None)?;
-        apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-        return finish_job_exit_status(job.show_xref(&mut pdf)?);
-    }
-    let input = input.ok_or_else(missing_input_usage_error)?;
-    let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
-    let mut job = new_cli_job(suppress_warnings);
-    apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-    finish_job_exit_status(job.show_xref(&mut pdf)?)
-}
-
-fn run_show_linearization(
-    input: Option<PathBuf>,
-    repair: bool,
-    password: &PasswordArgs,
-    no_warn: bool,
-    empty: bool,
-    transform_options: InspectionTransformOptions<'_>,
-    verbose: bool,
-) -> CliResult<()> {
-    if empty {
-        reject_empty_inspection_output(input.as_deref())?;
-        let mut job = new_cli_job(no_warn);
-        let mut pdf = create_empty_primary_document(&mut job, None)?;
-        apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-        return finish_job_exit_status(job.show_linearization(&mut pdf)?);
-    }
-    let input = input.ok_or_else(missing_input_usage_error)?;
-    let file = File::open(&input).map_err(|error| open_error_with_file(&input, error.into()))?;
-    let mut job = new_cli_job(no_warn);
-    let mut options = pdf_open_options(repair, password)?;
-    options.suppress_warnings = no_warn;
-    let mut pdf =
-        match job.open_with_description(BufReader::new(file), path_description(&input), options) {
-            Ok(pdf) => pdf,
-            Err(error) => return Err(error_with_file(&input, actionable_password_error(error))),
-        };
-    apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-    finish_job_exit_status(job.show_linearization(&mut pdf)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -9492,11 +9365,9 @@ fn run_show_encryption_key(
     }
 }
 
-/// `show-encryption FILE [--password ...]`: qpdf `--show-encryption`.
-///
-/// The report is the qpdf `QPDFJob::showEncryption` format. Weak-crypto
-/// (RC4 / R=5) files are inspectable with the correct password and no
-/// `--allow-weak-crypto`, matching qpdf's read-only treatment.
+/// `flpdf show-encryption FILE`: the flpdf-native subcommand form. No qpdf
+/// argv counterpart, so it keeps its own standalone document-open/report
+/// sequence rather than routing through [`run_combined_top_level_inspection`].
 ///
 /// Opens through its own job (rather than the shared
 /// [`open_pdf_for_inspection`] helper) so `--no-warn` reaches
@@ -10508,83 +10379,6 @@ fn run_all_attachment_mutations(
     )
 }
 
-/// `--list-attachments [--verbose] input`
-fn run_list_attachments(
-    input: Option<PathBuf>,
-    repair: bool,
-    password: &PasswordArgs,
-    verbose: bool,
-    suppress_warnings: bool,
-    empty: bool,
-    transform_options: InspectionTransformOptions<'_>,
-) -> CliResult<()> {
-    if empty {
-        reject_empty_inspection_output(input.as_deref())?;
-        let mut job = new_cli_job(suppress_warnings);
-        let mut pdf = create_empty_primary_document(&mut job, None)?;
-        apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-        let status = job.list_attachments(&mut pdf, verbose)?;
-        return finish_job_exit_status(status);
-    }
-    let input = input.ok_or_else(missing_input_usage_error)?;
-    let mut job = new_cli_job(suppress_warnings);
-    let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
-    job.set_input_name_bytes(path_description(&input));
-    apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-    let status = job.list_attachments(&mut pdf, verbose)?;
-    finish_job_exit_status(status)
-}
-
-/// Reserve standard output for the attachment payload.
-///
-/// Mirrors the `!m->attachment_to_show.empty()` arm of qpdf's
-/// `checkConfiguration` (`libqpdf/QPDFJob.cc:621-625`), which runs before the
-/// document is opened.
-fn reserve_show_attachment_output() -> CliResult<()> {
-    cli_logger().save_to_standard_output(true)?;
-    Ok(())
-}
-
-/// `--show-attachment KEY [-o PATH] input`
-#[allow(clippy::too_many_arguments)]
-fn run_show_attachment(
-    input: Option<PathBuf>,
-    repair: bool,
-    password: &PasswordArgs,
-    key: &OsStr,
-    verbose: bool,
-    suppress_warnings: bool,
-    empty: bool,
-    transform_options: InspectionTransformOptions<'_>,
-) -> CliResult<()> {
-    // qpdf latches standard output for `--show-attachment` in
-    // `checkConfiguration` (`QPDFJob.cc:621-625`), before it opens the document
-    // and long before `handleTransformations`. The latch has a second effect:
-    // `setSave` moves the info stream to standard error when it takes over
-    // standard output (`QPDFLogger.cc:197-200`), so the verbose image
-    // diagnostics land on stderr instead of colliding with the attachment
-    // payload. Reserving it here rather than inside the attachment writer keeps
-    // both effects in qpdf's order.
-    reserve_show_attachment_output()?;
-    if empty {
-        reject_empty_inspection_output(input.as_deref())?;
-        let mut job = new_cli_job(suppress_warnings);
-        let mut pdf = create_empty_primary_document(&mut job, None)?;
-        apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-        let key = arg_parser::os_bytes(key);
-        let status = job.show_attachment(&mut pdf, &key)?;
-        return finish_job_exit_status(status);
-    }
-    let input = input.ok_or_else(missing_input_usage_error)?;
-    let mut job = new_cli_job(suppress_warnings);
-    let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
-    job.set_input_name_bytes(path_description(&input));
-    apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-    let key = arg_parser::os_bytes(key);
-    let status = job.show_attachment(&mut pdf, &key)?;
-    finish_job_exit_status(status)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11359,6 +11153,48 @@ mod tests {
             .expect("Cli::command must not overflow a small stack");
 
         assert_eq!(command.get_name(), "flpdf");
+    }
+
+    #[test]
+    fn every_migrated_inspection_flag_requests_the_combined_route_on_its_own() {
+        // qpdf uses one `run()` call sequence for every flag combination
+        // (`qpdf/qpdf.cc:26-44`), so each of these flags must reach the
+        // canonical job route even when it is the only one given. The
+        // end-to-end oracle tests compare output; this pins the predicate
+        // itself, which is what decides the route.
+        for flag in [
+            "--check",
+            "--show-npages",
+            "--show-pages",
+            "--show-xref",
+            "--check-linearization",
+            "--show-linearization",
+            "--show-encryption",
+            "--list-attachments",
+            "--show-attachment=attachment.txt",
+        ] {
+            let args = cli_parse_from(vec![
+                OsString::from("flpdf"),
+                OsString::from(flag),
+                OsString::from("in.pdf"),
+            ]);
+            assert!(
+                top_level_inspection_combination_requested(&args, false, false),
+                "{flag} alone must route through the combined job lifecycle"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_invocation_does_not_request_the_combined_route() {
+        let args = cli_parse_from(vec![
+            OsString::from("flpdf"),
+            OsString::from("in.pdf"),
+            OsString::from("out.pdf"),
+        ]);
+        assert!(!top_level_inspection_combination_requested(
+            &args, false, false
+        ));
     }
 
     #[test]
