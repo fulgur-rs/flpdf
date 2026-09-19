@@ -724,10 +724,15 @@ fn page_box_or_err<R: Read + Seek>(
     };
     // Resolving accessor (matches the sibling `try_is_null()` calls inside
     // `get_crop_box`/`get_bleed_box`/`get_trim_box` in page_object_helper.rs
-    // for the same `get_attribute` return value): an indirect `/MediaBox` or
-    // `/TrimBox` reference is not guaranteed pre-resolved at this call site,
-    // and the non-resolving `is_null()` would answer `false` for such a
-    // handle even when it resolves to null (`ObjectHandle::is_null` doc).
+    // for the same `get_attribute` return value): the non-resolving
+    // `is_null()` would answer `false` for an unresolved indirect handle
+    // even when it resolves to null (`ObjectHandle::is_null` doc). Both
+    // `false, false` call sites above already force resolution before
+    // returning here -- `get_attribute`'s `result.try_is_null()?` is always
+    // evaluated regardless of outcome, and `apply_fallback` short-circuits
+    // to `Ok(fallback)` unchanged when `copy_if_fallback` is false -- so
+    // this has no observable effect today; it keeps the accessor contract
+    // consistent so a future caller with different arguments stays correct.
     if value.try_is_null()? {
         return Err(Error::Unsupported(format!(
             "destination page {page_ref} has no usable placement box"
