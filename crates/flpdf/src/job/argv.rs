@@ -901,8 +901,19 @@ impl<'a> Parser<'a> {
         let path = path_from_bytes(value);
         let prefix_bytes = self.job.message_prefix_bytes.clone();
         let result = (|| {
-            let bytes = std::fs::read(&path)
-                .map_err(|error| Error::file_io("open", path.clone(), error))?;
+            // qpdf reads a `--job-json-file`/`jobJsonFile` path through
+            // `QUtil::safe_fopen` (`QPDFJob_config.cc:776`,
+            // `libqpdf/QUtil.cc:490-519`), which reports a missing or
+            // unreadable file with portable `strerror` wording, not Rust's
+            // `io::Error` text. Keep the raw path bytes for the actual read
+            // (preserving non-UTF-8 paths) but normalize the error text.
+            let bytes = std::fs::read(&path).map_err(|error| {
+                Error::System(format!(
+                    "open {}: {}",
+                    path.display(),
+                    crate::qutil::strerror_text(&error)
+                ))
+            })?;
             self.job.initialize_from_json_partial_bytes(&bytes)
         })();
         // The public JSON entry point uses a C-wrapper-compatible
