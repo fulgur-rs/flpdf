@@ -50,7 +50,7 @@ markdown だけを読むので `--no-qpdf`（CI の形）でも完全に動く�
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 131 | 0 | 29 | 0 | 160 |
+| 132 | 0 | 28 | 0 | 160 |
 
 ### checker logical aggregate（259 rows）
 
@@ -63,7 +63,7 @@ rowsを検証する。2026-09-18 の現行 `origin/main` (`4942e7b3f7fbeb2a2d79e
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 211 | 0 | 48 | 0 | 259 |
+| 212 | 0 | 47 | 0 | 259 |
 
 したがって、160行の領域別表と259 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
@@ -141,7 +141,7 @@ C44は public facade と deferred blob の責務分離を追跡する mixed owne
 | ファイル | 行数 | canonical | bridge | mixed | unknown |
 |---|---|---|---|---|---|
 | [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 20 | 0 | 4 | 0 |
-| [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 26 | 0 | 8 | 0 |
+| [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 27 | 0 | 7 | 0 |
 | [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 42 | 0 | 0 | 0 |
 | [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 22 | 0 | 9 | 0 |
 | [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 21 | 0 | 8 | 0 |
@@ -173,7 +173,7 @@ C44は public facade と deferred blob の責務分離を追跡する mixed owne
 | **resolve 境界で例外は必ず warning に降格し、未解決なら null になる**（`QPDF::resolve` から例外は出ない） | `libqpdf/QPDF.cc:1737-1742` / `libqpdf/QPDF.cc:1745-1749` | A4 canonical。B22 mixed — resolve 側の再構築経路は `flpdf-3yn9.48.19` で qpdf の retry 条件（`getType() == 1` 限定、それ以外は `not found in file after regenerating cross reference table` をwarn して null、`libqpdf/QPDF.cc:1618-1633`）に揃えた。ただし本番経路では再構築後に compressed entry が残らない（`install_source_xref_entries` がテーブルを丸ごと置換し `recover_xref_entries` は `Uncompressed` しか挿入しない）ため、compressed 側は qpdf 同様に防御的な分岐で、end-to-end 実証はP3 の probe として継続中（`libqpdf/QPDF.cc:1618-1633`） | qpdf が warn + null で続行する入力で flpdf が `Err` を返し、その object 以降の処理が止まる。probe B-P3 |
 | **回復予算は `bool` 1 個**（2 回目の `reconstruct_xref` は引数の例外をそのまま re-throw する。残り回数カウンタは存在しない） | `libqpdf/QPDF.cc:518-522` / `include/qpdf/QPDF.hh:1480` | B25 mixed（open 時は `already_reconstructed` を経由して `ResolverCore` に転記）。B34 bridge — qpdf に対応物のない 64 回の read-to-end fallback 予算（`crates/flpdf/src/pdf.rs:148-154`） | 破損 PDF で回復の起きる回数が変わり、reconstruct の 3 連 warn（B33）が余分に出る／出ない |
 | **reconstruct が xref から消すのは type 1 entry のみ。ObjStm の内部は意図的に走査しない** | `libqpdf/QPDF.cc:532-541` / `libqpdf/QPDF.cc:618-622` | B24 canonical（**両側 absent が 1:1 対応**）。B23 canonical で scan 本体は 2 経路が共有 | 回復後に compressed entry を復元すると、qpdf が到達しない object を出力に含める。コミット `6ddb9661` で 1 度是正済みの退行そのもの |
-| **xref entry の上書き規則は 3 primitive で違う**（`insertXrefEntry` = first-seen wins、`insertFreeXrefEntry` = 未登録時のみ、`insertReconstructedXrefEntry` = 後勝ち + `deleted_objects` 抑止） | `libqpdf/QPDF.cc:1149-1184` / `libqpdf/QPDF.cc:1187-1192` / `libqpdf/QPDF.cc:1197-1210` | B19 canonical。B20 mixed — `deleted_objects` 抑止は 2026-09-18（`flpdf-3yn9.48.157`）に `recover_xref_from_linear_scan` の行スキャン直後（`crates/flpdf/src/xref.rs:2004`）へ移し、5 つの reconstruction handoff すべてに適用した。mixed が残るのは qpdf の 1 関数が guard / 後勝ち / 抑止の 3 箇所に分かれている点 | 増分更新 PDF でどの世代の object が読まれるかが変わる。`/XRefStm` が free 行の直後で壊れる入力で `qpdf --show-xref` と食い違っていた（probe B-P2 で実測・解消） |
+| **xref entry の上書き規則は 3 primitive で違う**（`insertXrefEntry` = first-seen wins、`insertFreeXrefEntry` = 未登録時のみ、`insertReconstructedXrefEntry` = 後勝ち + `deleted_objects` 抑止） | `libqpdf/QPDF.cc:1149-1184` / `libqpdf/QPDF.cc:1187-1192` / `libqpdf/QPDF.cc:1197-1210` | B19 canonical。B20 canonical（2026-09-19、`flpdf-3yn9.48.176`） — guard / 後勝ち / 抑止を `crates/flpdf/src/xref.rs::insert_reconstructed_xref_entry` 1 関数へ統合し、resolve 側 `recover_xref_entries` と open 側 `recover_xref_entries_from_source` の両方がこれを呼ぶ構成にした（B20 行参照） | 増分更新 PDF でどの世代の object が読まれるかが変わる。`/XRefStm` が free 行の直後で壊れる入力で `qpdf --show-xref` と食い違っていた（probe B-P2 で実測・解消） |
 | **`QPDF::readToken` は `allow_bad = true` を保証するが、全token consumerがこの責務ではない** | `libqpdf/QPDF.cc:1535-1539,1801-1814,846-946` | B7 canonical（`.48.175`）。5経路（classic xref subsection lookahead / `startxref` 値読み / trailerの`stream` lookahead / ObjStm header integers / reconstruct_xrefの行scan / `endstream`・`endobj` framing check）が `Tokenizer::read_qpdf_token` の1entrypointを共有する | `read_qpdf_token` が `allow_bad = true` を固定するので、falseを一律trueへ変える経路は無い。classic xrefのreadLine/parse_xrefEntry責務はByteCursorのまま維持される（B-P7） |
 | **`QPDFParser` は context があれば warn、無ければ同じ診断を例外に昇格する** | `libqpdf/QPDFParser.cc:487-498`（`libqpdf/QPDFParser.cc:496` が throw）/ `libqpdf/QPDFParser.cc:161-165` | B3 canonical（`has_context` 分岐 1 本）。B32 mixed — qpdf の 2 軸（例外クラス × `qpdf_error_code_e`）を `crates/flpdf/src/error.rs::Error` の 1 軸に畳んでいる | document なしの parse で構文エラーが黙って null になる。`Error::Parse` だけが reconstruct の trigger（`crates/flpdf/src/reader/resolver.rs:1615`）なので、振り分けを誤ると回復分岐自体が起きなくなる |
 
@@ -674,8 +674,10 @@ A11 を A10 の後に置いた理由で、当時の facade `Pdf::next_available_
    `Pdf::get_warnings` / `any_warnings` / `num_warnings` と Job completion の bounded cutover は実装済み。loggerへ表示済みのwarningをdrain時に再出力しない。残る `repair_diagnostics` snapshot/bookmark consumer は後続で caller-zero を確認する。
 3. **B8〜B13 / B34** — canonical file-object/header/stream/trailer責務へbootstrap consumerを移す。
    B10のEOL warning、B11のrecovery、B13のreadTrailer、B34のfallback撤去をbounded sliceに分ける。
-4. **B22 / B25 / B20** — canonical reconstructと3種のxref登録primitiveへconsumerを順次移行する。
-   B20のdeleted_objects抑止は2026-09-18（`flpdf-3yn9.48.157`）に全reconstruct handoffへ適用済みで、残るのはguard/後勝ち/抑止を1つのprimitiveへ束ねる作業。
+4. **B22 / B25** — canonical reconstructと3種のxref登録primitiveへconsumerを順次移行する。
+   B20（guard/後勝ち/抑止を1つのprimitiveへ束ねる作業）は2026-09-19（`flpdf-3yn9.48.176`）に完了しcanonicalへ移った。
+   残るB22/B25はopen時/resolve時で`Pdf`/`ResolverHandle`構築タイミングが異なるdocument-lifecycle由来の分裂で、
+   B20と同じ関数統合では解消しない。
 5. **B27 / B28 / B30 / B32 / B33** — bootstrap handoff・warning配送・例外分類を同じownerへ寄せる。
    warning順序とresolve境界のwarn/null降格を各sliceで検証する。
 6. **B14** — 自己参照Prevの既存probeでは二重warningは再現しない。visited初期化の変更を先に決めず、
