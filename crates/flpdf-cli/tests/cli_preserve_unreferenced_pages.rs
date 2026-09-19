@@ -7,7 +7,6 @@
 //! those objects as well.
 
 use assert_cmd::Command;
-use predicates::prelude::*;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command as ShellCommand;
