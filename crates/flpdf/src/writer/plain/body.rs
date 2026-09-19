@@ -2849,12 +2849,6 @@ fn planned_member_body_violation(
     if object.as_stream_dict().is_some() {
         return Ok(Some("stream body"));
     }
-    if object.try_is_dictionary_of_type(b"XRef", b"")? {
-        return Ok(Some("/Type /XRef dictionary"));
-    }
-    if object.try_is_dictionary_of_type(b"ObjStm", b"")? {
-        return Ok(Some("/Type /ObjStm dictionary"));
-    }
     if context.encryption_ref == Some(source) {
         return Ok(Some("encryption dictionary"));
     }
@@ -3068,6 +3062,10 @@ mod final_handle_tests {
             )?, // cov:ignore: the checked violation result is asserted by this test.
             Some("stream body")
         );
+        // qpdf's getCompressibleObjGens does not special-case a non-stream
+        // dictionary carrying /Type /ObjStm or /Type /XRef (QPDF.cc:2437-2443);
+        // such a dictionary is an ordinary compressible object, so it must not
+        // be flagged as a violation here either.
         assert_eq!(
             super::planned_member_body_violation(
                 ObjectRef::new(1, 0),
@@ -3077,8 +3075,8 @@ mod final_handle_tests {
                     ObjectHandle::name(b"XRef".to_vec()),
                 )]),
                 &context,
-            )?, // cov:ignore: the checked violation result is asserted by this test.
-            Some("/Type /XRef dictionary")
+            )?, // cov:ignore: the checked non-violation result is asserted by this test.
+            None
         );
         assert_eq!(
             super::planned_member_body_violation(
@@ -3089,8 +3087,8 @@ mod final_handle_tests {
                     ObjectHandle::name(b"ObjStm".to_vec()),
                 )]),
                 &context,
-            )?, // cov:ignore: the checked violation result is asserted by this test.
-            Some("/Type /ObjStm dictionary")
+            )?, // cov:ignore: the checked non-violation result is asserted by this test.
+            None
         );
         assert_eq!(
             super::planned_member_body_violation(

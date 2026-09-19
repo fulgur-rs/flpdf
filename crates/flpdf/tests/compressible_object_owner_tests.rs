@@ -430,3 +430,49 @@ fn preserve_planner_keeps_members_when_reachable_source_container_is_removed() {
         "the planner-driven Preserve path must retain all source members"
     );
 }
+
+// qpdf's getCompressibleObjGens (QPDF.cc:2437-2443) excludes an object only
+// when it is a stream (obj.isStream()) or a signed value dictionary; it does
+// not special-case a non-stream dictionary that merely carries /Type /ObjStm
+// or /Type /XRef. The fixture below was produced by handcrafting a minimal
+// PDF whose Catalog directly references such a dictionary, then running it
+// through `qpdf --object-streams=generate` (which folds it into the source
+// ObjStm as member index 3, confirming qpdf itself treats it as an ordinary
+// compressible object).
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn preserve_embeds_a_non_stream_dictionary_carrying_objstm_or_xref_type_like_qpdf() {
+    use std::process::Command;
+
+    let source =
+        include_bytes!("../../../tests/fixtures/compat/objstm-member-nested-objstm-type-dict.pdf");
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input.pdf");
+    let expected = temp.path().join("qpdf.pdf");
+    std::fs::write(&input, source).unwrap();
+    let status = Command::new("qpdf")
+        .args([
+            "--object-streams=preserve",
+            "--deterministic-id",
+            "--static-id",
+        ])
+        .arg(&input)
+        .arg(&expected)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let mut pdf = Pdf::open(Cursor::new(source.to_vec())).unwrap();
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Preserve);
+    writer.set_deterministic_id(true);
+    writer.set_static_id(true);
+    writer.set_output_memory().unwrap();
+    writer.write().unwrap();
+
+    assert_eq!(
+        writer.get_buffer().unwrap(),
+        std::fs::read(expected).unwrap(),
+        "a non-stream /Type /ObjStm dictionary must stay embedded, matching qpdf"
+    );
+}
