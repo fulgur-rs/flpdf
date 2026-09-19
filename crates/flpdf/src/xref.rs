@@ -26,6 +26,15 @@
 //! cannot enter the canonical cache as a speculative xref read before
 //! `reconstruct_xref` chooses the effective occurrence
 //! (`libqpdf/QPDF.cc:450-469,516-531`).
+//!
+//! Warnings produced while loading the cross-reference table are buffered in
+//! `LoadedXref::repair_diagnostics` and delivered in `warn()` call order,
+//! matching qpdf's single push_back-only `m->warnings`
+//! (`libqpdf/QPDF.cc:487-494`). The buffer exists because Rust's function
+//! boundaries make this module produce those warnings in separate pieces --
+//! one per candidate parse or recovery attempt -- where qpdf appends to one
+//! member as it goes. It is a container substitute that does not change the
+//! order warnings are reported in, or the bytes written.
 use crate::object_handle::ObjectValue;
 use crate::parser::{
     parse_qpdf_file_object_handle_with_diagnostics, HandleResolver, ParserDiagnostic,
@@ -174,8 +183,18 @@ fn deliver_canonical_diagnostics(
     diagnostics: &mut Diagnostics,
 ) -> Result<()> {
     let batch = diagnostics.drain();
-    for warning in batch.entries() {
-        owner.push_warning(warning.clone())?;
+    for (delivered, warning) in batch.entries().iter().enumerate() {
+        if let Err(error) = owner.push_warning(warning.clone()) {
+            // qpdf appends to `m->warnings` one `warn()` call at a time, so a
+            // sink that gives out partway through a batch leaves the warnings
+            // it has not reached yet still pending. Draining the batch before
+            // delivering any of it would discard that tail instead, which is a
+            // difference in behavior rather than in container.
+            for undelivered in &batch.entries()[delivered + 1..] {
+                diagnostics.push(undelivered.clone());
+            }
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -5295,6 +5314,9 @@ mod final_handle_tests {
     struct FailingCanonicalOwner {
         transport_error: bool,
         diagnostics: RefCell<Diagnostics>,
+        /// `None` accepts every warning. `Some(n)` accepts `n` and then fails,
+        /// so a sink that gives out partway through a batch can be observed.
+        accept_warnings: Option<usize>,
     }
 
     impl CanonicalTrailerOwner for FailingCanonicalOwner {
@@ -5364,6 +5386,12 @@ mod final_handle_tests {
         }
 
         fn push_warning(&self, warning: QpdfExc) -> Result<()> {
+            if self
+                .accept_warnings
+                .is_some_and(|limit| self.diagnostics.borrow().len() >= limit)
+            {
+                return Err(Error::parse(0, "synthetic warning sink failure"));
+            }
             self.diagnostics.borrow_mut().push(warning);
             Ok(())
         }
@@ -5373,11 +5401,49 @@ mod final_handle_tests {
         }
     }
 
+    /// qpdf appends to `m->warnings` one `warn()` call at a time, so a sink
+    /// that gives out partway through a batch leaves the warnings it has not
+    /// reached yet still pending. Draining the batch before delivering any of
+    /// it would discard that tail instead.
+    #[test]
+    fn a_failing_warning_sink_leaves_the_undelivered_tail_pending() {
+        let owner = FailingCanonicalOwner {
+            transport_error: false,
+            diagnostics: RefCell::new(Diagnostics::default()),
+            accept_warnings: Some(1),
+        };
+        let mut diagnostics = Diagnostics::default();
+        for message in [
+            b"first".as_slice(),
+            b"second".as_slice(),
+            b"third".as_slice(),
+        ] {
+            diagnostics.push(damaged_warning(b"synthetic.pdf", b"", message, None));
+        }
+
+        let error = deliver_canonical_diagnostics(&owner, &mut diagnostics)
+            .expect_err("the sink gives out on the second warning");
+        assert!(error.to_string().contains("synthetic warning sink failure"));
+        assert_eq!(owner.diagnostics.borrow().len(), 1);
+
+        let pending: Vec<String> = diagnostics
+            .entries()
+            .iter()
+            .map(|entry| entry.message_string())
+            .collect();
+        assert_eq!(pending.len(), 1, "only the warning after the failing one");
+        assert!(
+            pending[0].contains("third"),
+            "the undelivered tail must survive, got {pending:?}"
+        );
+    }
+
     #[test]
     fn canonical_owner_warning_sink_records_a_local_diagnostic() {
         let owner = FailingCanonicalOwner {
             transport_error: false,
             diagnostics: RefCell::new(Diagnostics::default()),
+            accept_warnings: None,
         };
         owner
             .push_warning(damaged_warning(
@@ -5584,6 +5650,7 @@ mod final_handle_tests {
             let owner = FailingCanonicalOwner {
                 transport_error,
                 diagnostics: RefCell::new(Diagnostics::default()),
+                accept_warnings: None,
             };
             let _ = owner.indirect_handle(ObjectRef::new(1, 0));
             let _ = owner.direct_handle(ObjectValue::Integer(1));
