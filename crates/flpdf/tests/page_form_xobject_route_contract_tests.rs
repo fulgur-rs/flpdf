@@ -87,8 +87,18 @@ impl<'ast> Visit<'ast> for ProductionCollector {
     }
 
     fn visit_ident(&mut self, ident: &'ast syn::Ident) {
-        self.identifiers.insert(ident.to_string());
+        self.identifiers.insert(unraw(ident));
     }
+}
+
+/// Strip a raw identifier's `r#` prefix.
+///
+/// `pdf.r#resolve(...)` calls the same method as `pdf.resolve(...)`, but syn
+/// renders the identifier as `r#resolve`, which would not match the forbidden
+/// spelling checked below.
+fn unraw(ident: &syn::Ident) -> String {
+    let text = ident.to_string();
+    text.strip_prefix("r#").unwrap_or(&text).to_owned()
 }
 
 fn collect_token_identifiers(
@@ -98,7 +108,8 @@ fn collect_token_identifiers(
     for token in tokens {
         match token {
             proc_macro2::TokenTree::Ident(ident) => {
-                identifiers.insert(ident.to_string());
+                let text = ident.to_string();
+                identifiers.insert(text.strip_prefix("r#").unwrap_or(&text).to_owned());
             }
             proc_macro2::TokenTree::Group(group) => {
                 collect_token_identifiers(group.stream(), identifiers);
@@ -137,12 +148,51 @@ fn stmt_attrs(stmt: &syn::Stmt) -> &[syn::Attribute] {
     }
 }
 
+/// Every `syn::Expr` variant that carries attributes.
+///
+/// A whitelist misses valid gated forms such as
+/// `#[cfg(test)] if condition { handle.resolve(); }`, so this covers the full
+/// set rather than the handful the wrapper happens to use today.
 fn expr_attrs(expr: &syn::Expr) -> &[syn::Attribute] {
     match expr {
-        syn::Expr::Call(e) => &e.attrs,
-        syn::Expr::MethodCall(e) => &e.attrs,
-        syn::Expr::Macro(e) => &e.attrs,
+        syn::Expr::Array(e) => &e.attrs,
+        syn::Expr::Assign(e) => &e.attrs,
+        syn::Expr::Async(e) => &e.attrs,
+        syn::Expr::Await(e) => &e.attrs,
+        syn::Expr::Binary(e) => &e.attrs,
         syn::Expr::Block(e) => &e.attrs,
+        syn::Expr::Break(e) => &e.attrs,
+        syn::Expr::Call(e) => &e.attrs,
+        syn::Expr::Cast(e) => &e.attrs,
+        syn::Expr::Closure(e) => &e.attrs,
+        syn::Expr::Const(e) => &e.attrs,
+        syn::Expr::Continue(e) => &e.attrs,
+        syn::Expr::Field(e) => &e.attrs,
+        syn::Expr::ForLoop(e) => &e.attrs,
+        syn::Expr::Group(e) => &e.attrs,
+        syn::Expr::If(e) => &e.attrs,
+        syn::Expr::Index(e) => &e.attrs,
+        syn::Expr::Infer(e) => &e.attrs,
+        syn::Expr::Let(e) => &e.attrs,
+        syn::Expr::Lit(e) => &e.attrs,
+        syn::Expr::Loop(e) => &e.attrs,
+        syn::Expr::Macro(e) => &e.attrs,
+        syn::Expr::Match(e) => &e.attrs,
+        syn::Expr::MethodCall(e) => &e.attrs,
+        syn::Expr::Paren(e) => &e.attrs,
+        syn::Expr::Path(e) => &e.attrs,
+        syn::Expr::Range(e) => &e.attrs,
+        syn::Expr::Reference(e) => &e.attrs,
+        syn::Expr::Repeat(e) => &e.attrs,
+        syn::Expr::Return(e) => &e.attrs,
+        syn::Expr::Struct(e) => &e.attrs,
+        syn::Expr::Try(e) => &e.attrs,
+        syn::Expr::TryBlock(e) => &e.attrs,
+        syn::Expr::Tuple(e) => &e.attrs,
+        syn::Expr::Unary(e) => &e.attrs,
+        syn::Expr::Unsafe(e) => &e.attrs,
+        syn::Expr::While(e) => &e.attrs,
+        syn::Expr::Yield(e) => &e.attrs,
         _ => &[],
     }
 }
@@ -238,19 +288,26 @@ fn production_page_form_xobject_uses_canonical_resolving_routes() {
     );
 }
 
-/// True when a non-test-only function calls `get_form_xobject_for_page` as a
-/// method and constructs a `PageObjectHelper`.
+/// True when a non-test-only function delegates the whole conversion to the
+/// canonical helper: `<helper>.get_form_xobject_for_page(true)` on a binding
+/// the same function obtained from `PageObjectHelper::new(...)`.
+///
+/// Recording only the method name would accept
+/// `helper.get_form_xobject_for_page(false)`, which is a different qpdf
+/// call (`getFormXObjectForPage`'s `handle_transformations`), and recording
+/// it anywhere would let a `#[cfg(test)]` helper satisfy the contract while
+/// the production wrapper stopped delegating.
 fn delegates_to_helper(source: &str) -> bool {
     let file = syn::parse_file(source).expect("page_form_xobject.rs must parse as Rust");
     let mut probe = DelegationProbe::default();
     probe.visit_file(&file);
-    probe.calls_helper_method && probe.constructs_helper
+    probe.delegating_call_seen
 }
 
 #[derive(Default)]
 struct DelegationProbe {
-    calls_helper_method: bool,
-    constructs_helper: bool,
+    helper_bindings: std::collections::BTreeSet<String>,
+    delegating_call_seen: bool,
 }
 
 impl<'ast> Visit<'ast> for DelegationProbe {
@@ -261,27 +318,90 @@ impl<'ast> Visit<'ast> for DelegationProbe {
         syn::visit::visit_item(self, item);
     }
 
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        if is_test_only(impl_item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_impl_item(self, item);
+    }
+
+    fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+        if is_test_only(trait_item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_trait_item(self, item);
+    }
+
+    fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
+        if is_test_only(stmt_attrs(stmt)) {
+            return;
+        }
+        // `let <name> = PageObjectHelper::new(...)` names the receiver the
+        // delegating call has to use.
+        if let syn::Stmt::Local(local) = stmt {
+            if let (syn::Pat::Ident(pat), Some(init)) = (&local.pat, &local.init) {
+                if constructs_helper(&init.expr) {
+                    self.helper_bindings.insert(unraw(&pat.ident));
+                }
+            }
+        }
+        syn::visit::visit_stmt(self, stmt);
+    }
+
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-        if call.method == "get_form_xobject_for_page" {
-            self.calls_helper_method = true;
+        if unraw(&call.method) == "get_form_xobject_for_page"
+            && receiver_is_helper_binding(&call.receiver, &self.helper_bindings)
+            && call_passes_true(call)
+        {
+            self.delegating_call_seen = true;
         }
         syn::visit::visit_expr_method_call(self, call);
     }
+}
 
-    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-        if let syn::Expr::Path(path) = call.func.as_ref() {
-            let segments: Vec<String> = path
-                .path
-                .segments
-                .iter()
-                .map(|segment| segment.ident.to_string())
-                .collect();
-            if segments == ["PageObjectHelper", "new"] {
-                self.constructs_helper = true;
-            }
-        }
-        syn::visit::visit_expr_call(self, call);
+fn constructs_helper(expr: &syn::Expr) -> bool {
+    let syn::Expr::Call(call) = expr else {
+        return false;
+    };
+    let syn::Expr::Path(path) = call.func.as_ref() else {
+        return false;
+    };
+    let segments: Vec<String> = path
+        .path
+        .segments
+        .iter()
+        .map(|segment| unraw(&segment.ident))
+        .collect();
+    segments == ["PageObjectHelper", "new"]
+}
+
+fn receiver_is_helper_binding(
+    receiver: &syn::Expr,
+    bindings: &std::collections::BTreeSet<String>,
+) -> bool {
+    match receiver {
+        syn::Expr::Path(path) => path
+            .path
+            .get_ident()
+            .is_some_and(|ident| bindings.contains(&unraw(ident))),
+        // `(&mut helper).get_form_xobject_for_page(true)` and friends.
+        syn::Expr::Reference(inner) => receiver_is_helper_binding(&inner.expr, bindings),
+        syn::Expr::Paren(inner) => receiver_is_helper_binding(&inner.expr, bindings),
+        syn::Expr::Group(inner) => receiver_is_helper_binding(&inner.expr, bindings),
+        _ => false,
     }
+}
+
+/// qpdf's `getFormXObjectForPage(handle_transformations = true)` is the
+/// canonical call; `false` skips the transformation handling.
+fn call_passes_true(call: &syn::ExprMethodCall) -> bool {
+    matches!(
+        call.args.first(),
+        Some(syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Bool(syn::LitBool { value: true, .. }),
+            ..
+        }))
+    )
 }
 
 fn read_module() -> String {
