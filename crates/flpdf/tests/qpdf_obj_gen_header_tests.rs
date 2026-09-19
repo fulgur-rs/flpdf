@@ -631,6 +631,46 @@ fn encrypted_linearized_raw_metadata_does_not_cleartext_other_raw_streams() {
 }
 
 #[test]
+fn plain_normalizes_a_raw_page_content_and_drops_its_parameters() {
+    // The plain live route gates content normalization on the raw
+    // `normalized_streams` set, matching qpdf's `old_og`-keyed membership test
+    // (`QPDFWriter.cc:1279`). A content stream whose generation does not project
+    // to an `ObjectRef` stays in that set, so it must still be normalized -- the
+    // `contents_seq` map alone would drop it. This is the plain counterpart of
+    // `linearized_normalizes_a_raw_page_content_and_drops_its_parameters`.
+    let mut pdf = Pdf::open_mem_owned(matching_out_of_range_content_stream_with_parameters_pdf())
+        .expect("open raw content stream PDF");
+    let raw_content = pdf.get_object_handle_by_raw_identity(5, 65_536);
+    pdf.get_object_handle(flpdf::ObjectRef::new(3, 0))
+        .replace_key(
+            b"/Contents",
+            ObjectHandle::array(vec![raw_content, ObjectHandle::integer(7)]),
+        )
+        .expect("attach raw content stream");
+
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_content_normalization(true);
+    writer.set_compress_streams(false);
+    writer.set_static_id(true);
+    writer.set_output_memory().expect("install memory output");
+    writer.write().expect("write normalized raw content output");
+    let output = writer
+        .get_buffer()
+        .expect("read normalized raw content output");
+    let text = String::from_utf8_lossy(&output);
+
+    assert!(
+        text.contains("q 1 0 0 1 0 0 cm Q"),
+        "raw page content must be normalized on the plain route: {text}"
+    );
+    assert!(
+        !text.contains("/DecodeParms"),
+        "normalized content must not retain the source parameter edge: {text}"
+    );
+}
+
+#[test]
 fn linearized_normalizes_a_raw_page_content_and_drops_its_parameters() {
     let mut pdf = Pdf::open_mem_owned(matching_out_of_range_content_stream_with_parameters_pdf())
         .expect("open raw content stream PDF");

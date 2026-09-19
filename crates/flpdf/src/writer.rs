@@ -1778,10 +1778,29 @@ pub(crate) struct SpecialStreams {
     pages: Vec<ObjectRef>,
     page_seq: HashMap<ObjectRef, u32>,
     contents_seq: HashMap<ObjectRef, u32>,
-    normalized_streams: BTreeSet<ObjectRef>,
     normalized_streams_raw: BTreeSet<QpdfObjGen>,
     pub(crate) content_container_refs: BTreeSet<ObjectRef>,
     content_container_seq: HashMap<ObjectRef, u32>,
+}
+
+/// Setup-time page/content-stream state the plain live QDF/normalize route
+/// consumes without re-deriving it at emission time
+/// (`QPDFWriter::initializeSpecialStreams`, `QPDFWriter.cc:1912-1936`).
+///
+/// `page_sequences`/`contents_sequences` back the QDF marker text (`%% Page N`
+/// / `%% Contents for page N`, `QPDFWriter.cc:1774-1781`). `normalized_streams`
+/// is the raw qpdf-identity projection of the same setup snapshot -- it
+/// matches `std::set<QPDFObjGen> m->normalized_streams`
+/// (`include/qpdf/QPDFWriter.hh:676`) exactly, keyed the same way qpdf's own
+/// membership gate is (`old_og = stream.getObjGen()`,
+/// `m->normalize_content && m->normalized_streams.count(old_og)`,
+/// `QPDFWriter.cc:1279`) -- rather than an `ObjectRef`-projected duplicate
+/// that would only coincidentally agree with it.
+#[derive(Debug, Default)]
+pub(crate) struct LiveContentStreamState {
+    pub(crate) page_sequences: BTreeMap<ObjectRef, usize>,
+    pub(crate) contents_sequences: BTreeMap<ObjectRef, usize>,
+    pub(crate) normalized_streams: BTreeSet<QpdfObjGen>,
 }
 
 impl SpecialStreams {
@@ -1796,15 +1815,17 @@ impl SpecialStreams {
     /// membership gate must read this same setup-time snapshot rather than
     /// repeat the page walk at emission time, so a page-tree mutation
     /// between setup and body emission cannot make the two disagree.
-    pub(crate) fn page_and_contents_sequences(
-        &self,
-    ) -> (BTreeMap<ObjectRef, usize>, BTreeMap<ObjectRef, usize>) {
+    pub(crate) fn live_content_stream_state(&self) -> LiveContentStreamState {
         let to_btreemap = |map: &HashMap<ObjectRef, u32>| -> BTreeMap<ObjectRef, usize> {
             map.iter()
                 .map(|(&object_ref, &sequence)| (object_ref, sequence as usize))
                 .collect()
         };
-        (to_btreemap(&self.page_seq), to_btreemap(&self.contents_seq))
+        LiveContentStreamState {
+            page_sequences: to_btreemap(&self.page_seq),
+            contents_sequences: to_btreemap(&self.contents_seq),
+            normalized_streams: self.normalized_streams_raw.clone(),
+        }
     }
 }
 
@@ -1822,7 +1843,6 @@ fn initialize_special_streams<R: Read + Seek>(
     let mut streams = SpecialStreams {
         page_seq: HashMap::with_capacity(pages.len()),
         contents_seq: HashMap::new(),
-        normalized_streams: BTreeSet::new(),
         normalized_streams_raw: BTreeSet::new(),
         content_container_refs: BTreeSet::new(),
         content_container_seq: HashMap::new(),
@@ -1838,7 +1858,6 @@ fn initialize_special_streams<R: Read + Seek>(
         for content_gen in collect_content_stream_qpdf_obj_gens(pdf, page_ref)? {
             if let Some(content_ref) = content_gen.to_object_ref() {
                 streams.contents_seq.insert(content_ref, sequence);
-                streams.normalized_streams.insert(content_ref);
             }
             streams.normalized_streams_raw.insert(content_gen);
         }
@@ -3600,39 +3619,33 @@ fn collect_content_container_refs<R: Read + Seek>(
     Ok(())
 }
 
-/// Collect indirect page-content stream references through canonical
+/// Collect raw qpdf identities for page-content streams through canonical
 /// `ObjectHandle` inspection. Direct streams and malformed non-stream values
-/// are omitted from the identity set: direct streams have no object identity
-/// for `contents_seq`, while qpdf only normalizes actual stream objects.
+/// are omitted: direct streams have no object identity for `contents_seq`,
+/// while qpdf only normalizes actual stream objects.
 ///
 /// This mirrors `QPDFWriter::initializeSpecialStreams`
 /// (`libqpdf/QPDFWriter.cc:1914-1931`): resolve the page `/Contents` handle
 /// once, inspect an array's immediate children, and never chase a
 /// flpdf-only reference-holder chain. Unlike `ObjectHandle::get_page_contents`,
 /// the writer pre-scan deliberately does not issue the `getPageContents`
-/// damage warning for a non-stream array member, because qpdf's writer
-/// pre-scan only asks each child whether it is a stream.
+/// damage warning for a non-stream array member. qpdf's array branch asks
+/// each child nothing at all -- it pushes every item's `getObjGen()`
+/// unconditionally (`QPDFWriter.cc:1922-1926`); only the scalar branch tests
+/// `isStream()` (`:1927`). flpdf filters array members by stream type here,
+/// which drops the `%% Contents for page N` marker qpdf emits before a
+/// non-stream member. Tracked separately; this route does not change it.
 ///
-/// Production now reads the equivalent `ObjectRef` set from
-/// [`SpecialStreams::page_and_contents_sequences`], computed once at setup;
-/// this projection remains only for the `#[cfg(test)]`
-/// `writer::plain::body::qdf_page_context` helper that re-derives the same
-/// maps for unit tests calling `emit_live` directly.
-#[cfg(test)]
-pub(crate) fn collect_content_stream_refs<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
-) -> Result<Vec<ObjectRef>> {
-    Ok(collect_content_stream_qpdf_obj_gens(pdf, page_ref)?
-        .into_iter()
-        .filter_map(|object_gen| object_gen.to_object_ref())
-        .collect())
-}
-
-/// Collect raw qpdf identities for page-content streams. Unlike the public
-/// ObjectRef projection, this retains valid raw generations used by the
-/// linearization normalization gate.
-fn collect_content_stream_qpdf_obj_gens<R: Read + Seek>(
+/// Production reads this identity set through
+/// [`SpecialStreams::live_content_stream_state`], computed once at setup for
+/// both `contents_seq` (`ObjectRef`-projected, filtered by
+/// [`QpdfObjGen::to_object_ref`]) and `normalized_streams_raw`
+/// (unfiltered, matching qpdf's `old_og`-keyed membership gate,
+/// `QPDFWriter.cc:1279`). The `#[cfg(test)]`
+/// `writer::plain::body::qdf_page_context` helper calls this function
+/// directly to re-derive the same state independently for unit tests that
+/// call `emit_live` without going through `PdfWriter::write`'s setup.
+pub(crate) fn collect_content_stream_qpdf_obj_gens<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
 ) -> Result<Vec<QpdfObjGen>> {
@@ -5184,8 +5197,12 @@ mod final_handle_writer_tests {
         assert_eq!(streams.page_seq.get(&page), Some(&1));
         assert_eq!(streams.contents_seq.get(&ObjectRef::new(6, 0)), Some(&1));
         assert_eq!(streams.contents_seq.get(&ObjectRef::new(7, 0)), Some(&1));
-        assert!(streams.normalized_streams.contains(&ObjectRef::new(6, 0)));
-        assert!(streams.normalized_streams.contains(&ObjectRef::new(7, 0)));
+        assert!(streams.normalized_streams_raw().contains(
+            &QpdfObjGen::from_valid_object_ref_for_test(ObjectRef::new(6, 0))
+        ));
+        assert!(streams.normalized_streams_raw().contains(
+            &QpdfObjGen::from_valid_object_ref_for_test(ObjectRef::new(7, 0))
+        ));
         assert!(streams
             .content_container_refs
             .contains(&ObjectRef::new(5, 0)));
@@ -5208,8 +5225,12 @@ mod final_handle_writer_tests {
 
         assert_eq!(streams.pages, vec![ObjectRef::new(3, 0)]);
         assert_eq!(streams.page_seq.get(&ObjectRef::new(3, 0)), Some(&1));
-        assert!(streams.normalized_streams.contains(&ObjectRef::new(6, 0)));
-        assert!(streams.normalized_streams.contains(&ObjectRef::new(7, 0)));
+        assert!(streams.normalized_streams_raw().contains(
+            &QpdfObjGen::from_valid_object_ref_for_test(ObjectRef::new(6, 0))
+        ));
+        assert!(streams.normalized_streams_raw().contains(
+            &QpdfObjGen::from_valid_object_ref_for_test(ObjectRef::new(7, 0))
+        ));
         assert!(streams.content_container_refs.is_empty());
     }
 
