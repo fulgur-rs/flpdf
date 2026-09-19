@@ -2636,10 +2636,12 @@ mod tests {
         // job_json_file_open_error's special-cased kinds.
         let error = std::io::Error::from_raw_os_error(13); // EACCES
         let rendered = job_json_file_open_error(Path::new("job.json"), error);
+        // cov:ignore-start: the else arm only fires if job_json_file_open_error
+        // stops returning SystemBytes.
         let Error::SystemBytes(message) = rendered else {
             panic!("expected a byte-preserving SystemBytes error, got {rendered:?}");
-            // cov:ignore: the else arm only fires if job_json_file_open_error stops returning SystemBytes
         };
+        // cov:ignore-end
         let text = String::from_utf8(message).expect("ASCII path and strerror text");
         assert!(
             text.starts_with("open job.json: "),
@@ -2657,10 +2659,12 @@ mod tests {
         let path = path_from_bytes(b"\xff");
         let error = std::io::Error::from(std::io::ErrorKind::NotFound);
         let rendered = job_json_file_open_error(&path, error);
+        // cov:ignore-start: the else arm only fires if job_json_file_open_error
+        // stops returning SystemBytes.
         let Error::SystemBytes(message) = rendered else {
             panic!("expected a byte-preserving SystemBytes error, got {rendered:?}");
-            // cov:ignore: the else arm only fires if job_json_file_open_error stops returning SystemBytes
         };
+        // cov:ignore-end
         assert_eq!(message, b"open \xff: No such file or directory");
     }
 }
