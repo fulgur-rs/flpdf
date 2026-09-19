@@ -216,7 +216,7 @@ public/private 境界の 2 つ目の witness になる。
 - 同名別シンボル（例: `PdfWriter::register_progress_reporter` と `QPDFJob::register_progress_reporter`）は宣言元を確認して分離し、行の注記で断る。
 
 `.claude/rules/qpdf-port-design-patterns.md` 8 に記録された行番号は 2026-08-21 時点の測定値で
-既に drift しているため、**issue ID だけを引用し行番号は再測定した**（`main.rs` は **2026-09-19 再計測で 12,593 行**。旧記載の 9313 行は stale、
+既に drift しているため、**issue ID だけを引用し行番号は再測定した**（`main.rs` は **2026-09-19 再計測でこのブランチ上 12,771 行**。旧記載の 9313 行は stale、
 同ルールが前提にしていた約 4800 行ではない）。
 
 2026-09-06 の追跡監査は main `4a2faf5c` を基準とする。以下の訂正行に明記した
