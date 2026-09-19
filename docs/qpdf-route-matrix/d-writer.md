@@ -617,7 +617,7 @@ route already did with `xref_stream: false`, matching qpdf's single
 (`QPDFWriter.cc:2481`). This is the first production caller to combine
 `qdf: true` with `xref_stream: true`, which surfaced a latent bug in the
 owner's `trailer <<`/QDF-newline branching (fixed; see the D14 row above).
-D14 is reclassified `canonical`. The route-specific framing this note
+D14 stays `mixed`（**2026-09-19 訂正**: 当初ここで `canonical` へ再分類すると書いたが、3 本目の `canonical_linearization_trailer_entries`（`crates/flpdf/src/linearization/writer.rs:1393`、production caller `:2432`）が残っており、統合されたのは classic と plain xref-stream の 2 本だけ。D14 行の記述と整合させた）。The route-specific framing this note
 originally called out (xref keyword, `startxref`, pass-1 `/ID` warnings)
 remains consumer-owned, consistent with D12/D13's classic-xref and
 xref-stream owners.
