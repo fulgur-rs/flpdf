@@ -1924,8 +1924,13 @@ fn json_output_conflicts_with_the_json_exclusive_flag_set() {
             "--json-output must reject {extra:?}; stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        // qpdf's checkConfiguration rejects these `require_outfile = false`
+        // options once an output file is present (`QPDFJob.cc:593-594`);
+        // `--json-output`'s value counts as that output file. Confirmed
+        // against live qpdf 11.9.0 for every case above.
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains("cannot be used with"),
+            String::from_utf8_lossy(&output.stderr)
+                .contains("no output file may be given for this option"),
             "--json-output conflict for {extra:?} must be a usage error; stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );

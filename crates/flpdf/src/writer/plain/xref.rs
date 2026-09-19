@@ -66,11 +66,19 @@ pub(crate) struct TrailerPlan {
     pub(crate) form: XrefForm,
     /// Remapped output reference for an indirect Catalog, when `/Root` is
     /// indirect in the source.
+    ///
+    /// D14: production no longer reads this field directly — both xref
+    /// forms reach `/Root` through `trailer_handle`'s own literal `/Root`
+    /// key via the shared `write_trailer_with_ref_map_and_kind`/
+    /// `_and_direct_root` owner. It stays only for the historical
+    /// `PlainWritePlan::validate` cross-check (`writer/plain/plan.rs`,
+    /// `#[cfg(test)]`-only scaffolding) that compares it against
+    /// `PlainWritePlan::root`.
+    #[allow(dead_code)]
     pub(crate) root: Option<ObjectRef>,
     /// Live direct Catalog value for a direct source `/Root`.
     pub(crate) direct_root: Option<ObjectHandle>,
     pub(crate) id: IdPlan,
-    pub(crate) encrypt: Option<ObjectRef>,
     pub(crate) structural_filtered: bool,
     /// Whether the enclosing writer is emitting qpdf's QDF layout.
     pub(crate) qdf: bool,
@@ -108,6 +116,16 @@ pub(crate) fn append_xref_and_trailer(
     }
 }
 
+/// Assemble the xref-stream dictionary's fixed header, then reach the
+/// trailer keys, `/ID`, `/Encrypt`, and the closing `>>` through the same
+/// `write_trailer_with_ref_map_and_kind`/`_and_direct_root` owner the
+/// classic table route (below) uses, with `xref_stream: true`. This mirrors
+/// qpdf's `QPDFWriter::writeXRefStream`, which writes its own dictionary
+/// prefix (`/Type /Length /Filter /DecodeParms /W [/Index]`) and then calls
+/// the *same* `writeTrailer(which, size, xref_stream, ...)` the classic
+/// route calls with `xref_stream=false` (`QPDFWriter.cc:2465-2481` vs.
+/// `QPDFWriter.cc:2740-2851`) — a single trailer-entry serializer for both
+/// xref forms, not two independent ones.
 fn append_xref_stream_and_trailer(
     out: &mut OutputSink<'_>,
     layout: &BodyLayout,
@@ -168,78 +186,105 @@ fn append_xref_stream_and_trailer(
             ))
         })
     };
-    let dictionary = xref_stream::XrefStreamDict {
-        filtered: trailer.structural_filtered,
-        widths: stream_layout.widths,
-        index: None,
-        info: None,
-        root: trailer.root,
-        root_value: None,
-        live_root_value: trailer.direct_root.as_ref(),
-        size,
-        prev: None,
-        canonical_entries: None,
-        live_trailer: Some(trailer_handle),
-        live_map: Some(&map),
-        live_removed_refs: Some(removed_refs),
-        id: None,
-        encrypt: trailer.encrypt,
-    };
     let xref_ref = ObjectRef::new(xref_number, 0);
+
+    xref_stream::write_xref_stream_dict_header(
+        out,
+        xref_ref,
+        trailer.structural_filtered,
+        stream_layout.widths,
+        None,
+        stream_layout.payload.len(),
+        trailer.qdf,
+    )?; // cov:ignore: covered multiline call; LLVM attributes this terminator to the call setup
+
     match &trailer.id {
-        IdPlan::Materialized { value } => {
-            let id = value
-                .as_ref()
-                .map(|(id0, id1)| (id0.as_slice(), id1.as_slice()));
-            let dictionary = xref_stream::XrefStreamDict { id, ..dictionary };
-            if trailer.qdf {
-                xref_stream::write_xref_stream(
-                    out,
-                    xref_ref,
-                    &dictionary,
-                    &stream_layout,
-                    true,
-                    None,
-                )?; // cov:ignore: LLVM maps the covered materialized QDF xref-stream call continuation to this line
-            } else {
-                xref_stream::write_xref_stream(
-                    out,
-                    xref_ref,
-                    &dictionary,
-                    &stream_layout,
-                    false,
-                    None,
-                )?; // cov:ignore: LLVM maps the covered materialized compact xref-stream call continuation to this line
-            }
-        }
         IdPlan::Deterministic {
             source_id0,
             info_suffix,
         } => {
-            let mut id_writer = |out: &mut crate::writer::output::OutputSink<'_>| {
+            let mut id_writer = |out: &mut OutputSink<'_>| {
                 write_deterministic_id_inline(out, info_suffix, source_id0.as_deref())
             };
-            if trailer.qdf {
-                xref_stream::write_xref_stream(
+            if let Some(direct_root) = trailer.direct_root.as_ref() {
+                crate::writer::object::write_trailer_with_ref_map_and_kind_and_direct_root(
+                    trailer_handle,
                     out,
-                    xref_ref,
-                    &dictionary,
-                    &stream_layout,
+                    TrailerKind::Normal {
+                        size: i64::from(size),
+                    },
                     true,
+                    trailer.qdf,
                     Some(&mut id_writer),
-                )?; // cov:ignore: LLVM maps the covered deterministic QDF xref-stream call continuation to this line
+                    &map,
+                    removed_refs,
+                    true,
+                    direct_root,
+                )?; // cov:ignore: deterministic direct-root xref-stream trailer serialization is covered by the dedicated writer differential; LLVM maps this continuation separately.
             } else {
-                xref_stream::write_xref_stream(
+                trailer_handle.write_trailer_with_ref_map_and_kind(
                     out,
-                    xref_ref,
-                    &dictionary,
-                    &stream_layout,
-                    false,
+                    TrailerKind::Normal {
+                        size: i64::from(size),
+                    },
+                    true,
+                    trailer.qdf,
                     Some(&mut id_writer),
-                )?; // cov:ignore: LLVM maps the covered deterministic compact xref-stream call continuation to this line
+                    &map,
+                    removed_refs,
+                    true,
+                )?; // cov:ignore: deterministic ID writer call is covered; LLVM maps this multiline terminator to the call setup
+            }
+        }
+        IdPlan::Materialized { .. } => {
+            if let Some(direct_root) = trailer.direct_root.as_ref() {
+                crate::writer::object::write_trailer_with_ref_map_and_kind_and_direct_root(
+                    trailer_handle,
+                    out,
+                    TrailerKind::Normal {
+                        size: i64::from(size),
+                    },
+                    true,
+                    trailer.qdf,
+                    None,
+                    &map,
+                    removed_refs,
+                    true,
+                    direct_root,
+                )?; // cov:ignore: LLVM attributes the covered materialized direct-root xref-stream trailer continuation separately.
+            } else {
+                trailer_handle.write_trailer_with_ref_map_and_kind(
+                    out,
+                    TrailerKind::Normal {
+                        size: i64::from(size),
+                    },
+                    true,
+                    trailer.qdf,
+                    None,
+                    &map,
+                    removed_refs,
+                    true,
+                )?; // cov:ignore: materialized ID writer call is covered; LLVM maps this multiline terminator to the call setup
             }
         }
     }
+
+    // The trailer owner above already wrote the closing `>>` (`QPDFWriter.cc:1234-1236`
+    // via `write_trailer_with_ref_map_and_kind*`); qpdf's `writeXRefStream` then appends
+    // `"\nstream\n"` unconditionally (`QPDFWriter.cc:2482`). flpdf's owner bakes its own
+    // trailing `\n` into the QDF close (`">>\n"`), so only QDF's `"stream\n"` needs no
+    // extra leading separator; the non-QDF close (`" >>"`) still needs one.
+    if trailer.qdf {
+        out.write_bytes(b"stream\n")?;
+    } else {
+        out.write_bytes(b"\nstream\n")?;
+    }
+    out.write_bytes(&stream_layout.payload)?;
+    out.write_bytes(b"\nendstream\nendobj\n")?;
+    if trailer.qdf {
+        out.write_bytes(b"\n")?;
+    }
+
     out.write_bytes(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes())?;
     written_xref_stream(layout, xref_ref, xref_offset)
 }
@@ -666,12 +711,12 @@ mod tests {
         })
     }
 
-    fn append_with_digest(
+    fn append_with_digest_and_handle(
         bytes: &mut Vec<u8>,
         layout: &BodyLayout,
         trailer: &TrailerPlan,
+        trailer_handle: &ObjectHandle,
     ) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
-        let trailer_handle = ObjectHandle::dictionary(Vec::new());
         let mut sink = OutputSink::new(bytes);
         sink.begin_digest();
         sink.write_bytes(b"body")?;
@@ -679,7 +724,7 @@ mod tests {
             &mut sink,
             layout,
             trailer,
-            &trailer_handle,
+            trailer_handle,
             &HashMap::new(),
             &BTreeSet::new(),
         )
@@ -716,7 +761,6 @@ mod tests {
             root: None,
             direct_root: None,
             id: IdPlan::Materialized { value: None },
-            encrypt: None,
             structural_filtered: false,
             qdf: false,
         }
@@ -961,6 +1005,16 @@ mod tests {
 
     #[test]
     fn xref_stream_materialized_and_deterministic_ids_cover_qdf_and_compact_routes() {
+        // D14: `/ID` now reaches the output through the shared trailer owner
+        // (`write_trailer_with_ref_map_and_kind`), which only fires its
+        // `id_writer`/materialized-value fallback for a literal `/ID` key it
+        // finds while walking `trailer_handle`'s own entries -- unlike the
+        // xref-stream route's old independent `dict.id` field, which wrote
+        // regardless of trailer_handle content. Every production
+        // `trailer_handle` always carries a literal `/ID`
+        // (`build_writer_trailer_handle` installs one unconditionally), so
+        // these fixtures do too, instead of the empty handle `append_bytes`
+        // uses elsewhere in this module.
         let mut layout = BodyLayout::default();
         layout.uncompressed.insert(1, (0, 12));
 
@@ -971,8 +1025,23 @@ mod tests {
             materialized.id = IdPlan::Materialized {
                 value: Some((b"permanent".to_vec(), b"changing".to_vec())),
             };
+            let materialized_trailer_handle = ObjectHandle::dictionary(vec![(
+                b"/ID".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(b"permanent".to_vec()),
+                    ObjectHandle::string(b"changing".to_vec()),
+                ]),
+            )]);
             let mut bytes = Vec::new();
-            append_bytes(&mut bytes, &layout, &materialized).expect("materialized xref-stream ID");
+            append_with_handle_bytes(
+                &mut bytes,
+                &layout,
+                &materialized,
+                &materialized_trailer_handle,
+                &HashMap::new(),
+                &BTreeSet::new(),
+            )
+            .expect("materialized xref-stream ID");
             assert!(bytes
                 .windows(b"/ID [<7065726d616e656e74><6368616e67696e67>]".len())
                 .any(|window| { window == b"/ID [<7065726d616e656e74><6368616e67696e67>]" }));
@@ -984,9 +1053,25 @@ mod tests {
                 source_id0: Some(b"source".to_vec()),
                 info_suffix: b" info".to_vec(),
             };
+            // The placeholder value itself is irrelevant: the deterministic
+            // `id_writer` closure overrides it. Only its presence as a
+            // literal key matters, mirroring the zero-filled placeholder
+            // `build_writer_trailer_handle` installs for deterministic IDs.
+            let deterministic_trailer_handle = ObjectHandle::dictionary(vec![(
+                b"/ID".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(vec![0; 16]),
+                    ObjectHandle::string(vec![0; 16]),
+                ]),
+            )]);
             let mut bytes = Vec::new();
-            append_with_digest(&mut bytes, &layout, &deterministic)
-                .expect("deterministic xref-stream ID");
+            append_with_digest_and_handle(
+                &mut bytes,
+                &layout,
+                &deterministic,
+                &deterministic_trailer_handle,
+            )
+            .expect("deterministic xref-stream ID");
             assert!(bytes
                 .windows(b"/ID [<736f75726365><".len())
                 .any(|window| { window == b"/ID [<736f75726365><" }));
@@ -995,7 +1080,13 @@ mod tests {
     }
 
     #[test]
-    fn xref_stream_reports_a_missing_live_trailer_reference_mapping() {
+    fn xref_stream_shared_owner_reports_a_missing_trailer_reference_map_entry() {
+        // Same shared `map` closure and owner as
+        // `classic_shared_owner_reports_a_missing_trailer_reference_map_entry`
+        // (D14: the xref-stream and classic table routes no longer format
+        // this error independently), so this asserts the same generic
+        // message shape -- not a per-key-name message a route-local
+        // formatter could produce.
         let pdf = crate::Pdf::empty().expect("empty PDF for trailer reference test");
         let custom = pdf
             .make_indirect_from_object_handle(ObjectHandle::integer(3))
@@ -1017,7 +1108,7 @@ mod tests {
         .expect_err("missing xref-stream trailer map entry must be reported");
 
         assert!(
-            matches!(&error, crate::Error::Unsupported(message) if message.contains("trailer /CustomRef reference") && message.contains("absent from renumber map")),
+            matches!(&error, crate::Error::Unsupported(message) if message.contains("absent from renumber map")),
             "unexpected xref-stream mapping error: {error:?}"
         );
     }
@@ -1034,6 +1125,56 @@ mod tests {
             .expect("xref stream emits the high-numbered range");
 
         assert!(String::from_utf8_lossy(&bytes).contains("/W [ 1 2 0 ]"));
+    }
+
+    #[test]
+    fn xref_stream_direct_root_shares_the_classic_trailer_owner() {
+        // D14: the xref-stream route no longer holds a live-trailer
+        // `XrefStreamDict` field (moved from
+        // `crate::writer::serialize::xref_stream::tests`). Direct `/Root`,
+        // a custom key, null suppression, and the writer-computed `/Size`
+        // override are exercised here through the SAME
+        // `write_trailer_with_ref_map_and_kind_and_direct_root` owner the
+        // classic table route below uses, with `xref_stream: true`.
+        let direct_root = ObjectHandle::dictionary(vec![(
+            b"/Type".to_vec(),
+            ObjectHandle::name(b"Catalog".to_vec()),
+        )]);
+        let trailer_handle = ObjectHandle::dictionary(vec![
+            (b"/Root".to_vec(), direct_root.clone()),
+            (b"/Custom".to_vec(), ObjectHandle::integer(9)),
+            (b"/Null".to_vec(), ObjectHandle::null()),
+            (b"/Size".to_vec(), ObjectHandle::integer(42)),
+        ]);
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(1, (0, 12));
+
+        for qdf in [false, true] {
+            let mut stream_trailer = trailer();
+            stream_trailer.form = XrefForm::Stream;
+            stream_trailer.direct_root = Some(direct_root.clone());
+            stream_trailer.qdf = qdf;
+
+            let mut bytes = Vec::new();
+            append_with_handle_bytes(
+                &mut bytes,
+                &layout,
+                &stream_trailer,
+                &trailer_handle,
+                &HashMap::new(),
+                &BTreeSet::new(),
+            )
+            .expect("direct-root xref-stream trailer succeeds");
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.contains("/Root"), "qdf={qdf}: {text}");
+            assert!(text.contains("/Type /Catalog"), "qdf={qdf}: {text}");
+            assert!(text.contains("/Custom 9"), "qdf={qdf}: {text}");
+            assert!(
+                text.contains("/Size 3"),
+                "qdf={qdf}: writer-computed /Size must override the literal 42: {text}"
+            );
+            assert!(!text.contains("/Null"), "qdf={qdf}: {text}");
+        }
     }
 
     #[test]
