@@ -722,7 +722,18 @@ fn page_box_or_err<R: Read + Seek>(
         BoxKind::Media => helper.get_media_box(false)?,
         BoxKind::Trim => helper.get_trim_box(false, false)?,
     };
-    if value.is_null() {
+    // Resolving accessor (matches the sibling `try_is_null()` calls inside
+    // `get_crop_box`/`get_bleed_box`/`get_trim_box` in page_object_helper.rs
+    // for the same `get_attribute` return value): the non-resolving
+    // `is_null()` would answer `false` for an unresolved indirect handle
+    // even when it resolves to null (`ObjectHandle::is_null` doc). Both
+    // `false, false` call sites above already force resolution before
+    // returning here -- `get_attribute`'s `result.try_is_null()?` is always
+    // evaluated regardless of outcome, and `apply_fallback` short-circuits
+    // to `Ok(fallback)` unchanged when `copy_if_fallback` is false -- so
+    // this has no observable effect today; it keeps the accessor contract
+    // consistent so a future caller with different arguments stays correct.
+    if value.try_is_null()? {
         return Err(Error::Unsupported(format!(
             "destination page {page_ref} has no usable placement box"
         )));
@@ -1356,5 +1367,81 @@ mod byte_gate {
             writer.set_minimum_pdf_version(version, max_ext);
         });
         assert_byte_identical(&actual, "overlay-onto-existing-acroform-dr.pdf");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Build a minimal PDF from a contiguous run of `1..=objects.len()`
+    /// objects, in `(object_number, body_literal)` order. `catalog_ref` is
+    /// the object number of the `/Catalog` object. Mirrors the identically
+    /// named helper in `page_object_helper.rs`.
+    fn pdf_from_objects(catalog_ref: u32, objects: &[(u32, String)]) -> Vec<u8> {
+        let mut data: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offsets: Vec<u64> = Vec::with_capacity(objects.len());
+        for (num, body) in objects {
+            offsets.push(data.len() as u64);
+            data.extend_from_slice(format!("{num} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+        let xref_start = data.len() as u64;
+        let total = objects.len() + 1;
+        let mut xref = format!("xref\n0 {total}\n0000000000 65535 f \n");
+        for off in &offsets {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        data.extend_from_slice(xref.as_bytes());
+        let trailer = format!(
+            "trailer\n<< /Size {total} /Root {catalog_ref} 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+        );
+        data.extend_from_slice(trailer.as_bytes());
+        data
+    }
+
+    /// `page_box_or_err` must reject a destination page whose `/MediaBox` is
+    /// absent from its whole ancestor chain, exercising the resolving
+    /// `try_is_null()` check (not the non-resolving `is_null()` that never
+    /// forces the dereference `ObjectHandle::is_null`'s own doc warns about).
+    #[test]
+    fn page_box_or_err_rejects_a_page_with_no_media_box_in_its_ancestry() {
+        let objects = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+            (3, "<< /Type /Page /Parent 2 0 R >>".to_string()),
+        ];
+        let bytes = pdf_from_objects(1, &objects);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let page_ref = ObjectRef::new(3, 0);
+
+        let error = page_box_or_err(&mut pdf, page_ref, BoxKind::Media)
+            .expect_err("a page with no /MediaBox anywhere in its ancestry has no usable box");
+        assert!(
+            error.to_string().contains("has no usable placement box"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The non-null path (an actual `/MediaBox`) must still resolve to a
+    /// usable `PageBox`, so the changed `try_is_null()` branch does not
+    /// regress the common case.
+    #[test]
+    fn page_box_or_err_accepts_a_page_with_a_media_box() {
+        let objects = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_string(),
+            ),
+        ];
+        let bytes = pdf_from_objects(1, &objects);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let page_ref = ObjectRef::new(3, 0);
+
+        let page_box = page_box_or_err(&mut pdf, page_ref, BoxKind::Media)
+            .expect("a page with a direct /MediaBox has a usable box");
+        assert_eq!(page_box, PageBox::new(0.0, 0.0, 612.0, 792.0));
     }
 }
