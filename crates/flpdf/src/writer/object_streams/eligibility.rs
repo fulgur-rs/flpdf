@@ -47,12 +47,14 @@ pub(crate) struct EligibilityContext {
 ///
 /// Disqualifying conditions (PDF spec + implementation constraints):
 /// 1. `object_ref.generation != 0`  — ObjStm members must have generation 0.
-/// 2. `object` is a stream — streams cannot be embedded in ObjStm.
-/// 3. The object is a dictionary with `/Type /ObjStm` — no nested ObjStm.
-/// 4. The object is a dictionary with `/Type /XRef` — xref streams must be direct.
-/// 5. The object is a signed signature dictionary with `/ByteRange` and
+/// 2. `object` is a stream — streams cannot be embedded in ObjStm. This is
+///    the only structural exclusion; qpdf's `getCompressibleObjGens`
+///    (`QPDF.cc:2437-2443`) does not special-case a non-stream dictionary
+///    that merely carries `/Type /ObjStm` or `/Type /XRef` — such a
+///    (malformed) dictionary is still eligible.
+/// 3. The object is a signed signature dictionary with `/ByteRange` and
 ///    `/Contents` — qpdf keeps signed values outside ObjStm.
-/// 6. `object_ref` is the encryption dictionary reference.
+/// 4. `object_ref` is the encryption dictionary reference.
 pub(crate) fn is_eligible_for_objstm_handle(
     object_ref: ObjectRef,
     object: &ObjectHandle,
@@ -69,21 +71,14 @@ pub(crate) fn is_eligible_for_objstm_handle(
         return Ok(false);
     }
 
-    // 3 & 4. Check /Type for Dictionary objects.
-    if object.try_is_dictionary_of_type(b"ObjStm", b"")?
-        || object.try_is_dictionary_of_type(b"XRef", b"")?
-    {
-        return Ok(false);
-    }
-
-    // 5. qpdf's getCompressibleObjGens excludes signed value dictionaries
+    // 3. qpdf's getCompressibleObjGens excludes signed value dictionaries
     // (QPDF.cc:2437-2443). Keep this in the shared predicate as well because
     // linearization uses it to route non-member open-document objects.
     if is_qpdf_signature_dict(object)? {
         return Ok(false);
     }
 
-    // 6. Encryption dictionary must not be embedded.
+    // 4. Encryption dictionary must not be embedded.
     if Some(object_ref) == ctx.encryption_ref {
         return Ok(false);
     }
