@@ -1381,15 +1381,21 @@ struct FinalFirstPageXref<'a> {
 /// canonical handle graph and mapped into output-number space; only the xref
 /// dictionary's fixed framing and key order remain raw layout.
 ///
-/// A value that is itself an indirect handle is never dereferenced here: qpdf's
-/// `writeTrailer` unparses each surviving key through `unparseChild`
-/// (`QPDFWriter.cc:1143-1155`), which branches solely on `child.isIndirect()`
-/// and, when true, writes the renumbered `"N 0 R"` token without ever
-/// inspecting what that reference resolves to -- an indirect stream target is
-/// no exception, so this mirrors that check before falling back to the
-/// generic handle-graph unparse used for direct values. Same split as the
-/// plain writer's sibling `canonical_trailer_entries`
-/// (`crates/flpdf/src/writer/plain/plan.rs`).
+/// D14 (`flpdf-3yn9.48.183`): this is the linearized two-pass route's own
+/// entry point into the *same* trailer machinery the classic table and
+/// plain xref-stream routes share through
+/// `crate::writer::object::write_trailer_with_ref_map_and_kind_and_direct_root`
+/// -- a distinct entry point remains necessary because this route needs the
+/// surviving entries as pre-serialized bytes before the physical layout (and
+/// therefore `/Root`/`/Info`/`/Size`/`/Prev` framing) is known, while the
+/// shared owner writes framing and entries together directly to an
+/// `OutputSink`. What is no longer independent: the removed-key set is
+/// `crate::writer::object::TRIMMED_TRAILER_KEYS`, the same qpdf
+/// `getTrimmedTrailer` list `crate::writer::build_writer_trailer_handle`
+/// removes for the other two routes, and a surviving value's serialization
+/// calls the shared `crate::writer::object::write_child_with_ref_map`
+/// dispatch rather than retyping its indirect-reference-vs-direct-value
+/// split.
 fn canonical_linearization_trailer_entries(
     trailer: &ObjectHandle,
     map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
@@ -1398,22 +1404,9 @@ fn canonical_linearization_trailer_entries(
     let entries = trailer.try_as_dictionary()?.unwrap_or_default();
     let mut serialized = Vec::with_capacity(entries.len());
     for (key, value) in entries {
-        if matches!(
-            key.as_slice(),
-            b"/ID"
-                | b"/Encrypt"
-                | b"/Info"
-                | b"/Prev"
-                | b"/Root"
-                | b"/Size"
-                | b"/Type"
-                | b"/W"
-                | b"/Index"
-                | b"/Length"
-                | b"/Filter"
-                | b"/DecodeParms"
-                | b"/XRefStm"
-        ) {
+        if crate::writer::object::TRIMMED_TRAILER_KEYS.contains(&key.as_slice())
+            || matches!(key.as_slice(), b"/Info" | b"/Root" | b"/Size")
+        {
             continue;
         }
         let removed = value.qpdf_obj_gen().is_some_and(|object_gen| {
@@ -1423,14 +1416,9 @@ fn canonical_linearization_trailer_entries(
             continue;
         }
         let mut value_bytes = Vec::new();
-        if let Some(object_gen) = value.qpdf_obj_gen() {
-            let mapped = map(object_gen)?;
-            value_bytes.extend_from_slice(mapped.to_string().as_bytes());
-        } else {
-            crate::writer::output::with_buffer_sink(&mut value_bytes, |out| {
-                value.write_object_with_qpdf_obj_gen_map_and_removed(out, map, removed_refs)
-            })?;
-        }
+        crate::writer::output::with_buffer_sink(&mut value_bytes, |out| {
+            crate::writer::object::write_child_with_ref_map(&value, out, map, removed_refs)
+        })?;
         serialized.push((key, value_bytes));
     }
     Ok(serialized)
