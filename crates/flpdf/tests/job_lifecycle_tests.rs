@@ -3273,6 +3273,63 @@ fn create_qpdf_returns_an_erased_multi_source_document_for_later_write() {
 /// fresh, unencrypted target (`docs/qpdf-correspondence.md`, `flpdf-clq9`),
 /// so a caller that still needs the encrypted primary's own encryption bits
 /// after `create_qpdf` returns cannot read them back from that document.
+/// A failed `create_qpdf` must not leave a previous document's encryption
+/// snapshot visible.
+///
+/// qpdf carries no such snapshot: `handlePageSpecs` mutates the primary
+/// `QPDF` in place (`libqpdf/QPDFJob.cc:2359-2362`), so a later `createQPDF`
+/// cannot observe an earlier document's `/Encrypt` state. These fields exist
+/// only because flpdf's merge builds a fresh target, which makes clearing
+/// them flpdf's responsibility.
+#[test]
+fn a_failed_create_clears_the_previous_encryption_snapshot() {
+    let primary = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
+    let secondary =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("multi-source-encrypted.pdf");
+    let json = serde_json::json!({
+        "inputFile": primary,
+        "outputFile": output,
+        "pages": [
+            {"file": ".", "range": "1"},
+            {"file": secondary, "range": "1"}
+        ]
+    })
+    .to_string();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json).unwrap();
+    job.create_qpdf()
+        .unwrap()
+        .expect("the encrypted multi-source create must succeed");
+    assert!(
+        job.encryption_status().0,
+        "the first create records the primary's encryption bit"
+    );
+
+    // Reuse the *same* job for a document that cannot be opened. qpdf has no
+    // snapshot to go stale here; flpdf must clear its own.
+    let missing = tempdir.path().join("no-such-input.pdf");
+    let second = serde_json::json!({
+        "inputFile": missing,
+        "outputFile": tempdir.path().join("second.pdf"),
+    })
+    .to_string();
+    job.initialize_from_json(&second).unwrap();
+    let _ = job.create_qpdf();
+
+    assert!(
+        !job.encryption_status().0,
+        "a create that never opened a document must not report encryption"
+    );
+    assert!(
+        job.take_primary_copy_encryption().is_none(),
+        "a create that never opened a document must not offer a copy-encryption donor"
+    );
+}
+
 /// `QPDFJob::encryption_status`/`take_primary_copy_encryption` expose the
 /// pre-merge snapshot for exactly that case (flpdf-3yn9.48.192).
 #[test]

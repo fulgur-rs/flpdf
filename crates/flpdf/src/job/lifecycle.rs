@@ -1902,6 +1902,14 @@ impl QPDFJob {
         self.configuration.allow_weak_crypto = value;
     }
 
+    /// Set qpdf's `--allow-insecure` policy for the 256-bit empty-owner-password
+    /// refusal (`QPDFJob::EncConfig::allowInsecure`,
+    /// `libqpdf/QPDFJob_config.cc:1171-1174`; the check itself is
+    /// `QPDFJob.cc:601`).
+    pub fn set_allow_insecure(&mut self, value: bool) {
+        self.configuration.encryption_defaults.allow_insecure = value;
+    }
+
     /// Configure qpdf's linearization writer mode and optional pass-one file.
     pub fn set_linearization(&mut self, value: bool, pass1: Option<PathBuf>) {
         self.configuration.linearize = value;
@@ -3234,6 +3242,16 @@ impl QPDFJob {
     /// error reporting for a missing or malformed input.
     pub fn create_qpdf(&mut self) -> Result<Option<JobDocument>> {
         self.create_qpdf_succeeded_without_document = false;
+        // qpdf holds no cross-document snapshot here: `handlePageSpecs`
+        // mutates the primary `QPDF` in place, so a later `createQPDF` can
+        // never observe a previous document's `/Encrypt` state. These fields
+        // exist only because flpdf's merge builds a fresh target, and
+        // `finish_created_document` clears them only after a successful open.
+        // Reset them at the top so a failed configure or open cannot leave a
+        // prior document's encryption visible to `encryption_status()` and
+        // `take_primary_copy_encryption()`.
+        self.primary_copy_encryption = None;
+        self.encryption_status = EncryptionStatus::default();
         match self.check_configuration() {
             Ok(()) => {}
             Err(error @ Error::Usage(_)) => return Err(error),

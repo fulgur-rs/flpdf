@@ -109,6 +109,7 @@ struct WriterOptions {
     preserve_encryption: bool,
     password_mode: PasswordMode,
     allow_weak_crypto: bool,
+    allow_insecure: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -229,6 +230,7 @@ impl Default for WriterOptions {
             preserve_encryption: true,
             password_mode: PasswordMode::default(),
             allow_weak_crypto: false,
+            allow_insecure: false,
         }
     }
 }
@@ -5074,6 +5076,7 @@ fn apply_encryption_options(options: &mut WriterOptions, inputs: EncryptionCliOp
                         progname()
                     ));
                 }
+                options.allow_insecure = parsed.allow_insecure;
                 options.encrypt = Some(parsed.params);
             }
         }
@@ -5217,6 +5220,12 @@ fn parse_perm_yn(flag: &str, val: &str) -> CliResult<bool> {
 struct ParsedEncryptSegment {
     params: EncryptParams,
     accessibility_warning: bool,
+    /// qpdf keeps `--allow-insecure` on the job
+    /// (`QPDFJob::EncConfig::allowInsecure`,
+    /// `libqpdf/QPDFJob_config.cc:1171-1174`) so `QPDFJob.cc:601`'s refusal
+    /// can see it. The CLI parses the flag here, so it must travel to the job
+    /// rather than being consumed by this segment alone.
+    allow_insecure: bool,
 }
 
 trait RawCliArg {
@@ -5725,6 +5734,7 @@ fn finish_encrypt_segment(
 
     Ok(ParsedEncryptSegment {
         params,
+        allow_insecure,
         accessibility_warning: accessibility_explicitly_disabled
             && matches!(
                 method,
@@ -6252,6 +6262,7 @@ fn configure_rewrite_job(
     job.set_password_is_hex_key(password.password_is_hex_key);
     job.set_suppress_password_recovery(password.suppress_password_recovery);
     job.set_allow_weak_crypto(options.allow_weak_crypto);
+    job.set_allow_insecure(options.allow_insecure);
     job.set_verbose(verbose);
     job.set_progress(options.progress);
     job.set_linearization(linearize, linearize_pass1.map(Path::to_path_buf));
@@ -7423,6 +7434,7 @@ fn run_empty_page_extraction(
     job.set_password_is_hex_key(password.password_is_hex_key);
     job.set_suppress_password_recovery(password.suppress_password_recovery);
     job.set_allow_weak_crypto(options.allow_weak_crypto);
+    job.set_allow_insecure(options.allow_insecure);
     job.set_verbose(verbose);
     configure_keep_files_open(&mut job, page_ops)?;
     {
@@ -8025,6 +8037,7 @@ fn finish_page_extraction<R: Read + Seek + 'static>(
         split_job.set_progress(split_progress);
         split_job.set_password_mode(options.password_mode);
         split_job.set_allow_weak_crypto(options.allow_weak_crypto);
+        split_job.set_allow_insecure(options.allow_insecure);
         split_job.set_linearization(linearize, linearize_pass1.map(std::path::Path::to_path_buf));
         {
             let mut configuration = split_job.config();
@@ -8068,6 +8081,7 @@ fn finish_page_extraction<R: Read + Seek + 'static>(
         write_job.set_progress(options.progress);
         write_job.set_password_mode(options.password_mode);
         write_job.set_allow_weak_crypto(options.allow_weak_crypto);
+        write_job.set_allow_insecure(options.allow_insecure);
         write_job.set_linearization(linearize, linearize_pass1.map(std::path::Path::to_path_buf));
         write_job.set_writer_configuration(writer_configuration_unnormalized(
             &options,
@@ -9755,6 +9769,7 @@ fn configure_attachment_job(
     job.set_suppress_recovery(password.recovery.suppress_recovery);
     job.set_ignore_xref_streams(password.recovery.ignore_xref_streams);
     job.set_allow_weak_crypto(writer_options.allow_weak_crypto);
+    job.set_allow_insecure(writer_options.allow_insecure);
     job.set_progress(writer_options.progress);
     job.set_verbose(verbose);
     job.set_linearization(linearize, linearize_pass1.map(Path::to_path_buf));
