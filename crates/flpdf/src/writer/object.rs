@@ -26,6 +26,32 @@ pub(crate) enum TrailerKind {
     LinearizedSecond { size: i64 },
 }
 
+/// qpdf's `getTrimmedTrailer` structural-key removal set
+/// (`libqpdf/QPDFWriter.cc:2009-2031`): keys the writer always supplies
+/// itself (encryption/modification metadata plus every key that may
+/// originate from a source cross-reference stream), so a source trailer's
+/// own copy must never reach a trailer-entries walk. Every production
+/// consumer of the live source trailer -- `crate::writer::build_writer_trailer_handle`
+/// (classic table and xref-stream routes, which removes these keys in
+/// place before [`write_trailer_with_ref_map_and_kind_and_direct_root`]
+/// walks the result) and
+/// `crate::linearization::writer::canonical_linearization_trailer_entries`
+/// (the linearized two-pass route, which filters them out while walking
+/// since it cannot mutate a shared live handle mid-pass) -- shares this one
+/// list rather than each retyping qpdf's removal set independently.
+pub(crate) const TRIMMED_TRAILER_KEYS: &[&[u8]] = &[
+    b"/ID",
+    b"/Encrypt",
+    b"/Prev",
+    b"/Index",
+    b"/W",
+    b"/Length",
+    b"/Filter",
+    b"/DecodeParms",
+    b"/Type",
+    b"/XRefStm",
+];
+
 /// Stream-dictionary changes selected by qpdf's `willFilterStream` result.
 ///
 /// `remove_filter_parameters` corresponds to `f_filtered` in
@@ -3252,7 +3278,12 @@ pub(crate) fn qpdf_obj_gen_set_from_object_ref_set(
 // top-level `self`. This is the primitive `writer/plain/body.rs`/
 // `writer/plain/plan.rs` actually call in production, so a direct reserved child
 // reaching a live document write is already covered by this path.
-fn write_child_with_ref_map(
+//
+// `pub(crate)` so `linearization::writer::canonical_linearization_trailer_entries`
+// can share this exact reference-vs-direct-value dispatch for its own
+// non-structural trailer values (D14: one child-value serializer instead of
+// linearization retyping the indirect-reference branch independently).
+pub(crate) fn write_child_with_ref_map(
     handle: &ObjectHandle,
     out: &mut OutputSink<'_>,
     map: &QpdfObjGenMap<'_>,

@@ -2,6 +2,25 @@
 //!
 //! qpdf correspondence: QPDFExc.cc and QPDFSystemError.cc concepts combined with flpdf-specific errors; public APIs are incomplete.
 //!
+//! # qpdf deviation (CLAUDE.md category (B)): exception class → enum variant
+//!
+//! qpdf classifies a raised error by which C++ exception class carries it —
+//! `QPDFExc`, or a bare `std::logic_error`/`std::runtime_error`/
+//! `std::range_error`. Rust has no exception hierarchy to mirror, so [`enum@Error`]
+//! carries that axis as variants instead: `Internal` projects
+//! `std::logic_error`; `System` and its byte-preserving counterpart
+//! [`Error::SystemBytes`] project `std::runtime_error`; and
+//! [`Error::QpdfExc`] carries a `QPDFExc`.
+//!
+//! This substitutes the container, not the classification. qpdf's second axis,
+//! `qpdf_error_code_e` (`include/qpdf/Constants.h:84-95`), is preserved rather
+//! than folded: [`QpdfExc`] stores it and [`QpdfExc::get_error_code`] returns
+//! it. Error values are never written into a PDF -- they are returned to a
+//! caller or rendered as diagnostic text -- so the substitution carries no
+//! output-byte risk of its own; whether each call site is assigned the
+//! classification qpdf would assign is a separate question, tracked as route
+//! matrix B32's `mixed` status.
+//!
 use crate::encryption::primitives::PrimitiveError;
 use thiserror::Error;
 
@@ -229,6 +248,21 @@ impl std::error::Error for QpdfExc {}
 /// [`Error::open_failure`]. A strict open wraps its failure the same way once
 /// any diagnostic has been collected, so the wrapper is not exclusive to
 /// permissive opens.
+///
+/// This enum flattens qpdf's C++ exception *class* axis — `QPDFExc` versus a
+/// bare `std::logic_error`/`std::runtime_error`/`std::range_error` — into one
+/// Rust variant set instead of mirroring the class hierarchy. The
+/// `qpdf_error_code_e` axis is **not** folded away: [`Error::QpdfExc`] wraps
+/// [`QpdfExc`], which stores that code and exposes it through
+/// [`QpdfExc::get_error_code`], so callers can still dispatch on it exactly as
+/// qpdf's own callers do. Only the legacy variants that predate `QpdfExc`
+/// carry their classification in the variant alone.
+///
+/// The code takes no part in rendering: `QpdfExc::new` passes only filename,
+/// object, offset, and message to `create_what`, matching
+/// `QPDFExc::createWhat` (`libqpdf/QPDFExc.cc:26-49`), so two otherwise
+/// identical exceptions with different codes render identically — as they do
+/// in qpdf.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("I/O error: {0}")]
