@@ -641,9 +641,18 @@ field the decision follows), and `qdf_special_streams_tests`
 `qdf_special_stream_fixtures_match_qpdf_static_id`), `writer_object_emission_tests`,
 `adbe_ext_qpdf_parity`, `cmp_generate_objstm_prepare_boundary_tests`,
 `cmp_generate_objstm_tests`, and `cmp_linearize_tests` all pass unchanged
-under `--features qpdf-zlib-compat`. D26 remains mixed for the same
-disjoint-slice reason recorded above; this probe closed only the
-normalized-streams gap.
+under `--features qpdf-zlib-compat`. D26 remains mixed, but **2026-09-19 訂正**: 旧記述の「disjoint-slice」という理由は
+この変更で失効した——`SpecialStreams::live_content_stream_state` が
+`normalized_streams_raw` を plain 経路へ渡し、linearized 経路も同じフィールドを
+読むため、両者はもはや別スライスではない。`mixed` が残る本当の理由は
+**qpdf の単一 predicate に対して flpdf が 2 実装を持つこと**: qpdf の
+`QPDFWriter::willFilterStream` は 1 本（`libqpdf/QPDFWriter.cc:1239`）で、
+`writeObject`（`:1539`）と linearized の `skip_stream_parameters` ラムダ
+（`:2546`）が共有する。flpdf は plain 側の `writer/plain/body.rs` インライン gate と
+linearized 側の `linearization/plan.rs::linearization_content_normalize_refs`
+（snapshot が無い場合に qpdf 対応物のない独自 page/content walk へ
+フォールバックする分岐を持つ）の 2 本。この probe が閉じたのは
+normalized-streams のギャップだけ。
 
 **D14 bounded consumer (2026-09-18, `flpdf-ymuj.67`):** the linearized
 classic main trailer now uses `TrailerKind::LinearizedSecond` through the
