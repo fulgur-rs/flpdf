@@ -3611,9 +3611,8 @@ fn collect_content_container_refs<R: Read + Seek>(
 }
 
 /// Collect raw qpdf identities for page-content streams through canonical
-/// `ObjectHandle` inspection. Direct streams and malformed non-stream values
-/// are omitted: direct streams have no object identity for `contents_seq`,
-/// while qpdf only normalizes actual stream objects.
+/// `ObjectHandle` inspection. A direct (non-indirect) value is omitted: it
+/// has no object identity for `contents_seq`.
 ///
 /// This mirrors `QPDFWriter::initializeSpecialStreams`
 /// (`libqpdf/QPDFWriter.cc:1914-1931`): resolve the page `/Contents` handle
@@ -3623,9 +3622,9 @@ fn collect_content_container_refs<R: Read + Seek>(
 /// damage warning for a non-stream array member. qpdf's array branch asks
 /// each child nothing at all -- it pushes every item's `getObjGen()`
 /// unconditionally (`QPDFWriter.cc:1922-1926`); only the scalar branch tests
-/// `isStream()` (`:1927`). flpdf filters array members by stream type here,
-/// which drops the `%% Contents for page N` marker qpdf emits before a
-/// non-stream member. Tracked separately; this route does not change it.
+/// `isStream()` (`:1927`). An indirect array member therefore contributes
+/// its identity here even when it resolves to a non-stream object, which
+/// drives the `%% Contents for page N` marker qpdf emits before it.
 ///
 /// Production reads this identity set through
 /// [`SpecialStreams::live_content_stream_state`], computed once at setup for
@@ -3655,13 +3654,11 @@ pub(crate) fn collect_content_stream_qpdf_obj_gens<R: Read + Seek>(
     };
     let mut refs = Vec::with_capacity(items.len());
     for item in items {
-        if item.type_code()? == 10 {
-            if let Some(object_gen) = item
-                .qpdf_obj_gen()
-                .filter(|object_gen| object_gen.is_indirect())
-            {
-                refs.push(object_gen);
-            }
+        if let Some(object_gen) = item
+            .qpdf_obj_gen()
+            .filter(|object_gen| object_gen.is_indirect())
+        {
+            refs.push(object_gen);
         }
     }
     Ok(refs)
@@ -5197,6 +5194,52 @@ mod final_handle_writer_tests {
         assert!(streams
             .content_container_refs
             .contains(&ObjectRef::new(5, 0)));
+    }
+
+    #[test]
+    fn special_stream_setup_includes_a_non_stream_contents_array_member() {
+        // qpdf's `initializeSpecialStreams` pushes every `/Contents` array
+        // item's `getObjGen()` unconditionally (`QPDFWriter.cc:1921-1926`);
+        // only the *scalar* (non-array) `/Contents` branch tests `isStream()`
+        // (`:1927`). A malformed array member that resolves to a non-stream
+        // object therefore still gets a page-sequence entry and a
+        // `normalized_streams` membership, driving the `%% Contents for page
+        // N` QDF marker before it.
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/qdf-contents-non-stream-member.pdf")
+                .to_vec(),
+        ))
+        .expect("non-stream-member fixture");
+        let options = WriterOptions {
+            qdf: true,
+            ..WriterOptions::default()
+        };
+
+        let streams = initialize_special_streams(&mut pdf, &options)
+            .expect("special-stream setup succeeds")
+            .expect("qdf setup must create a snapshot");
+
+        let page = ObjectRef::new(3, 0);
+        let stream_member = ObjectRef::new(5, 0);
+        let non_stream_member = ObjectRef::new(4, 0);
+        assert_eq!(streams.pages, vec![page]);
+        assert_eq!(streams.contents_seq.get(&stream_member), Some(&1));
+        assert_eq!(
+            streams.contents_seq.get(&non_stream_member),
+            Some(&1),
+            "a non-stream /Contents array member must still get a page-sequence entry, like qpdf"
+        );
+        assert!(streams
+            .normalized_streams_raw()
+            .contains(&QpdfObjGen::from_valid_object_ref_for_test(stream_member)));
+        assert!(
+            streams
+                .normalized_streams_raw()
+                .contains(&QpdfObjGen::from_valid_object_ref_for_test(
+                    non_stream_member
+                )),
+            "a non-stream /Contents array member must still be in normalized_streams, like qpdf"
+        );
     }
 
     #[test]
