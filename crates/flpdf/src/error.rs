@@ -6,7 +6,7 @@
 //!
 //! qpdf classifies a raised error by which C++ exception class carries it —
 //! `QPDFExc`, or a bare `std::logic_error`/`std::runtime_error`/
-//! `std::range_error`. Rust has no exception hierarchy to mirror, so [`Error`]
+//! `std::range_error`. Rust has no exception hierarchy to mirror, so [`enum@Error`]
 //! carries that axis as variants instead: `Internal` projects
 //! `std::logic_error`, `System` projects `std::runtime_error`, and
 //! [`Error::QpdfExc`] carries a `QPDFExc`.
