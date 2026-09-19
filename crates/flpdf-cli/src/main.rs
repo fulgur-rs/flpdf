@@ -4297,6 +4297,14 @@ fn run_json(
     // configurator sets it only when it has a transformation to install.
     job.set_verbose(cli.verbose);
     configure_top_level_attachment_mutations(&mut job, cli, attachment_segments)?;
+    // The page-source file lifetime is a property of the job that runs the
+    // merge, not of the write route: `QPDFJob::handlePageSpecs` consults
+    // `m->keep_files_open` when it decides whether to hold every donor open
+    // (`QPDFJob.cc:2404-2434`), and that runs inside `createQPDF` for JSON
+    // output as much as for a PDF write. Without this the explicit
+    // `--keep-files-open=n` is dropped and the job re-derives the policy from
+    // the source count, announcing a selection qpdf never makes.
+    configure_keep_files_open(&mut job, &cli.page_ops)?;
 
     // qpdf applies page selection, rotations, and underlay/overlay before the
     // remaining create-stage transformations inside `createQPDF`
@@ -4335,6 +4343,28 @@ fn run_json(
         }
         for parameter in &cli.page_ops.rotate {
             configuration.rotate(arg_parser::os_bytes(parameter.as_os_str()))?;
+        }
+        // An explicit `--remove-unreferenced-resources` must reach the job, or
+        // it stays at `Auto` and the shared-resource heuristic decides instead
+        // -- which qpdf only does when the option was not given
+        // (`QPDFJob.cc:2484-2510`). The other `create_qpdf` page-selection
+        // routes set this the same way.
+        configuration.remove_unreferenced_resources(cli.remove_unreferenced_resources.into());
+        // qpdf reuses `--encryption-file-password` for a page source whose
+        // filename matches the `--copy-encryption` donor
+        // (`QPDFJob.cc:1240-1252`). That fallback needs the donor configured
+        // on this job; otherwise the donor opens with an empty password.
+        if let Some(path) = cli.copy_encryption.as_ref() {
+            let password = cli
+                .raw_encryption_file_password
+                .clone()
+                .or_else(|| {
+                    cli.encryption_file_password
+                        .as_ref()
+                        .map(|password| arg_parser::os_bytes(password))
+                })
+                .unwrap_or_default();
+            configuration.copy_encryption(path.clone(), password);
         }
         if empty {
             configuration.empty_input()?;

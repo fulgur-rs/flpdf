@@ -1127,7 +1127,16 @@ fn handle_page_specs_into<R: Read + Seek + 'static, T: Read + Seek + 'static>(
     // page tree has its final shape, so JSON metadata (and any other
     // consumer of the flag/object-cache state) observes the same
     // target-document state qpdf's per-page loop would have left behind.
-    crate::PageDocumentHelper::new(&mut merged).push_inherited_attributes_to_pages()?;
+    //
+    // A selection that resolves to no pages makes zero `insertPage` calls, so
+    // qpdf never reaches that side effect at all; reproducing it anyway would
+    // report `pushedinheritedpageresources` as true for an empty result.
+    if !crate::PageDocumentHelper::new(&mut merged)
+        .get_all_pages()?
+        .is_empty()
+    {
+        crate::PageDocumentHelper::new(&mut merged).push_inherited_attributes_to_pages()?;
+    }
     for source in sources.iter() {
         job.record_document_warnings(source);
     }
