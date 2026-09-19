@@ -6,8 +6,7 @@ use clap::{Args as ClapArgs, CommandFactory, FromArgMatches, Parser, Subcommand,
 use flpdf::fix_qdf;
 use flpdf::job::{
     copy_duplicate_page_annotations, AttachmentAddOptions, CheckError, FlattenAnnotationsMode,
-    ImageOptimizationOptions, JobExitCode, JsonStreamData, PageSpecInput, PageSpecJobOutput,
-    QPDFJob, RemoveUnreferencedResources,
+    ImageOptimizationOptions, JobExitCode, JsonStreamData, QPDFJob, RemoveUnreferencedResources,
 };
 use flpdf::pipeline::{FlateAction, Pipeline, PipelineHandle, PlFlate, PlStdioFile};
 use flpdf::qutil::same_file as qpdf_same_file;
@@ -40,15 +39,11 @@ type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
 /// it is not a library-facing page-plan type.
 struct CliInputSpec {
     path: PathBuf,
-    range: PageRange,
 }
 
 impl CliInputSpec {
-    fn new(path: impl Into<PathBuf>, range: PageRange) -> Self {
-        Self {
-            path: path.into(),
-            range,
-        }
+    fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
     }
 }
 
@@ -4300,6 +4295,14 @@ fn run_json(
     job.set_suppress_password_recovery(cli.password.suppress_password_recovery);
     job.set_suppress_recovery(cli.password.recovery.suppress_recovery);
     job.set_ignore_xref_streams(cli.password.recovery.ignore_xref_streams);
+    // `create_qpdf`'s primary-input open reads the password from the job's
+    // own configuration rather than an argument, unlike the CLI-local
+    // `open_pdf_from_file`/`pdf_open_options` helper this route used before.
+    // Reuse that helper only for its `--password`/`--password-file` decoding
+    // (hex-key parsing, `-` for stdin, and so on) and set the resulting bytes
+    // on the job.
+    let input_options = pdf_open_options(cli.repair, &cli.password)?;
+    job.set_password(input_options.password);
     // qpdf builds this diagnostic from `pdf.getFilename()`
     // (`libqpdf/QPDFJob.cc:2129-2130`), so the create-stage job needs the
     // same input name the write routes already set.
@@ -4313,10 +4316,15 @@ fn run_json(
     job.set_verbose(cli.verbose);
     configure_top_level_attachment_mutations(&mut job, cli, attachment_segments)?;
 
-    // qpdf applies rotations after page selection and before underlay/overlay
-    // and the remaining create-stage transformations
-    // (`libqpdf/QPDFJob.cc:466-473`). Queue the raw parameters on this job so
-    // every JSON input branch observes the same canonical rotation boundary.
+    // qpdf applies page selection, rotations, and underlay/overlay before the
+    // remaining create-stage transformations inside `createQPDF`
+    // (`libqpdf/QPDFJob.cc:428-481`), and only then does `writeQPDF` serialize
+    // JSON (`libqpdf/QPDFJob.cc:428-480,484-489`). Queue every create-stage
+    // configuration on this job so all three JSON input branches
+    // (empty/json-input/plain) share the same canonical `create_qpdf`
+    // boundary that `QPDFJob::prepare_document` already implements for the
+    // rewrite/page-operation routes, instead of hand-rolling a narrower,
+    // primary-input-only page-spec path here.
     //
     // The JSON output selectors belong to the same configuration: `writeQPDF`
     // dispatches on `createsOutput()` and `writeOutfile` chooses `writeJSON`'s
@@ -4325,6 +4333,24 @@ fn run_json(
     // never travels as a separate argument.
     {
         let mut configuration = job.config();
+        if !cli.page_ops.pages.is_empty() {
+            let raw_specs = configured_page_specs(&cli.page_ops)?;
+            for spec in &raw_specs {
+                let password = spec.raw_password.clone().or_else(|| {
+                    spec.password
+                        .as_ref()
+                        .map(|password| arg_parser::os_bytes(password))
+                });
+                configuration.add_page_spec(
+                    PathBuf::from(&spec.file_token),
+                    &spec.range,
+                    password,
+                )?;
+            }
+        }
+        for parameter in &cli.page_ops.collate {
+            configuration.collate(parameter.as_bytes())?;
+        }
         for parameter in &cli.page_ops.rotate {
             configuration.rotate(arg_parser::os_bytes(parameter.as_os_str()))?;
         }
@@ -4336,6 +4362,12 @@ fn run_json(
                     .expect("a non-empty JSON job has an input")
                     .to_path_buf(),
             )?;
+        }
+        if cli.json_input {
+            configuration.json_input();
+        }
+        if let Some(update_from_json) = cli.update_from_json.as_deref() {
+            configuration.update_from_json(update_from_json.to_path_buf());
         }
         if let Some(path) = output_path {
             configuration.output_file(path.to_path_buf())?;
@@ -4364,6 +4396,24 @@ fn run_json(
             configuration.decode_level(StreamDecodeLevel::from(decode_level));
         }
     }
+    // `create_qpdf`'s `prepare_document` already applies every create-stage
+    // transformation queued on the configuration (rotations, copy-attachments,
+    // page selection, ...) exactly once (`libqpdf/QPDFJob.cc:428-481`).
+    // Queue the inspection-only transformations (image externalization,
+    // appearance generation, annotation/rotation flattening,
+    // remove-restrictions, coalesce-contents) here too, on the *same*
+    // configuration, instead of applying them a second time afterward through
+    // `QPDFJob::apply_transformations` -- that second pass would re-run
+    // `prepare_document_transformations` against the unchanged configuration
+    // and re-execute already-applied, non-idempotent steps such as
+    // `copy_attachments_from`.
+    configure_top_level_inspection_transformations(
+        &mut job,
+        transform_options,
+        cli.verbose,
+        cli.remove_restrictions,
+        cli.coalesce_contents,
+    )?;
     job.set_show_encryption_key(cli.show_encryption_key);
     // `QPDFJob::createQPDF` runs `checkConfiguration` before it opens the
     // primary input (`libqpdf/QPDFJob.cc:428-431`). It assigns the implicit
@@ -4372,108 +4422,16 @@ fn run_json(
     // the stream the document itself needs (`:582-586,613-625`).
     job.check_configuration()?;
 
-    if empty {
-        let mut pdf = create_empty_primary_document(&mut job, cli.update_from_json.as_deref())?;
-        apply_top_level_inspection_transformations(
-            &mut job,
-            &mut pdf,
-            transform_options,
-            cli.verbose,
-            cli.remove_restrictions,
-            cli.coalesce_contents,
-        )?;
-        return run_json_document(&mut job, &mut pdf);
-    }
-
-    let input = input.expect("non-empty JSON route has an input");
-
-    // 5. Open the input. JSON input uses the canonical complete-document
-    // importer; a partial update is applied immediately after
-    // creation/opening.
-    let input_file = File::open(input).map_err(|error| {
-        if cli.json_input {
-            qpdf_json_input_open_error(input, error)
-        } else {
-            json_input_open_error(input, error)
+    let mut pdf = match job.create_qpdf()? {
+        Some(pdf) => pdf,
+        None => {
+            return Err(Box::new(CliExitError {
+                code: ExitCode::Errors,
+                message: String::new(),
+            }))
         }
-    })?;
-    if cli.json_input {
-        let mut pdf = job
-            .create_from_json_document(input_file, path_description(input))
-            .map_err(|error| json_error_with_file(input, Box::new(error)))?;
-        apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
-        apply_top_level_inspection_transformations(
-            &mut job,
-            &mut pdf,
-            transform_options,
-            cli.verbose,
-            cli.remove_restrictions,
-            cli.coalesce_contents,
-        )?;
-        run_json_document(&mut job, &mut pdf)
-    } else {
-        let mut pdf =
-            open_pdf_from_file(input, input_file, cli.repair, &cli.password, cli.no_warn)?;
-        job.record_document_warnings(&pdf);
-        apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
-        apply_json_page_specs(&mut job, &mut pdf, input, &cli.page_ops)?;
-        apply_top_level_inspection_transformations(
-            &mut job,
-            &mut pdf,
-            transform_options,
-            cli.verbose,
-            cli.remove_restrictions,
-            cli.coalesce_contents,
-        )?;
-        run_json_document(&mut job, &mut pdf)
-    }
-}
-
-/// Apply the single-source `--pages` operation before qpdf JSON output.
-///
-/// qpdf's `createQPDF` applies `handlePageSpecs` after opening and updating the
-/// primary document, and only then does `writeQPDF` serialize JSON
-/// (`libqpdf/QPDFJob.cc:428-480`). Keep the JSON route on the existing page-job
-/// boundary so page-tree repair and inherited-attribute state are shared with
-/// ordinary page operations.
-fn apply_json_page_specs<R: Read + Seek + 'static>(
-    job: &mut QPDFJob,
-    pdf: &mut Pdf<R>,
-    primary_input: &Path,
-    page_ops: &PageOpArgs,
-) -> CliResult<()> {
-    if page_ops.pages.is_empty() {
-        return Ok(());
-    }
-
-    let raw_specs = configured_page_specs(page_ops)?;
-    let inputs = resolve_page_specs(&raw_specs, primary_input)?;
-    if inputs.iter().any(|input| input.path != primary_input) {
-        return Err("--pages: JSON output currently accepts only the primary input source".into());
-    }
-    let specs: Vec<_> = inputs
-        .into_iter()
-        .map(|input| PageSpecInput::new(0, input.range))
-        .collect();
-    let collate = parse_collate_values(&page_ops.collate)?;
-    match job.handle_page_specs(
-        std::slice::from_mut(pdf),
-        &specs,
-        collate.as_deref(),
-        RemoveUnreferencedResources::Auto,
-        false,
-    )? {
-        PageSpecJobOutput::InPlace {
-            pdf,
-            result,
-            prune_mode,
-        } => {
-            QPDFJob::complete_in_place_page_selection(pdf, &result, prune_mode).map_err(Into::into)
-        }
-        PageSpecJobOutput::Merged(_) => {
-            Err("--pages: JSON output unexpectedly selected a multi-source page job".into())
-        }
-    }
+    };
+    run_json_document(&mut job, &mut pdf)
 }
 
 fn run_json_input_inspection(
@@ -6668,9 +6626,12 @@ fn resolve_page_specs(
         } else {
             PathBuf::from(&s.file_token)
         };
-        let range = if s.range.is_empty() {
-            PageRange::all()
-        } else {
+        // The range itself is validated here (for the same CLI-boundary usage
+        // errors the former route reported) but not retained: page-spec
+        // ranges now travel to `QPDFJob::add_page_spec` as the original
+        // string, matching qpdf's `handlePageSpecs`. The per-segment
+        // password likewise no longer needs to be carried here.
+        if !s.range.is_empty() {
             PageRange::parse_numrange(&s.range).map_err(|e| {
                 let message = e
                     .raw_message()
@@ -6680,12 +6641,9 @@ fn resolve_page_specs(
                 what.extend_from_slice(b": ");
                 what.extend_from_slice(message);
                 Box::new(Error::SystemBytes(what)) as Box<dyn std::error::Error>
-            })?
-        };
-        // The per-segment password now travels on the job's page-spec
-        // configuration (`QPDFJob::add_page_spec`), matching qpdf's
-        // `handlePageSpecs`, so this CLI-local spec no longer carries it.
-        out.push(CliInputSpec::new(path, range));
+            })?;
+        }
+        out.push(CliInputSpec::new(path));
     }
     Ok(out)
 }
@@ -8556,15 +8514,6 @@ fn reject_same_file(
     Ok(())
 }
 
-fn json_input_open_error(input: &Path, error: std::io::Error) -> Box<dyn std::error::Error> {
-    let rendered = error.to_string();
-    let message = error
-        .raw_os_error()
-        .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
-        .unwrap_or(&rendered);
-    format!("open {}: {message}", input.display()).into()
-}
-
 fn qpdf_json_input_open_error(input: &Path, error: std::io::Error) -> Box<dyn std::error::Error> {
     let rendered = error.to_string();
     let message = match error.kind() {
@@ -8974,16 +8923,6 @@ fn open_pdf_with_suppression(
     suppress_warnings: bool,
 ) -> CliResult<Pdf<BufReader<File>>> {
     open_pdf_impl(input, repair, password, suppress_warnings)
-}
-
-fn open_pdf_from_file(
-    input: &Path,
-    file: File,
-    repair: bool,
-    password: &PasswordArgs,
-    suppress_warnings: bool,
-) -> CliResult<Pdf<BufReader<File>>> {
-    open_pdf_file_impl(input, file, repair, password, suppress_warnings, false)
 }
 
 /// Open for the read-only encryption inspections (`show-encryption`,

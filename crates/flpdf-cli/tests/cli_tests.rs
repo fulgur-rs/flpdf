@@ -42,7 +42,49 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
 }
 
+/// Mirror the CLI's file-open error text, matching qpdf's own message.
+///
+/// qpdf's `QUtil::safe_fopen` reports open failures via
+/// `QPDFSystemError`/`strerror` (`QUtil.cc:453-527`,
+/// `QPDFSystemError.cc:18-27`), which is the C runtime's errno-derived text
+/// -- the same on every platform qpdf builds for, including Windows (MSVC's
+/// `strerror_s`), not the OS-native message `std::io::Error`'s `Display`
+/// renders (e.g. Win32's "The system cannot find the file specified."
+/// instead of "No such file or directory"). `qpdf_file_io_source_message`
+/// in `crates/flpdf/src/job/lifecycle.rs` reproduces that fixed mapping for
+/// the common cases; keep this test oracle in sync with it rather than with
+/// `std::io::Error`'s platform-native rendering.
 fn normalized_os_message(error: &std::io::Error) -> String {
+    let message = match error.kind() {
+        std::io::ErrorKind::NotFound => Some("No such file or directory"),
+        std::io::ErrorKind::PermissionDenied => Some("Permission denied"),
+        std::io::ErrorKind::AlreadyExists => Some("File exists"),
+        std::io::ErrorKind::InvalidInput => Some("Invalid argument"),
+        std::io::ErrorKind::IsADirectory => Some("Is a directory"),
+        std::io::ErrorKind::NotADirectory => Some("Not a directory"),
+        _ => None,
+    };
+    if let Some(message) = message {
+        return message.to_owned();
+    }
+    let rendered = error.to_string();
+    error
+        .raw_os_error()
+        .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
+        .unwrap_or(&rendered)
+        .to_owned()
+}
+
+/// Mirror `crate::json_inspect::side_file_io_error`
+/// (`crates/flpdf/src/json_inspect.rs:370-389`), which renders a JSON
+/// side-file open failure through `std::io::Error`'s platform-native
+/// `Display` (with the "(os error N)" suffix stripped) rather than through
+/// `qpdf_file_io_source_message`'s fixed qpdf-strerror mapping that
+/// [`normalized_os_message`] mirrors. The two production error paths use
+/// different renderings (a pre-existing inconsistency, unrelated to this
+/// PR), so this test oracle must match the one the side-file path actually
+/// takes.
+fn normalized_side_file_os_message(error: &std::io::Error) -> String {
     let message = error.to_string();
     error
         .raw_os_error()
@@ -4542,7 +4584,7 @@ fn json_side_file_error_emits_recorded_warning_after_partial_json_before_fatal_e
     let open_error = std::fs::File::create(&side_path).unwrap_err();
     let expected_fatal = format!(
         "flpdf: open {side_path}: {}",
-        normalized_os_message(&open_error)
+        normalized_side_file_os_message(&open_error)
     );
     assert_eq!(
         stderr.lines().last(),
