@@ -1015,7 +1015,7 @@ trigger 一覧が不完全になる。
 | main | remove-restrictions |  | yes |
 | main | remove-unreferenced-resources |  | yes |
 | main | replace-input |  |  |
-| main | report-memory-usage |  |  |
+| main | report-memory-usage |  | yes |
 | main | requires-password |  | yes |
 | main | rotate |  | yes |
 | main | set-page-labels | yes | yes |
