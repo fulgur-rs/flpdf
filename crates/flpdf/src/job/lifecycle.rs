@@ -25,7 +25,7 @@ use crate::linearization::{show_linearization_pdf_with_warnings, ShowLinearizati
 use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
 use crate::qutil::{qpdf_string_to_int_checked, QpdfIntParse};
 use crate::{
-    AcroFormDocumentHelper, Error, ObjectHandle, ObjectStreamMode, PageDocumentHelper,
+    AcroFormDocumentHelper, Error, ObjectHandle, ObjectRef, ObjectStreamMode, PageDocumentHelper,
     PageObjectHelper, Pdf, PdfOpenOptions, PdfVersion, PdfWriter, QPDFLogger, ReadSeek, Result,
     UsageError, WriterConfiguration,
 };
