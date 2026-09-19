@@ -4093,6 +4093,47 @@ mod final_handle_writer_tests {
         assert_eq!(second, b"<< /Type /XRef /Size 6 /ID [<696430><696431>] >>");
     }
 
+    /// `xref_stream=true` combined with `qdf=true` is qpdf's shape for a QDF
+    /// file whose writer generated (or preserved) object streams: qpdf's
+    /// `writeXRefStream` writes the fixed dictionary prefix itself, then
+    /// calls the *same* `writeTrailer(which, size, xref_stream=true, ...)`
+    /// used by the classic table route (`QPDFWriter.cc:2470,1159-1236`).
+    /// `xref_stream=true` skips the `trailer <<` keyword in both modes;
+    /// `qdf` only ever controls whether a `\n` separates it from the caller's
+    /// prefix (`writeStringQDF("\n")` runs unconditionally after the
+    /// `if (xref_stream) {...} else {writeString("trailer <<");}` branch).
+    /// This is the cell no production caller exercised before this owner
+    /// became the xref-stream-embedded route's single trailer serializer.
+    #[test]
+    fn shared_trailer_contract_qdf_xref_stream_omits_trailer_keyword_but_keeps_newline() {
+        let (_pdf, trailer, root_ref, encrypt_ref) = shared_trailer_contract_fixture();
+        let map = |object_ref| Ok(object_ref);
+        let removed = BTreeSet::new();
+
+        let mut output = b"<< /Type /XRef".to_vec();
+        output::with_buffer_sink(&mut output, |out| {
+            trailer.write_trailer_with_ref_map_and_kind(
+                out,
+                TrailerKind::Normal { size: 6 },
+                true,
+                true,
+                None,
+                &map,
+                &removed,
+                true,
+            )
+        })
+        .expect("QDF xref-stream-embedded trailer succeeds");
+        assert_eq!(
+            output,
+            format!(
+                "<< /Type /XRef\n  /CustomRef {} 0 R\n  /Info 1\n  /Name /N\n  /Root {} 0 R\n  /Size 6\n  /ID [<696430><696431>] /Encrypt {} 0 R\n>>\n",
+                root_ref.number, root_ref.number, encrypt_ref.number
+            )
+            .as_bytes()
+        );
+    }
+
     #[test]
     fn linearized_second_trailer_synthesizes_a_missing_size_like_qpdf() {
         let (_pdf, trailer, _root_ref, _encrypt_ref) = shared_trailer_contract_fixture();
