@@ -106,9 +106,15 @@ impl SharedObjectHintEntry {
 // Closure helpers
 // ---------------------------------------------------------------------------
 
-/// The set of indirect page-content stream refs, matching the plain
-/// writer's `contents_seq` identity gate
-/// (`writer.rs`'s `options.content_normalization && contents_seq.contains_key(old_ref)`).
+/// The raw set of page-content stream identities, keyed by [`QpdfObjGen`]
+/// like qpdf's `old_og`-keyed membership test (`QPDFWriter.cc:1279`). The
+/// snapshot branch clones a `BTreeSet<QpdfObjGen>` and the fallback inserts
+/// each handle's raw `qpdf_obj_gen()`, so a `gen >= 65535` content stream
+/// stays in it -- which is what
+/// `linearized_normalizes_a_raw_page_content_and_drops_its_parameters`
+/// relies on. **2026-09-19**: the plain writer now reads the same raw
+/// representation instead of the `ObjectRef`-projected `contents_seq` gate,
+/// so the two routes agree on this identity.
 ///
 /// Empty when `options.content_normalization` is off: qpdf's own
 /// `m->normalize_content && m->normalized_streams.count(old_og)` gate
