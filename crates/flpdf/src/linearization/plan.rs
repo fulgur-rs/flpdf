@@ -2313,12 +2313,42 @@ impl LinearizationPlan {
                     optimization.page_users(*r).count() == 1
                 })
                 .collect();
+            // qpdf categorizes the page object itself into lc_other_page_private
+            // during the object-user classification pass, then asserts that
+            // placement immediately before pushing it into part7
+            // (QPDF_linearization.cc:1226-1231). A page reached by any user
+            // besides its own Page(page_idx) entry -- a shared /Kids slot, a
+            // non-/Root trailer key, an outline, an open-document key, or a
+            // thumbnail -- fails this invariant and qpdf refuses to linearize.
+            if !private.contains(&page_refs[page_idx]) {
+                return Err(qpdf_stop_on_error(
+                    pdf,
+                    format!(
+                        "INTERNAL ERROR: QPDF::calculateLinearizationData: page object for page {page_idx} not in lc_other_page_private"
+                    ),
+                ));
+            }
             if page_idx < page_hints.len() {
                 // Use private count; guarantee at least 1 so hint table isn't all zeros.
                 let count = private.len().max(1) as u32;
                 page_hints[page_idx].object_count = count;
             }
             per_page_private_objects.push(private);
+        }
+
+        // qpdf places the Pages tree into part9 by looking up
+        // `m->obj_user_to_objects[ObjUser(ou_root_key, "/Pages")]` and stops
+        // if that set is empty (QPDF_linearization.cc:1279-1283) -- a direct
+        // (non-indirect) /Pages value, or a missing /Pages key, leaves no
+        // object-user entry to place. This must be checked here, not
+        // defaulted to a fallback in a later derived view: qpdf treats an
+        // empty pages-tree user set as a fatal internal-consistency error,
+        // not a value to substitute.
+        if optimization.objects_for_root_key(b"Pages").next().is_none() {
+            return Err(qpdf_stop_on_error(
+                pdf,
+                b"found empty pages tree while calculating linearization data",
+            ));
         }
 
         // ----------------------------------------------------------------
