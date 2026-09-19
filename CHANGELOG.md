@@ -232,6 +232,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1](https://github.com/fulgur-rs/flpdf/compare/v0.7.0...v0.7.1) - 2026-09-19
+
+### Other
+
+- Merge pull request #2208 from fulgur-rs/b199-objstm-eligibility-impl
+- remove qpdf-unmatched /Type /ObjStm,/XRef exclusion from ObjStm eligibility (flpdf-3yn9.48.199, D6)
+- write-through attempt_recovery via CanonicalTrailerOwner (flpdf-3yn9.48.176, B26)
+- port stopOnError invariants for page-private and pages-tree checks (flpdf-rbyc6, :1232, :1283)
+
 ## [0.7.0](https://github.com/fulgur-rs/flpdf/compare/v0.6.0...v0.7.0) - 2026-09-19
 
 ### Added
