@@ -73,6 +73,22 @@ pub(crate) trait CanonicalTrailerOwner {
     fn install_xref_entries(&self, entries: BTreeMap<ObjectRef, XrefEntry>);
     fn discard_cached_generations(&self, object_gens: &[QpdfObjGen]);
     fn set_header_offset(&self, offset: usize);
+    /// Flips the owner's reconstruction flag on, mirroring qpdf's
+    /// `m->reconstructed_xref = true` inside `reconstruct_xref`
+    /// (`QPDF.cc:518-524`), which runs both at open time (`:464`) and during
+    /// object resolution (`:1617`) against the same `QPDF` instance. Xref
+    /// loading calls this the moment its own reconstruction succeeds, so the
+    /// owner's guard is armed by the loader itself rather than batched into a
+    /// returned struct and applied afterward.
+    ///
+    /// The sequence point is not yet qpdf's. qpdf assigns the flag on entry,
+    /// before it warns and before the scan runs, so a recovery that re-enters
+    /// mid-scan is rejected and a scan that fails partway still leaves the
+    /// flag set; this call happens once the scan has succeeded. Moving it to
+    /// the entry point fails nine tests today, because this crate's
+    /// candidate-xref re-entry does re-enter recovery while the scan is
+    /// running.
+    fn set_reconstructed_xref(&self);
     /// qpdf's live `m->file` source boundary (`QPDF.hh:67-97,1453-1457`).
     /// Xref loading uses these operations instead of a complete input
     /// snapshot.
@@ -147,6 +163,10 @@ impl<R: Read + Seek + 'static> CanonicalTrailerOwner for ResolverHandle<R> {
 
     fn set_header_offset(&self, offset: usize) {
         ResolverHandle::set_header_offset(self, offset);
+    }
+
+    fn set_reconstructed_xref(&self) {
+        ResolverHandle::set_reconstructed_xref(self, true);
     }
 
     fn read_object_at_offset(
@@ -227,15 +247,6 @@ pub(crate) struct LoadedXrefState {
     pub(crate) trailer_references: BTreeSet<ObjectRef>,
     pub(crate) parsed_xref_streams: BTreeMap<ObjectRef, ObjectHandle>,
     pub(crate) header_offset: usize,
-    /// True when open-time xref recovery via linear scan already ran.
-    ///
-    /// qpdf `m->reconstructed_xref` (`QPDF.cc:524`) is set inside
-    /// `reconstruct_xref` which runs both at open time (`:464`) and during
-    /// object resolution (`:1617`). Carrying this into the resolver lets it
-    /// initialize `ResolverCore::reconstructed_xref` correctly so that a second
-    /// full reconstruction scan is not performed when an object from an
-    /// already-recovered table later fails to parse.
-    pub(crate) already_reconstructed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1411,7 +1422,6 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
             trailer_references,
             parsed_xref_streams: BTreeMap::new(),
             header_offset: 0,
-            already_reconstructed: false,
         };
         for diagnostic in trailer_diags {
             loaded.loaded.repair_diagnostics.push(diagnostic);
@@ -2133,6 +2143,7 @@ fn recover_xref_from_linear_scan(
         canonical_trailer_owner.discard_cached_generations(&discarded_generations);
         discard_trailer_references(&mut trailer_references, &discarded_generations);
     }
+    canonical_trailer_owner.set_reconstructed_xref();
     Ok(LoadedXrefState {
         loaded: LoadedXref {
             version,
@@ -2149,7 +2160,6 @@ fn recover_xref_from_linear_scan(
         trailer_references,
         parsed_xref_streams,
         header_offset: 0,
-        already_reconstructed: true,
     })
 }
 
@@ -3590,7 +3600,6 @@ fn parse_xref_stream_with_canonical_owner(
         // rows as non-live while retaining them in the complete canonical cache view.
         parsed_xref_streams: BTreeMap::from([(object_ref, handle_object)]),
         header_offset: 0,
-        already_reconstructed: false,
     };
     // cov:ignore-start: CanonicalXrefContext never defers reconstruction; the live resolver performs any read-time recovery internally.
     if let Some(error) = reconstruction_trigger {
@@ -4053,7 +4062,7 @@ mod final_handle_tests {
         )
         .expect("canonical recovery should rebuild a nonzero malformed startxref");
 
-        assert!(state.already_reconstructed);
+        assert!(resolver.reconstructed_xref());
         assert_eq!(state.loaded.trailer.object_ref(), None);
     }
 
@@ -4588,7 +4597,6 @@ mod final_handle_tests {
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
             header_offset: 0,
-            already_reconstructed: false,
         }
     }
 
@@ -4905,7 +4913,6 @@ mod final_handle_tests {
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
             header_offset: 0,
-            already_reconstructed: false,
         };
         let resolver = canonical_test_resolver(Vec::new(), BTreeMap::new(), false, 68);
         let mut registration = XrefRegistration::default();
@@ -5333,6 +5340,8 @@ mod final_handle_tests {
         fn discard_cached_generations(&self, _object_gens: &[QpdfObjGen]) {} // cov:ignore: failure-injection owner has no canonical cache to purge
 
         fn set_header_offset(&self, _offset: usize) {}
+
+        fn set_reconstructed_xref(&self) {} // cov:ignore: failure-injection owner never reaches a successful reconstruction
 
         fn source_seek(&self, _offset: u64) -> Result<()> {
             Ok(())
@@ -5949,17 +5958,17 @@ mod final_handle_tests {
     #[test]
     fn hybrid_xref_stream_with_indirect_filter_loads_without_reconstruction() {
         let bytes = hybrid_xref_with_indirect_filter();
-        let (_owner, result) = load_xref_state_through_canonical_owner(
+        let (owner, result) = load_xref_state_through_canonical_owner(
             std::io::Cursor::new(bytes),
             XrefLoadOptions::default(),
             crate::QPDFLogger::create(),
             true,
             45,
         );
-        let state = result.expect("hybrid xref with an indirect /Filter must load");
+        let _state = result.expect("hybrid xref with an indirect /Filter must load");
 
         assert!(
-            !state.already_reconstructed,
+            !owner.reconstructed_xref(),
             "a valid indirect /Filter on the /XRefStm stream must not force \
              cross-reference reconstruction"
         );
@@ -6189,9 +6198,9 @@ mod final_handle_tests {
             true,
             46,
         );
-        let recovered =
+        let _recovered =
             recovered_result.expect("repair mode must complete the recovered size revalidation");
-        assert!(recovered.already_reconstructed);
+        assert!(recovered_owner.reconstructed_xref());
         assert!(recovered_owner
             .repair_diagnostics()
             .entries()
