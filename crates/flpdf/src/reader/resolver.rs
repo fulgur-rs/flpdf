@@ -3,6 +3,26 @@
 //!
 //! qpdf correspondence: `QPDF::resolve` (`libqpdf/QPDF.cc:1700-1753`) and the `QPDF::Members` fields it touches.
 //!
+//! # qpdf deviations recorded here
+//!
+//! Two behaviours in `replace_object`/`swap_objects` have no qpdf
+//! counterpart. Both carry an inline deviation marker at their sites, and
+//! `docs/qpdf-correspondence.md` carries the full rationale.
+//!
+//! 1. **xref-less-generation provenance** (CLAUDE.md category (C)): qpdf's
+//!    `updateCache` (`QPDF.cc:1842-1858`) stores whatever object it is handed
+//!    with no record of the caller, so `m->obj_cache` cannot distinguish a
+//!    replacement from a dangling `resolve`. flpdf records the provenance only
+//!    because `ResolverCore`'s split complete/live object-ref views need it
+//!    (`flpdf-uwn0`). Output bytes are unchanged.
+//! 2. **Foreign-owner guard** — *not* category (C), because it does change
+//!    output. `QPDF::replaceObject` (`QPDF.cc:1986-1993`) rejects only an
+//!    indirect or uninitialized handle and never calls `checkOwnership`, so a
+//!    direct value holding a foreign indirect child succeeds there and is
+//!    written; here it returns `Unsupported` and nothing is written. It stays
+//!    marked as an unresolved behavioral divergence, tracked by route matrix
+//!    A17, rather than being recorded as sanctioned scaffolding.
+//!
 //! # Why this exists as its own owner
 //!
 //! `DocumentResolver::resolve_indirect` takes `&self`
@@ -1898,9 +1918,18 @@ impl<R: Read + Seek> ResolverHandle<R> {
         }
         // qpdf-deviation: qpdf's own `QPDF::replaceObject` (`QPDF.cc:1986-1993`)
         // never calls `checkOwnership` -- it rejects only an indirect or
-        // uninitialized handle. This descendant-graph walk is flpdf's own
-        // defense against a foreign indirect object nested below the
-        // replacement value; see `ObjectHandle::belongs_exclusively_to_pdf`.
+        // uninitialized handle, then calls `updateCache`. This
+        // descendant-graph walk is flpdf's own defense against a foreign
+        // indirect object nested below the replacement value; see
+        // `ObjectHandle::belongs_exclusively_to_pdf`.
+        //
+        // This is NOT CLAUDE.md category (C): (C) covers deviations that do
+        // not change output bytes, and this one does. Passing a direct
+        // dictionary holding a foreign indirect child succeeds in qpdf and
+        // writes that value; here it returns `Unsupported` and writes
+        // nothing. It is an unresolved behavioral divergence, kept marked so
+        // a later audit finds it rather than mistaking it for sanctioned
+        // scaffolding. Route matrix A17 tracks it.
         if !replacement.belongs_exclusively_to_pdf(self.pdf_unique_id.get()) {
             return Err(Error::Unsupported(
                 "Attempting to add an object from a different QPDF. Use QPDF::copyForeignObject to add objects from another file.".to_string(),
@@ -1931,10 +1960,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
         target.reset_parsed_offset();
         target.set_end_offsets(NO_PARSED_OFFSET, NO_PARSED_OFFSET);
         // qpdf-deviation: qpdf's `updateCache` (`QPDF.cc:1842-1858`) is
-        // caller-blind -- the same call this `replaceObject` makes for an
-        // xref-less generation also runs, with identical arguments, when
-        // `resolve` merely finds a dangling reference. qpdf's own
-        // `m->obj_cache` therefore cannot and does not distinguish the two;
+        // caller-blind -- it stores whatever object it is handed under `og`,
+        // with no record of who called. `replaceObject` hands it the
+        // replacement (`QPDF.cc:1992`) while a dangling `resolve` hands it a
+        // fresh null (`:1711,1748`), so the arguments coincide only when the
+        // replacement is itself null; either way the resulting cache cell
+        // carries no provenance, so qpdf cannot distinguish the two;
         // flpdf records this provenance only because `ResolverCore`'s split
         // complete/live object-ref views need it (`docs/qpdf-correspondence.md`,
         // `flpdf-uwn0`).
