@@ -4175,14 +4175,12 @@ impl QPDFJob {
                     // routing it through the ordinary xref-backed `N G R`
                     // reference range (see `JobObjectSelector::Object` doc).
                     let object = pdf.get_object_handle_by_raw_identity(number, generation);
-                    // cov:ignore-start: malformed object-report errors are covered by the public inspection route; only this propagated edge is excluded
                     self.show_object_report(
                         pdf,
                         &object,
                         configuration.show_raw_stream_data,
                         configuration.show_filtered_stream_data,
                     )?;
-                    // cov:ignore-end
                 }
                 JobObjectSelector::Null => self.logger.info(b"null\n")?,
                 JobObjectSelector::NoObject => {}

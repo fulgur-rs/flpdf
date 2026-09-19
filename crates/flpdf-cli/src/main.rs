@@ -15,7 +15,7 @@ use flpdf::writer::DecodeLevel as StreamDecodeLevel;
 #[cfg(test)]
 use flpdf::PasswordWriteNotice;
 use flpdf::{
-    json_inspect::{DecodeLevel, JsonKey, JsonObjectSelector},
+    json_inspect::{DecodeLevel, JsonKey},
     normalize_content_stream, pages, parse_pdf_version, CompressStreams, CopyEncryptionSource,
     EncryptMethod, EncryptParams, Error, NewlineBeforeEndstream, ObjectHandle, ObjectKeyAlg,
     ObjectRef, ObjectStreamMode, PasswordMode, Pdf, PdfOpenOptions, PdfVersion, PermissionsConfig,
@@ -3310,27 +3310,6 @@ fn main() {
             &overlay_specs,
             &attachment_segments,
         )
-    } else if let Some(object_ref) = args.show_object.as_deref() {
-        run_show_object(
-            args.input,
-            args.repair,
-            &args.password,
-            object_ref,
-            args.raw_stream_data,
-            args.filtered_stream_data,
-            // `doShowObj` reads `m->normalize`, which only
-            // `Config::normalizeContent` ever sets
-            // (`QPDFJob_config.cc:412-418`); QDF derives its implicit
-            // normalization during writer setup instead, behind
-            // `if (m->normalize_set)` (`QPDFJob.cc:2861-2863`). So the
-            // inspection route must see the explicit setting alone, not the
-            // writer-facing fold of QDF's default.
-            matches!(args.normalize_content, Some(CliYesNo::Yes)),
-            args.no_warn,
-            args.page_ops.empty,
-            top_level_inspection_transform_options,
-            args.verbose,
-        )
     } else if attachment_mutation_requested {
         let options = top_level_writer_options(
             &args,
@@ -3737,17 +3716,20 @@ fn top_level_inspection_combination_requested(
     // every selected inspection branch through the same
     // `initializeFromArgv`/`run()`/`getExitCode` dispatch, independent of how
     // many branches are selected -- there is no separate qpdf code path for
-    // "exactly one inspection flag". Route every one of these nine flags
+    // "exactly one inspection flag". Route every one of these ten flags
     // through the combined job lifecycle unconditionally, matching that
-    // structure. `--show-object` is still excluded, but no longer
-    // because of a generation clamp: `parse_job_object_selector` now accepts
-    // any non-negative generation, matching qpdf's `parse_object_id`
-    // (`libqpdf/QPDFJob.cc:929-941`), which does not clamp either. What
-    // remains is that the sole-flag CLI selector resolves through
-    // `Pdf::get_object_handle_by_raw_identity` while the shared
-    // `JobObjectSelector`/`configuration.show_object` path uses the ordinary
-    // xref-backed lookup; folding the two is tracked separately.
+    // structure. `--show-object` no longer needs a special case: neither the
+    // generation-clamp gap nor the raw-identity-vs-xref-backed-lookup gap
+    // this comment used to describe still exists.
+    // `crate::job::lifecycle::parse_job_object_selector` accepts any
+    // non-negative generation, matching qpdf's `parse_object_id`
+    // (`libqpdf/QPDFJob.cc:929-941`, no clamp), and
+    // `JobObjectSelector::Object` resolves through
+    // `Pdf::get_object_handle_by_raw_identity` (`QPDF::getObjectByID`,
+    // `libqpdf/QPDF.cc:1973-1977`), the same primitive the CLI's own
+    // (now-removed) standalone selector used.
     let migrated_flag_selected = args.check
+        || args.show_object.is_some()
         || args.show_npages
         || args.show_pages
         || args.show_xref
@@ -8583,34 +8565,10 @@ fn qpdf_json_input_open_error(input: &Path, error: std::io::Error) -> Box<dyn st
     Box::new(flpdf::Error::SystemBytes(raw_message))
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ShowObjectSelector {
-    Trailer,
-    Object { number: i32, generation: i32 },
-    Null,
-    NoObject,
-}
-
-/// Parse qpdf's `parse_object_id` selector for top-level `--show-object`.
-fn parse_show_object_selector(value: &str) -> CliResult<ShowObjectSelector> {
-    match JsonObjectSelector::parse(value).map_err(UsageError::new)? {
-        JsonObjectSelector::Trailer => Ok(ShowObjectSelector::Trailer),
-        JsonObjectSelector::Object { number, .. } if number <= 0 => {
-            Ok(ShowObjectSelector::NoObject)
-        }
-        JsonObjectSelector::Object { generation, .. } if generation < 0 => {
-            Ok(ShowObjectSelector::Null)
-        }
-        JsonObjectSelector::Object { number, generation } => {
-            Ok(ShowObjectSelector::Object { number, generation })
-        }
-    }
-}
-
 /// qpdf's `QUtil::string_to_int` uses `strtoll`: it accepts a signed decimal
-/// prefix and returns zero when no digits are present. `--show-object` treats
-/// object number zero as a no-output selector, so retain that observable
-/// leniency instead of routing this option through the stricter shared parser.
+/// prefix and returns zero when no digits are present. Used by
+/// `--compress=N`/`-compress=N` (`run_zlib_flate`) and `--compression-level`
+/// (`parse_compression_level`).
 fn qpdf_selector_integer(value: &str) -> CliResult<i32> {
     let original = value;
     let value = value.trim_start_matches(|character| {
@@ -8646,85 +8604,6 @@ fn qpdf_selector_integer(value: &str) -> CliResult<i32> {
             "integer out of range converting {parsed} from a 8-byte signed type to a 4-byte signed type"
         ))
     })?)
-}
-
-/// Show one object through qpdf's canonical object/stream inspection split.
-#[allow(clippy::too_many_arguments)]
-fn run_show_object(
-    input: Option<PathBuf>,
-    repair: bool,
-    password: &PasswordArgs,
-    selector: &str,
-    raw_stream_data: bool,
-    filtered_stream_data: bool,
-    normalize_content: bool,
-    suppress_warnings: bool,
-    empty: bool,
-    transform_options: InspectionTransformOptions<'_>,
-    verbose: bool,
-) -> CliResult<()> {
-    // qpdf's Config::showObject callback parses the selector during argv
-    // parsing, before QPDFJob::run() ever opens the input file, so a usage
-    // error in the selector must surface even when no input file is given.
-    let selector = parse_show_object_selector(selector)?;
-    if empty {
-        reject_empty_inspection_output(input.as_deref())?;
-        let mut job = new_cli_job(suppress_warnings);
-        job.set_content_normalization(normalize_content);
-        let mut pdf = create_empty_primary_document(&mut job, None)?;
-        apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-        let object = match selector {
-            ShowObjectSelector::Trailer => pdf.trailer(),
-            ShowObjectSelector::Object { number, generation } => {
-                pdf.get_object_handle_by_raw_identity(number, generation)
-            }
-            ShowObjectSelector::NoObject => {
-                return finish_job_exit_status(
-                    job.inspect(&mut pdf, |_pdf| Ok::<(), flpdf::Error>(()))?,
-                );
-            }
-            ShowObjectSelector::Null => {
-                logger_info(b"null\n")?;
-                return finish_job_exit_status(
-                    job.inspect(&mut pdf, |_pdf| Ok::<(), flpdf::Error>(()))?,
-                );
-            }
-        };
-        return finish_job_exit_status(job.show_object(
-            &mut pdf,
-            object,
-            raw_stream_data,
-            filtered_stream_data,
-        )?);
-    }
-    let input = input.ok_or_else(missing_input_usage_error)?;
-    let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
-    let mut job = new_cli_job(suppress_warnings);
-    job.set_content_normalization(normalize_content);
-    apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-    let object = match selector {
-        ShowObjectSelector::Trailer => pdf.trailer(),
-        ShowObjectSelector::Object { number, generation } => {
-            pdf.get_object_handle_by_raw_identity(number, generation)
-        }
-        ShowObjectSelector::NoObject => {
-            return finish_job_exit_status(
-                job.inspect(&mut pdf, |_pdf| Ok::<(), flpdf::Error>(()))?,
-            );
-        }
-        ShowObjectSelector::Null => {
-            logger_info(b"null\n")?;
-            return finish_job_exit_status(
-                job.inspect(&mut pdf, |_pdf| Ok::<(), flpdf::Error>(()))?,
-            );
-        }
-    };
-    finish_job_exit_status(job.show_object(
-        &mut pdf,
-        object,
-        raw_stream_data,
-        filtered_stream_data,
-    )?)
 }
 
 /// `flpdf pages FILE --show-npages`: the flpdf-native subcommand form. No
@@ -10439,6 +10318,7 @@ mod tests {
             "--show-encryption",
             "--list-attachments",
             "--show-attachment=attachment.txt",
+            "--show-object=1",
         ] {
             let args = cli_parse_from(vec![
                 OsString::from("flpdf"),
@@ -11797,24 +11677,6 @@ mod tests {
     }
 
     #[test]
-    fn show_object_selector_defaults_generation_like_qpdf() {
-        assert!(matches!(
-            parse_show_object_selector("1"),
-            Ok(ShowObjectSelector::Object {
-                number: 1,
-                generation: 0,
-            })
-        ));
-        assert!(matches!(
-            parse_show_object_selector("1,"),
-            Ok(ShowObjectSelector::Object {
-                number: 1,
-                generation: 0,
-            })
-        ));
-    }
-
-    #[test]
     fn show_object_selector_integer_errors_match_qpdf() {
         let overflow = qpdf_selector_integer("9223372036854775808").expect_err("i64 overflow");
         assert_eq!(
@@ -11851,22 +11713,20 @@ mod tests {
         // qpdf's Config::showObject parses the selector during argv parsing,
         // before QPDFJob::run() ever opens an input file, so a usage error in
         // the selector must surface even when no input file was given.
-        let error = run_show_object(
-            None,
-            false,
-            &PasswordArgs::default(),
-            "2147483648",
-            false,
-            false,
-            false,
-            false,
-            false,
-            InspectionTransformOptions::new(ImageTransformOptions::default(), false, None),
-            false,
-        )
-        .expect_err("overflow selector with no input file");
+        // `run_combined_top_level_inspection` preserves this ordering: it
+        // calls `configure_top_level_inspection_job` (which parses
+        // `--show-object` eagerly through `configuration.show_object`)
+        // before it checks for a missing input file.
+        let args = cli_parse_from(vec![
+            OsString::from("flpdf"),
+            OsString::from("--show-object=2147483648"),
+        ]);
+        assert!(args.input.is_none());
+        let mut job = new_cli_job(false);
+        let error = configure_top_level_inspection_job(&mut job, &args)
+            .expect_err("overflow selector with no input file");
         assert!(
-            error.downcast_ref::<UsageError>().is_some(),
+            find_usage_error(error.as_ref()).is_some(),
             "got {error} instead of a UsageError -- the missing-input-file check must not \
              run before selector parsing"
         );
