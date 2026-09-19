@@ -51,6 +51,11 @@ fn the_production_wrapper_delegates_without_inspecting_handles() {
         "is_null",
         "as_string",
         "as_real",
+        "as_boolean",
+        "as_real_literal",
+        "as_number",
+        "as_rectangle",
+        "as_stream_dict",
     ] {
         assert!(
             !audit.non_helper_calls.contains(forbidden),
@@ -148,15 +153,20 @@ impl<'ast> Visit<'ast> for WrapperAudit {
                 self.visit_expr(&diverge.1);
             }
         }
+        // Every name this pattern binds shadows an earlier helper of that
+        // name, whether it is a plain `let helper = ...` or a destructuring
+        // `let (helper,) = ...`.
+        let mut bound = Vec::new();
+        collect_pattern_idents(&local.pat, &mut bound);
+        self.helper_bindings
+            .retain(|binding| !bound.contains(binding));
         if let syn::Pat::Ident(pat) = &local.pat {
-            let name = unraw(&pat.ident);
-            self.helper_bindings.retain(|binding| binding != &name);
             if local
                 .init
                 .as_ref()
                 .is_some_and(|init| constructs_helper(&init.expr))
             {
-                self.helper_bindings.push(name);
+                self.helper_bindings.push(unraw(&pat.ident));
             }
         }
         self.visit_pat(&local.pat);
@@ -231,6 +241,17 @@ impl<'ast> Visit<'ast> for WrapperAudit {
         self.helper_bindings = outer_bindings;
     }
 
+    /// An `async` block does not run until it is polled, so a delegation
+    /// that only appears there leaves the wrapper returning without
+    /// converting the page.
+    fn visit_expr_async(&mut self, block: &'ast syn::ExprAsync) {
+        let outer_bindings = self.helper_bindings.clone();
+        let outer_delegates = self.delegates;
+        syn::visit::visit_expr_async(self, block);
+        self.delegates = outer_delegates;
+        self.helper_bindings = outer_bindings;
+    }
+
     /// Same for a nested item: an inner `fn` only runs when called.
     fn visit_item(&mut self, item: &'ast syn::Item) {
         if is_test_only(item_attrs(item)) {
@@ -262,11 +283,91 @@ impl<'ast> Visit<'ast> for WrapperAudit {
     }
 }
 
-/// `PageObjectHelper::new(...)`, however the path is spelled.
+/// Collect every identifier a pattern binds.
+fn collect_pattern_idents(pat: &syn::Pat, out: &mut Vec<String>) {
+    match pat {
+        syn::Pat::Ident(ident) => {
+            out.push(unraw(&ident.ident));
+            if let Some((_, inner)) = &ident.subpat {
+                collect_pattern_idents(inner, out);
+            }
+        }
+        syn::Pat::Tuple(tuple) => tuple
+            .elems
+            .iter()
+            .for_each(|elem| collect_pattern_idents(elem, out)),
+        syn::Pat::TupleStruct(tuple) => tuple
+            .elems
+            .iter()
+            .for_each(|elem| collect_pattern_idents(elem, out)),
+        syn::Pat::Slice(slice) => slice
+            .elems
+            .iter()
+            .for_each(|elem| collect_pattern_idents(elem, out)),
+        syn::Pat::Struct(structure) => structure
+            .fields
+            .iter()
+            .for_each(|field| collect_pattern_idents(&field.pat, out)),
+        syn::Pat::Or(alternatives) => alternatives
+            .cases
+            .iter()
+            .for_each(|case| collect_pattern_idents(case, out)),
+        syn::Pat::Reference(inner) => collect_pattern_idents(&inner.pat, out),
+        syn::Pat::Paren(inner) => collect_pattern_idents(&inner.pat, out),
+        syn::Pat::Type(inner) => collect_pattern_idents(&inner.pat, out),
+        _ => {}
+    }
+}
+
+/// See through wrappers that do not change the value.
+fn unwrap_transparent(expr: &syn::Expr) -> &syn::Expr {
+    match expr {
+        syn::Expr::Paren(inner) => unwrap_transparent(&inner.expr),
+        syn::Expr::Group(inner) => unwrap_transparent(&inner.expr),
+        syn::Expr::Block(block) if block.block.stmts.len() == 1 => {
+            match block.block.stmts.first() {
+                Some(syn::Stmt::Expr(inner, None)) => unwrap_transparent(inner),
+                _ => expr,
+            }
+        }
+        _ => expr,
+    }
+}
+
+/// `PageObjectHelper::new(<page>, <pdf>)`, however the path is spelled, where
+/// the arguments are the wrapper's own parameters.
+///
+/// qpdf's helper is constructed on the page the caller asked about
+/// (`QPDFPageObjectHelper(oh)`); handing it a different page would convert
+/// the wrong one while leaving the call shape intact.
 fn constructs_helper(expr: &syn::Expr) -> bool {
+    let expr = unwrap_transparent(expr);
     let syn::Expr::Call(call) = expr else {
         return false;
     };
+    let argument_names: Vec<String> = call
+        .args
+        .iter()
+        .map(|arg| match unwrap_transparent(arg) {
+            syn::Expr::Path(path) => path
+                .path
+                .get_ident()
+                .map(unraw)
+                .unwrap_or_else(|| "<expr>".to_owned()),
+            syn::Expr::Reference(reference) => match unwrap_transparent(&reference.expr) {
+                syn::Expr::Path(path) => path
+                    .path
+                    .get_ident()
+                    .map(unraw)
+                    .unwrap_or_else(|| "<expr>".to_owned()),
+                _ => "<expr>".to_owned(),
+            },
+            _ => "<expr>".to_owned(),
+        })
+        .collect();
+    if argument_names != ["page_ref", "pdf"] {
+        return false;
+    }
     let syn::Expr::Path(path) = call.func.as_ref() else {
         return false;
     };
