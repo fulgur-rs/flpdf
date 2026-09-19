@@ -502,7 +502,7 @@ pub(crate) fn run_test_71<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{run_test_68, run_test_69, run_test_71};
+    use super::{run_test_68, run_test_69, run_test_70, run_test_71};
     use flpdf::{Error, Pdf, PdfOpenOptions};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -542,6 +542,138 @@ mod tests {
                 .as_bytes(),
         );
         bytes
+    }
+
+    /// The `PDF /RunLengthDecode` encoding (`libqpdf/Pl_RunLength.cc:67-99`)
+    /// of six repeated `b'A'` bytes: a run-length byte `257 - 6 = 251`
+    /// (`0xFB`), the repeated byte `b'A'`, and the EOD marker `128` (`0x80`).
+    /// Decoding these three bytes yields `b"AAAAAA"`.
+    const RUN_LENGTH_ENCODED_AAAAAA: [u8; 3] = [0xFB, b'A', 0x80];
+
+    /// A trailer with three `/RunLengthDecode` streams carrying identical
+    /// encoded bytes ([`RUN_LENGTH_ENCODED_AAAAAA`]): `/S1` and `/S2`, the
+    /// pair `run_test_70` calls `set_filter_on_write(false)` on, and an
+    /// untouched `/S3` control. Mirrors the shape of qpdf's own
+    /// `filter-on-write.pdf` (`/S1`/`/S2` protected, `/S3`/`/S4` not).
+    fn pdf_with_filter_on_write_streams() -> Vec<u8> {
+        let stream_body = |number: u32| -> Vec<u8> {
+            let mut body = format!(
+                "<< /Filter /RunLengthDecode /Length {} >>\nstream\n",
+                RUN_LENGTH_ENCODED_AAAAAA.len()
+            )
+            .into_bytes();
+            body.extend_from_slice(&RUN_LENGTH_ENCODED_AAAAAA);
+            body.extend_from_slice(b"\nendstream");
+            let _ = number;
+            body
+        };
+        let objects: Vec<(u32, Vec<u8>)> = vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Kids [] /Count 0 >>".to_vec()),
+            (3, stream_body(3)),
+            (4, stream_body(4)),
+            (5, stream_body(5)),
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        for (number, body) in &objects {
+            offsets.insert(*number, bytes.len());
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        for number in 1..=5 {
+            bytes.extend_from_slice(format!("{:010} 00000 n \n", offsets[&number]).as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 6 /Root 1 0 R /S1 3 0 R /S2 4 0 R /S3 5 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn test_70_disables_filter_on_write_only_for_s1_and_s2() {
+        let _lock = super::super::CURRENT_DIR_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("acquire current-directory test lock");
+        let directory = tempfile::tempdir().expect("create test directory");
+        let previous = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(directory.path()).expect("enter test directory");
+        let _restore = CurrentDirGuard(previous);
+
+        let mut pdf = Pdf::open_mem_owned(pdf_with_filter_on_write_streams())
+            .expect("open filter-on-write fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_70(
+            &mut pdf,
+            b"filter-on-write.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("test 70 should disable filter-on-write for S1/S2 and write a.pdf");
+
+        assert!(directory.path().join("a.pdf").is_file());
+        let mut written = Pdf::open(std::fs::File::open(directory.path().join("a.pdf")).unwrap())
+            .expect("reopen test 70 output");
+
+        // set_filter_on_write(false) must keep S1's and S2's on-disk bytes
+        // byte-for-byte as originally stored (the encoded run-length bytes),
+        // even though the writer's Specialized decode level would otherwise
+        // decode and rewrite them -- exactly what the untouched S3 control
+        // proves happens by default.
+        for key in [b"S1".as_slice(), b"S2".as_slice()] {
+            let handle = written.trailer_key_handle(key);
+            let raw = handle
+                .get_raw_stream_data()
+                .unwrap_or_else(|error| panic!("read raw {key:?} bytes: {error}"));
+            assert_eq!(
+                raw.as_ref().as_slice(),
+                RUN_LENGTH_ENCODED_AAAAAA.as_slice(),
+                "{key:?} must keep its original run-length-encoded bytes"
+            );
+        }
+        let s3 = written.trailer_key_handle(b"S3");
+        let s3_raw = s3
+            .get_raw_stream_data()
+            .expect("read raw S3 bytes")
+            .as_ref()
+            .clone();
+        assert_ne!(
+            s3_raw.as_slice(),
+            RUN_LENGTH_ENCODED_AAAAAA.as_slice(),
+            "the untouched S3 control must be re-encoded by the writer's Specialized \
+             decode level (decode then recompress), proving S1/S2's unchanged bytes \
+             are due to set_filter_on_write(false) and not writer inaction on this filter"
+        );
+        let s3_decoded = flpdf::DecodeLevel::Specialized;
+        let s3_content = s3
+            .get_stream_data(s3_decoded)
+            .expect("decode S3's rewritten content");
+        assert_eq!(
+            s3_content.as_ref().as_slice(),
+            b"AAAAAA",
+            "S3's decoded content must still round-trip to the original bytes"
+        );
+
+        assert!(
+            stdout.is_empty(),
+            "test 70 stdout should be empty: {stdout:?}"
+        );
+        assert!(
+            stderr.is_empty(),
+            "synthetic test 70 stderr should be empty: {stderr:?}"
+        );
     }
 
     #[test]
