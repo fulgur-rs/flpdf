@@ -77,7 +77,7 @@ fn open_secondary_pdf(
 /// test asset guarantees have a single content stream.
 fn page_contents<R: Read + Seek>(pdf: &mut Pdf<R>, page: ObjectRef) -> flpdf::Result<Vec<u8>> {
     let handle = pdf.get_object_handle(page);
-    let contents = handle.get_key(b"/Contents");
+    let contents = handle.try_get_key(b"/Contents")?;
     let data = contents.get_stream_data(DecodeLevel::Generalized)?;
     let mut owned = data.as_ref().clone();
     owned.push(0);
@@ -130,7 +130,7 @@ pub(crate) fn run_test_26<R: Read + Seek>(
         // drops it before constructing the writer (`test_driver.cc:987-994`).
         let mut oldpdf = open_secondary_pdf(arg2, b"", stdout, stderr)?;
         let qtest = oldpdf.trailer_key_handle(b"QTest");
-        let o3 = qtest.get_key(b"/O3");
+        let o3 = qtest.try_get_key(b"/O3")?;
         // qpdf never checks that `/O3` is indirect before calling `addPage`; a
         // page-tree entry is always an indirect object in a well-formed PDF,
         // matching the fixture this test is designed for.
@@ -222,8 +222,8 @@ pub(crate) fn run_test_27<R: Read + Seek>(
             arg2.expect("test 27 requires arg2, matching qpdf's own assert(arg2 != nullptr)");
         let mut oldpdf = open_secondary_pdf(arg2, b"", stdout, stderr)?;
         let qtest = oldpdf.trailer_key_handle(b"QTest");
-        let o3 = qtest.get_key(b"/O3");
-        let other_page = o3.get_key(b"/OtherPage");
+        let o3 = qtest.try_get_key(b"/O3")?;
+        let other_page = o3.try_get_key(b"/OtherPage")?;
         let other_page_ref = other_page
             .object_ref()
             .expect("/O3/OtherPage is a page, always an indirect object");
@@ -614,7 +614,7 @@ pub(crate) fn run_test_33<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{open_secondary_pdf, run_test_29, run_test_30, run_test_31};
+    use super::{open_secondary_pdf, run_test_26, run_test_29, run_test_30, run_test_31};
     use flpdf::{DecodeLevel, EncryptParams, Pdf, PdfOpenOptions, PdfWriter};
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -843,6 +843,81 @@ logic error: Attempting to add an object from a different QPDF. Use QPDF::copyFo
         assert!(
             stderr.is_empty(),
             "test 29 should not emit stderr: {stderr:?}"
+        );
+    }
+
+    #[test]
+    fn test_26_copies_o3_page_and_qtest_without_crossing_page_boundaries() {
+        let _lock = super::super::CURRENT_DIR_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("acquire current-directory test lock");
+        let directory = tempfile::tempdir().expect("create test directory");
+        let secondary = directory.path().join("copy-foreign-objects-in.pdf");
+        std::fs::write(&secondary, pdf_with_foreign_page_graph()).expect("write secondary PDF");
+
+        let previous = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(directory.path()).expect("enter test directory");
+        let _restore = CurrentDirGuard(previous);
+
+        let mut pdf = Pdf::open_mem_owned(
+            include_bytes!("../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        )
+        .expect("open primary PDF");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_26(
+            &mut pdf,
+            b"minimal.pdf",
+            Some(secondary.as_os_str()),
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("test 26 should add O3 and copy /QTest without crossing page boundaries");
+
+        assert!(
+            directory.path().join("a.pdf").is_file(),
+            "test 26 must reach the qpdf writer after the O3/QTest copy"
+        );
+        let mut written = Pdf::open(std::fs::File::open(directory.path().join("a.pdf")).unwrap())
+            .expect("reopen test 26 output");
+
+        // The primary document started with one page; adding the foreign O3
+        // page (test_driver.cc:991, `QPDFPageDocumentHelper(pdf).addPage(O3,
+        // false)`) must grow the page count to two, using the resolving
+        // `try_get_key` path this case now exercises for `/O3`.
+        let pages = flpdf::PageDocumentHelper::new(&mut written)
+            .get_all_pages()
+            .expect("read written page list");
+        assert_eq!(pages.len(), 2, "O3 must be appended as a second page");
+
+        // qpdf's `pdf.getTrailer().replaceKey("/QTest",
+        // pdf.copyForeignObject(qtest))` (test_driver.cc:993) leaves a live
+        // copy of the foreign `/QTest` dictionary -- resolved here through
+        // the same `try_get_key` receiver-resolution this case now uses.
+        let qtest = written.trailer_key_handle(b"QTest");
+        let o3 = qtest.try_get_key(b"/O3").expect("resolve copied /QTest/O3");
+        assert!(
+            o3.object_ref().is_some(),
+            "the copied /QTest/O3 must remain an indirect page reference"
+        );
+        let o3_type = o3
+            .try_get_key(b"/Type")
+            .expect("resolve copied O3 page dictionary")
+            .try_get_name()
+            .expect("read copied O3 page /Type");
+        assert_eq!(o3_type, b"/Page", "copied /QTest/O3 must still be a page");
+
+        assert!(
+            stdout.is_empty(),
+            "test 26 stdout should be empty: {stdout:?}"
+        );
+        assert!(
+            stderr.is_empty(),
+            "synthetic test 26 stderr should be empty: {stderr:?}"
         );
     }
 

@@ -134,13 +134,13 @@ pub(crate) fn run_test_20<R: Read + Seek + 'static>(
 ) -> flpdf::Result<()> {
     // test_driver.cc:834-849 -- "Shallow copy an array". The read half is a
     // real, faithful translation: `getKey`/`shallowCopy`/`appendItem` map
-    // directly onto `ObjectHandle::get_key`/`shallow_copy`/
-    // `append_array_item`, none of which resolve or repair anything (their
-    // own docs), so no new diagnostics can appear here.
+    // directly onto the resolving `ObjectHandle::try_get_key`/`shallow_copy`/
+    // `append_array_item`. `shallow_copy`/`append_array_item` do not repair
+    // anything (their own docs), so no new diagnostics can appear here.
     let trailer = pdf.trailer();
-    let qtest = trailer.get_key(b"/QTest");
+    let qtest = trailer.try_get_key(b"/QTest")?;
     let copy = qtest.shallow_copy()?;
-    let size = trailer.get_key(b"/Size").shallow_copy()?;
+    let size = trailer.try_get_key(b"/Size")?.shallow_copy()?;
     copy.append_array_item(size)?;
 
     // qpdf/test_driver.cc:846-849 installs the copied array in the live
@@ -317,27 +317,20 @@ pub(crate) fn run_test_24<R: Read + Seek + 'static>(
     assert!(res2.as_array().is_some());
     writeln!(stdout, "res2 is an array")?;
 
-    // qpdf's chained getArrayItem calls dereference each returned handle.
-    // Resolve those two hops explicitly through the canonical document
-    // resolver, then read the integer at the same array position.
-    let res1_first = res1
-        .as_array()
-        .and_then(|items| items.first().cloned())
-        .expect("res1 contains res2");
-    pdf.resolve(&res1_first)?;
-    let i1 = res1_first
-        .as_array()
-        .and_then(|items| items.get(1).and_then(ObjectHandle::as_integer))
-        .expect("res1/res2 circular access reaches integer 2");
-    let res2_first = res2
-        .as_array()
-        .and_then(|items| items.first().cloned())
-        .expect("res2 contains res1");
-    pdf.resolve(&res2_first)?;
-    let i2 = res2_first
-        .as_array()
-        .and_then(|items| items.get(1).and_then(ObjectHandle::as_integer))
-        .expect("res2/res1 circular access reaches integer 1");
+    // qpdf's `res1.getArrayItem(0).getArrayItem(1).getIntValueAsInt()`
+    // resolves each hop's receiver implicitly inside `getArrayItem`, and
+    // `getIntValueAsInt` resolves the final receiver the same way. The
+    // resolving accessor chain below reproduces that receiver-by-receiver
+    // resolution directly, without a separate explicit-resolve step or a
+    // non-resolving `as_array` snapshot.
+    let i1 = res1
+        .try_get_array_item(0)?
+        .try_get_array_item(1)?
+        .try_get_int_value_as_int()?;
+    let i2 = res2
+        .try_get_array_item(0)?
+        .try_get_array_item(1)?
+        .try_get_int_value_as_int()?;
     if (i1, i2) == (2, 1) {
         writeln!(stdout, "circular access and lazy resolution worked")?;
     }
@@ -395,18 +388,19 @@ pub(crate) fn run_test_25<R: Read + Seek + 'static>(
         // qpdf's `oldpdf.getTrailer().getKey("/QTest")`; `Pdf::trailer_handle`
         // is the direct equivalent of `QPDF::getTrailer` (both own docs).
         let oldpdf_trailer = oldpdf.trailer();
-        let qtest = oldpdf_trailer.get_key(b"/QTest");
+        let qtest = oldpdf_trailer.try_get_key(b"/QTest")?;
         let copied = pdf.copy_foreign_object(&qtest)?;
         let trailer = pdf.trailer();
         trailer.replace_key(b"/QTest", copied)?;
 
         // qpdf's oldpdf.getRoot().getKey("/Pages") first obtains the live root
-        // handle and then asks for its Pages child. trailer_key_handle lifts only
-        // /Root; resolving that handle once reproduces qpdf's root dereference
-        // without routing through the legacy terminal resolver.
+        // handle and then asks for its Pages child. trailer_key_handle lifts
+        // only /Root (still possibly unresolved), and the resolving
+        // `try_get_key` below resolves that handle as its own first step
+        // before reading /Pages, reproducing qpdf's root dereference without
+        // a separate explicit-resolve call.
         let oldpdf_root = oldpdf.trailer_key_handle(b"Root");
-        oldpdf.resolve(&oldpdf_root)?;
-        let pages = oldpdf_root.get_key(b"/Pages");
+        let pages = oldpdf_root.try_get_key(b"/Pages")?;
         let copied_pages = pdf.copy_foreign_object(&pages)?;
         assert!(copied_pages.is_null());
     }

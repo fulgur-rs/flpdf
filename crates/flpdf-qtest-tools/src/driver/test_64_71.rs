@@ -118,7 +118,9 @@ fn test_64_67_body<R: Read + Seek>(
                 allow_expand,
             )?; // cov:ignore: valid qpdf fixtures cover placement success; this is only the defensive Result propagation edge
             resources.merge_resources(&ObjectHandle::parse(b"<< /XObject << >> >>")?, None)?;
-            resources.get_key(b"/XObject").replace_key(&name, form)?;
+            resources
+                .try_get_key(b"/XObject")?
+                .replace_key(&name, form)?;
             content
         };
 
@@ -344,8 +346,8 @@ pub(crate) fn run_test_70<R: Read + Seek>(
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let trailer = pdf.trailer();
-    trailer.get_key(b"/S1").set_filter_on_write(false)?;
-    trailer.get_key(b"/S2").set_filter_on_write(false)?;
+    trailer.try_get_key(b"/S1")?.set_filter_on_write(false)?;
+    trailer.try_get_key(b"/S2")?.set_filter_on_write(false)?;
 
     let mut writer = PdfWriter::new(pdf);
     writer.set_output_file("a.pdf")?;
