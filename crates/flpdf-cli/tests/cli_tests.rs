@@ -42,12 +42,36 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
 }
 
+/// Mirror the CLI's file-open error text, matching qpdf's own message.
+///
+/// qpdf's `QUtil::safe_fopen` reports open failures via
+/// `QPDFSystemError`/`strerror` (`QUtil.cc:453-527`,
+/// `QPDFSystemError.cc:18-27`), which is the C runtime's errno-derived text
+/// -- the same on every platform qpdf builds for, including Windows (MSVC's
+/// `strerror_s`), not the OS-native message `std::io::Error`'s `Display`
+/// renders (e.g. Win32's "The system cannot find the file specified."
+/// instead of "No such file or directory"). `qpdf_file_io_source_message`
+/// in `crates/flpdf/src/job/lifecycle.rs` reproduces that fixed mapping for
+/// the common cases; keep this test oracle in sync with it rather than with
+/// `std::io::Error`'s platform-native rendering.
 fn normalized_os_message(error: &std::io::Error) -> String {
-    let message = error.to_string();
+    let message = match error.kind() {
+        std::io::ErrorKind::NotFound => Some("No such file or directory"),
+        std::io::ErrorKind::PermissionDenied => Some("Permission denied"),
+        std::io::ErrorKind::AlreadyExists => Some("File exists"),
+        std::io::ErrorKind::InvalidInput => Some("Invalid argument"),
+        std::io::ErrorKind::IsADirectory => Some("Is a directory"),
+        std::io::ErrorKind::NotADirectory => Some("Not a directory"),
+        _ => None,
+    };
+    if let Some(message) = message {
+        return message.to_owned();
+    }
+    let rendered = error.to_string();
     error
         .raw_os_error()
-        .and_then(|code| message.strip_suffix(&format!(" (os error {code})")))
-        .unwrap_or(&message)
+        .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
+        .unwrap_or(&rendered)
         .to_owned()
 }
 
