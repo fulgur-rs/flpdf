@@ -397,7 +397,7 @@ traversal・allocation・trailer snapshotは追加していない。
 
 `flpdf-tcfj` では、qpdf 11.9.0 の `QPDF::resolve` が `isUnresolved` を確認して永続 `m->obj_cache` を一度だけ更新する責務（`QPDF.cc:1700-1753`）に合わせ、xref bootstrap の raw object view と handle-native view を `SharedBootstrapCache` の同一状態へ束ねる。`BootstrapHandleDocument`、再帰ガード、ObjStm の解決済み集合、診断、reconstruction trigger は xref-loading operation 全体で共有し、`read_uncompressed_object` の `FileObjectDiagnostic` は一度だけ転送する。raw view が先に materialize した値は handle slot へ seed し、handle view が先に解決した値は raw lookup から再利用するため、同じ bootstrap object の再パースと警告の二重出力を避ける。
 
-`flpdf-uwn0` では qpdf の `makeIndirectFromQPDFObject` (`QPDF.cc:1882-1894`) / `replaceObject` (`QPDF.cc:1986-1993`) が source xref と別に `m->obj_cache` へ登録する allocation と、参照解決で同じ cache に入る dangling null を object-ref view で区別する。qpdf の `getAllObjects` は `fixDanglingReferences` 後の `m->obj_cache` 全体 (`QPDF.cc:1258-1294`) を列挙し、live probe でも `newIndirectNull()` は列挙される。flpdf の `ResolverCore::allocated_object_refs` はこの provenance だけを canonical allocation 境界で記録し、canonical object-ref views が allocated indirect null を落とさないようにする。legacy cache/memo の互換 bridge や qpdf-deviation marker は追加しない。
+`flpdf-uwn0` では qpdf の `makeIndirectFromQPDFObject` (`QPDF.cc:1882-1894`) / `replaceObject` (`QPDF.cc:1986-1993`) が source xref と別に `m->obj_cache` へ登録する allocation と、参照解決で同じ cache に入る dangling null を object-ref view で区別する。qpdf の `getAllObjects` は `fixDanglingReferences` 後の `m->obj_cache` 全体 (`QPDF.cc:1258-1294`) を列挙し、live probe でも `newIndirectNull()` は列挙される。flpdf の `ResolverCore::allocated_object_refs` はこの provenance だけを canonical allocation 境界で記録し、canonical object-ref views が allocated indirect null を落とさないようにする。`ResolverHandle::make_indirect_from_object_handle`（A12、qpdf の `makeIndirectFromQPDFObject`/`makeIndirectObject` と1:1）からのこの記録には legacy cache/memo の互換 bridge や qpdf-deviation marker を追加しない。一方 `ResolverHandle::replace_object`/`swap_objects`（A16/A17）末尾の同じ記録には、`flpdf-3yn9.48.172`（`crates/flpdf/src/reader/resolver.rs`）で逸脱 marker を追加した（分類 (C)：出力バイトは変わらない）——qpdf の `updateCache` 自体が呼び出し元を区別せず、`resolve` の dangling-reference 経路も `replaceObject`/`swapObjects` と同じ `updateCache(og, ..., -1, -1)` を通るため、この2箇所での「document-owned allocation」と「単なる dangling 解決」の区別自体に qpdf 側の対応物がない（`docs/qpdf-route-matrix/a-objecthandle-resolver.md` の A16/A17 行を参照）。**2026-09-19 追記**: `ResolverHandle::replace_object` の foreign-owner guard （`belongs_exclusively_to_pdf`）は**これとは別の逸脱で、分類 (C) には該当しない**——(C) は「出力バイトを変えない」ことが前提だが、この guard は変える。qpdf の `QPDF::replaceObject`（`QPDF.cc:1986-1993`）は indirect / uninitialized の handle しか弾かず `checkOwnership` を呼ばないので、foreign な indirect 子を持つ direct 値は qpdf では成功して書き出される一方、flpdf は `Unsupported` を返して何も書かない。未解決の挙動乖離として marker を残し、**route matrix A16** で追跡する（guard は `replace_object` にのみ存在し、A17 が追う `swap_objects` は持たない）。
 
 `flpdf-25kg.2.5.12` では、qpdf の `makeIndirectObject` が `nextObjGen` → `getObjectCount` → `fixDanglingReferences` の順で新規番号を決める契約 (`QPDF.cc:1239-1294,1872-1901`) を `Pdf::make_indirect_object_handle` の allocation boundary に適用した。repairで再構築されるobjectがある場合も、canonical resolverを先に準備してから既存の番号走査を行うため、recovered objectとの番号衝突を起こさない。
 
@@ -676,6 +676,55 @@ qpdf's independent error code, raw filename/object/message fields, signed file p
 and `createWhat` formatting. `QpdfExc::what_bytes()` intentionally exposes the observable
 NUL-terminated `what()` bytes; getters retain complete fields. Resolver/diagnostic consumer
 cutover and removal of duplicate formatters remain in the follow-up `.48.27` layers.
+
+⚪ **(B) `Error` carries qpdf's exception-class axis as variants** (route matrix B32,
+`docs/qpdf-route-matrix/b-parser-recovery-diagnostics.md`): qpdf classifies a raised
+error along two independent axes — which C++ exception class carries it (`QPDFExc`,
+or a bare `std::logic_error`/`std::runtime_error`/`std::range_error`; B32 cites concrete
+throw sites, e.g. `libqpdf/QPDF.cc:481,1231`, `libqpdf/QPDFParser.cc:163`,
+`libqpdf/QPDFTokenizer.cc:241,248,770`, `libqpdf/QPDFLogger.cc:200,252`, and
+`libqpdf/QPDF.cc:1101` for `std::range_error`) and, only for `QPDFExc`, its independent
+`qpdf_error_code_e` (`include/qpdf/Constants.h:84-95`). `crates/flpdf/src/error.rs::Error`
+carries axis 1 as variants instead of mirroring the C++ class hierarchy. **Axis 2 is not
+folded away**: `Error::QpdfExc` wraps `QpdfExc`, which stores `error_code: QpdfErrorCode`
+and exposes it through `QpdfExc::get_error_code` (`crates/flpdf/src/error.rs:116,148`), so
+production callers match on both layers exactly as qpdf's own callers do — only the legacy
+variants that predate `QpdfExc` carry their classification in the variant alone. The code
+takes no part in rendering: `QpdfExc::new` passes only filename, object, offset, and message
+to `create_what` (`crates/flpdf/src/error.rs:133-136`), matching `QPDFExc::createWhat`, so
+two otherwise identical exceptions with different codes render identically — as in qpdf.
+The module documentation (`crates/flpdf/src/error.rs`, the `//!` header) records this
+deviation as CLAUDE.md category (B) condition 3 requires, and
+`Internal` is the 1:1 projection of axis 1 onto `std::logic_error`, and `System` together with its byte-preserving counterpart `SystemBytes` (`crates/flpdf/src/error.rs:246-247,321`) onto `std::runtime_error` (`crates/flpdf/src/error.rs:223-224`). This satisfies CLAUDE.md
+deviation category (B): the fold changes only the Rust "container" a caller matches on —
+where qpdf's own callers instead dispatch by C++ class and by `getErrorCode()` — not the
+classification's meaning. Condition 1 (no output-byte impact): this substitution reaches no file bytes at all, so
+there is no route for a `qpdf-zlib-compat` gated file-byte test to cover. `Error` values are
+returned to a caller or rendered as diagnostic text; the one qpdf-observable surface is that
+text, and `crates/flpdf/src/error.rs::qpdf_exc_what_matches_qpdf_c_string_boundaries_and_display_projection`
+(`:532`, a plain `#[test]` — it needs no feature gate because no DEFLATE backend is involved)
+pins `what_bytes` byte-for-byte across the filename/object/offset/message boundaries,
+embedded NULs included. Naming a gated file-byte test here would be naming one that does not
+and cannot exercise this boundary. Unlike
+a serialization-layer substitution (e.g. `InputSource`/`Pipeline`) where the substituted
+container sits on the write path: `Error` values are never themselves written into a PDF
+file, only returned to a caller or rendered as that diagnostic text, so the container shape
+carries no *additional* byte risk beyond whether each call site is assigned the same
+classification qpdf's two axes would assign it — and that per-call-site accuracy is
+exactly the open question B32's `mixed` status already tracks (see below), not something
+this container-design note independently proves. Where a variant does render
+qpdf-observable text, the byte-identical rendering is owned by `QpdfExc::what_bytes`/
+`create_what` (B30 above, already qpdf-verified byte-for-byte), which takes no error code
+at all: `QpdfExc::new` passes only filename, object, offset and message
+(`crates/flpdf/src/error.rs:133-136`), matching `QPDFExc::createWhat`, so neither the
+stored `QpdfErrorCode` nor which `Error` variant wraps it reaches the rendered text. This entry is the
+`docs/qpdf-correspondence.md` half of condition 3's required two-location record; the
+module-doc half is the deviation statement at `crates/flpdf/src/error.rs` の `//!` ヘッダ. It does
+not change B32's `mixed` classification or resolve its open correctness questions: whether
+each existing per-code call site (`Parse` for `qpdf_e_damaged_pdf`, `Pages` for
+`qpdf_e_pages`, etc.) is populated the way qpdf's `qpdf_error_code_e` would assign it, and
+whether the reconstruction-trigger guard at `crates/flpdf/src/reader/resolver.rs:2062-2079`
+matches qpdf's `catch (QPDFExc&)` (`libqpdf/QPDF.cc:1614`) for every producer, remain open.
 
 `flpdf-15qk` completes the `QPDF_pages.cc` cache boundary: `Pdf::page_list_cache`
 stores the prepared root and ordered leaf identities after the canonical repair

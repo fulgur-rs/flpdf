@@ -177,7 +177,7 @@ crates/flpdf/src/writer.rs::write_qpdf_to_memory                         # D30 t
 crates/flpdf/src/writer.rs::PdfWriter::write                             # D1/D26（曖昧 leaf `write`）
 crates/flpdf/src/writer/rewrite_renumber.rs::ObjectStreamRenumber        # D2 canonical
 crates/flpdf/src/writer/object_streams/planning.rs::ObjectStreamGroup    # D5
-crates/flpdf/src/writer/object_streams/planning.rs::plan_qpdf_preserve_object_streams_with_unreferenced  # D6 canonical
+crates/flpdf/src/writer/object_streams/planning.rs::plan_qpdf_preserve_object_streams_with_source_membership  # D6 canonical（2026-09-19 訂正: 旧記載の `_with_unreferenced` は第 3 引数 None で委譲する wrapper で、production の plain / linearized はいずれもこちらを直接呼ぶ）
 crates/flpdf/src/writer/object_streams/eligibility.rs::compressible_objgens_qpdf_plan      # D8 shared Generate/Preserve/linearized walk
 crates/flpdf/src/reader.rs::get_compressible_objgens                                   # D8 canonical document walk
 crates/flpdf/src/reader/resolver.rs::has_newer_cached_generation                       # D8 live cache upper_bound
@@ -191,7 +191,7 @@ crates/flpdf/src/writer.rs::EncryptionContext                            # D16
 crates/flpdf/src/writer/object_streams/planning.rs::filter_objstm_batches_for_output       # D23 canonical
 crates/flpdf/src/writer/plain/body.rs::enqueue_objects_pclm              # D24
 crates/flpdf/src/writer/plain/body.rs::enqueue_objects_standard            # D24
-crates/flpdf/src/writer/plain/plan.rs::retain_reachable_object_stream_members              # D28
+crates/flpdf/src/writer/object_streams/eligibility.rs::compressible_objgens_qpdf_plan      # D28
 
 # ===========================================================================
 # E. QPDFJob / CLI / C API
