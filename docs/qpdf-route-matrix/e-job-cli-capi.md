@@ -438,16 +438,20 @@ resolving チェーンへ書き換え、case 25/80 は直後の呼び出し
 （`try_get_key`／`AcroFormDocumentHelper::transform_annotations` 内部の
 `try_as_array`）が receiver を自ら解決するため、独立した explicit-resolve
 ステップ自体が元々冗長だったと判明し削除した（削除後の構造は qpdf 自身が
-明示 resolve を持たないことと一致する）。全 12 件を qpdf 11.9.0 の実機出力
-（`/usr/bin/qpdf` 11.9.0、pinned source と同一バージョン）と exit
-status・stdout/stderr・生成 PDF のバイト列で比較し byte-identical を確認した。
+明示 resolve を持たないことと一致する）。全 12 件を qpdf 11.9.0 の実機（`/usr/bin/qpdf` 11.9.0、pinned source と同一
+バージョン）と比較した——exit status と stdout/stderr は 12 件すべて、生成 PDF の
+バイト列は **case 30 を除く 11 件**。**2026-09-19 訂正**: 当初「全 12 件を生成 PDF の
+バイト列まで比較」と書いたが、case 30 だけは `b.pdf` を直接 `cmp` しておらず、
+`qpdf --show-encryption b.pdf --password=owner` の出力を qpdf 自身の
+`copied-encryption.out` と突き合わせている（qpdf の当該 qtest ケース自体がその形で
+検証するため。case 30 行に同じ記載あり）。検査出力の一致は byte-identical の証明では
+ないので、集計側の文言をそろえた。
 cutover 自体は 12 件に行ったが、**case 30 は `mixed` のまま**とし（下記）、
 E-28 の集計は `canonical` 91 / `mixed` 8（論理ケース。0/1 統合で表は 98 行）に
 なった。残る 8 件は case 12/13 が E-7、case 14 が A17、case 30 が D16、
-case 45/84 が E-19、case 63 が D1/D16、case 83 が E-17 で、いずれもこのパスの対象外（**2026-09-19 再訂正**: case 30 も一度 canonical にしたが、`run_test_30` は `PdfWriter::copy_encryption_parameters` を直接呼ぶため D16 依存が残る。`page_contents` 内の hidden accessor 解消はその依存を消さない）（**2026-09-19 訂正**: 当初
-93/6 と書き case 63 を落としていたが、詳細表の case 63 行は D16 依存を
-理由に `mixed` のままで、表を数え直すと mixed は 12/13/14/45/63/83/84 の
-7 件）。
+case 45/84 が E-19、case 63 が D1/D16、case 83 が E-17 で、いずれもこのパスの対象外（**2026-09-19 再訂正**: case 30 も一度 canonical にしたが、`run_test_30` は `PdfWriter::copy_encryption_parameters` を直接呼ぶため D16 依存が残る。`page_contents` 内の hidden accessor 解消はその依存を消さない）（**2026-09-19 訂正の経緯**: 当初 93/6 と書いて case 63 を落とし、次に 92/7 と直した際は
+case 30 を canonical 側に数えていた。表を数え直した現在の mixed は
+12/13/14/30/45/63/83/84 の 8 件）。
 
 | case | qpdf test fn | flpdf owner fn | classification | A-D/E owner refs / notes |
 |---|---|---|---|---|
