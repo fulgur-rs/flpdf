@@ -7274,9 +7274,10 @@ fn validate_keep_files_open_threshold(page_ops: &PageOpArgs) -> CliResult<()> {
 /// branch below configures those specifications on `QPDFJob::create_qpdf`'s
 /// canonical page-spec lifecycle (the same boundary
 /// [`run_empty_page_extraction`] and the top-level `--pages` route already
-/// use), matching qpdf's `createQPDF` → `handlePageSpecs` call order; the
-/// multi-source branch still opens sources directly and calls
-/// `QPDFJob::handle_page_specs` itself, a known remaining gap.
+/// use), matching qpdf's `createQPDF` → `handlePageSpecs` call order. The
+/// multi-source branch reaches the same boundary as of
+/// `flpdf-3yn9.48.192`; it no longer opens sources or calls
+/// `QPDFJob::handle_page_specs` itself.
 ///
 /// The `--json-input`/`--update-from-json` combination with `--pages` has no
 /// grammar on the `rewrite` subcommand (this function's only caller): those

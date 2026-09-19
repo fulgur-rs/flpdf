@@ -3387,6 +3387,12 @@ impl QPDFJob {
     /// internally (via the same field) when it writes through *this* job. A
     /// caller that completes the write on a *different* `QPDFJob` instance
     /// must take the snapshot here first, before configuring that instance.
+    // qpdf-deviation: qpdf's `handlePageSpecs` mutates the primary `QPDF` in
+    // place (`libqpdf/QPDFJob.cc:2359-2362`), so `writeQPDF` reads the still-live
+    // primary's `/Encrypt` state and qpdf has no accessor to correspond to. This
+    // snapshot exists only because flpdf's canonical multi-source merge builds a
+    // fresh target (`flpdf-clq9`); it is CLAUDE.md deviation class (C), not (B),
+    // since there is no qpdf concept whose container is being substituted.
     pub fn take_primary_copy_encryption(&mut self) -> Option<crate::CopyEncryptionSource> {
         self.primary_copy_encryption.take()
     }

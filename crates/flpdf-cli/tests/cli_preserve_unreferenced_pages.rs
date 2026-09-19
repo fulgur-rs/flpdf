@@ -304,7 +304,7 @@ fn multi_source_preserve_objstm_members_follow_source_objgen_order() {
 
 /// `rewrite --pages`'s multi-source route (`run_page_extraction_from_multiple_sources`)
 /// queues `--collate` on the same `QPDFJobConfig` boundary the top-level
-/// `--pages` route uses (`QPDFJob.cc:2251-2337`'s collate grouping, applied
+/// `--pages` route uses (`QPDFJob.cc:2484-2510`'s collate grouping, applied
 /// inside `prepare_document`'s merge branch). Byte-identity here pins that
 /// this `rewrite`-specific consumer of `create_qpdf` reaches the same
 /// collate behavior as the already-covered top-level route.
