@@ -2772,6 +2772,22 @@ qpdf --object-streams=preserve --static-id --warning-exit-0 \
 echo "nonmonotonic-objstm-index/preserve.pdf"
 qpdf --check --warning-exit-0 "$REF/nonmonotonic-objstm-index/preserve.pdf"
 
+# nonmonotonic-objstm-index-linearizable.pdf: same reversed source-declaration-
+# order ObjStm shape as nonmonotonic-objstm-index.pdf, but with a real page so
+# --linearize is possible (the base fixture has 0 pages). Probes D-U1
+# (docs/qpdf-route-matrix/README.md D-U1 row): qpdf's writeLinearized consumes
+# Preserve members in ascending SOURCE OBJECT NUMBER order (the shared
+# object_stream_to_objects std::set<QPDFObjGen>, QPDFWriter.cc:2164-2170),
+# never the ObjStm's own source-declaration index (QPDF::getObjectStreamData,
+# QPDF.cc:2381-2390, never reads getObjStreamIndex()).
+mkdir -p "$REF/nonmonotonic-objstm-index-linearizable"
+qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
+    "$FIX/nonmonotonic-objstm-index-linearizable.pdf" \
+    "$REF/nonmonotonic-objstm-index-linearizable/linearize-objstm-preserve.pdf"
+echo "nonmonotonic-objstm-index-linearizable/linearize-objstm-preserve.pdf"
+qpdf --check-linearization \
+    "$REF/nonmonotonic-objstm-index-linearizable/linearize-objstm-preserve.pdf"
+
 qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/three-page-objstm.pdf" "$REF/three-page-objstm/linearize-objstm.pdf"
 echo "three-page-objstm/linearize-objstm.pdf"

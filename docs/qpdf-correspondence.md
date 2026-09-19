@@ -1365,7 +1365,8 @@ qpdf 11.9.0 の責務境界へ再接続した。`QPDFWriter::willFilterStream` �
 Catalog `/Metadata` の参照同一性ではなく、各 stream dictionary の
 `/Type /Metadata` を判定し、`!encrypt_metadata` のときだけ data keyを外す
 （`libqpdf/QPDFWriter.cc:1234-1314,1537-1556`）。flpdf の
-`linearization/writer.rs::append_body_object_with_raw_identity` も同じ raw stream
+`linearization/writer.rs::LinearizedObjectEmitter::unparse_object`（`flpdf-3yn9.48.203`
+で `append_body_object_with_raw_identity` から統合、D11）も同じ raw stream
 dictionary判定を使い、`metadata_ref` を `None == None` の代替identityとして使わない。
 
 content normalization と stream-parameter omission は同じ raw setを共有する。
