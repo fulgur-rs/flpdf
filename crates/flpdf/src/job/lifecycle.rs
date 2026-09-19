@@ -2967,9 +2967,23 @@ impl QPDFJob {
         Ok(pdf)
     }
 
+    /// Discard the encryption snapshots a previous document left behind.
+    ///
+    /// qpdf holds nothing to go stale here: `handlePageSpecs` mutates the
+    /// primary `QPDF` in place (`libqpdf/QPDFJob.cc:2359-2362`), so a later
+    /// creation can never observe an earlier document's `/Encrypt` state.
+    /// These fields exist only because flpdf's merge builds a fresh target,
+    /// and `finish_created_document` clears them only after a successful
+    /// open -- so every creation entry point clears them on the way in.
+    fn reset_encryption_snapshots(&mut self) {
+        self.primary_copy_encryption = None;
+        self.encryption_status = EncryptionStatus::default();
+    }
+
     /// Create qpdf's canonical empty document through the same job document
     /// boundary as file and JSON input.
     pub fn create_empty_document(&mut self) -> Result<JobDocument> {
+        self.reset_encryption_snapshots();
         // qpdf's `Config::emptyInput` uses the empty string as the page-spec
         // source-map key while `QPDF::emptyPDF` names the diagnostic source
         // "empty PDF" (`libqpdf/QPDFJob_config.cc:27-38`;
@@ -3029,6 +3043,7 @@ impl QPDFJob {
     where
         S: Read + Seek + 'static,
     {
+        self.reset_encryption_snapshots();
         let input_name = input_name.as_ref().to_vec();
         self.set_input_name_bytes(&input_name);
         // See `create_empty_document`: qpdf applies `noWarn` to every
@@ -3258,16 +3273,7 @@ impl QPDFJob {
     /// error reporting for a missing or malformed input.
     pub fn create_qpdf(&mut self) -> Result<Option<JobDocument>> {
         self.create_qpdf_succeeded_without_document = false;
-        // qpdf holds no cross-document snapshot here: `handlePageSpecs`
-        // mutates the primary `QPDF` in place, so a later `createQPDF` can
-        // never observe a previous document's `/Encrypt` state. These fields
-        // exist only because flpdf's merge builds a fresh target, and
-        // `finish_created_document` clears them only after a successful open.
-        // Reset them at the top so a failed configure or open cannot leave a
-        // prior document's encryption visible to `encryption_status()` and
-        // `take_primary_copy_encryption()`.
-        self.primary_copy_encryption = None;
-        self.encryption_status = EncryptionStatus::default();
+        self.reset_encryption_snapshots();
         match self.check_configuration() {
             Ok(()) => {}
             Err(error @ Error::Usage(_)) => return Err(error),

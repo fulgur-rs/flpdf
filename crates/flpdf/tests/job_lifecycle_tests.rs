@@ -3407,6 +3407,42 @@ fn a_failed_create_clears_the_previous_encryption_snapshot() {
     );
 }
 
+/// The public creation factories clear the snapshots too.
+///
+/// `create_empty_document` and `create_from_json_document` are advertised
+/// entry points that do not run through `create_qpdf`, so each has to clear
+/// what a previous document left behind.
+#[test]
+fn the_public_factories_clear_the_previous_encryption_snapshot() {
+    let primary = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
+    let secondary =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let json = serde_json::json!({
+        "inputFile": primary,
+        "outputFile": tempdir.path().join("merged.pdf"),
+        "pages": [
+            {"file": ".", "range": "1"},
+            {"file": secondary, "range": "1"}
+        ]
+    })
+    .to_string();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json).unwrap();
+    job.create_qpdf().unwrap().expect("the merge must succeed");
+    assert!(job.encryption_status().0);
+
+    job.create_empty_document()
+        .expect("the empty factory must succeed");
+    assert!(
+        !job.encryption_status().0,
+        "create_empty_document must not inherit the previous document's encryption"
+    );
+    assert!(job.take_primary_copy_encryption().is_none());
+}
+
 /// `QPDFJob::encryption_status`/`take_primary_copy_encryption` expose the
 /// pre-merge snapshot for exactly that case (flpdf-3yn9.48.192).
 #[test]

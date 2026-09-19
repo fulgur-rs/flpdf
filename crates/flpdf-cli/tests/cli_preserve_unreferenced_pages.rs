@@ -426,8 +426,13 @@ fn multi_source_rewrite_pages_missing_primary_matches_qpdf_open_wording() {
         "unexpected qpdf stderr for a missing primary: {qpdf_stderr}"
     );
 
-    Command::cargo_bin("flpdf")
+    // Compare the whole diagnostic, not just the OS substring: the action
+    // text, the path, the program prefix, and the absence of duplicates are
+    // all part of the parity this pins. qpdf prefixes with its own argv[0],
+    // so FLPDF_PROGNAME makes the two directly comparable.
+    let flpdf_result = Command::cargo_bin("flpdf")
         .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
         .args(["rewrite", "--pages", "."])
         .arg("1")
         .arg(&secondary)
@@ -438,7 +443,13 @@ fn multi_source_rewrite_pages_missing_primary_matches_qpdf_open_wording() {
         .assert()
         .failure()
         .code(2)
-        .stderr(predicate::str::contains("No such file or directory"));
+        .get_output()
+        .clone();
+    assert_eq!(
+        String::from_utf8_lossy(&flpdf_result.stderr),
+        qpdf_stderr,
+        "the missing-primary diagnostic must match qpdf byte for byte"
+    );
 }
 
 /// A preserved orphan may reference the primary's own structural roots
