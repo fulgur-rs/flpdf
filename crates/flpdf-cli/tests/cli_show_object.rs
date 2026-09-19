@@ -41,6 +41,10 @@ fn show_object_accepts_qpdf_selector_forms() {
     for (selector, expected) in [
         ("1", "<< /Pages 2 0 R /Type /Catalog >>"),
         ("1,0", "<< /Pages 2 0 R /Type /Catalog >>"),
+        // A trailing comma with no generation digits defaults to 0, same as
+        // omitting the comma entirely (qpdf's `parse_object_id`,
+        // `libqpdf/QPDFJob.cc:929-940`).
+        ("1,", "<< /Pages 2 0 R /Type /Catalog >>"),
         ("trailer", "<< /Root 1 0 R /Size 3 >>"),
     ] {
         let output = flpdf(&[&format!("--show-object={selector}"), MINIMAL]);
