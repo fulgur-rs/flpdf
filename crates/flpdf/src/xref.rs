@@ -75,12 +75,19 @@ pub(crate) trait CanonicalTrailerOwner {
     fn set_header_offset(&self, offset: usize);
     /// Flips the owner's reconstruction flag on, mirroring qpdf's
     /// `m->reconstructed_xref = true` inside `reconstruct_xref`
-    /// (`QPDF.cc:518-522`), which runs both at open time (`:464`) and during
+    /// (`QPDF.cc:518-524`), which runs both at open time (`:464`) and during
     /// object resolution (`:1617`) against the same `QPDF` instance. Xref
     /// loading calls this the moment its own reconstruction succeeds, so the
-    /// owner's guard against a second full reconstruction scan is armed at
-    /// the same point in the sequence qpdf arms it — not batched into a
+    /// owner's guard is armed by the loader itself rather than batched into a
     /// returned struct and applied afterward.
+    ///
+    /// The sequence point is not yet qpdf's. qpdf assigns the flag on entry,
+    /// before it warns and before the scan runs, so a recovery that re-enters
+    /// mid-scan is rejected and a scan that fails partway still leaves the
+    /// flag set; this call happens once the scan has succeeded. Moving it to
+    /// the entry point fails nine tests today, because this crate's
+    /// candidate-xref re-entry does re-enter recovery while the scan is
+    /// running.
     fn set_reconstructed_xref(&self);
     /// qpdf's live `m->file` source boundary (`QPDF.hh:67-97,1453-1457`).
     /// Xref loading uses these operations instead of a complete input

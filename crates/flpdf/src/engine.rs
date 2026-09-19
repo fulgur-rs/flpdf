@@ -250,10 +250,10 @@ impl<R: Read + Seek> Pdf<R> {
         // The xref loader was given this resolver as its canonical owner, so
         // xref-stream handles and all metadata they resolve are already in the
         // live cache. `header_offset` and `reconstructed_xref` are also
-        // already live on this resolver: the loader wrote them through
-        // `CanonicalTrailerOwner` at the point in the sequence qpdf writes
-        // them (`xref.rs:850`, `xref.rs::set_reconstructed_xref`), not
-        // batched here.
+        // already live on this resolver: the loader writes them through
+        // `CanonicalTrailerOwner` itself (`xref.rs:850`,
+        // `xref.rs::set_reconstructed_xref`) rather than returning them for
+        // this function to transcribe.
         let parsed_xref_streams = loaded_state.parsed_xref_streams;
         let trailer_references = loaded_state.trailer_references;
         let first_xref_item_offset = loaded_state.first_xref_item_offset;
