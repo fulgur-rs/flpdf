@@ -3,6 +3,26 @@
 //!
 //! qpdf correspondence: `QPDF::resolve` (`libqpdf/QPDF.cc:1700-1753`) and the `QPDF::Members` fields it touches.
 //!
+//! # qpdf deviations recorded here
+//!
+//! Two behaviours in `replace_object`/`swap_objects` have no qpdf
+//! counterpart. Both carry an inline deviation marker at their sites, and
+//! `docs/qpdf-correspondence.md` carries the full rationale.
+//!
+//! 1. **xref-less-generation provenance** (CLAUDE.md category (C)): qpdf's
+//!    `updateCache` (`QPDF.cc:1842-1858`) stores whatever object it is handed
+//!    with no record of the caller, so `m->obj_cache` cannot distinguish a
+//!    replacement from a dangling `resolve`. flpdf records the provenance only
+//!    because `ResolverCore`'s split complete/live object-ref views need it
+//!    (`flpdf-uwn0`). Output bytes are unchanged.
+//! 2. **Foreign-owner guard** — *not* category (C), because it does change
+//!    output. `QPDF::replaceObject` (`QPDF.cc:1986-1993`) rejects only an
+//!    indirect or uninitialized handle and never calls `checkOwnership`, so a
+//!    direct value holding a foreign indirect child succeeds there and is
+//!    written; here it returns `Unsupported` and nothing is written. It stays
+//!    marked as an unresolved behavioral divergence, tracked by route matrix
+//!    A17, rather than being recorded as sanctioned scaffolding.
+//!
 //! # Why this exists as its own owner
 //!
 //! `DocumentResolver::resolve_indirect` takes `&self`
@@ -1882,6 +1902,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// `QPDFValue` (`QPDF.cc:1986-1993,1835-1857`;
     /// `QPDFObject_private.hh:117-120`), which is represented by
     /// [`ObjectHandle::assign_value_state`].
+    ///
+    /// The foreign-owner guard and the trailing xref-less-generation
+    /// provenance recording below both have no qpdf counterpart; the body
+    /// marks each one.
     pub(crate) fn replace_object(
         &self,
         object_ref: ObjectRef,
@@ -1892,6 +1916,20 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 "QPDF::replaceObject called with indirect object handle".to_string(),
             ));
         }
+        // qpdf-deviation: qpdf's own `QPDF::replaceObject` (`QPDF.cc:1986-1993`)
+        // never calls `checkOwnership` -- it rejects only an indirect or
+        // uninitialized handle, then calls `updateCache`. This
+        // descendant-graph walk is flpdf's own defense against a foreign
+        // indirect object nested below the replacement value; see
+        // `ObjectHandle::belongs_exclusively_to_pdf`.
+        //
+        // This is NOT CLAUDE.md category (C): (C) covers deviations that do
+        // not change output bytes, and this one does. Passing a direct
+        // dictionary holding a foreign indirect child succeeds in qpdf and
+        // writes that value; here it returns `Unsupported` and writes
+        // nothing. It is an unresolved behavioral divergence, kept marked so
+        // a later audit finds it rather than mistaking it for sanctioned
+        // scaffolding. Route matrix A17 tracks it.
         if !replacement.belongs_exclusively_to_pdf(self.pdf_unique_id.get()) {
             return Err(Error::Unsupported(
                 "Attempting to add an object from a different QPDF. Use QPDF::copyForeignObject to add objects from another file.".to_string(),
@@ -1921,6 +1959,16 @@ impl<R: Read + Seek> ResolverHandle<R> {
         target.clear_description();
         target.reset_parsed_offset();
         target.set_end_offsets(NO_PARSED_OFFSET, NO_PARSED_OFFSET);
+        // qpdf-deviation: qpdf's `updateCache` (`QPDF.cc:1842-1858`) is
+        // caller-blind -- it stores whatever object it is handed under `og`,
+        // with no record of who called. `replaceObject` hands it the
+        // replacement (`QPDF.cc:1992`) while a dangling `resolve` hands it a
+        // fresh null (`:1711,1748`), so the arguments coincide only when the
+        // replacement is itself null; either way the resulting cache cell
+        // carries no provenance, so qpdf cannot distinguish the two;
+        // flpdf records this provenance only because `ResolverCore`'s split
+        // complete/live object-ref views need it (`docs/qpdf-correspondence.md`,
+        // `flpdf-uwn0`).
         if self.xref_entry(object_ref).is_none() {
             self.core.borrow_mut().record_allocated_object(object_gen);
         }
@@ -1934,6 +1982,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// both cache entries are resolved before `QPDFObject::swapWith` exchanges
     /// their value allocations. Unknown object generations therefore resolve
     /// to qpdf's ordinary null object before the swap.
+    ///
+    /// qpdf's own `swapObjects` is exactly those three lines; the trailing
+    /// xref-less-generation provenance recording below has no qpdf
+    /// counterpart, and the body marks it.
     pub(crate) fn swap_objects(&self, first: ObjectRef, second: ObjectRef) -> Result<()> {
         let first_gen = QpdfObjGen::try_from_object_ref(first)?;
         let second_gen = QpdfObjGen::try_from_object_ref(second)?;
@@ -1950,17 +2002,23 @@ impl<R: Read + Seek> ResolverHandle<R> {
             self.resolve_indirect(second, &second_handle)?;
         }
         first_handle.swap_value_state_with(&second_handle);
-        // `QPDF::swapObjects` resolves both identities before the swap
-        // (`libqpdf/QPDF.cc:2284-2291`), so a generation that had no xref row
-        // now owns a cache cell that `getAllObjects` enumerates
-        // (`libqpdf/QPDF.cc:1286-1294`). Record the same document-owned
-        // provenance `replace_object` records, or the writer's live view drops
-        // the value that was just swapped in.
+        // qpdf-deviation-start: `QPDF::swapObjects` resolves both identities
+        // before the swap (`libqpdf/QPDF.cc:2284-2291`), so a generation that
+        // had no xref row now owns a cache cell that `getAllObjects`
+        // enumerates (`libqpdf/QPDF.cc:1286-1294`). Record the same
+        // document-owned provenance `replace_object` records, or the
+        // writer's live view drops the value that was just swapped in. qpdf
+        // itself draws no such distinction: `resolve`'s dangling-reference
+        // path and this explicit swap both reach `updateCache`
+        // (`QPDF.cc:1842-1858`) the same way, so `m->obj_cache` cannot tell
+        // them apart; flpdf records this provenance only because
+        // `ResolverCore`'s split complete/live object-ref views need it.
         for (object_ref, object_gen) in [(first, first_gen), (second, second_gen)] {
             if self.xref_entry(object_ref).is_none() {
                 self.core.borrow_mut().record_allocated_object(object_gen);
             }
         }
+        // qpdf-deviation-end
         Ok(())
     }
 
