@@ -1158,9 +1158,13 @@ fn parse_job_split_pages(value: &[u8]) -> Result<i32> {
         // `libqpdf/QPDFJob.cc:2970`). Preserve the signed value here so the
         // split path can reproduce that late conversion error.
         QpdfIntParse::Value(count) => Ok(count),
-        QpdfIntParse::Overflow(_) => Err(Error::Usage(UsageError::new(format!(
-            ".splitPages: invalid page count {text}"
-        )))),
+        // qpdf reports the conversion failure itself rather than a
+        // splitPages-specific message: `--split-pages=<huge>` prints
+        // "overflow/underflow converting <n> to 64-bit integer" and an i32
+        // overflow prints the narrowing text, through the same
+        // `QUtil::string_to_int` boundary every other numeric option uses.
+        // `parse_job_compression_level` below already propagates it this way.
+        QpdfIntParse::Overflow(message) => Err(Error::System(message)),
     }
 }
 
@@ -6983,10 +6987,26 @@ mod tests {
 
     #[test]
     fn job_json_split_pages_rejects_an_i32_overflow_at_the_qpdf_boundary() {
+        // qpdf 11.9.0, `--job-json-file` with `"splitPages":"2147483648"`:
+        //   qpdf: error with job-json file sp.json: integer out of range
+        //   converting 2147483648 from a 8-byte signed type to a 4-byte
+        //   signed type
         let error = parse_job_split_pages(b"2147483648").expect_err("i32 overflow must fail");
         assert_eq!(
             error.to_string(),
-            ".splitPages: invalid page count 2147483648"
+            "integer out of range converting 2147483648 from a 8-byte signed type to a 4-byte signed type"
+        );
+    }
+
+    #[test]
+    fn job_json_split_pages_rejects_an_i64_overflow_at_the_qpdf_boundary() {
+        // qpdf 11.9.0: `qpdf: overflow/underflow converting
+        // 999999999999999999999 to 64-bit integer`
+        let error =
+            parse_job_split_pages(b"999999999999999999999").expect_err("i64 overflow must fail");
+        assert_eq!(
+            error.to_string(),
+            "overflow/underflow converting 999999999999999999999 to 64-bit integer"
         );
     }
 

@@ -663,14 +663,6 @@ fn top_level_parse_errors_follow_qpdf_argv_order() {
     ];
 
     for (name, args) in cases {
-        // Known bug, tracked separately (flpdf-3yn9.48.193):
-        // `parse_job_split_pages`'s 64-bit-overflow arm substitutes its own
-        // "invalid page count" text instead of propagating the shared
-        // `qpdf_string_to_int_checked` overflow message the way every other
-        // case above does. Skip only this case; the other 14 already pass.
-        if name == "split-pages-before-job-json" {
-            continue;
-        }
         let qpdf = ProcessCommand::new("/usr/bin/qpdf")
             .current_dir(directory.path())
             .args(&args)
