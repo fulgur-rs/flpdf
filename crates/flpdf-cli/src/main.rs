@@ -7338,7 +7338,7 @@ fn run_page_extraction(
             repair,
             password,
             page_ops,
-            specs,
+            raw_specs,
             overlay_specs,
             remove_unref,
             remove_restrictions,
