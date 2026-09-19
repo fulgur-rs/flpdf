@@ -40,15 +40,13 @@ type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
 /// it is not a library-facing page-plan type.
 struct CliInputSpec {
     path: PathBuf,
-    password: Option<Vec<u8>>,
     range: PageRange,
 }
 
 impl CliInputSpec {
-    fn new(path: impl Into<PathBuf>, password: Option<Vec<u8>>, range: PageRange) -> Self {
+    fn new(path: impl Into<PathBuf>, range: PageRange) -> Self {
         Self {
             path: path.into(),
-            password,
             range,
         }
     }
@@ -6668,15 +6666,10 @@ fn resolve_page_specs(
                 Box::new(Error::SystemBytes(what)) as Box<dyn std::error::Error>
             })?
         };
-        out.push(CliInputSpec::new(
-            path,
-            s.raw_password.clone().or_else(|| {
-                s.password
-                    .as_ref()
-                    .map(|password| arg_parser::os_bytes(password))
-            }),
-            range,
-        ));
+        // The per-segment password now travels on the job's page-spec
+        // configuration (`QPDFJob::add_page_spec`), matching qpdf's
+        // `handlePageSpecs`, so this CLI-local spec no longer carries it.
+        out.push(CliInputSpec::new(path, range));
     }
     Ok(out)
 }
