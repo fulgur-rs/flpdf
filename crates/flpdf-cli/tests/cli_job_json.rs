@@ -1319,6 +1319,103 @@ fn job_json_file_list_attachments_matches_qpdf_without_output_file() {
     assert_eq!(flpdf.stderr, qpdf.stderr);
 }
 
+/// Every `--add-attachment FILE ... --` group on argv must be applied when
+/// combined with `--job-json-file`, not just the first one. The
+/// `--job-json-file` route feeds the full raw argv straight into qpdf's own
+/// argv grammar (`QPDFJob::initializeFromArgv`), which accumulates every
+/// `--add-attachment` group it sees; flpdf-cli's own preprocessing must
+/// preserve every group for that route to see them all.
+#[test]
+fn job_json_file_applies_every_add_attachment_group() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/two-page.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(directory.path().join("a1.txt"), b"attachment one").unwrap();
+    fs::write(directory.path().join("a2.txt"), b"attachment two").unwrap();
+    fs::write(
+        directory.path().join("job-qpdf.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"qpdf-out.pdf"}"#,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("job-flpdf.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"flpdf-out.pdf"}"#,
+    )
+    .unwrap();
+
+    let extra_args = |job_json: &str| {
+        vec![
+            format!("--job-json-file={job_json}"),
+            "--static-id".to_owned(),
+            "--add-attachment".to_owned(),
+            "a1.txt".to_owned(),
+            "--key=k1".to_owned(),
+            "--creationdate=D:20240101000000Z".to_owned(),
+            "--moddate=D:20240101000000Z".to_owned(),
+            "--".to_owned(),
+            "--add-attachment".to_owned(),
+            "a2.txt".to_owned(),
+            "--key=k2".to_owned(),
+            "--creationdate=D:20240101000000Z".to_owned(),
+            "--moddate=D:20240101000000Z".to_owned(),
+            "--".to_owned(),
+        ]
+    };
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .args(extra_args("job-qpdf.json"))
+        .output()
+        .unwrap();
+    assert!(qpdf.status.success(), "qpdf job JSON failed: {qpdf:?}");
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .args(extra_args("job-flpdf.json"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        flpdf.status.code(),
+        Some(0),
+        "flpdf job JSON failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&flpdf.stdout),
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+
+    // Compare `--list-attachments` text rather than raw output bytes: the
+    // default Pure-Rust DEFLATE backend (miniz_oxide) does not produce
+    // byte-identical compressed stream data to qpdf's zlib (documented
+    // exception in this repo's CLAUDE.md), so a full-file byte comparison
+    // would need the `qpdf-zlib-compat` feature. The attachment listing text
+    // itself does not depend on stream compression and is the qpdf-parity
+    // surface this regression test is about: both `--add-attachment` groups
+    // being applied, not just the first.
+    let qpdf_listing = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .args(["--list-attachments", "qpdf-out.pdf"])
+        .output()
+        .unwrap();
+    let flpdf_listing = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .args(["--list-attachments", "flpdf-out.pdf"])
+        .output()
+        .unwrap();
+    assert!(qpdf_listing.status.success());
+    assert_eq!(flpdf_listing.status.code(), Some(0));
+    assert_eq!(flpdf_listing.stdout, qpdf_listing.stdout);
+    let listing = String::from_utf8_lossy(&flpdf_listing.stdout);
+    assert!(listing.contains("k1"), "listing must contain k1: {listing}");
+    assert!(listing.contains("k2"), "listing must contain k2: {listing}");
+}
+
 #[test]
 fn job_json_file_show_attachment_matches_qpdf_without_output_file() {
     if !qpdf_available() {

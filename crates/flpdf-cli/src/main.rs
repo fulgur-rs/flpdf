@@ -10156,6 +10156,36 @@ mod tests {
     }
 
     #[test]
+    fn preprocess_qpdf_args_preserves_every_add_attachment_group_in_raw_residual_args() {
+        // The `--job-json-file` route (`preflight_qpdf_cli_events`) parses
+        // `raw_residual_args` through the qpdf-compatible argv parser
+        // directly, unlike every other route, which reads attachment data
+        // from `attachment_segments` instead. Every `--add-attachment` group
+        // must therefore survive in `raw_residual_args`, the same as every
+        // `--copy-attachments-from` group already does.
+        let preprocessed = preprocess_qpdf_args(strs(&[
+            "flpdf",
+            "--job-json-file=job.json",
+            "--add-attachment",
+            "a1.txt",
+            "--",
+            "--add-attachment",
+            "a2.txt",
+            "--",
+        ]))
+        .expect("qpdf accepts repeated add-attachment groups");
+        let count = preprocessed
+            .raw_residual_args
+            .iter()
+            .filter(|argument| argument.as_bytes() == b"--add-attachment")
+            .count();
+        assert_eq!(
+            count, 2,
+            "raw_residual_args must retain every --add-attachment group"
+        );
+    }
+
+    #[test]
     fn preprocess_qpdf_args_does_not_promote_segment_password_to_top_level() {
         let directory = tempfile::tempdir().expect("create argument-file directory");
         let path = directory.path().join("pages-args");
@@ -11083,6 +11113,12 @@ mod tests {
         ]);
         let (residual, groups) = extract_attachment_groups(argv).unwrap();
 
+        // Every `--add-attachment` group is retained in `residual_args`, not
+        // just the first: the `--job-json-file` route
+        // (`preflight_qpdf_cli_events`) parses `raw_residual_args` through
+        // the qpdf-compatible argv parser directly and needs every group,
+        // matching `--copy-attachments-from`'s existing (never-truncated)
+        // retention.
         assert_eq!(
             residual,
             strs(&[
@@ -11091,6 +11127,10 @@ mod tests {
                 "--add-attachment",
                 "one.txt",
                 "--key=one",
+                "--",
+                "--add-attachment",
+                "two.txt",
+                "--key=two",
                 "--",
                 "out.pdf",
             ])
