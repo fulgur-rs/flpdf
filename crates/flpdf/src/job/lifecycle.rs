@@ -4851,7 +4851,22 @@ impl QPDFJob {
     /// lifecycle boundary (`QPDFJob.cc:484-563`). The warning-summary
     /// destination is derived from [`JsonJobOutput`] itself, so callers cannot
     /// provide a destination and an inconsistent `creates_output` flag.
-    pub fn write_json<R>(
+    // `pub(crate)`: qpdf's own `QPDFJob::writeJSON` is private
+    // (`include/qpdf/QPDFJob.hh:549`), flpdf-cli's `--json` route reaches JSON
+    // output through `write_qpdf` rather than calling this method directly
+    // (`flpdf-3yn9.48.150.3`), and neither this method nor `write_json` is
+    // documented as an intentional library feature in `lib.rs`'s opening doc
+    // block, so none of the `pub` grounds in
+    // `.claude/rules/qpdf-port-design-patterns.md` section 8 apply. The
+    // narrowing leaves this method with no non-test caller (`write_qpdf`'s
+    // JSON branch reaches `write_json_without_completion` directly and owns
+    // its own completion boundary), matching the existing
+    // `#[cfg_attr(not(test), allow(dead_code))]` precedent for other
+    // qpdf-mirroring `pub(crate)` methods exercised only by unit tests
+    // (`reader/resolver.rs::input_source_name`,
+    // `writer/plain/body.rs::emit_content_container_from_handle_with_ref_map`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn write_json<R>(
         &mut self,
         pdf: &mut Pdf<R>,
         options: JsonJobOptions<'_>,
@@ -4865,8 +4880,10 @@ impl QPDFJob {
 
     /// Serialize one already-created document with the requested qpdf JSON
     /// version and optional generated-schema validation.
+    // Same `pub(crate)` rationale as `write_json` above.
     #[allow(clippy::too_many_arguments)]
-    pub fn write_json_with_version<R>(
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn write_json_with_version<R>(
         &mut self,
         pdf: &mut Pdf<R>,
         version: i32,
@@ -8109,5 +8126,347 @@ mod tests {
         assert!(job.configuration.suppress_recovery);
         assert!(job.configuration.ignore_xref_streams);
         assert!(job.configuration.check_linearization);
+    }
+
+    // `QPDFJob::write_json`/`write_json_with_version` moved in-crate:
+    // `write_json`'s pub visibility has no rule-8 ground (qpdf's own
+    // `QPDFJob::writeJSON` is private, flpdf-cli's `--json` route no longer
+    // calls it directly since it joined `write_qpdf` in `flpdf-3yn9.48.150.3`,
+    // and it is not documented as an intentional library feature in `lib.rs`),
+    // so these tests -- which exercise the job lifecycle boundary the method
+    // owns (warning drain, completion suffix, exit code) -- moved from
+    // `tests/job_lifecycle_tests.rs` alongside the visibility narrowing
+    // (`flpdf-3yn9.48.182`).
+    const COMPLETE_JSON: &[u8] = br#"{
+  "qpdf": [
+    {"jsonversion": 2, "pdfversion": "1.3"},
+    {
+      "obj:1 0 R": {"value": {"/Pages": "2 0 R", "/Type": "/Catalog"}},
+      "obj:2 0 R": {"value": {"/Count": 0, "/Kids": [], "/Type": "/Pages"}},
+      "trailer": {"value": {"/Root": "1 0 R", "/Size": 3}}
+    }
+  ]
+}"#;
+
+    const ROOTLESS_JSON: &[u8] = br#"{
+  "qpdf": [
+    {"jsonversion": 2, "pdfversion": "1.3"},
+    {"trailer": {"value": {}}}
+  ]
+}"#;
+
+    const UPDATE_JSON: &[u8] = br#"{
+  "qpdf": [
+    {"jsonversion": 2},
+    {"obj:1 0 R": {"value": {"/Marker": true, "/Pages": "2 0 R", "/Type": "/Catalog"}}}
+  ]
+}"#;
+
+    #[derive(Default)]
+    struct JsonSinkState {
+        bytes: Vec<u8>,
+    }
+
+    struct JsonRecordingSink {
+        state: std::sync::Arc<std::sync::Mutex<JsonSinkState>>,
+    }
+
+    struct JsonFailingSink;
+
+    // `identifier`/`finish` on both sinks below are `Pipeline` trait-contract
+    // boilerplate the job's warning/info logger routes never call (warnings
+    // are forwarded by message text alone, and the logger never finishes a
+    // diagnostic sink mid-job) -- only `write` is exercised, so each is
+    // individually excluded from coverage below.
+    impl Pipeline for JsonRecordingSink {
+        // cov:ignore-start: never called; see the block comment above.
+        fn identifier(&self) -> &str {
+            "json lifecycle test sink"
+        }
+        // cov:ignore-end
+
+        fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+            self.state.lock().unwrap().bytes.extend_from_slice(data);
+            Ok(())
+        }
+
+        // cov:ignore-start: never called; see the block comment above.
+        fn finish(&mut self) -> PipelineResult<()> {
+            Ok(())
+        }
+        // cov:ignore-end
+    }
+
+    impl Pipeline for JsonFailingSink {
+        // cov:ignore-start: never called; see the block comment above.
+        fn identifier(&self) -> &str {
+            "json lifecycle failing sink"
+        }
+        // cov:ignore-end
+
+        fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
+            Err(crate::pipeline::PipelineError::runtime(
+                "warning sink failed",
+            ))
+        }
+
+        // cov:ignore-start: never called; see the block comment above.
+        fn finish(&mut self) -> PipelineResult<()> {
+            Ok(())
+        }
+        // cov:ignore-end
+    }
+
+    fn json_logger_with_warning_sink(
+    ) -> (QPDFLogger, std::sync::Arc<std::sync::Mutex<JsonSinkState>>) {
+        let logger = QPDFLogger::create();
+        let state = std::sync::Arc::new(std::sync::Mutex::new(JsonSinkState::default()));
+        logger.set_warn(Some(PipelineHandle::new(JsonRecordingSink {
+            state: std::sync::Arc::clone(&state),
+        })));
+        (logger, state)
+    }
+
+    fn json_logger_with_info_sink() -> (QPDFLogger, std::sync::Arc<std::sync::Mutex<JsonSinkState>>)
+    {
+        let logger = QPDFLogger::create();
+        let state = std::sync::Arc::new(std::sync::Mutex::new(JsonSinkState::default()));
+        logger.set_info(Some(PipelineHandle::new(JsonRecordingSink {
+            state: std::sync::Arc::clone(&state),
+        })));
+        (logger, state)
+    }
+
+    #[test]
+    fn json_create_update_and_write_share_one_job_lifecycle() {
+        let mut job = QPDFJob::new();
+        let mut pdf = job
+            .create_from_json(Cursor::new(COMPLETE_JSON), "input.json")
+            .expect("complete JSON input");
+        assert_eq!(pdf.root_ref(), Some(ObjectRef::new(1, 0)));
+
+        job.update_from_json(&mut pdf, Cursor::new(UPDATE_JSON), "update.json")
+            .expect("partial JSON update");
+        assert_eq!(
+            pdf.get_object_handle(ObjectRef::new(1, 0))
+                .try_get_key(b"/Marker")
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
+
+        let mut output = Vec::new();
+        let status = job
+            .write_json(
+                &mut pdf,
+                JsonJobOptions {
+                    decode_level: JsonDecodeLevel::None,
+                    stream_data: JsonStreamData::None,
+                    stream_prefix: None,
+                    keys: &[],
+                    objects: &[],
+                },
+                JsonJobOutput::Stdout(&mut output),
+            )
+            .expect("JSON output");
+
+        assert_eq!(status, JobExitCode::Success);
+        assert!(String::from_utf8_lossy(&output).contains("\"jsonversion\": 2"));
+    }
+
+    /// A library caller that turns verbosity on through the job gets the same
+    /// `wrote file` report the CLI flag produces.
+    ///
+    /// qpdf gates it on `m->verbose` inside `writeOutfile`
+    /// (`libqpdf/QPDFJob.cc:3057-3062`), which `QPDFJob::Config::verbose` sets, so
+    /// the JSON route must read the job-owned setting rather than requiring a
+    /// separate value.
+    #[test]
+    fn json_write_reports_the_written_file_for_a_job_verbose_caller() {
+        let (logger, state) = json_logger_with_info_sink();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let output_path = directory.path().join("out.json");
+        let mut file = std::fs::File::create(&output_path).expect("create output");
+        let mut pdf = Pdf::open(BufReader::new(
+            File::open(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf"),
+            )
+            .expect("committed minimal fixture"),
+        ))
+        .expect("minimal fixture parses");
+
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.set_verbose(true);
+        let status = job
+            .write_json(
+                &mut pdf,
+                JsonJobOptions {
+                    decode_level: JsonDecodeLevel::None,
+                    stream_data: JsonStreamData::None,
+                    stream_prefix: None,
+                    keys: &[],
+                    objects: &[],
+                },
+                JsonJobOutput::File {
+                    filename: &output_path,
+                    writer: &mut file,
+                },
+            )
+            .expect("JSON output");
+
+        assert_eq!(status, JobExitCode::Success);
+        let info = String::from_utf8(state.lock().expect("sink state").bytes.clone())
+            .expect("info output is utf-8");
+        assert!(
+            info.contains(&format!("wrote file {}", output_path.display())),
+            "the job-owned verbose setting must reach the JSON report: {info:?}"
+        );
+    }
+
+    #[test]
+    fn json_write_derives_file_completion_suffix_from_output_destination() {
+        let (logger, state) = json_logger_with_warning_sink();
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.record_warnings();
+        let mut pdf = job
+            .create_from_json(Cursor::new(COMPLETE_JSON), "input.json")
+            .expect("complete JSON input");
+        let mut output = Vec::new();
+        let filename = Path::new("output.json");
+
+        let status = job
+            .write_json(
+                &mut pdf,
+                JsonJobOptions {
+                    decode_level: JsonDecodeLevel::None,
+                    stream_data: JsonStreamData::None,
+                    stream_prefix: None,
+                    keys: &[],
+                    objects: &[],
+                },
+                JsonJobOutput::File {
+                    filename,
+                    writer: &mut output,
+                },
+            )
+            .expect("JSON output");
+
+        assert_eq!(status, JobExitCode::Warning);
+        assert_eq!(
+            state.lock().unwrap().bytes,
+            b"qpdf: operation succeeded with warnings; resulting file may have some problems\n"
+        );
+    }
+
+    #[test]
+    fn json_write_reports_completion_sink_errors() {
+        let logger = QPDFLogger::create();
+        logger.set_warn(Some(PipelineHandle::new(JsonFailingSink)));
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.record_warnings();
+        let mut pdf = job
+            .create_from_json(Cursor::new(COMPLETE_JSON), "input.json")
+            .expect("complete JSON input");
+        let mut output = Vec::new();
+
+        let error = job
+            .write_json(
+                &mut pdf,
+                JsonJobOptions {
+                    decode_level: JsonDecodeLevel::None,
+                    stream_data: JsonStreamData::None,
+                    stream_prefix: None,
+                    keys: &[],
+                    objects: &[],
+                },
+                JsonJobOutput::Stdout(&mut output),
+            )
+            .expect_err("completion warning sink failure must be reported");
+
+        assert!(matches!(
+            error,
+            JsonJobError::Completion(Error::System(message))
+                if message == "warning sink failed"
+        ));
+    }
+
+    #[test]
+    fn json_write_failure_does_not_emit_completion_summary() {
+        let (logger, state) = json_logger_with_warning_sink();
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.record_warnings();
+        let mut pdf = Pdf::create_from_json(Cursor::new(ROOTLESS_JSON), "input.json")
+            .expect("rootless JSON input");
+        let mut output = Vec::new();
+
+        let error = job
+            .write_json(
+                &mut pdf,
+                JsonJobOptions {
+                    decode_level: JsonDecodeLevel::None,
+                    stream_data: JsonStreamData::None,
+                    stream_prefix: None,
+                    keys: &[],
+                    objects: &[],
+                },
+                JsonJobOutput::Stdout(&mut output),
+            )
+            .expect_err("serializer failure must abort before completion");
+
+        assert!(matches!(error, JsonJobError::Output(_)));
+        assert!(state.lock().unwrap().bytes.is_empty());
+    }
+
+    #[test]
+    fn json_job_output_matches_qpdf_11_9_json_input_route() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/json-input/complete.json");
+        let expected = match std::process::Command::new("qpdf")
+            .args(["--json-input", "--json=2"])
+            .arg(&path)
+            .arg("-")
+            .output()
+        {
+            Ok(output) if output.status.success() => output.stdout,
+            // cov:ignore-start: this test environment always has a working qpdf
+            // 11.9.0 (many other oracle tests in this crate rely on it), so
+            // neither the failure nor the unavailable branch can be exercised
+            // without uninstalling qpdf.
+            Ok(output) => panic!(
+                "qpdf JSON route failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => {
+                eprintln!("skipping qpdf differential: {error}");
+                return;
+            } // cov:ignore-end
+        };
+
+        let mut job = QPDFJob::new();
+        let mut pdf = job
+            .create_from_json(
+                File::open(&path).expect("complete JSON fixture"),
+                path.display().to_string(),
+            )
+            .expect("complete JSON input");
+        let mut actual = Vec::new();
+        job.write_json(
+            &mut pdf,
+            JsonJobOptions {
+                decode_level: JsonDecodeLevel::Generalized,
+                stream_data: JsonStreamData::None,
+                stream_prefix: None,
+                keys: &[],
+                objects: &[],
+            },
+            JsonJobOutput::Stdout(&mut actual),
+        )
+        .expect("JSON output");
+
+        assert_eq!(actual, expected);
     }
 }

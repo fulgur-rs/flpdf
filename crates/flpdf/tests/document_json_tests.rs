@@ -7,8 +7,7 @@
 //! command output is a usable oracle for the library call.
 
 use flpdf::document_json::write_json;
-use flpdf::job::{JsonJobOptions, JsonJobOutput, JsonStreamData, QPDFJob};
-use flpdf::json_inspect::{DecodeLevel, JsonKey, JsonOutputError, StreamDataMode};
+use flpdf::json_inspect::{DecodeLevel, JsonOutputError, StreamDataMode};
 use flpdf::pipeline::PlString;
 use flpdf::Pdf;
 use std::fs::File;
@@ -44,28 +43,6 @@ fn flpdf_complete_json(name: &str) -> Vec<u8> {
     bytes
 }
 
-/// Write the JSON document `qpdf --json=2 --json-key=qpdf` produces.
-///
-/// This is the shipping path: the envelope comes from the section builders and
-/// the `qpdf` key from the in-progress overload, exactly as qpdf's `doJSON` and
-/// `doJSONObjects` split the work.
-fn flpdf_qpdf_key_only_json(name: &str) -> Vec<u8> {
-    let mut pdf = open_fixture(name);
-    let mut bytes = Vec::new();
-    let keys = [JsonKey::Qpdf];
-    let options = JsonJobOptions {
-        decode_level: DecodeLevel::Generalized,
-        stream_data: JsonStreamData::None,
-        stream_prefix: None,
-        keys: &keys,
-        objects: &[],
-    };
-    QPDFJob::new()
-        .write_json(&mut pdf, options, JsonJobOutput::Stdout(&mut bytes))
-        .expect("qpdf JSON must be written");
-    bytes
-}
-
 /// Run `qpdf --json-output=2` on a fixture, or `None` when qpdf is unavailable.
 ///
 /// Only a missing qpdf binary is tolerated: a missing fixture or a failing qpdf
@@ -84,26 +61,6 @@ fn qpdf_json_output(name: &str) -> Option<Vec<u8>> {
     assert!(
         output.status.success(),
         "qpdf --json-output=2 failed on {name}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Some(output.stdout)
-}
-
-/// Run `qpdf --json=2 --json-key=qpdf`, or `None` when qpdf is unavailable.
-fn qpdf_json_key_only(name: &str) -> Option<Vec<u8>> {
-    let path = fixture(name);
-    assert!(path.is_file(), "missing fixture: {}", path.display());
-    let Ok(output) = Command::new("qpdf")
-        .arg("--json=2")
-        .arg("--json-key=qpdf")
-        .arg(&path)
-        .output()
-    else {
-        return None;
-    };
-    assert!(
-        output.status.success(),
-        "qpdf --json=2 --json-key=qpdf failed on {name}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     Some(output.stdout)
@@ -146,21 +103,6 @@ fn write_json_matches_qpdf_json_output_bytes() {
         };
         assert_eq!(
             String::from_utf8_lossy(&flpdf_complete_json(name)),
-            String::from_utf8_lossy(&expected),
-            "{name}"
-        );
-    }
-}
-
-#[test]
-fn qpdf_key_only_json_matches_qpdf_json_key_bytes() {
-    for name in ORACLE_FIXTURES {
-        let Some(expected) = qpdf_json_key_only(name) else {
-            eprintln!("skipping {name}: qpdf is unavailable");
-            continue;
-        };
-        assert_eq!(
-            String::from_utf8_lossy(&flpdf_qpdf_key_only_json(name)),
             String::from_utf8_lossy(&expected),
             "{name}"
         );
