@@ -1726,6 +1726,83 @@ fn raw_argv_show_npages_matches_the_qpdf_11_9_0_boundary() {
     );
 }
 
+/// A hand-built single-object-generation-per-entry PDF whose object 5 has
+/// generation 65536 (one past `u16::MAX`) in both `5 65536 obj` and its xref
+/// entry, mirroring
+/// `crates/flpdf-cli/tests/cli_raw_xref_identity.rs::matching_in_use_generation_65536_pdf`.
+fn matching_in_use_generation_65536_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let objects = [
+        b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".as_slice(),
+        b"2 0 obj\n42\nendobj\n".as_slice(),
+        b"3 0 obj\n43\nendobj\n".as_slice(),
+        b"4 0 obj\n44\nendobj\n".as_slice(),
+        b"5 65536 obj\n45\nendobj\n".as_slice(),
+    ];
+    let mut offsets = Vec::with_capacity(objects.len());
+    for object in objects {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    }
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for (index, offset) in offsets.iter().enumerate() {
+        let generation = if index == 4 { 65_536 } else { 0 };
+        bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
+/// `--show-object`'s raw generation (beyond `u16::MAX`) must resolve
+/// identically whether the flag is dispatched through the standalone CLI
+/// route (`crates/flpdf-cli/tests/cli_raw_xref_identity.rs::
+/// show_object_accepts_a_raw_generation_like_qpdf`) or, as exercised here,
+/// through the combined `job.config()`/`run()` boundary
+/// (`QPDFJob::doInspection`, `libqpdf/QPDFJob.cc:1678-1680`).
+/// `JobObjectSelector::Object`'s generation-range clamp previously
+/// projected `5 65536 obj` onto `Null` instead of the raw identity qpdf
+/// itself resolves it through (`QPDF::getObjectByID`,
+/// `libqpdf/QPDF.cc:1973-1977`).
+#[test]
+fn raw_argv_show_object_accepts_a_raw_generation_like_qpdf() {
+    let version = Command::new("qpdf").arg("--version").output();
+    if !version.as_ref().is_ok_and(|output| {
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout).starts_with("qpdf version 11.9.0")
+    }) {
+        return;
+    }
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let input = tempdir.path().join("matching-in-use-generation-65536.pdf");
+    std::fs::write(&input, matching_in_use_generation_65536_pdf()).unwrap();
+
+    let qpdf = Command::new("qpdf")
+        .arg("--show-object=5,65536")
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(qpdf.status.success(), "qpdf failed: {qpdf:?}");
+
+    let (logger, info) = logger_with_info_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.initialize_from_raw_argv(&[
+        b"qpdfjob".to_vec(),
+        input.to_string_lossy().into_owned().into_bytes(),
+        b"--show-object=5,65536".to_vec(),
+    ])
+    .unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    assert_eq!(
+        normalize_text_newlines(&info.lock().unwrap().bytes),
+        normalize_text_newlines(&qpdf.stdout)
+    );
+}
+
 #[test]
 fn raw_argv_writer_matches_qpdf_process_contract() {
     let version = Command::new("qpdf").arg("--version").output();
