@@ -138,6 +138,16 @@ impl<'ast> Visit<'ast> for WrapperAudit {
         if is_test_only(&local.attrs) {
             return;
         }
+        // Rust resolves the initializer before the new binding enters scope,
+        // so `let helper = helper.get_form_xobject_for_page(true)?;` still
+        // calls on the *outer* helper. Walk the initializer first, then
+        // rebind.
+        if let Some(init) = local.init.as_ref() {
+            self.visit_expr(&init.expr);
+            if let Some(diverge) = init.diverge.as_ref() {
+                self.visit_expr(&diverge.1);
+            }
+        }
         if let syn::Pat::Ident(pat) = &local.pat {
             let name = unraw(&pat.ident);
             self.helper_bindings.retain(|binding| binding != &name);
@@ -149,7 +159,7 @@ impl<'ast> Visit<'ast> for WrapperAudit {
                 self.helper_bindings.push(name);
             }
         }
-        syn::visit::visit_local(self, local);
+        self.visit_pat(&local.pat);
     }
 
     fn visit_arm(&mut self, arm: &'ast syn::Arm) {
@@ -207,6 +217,43 @@ impl<'ast> Visit<'ast> for WrapperAudit {
             }
         }
         syn::visit::visit_expr_call(self, call);
+    }
+
+    /// A closure body does not run unless it is called. A delegation that
+    /// only appears there leaves the wrapper returning without converting the
+    /// page, so it is walked for forbidden calls but cannot satisfy the
+    /// delegation assertion.
+    fn visit_expr_closure(&mut self, closure: &'ast syn::ExprClosure) {
+        let outer_bindings = self.helper_bindings.clone();
+        let outer_delegates = self.delegates;
+        syn::visit::visit_expr_closure(self, closure);
+        self.delegates = outer_delegates;
+        self.helper_bindings = outer_bindings;
+    }
+
+    /// Same for a nested item: an inner `fn` only runs when called.
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if is_test_only(item_attrs(item)) {
+            return;
+        }
+        let outer_bindings = std::mem::take(&mut self.helper_bindings);
+        let outer_delegates = self.delegates;
+        syn::visit::visit_item(self, item);
+        self.delegates = outer_delegates;
+        self.helper_bindings = outer_bindings;
+    }
+
+    /// A qualified path used as a value aliases the function it names --
+    /// `let inspect = ObjectHandle::as_dictionary;` -- so the callee is
+    /// recorded even though no call expression mentions it. A bare local
+    /// (single segment) is just a variable and is left alone.
+    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+        if path.path.segments.len() > 1 {
+            if let Some(last) = path.path.segments.last() {
+                self.non_helper_calls.insert(unraw(&last.ident));
+            }
+        }
+        syn::visit::visit_expr_path(self, path);
     }
 
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
@@ -324,6 +371,7 @@ fn expr_attrs(expr: &syn::Expr) -> &[syn::Attribute] {
         syn::Expr::Paren(e) => &e.attrs,
         syn::Expr::Path(e) => &e.attrs,
         syn::Expr::Range(e) => &e.attrs,
+        syn::Expr::RawAddr(e) => &e.attrs,
         syn::Expr::Reference(e) => &e.attrs,
         syn::Expr::Repeat(e) => &e.attrs,
         syn::Expr::Return(e) => &e.attrs,
@@ -362,7 +410,21 @@ fn cfg_requires_test(meta: &syn::Meta) -> bool {
         syn::Meta::List(list) if list.path.is_ident("any") => nested(list)
             .map(|metas| !metas.is_empty() && metas.iter().all(cfg_requires_test))
             .unwrap_or(false),
-        // `not(test)` makes the node production-only; never drop it here.
+        // `not(not(test))` is still test-only; `not(test)` is not.
+        syn::Meta::List(list) if list.path.is_ident("not") => nested(list)
+            .map(|metas| metas.len() == 1 && cfg_forbids_test(&metas[0]))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// True when the predicate is false in every `test` build, which makes its
+/// negation test-only.
+fn cfg_forbids_test(meta: &syn::Meta) -> bool {
+    match meta {
+        syn::Meta::List(list) if list.path.is_ident("not") => nested(list)
+            .map(|metas| metas.len() == 1 && cfg_requires_test(&metas[0]))
+            .unwrap_or(false),
         _ => false,
     }
 }
