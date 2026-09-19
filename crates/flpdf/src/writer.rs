@@ -3629,8 +3629,12 @@ fn collect_content_container_refs<R: Read + Seek>(
 /// once, inspect an array's immediate children, and never chase a
 /// flpdf-only reference-holder chain. Unlike `ObjectHandle::get_page_contents`,
 /// the writer pre-scan deliberately does not issue the `getPageContents`
-/// damage warning for a non-stream array member, because qpdf's writer
-/// pre-scan only asks each child whether it is a stream.
+/// damage warning for a non-stream array member. qpdf's array branch asks
+/// each child nothing at all -- it pushes every item's `getObjGen()`
+/// unconditionally (`QPDFWriter.cc:1922-1926`); only the scalar branch tests
+/// `isStream()` (`:1927`). flpdf filters array members by stream type here,
+/// which drops the `%% Contents for page N` marker qpdf emits before a
+/// non-stream member. Tracked separately; this route does not change it.
 ///
 /// Production reads this identity set through
 /// [`SpecialStreams::live_content_stream_state`], computed once at setup for

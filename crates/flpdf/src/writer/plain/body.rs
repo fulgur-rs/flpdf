@@ -3760,10 +3760,12 @@ mod object_emitter_tests {
     /// `m->normalized_streams` -- a `std::set<QPDFObjGen>`
     /// (`QPDFWriter.cc:1279`, `include/qpdf/QPDFWriter.hh:676`) -- not
     /// against the `ObjectRef`-keyed `contents_sequences` map the plain live
-    /// QDF marker text separately reads. `initialize_special_streams` always
-    /// populates both together, so production can never observe them
-    /// disagree; construct that disagreement directly here to pin which one
-    /// this route's normalization decision actually follows.
+    /// QDF marker text separately reads. `initialize_special_streams`
+    /// populates both from the same walk, but they can still disagree in
+    /// production: a content stream whose generation cannot be projected
+    /// (`gen >= 65535`, reachable through `Pdf::get_object_handle_by_raw_identity`)
+    /// stays in the raw set and drops out of the `ObjectRef`-keyed map. This
+    /// case pins which one this route's normalization decision follows.
     #[test]
     fn plain_live_content_normalization_gate_reads_the_raw_normalized_streams_set(
     ) -> crate::Result<()> {

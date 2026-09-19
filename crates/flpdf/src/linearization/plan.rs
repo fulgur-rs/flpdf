@@ -106,9 +106,12 @@ impl SharedObjectHintEntry {
 // Closure helpers
 // ---------------------------------------------------------------------------
 
-/// The set of indirect page-content stream refs, matching the plain
-/// writer's `contents_seq` identity gate
-/// (`writer.rs`'s `options.content_normalization && contents_seq.contains_key(old_ref)`).
+/// The set of indirect page-content stream refs. **2026-09-19**: the plain
+/// writer no longer gates on `contents_seq`; it reads the raw
+/// `normalized_streams` set keyed by `QpdfObjGen`, matching qpdf's
+/// `old_og`-keyed membership test (`QPDFWriter.cc:1279`). This set is still
+/// `ObjectRef`-projected, so the two routes can disagree for a content stream
+/// whose generation does not project.
 ///
 /// Empty when `options.content_normalization` is off: qpdf's own
 /// `m->normalize_content && m->normalized_streams.count(old_og)` gate

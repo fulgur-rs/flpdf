@@ -626,12 +626,16 @@ content stream is unreachable in practice: both qpdf's parser
 (`QPDFParser.cc:168`) and flpdf's (`parser.rs:872`) null out any `N G R`
 token with `gen>=65535` at parse time, and `collect_content_stream_qpdf_obj_gens`
 already filters non-indirect (`object==0`) gens before either raw or
-`ObjectRef`-projected insert, so the two representations could never diverge
-in a real write. No output-byte change: a RED/GREEN unit test
+`ObjectRef`-projected insert. **2026-09-19 訂正**: 「両表現は実際の write では
+決して食い違わない」は言い過ぎだった——`Pdf::get_object_handle_by_raw_identity`
+（`crates/flpdf/src/reader.rs`、`pub`）で構築した `gen >= 65535` の content stream は
+raw set に残り `ObjectRef`-projected map からは落ちる。parse 由来の入力からは
+到達不能というだけで、library API 経路では食い違う。その場合の挙動変化は
+**qpdf に寄る方向**（qpdf は ObjGen keyed なので正規化する）で、linearized 経路は
+既に同じ挙動を `qpdf_obj_gen_header_tests.rs` で pin 済み。RED/GREEN unit test
 (`plain_live_content_normalization_gate_reads_the_raw_normalized_streams_set`)
 pins the new gate against a deliberately-disagreeing
-`contents_sequences`/`normalized_streams` pair (impossible from
-`initialize_special_streams`'s own setup, constructed directly to prove which
+`contents_sequences`/`normalized_streams` pair (constructed directly to prove which
 field the decision follows), and `qdf_special_streams_tests`
 (`normalize_content_fixtures_match_qpdf_static_id`,
 `qdf_special_stream_fixtures_match_qpdf_static_id`), `writer_object_emission_tests`,
