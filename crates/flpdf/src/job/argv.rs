@@ -2638,6 +2638,7 @@ mod tests {
         let rendered = job_json_file_open_error(Path::new("job.json"), error);
         let Error::SystemBytes(message) = rendered else {
             panic!("expected a byte-preserving SystemBytes error, got {rendered:?}");
+            // cov:ignore: the else arm only fires if job_json_file_open_error stops returning SystemBytes
         };
         let text = String::from_utf8(message).expect("ASCII path and strerror text");
         assert!(
@@ -2658,6 +2659,7 @@ mod tests {
         let rendered = job_json_file_open_error(&path, error);
         let Error::SystemBytes(message) = rendered else {
             panic!("expected a byte-preserving SystemBytes error, got {rendered:?}");
+            // cov:ignore: the else arm only fires if job_json_file_open_error stops returning SystemBytes
         };
         assert_eq!(message, b"open \xff: No such file or directory");
     }
