@@ -3739,15 +3739,14 @@ fn top_level_inspection_combination_requested(
     // many branches are selected -- there is no separate qpdf code path for
     // "exactly one inspection flag". Route every one of these nine flags
     // through the combined job lifecycle unconditionally, matching that
-    // structure. `--show-object` is excluded: its sole-flag CLI selector
-    // accepts a raw (number, generation) pair beyond generation 65535 and
-    // resolves it through `Pdf::get_object_handle_by_raw_identity` (bypassing
-    // the ordinary xref-backed lookup, since qpdf's own parser nulls
-    // references at that generation), while the shared
-    // `JobObjectSelector`/`configuration.show_object` path this function
-    // would otherwise route through has no such bypass yet
-    // (`crates/flpdf/src/job/lifecycle.rs::parse_job_object_selector` clamps
-    // the generation to `u16`). Tracked by `flpdf-t3as9`.
+    // structure. `--show-object` is still excluded, but no longer
+    // because of a generation clamp: `parse_job_object_selector` now accepts
+    // any non-negative generation, matching qpdf's `parse_object_id`
+    // (`libqpdf/QPDFJob.cc:929-941`), which does not clamp either. What
+    // remains is that the sole-flag CLI selector resolves through
+    // `Pdf::get_object_handle_by_raw_identity` while the shared
+    // `JobObjectSelector`/`configuration.show_object` path uses the ordinary
+    // xref-backed lookup; folding the two is tracked separately.
     let migrated_flag_selected = args.check
         || args.show_npages
         || args.show_pages
