@@ -16,22 +16,40 @@ fn production_source() -> String {
     strip_cfg_test_items(&source)
 }
 
-/// Drop each `#[cfg(test)]` attribute together with the item it gates.
+/// Drop each `#[cfg(test)]` attribute together with the item it gates, and
+/// with the doc comment and attributes that precede it.
 ///
-/// A gated `use` (or any other statement) ends at its first `;`; a gated
-/// function or module ends when its brace depth returns to zero.
+/// Rust puts doc comments and other attributes *before* `#[cfg(test)]`, so
+/// stopping at the `#[cfg(test)]` line would leave a gated helper's `///`
+/// text in the scanned source -- and a forbidden spelling quoted in that
+/// text would fail the contract even though the shipped route is unchanged.
+///
+/// A gated statement ends at its first `;`; a gated function or module ends
+/// when its brace depth returns to zero.
 fn strip_cfg_test_items(source: &str) -> String {
-    let mut production = String::with_capacity(source.len());
-    let mut lines = source.lines().peekable();
-    while let Some(line) = lines.next() {
+    let lines: Vec<&str> = source.split('\n').collect();
+    let mut production: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut index = 0usize;
+    while index < lines.len() {
+        let line = lines[index];
         if line.trim() != "#[cfg(test)]" {
-            production.push_str(line);
-            production.push('\n');
+            production.push(line);
+            index += 1;
             continue;
         }
+        // Discard the doc comment and attributes already emitted for this item.
+        while production.last().is_some_and(|previous| {
+            let trimmed = previous.trim();
+            trimmed.starts_with("///") || trimmed.starts_with("#[") || trimmed.starts_with("//!")
+        }) {
+            production.pop();
+        }
+        index += 1;
         let mut depth = 0usize;
         let mut opened = false;
-        for gated in lines.by_ref() {
+        while index < lines.len() {
+            let gated = lines[index];
+            index += 1;
             depth += gated.matches('{').count();
             depth -= gated.matches('}').count().min(depth);
             if gated.contains('{') {
@@ -46,13 +64,26 @@ fn strip_cfg_test_items(source: &str) -> String {
             }
         }
     }
-    production
+    production.join("\n")
 }
 
 #[test]
 fn production_page_form_xobject_uses_canonical_resolving_routes() {
     let production = production_source();
-    for forbidden in [".resolve(", ".resolve_handle(", ".resolve_handle_ref("] {
+    // The A6 boundary is assigned to `page_object_helper.rs` because this
+    // wrapper performs no type inspection of its own -- it hands the page to
+    // the canonical helper. Keeping the non-resolving accessors out of this
+    // list would let that logic creep back in undetected.
+    for forbidden in [
+        ".resolve(",
+        ".resolve_handle(",
+        ".resolve_handle_ref(",
+        ".as_dictionary(",
+        ".as_array(",
+        ".as_integer(",
+        ".as_name(",
+        ".is_null(",
+    ] {
         assert!(
             !production.contains(forbidden),
             "page_form_xobject production retains non-canonical route {forbidden}"
