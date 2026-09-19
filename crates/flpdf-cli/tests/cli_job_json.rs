@@ -3941,3 +3941,101 @@ fn job_json_no_warn_survives_the_cli_default() {
     assert_eq!(flpdf.status.code(), qpdf.status.code());
     assert_eq!(flpdf.stderr, qpdf.stderr);
 }
+
+/// A CLI-only flag inside a named segment belongs to that segment's qpdf
+/// sub-parser, not to the main table.
+///
+/// `--repair` has no qpdf main-table entry, so the preflight drops it before
+/// handing argv to `QPDFJob::initialize_from_raw_argv`. Dropping it by byte
+/// comparison alone would also silence it inside an `--add-attachment ... --`
+/// group, where qpdf rejects it. The job-JSON route never reparses the
+/// attachment segments, so that error would be lost for good.
+#[test]
+fn repair_inside_an_attachment_segment_is_rejected_like_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("payload"), b"payload").unwrap();
+    std::fs::write(directory.path().join("job.json"), b"{}").unwrap();
+
+    let args = [
+        "--empty",
+        "--job-json-file=job.json",
+        "out.pdf",
+        "--add-attachment",
+        "payload",
+        "--repair",
+        "--",
+    ];
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .args(args)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(args)
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        qpdf.status.code(),
+        flpdf.status.code(),
+        "exit code mismatch"
+    );
+    let expected = "unrecognized argument --repair (attachment options must be terminated with --)";
+    assert!(
+        String::from_utf8_lossy(&qpdf.stderr).contains(expected),
+        "qpdf stderr: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&flpdf.stderr).contains(expected),
+        "flpdf stderr: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert!(
+        !directory.path().join("out.pdf").exists(),
+        "a rejected invocation must not write output"
+    );
+}
+
+/// A top-level `--repair` still reaches the reader, since the preflight only
+/// drops it while scanning the main table.
+#[test]
+fn top_level_repair_still_runs_with_a_job_json_file() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/three-page.pdf"
+        ),
+        directory.path().join("input.pdf"),
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("job.json"), b"{}").unwrap();
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .args([
+            "--repair",
+            "--job-json-file=job.json",
+            "input.pdf",
+            "out.pdf",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        flpdf.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert!(directory.path().join("out.pdf").exists());
+}

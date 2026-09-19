@@ -537,8 +537,7 @@ fn emit_live_body<R: Read + Seek + 'static>(
     object_streams: &[crate::writer::object_streams::ObjectStreamGroup],
     encryption_context: Option<&crate::writer::EncryptionContext>,
     content_container_refs: &BTreeSet<ObjectRef>,
-    page_sequences: BTreeMap<ObjectRef, usize>,
-    contents_sequences: BTreeMap<ObjectRef, usize>,
+    content_stream_state: crate::writer::LiveContentStreamState,
 ) -> crate::Result<LiveBodyOutput> {
     out.write_bytes(format!("%PDF-{version}\n").as_bytes())?;
     // `QPDFWriter::writeHeader` selects the PCLm version marker in place of
@@ -591,8 +590,7 @@ fn emit_live_body<R: Read + Seek + 'static>(
         encryption_context,
         content_container_refs: content_container_refs.clone(),
         current_raw_output: None,
-        page_sequences,
-        contents_sequences,
+        content_stream_state,
         current_stream_length: None,
         two_pass_object_streams: !object_streams.is_empty(),
     };
@@ -638,8 +636,7 @@ pub(crate) fn emit_live<R: Read + Seek + 'static>(
     object_streams: &[crate::writer::object_streams::ObjectStreamGroup],
     encryption_context: Option<&crate::writer::EncryptionContext>,
     content_container_refs: &BTreeSet<ObjectRef>,
-    page_sequences: BTreeMap<ObjectRef, usize>,
-    contents_sequences: BTreeMap<ObjectRef, usize>,
+    content_stream_state: crate::writer::LiveContentStreamState,
 ) -> crate::Result<LiveBodyOutput> {
     emit_live_body(
         pdf,
@@ -652,34 +649,47 @@ pub(crate) fn emit_live<R: Read + Seek + 'static>(
         object_streams,
         encryption_context,
         content_container_refs,
-        page_sequences,
-        contents_sequences,
+        content_stream_state,
     )
 }
 
-/// Test-only re-derivation of the page/content sequence maps that
-/// [`crate::writer::SpecialStreams::page_and_contents_sequences`] now owns in
+/// Test-only re-derivation of the setup-time state that
+/// [`crate::writer::SpecialStreams::live_content_stream_state`] now owns in
 /// production. Kept so existing unit tests that call [`emit_live`] directly
 /// (bypassing [`crate::writer::PdfWriter::write`]'s setup) can still exercise
-/// a populated map without duplicating the setup-time walk in production
+/// a populated state without duplicating the setup-time walk in production
 /// code; see D26 in `docs/qpdf-route-matrix/d-writer.md`.
+///
+/// This independently re-derives `normalized_streams` from the raw
+/// `collect_content_stream_qpdf_obj_gens` walk (rather than reusing
+/// `contents_sequences.keys()`) so a test built on this helper still exercises
+/// the same qpdf-identity-keyed membership set production uses, and would
+/// catch a regression that made the two setup paths disagree.
 #[cfg(test)]
 fn qdf_page_context<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-) -> crate::Result<(BTreeMap<ObjectRef, usize>, BTreeMap<ObjectRef, usize>)> {
+) -> crate::Result<crate::writer::LiveContentStreamState> {
     let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
     let mut page_sequences = BTreeMap::new();
     let mut contents_sequences = BTreeMap::new();
+    let mut normalized_streams = BTreeSet::new();
     for (index, page) in pages.into_iter().enumerate() {
         let sequence = index
             .checked_add(1)
             .ok_or_else(|| crate::Error::Unsupported("QDF page sequence overflows usize".into()))?;
         page_sequences.insert(page, sequence);
-        for content in crate::writer::collect_content_stream_refs(pdf, page)? {
-            contents_sequences.insert(content, sequence);
+        for object_gen in crate::writer::collect_content_stream_qpdf_obj_gens(pdf, page)? {
+            if let Some(content) = object_gen.to_object_ref() {
+                contents_sequences.insert(content, sequence);
+            }
+            normalized_streams.insert(object_gen);
         }
     }
-    Ok((page_sequences, contents_sequences))
+    Ok(crate::writer::LiveContentStreamState {
+        page_sequences,
+        contents_sequences,
+        normalized_streams,
+    })
 }
 
 #[cfg(test)]
@@ -799,8 +809,8 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
     let groups = planned_object_stream_groups(plan)?;
     // This historical-plan adapter's one caller never sets qdf/content
     // normalization, so it has no setup-owned `SpecialStreams` snapshot to
-    // read from (unlike `write_plain_live`); pass empty maps rather than
-    // add an untested re-derivation branch here.
+    // read from (unlike `write_plain_live`); pass the empty default state
+    // rather than add an untested re-derivation branch here.
     emit_live_body(
         pdf,
         out,
@@ -812,8 +822,7 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
         &groups,
         None,
         &BTreeSet::new(),
-        BTreeMap::new(),
-        BTreeMap::new(),
+        crate::writer::LiveContentStreamState::default(),
     )
 }
 
@@ -834,8 +843,7 @@ struct LiveObjectEmitter<'pdf, 'output, 'sink, R: Read + Seek + 'static> {
     encryption_context: Option<&'pdf crate::writer::EncryptionContext>,
     content_container_refs: BTreeSet<ObjectRef>,
     current_raw_output: Option<ObjectRef>,
-    page_sequences: BTreeMap<ObjectRef, usize>,
-    contents_sequences: BTreeMap<ObjectRef, usize>,
+    content_stream_state: crate::writer::LiveContentStreamState,
     current_stream_length: Option<IndirectStreamLength>,
     two_pass_object_streams: bool,
 }
@@ -937,9 +945,18 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> crate::writer::write_object
             .and_then(|source| QpdfObjGen::try_from_object_ref(source).ok())
             .unwrap_or(object);
         self.options.qdf.then(|| QdfObjectInfo {
-            page_sequence: source.and_then(|source| self.page_sequences.get(&source).copied()),
-            contents_sequence: source
-                .and_then(|source| self.contents_sequences.get(&source).copied()),
+            page_sequence: source.and_then(|source| {
+                self.content_stream_state
+                    .page_sequences
+                    .get(&source)
+                    .copied()
+            }),
+            contents_sequence: source.and_then(|source| {
+                self.content_stream_state
+                    .contents_sequences
+                    .get(&source)
+                    .copied()
+            }),
             suppress_original_object_ids: self.options.no_original_object_ids,
             original_object_id: Some(original_object_id),
         })
@@ -1135,14 +1152,19 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> crate::writer::write_object
             }
         } else if object.as_stream_dict().is_some() {
             let source = object.object_ref();
-            let (dict, data, dictionary_options) = canonical_stream_output_for_rewrite(
-                object,
-                self.options,
-                source.is_some_and(|source| {
-                    self.options.content_normalization
-                        && self.contents_sequences.contains_key(&source)
-                }),
-            )?;
+            // qpdf's `willFilterStream` gates content normalization on the
+            // stream's own raw identity (`old_og = stream.getObjGen()`),
+            // matching `m->normalized_streams` -- a `std::set<QPDFObjGen>`
+            // (`QPDFWriter.cc:1279`, `include/qpdf/QPDFWriter.hh:676`) -- not
+            // a resolved `ObjectRef`.
+            let normalize_content = self.options.content_normalization
+                && object.qpdf_obj_gen().is_some_and(|object_gen| {
+                    self.content_stream_state
+                        .normalized_streams
+                        .contains(&object_gen)
+                });
+            let (dict, data, dictionary_options) =
+                canonical_stream_output_for_rewrite(object, self.options, normalize_content)?;
             let surviving_children = crate::writer::object::prepared_stream_dictionary_children(
                 &dict,
                 dictionary_options,
@@ -1685,7 +1707,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
                 marker_starts.push(marker_start);
                 marker_lengths.push(out.position_usize()? - marker_start);
             }
-            if let Some(sequence) = self.page_sequences.get(&source_member) {
+            if let Some(sequence) = self.content_stream_state.page_sequences.get(&source_member) {
                 out.write_bytes(b"%% Page ")?;
                 write_decimal_u64(out, *sequence as u64)?;
                 out.write_bytes(b"\n")?;
@@ -3447,7 +3469,6 @@ mod object_emitter_tests {
                 root: None,
                 direct_root: None,
                 id: crate::writer::plain::xref::IdPlan::Materialized { value: None },
-                encrypt: None,
                 structural_filtered: false,
                 qdf: false,
             },
@@ -3663,10 +3684,10 @@ mod object_emitter_tests {
                 compress_streams: CompressStreams::No,
                 ..WriterOptions::default()
             };
-            let (page_sequences, contents_sequences) = if qdf {
+            let content_stream_state = if qdf {
                 qdf_page_context(&mut pdf)?
             } else {
-                (BTreeMap::new(), BTreeMap::new())
+                crate::writer::LiveContentStreamState::default()
             };
             let mut output = Vec::new();
             crate::writer::output::with_buffer_sink(&mut output, |out| {
@@ -3681,8 +3702,7 @@ mod object_emitter_tests {
                     &[],
                     Some(&encryption_context()),
                     &BTreeSet::new(),
-                    page_sequences,
-                    contents_sequences,
+                    content_stream_state,
                 )
             })
             .expect("encrypted live body");
@@ -3721,8 +3741,7 @@ mod object_emitter_tests {
                 &[],
                 Some(&encryption_context()),
                 &[root_source].into_iter().collect(),
-                BTreeMap::new(),
-                BTreeMap::new(),
+                crate::writer::LiveContentStreamState::default(),
             )
         })
         .expect("encrypted live content container");
@@ -3732,6 +3751,102 @@ mod object_emitter_tests {
         assert!(!output
             .windows(b"root-secret".len())
             .any(|window| window == b"root-secret"));
+        Ok(())
+    }
+
+    /// `QPDFWriter::willFilterStream` gates content normalization on the
+    /// stream's own raw identity, `old_og = stream.getObjGen()`, against
+    /// `m->normalized_streams` -- a `std::set<QPDFObjGen>`
+    /// (`QPDFWriter.cc:1279`, `include/qpdf/QPDFWriter.hh:676`) -- not
+    /// against the `ObjectRef`-keyed `contents_sequences` map the plain live
+    /// QDF marker text separately reads. `initialize_special_streams`
+    /// populates both from the same walk, but they can still disagree in
+    /// production: a content stream whose generation cannot be projected
+    /// (`gen >= 65535`, reachable through `Pdf::get_object_handle_by_raw_identity`)
+    /// stays in the raw set and drops out of the `ObjectRef`-keyed map. This
+    /// case pins which one this route's normalization decision follows.
+    #[test]
+    fn plain_live_content_normalization_gate_reads_the_raw_normalized_streams_set(
+    ) -> crate::Result<()> {
+        let options = WriterOptions {
+            content_normalization: true,
+            compress_streams: CompressStreams::No,
+            ..WriterOptions::default()
+        };
+
+        // `normalized_streams` names the stream; `contents_sequences` does
+        // not. qpdf's gate normalizes it (the CRLF token separator collapses
+        // to a bare LF).
+        {
+            let mut pdf = pdf();
+            let stream = pdf.new_stream_with_data(Rc::new(b"q\r\nQ".to_vec()))?;
+            let stream_gen =
+                QpdfObjGen::from_valid_object_ref_for_test(stream.object_ref().unwrap());
+            pdf.root_handle()?
+                .replace_key(b"/Contents", stream)
+                .expect("attach indirect content stream");
+            let root_source = pdf.root_ref();
+            let mut output = Vec::new();
+            crate::writer::output::with_buffer_sink(&mut output, |out| {
+                emit_live(
+                    &mut pdf,
+                    out,
+                    &options,
+                    "1.4",
+                    0,
+                    root_source,
+                    BTreeSet::new(),
+                    &[],
+                    None,
+                    &BTreeSet::new(),
+                    crate::writer::LiveContentStreamState {
+                        normalized_streams: [stream_gen].into_iter().collect(),
+                        ..Default::default()
+                    },
+                )
+            })?;
+            let text = String::from_utf8_lossy(&output);
+            assert!(
+                text.contains("stream\nq\nQ"),
+                "normalized_streams membership alone must normalize the stream: {text}"
+            );
+        }
+
+        // `contents_sequences` names the stream instead; `normalized_streams`
+        // does not. qpdf's gate leaves the CRLF untouched.
+        {
+            let mut pdf = pdf();
+            let stream = pdf.new_stream_with_data(Rc::new(b"q\r\nQ".to_vec()))?;
+            let stream_ref = stream.object_ref().unwrap();
+            pdf.root_handle()?
+                .replace_key(b"/Contents", stream)
+                .expect("attach indirect content stream");
+            let root_source = pdf.root_ref();
+            let mut output = Vec::new();
+            crate::writer::output::with_buffer_sink(&mut output, |out| {
+                emit_live(
+                    &mut pdf,
+                    out,
+                    &options,
+                    "1.4",
+                    0,
+                    root_source,
+                    BTreeSet::new(),
+                    &[],
+                    None,
+                    &BTreeSet::new(),
+                    crate::writer::LiveContentStreamState {
+                        contents_sequences: [(stream_ref, 1)].into_iter().collect(),
+                        ..Default::default()
+                    },
+                )
+            })?;
+            let text = String::from_utf8_lossy(&output);
+            assert!(
+                text.contains("stream\nq\r\nQ"),
+                "contents_sequences membership alone must not normalize the stream: {text}"
+            );
+        }
         Ok(())
     }
 
@@ -3760,8 +3875,7 @@ mod object_emitter_tests {
                 &[],
                 None,
                 &[root_source].into_iter().collect(),
-                BTreeMap::new(),
-                BTreeMap::new(),
+                crate::writer::LiveContentStreamState::default(),
             )
         })?;
 
@@ -3789,7 +3903,7 @@ mod object_emitter_tests {
             ..WriterOptions::default()
         };
         let mut output = Vec::new();
-        let (page_sequences, contents_sequences) = qdf_page_context(&mut pdf)?;
+        let content_stream_state = qdf_page_context(&mut pdf)?;
 
         crate::writer::output::with_buffer_sink(&mut output, |out| {
             emit_live(
@@ -3803,8 +3917,7 @@ mod object_emitter_tests {
                 &[],
                 None,
                 &BTreeSet::new(),
-                page_sequences,
-                contents_sequences,
+                content_stream_state,
             )
         })?;
 
@@ -3834,7 +3947,10 @@ mod object_emitter_tests {
             compress_streams: CompressStreams::No,
             ..WriterOptions::default()
         };
-        let page_sequences: BTreeMap<ObjectRef, usize> = [(page_ref, 99)].into_iter().collect();
+        let content_stream_state = crate::writer::LiveContentStreamState {
+            page_sequences: [(page_ref, 99)].into_iter().collect(),
+            ..Default::default()
+        };
         let mut output = Vec::new();
 
         crate::writer::output::with_buffer_sink(&mut output, |out| {
@@ -3849,8 +3965,7 @@ mod object_emitter_tests {
                 &[],
                 None,
                 &BTreeSet::new(),
-                page_sequences,
-                BTreeMap::new(),
+                content_stream_state,
             )
         })?;
 
@@ -3859,6 +3974,38 @@ mod object_emitter_tests {
             text.contains("%% Page 99"),
             "QDF page marker must reflect the caller-supplied snapshot, not a fresh page walk: {text}"
         );
+        Ok(())
+    }
+
+    /// The other `emit_live` unit tests in this module build their PDF from
+    /// `pdf()` (`one-page-no-ext.pdf`), whose `/Pages` tree has `/Count 0`,
+    /// so `qdf_page_context`'s page/content walk never actually iterates for
+    /// them. Exercise it against a page with a real indirect content stream
+    /// so its independent re-derivation of `contents_sequences` and
+    /// `normalized_streams` (mirroring `initialize_special_streams`,
+    /// `writer.rs`) is itself under test, not just its signature.
+    #[test]
+    fn qdf_page_context_walks_a_real_pages_content_stream() -> crate::Result<()> {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        ))?; // cov:ignore: LLVM attributes the executed multiline Pdf::open call terminator to an unhit continuation line.
+        let page_ref = ObjectRef::new(3, 0);
+        let content_ref = ObjectRef::new(7, 0);
+        assert_eq!(
+            PageDocumentHelper::new(&mut pdf).get_all_pages()?,
+            vec![page_ref]
+        );
+
+        let content_stream_state = qdf_page_context(&mut pdf)?;
+
+        assert_eq!(content_stream_state.page_sequences.get(&page_ref), Some(&1));
+        assert_eq!(
+            content_stream_state.contents_sequences.get(&content_ref),
+            Some(&1)
+        );
+        assert!(content_stream_state
+            .normalized_streams
+            .contains(&QpdfObjGen::from_valid_object_ref_for_test(content_ref)));
         Ok(())
     }
 
@@ -3893,8 +4040,7 @@ mod object_emitter_tests {
                 &[],
                 Some(&context),
                 &BTreeSet::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
+                crate::writer::LiveContentStreamState::default(),
             )
         })?;
 
@@ -3979,8 +4125,7 @@ mod object_emitter_tests {
                 &[],
                 None,
                 &BTreeSet::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
+                crate::writer::LiveContentStreamState::default(),
             )
         })?; // cov:ignore: LLVM attributes the live-body test call terminator to callback cleanup.
         assert!(!bytes.is_empty());
@@ -4207,8 +4352,7 @@ mod object_emitter_tests {
                 &object_streams,
                 None,
                 &BTreeSet::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
+                crate::writer::LiveContentStreamState::default(),
             )
         })?; // cov:ignore: LLVM attributes the live-body test call terminator to callback cleanup.
         assert!(bytes
@@ -4254,8 +4398,7 @@ mod object_emitter_tests {
                 &object_streams,
                 None,
                 &BTreeSet::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
+                crate::writer::LiveContentStreamState::default(),
             )
         })?; // cov:ignore: LLVM attributes the live-body test call terminator to callback cleanup.
         let predecessor_output = body
@@ -4305,7 +4448,7 @@ mod object_emitter_tests {
             };
             let context = encryption_context();
             let mut bytes = Vec::new();
-            let (page_sequences, contents_sequences) = qdf_page_context(&mut pdf)?;
+            let content_stream_state = qdf_page_context(&mut pdf)?;
 
             crate::writer::output::with_buffer_sink(&mut bytes, |out| {
                 emit_live(
@@ -4319,8 +4462,7 @@ mod object_emitter_tests {
                     &object_streams,
                     encrypted.then_some(&context),
                     &BTreeSet::new(),
-                    page_sequences,
-                    contents_sequences,
+                    content_stream_state,
                 )
             })?;
 
@@ -4360,7 +4502,7 @@ mod object_emitter_tests {
             ..WriterOptions::default()
         };
         let mut bytes = Vec::new();
-        let (page_sequences, contents_sequences) = qdf_page_context(&mut pdf)?;
+        let content_stream_state = qdf_page_context(&mut pdf)?;
 
         crate::writer::output::with_buffer_sink(&mut bytes, |out| {
             emit_live(
@@ -4374,8 +4516,7 @@ mod object_emitter_tests {
                 &object_streams,
                 None,
                 &BTreeSet::new(),
-                page_sequences,
-                contents_sequences,
+                content_stream_state,
             )
         })?;
 
@@ -4407,7 +4548,7 @@ mod object_emitter_tests {
             ..WriterOptions::default()
         };
         let mut output = Vec::new();
-        let (page_sequences, contents_sequences) = qdf_page_context(&mut pdf)?;
+        let content_stream_state = qdf_page_context(&mut pdf)?;
 
         crate::writer::output::with_buffer_sink(&mut output, |out| {
             emit_live(
@@ -4421,8 +4562,7 @@ mod object_emitter_tests {
                 &object_streams,
                 None,
                 &BTreeSet::new(),
-                page_sequences,
-                contents_sequences,
+                content_stream_state,
             )
         })?;
 
@@ -4457,7 +4597,7 @@ mod object_emitter_tests {
             ..WriterOptions::default()
         };
         let mut output = Vec::new();
-        let (page_sequences, contents_sequences) = qdf_page_context(&mut pdf)?;
+        let content_stream_state = qdf_page_context(&mut pdf)?;
 
         let result = crate::writer::output::with_buffer_sink(&mut output, |out| {
             emit_live(
@@ -4471,8 +4611,7 @@ mod object_emitter_tests {
                 &object_streams,
                 None,
                 &BTreeSet::new(),
-                page_sequences,
-                contents_sequences,
+                content_stream_state,
             )
         });
         let error = match result {
