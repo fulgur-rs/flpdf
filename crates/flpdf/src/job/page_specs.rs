@@ -1116,6 +1116,18 @@ fn handle_page_specs_into<R: Read + Seek + 'static, T: Read + Seek + 'static>(
             .write_reconstructed_labels_raw(&copied)?;
     }
 
+    // qpdf's multi-source merge is qpdf's own primary `QPDF::insertPage`
+    // called once per selected page (`QPDFJob.cc:2470,2597`), and each call
+    // flattens the *target*'s own page tree first
+    // (`QPDF_pages.cc:204-218,161-164`), which materializes
+    // `everPushedInheritedAttributesToPages` on the target as a side effect.
+    // flpdf's bulk `merge_documents` route builds the same final page tree in
+    // one pass instead of one `insertPage` per page, so that per-insertion
+    // side effect never fires here. Reproduce it once, after the target's
+    // page tree has its final shape, so JSON metadata (and any other
+    // consumer of the flag/object-cache state) observes the same
+    // target-document state qpdf's per-page loop would have left behind.
+    crate::PageDocumentHelper::new(&mut merged).push_inherited_attributes_to_pages()?;
     for source in sources.iter() {
         job.record_document_warnings(source);
     }

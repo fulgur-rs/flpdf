@@ -2586,6 +2586,94 @@ fn json_output_pages_selection_rebuilds_the_live_page_tree() {
         .is_some());
 }
 
+/// Regression coverage for flpdf-3yn9.48.194: `--empty --json=2 --pages
+/// <file> N` used to silently drop the page selection (the JSON route's
+/// `apply_json_page_specs` only ever ran on the non-empty/plain branch), so
+/// `"pages"` came back empty instead of matching qpdf's selected page count.
+#[test]
+fn json_output_empty_input_with_pages_selects_the_requested_page() {
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/one-page.pdf");
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("empty-pages.json");
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--empty", "--json=2", "--pages"])
+        .arg(&source)
+        .arg("1")
+        .arg("--")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        flpdf.status.success(),
+        "flpdf failed: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+    let pages = json["pages"].as_array().expect("pages array");
+    assert_eq!(
+        pages.len(),
+        1,
+        "qpdf selects exactly one page for --empty --pages <file> 1, got: {json}"
+    );
+}
+
+/// Regression coverage for flpdf-3yn9.48.194: multi-source `--pages` used to
+/// be explicitly rejected on the JSON route ("--pages: JSON output currently
+/// accepts only the primary input source") where qpdf 11.9.0 accepts it.
+/// The merged object graph itself still diverges from qpdf in a known way
+/// (`flpdf-3yn9.48.210`), so this only pins the page count and exit status,
+/// not byte-for-byte JSON equality.
+#[test]
+fn json_output_multi_source_pages_is_no_longer_rejected() {
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    let primary = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/one-page.pdf");
+    let secondary = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/three-page.pdf");
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("multi-source-pages.json");
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json=2", "--pages"])
+        .arg(&primary)
+        .arg("1")
+        .arg(&secondary)
+        .arg("1")
+        .arg("--")
+        .arg(&primary)
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        flpdf.status.success(),
+        "flpdf failed: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&flpdf.stderr)
+            .contains("JSON output currently accepts only the primary input source"),
+        "the multi-source restriction must be gone"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+    let pages = json["pages"].as_array().expect("pages array");
+    assert_eq!(
+        pages.len(),
+        2,
+        "one page from each of the two sources, got: {json}"
+    );
+}
+
 /// `QPDFJob::checkConfiguration` rejects a `--json-key` that does not belong to
 /// the selected JSON version (`QPDFJob.cc:633-641`), and the argument parser
 /// rejects a `--json-output` outside its registered choices
