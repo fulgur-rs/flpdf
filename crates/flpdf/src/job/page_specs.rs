@@ -335,8 +335,18 @@ fn handle_single_source_page_specs<R: Read + Seek>(
     // everPushedInheritedAttributesToPages state as qpdf.
     crate::PageDocumentHelper::new(source).push_inherited_attributes_to_pages()?;
     let selected_refs: Vec<_> = selected.iter().map(|page| page.page_ref).collect();
-    let result = crate::pages::tree_rebuild::rebuild_page_tree(source, &selected_refs)?;
-    copy_duplicate_page_annotations(source, &result)?;
+    let mut copy_duplicate_annotations =
+        |pdf: &mut Pdf<R>, source_page_ref: ObjectRef, new_page: ObjectRef| -> Result<()> {
+            let source_page = pdf.get_object_handle(source_page_ref);
+            let destination_page = pdf.get_object_handle(new_page);
+            destination_page.remove_key(b"/Annots");
+            PageObjectHelper::new(new_page, pdf).copy_annotations(source_page, Matrix::default())
+        };
+    let result = crate::pages::tree_rebuild::rebuild_page_tree_with_duplicate_hook(
+        source,
+        &selected_refs,
+        &mut copy_duplicate_annotations,
+    )?;
 
     let mut labels = source.page_labels();
     if labels.has_page_labels()? {

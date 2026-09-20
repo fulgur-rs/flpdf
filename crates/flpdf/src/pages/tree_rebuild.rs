@@ -430,7 +430,40 @@ pub fn rebuild_page_tree<R: Read + Seek>(
     // qpdf's `getAllPagesInternal` recurses with no depth cap and detects
     // cycles with `visited` alone (`QPDF_pages.cc:76-137`), so the default
     // rebuild must not impose one either.
-    rebuild_page_tree_canonical(pdf, selected, None)
+    rebuild_page_tree_canonical(pdf, selected, None, None)
+}
+
+/// Callback invoked for each duplicate-selection clone: `(pdf,
+/// first_occurrence_ref, clone_ref)`. See
+/// [`rebuild_page_tree_with_duplicate_hook`].
+type DuplicateHook<'a, R> = &'a mut dyn FnMut(&mut Pdf<R>, ObjectRef, ObjectRef) -> Result<()>;
+
+/// Like [`rebuild_page_tree`], but invokes `on_duplicate` immediately after
+/// allocating each duplicate-selection clone's object number, before moving
+/// on to the next selected page.
+///
+/// qpdf allocates a duplicate page's clone and copies its annotations back
+/// to back within one loop iteration over the selected pages
+/// (`QPDFJob.cc:2537-2585`: `shallowCopyPage` immediately followed by
+/// `fixCopiedAnnotations` for that same occurrence, before the next
+/// `pageno_iter` is processed). Callers that need that same interleaved
+/// object-number allocation order — rather than cloning every duplicate page
+/// first and only then copying annotations for all of them in a second pass
+/// — use this entry point instead of calling [`rebuild_page_tree`] followed
+/// by a separate annotation-copy pass.
+///
+/// `on_duplicate` receives the live `pdf`, the selected ref's first-occurrence
+/// output ref, and the newly allocated clone's ref.
+///
+/// # Errors
+///
+/// Same as [`rebuild_page_tree`], plus any error returned by `on_duplicate`.
+pub fn rebuild_page_tree_with_duplicate_hook<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    selected: &[ObjectRef],
+    on_duplicate: DuplicateHook<'_, R>,
+) -> Result<RebuildResult> {
+    rebuild_page_tree_canonical(pdf, selected, None, Some(on_duplicate))
 }
 
 /// Like [`rebuild_page_tree`] but with a caller-supplied inheritance-walk
@@ -455,7 +488,7 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
     selected: &[ObjectRef],
     max_depth: usize,
 ) -> Result<RebuildResult> {
-    rebuild_page_tree_canonical(pdf, selected, Some(max_depth))
+    rebuild_page_tree_canonical(pdf, selected, Some(max_depth), None)
 }
 
 /// Rebuild the page tree, optionally bounding the inheritance walk.
@@ -468,6 +501,7 @@ fn rebuild_page_tree_canonical<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     selected: &[ObjectRef],
     max_depth: Option<usize>,
+    mut on_duplicate: Option<DuplicateHook<'_, R>>,
 ) -> Result<RebuildResult> {
     let inherited_depth = max_depth.unwrap_or(usize::MAX);
     // qpdf obtains the effective /Pages handle through getAllPages before
@@ -555,7 +589,16 @@ fn rebuild_page_tree_canonical<R: Read + Seek>(
             // live page and allocate only the page dictionary. Indirect child
             // handles (`/Contents`, `/Resources`, ...) remain shared.
             let copy = page.shallow_copy()?;
-            pdf.make_indirect_from_object_handle(copy)?
+            let clone = pdf.make_indirect_from_object_handle(copy)?;
+            if let Some(hook) = on_duplicate.as_deref_mut() {
+                let clone_ref = clone.object_ref().expect("duplicate promotion is indirect");
+                let first_occurrence_ref = ref_map
+                    .get(&src)
+                    .and_then(|refs| refs.first().copied())
+                    .expect("a duplicate occurrence always follows a recorded first occurrence");
+                hook(pdf, first_occurrence_ref, clone_ref)?;
+            }
+            clone
         };
         let target_ref = target
             .object_ref()
