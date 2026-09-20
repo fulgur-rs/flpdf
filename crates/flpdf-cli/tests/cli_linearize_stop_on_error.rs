@@ -198,3 +198,41 @@ fn empty_pages_tree_pdf() -> Vec<u8> {
 fn linearize_rejects_an_empty_pages_tree_like_qpdf() {
     assert_linearize_rejected_like_qpdf(&empty_pages_tree_pdf(), "empty-pages-tree");
 }
+
+/// flpdf-ytqlr swept 171 `tests/fixtures/compat/*.pdf` fixtures through
+/// `--linearize` against qpdf 11.9.0 and found 10 whose zero-visible-page
+/// `stopOnError` framing (filename + `(offset N)`) was dropped in favor of
+/// `Error::Unsupported`'s "unsupported PDF feature: " prefix. That divergence
+/// no longer reproduces on `main`: d3e5f2f8a ("fix(linearization): shape the
+/// two planning failures like qpdf's", 2026-09-16) replaced the
+/// `Error::Unsupported` wrapping with the `QPDFExc` framing, and running
+/// `adbe-orphan-url.pdf` against builds of both sides shows it --
+/// d3e5f2f8a^ prints "unsupported PDF feature: no pages found ...", d3e5f2f8a
+/// prints qpdf's "adbe-orphan-url.pdf (offset 222): no pages found ...".
+///
+/// Nothing previously pinned the fix for this fixture set, so a regression
+/// to the `Error::Unsupported` wrapping would go uncaught. This locks in
+/// full stderr byte-equality against real qpdf for all 10.
+const NO_PAGES_FOUND_FIXTURES: &[&str] = &[
+    "adbe-orphan-url",
+    "compressible-stale-generation-alias",
+    "direct-root-adbe",
+    "make-indirect-historical-trailer",
+    "nonmonotonic-objstm-index",
+    "ocproperties-multiconfig",
+    "one-page-ext-indirect",
+    "one-page-no-ext",
+    "one-page-xyzw-only",
+    "preserve-no-source-objstm-xref",
+];
+
+#[test]
+fn linearize_matches_qpdf_no_pages_found_framing_across_compat_fixtures() {
+    for &name in NO_PAGES_FOUND_FIXTURES {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat")
+            .join(format!("{name}.pdf"));
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {name}: {e}"));
+        assert_linearize_rejected_like_qpdf(&bytes, name);
+    }
+}
