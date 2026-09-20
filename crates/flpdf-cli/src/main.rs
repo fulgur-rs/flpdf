@@ -5789,14 +5789,18 @@ fn parse_encrypt_key_len(value: &str) -> CliResult<u32> {
 }
 
 /// The dashed `--bits=value` form of `--encrypt` never reaches
-/// `ArgParser::argEncBits`'s own validation: qpdf's `job.yml` registers
-/// `bits`'s `choices` (`enc_bits: [40, 128, 256]`) on the named option
-/// itself (`table: encryption`, `required_choices: {bits: enc_bits}`), so an
-/// invalid or missing dashed value is caught first by
+/// `ArgParser::argEncBits`'s own validation: qpdf's generated
+/// `this->ap.addChoices("bits", p(&ArgParser::argEncBits), true,
+/// enc_bits_choices)` (`libqpdf/qpdf/auto_job_init.hh:137`, generated from
+/// `job.yml`'s `table: encryption` / `required_choices: {bits: enc_bits}`)
+/// registers `bits`'s choices (`{"40", "128", "256"}`,
+/// `auto_job_init.hh:26`) on the named option itself, so an invalid or
+/// missing dashed value is caught first by
 /// `QPDFArgParser::checkCompletion`'s generic choices check
 /// (`libqpdf/QPDFArgParser.cc:505-522`), which never calls into
 /// `argEncBits` at all. That check's `choices` set is a
-/// `std::set<std::string>`, so the message lists the three values in
+/// `std::set<std::string>` (`QPDFArgParser::addChoices`,
+/// `QPDFArgParser.cc:125-134`), so the message lists the three values in
 /// dictionary order (`128,256,40`), not the numeric order
 /// `parse_encrypt_key_len`'s positional-path message uses.
 fn parse_dashed_encrypt_bits(value: &str) -> CliResult<u32> {
