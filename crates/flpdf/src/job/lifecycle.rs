@@ -1933,6 +1933,16 @@ impl QPDFJob {
         self.configuration.encryption_defaults.allow_insecure = value;
     }
 
+    /// Set qpdf's `--accessibility=n` policy for the write-time notice that
+    /// the setting is ignored for modern (R > 3) encryption formats
+    /// (`QPDFJob::EncConfig::r3_accessibility`, `QPDFJob.hh:618`; the check
+    /// itself is `QPDFJob::setEncryptionOptions`, `QPDFJob.cc:2746-2747`).
+    pub fn set_accessibility_disabled(&mut self, value: bool) {
+        self.configuration
+            .encryption_defaults
+            .accessibility_disabled = value;
+    }
+
     /// Configure qpdf's linearization writer mode and optional pass-one file.
     pub fn set_linearization(&mut self, value: bool, pass1: Option<PathBuf>) {
         self.configuration.linearize = value;
