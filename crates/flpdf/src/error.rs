@@ -273,7 +273,13 @@ pub enum Error {
 
     /// A filesystem failure whose operation and path are known at this API
     /// boundary.
-    #[error("{operation} {}: {source}", path.display())]
+    ///
+    /// Rendered through the crate's internal portable `strerror` mapping
+    /// rather than `source`'s own `Display`, matching qpdf's portable
+    /// `QPDFSystemError::createWhat` wording on every host
+    /// (`libqpdf/QPDFSystemError.cc:13-29`) instead of Rust's native
+    /// Windows message or its appended `(os error N)` suffix.
+    #[error("{operation} {}: {}", path.display(), crate::qutil::strerror_text(source))]
     FileIo {
         operation: &'static str,
         path: std::path::PathBuf,
@@ -775,5 +781,37 @@ mod tests {
         let original = Error::Unsupported("nope".into());
         let rebased = original.rebase_offset(100);
         assert!(matches!(rebased, Error::Unsupported(ref s) if s == "nope"));
+    }
+
+    /// `Error::FileIo`'s `Display` must route through the crate's portable
+    /// `strerror` mapping rather than `source`'s own `Display`: a bare
+    /// synthetic `io::Error` (no `raw_os_error`, matching how Windows'
+    /// native message would otherwise leak through) must render qpdf's
+    /// portable wording, and a real syscall failure must not carry Rust's
+    /// appended `(os error N)` suffix that `strerror` itself never produces.
+    #[test]
+    fn file_io_display_uses_portable_strerror_wording_not_raw_display() {
+        let synthetic = Error::file_io(
+            "open",
+            "/some/path",
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        );
+        assert_eq!(
+            synthetic.to_string(),
+            "open /some/path: No such file or directory"
+        );
+
+        let real = std::fs::read("/definitely/missing/flpdf-dgei4-probe")
+            .expect_err("this path must not exist");
+        let wrapped = Error::file_io("open", "/definitely/missing/flpdf-dgei4-probe", real);
+        let rendered = wrapped.to_string();
+        assert!(
+            !rendered.contains("os error"),
+            "must not leak Rust's (os error N) suffix: {rendered}"
+        );
+        assert_eq!(
+            rendered,
+            "open /definitely/missing/flpdf-dgei4-probe: No such file or directory"
+        );
     }
 }

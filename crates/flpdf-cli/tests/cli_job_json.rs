@@ -4186,3 +4186,100 @@ fn top_level_repair_still_runs_with_a_job_json_file() {
     );
     assert!(directory.path().join("out.pdf").exists());
 }
+
+/// qpdf's `QPDFJob::Config::passwordFile` reads the file during argument/job
+/// configuration parsing (`QPDFJob_config.cc:661-679`, itself calling
+/// `QUtil::read_lines_from_file` -> `QUtil::safe_fopen`), so a missing
+/// `--password-file` renders as a `QPDFUsage` failure -- the portable
+/// `safe_fopen` wording ("open <path>: <strerror>") plus the CLI's usage
+/// "For help:" block -- not a plain runtime error. flpdf-dgei4 found this
+/// diverging on two counts: the operation word ("read password file" instead
+/// of qpdf's "open") and a leaked Rust `(os error N)` suffix that `strerror`
+/// itself never produces. Cover both the standalone and job-json-routed
+/// paths, since they go through independent flpdf-cli/flpdf-library code.
+#[test]
+fn password_file_missing_matches_qpdf_standalone() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing-password.txt");
+    let fixture = directory.path().join("minimal.pdf");
+    fs::write(
+        &fixture,
+        fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/minimal.pdf"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let argument = format!("--password-file={}", missing.display());
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg(&argument)
+        .arg("--check")
+        .arg(&fixture)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg(&argument)
+        .arg("--check")
+        .arg(&fixture)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
+fn password_file_missing_matches_qpdf_via_job_json() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing-password.txt");
+    let fixture = directory.path().join("minimal.pdf");
+    fs::write(
+        &fixture,
+        fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/minimal.pdf"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let job_json = directory.path().join("job.json");
+    fs::write(&job_json, b"{}").unwrap();
+    let argument = format!("--password-file={}", missing.display());
+    let job_json_argument = format!("--job-json-file={}", job_json.display());
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg(&argument)
+        .arg(&job_json_argument)
+        .arg("--check")
+        .arg(&fixture)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg(&argument)
+        .arg(&job_json_argument)
+        .arg("--check")
+        .arg(&fixture)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}

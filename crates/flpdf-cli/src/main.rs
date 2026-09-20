@@ -9054,13 +9054,22 @@ fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenO
 /// and does not create an extra line for a final newline. qpdf also treats
 /// `-` as stdin and warns about every line after the first; that warning is a
 /// configuration diagnostic, so it is emitted even for `--no-warn`.
-fn read_password_file(path: &Path) -> std::io::Result<Vec<u8>> {
+fn read_password_file(path: &Path) -> CliResult<Vec<u8>> {
+    let open_usage_error = |error: std::io::Error| {
+        let mut message = b"open ".to_vec();
+        message.extend_from_slice(&path_description(path));
+        message.extend_from_slice(b": ");
+        message.extend_from_slice(qpdf_open_io_error_message(&error).as_bytes());
+        Box::new(UsageError::new(message)) as Box<dyn std::error::Error>
+    };
     let bytes = if path == Path::new("-") {
         let mut bytes = Vec::new();
-        std::io::stdin().read_to_end(&mut bytes)?;
+        std::io::stdin()
+            .read_to_end(&mut bytes)
+            .map_err(open_usage_error)?;
         bytes
     } else {
-        std::fs::read(path)?
+        std::fs::read(path).map_err(open_usage_error)?
     };
 
     let first_newline = bytes.iter().position(|&byte| byte == b'\n');

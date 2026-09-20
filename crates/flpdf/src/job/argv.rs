@@ -2506,12 +2506,11 @@ fn read_password_file(job: &QPDFJob, value: &[u8]) -> Result<Option<Vec<u8>>> {
         let mut bytes = Vec::new();
         std::io::stdin()
             .read_to_end(&mut bytes)
-            .map_err(|error| Error::file_io("read password file", "-", error))?;
+            .map_err(|error| Error::file_io("open", "-", error))?;
         bytes
     } else {
         // cov:ignore: the file-backed branch is exercised; llvm-cov leaves this shared branch line at zero in its duplicate record
-        std::fs::read(&path)
-            .map_err(|error| Error::file_io("read password file", path.clone(), error))?
+        std::fs::read(&path).map_err(|error| Error::file_io("open", path.clone(), error))?
     }; // cov:ignore: LLVM maps the covered password-file read continuation to its branch arms
     if bytes.is_empty() {
         // cov:ignore-start: these explanatory comments have no executable path
