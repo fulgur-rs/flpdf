@@ -229,6 +229,51 @@ fn copy_encryption_rederives_the_key_for_a_malformed_length() {
     assert_both_routes(directory.path(), "v5-len128", &v5, "u");
 }
 
+/// `QPDF::compute_data_key` (`libqpdf/QPDF_encryption.cc:325-357`) appends a
+/// fixed 9 bytes to the file key before hashing for AES (3-byte object id +
+/// 2-byte generation + 4-byte `sAlT`), then clamps to 16: per-object key
+/// length is `min(key_len + 9, 16)`. Every `key_len < 7` -- i.e. every
+/// `/Length < 56` -- therefore yields a per-object key shorter than the 16
+/// bytes the reader authenticated with, not just the single `/Length 032`
+/// point the malformed-length test above covers. Sweep the range this
+/// construction (patching `/Length` on an already-encrypted donor, same as
+/// the test above) can actually authenticate: `000` through `032` open with
+/// the original password under real qpdf 11.9.0; `040` and above do not
+/// (`qpdf --show-npages`: "invalid password", reproduced directly with this
+/// same donor-patching method, for both `--use-aes=n` and AES). That
+/// falsifies this construction as a way to reach `040`-`048` -- a donor
+/// authenticated at key_len 16 does not stay authenticatable once `/Length`
+/// is relabeled down into that sub-range, regardless of what
+/// `compute_data_key`'s clamped length would be if it were reached. A donor
+/// actually reaching that sub-range (if one exists) needs a different
+/// construction than this one.
+#[test]
+fn copy_encryption_rederives_the_key_across_the_full_short_length_range() {
+    if !qpdf_available() {
+        eprintln!("skipping qpdf differential: qpdf 11.9.0 is not available");
+        return;
+    }
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let rc4_128: &[&str] = &[
+        "--user-password=u",
+        "--owner-password=o",
+        "--bits=128",
+        "--use-aes=n",
+    ];
+
+    for length in ["000", "008", "016", "024", "032"] {
+        let case = format!("v2-len{length}");
+        let donor = donor_with_patched_length(
+            directory.path(),
+            &case,
+            rc4_128,
+            b"/Length 128 /O",
+            format!("/Length {length} /O").as_bytes(),
+        );
+        assert_both_routes(directory.path(), &case, &donor, "u");
+    }
+}
+
 #[test]
 fn copy_encryption_rederives_the_key_from_an_empty_hex_key_password() {
     if !qpdf_available() {
