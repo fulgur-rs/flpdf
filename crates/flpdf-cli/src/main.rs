@@ -7380,7 +7380,14 @@ fn run_page_extraction(
 
     let raw_specs = configured_page_specs(page_ops)?;
     let inputs = resolve_page_specs(&raw_specs, primary_input)?;
-    let has_external_source = inputs.iter().any(|spec| spec.path != primary_input);
+    // The library keys its page-spec source map on the raw filename bytes,
+    // matching qpdf (`QPDFJob.cc:2393-2401`). Classify here the same way: a
+    // raw-distinct spelling of the primary is a separate source there, and
+    // routing it through the single-source path instead would rebuild the
+    // output from the merged document and drop the primary's encryption.
+    let has_external_source = inputs
+        .iter()
+        .any(|spec| spec.path.as_os_str() != primary_input.as_os_str());
 
     // qpdf's ordinary page-spec job owns every page-spec selection, whether
     // the segment names one source or several. Distinct input documents are
