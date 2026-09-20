@@ -346,7 +346,7 @@ fn handle_single_source_page_specs<R: Read + Seek>(
         source,
         &selected_refs,
         &mut copy_duplicate_annotations,
-    )?;
+    )?; // cov:ignore: llvm-cov attributes this executed multiline call to its closing delimiter
 
     let mut labels = source.page_labels();
     if labels.has_page_labels()? {
@@ -1888,7 +1888,7 @@ mod tests {
             .expect("triple-duplicate single-source page job");
         assert!(matches!(&output, PageSpecJobOutput::InPlace { .. }));
         let PageSpecJobOutput::InPlace { pdf, .. } = output else {
-            unreachable!("asserted InPlace above")
+            unreachable!("asserted InPlace above") // cov:ignore: prior assert! makes this arm unreachable
         };
 
         let page_refs = crate::pages::page_refs(pdf).expect("read merged page tree");
