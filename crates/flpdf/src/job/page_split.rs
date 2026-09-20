@@ -3,8 +3,7 @@
 //! repairs copied form annotations, reconstructs chunk-local labels, and is
 //! written to its own output path.
 //!
-//! qpdf correspondence: `QPDFJob::doSplitPages` (`QPDFJob.cc:2940-3027`).
-//!
+//! qpdf correspondence: `QPDFJob::doSplitPages` (`QPDFJob.cc:2940-3027`), applying `shouldRemoveUnreferencedResources`'s Auto|Yes|No decision before page enumeration (`QPDFJob.cc:2251-2340`) and sending its verbose finding messages through the same job logger (`QPDFJob.cc:340-345`).
 //!
 //!
 //! # Naming convention
@@ -413,6 +412,9 @@ fn same_file_if_existing(input: &Path, output: &Path) -> Result<bool> {
 // ---------------------------------------------------------------------------
 // Output naming helpers (qpdf: inlined in `doSplitPages`)
 // ---------------------------------------------------------------------------
+// These are qpdf-private (inlined in `doSplitPages`, not a separate qpdf
+// function), so they stay `fn`-private here rather than a separate public
+// module.
 
 /// Compute the output path for one chunk, honoring qpdf 11.9.0's
 /// `chunk_size`-dependent naming:

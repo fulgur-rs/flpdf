@@ -49,7 +49,7 @@
 | `crates/flpdf/src/job/page_plan.rs` | correspondence | QPDFJob.cc handlePageSpecs single-document selection planning |
 | `crates/flpdf/src/job/page_range.rs` | correspondence | QPDFJob.cc page-range parsing split from page-operation orchestration |
 | `crates/flpdf/src/job/page_specs.rs` | correspondence | \`QPDFJob::handlePageSpecs\` page-selection boundary |
-| `crates/flpdf/src/job/page_split.rs` | correspondence | \`QPDFJob::doSplitPages\` (\`QPDFJob.cc:2940-3027\`) |
+| `crates/flpdf/src/job/page_split.rs` | correspondence | \`QPDFJob::doSplitPages\` (\`QPDFJob.cc:2940-3027\`), applying \`shouldRemoveUnreferencedResources\`'s Auto\|Yes\|No decision before page enumeration (\`QPDFJob.cc:2251-2340\`) and sending its verbose finding messages through the same job logger (\`QPDFJob.cc:340-345\`) |
 | `crates/flpdf/src/job/page_subset.rs` | correspondence | \`QPDFJob::handlePageSpecs\` page-subset completion |
 | `crates/flpdf/src/job/resource_pruning.rs` | correspondence | \`QPDFJob::shouldRemoveUnreferencedResources\` |
 | `crates/flpdf/src/job/rotate.rs` | correspondence | QPDFJob.cc page rotation plus QPDFPageObjectHelper.cc matrix responsibilities |
@@ -133,7 +133,7 @@
 | `crates/flpdf/src/qdf_fix.rs` | correspondence | qpdf/fix-qdf.cc tool behavior outside libqpdf |
 | `crates/flpdf/src/qpdf_obj_gen.rs` | correspondence | QPDFObjGen.hh/QPDF.cc raw xref identity and valid indirect-reference boundary |
 | `crates/flpdf/src/qpdf_time.rs` | correspondence | \`QUtil::QPDFTime\`, \`get_current_qpdf_time\`, and \`qpdf_time_to_pdf_time\` |
-| `crates/flpdf/src/qutil.rs` | correspondence | \`QUtil.cc\` integer conversion, filesystem identity, and UTF-8 single-byte encoding primitives |
+| `crates/flpdf/src/qutil.rs` | correspondence | \`QUtil.cc\` integer conversion, filesystem identity, and UTF-8 single-byte encoding primitives, used by form appearance generation per \`libqpdf/QPDFFormFieldObjectHelper.cc:811-849\` |
 | `crates/flpdf/src/reader.rs` | correspondence | QPDF.cc object resolution, recovery, diagnostics, and authentication responsibilities |
 | `crates/flpdf/src/reader/resolver.rs` | correspondence | \`QPDF::resolve\` (\`libqpdf/QPDF.cc:1700-1753\`) and the \`QPDF::Members\` fields it touches |
 | `crates/flpdf/src/resource_finder.rs` | correspondence | \`ResourceFinder.cc\` |
