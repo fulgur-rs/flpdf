@@ -168,3 +168,33 @@ fn direct_pages_tree_pdf() -> Vec<u8> {
 fn linearize_rejects_a_direct_pages_tree_like_qpdf() {
     assert_linearize_rejected_like_qpdf(&direct_pages_tree_pdf(), "direct-pages-tree");
 }
+
+/// An empty `/Pages` tree (`/Kids []`, `/Count 0`). qpdf's page-refs walk
+/// then produces zero pages and `QPDF_linearization.cc:1188-1190`'s
+/// `pages.empty()` check calls `stopOnError`, which throws a
+/// `qpdf_e_damaged_pdf` `QPDFExc` carrying the input filename and the
+/// source's last-read offset and no object description
+/// (`libqpdf/QPDF.cc:2590-2592,2625-2628`). flpdf-a9m5 tracked a divergence
+/// where this path was instead wrapped in `Error::Unsupported`'s
+/// "unsupported PDF feature: " prefix, dropping that filename+offset
+/// framing.
+fn empty_pages_tree_pdf() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.3\n".to_vec();
+    let catalog = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+    let xref = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "xref\n0 3\n0000000000 65535 f \n{catalog:010} 00000 n \n{pages:010} 00000 n \ntrailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn linearize_rejects_an_empty_pages_tree_like_qpdf() {
+    assert_linearize_rejected_like_qpdf(&empty_pages_tree_pdf(), "empty-pages-tree");
+}
