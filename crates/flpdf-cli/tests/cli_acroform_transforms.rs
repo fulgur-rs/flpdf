@@ -425,9 +425,116 @@ fn top_level_generate_appearances_routes_to_canonical_writer() {
         .unwrap()
         .get_stream_data(DecodeLevel::Generalized)
         .expect("top-level generation must install /AP/N");
+    // The fixture's existing /AP/N already contains "BT (Hello) Tj ET" (no
+    // /Tx BMC wrapper), so a bare "Tj" check would pass whether or not this
+    // ran the generated-appearance path at all -- both the stale original
+    // and a freshly generated marked-content block contain "Tj". Check for
+    // the "/Tx BMC" marker (QPDFFormFieldObjectHelper.cc:524-570's generated
+    // wrapper) instead: qpdf's `--qdf` forces the token-filter pass to run
+    // even with `--compress-streams=n` (confirmed against qpdf 11.9.0, see
+    // flpdf-wthas), so this specific flag combination must produce a
+    // regenerated, not stale, appearance.
     assert!(
-        appearance.windows(2).any(|window| window == b"Tj"),
-        "top-level --generate-appearances must render the field value"
+        appearance.windows(7).any(|window| window == b"/Tx BMC"),
+        "top-level --qdf --generate-appearances --compress-streams=n must \
+         regenerate (not leave stale) the appearance content, matching \
+         qpdf 11.9.0's observed behavior: {}",
+        String::from_utf8_lossy(&appearance)
+    );
+}
+
+/// Companion to the `--qdf` case above: without `--qdf`, qpdf's own
+/// `QPDFWriter::willFilterStream` (`QPDFWriter.cc:1254-1314`) computes
+/// `encode_flags = 0` and `decode_level = qpdf_dl_none` for
+/// `--compress-streams=n`, so `QPDF_Stream::pipeStreamData`
+/// (`QPDF_Stream.cc:504`) takes `filter = false` and never runs the
+/// token-filter pass that installs the generated marked-content block --
+/// the pre-existing "BT (Hello) Tj ET" content is written unchanged, even
+/// though `--generate-appearances` ran and the widget's value did not
+/// change. This is qpdf's own observed behavior (flpdf-wthas), not a flpdf
+/// bug; pin it directly against qpdf 11.9.0 so it isn't mistaken for one.
+///
+/// `--show-object --filtered-stream-data` is a read-only inspection route
+/// that is not driven by `QPDFWriter`'s `compress_streams` setting at all,
+/// so it cannot observe this write-time behavior -- both tools must
+/// actually write an output file and the appearance must be read back from
+/// it, matching `top_level_generate_appearances_routes_to_canonical_writer`
+/// above.
+#[test]
+fn top_level_generate_appearances_compress_streams_n_without_qdf_stays_stale_like_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("stale-ap-tx.pdf");
+    std::fs::write(&input, tx_widget_with_ap_needing_appearances()).unwrap();
+
+    let read_appearance = |output: &Path| -> Vec<u8> {
+        let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
+        let widget_ref = first_widget_ref(&mut pdf);
+        let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
+        helper
+            .get_appearance_stream(b"N", None)
+            .unwrap()
+            .get_stream_data(DecodeLevel::Generalized)
+            .expect("/AP/N must be present after --generate-appearances")
+            .to_vec()
+    };
+
+    let qpdf_output = temp.path().join("qpdf-out.pdf");
+    let qpdf = ProcessCommand::new("qpdf")
+        .args([
+            "--static-id",
+            "--generate-appearances",
+            "--compress-streams=n",
+        ])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf 11.9.0 must be available");
+    assert!(qpdf.status.success(), "qpdf write failed: {qpdf:?}");
+    let qpdf_appearance = read_appearance(&qpdf_output);
+    assert!(
+        !qpdf_appearance
+            .windows(7)
+            .any(|window| window == b"/Tx BMC"),
+        "qpdf itself must leave the appearance stale (no /Tx BMC) for \
+         --compress-streams=n without --qdf: {}",
+        String::from_utf8_lossy(&qpdf_appearance)
+    );
+    assert!(
+        qpdf_appearance
+            .windows(16)
+            .any(|window| window == b"BT (Hello) Tj ET"),
+        "qpdf must preserve the pre-existing appearance content unchanged: {}",
+        String::from_utf8_lossy(&qpdf_appearance)
+    );
+
+    let flpdf_output = temp.path().join("flpdf-out.pdf");
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            "--generate-appearances",
+            "--compress-streams=n",
+        ])
+        .arg(&input)
+        .arg(&flpdf_output)
+        .output()
+        .unwrap();
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert!(flpdf.status.success(), "flpdf write failed: {flpdf:?}");
+    let flpdf_appearance = read_appearance(&flpdf_output);
+    assert_eq!(
+        flpdf_appearance,
+        qpdf_appearance,
+        "stale (non-regenerated) appearance content must match qpdf 11.9.0\nqpdf: {}\nflpdf: {}",
+        String::from_utf8_lossy(&qpdf_appearance),
+        String::from_utf8_lossy(&flpdf_appearance)
     );
 }
 
