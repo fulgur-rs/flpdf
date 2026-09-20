@@ -243,6 +243,12 @@ pub(crate) struct LoadedXrefState {
     /// qpdf's `m->first_xref_item_offset`, populated while reading the xref
     /// section and consumed later by `checkLinearizationInternal`.
     pub(crate) first_xref_item_offset: u64,
+    /// qpdf's `m->uncompressed_after_compressed`: true once any xref stream
+    /// section read for this document has a type-1 (or type-0) entry after
+    /// its first type-2 entry (`QPDF.cc:1070,1110-1116`). Sticky across every
+    /// section in the `/Prev` chain and the hybrid `/XRefStm`, and consumed
+    /// later by `checkLinearizationInternal` (`QPDF_linearization.cc:478-481`).
+    pub(crate) uncompressed_after_compressed: bool,
     /// Byte position qpdf's `readTrailer` records for a classic trailer
     /// keyword. `None` identifies an xref-stream dictionary, whose `/Prev`
     /// diagnostics have a different qpdf description and remain on that
@@ -1411,6 +1417,8 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
             trailer_references,
             parsed_xref_streams: BTreeMap::new(),
             header_offset: 0,
+            // A classic xref table has no type-2 entries at all.
+            uncompressed_after_compressed: false,
         };
         for diagnostic in trailer_diags {
             loaded.loaded.repair_diagnostics.push(diagnostic);
@@ -1609,6 +1617,7 @@ fn merge_xref_stream_from_classic_trailer_with_build_diagnostics(
     if hybrid.first_xref_item_offset != 0 {
         loaded.first_xref_item_offset = hybrid.first_xref_item_offset;
     }
+    loaded.uncompressed_after_compressed |= hybrid.uncompressed_after_compressed;
     loaded
         .trailer_references
         .extend(hybrid.trailer_references.iter().copied());
@@ -1786,6 +1795,7 @@ fn merge_previous_xref_sections_with_observer(
         if previous.first_xref_item_offset != 0 {
             loaded.first_xref_item_offset = previous.first_xref_item_offset;
         }
+        loaded.uncompressed_after_compressed |= previous.uncompressed_after_compressed;
         loaded
             .trailer_references
             .extend(previous.trailer_references.iter().copied());
@@ -2016,39 +2026,57 @@ fn recover_xref_from_linear_scan(
     // `merge_recovered_qpdf_state` with the already-successfully-parsed
     // revision's own real form once this returns.
     let mut candidate_xref_reentered = false;
-    let (trailer, recovered_startxref, recovered_form, recovered_first_xref_item_offset) =
-        if let Some(trailer) = fallback_trailer {
-            (trailer.clone(), startxref, XrefForm::Table, 0)
-        } else {
-            match recovered.trailer {
-                Some(trailer) => (trailer, startxref, XrefForm::Table, 0),
-                None => match recover_trailer_from_xref_stream_candidate(
-                    bytes,
-                    &version,
-                    options.clone(),
-                    &mut entries,
-                    &mut parsed_xref_streams,
-                    &mut repair_diagnostics,
-                    &mut extra_trailer_references,
-                    preexisting_raw_entries,
-                    canonical_trailer_owner,
-                ) {
-                    Ok((trailer, max_offset, form, _deleted_objects, first_xref_item_offset)) => {
-                        // Candidate re-entry has already consumed its local
-                        // tombstones while filtering `entries`; never retain
-                        // them past this recovery operation.
-                        candidate_xref_reentered = true;
-                        (trailer, max_offset, form, first_xref_item_offset)
-                    }
-                    Err(candidate_error) => {
-                        return Err(with_xref_open_diagnostics(
-                            candidate_error,
-                            canonical_trailer_owner,
-                        ));
-                    }
-                },
-            }
-        };
+    let (
+        trailer,
+        recovered_startxref,
+        recovered_form,
+        recovered_first_xref_item_offset,
+        recovered_uncompressed_after_compressed,
+    ) = if let Some(trailer) = fallback_trailer {
+        (trailer.clone(), startxref, XrefForm::Table, 0, false)
+    } else {
+        match recovered.trailer {
+            Some(trailer) => (trailer, startxref, XrefForm::Table, 0, false),
+            None => match recover_trailer_from_xref_stream_candidate(
+                bytes,
+                &version,
+                options.clone(),
+                &mut entries,
+                &mut parsed_xref_streams,
+                &mut repair_diagnostics,
+                &mut extra_trailer_references,
+                preexisting_raw_entries,
+                canonical_trailer_owner,
+            ) {
+                Ok((
+                    trailer,
+                    max_offset,
+                    form,
+                    _deleted_objects,
+                    first_xref_item_offset,
+                    uncompressed_after_compressed,
+                )) => {
+                    // Candidate re-entry has already consumed its local
+                    // tombstones while filtering `entries`; never retain
+                    // them past this recovery operation.
+                    candidate_xref_reentered = true;
+                    (
+                        trailer,
+                        max_offset,
+                        form,
+                        first_xref_item_offset,
+                        uncompressed_after_compressed,
+                    )
+                }
+                Err(candidate_error) => {
+                    return Err(with_xref_open_diagnostics(
+                        candidate_error,
+                        canonical_trailer_owner,
+                    ));
+                }
+            },
+        }
+    };
     let recovered_first_xref_item_offset =
         observed_first_xref_item_offset.unwrap_or(recovered_first_xref_item_offset);
 
@@ -2107,6 +2135,7 @@ fn recover_xref_from_linear_scan(
         trailer_references,
         parsed_xref_streams,
         header_offset: 0,
+        uncompressed_after_compressed: recovered_uncompressed_after_compressed,
     })
 }
 
@@ -2128,6 +2157,7 @@ fn merge_recovered_qpdf_state(
     if recovered.first_xref_item_offset == 0 {
         recovered.first_xref_item_offset = accumulated.first_xref_item_offset;
     }
+    recovered.uncompressed_after_compressed |= accumulated.uncompressed_after_compressed;
     recovered.classic_trailer_offset = accumulated
         .classic_trailer_offset
         .or(recovered.classic_trailer_offset);
@@ -2362,7 +2392,7 @@ fn recover_xref_entries_from_source(
 /// line-scan filter was already cleared at `:575`. The returned filter is
 /// consumed only by this immediate candidate merge; it is never resolver or
 /// mutation state.
-type RecoveredXrefStream = (ObjectHandle, u64, XrefForm, BTreeSet<u32>, u64);
+type RecoveredXrefStream = (ObjectHandle, u64, XrefForm, BTreeSet<u32>, u64, bool);
 
 #[allow(clippy::too_many_arguments)]
 fn recover_trailer_from_xref_stream_candidate(
@@ -2522,6 +2552,7 @@ fn recover_trailer_from_xref_stream_candidate(
     }
 
     let first_xref_item_offset = reentry.first_xref_item_offset;
+    let uncompressed_after_compressed = reentry.uncompressed_after_compressed;
     let deleted_objects = reentry_registration.deleted_objects.clone();
 
     // `reentry.loaded.entries` is already the live-only snapshot of
@@ -2582,6 +2613,7 @@ fn recover_trailer_from_xref_stream_candidate(
         reentry.loaded.last_xref_form,
         deleted_objects,
         first_xref_item_offset,
+        uncompressed_after_compressed,
     ))
 }
 
@@ -3311,6 +3343,7 @@ type XrefStreamBuild = (
     Vec<ParsedXrefEntry>,
     BTreeSet<ObjectRef>,
     bool,
+    bool,
 );
 
 struct XrefStreamObjectRead {
@@ -3433,7 +3466,7 @@ fn build_xref_stream(
         ));
     }
     let mut cursor = ByteCursor::new(&stream_data, 0);
-    let entries = parse_xref_entries(
+    let (entries, uncompressed_after_compressed) = parse_xref_entries(
         &mut cursor,
         &ranges,
         widths,
@@ -3442,7 +3475,13 @@ fn build_xref_stream(
     )?;
     let trailer_references = collect_trailer_references(&trailer);
 
-    Ok((trailer, entries, trailer_references, has_first_xref_item))
+    Ok((
+        trailer,
+        entries,
+        trailer_references,
+        has_first_xref_item,
+        uncompressed_after_compressed,
+    ))
 }
 
 fn parse_xref_stream_with_canonical_owner(
@@ -3495,13 +3534,14 @@ fn parse_xref_stream_with_canonical_owner(
     let mut diagnostics = Diagnostics::default();
     context.append_diagnostics_to(&mut diagnostics);
     deliver_canonical_diagnostics(owner, &mut diagnostics)?;
-    let (trailer, entries, trailer_references, has_first_xref_item) = match build_result {
-        Ok(build) => build,
-        Err(error) => {
-            let error = reconstruction_trigger.unwrap_or(error);
-            return Err(error);
-        }
-    };
+    let (trailer, entries, trailer_references, has_first_xref_item, uncompressed_after_compressed) =
+        match build_result {
+            Ok(build) => build,
+            Err(error) => {
+                let error = reconstruction_trigger.unwrap_or(error);
+                return Err(error);
+            }
+        };
     for entry in entries {
         match entry {
             ParsedXrefEntry::Live { object_ref, entry } => {
@@ -3535,6 +3575,7 @@ fn parse_xref_stream_with_canonical_owner(
         // rows as non-live while retaining them in the complete canonical cache view.
         parsed_xref_streams: BTreeMap::from([(object_ref, handle_object)]),
         header_offset: 0,
+        uncompressed_after_compressed,
     };
     // cov:ignore-start: CanonicalXrefContext never defers reconstruction; the live resolver performs any read-time recovery internally.
     if let Some(error) = reconstruction_trigger {
@@ -3655,7 +3696,7 @@ fn parse_xref_entries(
     widths: XrefWidths,
     stream_data_offset: Option<usize>,
     registration: &mut XrefRegistration,
-) -> Result<Vec<ParsedXrefEntry>> {
+) -> Result<(Vec<ParsedXrefEntry>, bool)> {
     let (w0, w1, w2) = widths;
     let entry_width = w0 + w1 + w2;
     if entry_width == 0 {
@@ -3663,6 +3704,11 @@ fn parse_xref_entries(
     }
 
     let mut entries = Vec::new();
+    // qpdf's `saw_first_compressed_object` (`QPDF.cc:1070`): local to one
+    // xref stream section, feeding the sticky `m->uncompressed_after_compressed`
+    // the caller ORs into the document-wide flag.
+    let mut saw_first_compressed_object = false;
+    let mut uncompressed_after_compressed = false;
     for &(start, count) in ranges {
         let start =
             usize::try_from(start).map_err(|_| Error::parse(0, "object number too large"))?;
@@ -3683,6 +3729,17 @@ fn parse_xref_entries(
             };
             let field1 = if w1 == 0 { 0 } else { cursor.read_be_u64(w1)? };
             let field2 = if w2 == 0 { 0 } else { cursor.read_be_u64(w2)? };
+
+            // qpdf's numbering check (`QPDF.cc:1110-1116`): once a type-2
+            // (compressed) entry has been seen in this section, any later
+            // entry whose type is not 2 trips the sticky document-wide flag.
+            if saw_first_compressed_object {
+                if object_type != 2 {
+                    uncompressed_after_compressed = true;
+                }
+            } else if object_type == 2 {
+                saw_first_compressed_object = true;
+            }
 
             let object_number = (start + index) as u32;
             let object_ref = QpdfObjGen::new(
@@ -3747,7 +3804,7 @@ fn parse_xref_entries(
         }
     }
 
-    Ok(entries)
+    Ok((entries, uncompressed_after_compressed))
 }
 
 fn parse_usize(value: u64, name: &str) -> Result<usize> {
@@ -4274,10 +4331,11 @@ mod final_handle_tests {
     fn xref_stream_index_rows_are_not_rejected_only_for_exceeding_size() {
         let mut cursor = ByteCursor::new(&[1, 0], 0);
         let mut registration = XrefRegistration::default();
-        let entries =
+        let (entries, uncompressed_after_compressed) =
             parse_xref_entries(&mut cursor, &[(35, 1)], (1, 0, 1), None, &mut registration)
                 .expect("qpdf accepts an /Index row beyond the reported /Size");
 
+        assert!(!uncompressed_after_compressed);
         assert!(matches!(
             entries.as_slice(),
             [ParsedXrefEntry::Live {
@@ -4285,6 +4343,44 @@ mod final_handle_tests {
                 entry: XrefEntry::Uncompressed { offset: 0 },
             }] if *object_ref == QpdfObjGen::new(35, 0)
         ));
+    }
+
+    #[test]
+    fn xref_entries_track_uncompressed_after_compressed_like_qpdf() {
+        // qpdf's numbering check (`QPDF.cc:1070,1110-1116`): only a type-1/
+        // type-0 entry seen *after* the section's first type-2 entry trips
+        // the flag. Widths (1, 0, 1) match the sibling test above: one type
+        // byte, no field1, one field2 byte.
+
+        // type 2, then type 1: trips.
+        let mut cursor = ByteCursor::new(&[2, 0, 1, 0], 0);
+        let mut registration = XrefRegistration::default();
+        let (_, flagged) =
+            parse_xref_entries(&mut cursor, &[(0, 2)], (1, 0, 1), None, &mut registration)
+                .expect("two-entry section parses");
+        assert!(
+            flagged,
+            "an uncompressed entry after a compressed one must trip the flag"
+        );
+
+        // type 1, then type 2: qpdf's own layout convention, never trips.
+        let mut cursor = ByteCursor::new(&[1, 0, 2, 0], 0);
+        let mut registration = XrefRegistration::default();
+        let (_, flagged) =
+            parse_xref_entries(&mut cursor, &[(10, 2)], (1, 0, 1), None, &mut registration)
+                .expect("two-entry section parses");
+        assert!(
+            !flagged,
+            "an uncompressed entry strictly before the first compressed one must not trip the flag"
+        );
+
+        // type 2, then type 2: no uncompressed entry at all, never trips.
+        let mut cursor = ByteCursor::new(&[2, 0, 2, 0], 0);
+        let mut registration = XrefRegistration::default();
+        let (_, flagged) =
+            parse_xref_entries(&mut cursor, &[(20, 2)], (1, 0, 1), None, &mut registration)
+                .expect("two-entry section parses");
+        assert!(!flagged, "two compressed entries must not trip the flag");
     }
 
     #[test]
@@ -4526,6 +4622,7 @@ mod final_handle_tests {
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
             header_offset: 0,
+            uncompressed_after_compressed: false,
         }
     }
 
@@ -4840,6 +4937,7 @@ mod final_handle_tests {
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
             header_offset: 0,
+            uncompressed_after_compressed: false,
         };
         let resolver = canonical_test_resolver(Vec::new(), BTreeMap::new(), false, 68);
         let mut registration = XrefRegistration::default();
@@ -6077,6 +6175,26 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn recovered_state_merge_ors_uncompressed_after_compressed_from_accumulated() {
+        // flpdf-2osux: exercises `merge_recovered_qpdf_state`'s
+        // `recovered.uncompressed_after_compressed |=
+        // accumulated.uncompressed_after_compressed` directly, with
+        // source=true (accumulated, the already-parsed newest revision) and
+        // dest=false (recovered, the reconstruction candidate) -- the
+        // direction a fixture-only regression test cannot isolate, since
+        // both of this merge's call sites are themselves coverage-exempt
+        // (the reconstruction path is superseded by the canonical
+        // classic-trailer recovery handoff).
+        let recovered = loaded_state_with_trailer(ObjectHandle::dictionary(Vec::new()));
+        let mut accumulated = loaded_state_with_trailer(ObjectHandle::dictionary(Vec::new()));
+        accumulated.uncompressed_after_compressed = true;
+
+        let merged = merge_recovered_qpdf_state(recovered, accumulated);
+
+        assert!(merged.uncompressed_after_compressed);
+    }
+
+    #[test]
     fn reconstructed_size_revalidation_uses_the_recovery_offset_index() {
         let mut bytes = b"%PDF-1.4\n".to_vec();
         let object_offset = bytes.len();
@@ -6287,5 +6405,141 @@ mod final_handle_tests {
         assert!(registration.raw_entries.is_empty());
         assert!(registration.entries.is_empty());
         assert!(registration.deleted_objects.is_empty());
+    }
+
+    fn xref_stream_entry(object_type: u8, field1: u16, field2: u8) -> [u8; 4] {
+        let [hi, lo] = field1.to_be_bytes();
+        [object_type, hi, lo, field2]
+    }
+
+    /// flpdf-2osux: an unfiltered hybrid `/XRefStm` stream whose own entries
+    /// are type-2 (object 1) then type-1 (object 2, self), tripping qpdf's
+    /// `saw_first_compressed_object` check (`QPDF.cc:1070,1110-1116`) inside
+    /// the hybrid section alone. The classic main table's own entries are
+    /// all type-1 (classic tables never set the sticky flag), isolating the
+    /// hybrid merge site (`loaded.uncompressed_after_compressed |=
+    /// hybrid.uncompressed_after_compressed`) with source=true, dest=false.
+    fn hybrid_xref_stream_trips_uncompressed_after_compressed() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+        let object_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+        let xref_stream_offset = bytes.len();
+        let mut stream_data = Vec::new();
+        stream_data.extend_from_slice(&xref_stream_entry(2, 99, 0));
+        stream_data.extend_from_slice(&xref_stream_entry(1, xref_stream_offset as u16, 0));
+        bytes.extend_from_slice(b"2 0 obj\n");
+        bytes.extend_from_slice(
+            format!(
+                "<< /Type /XRef /W [1 2 1] /Index [1 2] /Size 3 /Root 1 0 R /Length {} >>",
+                stream_data.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(b"\nstream\n");
+        bytes.extend_from_slice(&stream_data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let classic_xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        bytes.extend_from_slice(format!("{object_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(format!("{xref_stream_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 3 /Root 1 0 R /XRefStm {xref_stream_offset} >>\n")
+                .as_bytes(),
+        );
+        bytes.extend_from_slice(format!("startxref\n{classic_xref_offset}\n%%EOF\n").as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn hybrid_xref_stream_merge_sets_uncompressed_after_compressed() {
+        let bytes = hybrid_xref_stream_trips_uncompressed_after_compressed();
+        let (_owner, result) = load_xref_state_through_canonical_owner(
+            std::io::Cursor::new(bytes),
+            false,
+            XrefLoadOptions::default(),
+            crate::QPDFLogger::create(),
+            true,
+            70,
+        );
+        let state = result.expect("the hybrid xref stream fixture must load");
+        assert!(
+            state.uncompressed_after_compressed,
+            "a hybrid /XRefStm section's own uncompressed-after-compressed \
+             ordering must OR into the document-wide sticky flag even though \
+             the classic main table itself never sets it"
+        );
+    }
+
+    /// flpdf-2osux: two chained xref-stream sections. The current section
+    /// (object 4) is entirely type-1 (no compressed entries at all), so its
+    /// own scan leaves the sticky flag false; its `/Prev` section (object 2)
+    /// is type-2 then type-1 and trips the flag on its own. This isolates
+    /// the `/Prev`-chain merge site (`loaded.uncompressed_after_compressed
+    /// |= previous.uncompressed_after_compressed`) with source=true,
+    /// dest=false -- the opposite direction from the current-section case
+    /// above.
+    fn xref_stream_prev_chain_trips_uncompressed_after_compressed() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+        let object_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+        let previous_xref = bytes.len();
+        let mut previous_data = Vec::new();
+        previous_data.extend_from_slice(&xref_stream_entry(0, 0, 0));
+        previous_data.extend_from_slice(&xref_stream_entry(2, 99, 0));
+        previous_data.extend_from_slice(&xref_stream_entry(1, previous_xref as u16, 0));
+        bytes.extend_from_slice(b"2 0 obj\n");
+        bytes.extend_from_slice(
+            format!(
+                "<< /Type /XRef /W [1 2 1] /Index [0 3] /Size 3 /Root 1 0 R /Length {} >>",
+                previous_data.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(b"\nstream\n");
+        bytes.extend_from_slice(&previous_data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let current_xref = bytes.len();
+        let mut current_data = Vec::new();
+        current_data.extend_from_slice(&xref_stream_entry(0, 0, 0));
+        current_data.extend_from_slice(&xref_stream_entry(1, object_offset as u16, 0));
+        current_data.extend_from_slice(&xref_stream_entry(1, previous_xref as u16, 0));
+        current_data.extend_from_slice(&xref_stream_entry(1, current_xref as u16, 0));
+        bytes.extend_from_slice(b"3 0 obj\n");
+        bytes.extend_from_slice(
+            format!(
+                "<< /Type /XRef /W [1 2 1] /Index [0 4] /Size 4 /Root 1 0 R /Prev {previous_xref} /Length {} >>",
+                current_data.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(b"\nstream\n");
+        bytes.extend_from_slice(&current_data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes.extend_from_slice(format!("startxref\n{current_xref}\n%%EOF\n").as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn prev_chain_xref_stream_merge_sets_uncompressed_after_compressed() {
+        let bytes = xref_stream_prev_chain_trips_uncompressed_after_compressed();
+        let (_owner, result) = load_xref_state_through_canonical_owner(
+            std::io::Cursor::new(bytes),
+            false,
+            XrefLoadOptions::default(),
+            crate::QPDFLogger::create(),
+            true,
+            71,
+        );
+        let state = result.expect("the /Prev-chained xref stream fixture must load");
+        assert!(
+            state.uncompressed_after_compressed,
+            "an older /Prev section's uncompressed-after-compressed ordering \
+             must OR into the document-wide sticky flag even though the \
+             current section's own scan never sets it"
+        );
     }
 }

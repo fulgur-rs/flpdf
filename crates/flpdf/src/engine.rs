@@ -73,6 +73,7 @@ impl<R: Read + Seek> Pdf<R> {
             check_mode: false,
             trailer: ObjectHandle::uninitialized(),
             first_xref_item_offset: 0,
+            uncompressed_after_compressed: false,
             foreign_object_maps: BTreeMap::new(),
             foreign_object_to_copy: BTreeMap::new(),
             foreign_page_copy_orders: BTreeMap::new(),
@@ -256,6 +257,7 @@ impl<R: Read + Seek> Pdf<R> {
         let parsed_xref_streams = loaded_state.parsed_xref_streams;
         let trailer_references = loaded_state.trailer_references;
         let first_xref_item_offset = loaded_state.first_xref_item_offset;
+        let uncompressed_after_compressed = loaded_state.uncompressed_after_compressed;
         let classic_trailer_offset = loaded_state.classic_trailer_offset;
         let raw_xref_entries = loaded_state.raw_entries.clone();
         let loaded = loaded_state.loaded;
@@ -298,6 +300,7 @@ impl<R: Read + Seek> Pdf<R> {
             check_mode: false,
             trailer,
             first_xref_item_offset,
+            uncompressed_after_compressed,
             foreign_object_maps: BTreeMap::new(),
             foreign_object_to_copy: BTreeMap::new(),
             foreign_page_copy_orders: BTreeMap::new(),

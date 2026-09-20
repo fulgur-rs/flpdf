@@ -1405,6 +1405,25 @@ fn check_linearization_inner<R: Read + Seek>(
         }
     }
     // -----------------------------------------------------------------------
+    // 5b. Check numbering of compressed objects in each xref section. For
+    // linearized files, every compressed object is supposed to be at the end
+    // of its containing xref section. qpdf's xref parser already tracked this
+    // sticky, document-wide flag while loading the section
+    // (`QPDF.cc:1070,1110-1116`); this check only reads it back
+    // (`QPDF_linearization.cc:474-481`), unconditionally as a warning --
+    // qpdf's own `linearizationWarning` never throws for this condition.
+    // -----------------------------------------------------------------------
+    if pdf.uncompressed_after_compressed() {
+        let message =
+            "linearized file contains an uncompressed object after a compressed one in a cross-reference stream"
+                .to_string();
+        if collect_soft_warnings {
+            warnings.push(message);
+        } else {
+            fail!("{message}");
+        }
+    }
+    // -----------------------------------------------------------------------
     // 6. /E must match the source extent envelope of qpdf's part 6, not merely
     //    be smaller than EOF.
     // -----------------------------------------------------------------------
@@ -1843,7 +1862,10 @@ pub fn check_linearization_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{length_next_n, load_hint_stream_with_damage, LinearizationCheckError};
+    use super::{
+        check_linearization_warnings, length_next_n, load_hint_stream_with_damage,
+        LinearizationCheckError,
+    };
     use crate::Pdf;
     use std::collections::BTreeMap;
     use std::io::Cursor;
@@ -1929,6 +1951,57 @@ mod tests {
             load_hint_stream_with_damage(&mut pdf, file_bytes, 601, 118),
             Err(super::HintStreamLoadError::Core(_))
         ));
+    }
+
+    #[test]
+    fn check_reports_uncompressed_after_compressed_like_qpdf() {
+        // flpdf-2osux: qpdf's linearization check warns when any xref stream
+        // section has a type-1/type-0 entry after its first type-2 entry
+        // (QPDF.cc:1070,1110-1116, QPDF_linearization.cc:474-481). This
+        // fixture is flpdf's own `--linearize --object-streams=generate`
+        // output with its part-2 xref stream's `/Index` subsections
+        // reordered (objects 13-16, then 6-12) so the byte sequence a type-2
+        // run before a type-1 run -- no object's own resolved value changes,
+        // only the physical entry order within the section. Verified
+        // byte-for-byte identical against /usr/bin/qpdf 11.9.0's own
+        // `--check` output (four warnings, same order, same exit code).
+        let file_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/linearized-uncompressed-after-compressed.pdf"
+        ));
+        let mut pdf = Pdf::open(Cursor::new(file_bytes.to_vec())).expect("fixture should open");
+        let warnings = check_linearization_warnings(&mut pdf, file_bytes, false)
+            .expect("the fixture is linearized enough to reach every soft-warning check");
+        assert!(
+            warnings.iter().any(|warning| warning
+                == "linearized file contains an uncompressed object after a compressed one in a cross-reference stream"),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn check_linearization_strict_mode_fails_on_uncompressed_after_compressed() {
+        // The same fixture, through `check_linearization`'s strict
+        // (collect_soft_warnings = false) entry point: this check's
+        // `else { fail!(...) }` arm escalates the same qpdf warning to a hard
+        // `InvalidParam` there. The fixture's /T value was corrected to match
+        // (verified against qpdf 11.9.0: this is the first divergence the
+        // strict walk reaches; /E's later, separate mismatch is not).
+        let file_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/linearized-uncompressed-after-compressed.pdf"
+        ));
+        let mut pdf = Pdf::open(Cursor::new(file_bytes.to_vec())).expect("fixture should open");
+        let error = super::check_linearization(&mut pdf, file_bytes)
+            .expect_err("the fixture's cross-reference stream entry order must fail strict mode");
+        assert!(
+            matches!(
+                &error,
+                LinearizationCheckError::InvalidParam { message }
+                    if message == "linearized file contains an uncompressed object after a compressed one in a cross-reference stream"
+            ),
+            "{error:?}"
+        );
     }
 
     #[test]
