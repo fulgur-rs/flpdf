@@ -11,9 +11,10 @@
 #
 # Result on 2026-09-18 (qpdf 11.9.0, flpdf @ da153c06a, --features
 # qpdf-zlib-compat): zero differences across every cell below.
-set -u
-P="${1:?workdir}"
+set -eu
+P="$(realpath "${1:?workdir}")"
 FL="${2:-flpdf}"
+case "$FL" in */*) FL="$(realpath "$FL")" ;; esac
 export FLPDF_STATIC_ID_QUIET=1
 rm -rf "$P/fix" "$P/q" "$P/f"; mkdir -p "$P/fix" "$P/q" "$P/f"
 python3 "$(dirname "$0")/make_fixtures.py" "$P/fix" >/dev/null
@@ -21,6 +22,12 @@ cp "$P/fix/e16-indirect-kids-shared.pdf" "$P/fix/a.pdf"
 cp "$P/fix/e16-unshared.pdf"             "$P/fix/b.pdf"
 cp "$P/fix/e16-nonleaf-resources.pdf"    "$P/fix/c has space.pdf"
 cd "$P/fix" || exit 1
+# Setup (fixture generation above) must not fail silently into a partial
+# fixture set that then produces spurious DIFFs below -- `set -e` covers it.
+# The probe cells themselves are not expected to fail here (unlike D16's),
+# but turning -e off before the run loop keeps both probes' shape identical
+# and avoids `set -e` masking a later `run` invocation's own exit status.
+set +e
 run() { tag="$1"; shift
   /usr/bin/qpdf "${@//@OUT@/$P/q/$tag.pdf}" >"$P/q/$tag.out" 2>"$P/q/$tag.err"; echo $? >"$P/q/$tag.rc"
   "$FL"         "${@//@OUT@/$P/f/$tag.pdf}" >"$P/f/$tag.out" 2>"$P/f/$tag.err"; echo $? >"$P/f/$tag.rc"

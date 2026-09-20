@@ -40,10 +40,18 @@ CONTENT = b"BT /F1 12 Tf 72 720 Td (hi) Tj ET"
 def direct_kids_shared_resources():
     """Two DIRECT page dicts in /Kids that share one indirect /Resources (5 0 R).
 
-    qpdf's shouldRemoveUnreferencedResources keys nodes_seen on QPDFObjGen, so
-    both direct kids collapse to `0 0` and the second is skipped; flpdf keys on
-    canonical handle identity and visits both.  /F2 is unreferenced, so the
-    decision is observable in the output bytes.
+    This was written to distinguish qpdf's shouldRemoveUnreferencedResources,
+    which keys nodes_seen on QPDFObjGen (so both direct kids would collapse to
+    `0 0` and the second would be skipped), from an implementation keying on
+    canonical handle identity (which would visit both). It does not actually
+    exercise that distinction through this probe's `run()` calls: the CLI's
+    page-selection/extraction step (`--pages .` / `--split-pages`) converts
+    each direct /Kids entry into its own numbered indirect page object before
+    should_remove_unreferenced_resources ever runs, so the heuristic always
+    observes two distinct numbered leaves here, never two direct `0 0` nodes.
+    Exercising the QPDFObjGen-vs-handle-identity distinction this fixture
+    names would need a harness that calls the heuristic directly on a page
+    tree still holding direct /Kids entries, ahead of page enumeration.
     """
     page = (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
             b"/Resources 5 0 R /Contents %d 0 R >>")
