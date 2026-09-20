@@ -12,7 +12,10 @@
 # Result on 2026-09-18 (qpdf 11.9.0, flpdf @ da153c06a, --features
 # qpdf-zlib-compat): zero differences across every cell below.
 set -eu
-P="$(realpath "${1:?workdir}")"
+# -m so a workdir whose parent does not exist yet is still accepted -- the
+# `mkdir -p` below creates it. Plain `realpath` fails on a missing component,
+# and under `set -e` that ends the run before the directory is ever made.
+P="$(realpath -m "${1:?workdir}")"
 FL="${2:-flpdf}"
 case "$FL" in */*) FL="$(realpath "$FL")" ;; esac
 export FLPDF_STATIC_ID_QUIET=1
