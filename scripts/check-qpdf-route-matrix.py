@@ -912,12 +912,19 @@ class Checker:
     def _check_classification_row_id_collisions(self) -> None:
         # Keyed by (doc, table_kind, row_id) rather than including
         # table_index: a document that splits its classification rows across
-        # more than one table of the same kind (e.g. a table per section)
+        # more than one table of a *known* kind (e.g. a table per section)
         # must still keep row ids unique across all of them, not just within
         # a single physical table.
-        rows_by_table: dict[tuple[Path, str, str], list[ClassificationRow]] = {}
+        #
+        # `other` is the fallback for a header this checker does not
+        # recognize, so two `other` tables are not known to share a namespace
+        # -- a `scope` table and a `category` table both carrying `X1` are
+        # unrelated. Keep `table_index` in the key for that kind so the
+        # cross-table rule applies only where the shared namespace is known.
+        rows_by_table: dict[tuple[Path, str, str, int], list[ClassificationRow]] = {}
         for row in self.report.classification_rows:
-            key = (row.doc, row.table_kind, row.row_id)
+            scope = row.table_index if row.table_kind == "other" else -1
+            key = (row.doc, row.table_kind, row.row_id, scope)
             rows_by_table.setdefault(key, []).append(row)
         for rows in rows_by_table.values():
             if len(rows) < 2:
@@ -1038,14 +1045,25 @@ class Checker:
             enumeration = parse_enumeration(remainder or "")
             if enumeration is None:
                 # A zero count has nothing to enumerate, so a bare `0` with
-                # no parenthesized text (not even a `(—)` placeholder) is a
-                # legitimate way to write it -- only a non-zero count that
-                # omits its enumeration is an error under `require_enumeration`.
+                # nothing after it (not even a `(—)` placeholder) is a
+                # legitimate way to write it. Trailing text that is not a
+                # parenthesized enumeration is not that case: `0 3` is either
+                # a typo or an enumeration written in a shape this checker
+                # does not read, and silently accepting it would put an
+                # unvalidated row id in an aggregate cell.
                 if require_enumeration and declared != 0:
                     self.report.error(
                         table.doc,
                         line_number,
                         f"{context}: `{name}` says {declared} but enumerates no row ids",
+                    )
+                elif declared == 0 and (remainder or "").strip():
+                    self.report.error(
+                        table.doc,
+                        line_number,
+                        f"{context}: `{name}` says 0 but carries unparsed text "
+                        f"`{(remainder or '').strip()}`; write a bare `0` or a "
+                        f"parenthesized enumeration",
                     )
                 continue
             row_ids, reason = parse_row_ids(enumeration)

@@ -1378,6 +1378,66 @@ class StatsTests(unittest.TestCase):
                 payload["documents"]["b-x.md"]["detail"]["logical"],
             )
 
+    def test_zero_count_cell_rejects_unparsed_trailing_text(self) -> None:
+        """A bare `0` is fine; `0 3` is not.
+
+        The zero-count exception exists because there is nothing to
+        enumerate, not because the rest of the cell stops being checked.
+        Trailing text that is not a parenthesized enumeration is either a
+        typo or an enumeration in a shape this checker does not read, and
+        accepting it would leave an unvalidated row id in an aggregate cell.
+        """
+        original = "| 0/1, 2 | 2 | 1（0/1） | 1（2） | 0（—） | 0（—） |"
+        for cell, expect_error in (
+            ("| 0/1, 2 | 2 | 1（0/1） | 1（2） | 0 | 0（—） |", False),
+            ("| 0/1, 2 | 2 | 1（0/1） | 1（2） | 0 3 | 0（—） |", True),
+        ):
+            with self.subTest(cell=cell):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    repo = SyntheticRepository(Path(temporary_directory))
+                    repo.write("README.md", README_DOCUMENT)
+                    repo.write("a-x.md", A_DOCUMENT)
+                    repo.write("b-x.md", B_DOCUMENT.replace(original, cell))
+                    result = repo.check()
+                    output = result.stdout + result.stderr
+                    if expect_error:
+                        self.assertIn("carries unparsed text `3`", output)
+                    else:
+                        self.assertNotIn("carries unparsed text", output)
+
+    def test_unrelated_fallback_tables_may_share_a_row_id(self) -> None:
+        """`other` is the fallback for an unrecognized header.
+
+        Two such tables are not known to share a namespace, so the same row
+        id in each is not a duplicate -- but a repeat inside one of them
+        still is.
+        """
+        def fallback_table(header: str, *row_ids: str) -> str:
+            rows = "".join(
+                f"| {row_id} | `a` | `b` | canonical | n |\n" for row_id in row_ids
+            )
+            return (
+                f"\n## {header}\n\n"
+                f"| {header} | qpdf | flpdf | classification | notes |\n"
+                "|---|---|---|---|---|\n" + rows
+            )
+
+        for extra, expect_error in (
+            (fallback_table("scope", "X1") + fallback_table("category", "X1"), False),
+            (fallback_table("scope", "X1", "X1"), True),
+        ):
+            with self.subTest(expect_error=expect_error):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    repo = SyntheticRepository(Path(temporary_directory))
+                    repo.write("README.md", README_DOCUMENT)
+                    repo.write("a-x.md", A_DOCUMENT)
+                    repo.write("b-x.md", B_DOCUMENT + extra)
+                    output = repo.check().stdout + repo.check().stderr
+                    if expect_error:
+                        self.assertIn("appears more than once", output)
+                    else:
+                        self.assertNotIn("appears more than once", output)
+
     def test_stats_format_requires_stats(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             repo = SyntheticRepository(Path(temporary_directory))
