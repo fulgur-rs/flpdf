@@ -174,3 +174,63 @@ fn explicit_primary_path_spelling_is_not_deduplicated_with_dot() {
         "explicit primary path spelling vs. '.' must not be deduplicated, matching qpdf's raw-string source map"
     );
 }
+
+/// The two tests above both reach the primary-input comparison. This one
+/// stays clear of it: an `--empty` job with three specs, the dotted pair
+/// arriving only after a different source has already populated the
+/// source list, so the match runs against `source_paths` alone.
+#[test]
+fn dotted_path_is_not_deduplicated_among_non_primary_sources() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("dir");
+    std::fs::create_dir(&dir).unwrap();
+    let first = dir.join("g.pdf");
+    let second = dir.join("f.pdf");
+    std::fs::copy(fixture("link-annot-no-acroform.pdf"), &first).unwrap();
+    std::fs::copy(fixture("link-annot-no-acroform.pdf"), &second).unwrap();
+    let plain = second.to_str().unwrap().to_owned();
+    let dotted = dir.join("./f.pdf").to_str().unwrap().to_owned();
+    let other = first.to_str().unwrap().to_owned();
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+
+    let qpdf = run_qpdf(&[
+        "--static-id",
+        "--empty",
+        "--pages",
+        &other,
+        "1",
+        &plain,
+        "1",
+        &dotted,
+        "1",
+        "--",
+        qpdf_output.to_str().unwrap(),
+    ]);
+    assert_success(&qpdf, "qpdf non-primary dotted-path source dedup");
+
+    let flpdf = run_flpdf(&[
+        "--static-id",
+        "--empty",
+        "--pages",
+        &other,
+        "1",
+        &plain,
+        "1",
+        &dotted,
+        "1",
+        "--",
+        flpdf_output.to_str().unwrap(),
+    ]);
+    assert_success(&flpdf, "flpdf non-primary dotted-path source dedup");
+
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "a dotted spelling among non-primary sources must not be deduplicated either"
+    );
+}
