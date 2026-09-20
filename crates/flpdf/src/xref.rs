@@ -1283,7 +1283,7 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
     version: &str,
     options: XrefLoadOptions,
     registration: &mut XrefRegistration,
-    mut error_diagnostics_sink: Option<&mut Diagnostics>,
+    error_diagnostics_sink: Option<&mut Diagnostics>,
     first_xref_item_offset_sink: Option<&mut Option<u64>>,
     validate_current_classic_trailer: bool,
     canonical_trailer_owner: &dyn CanonicalTrailerOwner,
@@ -1420,22 +1420,14 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
             &mut loaded.loaded.repair_diagnostics,
         )?; // cov:ignore: this only propagates an injected logger failure after classic trailer parsing; the live sink is covered at the Pdf open boundary
         if validate_current_classic_trailer {
-            let validation = {
+            {
                 let mut context =
                     CanonicalXrefContext::new(canonical_trailer_owner, options.description.clone());
                 let validation =
                     validate_classic_trailer(&mut context, &loaded.loaded.trailer, trailer_start);
                 context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
                 validation
-            };
-            if let Err(error) = validation {
-                if let Some(sink) = error_diagnostics_sink.as_deref_mut() {
-                    for diagnostic in loaded.loaded.repair_diagnostics.entries() {
-                        sink.push(diagnostic.clone());
-                    }
-                }
-                return Err(error);
-            }
+            }?;
             deliver_canonical_diagnostics(
                 canonical_trailer_owner,
                 &mut loaded.loaded.repair_diagnostics,
