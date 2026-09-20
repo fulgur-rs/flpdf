@@ -55,7 +55,11 @@ fn path_description_bytes(path: &Path) -> Vec<u8> {
     }
 }
 
-/// Select which annotations `--flatten-annotations` bakes into page content.
+/// Select the annotation flag masks `--flatten-annotations` filters on.
+///
+/// The masks decide eligibility, not the final outcome: an eligible
+/// annotation is still left alone when it has no appearance stream, and a
+/// Widget is skipped outright while `/AcroForm /NeedAppearances` is set.
 ///
 /// The three modes map to the `required` and `forbidden` annotation flag masks
 /// used by `QPDFPageDocumentHelper::flattenAnnotations`
