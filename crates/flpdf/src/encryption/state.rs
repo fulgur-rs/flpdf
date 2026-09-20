@@ -16,11 +16,14 @@
 //!
 //! The bytes qpdf reads past the end are undefined, so
 //! [`aes128_object_key`] rejects the key instead of fabricating them. Against
-//! the qpdf 11.9.0 build used here the two agreed on the exit code and
-//! differed only in the diagnostic, but an out-of-bounds read has no
-//! guaranteed outcome, so that is an observation rather than part of the
-//! deviation's contract. See `docs/qpdf-correspondence.md` for the
-//! corresponding row.
+//! the qpdf 11.9.0 build used here, `--check` agreed on the exit code and
+//! differed only in the diagnostic; the write path (`--static-id`) and
+//! `--json` diverge in exit code too (0 vs. 2, 0 vs. 3), since qpdf's
+//! zlib-inflate failure downstream of the garbage key is a read path
+//! outcome that the write/JSON paths don't share. An out-of-bounds read has
+//! no guaranteed outcome on any path, so none of this is part of the
+//! deviation's contract -- it is an observation of one build, not a target
+//! to port. See `docs/qpdf-correspondence.md` for the corresponding row.
 //!
 
 use super::crypt_filters::{
