@@ -3132,9 +3132,15 @@ impl QPDFJob {
             return Ok(pdf);
         }
         if let Some(update_path) = configuration.update_from_json.as_deref() {
-            let update_file = File::open(update_path).map_err(|error| {
-                Error::file_io("open update JSON", update_path.to_path_buf(), error)
-            })?;
+            // qpdf's QPDF::updateFromJSON(std::string const&) opens the file
+            // through FileInputSource, whose constructor calls
+            // QUtil::safe_fopen directly with no extra operation-word
+            // context (`libqpdf/QPDF_json.cc:809-812`,
+            // `libqpdf/FileInputSource.cc:14-19`), so a missing update file
+            // renders as qpdf's plain "open <path>: <strerror>", not a
+            // "open update JSON <path>: ..." variant.
+            let update_file = File::open(update_path)
+                .map_err(|error| Error::file_io("open", update_path.to_path_buf(), error))?;
             self.update_from_json(
                 &mut pdf,
                 BufReader::new(update_file),

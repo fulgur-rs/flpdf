@@ -285,6 +285,75 @@ fn update_from_json_check_matches_qpdf_11_9() {
     assert_eq!(flpdf.stderr, qpdf.stderr);
 }
 
+/// qpdf's `QPDF::updateFromJSON(std::string const&)` opens the update file
+/// through `FileInputSource`, whose constructor calls `QUtil::safe_fopen`
+/// directly with no extra operation-word context
+/// (`libqpdf/QPDF_json.cc:809-812`, `libqpdf/FileInputSource.cc:14-19`), so a
+/// missing update file renders as qpdf's plain `open <path>: <strerror>`.
+/// flpdf-43qyq found the plain-write dispatch (unlike `--check`, which
+/// already routed correctly) prepending an extra `update JSON` operation
+/// word that qpdf never emits.
+#[test]
+fn update_from_json_missing_file_write_matches_qpdf_11_9() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing-update.json");
+    let argument = format!("--update-from-json={}", missing.display());
+
+    let qpdf = ShellCommand::new("qpdf")
+        .arg(&argument)
+        .arg(MINIMAL_PDF)
+        .arg(directory.path().join("qpdf-out.pdf"))
+        .output()
+        .unwrap();
+    let flpdf = ShellCommand::new(assert_cmd::cargo_bin!("flpdf"))
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg(&argument)
+        .arg(MINIMAL_PDF)
+        .arg(directory.path().join("flpdf-out.pdf"))
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+/// The `--check` dispatch opens the update-from-json file through a
+/// different flpdf-cli call site (`apply_json_update_with_job` ->
+/// `qpdf_json_input_open_error`) than the plain-write dispatch pinned above
+/// (`QPDFJob::create_qpdf`'s internal update handling). It already rendered
+/// qpdf's plain `open <path>: <strerror>` wording before flpdf-43qyq's fix,
+/// but had no regression test pinning that -- this locks it in so a future
+/// consolidation of the two call sites cannot silently regress either one.
+#[test]
+fn update_from_json_missing_file_check_matches_qpdf_11_9() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing-update.json");
+    let argument = format!("--update-from-json={}", missing.display());
+
+    let qpdf = ShellCommand::new("qpdf")
+        .arg(&argument)
+        .args(["--check", MINIMAL_PDF])
+        .output()
+        .unwrap();
+    let flpdf = ShellCommand::new(assert_cmd::cargo_bin!("flpdf"))
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg(&argument)
+        .args(["--check", MINIMAL_PDF])
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
 #[test]
 fn update_from_json_show_npages_matches_qpdf_11_9() {
     if skip_if_qpdf_missing() {
