@@ -3183,11 +3183,28 @@ impl QPDFJob {
         let mut source_passwords: Vec<Option<Vec<u8>>> = Vec::new();
         let mut specs = Vec::with_capacity(configuration.page_specs.len());
         for page in &configuration.page_specs {
+            // qpdf keys its page-spec source map by the raw filename string
+            // (`page_spec_qpdfs[page_spec.filename]`, pre-seeded with the
+            // primary at `page_spec_qpdfs[m->infilename.get()]`,
+            // `QPDFJob.cc:2366-2367,2393-2401`) and never canonicalizes it
+            // (`QPDFJob.cc:2397`: "Do not canonicalize the file name").
+            // `Path` equality folds away `.` components and repeated
+            // separators, so compare the `OsStr` bytes to match that raw
+            // string identity, both for the primary match and for dedup
+            // against already-opened secondary sources below.
             let source_index = if page.path == Path::new(".")
-                || self.configuration.input_file.as_deref() == Some(page.path.as_path())
+                || self
+                    .configuration
+                    .input_file
+                    .as_deref()
+                    .map(Path::as_os_str)
+                    == Some(page.path.as_os_str())
             {
                 0
-            } else if let Some(index) = source_paths.iter().position(|path| *path == page.path) {
+            } else if let Some(index) = source_paths
+                .iter()
+                .position(|path| path.as_os_str() == page.path.as_os_str())
+            {
                 index + 1
             } else {
                 source_paths.push(page.path.clone());
