@@ -8568,24 +8568,12 @@ fn reject_same_file(
 }
 
 fn qpdf_json_input_open_error(input: &Path, error: std::io::Error) -> Box<dyn std::error::Error> {
-    let rendered = error.to_string();
-    let message = match error.kind() {
-        std::io::ErrorKind::NotFound => {
-            // qpdf uses its portable POSIX wording for a missing JSON input on
-            // every host; Rust exposes the native Windows wording instead.
-            "No such file or directory"
-        }
-        std::io::ErrorKind::IsADirectory => {
-            // qpdf-deviation: qpdf 11.9.0 leaks libstdc++'s basic_string::_M_create
-            // for directory job-JSON paths; that toolchain artifact has no qpdf
-            // semantic contract to reproduce in Rust.
-            "Is a directory"
-        }
-        _ => error
-            .raw_os_error()
-            .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
-            .unwrap_or(&rendered),
-    };
+    // qpdf-deviation: for a directory job-JSON path, qpdf 11.9.0 leaks
+    // libstdc++'s basic_string::_M_create; that toolchain artifact has no
+    // qpdf semantic contract to reproduce in Rust, so this shares
+    // qpdf_open_io_error_message's own portable "Is a directory" wording
+    // instead like every other kind here.
+    let message = qpdf_open_io_error_message(&error);
     let mut raw_message = b"open ".to_vec();
     raw_message.extend_from_slice(&path_description(input));
     raw_message.extend_from_slice(b": ");
@@ -9370,6 +9358,18 @@ fn open_error_with_file(
 /// omit Rust's numeric `(os error N)` suffix. qpdf uses the portable
 /// not-found wording on every supported host.
 fn qpdf_open_io_error_message(error: &std::io::Error) -> String {
+    // A real syscall failure on a `strerror`-rendering host already carries
+    // exactly the text qpdf prints, so use it rather than the table below.
+    // The table keys on `ErrorKind`, which is coarser than `errno`: `EPERM`
+    // and `EACCES` share `PermissionDenied` but print "Operation not
+    // permitted" and "Permission denied" respectively, and only the raw code
+    // tells them apart. The table still covers synthetic errors carrying no
+    // `errno`, and every host whose `Display` is not `strerror` -- which is
+    // the Windows wording this table exists for.
+    #[cfg(unix)]
+    if error.raw_os_error().is_some() {
+        return strerror_from_display(error);
+    }
     let message = match error.kind() {
         std::io::ErrorKind::NotFound => Some("No such file or directory"),
         std::io::ErrorKind::PermissionDenied => Some("Permission denied"),
@@ -9382,6 +9382,12 @@ fn qpdf_open_io_error_message(error: &std::io::Error) -> String {
     if let Some(message) = message {
         return message.to_owned();
     }
+    strerror_from_display(error)
+}
+
+/// Render `error` through its own `Display`, less the ` (os error N)` suffix
+/// Rust appends and `strerror` does not.
+fn strerror_from_display(error: &std::io::Error) -> String {
     let rendered = error.to_string();
     error
         .raw_os_error()
@@ -10289,6 +10295,29 @@ mod tests {
         );
     }
 
+    /// The four kinds this helper previously fell through on. It now shares
+    /// `qpdf_open_io_error_message`'s table, which renders qpdf's portable
+    /// `strerror` wording on every host rather than Rust's native text.
+    /// A synthetic error carries no `errno`, so this exercises the table
+    /// itself rather than the raw-code path a real syscall failure takes.
+    #[test]
+    fn json_input_open_error_uses_qpdf_wording_for_every_kind() {
+        for (kind, expected) in [
+            (std::io::ErrorKind::PermissionDenied, "Permission denied"),
+            (std::io::ErrorKind::AlreadyExists, "File exists"),
+            (std::io::ErrorKind::InvalidInput, "Invalid argument"),
+            (std::io::ErrorKind::NotADirectory, "Not a directory"),
+        ] {
+            let error =
+                qpdf_json_input_open_error(Path::new("in.json"), std::io::Error::from(kind));
+            assert_eq!(
+                error.to_string(),
+                format!("open in.json: {expected}"),
+                "{kind:?}"
+            );
+        }
+    }
+
     #[test]
     fn open_error_with_file_keeps_non_io_errors_outside_open_prefix() {
         let error = open_error_with_file(
@@ -10300,6 +10329,23 @@ mod tests {
             error.to_string(),
             "bad.pdf: parse error at byte 0: malformed PDF"
         );
+    }
+
+    /// `ErrorKind` is coarser than `errno`: `EPERM` and `EACCES` both map to
+    /// `PermissionDenied`, but `strerror` prints "Operation not permitted"
+    /// for the first and "Permission denied" for the second, and qpdf prints
+    /// whichever `strerror(errno)` returns
+    /// (`QPDFSystemError::createWhat`, `QPDFSystemError.cc:13-29`). A real
+    /// syscall failure carries the raw code, so it must not be flattened
+    /// through the `ErrorKind` table.
+    #[cfg(unix)]
+    #[test]
+    fn qpdf_open_io_error_keeps_errno_wording_error_kind_cannot_distinguish() {
+        for (code, expected) in [(1, "Operation not permitted"), (13, "Permission denied")] {
+            let error = std::io::Error::from_raw_os_error(code);
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(qpdf_open_io_error_message(&error), expected, "errno {code}");
+        }
     }
 
     #[test]
