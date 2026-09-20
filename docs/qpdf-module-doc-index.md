@@ -49,7 +49,7 @@
 | `crates/flpdf/src/job/page_plan.rs` | correspondence | QPDFJob.cc handlePageSpecs single-document selection planning |
 | `crates/flpdf/src/job/page_range.rs` | correspondence | QPDFJob.cc page-range parsing split from page-operation orchestration |
 | `crates/flpdf/src/job/page_specs.rs` | correspondence | \`QPDFJob::handlePageSpecs\` page-selection boundary |
-| `crates/flpdf/src/job/page_split.rs` | correspondence | \`QPDFJob::doSplitPages\` (\`QPDFJob.cc:2940-3027\`), applying \`shouldRemoveUnreferencedResources\`'s Auto\|Yes\|No decision before page enumeration (\`QPDFJob.cc:2251-2340,340-345\`) |
+| `crates/flpdf/src/job/page_split.rs` | correspondence | \`QPDFJob::doSplitPages\` (\`QPDFJob.cc:2940-3027\`), applying \`shouldRemoveUnreferencedResources\`'s Auto\|Yes\|No decision before page enumeration (\`QPDFJob.cc:2251-2340\`) and sending its verbose finding messages through the same job logger (\`QPDFJob.cc:340-345\`) |
 | `crates/flpdf/src/job/page_subset.rs` | correspondence | \`QPDFJob::handlePageSpecs\` page-subset completion |
 | `crates/flpdf/src/job/resource_pruning.rs` | correspondence | \`QPDFJob::shouldRemoveUnreferencedResources\` |
 | `crates/flpdf/src/job/rotate.rs` | correspondence | QPDFJob.cc page rotation plus QPDFPageObjectHelper.cc matrix responsibilities |

@@ -3,7 +3,7 @@
 //! repairs copied form annotations, reconstructs chunk-local labels, and is
 //! written to its own output path.
 //!
-//! qpdf correspondence: `QPDFJob::doSplitPages` (`QPDFJob.cc:2940-3027`), applying `shouldRemoveUnreferencedResources`'s Auto|Yes|No decision before page enumeration (`QPDFJob.cc:2251-2340,340-345`).
+//! qpdf correspondence: `QPDFJob::doSplitPages` (`QPDFJob.cc:2940-3027`), applying `shouldRemoveUnreferencedResources`'s Auto|Yes|No decision before page enumeration (`QPDFJob.cc:2251-2340`) and sending its verbose finding messages through the same job logger (`QPDFJob.cc:340-345`).
 //!
 //!
 //! # Naming convention
