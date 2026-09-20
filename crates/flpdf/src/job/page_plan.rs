@@ -84,7 +84,14 @@ impl PagePlan {
         })?;
 
         if page_count == 0 {
-            // PageRange::resolve would also error, but surface a clearer message.
+            // qpdf-deviation: qpdf 11.9.0 does not guard this case in
+            // QUtil::parse_numrange's caller, so an empty page vector reaches
+            // std::vector::at and leaks libstdc++'s
+            // "vector::_M_range_check: __n (which is 0) >= this->size()
+            // (which is 0)" -- a toolchain implementation detail with no
+            // qpdf semantic contract to reproduce in Rust (same reasoning as
+            // job/argv.rs::job_json_file_open_error's libstdc++ leak note).
+            // Surface flpdf's own actionable diagnostic instead.
             return Err(Error::Missing("document has no pages"));
         }
 
