@@ -149,6 +149,10 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// linearization `/T` check; zero preserves qpdf's initialized default
     /// when no parsed xref section contains object 0.
     pub(crate) first_xref_item_offset: u64,
+    /// qpdf's xref-parser-owned `m->uncompressed_after_compressed`, sticky
+    /// across every xref stream section read for this document and consumed
+    /// by the linearization check.
+    pub(crate) uncompressed_after_compressed: bool,
     // The canonical indirect-object handle registry that used to live here is
     // now `ResolverCore::object_cache`, reached through `self.resolver`. It
     // had to move: `DocumentResolver::resolve_indirect` takes `&self` and

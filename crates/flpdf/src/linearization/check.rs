@@ -1405,6 +1405,25 @@ fn check_linearization_inner<R: Read + Seek>(
         }
     }
     // -----------------------------------------------------------------------
+    // 5b. Check numbering of compressed objects in each xref section. For
+    // linearized files, every compressed object is supposed to be at the end
+    // of its containing xref section. qpdf's xref parser already tracked this
+    // sticky, document-wide flag while loading the section
+    // (`QPDF.cc:1070,1110-1116`); this check only reads it back
+    // (`QPDF_linearization.cc:474-481`), unconditionally as a warning --
+    // qpdf's own `linearizationWarning` never throws for this condition.
+    // -----------------------------------------------------------------------
+    if pdf.uncompressed_after_compressed() {
+        let message =
+            "linearized file contains an uncompressed object after a compressed one in a cross-reference stream"
+                .to_string();
+        if collect_soft_warnings {
+            warnings.push(message);
+        } else {
+            fail!("{message}");
+        }
+    }
+    // -----------------------------------------------------------------------
     // 6. /E must match the source extent envelope of qpdf's part 6, not merely
     //    be smaller than EOF.
     // -----------------------------------------------------------------------

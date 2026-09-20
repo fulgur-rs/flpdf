@@ -803,6 +803,12 @@ impl<R: Read + Seek> Pdf<R> {
         self.first_xref_item_offset
     }
 
+    /// Return qpdf's xref-parser-owned `m->uncompressed_after_compressed`
+    /// used by the linearization check.
+    pub(crate) fn uncompressed_after_compressed(&self) -> bool {
+        self.uncompressed_after_compressed
+    }
+
     pub(crate) fn source_xref_entries(&self) -> BTreeMap<ObjectRef, XrefEntry> {
         self.resolver.source_xref_entries()
     }
