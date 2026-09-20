@@ -2350,6 +2350,58 @@ fn collate_zero_with_split_pages_matches_qpdf_no_op() {
 }
 
 #[test]
+fn zero_page_pages_source_exits_2_like_qpdf_with_a_documented_stderr_deviation() {
+    // qpdf 11.9.0's `handlePageSpecs` has no empty-selection guard for a
+    // zero-page `--pages` source, so an unguarded vector access leaks
+    // libstdc++'s `std::out_of_range` text -- a toolchain implementation
+    // detail with no qpdf semantic contract, not a diagnostic qpdf itself
+    // composed. flpdf surfaces its own stable diagnostic instead
+    // (`crates/flpdf/src/job/page_plan.rs::PagePlan::build`, `qpdf-deviation`
+    // marked; see `docs/qpdf-correspondence.md`'s "`--pages` zero-page source
+    // diagnostic" entry). Both sides still exit 2 and write no output.
+    if !qpdf_available() {
+        return;
+    }
+    let zero_page = fixture_abs("../../tests/fixtures/compat/adbe-orphan-url.pdf");
+    let tmp = tempfile::tempdir().unwrap();
+    let q_out = tmp.path().join("q.pdf");
+    let f_out = tmp.path().join("f.pdf");
+
+    let q_result = Shell::new(QPDF)
+        .args(["--static-id", "--pages"])
+        .arg(&zero_page)
+        .arg("1")
+        .arg("--")
+        .arg(&zero_page)
+        .arg(&q_out)
+        .output()
+        .expect("qpdf should spawn");
+    assert_eq!(q_result.status.code(), Some(2));
+    assert!(!q_out.exists(), "qpdf must write no output for this source");
+
+    let f_result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--static-id", "--pages"])
+        .arg(&zero_page)
+        .arg("1")
+        .arg("--")
+        .arg(&zero_page)
+        .arg(&f_out)
+        .output()
+        .unwrap();
+    assert_eq!(f_result.status.code(), Some(2));
+    assert!(
+        !f_out.exists(),
+        "flpdf must write no output for this source"
+    );
+    let f_stderr = String::from_utf8_lossy(&f_result.stderr);
+    assert!(
+        f_stderr.contains("missing required PDF entry: document has no pages"),
+        "flpdf's documented diagnostic must still be present: {f_stderr}"
+    );
+}
+
+#[test]
 fn collate_invalid_parameter_without_pages_is_rejected_like_qpdf() {
     if !qpdf_available() {
         return;
