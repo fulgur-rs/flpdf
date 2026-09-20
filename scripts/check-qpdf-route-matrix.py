@@ -841,6 +841,19 @@ class Checker:
                 )
         readme = matrix_dir / "README.md"
         readme_exists = readme.is_file()
+        # A populated matrix owes the three repository-wide aggregates. Without
+        # this, deleting `README.md` outright takes all three with it and the
+        # per-kind loop below has nothing left to complain about -- the whole
+        # point of the loop is that a deleted table must fail rather than
+        # silently opt out. Keyed on area documents existing so that a minimal
+        # fixture (no `[a-e]-*.md` at all) still has nothing to check.
+        if not readme_exists and self._area_documents(matrix_dir):
+            self.report.note(
+                matrix_dir,
+                "has area documents but no `README.md` to hold the "
+                + ", ".join(f"`route-matrix-aggregate: {k}`" for k in REPOSITORY_WIDE_KINDS)
+                + " tables",
+            )
         for kind in REPOSITORY_WIDE_KINDS:
             found_tables = self._tables_of(kind)
             if readme_exists:

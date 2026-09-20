@@ -1438,6 +1438,39 @@ class StatsTests(unittest.TestCase):
                     else:
                         self.assertNotIn("appears more than once", output)
 
+    def test_deleting_readme_does_not_drop_the_repository_wide_aggregates(
+        self,
+    ) -> None:
+        """Deleting `README.md` must not take the three aggregates with it.
+
+        The per-kind placement loop only sees tables that exist, so with no
+        `README.md` there is nothing left for it to flag. A matrix that has
+        area documents owes those tables regardless of where they live.
+        """
+        for files, expect_error in (
+            ((("a-x.md", A_DOCUMENT), ("b-x.md", B_DOCUMENT)), True),
+            (
+                (
+                    ("README.md", README_DOCUMENT),
+                    ("a-x.md", A_DOCUMENT),
+                    ("b-x.md", B_DOCUMENT),
+                ),
+                False,
+            ),
+            ((("a.md", HEADER + area_row("A1", "canonical")),), False),
+        ):
+            with self.subTest(expect_error=expect_error):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    repo = SyntheticRepository(Path(temporary_directory))
+                    for name, body in files:
+                        repo.write(name, body)
+                    result = repo.check()
+                    output = result.stdout + result.stderr
+                    if expect_error:
+                        self.assertIn("no `README.md` to hold the", output)
+                    else:
+                        self.assertNotIn("no `README.md` to hold the", output)
+
     def test_stats_format_requires_stats(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             repo = SyntheticRepository(Path(temporary_directory))
