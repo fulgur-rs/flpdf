@@ -15,9 +15,9 @@ set -eu
 # -m so a workdir whose parent does not exist yet is still accepted -- the
 # `mkdir -p` below creates it. Plain `realpath` fails on a missing component,
 # and under `set -e` that ends the run before the directory is ever made.
-P="$(realpath -m "${1:?workdir}")"
+P="$(realpath -m -- "${1:?workdir}")"
 FL="${2:-flpdf}"
-case "$FL" in */*) FL="$(realpath "$FL")" ;; esac
+case "$FL" in */*) FL="$(realpath -- "$FL")" ;; esac
 export FLPDF_STATIC_ID_QUIET=1
 rm -rf "$P/fix" "$P/q" "$P/f"; mkdir -p "$P/fix" "$P/q" "$P/f"
 python3 "$(dirname "$0")/make_fixtures.py" "$P/fix" >/dev/null
