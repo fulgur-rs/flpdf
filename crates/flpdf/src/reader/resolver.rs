@@ -4008,11 +4008,19 @@ impl<R: Read + Seek> ResolverHandle<R> {
             };
             let trailing = if parsed.empty.is_none() {
                 let mut trailing_tokens = LiveTokenSource::new(&mut input);
-                let trailing = trailing_tokens
-                    .next_token()
-                    .map_err(ReadObjectAtOffsetError::Body)?;
+                let trailing = trailing_tokens.next_token();
                 drop(trailing_tokens);
-                Some(trailing)
+                match trailing {
+                    Ok(trailing) => Some(trailing),
+                    Err(error) => {
+                        // qpdf's InputSource has one shared cursor. Flush the
+                        // parser's logical position before returning a body
+                        // error, matching the header/body arms above
+                        // (`QPDF.cc:1561-1639`).
+                        input.finish().map_err(ReadObjectAtOffsetError::Body)?;
+                        return Err(ReadObjectAtOffsetError::Body(error));
+                    }
+                }
             } else {
                 None
             };
@@ -16662,5 +16670,99 @@ mod tests {
             .any(|diagnostic| diagnostic
                 .message_string()
                 .contains("supposed object stream 9 is not a stream")));
+    }
+
+    /// flpdf-lomsz: a read failure specifically at the trailing-token read
+    /// (after the object's own value has already parsed successfully) must
+    /// reach the same `input.finish()` call the header- and body-parse error
+    /// arms right above it already make, matching qpdf's shared-cursor
+    /// contract for `read_object_at_offset_with_description`
+    /// (`QPDF.cc:1561-1639`).
+    ///
+    /// The only reachable failure at this specific point is a refill I/O
+    /// error: `ResolverLiveInput::read_byte` clears its buffer before the
+    /// fallible refill, so at the moment such a failure happens `tell()`
+    /// already equals the raw resolver position and `finish()`'s seek is a
+    /// no-op there -- confirmed by reverting the fix and observing this test
+    /// still passes. It still exercises the line for parity with the two
+    /// arms above (and for the case where a future buffering change makes
+    /// the seek observable), matching those two arms' own existing test
+    /// coverage, which is likewise line-only rather than behavior-
+    /// discriminating.
+    #[test]
+    fn trailing_token_read_failure_flushes_the_cursor_like_the_other_error_arms() {
+        // `ResolverCore::read` loops a short underlying `Read::read` until its
+        // 128-byte (`LIVE_INPUT_BUFFER`) request is fully served or the
+        // source errors, so a single logical `read_byte()` refill can drive
+        // many calls to this reader. Count refill *calls*, not bytes: the
+        // first refill (covering the object's header, value, and most of a
+        // padding comment placed between the value and `endobj`) is allowed
+        // to succeed in full; only the second refill -- needed to read past
+        // the padding and reach `endobj` -- fails.
+        struct Breakable {
+            inner: std::io::Cursor<Vec<u8>>,
+            enabled: bool,
+            calls_since_enabled: u64,
+            fail_from_call: u64,
+        }
+
+        impl std::io::Read for Breakable {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.enabled {
+                    self.calls_since_enabled += 1;
+                    if self.calls_since_enabled >= self.fail_from_call {
+                        return Err(std::io::Error::other("input source went away"));
+                    }
+                }
+                self.inner.read(buf)
+            }
+        }
+
+        impl std::io::Seek for Breakable {
+            fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.inner.seek(position)
+            }
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"%PDF-1.4\n");
+        let object_offset = bytes.len() as u64;
+        bytes.extend_from_slice(b"1 0 obj\n42\n%");
+        bytes.extend(std::iter::repeat_n(b'X', 200));
+        bytes.extend_from_slice(b"\nendobj\n");
+        let xref_offset = bytes.len() as u64;
+        bytes.extend_from_slice(
+            format!("xref\n0 2\n0000000000 65535 f \n{object_offset:010} 00000 n \n").as_bytes(),
+        );
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+
+        let mut pdf = Pdf::open(Breakable {
+            inner: std::io::Cursor::new(bytes),
+            enabled: false,
+            calls_since_enabled: 0,
+            fail_from_call: 0,
+        })
+        .expect("open");
+
+        // Enable the break only now, so the xref/trailer read during `open`
+        // above is unaffected.
+        pdf.resolver.with_reader_mut(|reader| {
+            reader.fail_from_call = 2;
+            reader.enabled = true;
+        });
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
+
+        handle
+            .try_is_scalar()
+            .expect("qpdf catches std::exception, warns, and resolves to null");
+        assert!(handle.is_null());
+        assert!(pdf.repair_diagnostics().entries().iter().any(|warning| {
+            warning
+                .get_message_detail()
+                .starts_with(b"object 1/0: error reading object: ")
+        }));
     }
 }
