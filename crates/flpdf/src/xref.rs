@@ -1070,7 +1070,16 @@ fn load_xref_state_from_window(
         }
         Err(error) => return Err(error),
     };
-    prepend_repair_diagnostics(&mut loaded.loaded.repair_diagnostics, initial_diagnostics);
+    // `initial_diagnostics` is always empty by this point: the header-check
+    // warning it can carry (pushed above) is delivered through
+    // `deliver_canonical_diagnostics` before the first `load_xref_state_from_window`
+    // call in every production caller, and a delivery failure there returns
+    // early via `?` without ever reaching this branch. Verified empirically
+    // (2026-09-20, flpdf-po4te): a hard assertion here never fired across the
+    // full workspace test suite, all 589 qpdf qtest fixtures, and all 177
+    // tests/fixtures/compat/*.pdf fixtures under both `--check` and
+    // `--qdf --object-streams=generate`.
+    debug_assert!(initial_diagnostics.entries().is_empty());
     deliver_canonical_diagnostics(
         canonical_trailer_owner,
         &mut loaded.loaded.repair_diagnostics,
@@ -1511,14 +1520,7 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
         canonical_trailer_owner,
     ) {
         Ok(state) => Ok(state),
-        Err(failure) => {
-            if let Some(sink) = error_diagnostics_sink {
-                for diagnostic in failure.diagnostics.entries() {
-                    sink.push(diagnostic.clone());
-                }
-            } // cov:ignore: LLVM maps the covered sink-forwarding condition to this closing branch edge
-            Err(failure.error)
-        }
+        Err(failure) => Err(failure.error),
     }
 }
 
@@ -1638,7 +1640,6 @@ fn merge_xref_stream_from_classic_trailer_with_build_diagnostics(
 
     // The hybrid stream contributes entries and raw-object discovery state, but
     // its own trailer is not the current trailer and its `/Prev` is ignored.
-    let mut hybrid_error_diagnostics = Diagnostics::default();
     let hybrid = match parse_xref_stream(
         xref_stream_pos,
         xref_stream_pos as u64,
@@ -1649,14 +1650,8 @@ fn merge_xref_stream_from_classic_trailer_with_build_diagnostics(
     ) {
         Ok(hybrid) => hybrid,
         Err(failure) => {
-            for diagnostic in failure.diagnostics.entries() {
-                hybrid_error_diagnostics.push(diagnostic.clone());
-            }
             if let Some(sink) = error_diagnostics_sink.as_mut() {
                 for diagnostic in loaded.loaded.repair_diagnostics.entries() {
-                    sink.push(diagnostic.clone());
-                }
-                for diagnostic in hybrid_error_diagnostics.entries() {
                     sink.push(diagnostic.clone());
                 }
             }
@@ -2175,17 +2170,6 @@ fn recover_xref_from_linear_scan(
         parsed_xref_streams,
         header_offset: 0,
     })
-}
-
-fn prepend_repair_diagnostics(target: &mut Diagnostics, initial: Diagnostics) {
-    if initial.entries().is_empty() {
-        return;
-    }
-    let existing = std::mem::take(target);
-    *target = initial;
-    for diagnostic in existing.entries() {
-        target.push(diagnostic.clone());
-    }
 }
 
 fn merge_recovered_qpdf_state(
@@ -3333,22 +3317,22 @@ fn parse_xref_entry_line(line: &[u8]) -> Option<(u64, i32, u8, bool)> {
     ))
 }
 
-/// An xref-stream read keeps its diagnostics beside the terminal error so a
-/// caller that buffers a speculative section can order them itself. This
-/// mirrors qpdf's document-owned `QPDF::warn` channel without passing a
-/// parser-local sink through the stream parser.
+/// An xref-stream read's terminal error, boxed for a large `Err` arm.
+///
+/// A prior revision paired this with a `diagnostics: Diagnostics` field for
+/// a caller that buffers a speculative section to order diagnostics itself,
+/// but no code path ever constructed it non-empty (verified empirically,
+/// 2026-09-20, flpdf-po4te): every consumer of a failed `parse_xref_stream`
+/// call only ever iterated over an empty buffer. Removed rather than left as
+/// unreachable plumbing.
 #[derive(Debug)]
 struct XrefStreamFailure {
     error: Error,
-    diagnostics: Diagnostics,
 }
 
 impl XrefStreamFailure {
     fn new(error: Error) -> Box<Self> {
-        Box::new(Self {
-            error,
-            diagnostics: Diagnostics::default(),
-        })
+        Box::new(Self { error })
     }
 }
 
@@ -4820,7 +4804,6 @@ mod final_handle_tests {
         .expect_err("a malformed xref-stream object header must fail framing");
 
         assert!(matches!(failure.error, Error::Parse { .. }));
-        assert!(failure.diagnostics.entries().is_empty());
     }
 
     #[test]
