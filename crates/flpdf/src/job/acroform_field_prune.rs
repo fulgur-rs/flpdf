@@ -171,6 +171,19 @@ pub(crate) fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
         return Ok(()); // /Fields is missing or not an array.
     };
 
+    // qpdf allocates the replacement array's object number *before* counting
+    // how many fields survive (`QPDFJob.cc:2610-2614`: `new_fields =
+    // pdf.makeIndirectObject(new_fields)` runs ahead of the keep/drop loop).
+    // When every field is later dropped, that already-allocated object is
+    // never linked anywhere and stays an orphan in the object table -- this
+    // reservation reproduces the same orphan rather than only allocating an
+    // indirect object when there is content to attach to it.
+    let reserved_indirect_fields = if fields.is_indirect() {
+        Some(pdf.make_indirect_object_handle(ObjectHandle::array(Vec::new()))?)
+    } else {
+        None
+    };
+
     // ── Step 4: for each top-level field, decide keep/drop ────────────────
     // A field is kept when it (or any descendant in its /Kids tree) has at
     // least one widget in `widget_to_page` (i.e. a widget on a retained page).
@@ -233,17 +246,19 @@ pub(crate) fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
     // ── Step 6: write back pruned /AcroForm or remove it ─────────────────
     if kept_fields.is_empty() {
         // All fields dropped → remove /AcroForm from catalog entirely,
-        // matching qpdf's observed behaviour.
+        // matching qpdf's observed behaviour. `reserved_indirect_fields`
+        // (if any) is intentionally left allocated but unlinked here,
+        // matching qpdf's own orphaned `new_fields` object in this case.
         catalog.remove_key(b"/AcroForm");
     } else {
         // qpdf creates a fresh array for an indirect /Fields holder and
         // replaces the key on the live AcroForm handle. A direct holder
         // remains direct (`QPDFJob.cc:2620-2631`).
-        let replacement = ObjectHandle::array(kept_fields);
-        let replacement = if fields.is_indirect() {
-            pdf.make_indirect_object_handle(replacement)?
+        let replacement = if let Some(reserved) = reserved_indirect_fields {
+            reserved.try_set_array_items(kept_fields)?;
+            reserved
         } else {
-            replacement
+            ObjectHandle::array(kept_fields)
         };
         acroform.replace_key(b"/Fields", replacement)?;
     }
@@ -953,6 +968,63 @@ mod tests {
         assert!(
             !cat.contains_key(b"/AcroForm".as_slice()),
             "/AcroForm should be removed from catalog when /Fields is empty"
+        );
+    }
+
+    /// Build a 1-page PDF whose `/AcroForm /Fields` is an *indirect* array
+    /// (unlike `build_all_on_page1_pdf`'s direct array), with every field on
+    /// the single retained page — so pruning drops all fields but still hits
+    /// the `fields.is_indirect()` branch.
+    fn build_indirect_empty_fields_pdf() -> Vec<u8> {
+        let objects: Vec<(u32, &[u8])> = vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>"),
+            (
+                2,
+                b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 612 792] >>",
+            ),
+            (3, b"<< /Type /Page /Parent 2 0 R /Annots [6 0 R] >>"),
+            (4, b"<< /Type /Page /Parent 2 0 R >>"),
+            (5, b"<< /Fields 7 0 R /DA (/Helvetica 12 Tf 0 g) >>"),
+            (
+                6,
+                b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (FieldA) \
+                   /P 3 0 R /Rect [10 700 200 720] >>",
+            ),
+            (7, b"[6 0 R]"),
+        ];
+        build_pdf(&objects)
+    }
+
+    /// qpdf allocates the replacement array's object number *before* the
+    /// keep/drop loop even when every field is later dropped
+    /// (`QPDFJob.cc:2610-2632`), so that already-allocated object survives as
+    /// an orphan once /AcroForm itself is removed. `--json` (unlike the write
+    /// path, which garbage-collects unreferenced objects) must report this
+    /// orphan, matching qpdf's observed `maxobjectid` and object enumeration.
+    #[test]
+    fn indirect_empty_fields_reserves_an_orphan_object() {
+        let mut pdf = open(build_indirect_empty_fields_pdf());
+
+        // Extract only page 2 (obj 4) — drops page 1 where the only widget lives.
+        let sel = [ObjectRef::new(4, 0)];
+        let result = rebuild_page_tree(&mut pdf, &sel).unwrap();
+        // `rebuild_page_tree` allocates its own new objects (e.g. a rebuilt
+        // Pages container); count *after* it, so the delta below isolates
+        // just the object `prune_acroform_after_subset` itself allocates.
+        let before_prune_count = pdf.get_object_count().unwrap();
+        prune_acroform_after_subset(&mut pdf, &result).unwrap();
+
+        let cat = dict_of(&mut pdf, ObjectRef::new(1, 0));
+        assert!(
+            !cat.contains_key(b"/AcroForm".as_slice()),
+            "/AcroForm should be removed from catalog when /Fields is empty"
+        );
+
+        let after_count = pdf.get_object_count().unwrap();
+        assert_eq!(
+            after_count,
+            before_prune_count + 1,
+            "the reserved replacement array must remain allocated as an orphan"
         );
     }
 
