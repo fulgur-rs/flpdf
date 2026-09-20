@@ -924,6 +924,23 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         // this common boundary so the two output routes consume one live
         // graph rather than maintaining route-local preparation bridges.
         prepare_file_for_write(self.pdf)?;
+        // With a static ID, QPDFWriter::copyEncryptionParameters's early
+        // generateID() call (inside doWriteSetup, before the
+        // get_object_count() call above) already filled `id2` from the
+        // hardcoded static bytes, so the earlier check in
+        // prepared_write_options above does not fire for this combination.
+        // qpdf's own failure for it surfaces later, from
+        // QPDFWriter::writeStandard/writeLinearized's first action,
+        // pushMD5Pipeline, which rejects an already-nonempty `id2`
+        // (QPDFWriter.cc:1011-1014, 2990-2996, 2673-2675) -- reached only
+        // after get_object_count()'s fixDanglingReferences pass and the
+        // graph preparation just above have already run. Reproduce that
+        // same ordering here so qpdf's lazy stream-recovery warnings from
+        // resolving the xref table surface before this error, matching the
+        // observed qpdf stderr order.
+        if options.deterministic_id && options.static_id && options.encryption_generated_id {
+            return Err(deterministic_id_after_id_generation());
+        }
         let result = if self.settings.linearization {
             options.qdf = false;
             let pass1_path = self.settings.linearization_pass1_filename.as_deref();
@@ -1048,18 +1065,36 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
 
         // QPDFWriter::setEncryptionParameters and
         // QPDFWriter::copyEncryptionParameters both call generateID() before
-        // installing the encryption state (QPDFWriter.cc:619 and :656). A
-        // deterministic ID has no data until the writer has emitted the bytes,
-        // so qpdf reports generateID's logic_error for this combination before
-        // forced-version handling can disable encryption. With a static ID
-        // that early generateID succeeds and pushMD5Pipeline rejects the
-        // already-generated ID instead (QPDFWriter.cc:1011-1014).
-        if options.deterministic_id
+        // installing the encryption state (QPDFWriter.cc:619 and :656),
+        // inside doWriteSetup -- before qpdf's write() snapshots
+        // getObjectCount() (QPDFWriter.cc:2189-2195). Without a static ID,
+        // that early generateID() call has no deterministic digest yet and
+        // throws immediately, so qpdf never reaches getObjectCount()'s
+        // fixDanglingReferences pass and prints none of its lazy stream-
+        // recovery warnings. With a static ID, generateID() succeeds right
+        // away (QPDFWriter.cc:1836-1856 takes the static branch
+        // unconditionally), so this combination is not an error yet here;
+        // the corresponding failure moves to pushMD5Pipeline
+        // (QPDFWriter.cc:1011-1014), reached only after getObjectCount() and
+        // prepareFileForWrite() have already run -- see the check beside
+        // `self.pdf.get_object_count()` in `write` below, which reproduces
+        // that later failure point and lets qpdf's stream-recovery warnings
+        // surface first.
+        if uses_deterministic_id(&options)
             && (options.encrypt.is_some() || options.copy_encryption.is_some())
         {
             return Err(deterministic_id_encryption_error(&options));
         }
 
+        // qpdf's `copyEncryptionParameters`/`setEncryptionParameters` call
+        // `generateID()` from inside `doWriteSetup`, so with a static ID the
+        // ID is already filled by the time forced-version handling turns the
+        // encryption off (`QPDFWriter.cc:619,656`). `pushMD5Pipeline` still
+        // rejects deterministic-ID mode afterwards, so record that the ID was
+        // generated rather than testing the normalized fields, which by then
+        // no longer say encryption was ever requested.
+        options.encryption_generated_id =
+            options.encrypt.is_some() || options.copy_encryption.is_some();
         if forced_version_disables_encryption(&options) {
             options.encrypt = None;
             options.copy_encryption = None;
@@ -1468,6 +1503,13 @@ impl Default for ProgressStateInner {
 /// Public callers configure [`PdfWriter`] directly.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct WriterOptions {
+    /// Whether encryption setup ran and therefore already generated an ID.
+    ///
+    /// qpdf generates the ID inside `doWriteSetup`'s encryption setup
+    /// (`QPDFWriter.cc:619,656`), before forced-version handling can turn the
+    /// encryption back off. The encryption fields alone cannot answer this
+    /// afterwards, so record it while they are still set.
+    pub encryption_generated_id: bool,
     /// Stream decode level used by the qpdf-shaped writer bridge.
     ///
     /// A filter chain that is not wholly decodable at this level is preserved
@@ -4385,6 +4427,107 @@ mod final_handle_writer_tests {
                 .expect("read prepared Extensions after failure")
                 .is_direct(),
             "a later write failure must not restore the pre-prepare indirect graph"
+        );
+    }
+
+    /// Reproduces a divergence found while investigating flpdf-k1k8i: for
+    /// `--static-id --deterministic-id` on a preserved-encryption source
+    /// whose damaged xref needs reconstruction, qpdf's own generateID()
+    /// succeeds early (the static branch does not need deterministic digest
+    /// data, `QPDFWriter.cc:1836-1856`), so the actual failure moves to
+    /// `pushMD5Pipeline` (`QPDFWriter.cc:1011-1014`), reached only after
+    /// `QPDFWriter::write`'s `getObjectCount()` snapshot has already run
+    /// `fixDanglingReferences` (`QPDFWriter.cc:2189-2195`) and printed the
+    /// source's lazy stream-recovery warnings. Without a static ID,
+    /// `generateID()` itself has no deterministic digest yet and throws
+    /// immediately from inside `doWriteSetup`, before `getObjectCount()` is
+    /// ever reached (`QPDFWriter.cc:1868-1874`).
+    #[test]
+    fn write_reports_qpdf_logic_error_for_deterministic_id_with_preserved_encryption() {
+        for (static_id, expected_message, dangling_refs_fixed_expected) in [
+            (
+                false,
+                "INTERNAL ERROR: QPDFWriter::generateID has no data for deterministic ID",
+                false,
+            ),
+            (
+                true,
+                "Deterministic ID computation enabled after ID generation has already occurred.",
+                true,
+            ),
+        ] {
+            let mut pdf = Pdf::open(Cursor::new(
+                include_bytes!("../../../tests/fixtures/compat/encrypted-recovered-eol.pdf")
+                    .to_vec(),
+            ))
+            .expect("encrypted, reconstructed-xref fixture opens with its empty password");
+            assert!(
+                !pdf.dangling_references_fixed(),
+                "static_id={static_id}: opening must not eagerly fix dangling references"
+            );
+
+            let mut writer = PdfWriter::new(&mut pdf);
+            writer.set_static_id(static_id);
+            writer.set_deterministic_id(true);
+            writer
+                .set_output_writer(Vec::new())
+                .expect("install an in-memory output sink");
+
+            let error = writer
+                .write()
+                .expect_err("deterministic ID with preserved encryption must fail");
+            assert!(
+                matches!(error, Error::Internal(ref message) if message.starts_with(expected_message)),
+                "static_id={static_id}: unexpected error {error:?}"
+            );
+            assert_eq!(
+                pdf.dangling_references_fixed(),
+                dangling_refs_fixed_expected,
+                "static_id={static_id}: qpdf's getObjectCount() dangling-reference fixup runs \
+                 before the static-ID pushMD5Pipeline failure, but before the non-static-ID \
+                 generateID failure, which happens earlier still, inside doWriteSetup"
+            );
+        }
+    }
+
+    /// A forced version too low for the requested encryption turns that
+    /// encryption back off, but qpdf has already generated the ID by then --
+    /// `copyEncryptionParameters`/`setEncryptionParameters` call
+    /// `generateID()` from inside `doWriteSetup` (`QPDFWriter.cc:619,656`),
+    /// ahead of forced-version handling. `pushMD5Pipeline` still rejects
+    /// deterministic-ID mode afterwards, so testing the normalized encryption
+    /// fields (which no longer say encryption was requested) lets a cleartext
+    /// file through where qpdf fails. Measured against qpdf 11.9.0:
+    /// `--static-id --deterministic-id --force-version=1.3 --encrypt '' '' 256`
+    /// exits 2 with "Deterministic ID computation enabled after ID generation
+    /// has already occurred." and writes nothing.
+    #[test]
+    fn deterministic_id_fails_even_when_a_forced_version_disables_the_encryption() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/encrypted-recovered-eol.pdf").to_vec(),
+        ))
+        .expect("encrypted, reconstructed-xref fixture opens with its empty password");
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_static_id(true);
+        writer.set_deterministic_id(true);
+        writer.force_pdf_version("1.3", 0);
+        writer
+            .set_output_writer(Vec::new())
+            .expect("install an in-memory output sink");
+
+        let error = writer
+            .write()
+            .expect_err("a forced version must not let deterministic ID through");
+        assert!(
+            matches!(
+                error,
+                Error::Internal(ref message)
+                    if message.starts_with(
+                        "Deterministic ID computation enabled after ID generation has already occurred."
+                    )
+            ),
+            "unexpected error {error:?}"
         );
     }
 
