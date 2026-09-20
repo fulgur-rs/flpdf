@@ -198,9 +198,11 @@ fn collate_values_for_specs(
 /// absent, which is what the qtest and compat corpora contain; removing that
 /// step would reintroduce the difference.
 ///
-/// The two part ways whenever `fixCopiedAnnotations` takes its early return
-/// -- a present but non-array `/Annots` (`null`, say) *or* an empty array,
-/// both covered by `:1024-1026`. qpdf leaves whatever page copying installed
+/// The two part ways on two of the inputs `fixCopiedAnnotations` early-returns
+/// on (`:1024-1026`): a present but non-array `/Annots` (`null`, say) and an
+/// empty array. An absent `/Annots` takes that same return, but there the
+/// clear is a no-op and both sides leave the key off, so it stays in the
+/// agreeing set above. qpdf leaves whatever page copying installed
 /// alone; clearing first drops it, after which `copy_annotations` either
 /// returns on its own non-array check
 /// (`QPDFPageObjectHelper.cc:999-1001`) or, for an empty array, installs a
