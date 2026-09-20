@@ -16,11 +16,17 @@
 //!
 //! The bytes qpdf reads past the end are undefined, so
 //! [`aes128_object_key`] rejects the key instead of fabricating them. Against
-//! the qpdf 11.9.0 build used here the two agreed on the exit code and
-//! differed only in the diagnostic, but an out-of-bounds read has no
-//! guaranteed outcome, so that is an observation rather than part of the
-//! deviation's contract. See `docs/qpdf-correspondence.md` for the
-//! corresponding row.
+//! the qpdf 11.9.0 build used here the exit codes sometimes agree and
+//! sometimes do not, and which paths diverge depends on the input as much
+//! as on the build: on one file `--check` agreed while the write and
+//! `--json` paths differed (0 vs. 2, 0 vs. 3), while on
+//! `enc-XI-R6,V5,O=master` all of `--check`, the write path, `--json` and
+//! `--show-npages` differed the same way (3 vs. 2), and on
+//! `enc-XI-R6,V5,U=attachment,encrypted-attachments` `--json` agreed while
+//! the other two differed. An out-of-bounds read has no guaranteed outcome,
+//! so none of these pairings is part of the deviation's contract -- they
+//! are observations, not a target to port. See
+//! `docs/qpdf-correspondence.md` for the corresponding row.
 //!
 
 use super::crypt_filters::{
