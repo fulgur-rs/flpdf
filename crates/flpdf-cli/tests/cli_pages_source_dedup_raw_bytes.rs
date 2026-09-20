@@ -234,3 +234,53 @@ fn dotted_path_is_not_deduplicated_among_non_primary_sources() {
         "a dotted spelling among non-primary sources must not be deduplicated either"
     );
 }
+
+/// The `.` shorthand is raw-string too: qpdf rewrites the spec only when the
+/// filename is exactly `"."` (`QPDFJob.cc:2367`), so `./`, `.//` and `./.`
+/// stay ordinary filenames it then fails to open. Folding them into the
+/// shorthand would silently substitute the primary input instead.
+#[test]
+fn dot_shorthand_does_not_absorb_other_directory_spellings() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    for token in ["./", ".//", "./."] {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("f.pdf");
+        std::fs::copy(fixture("link-annot-no-acroform.pdf"), &source).unwrap();
+        let input = source.to_str().unwrap().to_owned();
+        let qpdf_output = temp.path().join("qpdf.pdf");
+        let flpdf_output = temp.path().join("flpdf.pdf");
+
+        let qpdf = run_qpdf(&[
+            "--static-id",
+            "--pages",
+            token,
+            "1",
+            "--",
+            &input,
+            qpdf_output.to_str().unwrap(),
+        ]);
+        let flpdf = run_flpdf(&[
+            "--static-id",
+            "--pages",
+            token,
+            "1",
+            "--",
+            &input,
+            flpdf_output.to_str().unwrap(),
+        ]);
+
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "{token}: exit code must match qpdf"
+        );
+        assert_eq!(
+            qpdf_output.exists(),
+            flpdf_output.exists(),
+            "{token}: neither side may write an output qpdf does not"
+        );
+    }
+}

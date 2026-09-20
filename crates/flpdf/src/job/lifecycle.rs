@@ -3191,8 +3191,11 @@ impl QPDFJob {
             // `Path` equality folds away `.` components and repeated
             // separators, so compare the `OsStr` bytes to match that raw
             // string identity, both for the primary match and for dedup
-            // against already-opened secondary sources below.
-            let source_index = if page.path == Path::new(".")
+            // against already-opened secondary sources below. The `.`
+            // shorthand is the same story: qpdf rewrites the spec only on
+            // `page_spec.filename == "."` (`QPDFJob.cc:2367`), so `./` and
+            // `./.` stay ordinary filenames it then fails to open.
+            let source_index = if page.path.as_os_str() == std::ffi::OsStr::new(".")
                 || self
                     .configuration
                     .input_file
