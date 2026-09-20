@@ -65,3 +65,30 @@ fn list_attachments_rejects_output_file() {
 fn show_attachment_rejects_output_file() {
     assert_rejects_output(&["--show-attachment=missing"]);
 }
+
+#[test]
+fn show_encryption_rejects_output_file() {
+    assert_rejects_output(&["--show-encryption"]);
+}
+
+/// `--requires-password` and `--is-encrypted` are a separate
+/// `checkConfiguration` check (`QPDFJob.cc:597-599`), independent of the
+/// output-file rejection above, so it gets its own assertion rather than
+/// `assert_rejects_output`'s message and output-arg shape.
+#[test]
+fn requires_password_and_is_encrypted_reject_each_other() {
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args([
+            "--requires-password",
+            "--is-encrypted",
+            "../../tests/fixtures/minimal.pdf",
+        ])
+        .assert()
+        .failure()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "--requires-password and --is-encrypted may not be given together",
+        ));
+}
