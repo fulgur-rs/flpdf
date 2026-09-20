@@ -2478,8 +2478,17 @@ impl QPDFJob {
             // `read_to_string` + `.lines().next()`, which both rejects
             // non-UTF-8 password bytes and (for a file with no trailing
             // newline at all) can differ on whether a lone final line counts.
-            let bytes = std::fs::read(&path)
-                .map_err(|error| Error::file_io("open", path.clone(), error))?;
+            //
+            // The open/read split below (instead of `std::fs::read`) mirrors
+            // qpdf's own: `safe_fopen` succeeds on a directory on Unix, and
+            // only the first `fread` fails, reporting a fixed, path-less
+            // message (`read_char_from_FILE`, `QUtil.cc:1217-1228`).
+            let mut file =
+                File::open(&path).map_err(|error| Error::file_io("open", path.clone(), error))?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map_err(|_error| {
+                Error::System("failure reading character from file".to_owned())
+            })?;
             let first_line_len = bytes
                 .iter()
                 .position(|&byte| byte == b'\n')

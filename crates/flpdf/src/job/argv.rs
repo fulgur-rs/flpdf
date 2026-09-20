@@ -2509,8 +2509,24 @@ fn read_password_file(job: &QPDFJob, value: &[u8]) -> Result<Option<Vec<u8>>> {
             .map_err(|error| Error::file_io("open", "-", error))?;
         bytes
     } else {
+        // qpdf's `QUtil::read_lines_from_file(char const*)` opens with
+        // `safe_fopen` and only reads afterward (`libqpdf/QUtil.cc:1231-1239`).
+        // `fopen(..., "rb")` on a directory succeeds on Unix; the failure
+        // surfaces only on the first `fread`, which reports a fixed,
+        // path-less message with no `open <path>:` prefix
+        // (`read_char_from_FILE`, `QUtil.cc:1217-1228`: `ferror(f)` throws
+        // `std::runtime_error("failure reading character from file")`).
+        // `std::fs::File::open` mirrors that same open/read split on Unix, so
+        // the two stages are kept separate here instead of using
+        // `std::fs::read`, which would blame the read-stage failure on
+        // `Error::file_io`'s `open`-operation wording.
+        let mut file =
+            File::open(&path).map_err(|error| Error::file_io("open", path.clone(), error))?;
+        let mut bytes = Vec::new();
         // cov:ignore: the file-backed branch is exercised; llvm-cov leaves this shared branch line at zero in its duplicate record
-        std::fs::read(&path).map_err(|error| Error::file_io("open", path.clone(), error))?
+        file.read_to_end(&mut bytes)
+            .map_err(|_error| Error::System("failure reading character from file".to_owned()))?;
+        bytes
     }; // cov:ignore: LLVM maps the covered password-file read continuation to its branch arms
     if bytes.is_empty() {
         // cov:ignore-start: these explanatory comments have no executable path

@@ -9101,7 +9101,24 @@ fn read_password_file(path: &Path) -> CliResult<Vec<u8>> {
             .map_err(open_usage_error)?;
         bytes
     } else {
-        std::fs::read(path).map_err(open_usage_error)?
+        // qpdf's `QUtil::read_lines_from_file(char const*)` opens with
+        // `safe_fopen` and only reads afterward (`libqpdf/QUtil.cc:1231-1239`).
+        // `fopen(..., "rb")` on a directory succeeds on Unix; the failure
+        // surfaces only on the first `fread`, which reports a fixed,
+        // path-less message with no `open <path>:` prefix
+        // (`read_char_from_FILE`, `QUtil.cc:1217-1228`: `ferror(f)` throws
+        // `std::runtime_error("failure reading character from file")`).
+        // `std::fs::File::open` mirrors that same open/read split on Unix, so
+        // the two stages are kept separate here instead of using
+        // `std::fs::read`, which would blame the read-stage failure on
+        // `open_usage_error`.
+        let mut file = File::open(path).map_err(open_usage_error)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|_error| {
+            Box::new(UsageError::new("failure reading character from file"))
+                as Box<dyn std::error::Error>
+        })?;
+        bytes
     };
 
     let first_newline = bytes.iter().position(|&byte| byte == b'\n');
