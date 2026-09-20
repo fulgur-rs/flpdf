@@ -4238,3 +4238,90 @@ fn top_level_show_encryption_no_warn_suppresses_all_warning_output() {
         "--no-warn --show-encryption must print only the qpdf report body"
     );
 }
+
+/// qpdf's `-accessibility=n is ignored for modern encryption formats` notice
+/// comes from `QPDFJob::setEncryptionOptions`, called once per chunk from
+/// inside `doSplitPages`'s own per-chunk write loop (`QPDFJob.cc:2746-2747`,
+/// `QPDFJob.cc:2976-3022`). flpdf-cli's `--encrypt` argument parser used to
+/// print this notice once, directly, at argument-parse time -- before it
+/// bypassed the job's own per-chunk-aware `accessibility_disabled` field
+/// entirely (flpdf-brdg9). Pin the fixed repeat count against real qpdf.
+#[test]
+fn accessibility_disabled_notice_repeats_once_per_split_pages_chunk() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("three-pages.pdf");
+    let build = ShellCommand::new("qpdf")
+        .arg("--empty")
+        .arg("--pages")
+        .arg(fixture(ONE_PAGE_FIXTURE))
+        .arg("1")
+        .arg(fixture(ONE_PAGE_FIXTURE))
+        .arg("1")
+        .arg(fixture(ONE_PAGE_FIXTURE))
+        .arg("1")
+        .arg("--")
+        .arg(&source)
+        .status()
+        .unwrap();
+    assert!(build.success(), "qpdf must build the 3-page source fixture");
+
+    let split_args = [
+        "--split-pages",
+        "--encrypt",
+        "",
+        "",
+        "128",
+        "--accessibility=n",
+        "--use-aes=y",
+        "--",
+    ];
+
+    let qpdf_out = tmp.path().join("qpdf-split-%d.pdf");
+    let qpdf_result = ShellCommand::new("qpdf")
+        .args(split_args)
+        .arg(&source)
+        .arg(&qpdf_out)
+        .output()
+        .unwrap();
+    assert!(
+        qpdf_result.status.success(),
+        "qpdf split-pages with --accessibility=n must succeed: {}",
+        String::from_utf8_lossy(&qpdf_result.stderr)
+    );
+    let qpdf_notice_count = String::from_utf8_lossy(&qpdf_result.stderr)
+        .matches("-accessibility=n is ignored for modern encryption formats")
+        .count();
+    assert_eq!(
+        qpdf_notice_count,
+        3,
+        "sanity check: real qpdf 11.9.0 must repeat the notice once per \
+         3-page-source, 1-page-chunk split: {}",
+        String::from_utf8_lossy(&qpdf_result.stderr)
+    );
+
+    let flpdf_out = tmp.path().join("flpdf-split-%d.pdf");
+    let flpdf_result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(split_args)
+        .arg(&source)
+        .arg(&flpdf_out)
+        .output()
+        .unwrap();
+    assert!(
+        flpdf_result.status.success(),
+        "flpdf split-pages with --accessibility=n must succeed: {}",
+        String::from_utf8_lossy(&flpdf_result.stderr)
+    );
+    let flpdf_notice_count = String::from_utf8_lossy(&flpdf_result.stderr)
+        .matches("-accessibility=n is ignored for modern encryption formats")
+        .count();
+    assert_eq!(
+        flpdf_notice_count,
+        3,
+        "flpdf must repeat the notice once per chunk, matching qpdf: {}",
+        String::from_utf8_lossy(&flpdf_result.stderr)
+    );
+}
