@@ -8555,24 +8555,12 @@ fn reject_same_file(
 }
 
 fn qpdf_json_input_open_error(input: &Path, error: std::io::Error) -> Box<dyn std::error::Error> {
-    let rendered = error.to_string();
-    let message = match error.kind() {
-        std::io::ErrorKind::NotFound => {
-            // qpdf uses its portable POSIX wording for a missing JSON input on
-            // every host; Rust exposes the native Windows wording instead.
-            "No such file or directory"
-        }
-        std::io::ErrorKind::IsADirectory => {
-            // qpdf-deviation: qpdf 11.9.0 leaks libstdc++'s basic_string::_M_create
-            // for directory job-JSON paths; that toolchain artifact has no qpdf
-            // semantic contract to reproduce in Rust.
-            "Is a directory"
-        }
-        _ => error
-            .raw_os_error()
-            .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
-            .unwrap_or(&rendered),
-    };
+    // qpdf-deviation: for a directory job-JSON path, qpdf 11.9.0 leaks
+    // libstdc++'s basic_string::_M_create; that toolchain artifact has no
+    // qpdf semantic contract to reproduce in Rust, so this shares
+    // qpdf_open_io_error_message's own portable "Is a directory" wording
+    // instead like every other kind here.
+    let message = qpdf_open_io_error_message(&error);
     let mut raw_message = b"open ".to_vec();
     raw_message.extend_from_slice(&path_description(input));
     raw_message.extend_from_slice(b": ");

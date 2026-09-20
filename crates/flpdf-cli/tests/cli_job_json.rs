@@ -2,6 +2,8 @@ use assert_cmd::Command;
 use flpdf::{PageDocumentHelper, PageObjectHelper, Pdf};
 use std::fs;
 use std::io::Cursor;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 
@@ -1019,6 +1021,57 @@ fn job_json_file_directory_keeps_the_portable_flpdf_diagnostic() {
             directory.path().display()
         )),
         "flpdf should retain its portable directory diagnostic: {flpdf_stderr}"
+    );
+}
+
+/// Companion to `job_json_file_directory_keeps_the_portable_flpdf_diagnostic`:
+/// a `PermissionDenied` job-JSON open (unlike `IsADirectory`, no known
+/// qpdf-11.9.0 deviation) must match qpdf byte-for-byte. flpdf-brdg9's
+/// sibling issue (flpdf-9kvq1) found this branch missing from
+/// `qpdf_json_input_open_error`'s inline match, unlike the full table in
+/// `qpdf_open_io_error_message` used elsewhere in the CLI.
+#[cfg(target_os = "linux")]
+#[test]
+fn job_json_file_permission_denied_matches_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let job_json = directory.path().join("noperm.json");
+    std::fs::write(&job_json, b"{}").unwrap();
+    std::fs::set_permissions(&job_json, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let argument = format!("--job-json-file={}", job_json.display());
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg(&argument)
+        .output()
+        .unwrap();
+
+    if qpdf.status.code() != Some(2) {
+        // A root process still opens a mode-000 file, so this scenario is
+        // unobservable there; skip rather than assert on a false pass.
+        std::fs::set_permissions(&job_json, std::fs::Permissions::from_mode(0o644)).unwrap();
+        return;
+    }
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg(&argument)
+        .output()
+        .unwrap();
+
+    std::fs::set_permissions(&job_json, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(
+        flpdf.stderr, qpdf.stderr,
+        "a permission-denied job-json open carries no known qpdf deviation, \
+         unlike the directory case above -- flpdf and qpdf must match exactly"
     );
 }
 
