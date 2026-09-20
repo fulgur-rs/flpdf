@@ -2,8 +2,6 @@ use assert_cmd::Command;
 use flpdf::{PageDocumentHelper, PageObjectHelper, Pdf};
 use std::fs;
 use std::io::Cursor;
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 
