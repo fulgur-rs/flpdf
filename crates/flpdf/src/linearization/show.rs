@@ -83,7 +83,7 @@ pub enum ShowLinearizationError {
 /// Successful `--show-linearization` output plus qpdf soft-check warnings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShowLinearizationOutput {
-    /// The qpdf-compatible dump written to stdout.
+    /// The `--show-linearization` text report.
     pub dump: Vec<u8>,
     /// Ordered warning messages emitted by qpdf's linearization checker.
     pub warnings: Vec<Vec<u8>>,

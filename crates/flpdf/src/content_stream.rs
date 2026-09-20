@@ -34,12 +34,14 @@ pub enum ParseControl {
     Stop,
 }
 
-/// qpdf's `QPDFObjectHandle::ParserCallbacks` boundary
-/// (`include/qpdf/QPDFObjectHandle.hh:204-226`).
+/// Receive objects parsed from a content stream, one at a time.
 ///
 /// Parsed values are canonical [`ObjectHandle`]s, so callback code
 /// can inspect identity and parsed offsets without introducing an
 /// ObjectHandle-to-Object consumer bridge.
+///
+/// qpdf correspondence: `QPDFObjectHandle::ParserCallbacks`
+/// (`include/qpdf/QPDFObjectHandle.hh:204-226`).
 pub trait ObjectHandleParserCallbacks {
     /// Receive the full decoded content size before the first object.
     fn content_size(&mut self, _size: usize) -> Result<()> {

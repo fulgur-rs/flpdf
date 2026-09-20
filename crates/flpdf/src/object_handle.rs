@@ -214,12 +214,16 @@ impl std::fmt::Debug for StreamTokenFilterList {
     }
 }
 
-/// qpdf's `qpdf_ef_compress` bit in `QPDF_Stream::pipeStreamData`, for the
-/// `encode_flags` argument of [`ObjectHandle::pipe_stream_data`].
+/// Request Flate compression when encoding stream data for
+/// [`ObjectHandle::pipe_stream_data`]'s `encode_flags` argument.
+///
+/// qpdf correspondence: `qpdf_ef_compress` bit in `QPDF_Stream::pipeStreamData`.
 pub const STREAM_ENCODE_COMPRESS: u32 = 1;
 
-/// qpdf's `qpdf_ef_normalize` bit in `QPDF_Stream::pipeStreamData`, for the
-/// `encode_flags` argument of [`ObjectHandle::pipe_stream_data`].
+/// Request content-stream token normalization when encoding stream data for
+/// [`ObjectHandle::pipe_stream_data`]'s `encode_flags` argument.
+///
+/// qpdf correspondence: `qpdf_ef_normalize` bit in `QPDF_Stream::pipeStreamData`.
 pub const STREAM_ENCODE_NORMALIZE: u32 = 2;
 
 const STREAM_DATA_PROVIDER_DEFAULT_ERROR: &str =
@@ -3151,11 +3155,12 @@ impl ObjectHandle {
         ))
     }
 
-    /// qpdf-compatible null inspection with lazy dereference.
+    /// Report whether this handle resolves to the PDF null object.
     ///
     /// An uninitialized handle returns `Ok(false)` without entering the
-    /// value-demanding error boundary, matching `isNull`'s
-    /// `dereference() && ...` implementation
+    /// value-demanding error boundary.
+    ///
+    /// qpdf correspondence: `isNull`'s `dereference() && ...` implementation
     /// (`libqpdf/QPDFObjectHandle.cc:353-356`).
     pub fn try_is_null(&self) -> Result<bool> {
         if !self.is_initialized() {
@@ -4222,10 +4227,10 @@ impl ObjectHandle {
         }
     }
 
-    /// qpdf-compatible dictionary lookup. The holder dictionary is resolved;
+    /// Look up a dictionary key. The holder dictionary is resolved;
     /// the returned child retains its own direct/indirect identity.
     ///
-    /// Ports `QPDFObjectHandle::getKey`
+    /// qpdf correspondence: `QPDFObjectHandle::getKey`
     /// (`libqpdf/QPDFObjectHandle.cc:978-989`). A non-dictionary receiver
     /// yields null. qpdf additionally raises
     /// `typeWarning("dictionary", "returning null for attempted key
@@ -4281,11 +4286,14 @@ impl ObjectHandle {
         }
     }
 
-    /// qpdf-compatible visible-key test. `key` must be qpdf's decoded,
-    /// canonical dictionary key including its leading `/` (for example,
-    /// `/Type`). Lookup is exact; a slashless key is not an alias. A present
-    /// value that resolves to null is treated as absent, matching
-    /// `QPDF_Dictionary::hasKey`.
+    /// Report whether a dictionary key is present and non-null.
+    ///
+    /// `key` must be qpdf's decoded, canonical dictionary key including its
+    /// leading `/` (for example, `/Type`). Lookup is exact; a slashless key
+    /// is not an alias. A present value that resolves to null is treated as
+    /// absent.
+    ///
+    /// qpdf correspondence: `QPDF_Dictionary::hasKey`.
     pub fn try_has_key(&self, key: &[u8]) -> Result<bool> {
         self.try_dereference()?;
         let (is_dictionary, child) = self.with_value(|value| match value {
@@ -4353,16 +4361,17 @@ impl ObjectHandle {
         parsed_offset
     }
 
-    /// The qpdf-compatible signed parsed offset, resolving a lazy indirect
-    /// reference first when needed.
+    /// Return the byte offset where this handle's value was parsed,
+    /// resolving a lazy indirect reference first when needed.
     ///
-    /// Mirrors `QPDFObjectHandle::getParsedOffset`
+    /// An uninitialized handle returns `-1` without an error.
+    ///
+    /// qpdf correspondence: `QPDFObjectHandle::getParsedOffset`
     /// (`include/qpdf/QPDFObjectHandle.hh:419`,
     /// `libqpdf/QPDFObjectHandle.cc:1874-1881`): qpdf's `dereference()`
     /// resolves the handle before reading the offset it recorded when the
-    /// object was actually parsed. An uninitialized handle returns `-1`
-    /// without an error, matching qpdf's `dereference()` returning `false`
-    /// there rather than throwing.
+    /// object was actually parsed, and returns `false` for an uninitialized
+    /// handle rather than throwing.
     ///
     /// # Errors
     /// Returns `Err` if the handle is initialized but its owning document
@@ -4920,10 +4929,18 @@ impl ObjectHandle {
         Ok(())
     }
 
-    /// qpdf's `insertItemAndGetNew`: return the supplied handle after the
-    /// same insertion/warning/ownership path as [`Self::insert_array_item`].
-    /// A direct-cycle rejection is propagated as [`Error::Internal`], so no
-    /// handle is returned for a mutation that was not inserted.
+    /// Insert one item into the live array and return the same handle back.
+    ///
+    /// The handle comes back whether or not the insertion happened: a
+    /// document-owned non-array receiver, or an index past the array's
+    /// length, warns and leaves the receiver untouched.
+    ///
+    /// Follows the same insertion/warning/ownership path as
+    /// [`Self::insert_array_item`]. A direct-cycle rejection is propagated
+    /// as [`Error::Internal`], so no handle is returned for a mutation that
+    /// was not inserted.
+    ///
+    /// qpdf correspondence: `insertItemAndGetNew`.
     pub fn insert_array_item_and_get_new(
         &self,
         index: usize,
@@ -4959,10 +4976,18 @@ impl ObjectHandle {
         Ok(())
     }
 
-    /// qpdf's `appendItemAndGetNew`: return the supplied handle after the
-    /// same append/warning/ownership path as [`Self::append_array_item`].
-    /// A direct-cycle rejection is propagated as [`Error::Internal`], so no
-    /// handle is returned for a mutation that was not appended.
+    /// Append one item to the live array and return the same handle back.
+    ///
+    /// The handle comes back whether or not the append happened: a
+    /// document-owned non-array receiver warns and leaves the receiver
+    /// untouched.
+    ///
+    /// Follows the same append/warning/ownership path as
+    /// [`Self::append_array_item`]. A direct-cycle rejection is propagated
+    /// as [`Error::Internal`], so no handle is returned for a mutation that
+    /// was not appended.
+    ///
+    /// qpdf correspondence: `appendItemAndGetNew`.
     pub fn append_array_item_and_get_new(&self, value: ObjectHandle) -> Result<ObjectHandle> {
         self.append_array_item(value.clone())?;
         Ok(value)
@@ -5007,15 +5032,18 @@ impl ObjectHandle {
         Ok(old_value)
     }
 
-    /// qpdf-facing append spelling used by consumers that need a fallible
-    /// Rust boundary. It preserves the existing canonical mutation path.
+    /// Append one item to the live array through a fallible Rust boundary.
+    ///
+    /// Preserves the existing canonical mutation path in
+    /// [`Self::append_array_item`].
     pub fn try_append_array_item(&self, value: ObjectHandle) -> Result<()> {
         self.append_array_item(value)
     }
 
-    /// qpdf-facing vector replacement spelling used by consumers that need a
-    /// fallible Rust boundary. It preserves qpdf's non-transactional prefix
-    /// mutation behavior through [`Self::set_array_items`].
+    /// Replace the live array's items through a fallible Rust boundary.
+    ///
+    /// Preserves qpdf's non-transactional prefix mutation behavior through
+    /// [`Self::set_array_items`].
     pub fn try_set_array_items(&self, items: Vec<ObjectHandle>) -> Result<()> {
         self.set_array_items(items)
     }
@@ -7355,11 +7383,14 @@ impl ObjectHandle {
         Ok(filterable.then_some(plan))
     }
 
-    /// qpdf `QPDF_Stream::getRawStreamData` (`libqpdf/QPDF_Stream.cc:362-376`).
+    /// Return this stream's raw (undecoded) bytes.
     ///
     /// Replaced stream data is written directly; original data is read through
     /// the owning document at the parsed offset and stored parse-time length.
     /// No filter or decoder stage is constructed here.
+    ///
+    /// qpdf correspondence: `QPDF_Stream::getRawStreamData`
+    /// (`libqpdf/QPDF_Stream.cc:362-376`).
     pub fn get_raw_stream_data(&self) -> Result<Rc<Vec<u8>>> {
         // Match QPDFObjectHandle::getRawStreamData's asStreamWithAssert
         // boundary (`libqpdf/QPDFObjectHandle.cc:1294-1297`) before the raw
@@ -7573,12 +7604,15 @@ impl ObjectHandle {
         })
     }
 
-    /// The qpdf-compatible type name string for this handle's value.
-    /// `QPDFObjectHandle::getTypeName` dereferences and delegates to
-    /// `QPDFObject::getTypeName` (`libqpdf/QPDFObjectHandle.cc:247-250`),
-    /// which reads the value-layer `type_name` field. An uninitialized handle
-    /// returns `"uninitialized"`; other resolution errors are propagated
-    /// unchanged.
+    /// Return this handle's value type as a human-readable name.
+    ///
+    /// An uninitialized handle returns `"uninitialized"`; other resolution
+    /// errors are propagated unchanged.
+    ///
+    /// qpdf correspondence: `QPDFObjectHandle::getTypeName` dereferences and
+    /// delegates to `QPDFObject::getTypeName`
+    /// (`libqpdf/QPDFObjectHandle.cc:247-250`), which reads the value-layer
+    /// `type_name` field.
     pub fn type_name(&self) -> Result<&'static str> {
         if !self.is_initialized() {
             return Ok("uninitialized");

@@ -395,10 +395,13 @@ pub(crate) struct NNTree<K: TreeKey> {
     marker: PhantomData<K>,
 }
 
-/// qpdf-compatible helper for a PDF name tree.
+/// Read and modify a PDF name tree (a `/Names`-style sorted key/value index).
 ///
 /// Name keys are supplied as UTF-8 bytes. Both byte slices and strings are
 /// accepted through [`AsRef<[u8]>`].
+///
+/// qpdf correspondence: `NNTreeImpl` (`libqpdf/NNTree.cc`) constructed with
+/// `NameTreeDetails` (`libqpdf/QPDFNameTreeObjectHelper.cc`).
 pub struct NameTree {
     inner: NNTree<NameKey>,
     cursor_owner: Arc<()>,
@@ -702,11 +705,15 @@ impl NameTreeCursor {
     }
 }
 
-/// qpdf-compatible helper for a PDF number tree.
+/// Read and modify a PDF number tree (a `/PageLabels`-style sorted
+/// integer-key index).
 ///
 /// The helper owns the tree root while all indirect nodes remain in the
 /// supplied [`Pdf`]. Mutating a direct root therefore updates this helper's
 /// owned root; use the helper for subsequent operations.
+///
+/// qpdf correspondence: `NNTreeImpl` (`libqpdf/NNTree.cc`) constructed with
+/// `NumberTreeDetails` (`libqpdf/QPDFNumberTreeObjectHelper.cc`).
 pub struct NumberTree {
     inner: NNTree<NumberKey>,
     cursor_owner: Arc<()>,

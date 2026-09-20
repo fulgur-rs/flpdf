@@ -44,7 +44,7 @@ impl Pipeline for PipelineHandleSink {
     }
 }
 
-/// qpdf's per-file configuration for `QPDFJob::copyAttachments`.
+/// Per-file options for copying attachments from a donor PDF.
 ///
 /// `path` is retained for the `copying attachments from PATH` verbose
 /// diagnostic and the `file: PATH, key: ...` duplicate-key message. The
@@ -52,6 +52,8 @@ impl Pipeline for PipelineHandleSink {
 /// source-backed [`QPDFJob::copy_attachments`] and
 /// [`QPDFJob::copy_attachments_many`] forms intentionally accept already-open
 /// sources for direct library callers.
+///
+/// qpdf correspondence: `QPDFJob::copyAttachments`.
 #[derive(Debug, Clone)]
 pub struct AttachmentCopyOptions {
     /// Source PDF path, used only for diagnostics.
@@ -76,14 +78,17 @@ pub struct AttachmentCopySource<'a, R: Read + Seek + 'static> {
     pub options: AttachmentCopyOptions,
 }
 
-/// qpdf's per-file configuration for `QPDFJob::addAttachments`.
+/// Per-file options for embedding a new file attachment.
 ///
 /// The path is retained by the provider-backed embedded-file stream; the
 /// payload is not materialized by the job. `creation_date` and
-/// `modification_date` carry raw PDF date strings so an explicit qpdf date is
-/// preserved byte-for-byte. When omitted, the job supplies qpdf's process-stable
-/// local-wall-clock date with its UTC offset (`QUtil::get_current_qpdf_time`
-/// and `QPDFJob::AttConfig::endAddAttachment`, `libqpdf/QUtil.cc:867-934`,
+/// `modification_date` carry raw PDF date strings so an explicit date is
+/// preserved byte-for-byte. When omitted, the job supplies a process-stable
+/// local-wall-clock date with its UTC offset.
+///
+/// qpdf correspondence: `QPDFJob::addAttachments`; the omitted-date default
+/// mirrors `QUtil::get_current_qpdf_time` and
+/// `QPDFJob::AttConfig::endAddAttachment` (`libqpdf/QUtil.cc:867-934`,
 /// `libqpdf/QPDFJob_config.cc:911-936`).
 #[derive(Debug, Clone)]
 pub struct AttachmentAddOptions {

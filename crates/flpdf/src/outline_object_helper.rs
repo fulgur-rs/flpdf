@@ -117,10 +117,13 @@ pub struct OutlineItem {
 }
 
 impl OutlineItem {
-    /// Mirror qpdf `getTitle()` (`libqpdf/QPDFOutlineObjectHelper.cc:91-98`).
+    /// Return this outline entry's title text.
+    ///
     /// Decodes `/Title` fresh from [`Self::object`] every call, resolving
     /// one level of indirection off the fetched value; returns an empty
     /// string when the key is absent.
+    ///
+    /// qpdf correspondence: `getTitle()` (`libqpdf/QPDFOutlineObjectHelper.cc:91-98`).
     ///
     /// # Errors
     ///
@@ -137,10 +140,13 @@ impl OutlineItem {
         title_from_handle(&value)
     }
 
-    /// Mirror qpdf `getCount()` (`libqpdf/QPDFOutlineObjectHelper.cc:81-88`).
+    /// Return this outline entry's descendant-count hint.
+    ///
     /// Reads `/Count` fresh from [`Self::object`] every call, resolving one
     /// level of indirection off the fetched value; returns `0` when the key
     /// is absent.
+    ///
+    /// qpdf correspondence: `getCount()` (`libqpdf/QPDFOutlineObjectHelper.cc:81-88`).
     ///
     /// # Errors
     ///
@@ -157,16 +163,19 @@ impl OutlineItem {
         count_from_handle(&value)
     }
 
-    /// Mirror qpdf `getDest()` (`libqpdf/QPDFOutlineObjectHelper.cc:47-69`).
+    /// Resolve this outline entry's destination.
+    ///
     /// Resolves `/Dest`, or else a `/A` `GoTo` action's `/D`, fresh from
     /// [`Self::object`] every call, following a name or string result
     /// through the catalog's named-destination tables via
-    /// `OutlineDocumentHelper::resolve_named_dest` — exactly like
-    /// qpdf's own `if (dest.isName() || dest.isString())` dispatch to
-    /// `m->dh.resolveNamedDest()`. A candidate that is neither name nor
-    /// string (an explicit destination array, typically) is returned as-is.
-    /// `/A` is only read when `/Dest` is absent, matching qpdf's
-    /// `if (hasKey("/Dest")) {...} else if ((A = getKey("/A"))...)`.
+    /// `OutlineDocumentHelper::resolve_named_dest`. A candidate that is
+    /// neither name nor string (an explicit destination array, typically) is
+    /// returned as-is. `/A` is only read when `/Dest` is absent.
+    ///
+    /// qpdf correspondence: `getDest()` (`libqpdf/QPDFOutlineObjectHelper.cc:47-69`)
+    /// — its `if (dest.isName() || dest.isString())` dispatch to
+    /// `m->dh.resolveNamedDest()`, and its
+    /// `if (hasKey("/Dest")) {...} else if ((A = getKey("/A"))...)` fallback.
     ///
     /// # Errors
     ///
@@ -197,9 +206,12 @@ impl OutlineItem {
         Ok(dest)
     }
 
-    /// Mirror qpdf `getDestPage()` (`libqpdf/QPDFOutlineObjectHelper.cc:71-78`).
+    /// Resolve this outline entry's destination page reference.
+    ///
     /// Calls [`Self::get_dest`] fresh every call and extracts its first
     /// array item, without resolving the page operand.
+    ///
+    /// qpdf correspondence: `getDestPage()` (`libqpdf/QPDFOutlineObjectHelper.cc:71-78`).
     ///
     /// # Errors
     ///
