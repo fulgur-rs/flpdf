@@ -21,6 +21,17 @@
 #                    qpdf re-derives the key at /Length/8 instead)
 #   DIVERGENT (message framing only, both rc=2):
 #                   missing-donor wrong-pw no-pw donor-is-dir donor-not-pdf
+#   DIVERGENT (unsupported-handler message text, both rc=2 -- added
+#   2026-09-20, flpdf-rxtdr, flpdf @ 4f20a5953; unlike the message-framing
+#   set above, this one is not yet byte-identical):
+#                   d-v3 (qpdf: "Unsupported /R or /V in encryption
+#                   dictionary; R = 3 (max 6), V = 3 (max 5)"; flpdf:
+#                   "unsupported encryption handler: filter=Standard, V=3,
+#                   R=3, CFM=None". Both correctly reject the donor -- qpdf's
+#                   own encryption-handler registry has no V=3/R=3 entry
+#                   either -- so this is wording only, tracked separately
+#                   from the fixed message-framing set since it has not been
+#                   matched to qpdf's text yet.)
 #   DIVERGENT but reader-level, reproduces without --copy-encryption:
 #                   d-v4-r3 d-v4-r5 d-v2-r4
 #   DIVERGENT with --password-is-hex-key (hexkey-*): qpdf re-derives the
@@ -30,9 +41,13 @@
 #                   its own --check.  Off-length keys make flpdf exit 2, from
 #                   the CLI predicate (main.rs:5470-5484) on the donor path and
 #                   from writer.rs:2747-2800 on the primary-input path.
-set -u
-P="${1:?workdir}"
+set -eu
+# -m so a workdir whose parent does not exist yet is still accepted -- the
+# `mkdir -p` below creates it. Plain `realpath` fails on a missing component,
+# and under `set -e` that ends the run before the directory is ever made.
+P="$(realpath -m -- "${1:?workdir}")"
 FL="${2:-flpdf}"
+case "$FL" in */*) FL="$(realpath -- "$FL")" ;; esac
 export FLPDF_STATIC_ID_QUIET=1
 rm -rf "$P/fix" "$P/q" "$P/f"; mkdir -p "$P/fix" "$P/q" "$P/f"
 python3 "$(dirname "$0")/make_fixtures.py" "$P/fix" >/dev/null
@@ -61,6 +76,11 @@ patch('d-aes-128.pdf', 'd-v4-r3.pdf',       b'/R 4 /StmF',     b'/R 3 /StmF')
 patch('d-aes-128.pdf', 'd-v4-r5.pdf',       b'/R 4 /StmF',     b'/R 5 /StmF')
 patch('d-rc4-128.pdf', 'd-v2-r4.pdf',       b'/R 3 /U',        b'/R 4 /U')
 PY
+# Setup (fixture generation above) must not fail silently into a partial
+# fixture set that then produces spurious DIFFs below -- `set -e` covers it.
+# The probe cells themselves intentionally exercise failure paths (wrong
+# password, missing donor, ...), so turn -e back off before running them.
+set +e
 run() { tag="$1"; shift
   /usr/bin/qpdf "${@//@OUT@/$P/q/$tag.pdf}" >"$P/q/$tag.out" 2>"$P/q/$tag.err"; echo $? >"$P/q/$tag.rc"
   "$FL"         "${@//@OUT@/$P/f/$tag.pdf}" >"$P/f/$tag.out" 2>"$P/f/$tag.err"; echo $? >"$P/f/$tag.rc"
