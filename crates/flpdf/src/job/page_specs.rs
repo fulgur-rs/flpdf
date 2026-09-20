@@ -192,10 +192,17 @@ fn collate_values_for_specs(
 /// Both run the same `transformAnnotations`, but they differ on what they do
 /// with the destination's existing `/Annots`: `fixCopiedAnnotations` replaces
 /// the array outright (`:1040`), while `copyAnnotations` appends to it
-/// (`QPDFPageObjectHelper.cc:1032-1037`). This function reaches the same
-/// result only because it clears `/Annots` on the destination page before
-/// calling [`PageObjectHelper::copy_annotations`] -- removing that step would
+/// (`QPDFPageObjectHelper.cc:1032-1037`). Clearing `/Annots` on the
+/// destination page before calling [`PageObjectHelper::copy_annotations`]
+/// lines the two up when the source's `/Annots` is an array or absent, which
+/// is what the qtest and compat corpora contain; removing that step would
 /// reintroduce the difference.
+///
+/// The two still part ways when the source has a present but non-array
+/// `/Annots` (`null`, say): `fixCopiedAnnotations` returns before touching
+/// the destination (`:1024-1026`) and so keeps whatever page copying put
+/// there, while clearing first drops it and `copy_annotations` then returns
+/// early on the same check (`QPDFPageObjectHelper.cc:999-1001`).
 pub fn copy_duplicate_page_annotations<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     result: &RebuildResult,
