@@ -40,18 +40,25 @@ CONTENT = b"BT /F1 12 Tf 72 720 Td (hi) Tj ET"
 def direct_kids_shared_resources():
     """Two DIRECT page dicts in /Kids that share one indirect /Resources (5 0 R).
 
-    This was written to distinguish qpdf's shouldRemoveUnreferencedResources,
-    which keys nodes_seen on QPDFObjGen (so both direct kids would collapse to
-    `0 0` and the second would be skipped), from an implementation keying on
-    canonical handle identity (which would visit both). It does not actually
-    exercise that distinction through this probe's `run()` calls: the CLI's
-    page-selection/extraction step (`--pages .` / `--split-pages`) converts
-    each direct /Kids entry into its own numbered indirect page object before
-    should_remove_unreferenced_resources ever runs, so the heuristic always
-    observes two distinct numbered leaves here, never two direct `0 0` nodes.
-    Exercising the QPDFObjGen-vs-handle-identity distinction this fixture
-    names would need a harness that calls the heuristic directly on a page
-    tree still holding direct /Kids entries, ahead of page enumeration.
+    This was written on the premise that qpdf's shouldRemoveUnreferencedResources
+    keys nodes_seen on QPDFObjGen, so both direct kids would collapse to `0 0`
+    and the second would be skipped, while an implementation keying on canonical
+    handle identity would visit both.  That premise is wrong about qpdf:
+    `QPDFObjGen::set::add` ignores attempts to insert `QPDFObjGen(0, 0)` and
+    returns true (include/qpdf/QPDFObjGen.hh:108-121), so direct nodes are never
+    deduplicated and qpdf visits both kids too.  Measured on qpdf 11.9.0: the
+    --split-pages cells print `found shared resources in leaf node 0 0: 5 0`,
+    i.e. qpdf reaches the shared /Resources through a direct node.
+
+    What the fixture does exercise depends on the cell.  Through `--pages .`
+    the CLI promotes each direct /Kids entry to its own numbered page object
+    first, so the heuristic sees numbered leaves (qpdf prints `leaf node 11 0`).
+    Through `--split-pages` it does not: two direct `0 0` nodes reach the
+    heuristic in both tools.  Those cells do guard the distinction -- keying
+    nodes_seen on the object number instead of handle identity (so the second
+    `0 0` node is skipped) makes e16_probe.sh report DIFFs on
+    e16-direct-kids-shared.auto.split-1.pdf and .split-2.pdf -- they just do not
+    show a qpdf/flpdf divergence, because qpdf does not collapse them either.
     """
     page = (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
             b"/Resources 5 0 R /Contents %d 0 R >>")
