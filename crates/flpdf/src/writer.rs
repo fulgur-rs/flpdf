@@ -938,10 +938,7 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         // same ordering here so qpdf's lazy stream-recovery warnings from
         // resolving the xref table surface before this error, matching the
         // observed qpdf stderr order.
-        if options.deterministic_id
-            && options.static_id
-            && (options.encrypt.is_some() || options.copy_encryption.is_some())
-        {
+        if options.deterministic_id && options.static_id && options.encryption_generated_id {
             return Err(deterministic_id_after_id_generation());
         }
         let result = if self.settings.linearization {
@@ -1089,6 +1086,15 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
             return Err(deterministic_id_encryption_error(&options));
         }
 
+        // qpdf's `copyEncryptionParameters`/`setEncryptionParameters` call
+        // `generateID()` from inside `doWriteSetup`, so with a static ID the
+        // ID is already filled by the time forced-version handling turns the
+        // encryption off (`QPDFWriter.cc:619,656`). `pushMD5Pipeline` still
+        // rejects deterministic-ID mode afterwards, so record that the ID was
+        // generated rather than testing the normalized fields, which by then
+        // no longer say encryption was ever requested.
+        options.encryption_generated_id =
+            options.encrypt.is_some() || options.copy_encryption.is_some();
         if forced_version_disables_encryption(&options) {
             options.encrypt = None;
             options.copy_encryption = None;
@@ -1497,6 +1503,13 @@ impl Default for ProgressStateInner {
 /// Public callers configure [`PdfWriter`] directly.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct WriterOptions {
+    /// Whether encryption setup ran and therefore already generated an ID.
+    ///
+    /// qpdf generates the ID inside `doWriteSetup`'s encryption setup
+    /// (`QPDFWriter.cc:619,656`), before forced-version handling can turn the
+    /// encryption back off. The encryption fields alone cannot answer this
+    /// afterwards, so record it while they are still set.
+    pub encryption_generated_id: bool,
     /// Stream decode level used by the qpdf-shaped writer bridge.
     ///
     /// A filter chain that is not wholly decodable at this level is preserved
@@ -4475,6 +4488,47 @@ mod final_handle_writer_tests {
                  generateID failure, which happens earlier still, inside doWriteSetup"
             );
         }
+    }
+
+    /// A forced version too low for the requested encryption turns that
+    /// encryption back off, but qpdf has already generated the ID by then --
+    /// `copyEncryptionParameters`/`setEncryptionParameters` call
+    /// `generateID()` from inside `doWriteSetup` (`QPDFWriter.cc:619,656`),
+    /// ahead of forced-version handling. `pushMD5Pipeline` still rejects
+    /// deterministic-ID mode afterwards, so testing the normalized encryption
+    /// fields (which no longer say encryption was requested) lets a cleartext
+    /// file through where qpdf fails. Measured against qpdf 11.9.0:
+    /// `--static-id --deterministic-id --force-version=1.3 --encrypt '' '' 256`
+    /// exits 2 with "Deterministic ID computation enabled after ID generation
+    /// has already occurred." and writes nothing.
+    #[test]
+    fn deterministic_id_fails_even_when_a_forced_version_disables_the_encryption() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/encrypted-recovered-eol.pdf").to_vec(),
+        ))
+        .expect("encrypted, reconstructed-xref fixture opens with its empty password");
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_static_id(true);
+        writer.set_deterministic_id(true);
+        writer.force_pdf_version("1.3", 0);
+        writer
+            .set_output_writer(Vec::new())
+            .expect("install an in-memory output sink");
+
+        let error = writer
+            .write()
+            .expect_err("a forced version must not let deterministic ID through");
+        assert!(
+            matches!(
+                error,
+                Error::Internal(ref message)
+                    if message.starts_with(
+                        "Deterministic ID computation enabled after ID generation has already occurred."
+                    )
+            ),
+            "unexpected error {error:?}"
+        );
     }
 
     #[test]
