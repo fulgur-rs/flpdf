@@ -2171,6 +2171,31 @@ impl QPDFJob {
         argv::initialize(self, raw)
     }
 
+    /// Initialize the job from argv the caller has already run through
+    /// qpdf's one-level `@file` expansion.
+    ///
+    /// qpdf has no counterpart to this entry point: its single
+    /// `QPDFArgParser` instance expands `@file` exactly once per parse
+    /// (`QPDFArgParser.cc:437`), and [`Self::initialize_from_raw_argv`]
+    /// mirrors that. This method exists only for flpdf-cli's own argv
+    /// pre-scan, which must already perform that expansion (to recognize its
+    /// native clap subcommand grammar and qpdf's named-segment boundaries
+    /// before this parser can run) and would otherwise double-expand an
+    /// `@file` token that survives into the residual argv by handing it to
+    /// [`Self::initialize_from_raw_argv`] a second time.
+    ///
+    /// # Errors
+    ///
+    /// The same [`Error::Usage`] arms [`Self::initialize_from_raw_argv`]
+    /// raises for its qpdf-compatible options.
+    pub fn initialize_from_expanded_raw_argv<A: AsRef<[u8]>>(&mut self, argv: &[A]) -> Result<()> {
+        let raw = argv
+            .iter()
+            .map(|argument| argument.as_ref().to_vec())
+            .collect::<Vec<_>>();
+        argv::initialize_expanded(self, raw)
+    }
+
     /// Initialize the qpdf-compatible job-JSON fields supported by this
     /// lifecycle.
     ///

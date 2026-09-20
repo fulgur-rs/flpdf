@@ -4141,7 +4141,17 @@ fn preflight_qpdf_cli_events(args: &[arg_parser::RawArg]) -> CliResult<QpdfCliPr
         *program = progname().into_bytes();
     }
     let mut job = QPDFJob::new();
-    job.initialize_from_raw_argv(&filtered)
+    // `args` has already been through `expand_arg_files` once (this
+    // function's caller builds it from `PreprocessedArgs::raw_residual_args`,
+    // which `arg_parser::ArgParser::parse_os_with_handler` produces after its
+    // own single-level `@file` expansion). Using
+    // `initialize_from_expanded_raw_argv` here, instead of
+    // `initialize_from_raw_argv`, keeps that expansion at exactly the one
+    // level qpdf's own `QPDFArgParser` performs: a literal `@file` token that
+    // survived expansion (because it came from inside an already-expanded
+    // file, per qpdf's no-recursion rule) must stay literal, not be expanded
+    // again here.
+    job.initialize_from_expanded_raw_argv(&filtered)
         .map_err(|error| qpdf_argv_usage_error(Box::new(error)))?;
     Ok(QpdfCliPreflight { job })
 }

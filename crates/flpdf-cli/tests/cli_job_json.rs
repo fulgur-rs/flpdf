@@ -1417,6 +1417,56 @@ fn job_json_file_applies_every_add_attachment_group() {
 }
 
 #[test]
+fn job_json_file_with_argfile_does_not_re_expand_a_literal_at_token() {
+    // Regression test for flpdf-ip497: qpdf expands `@file` exactly once,
+    // via a single `QPDFArgParser::handleArgFileArguments` call
+    // (`QPDFArgParser.cc:437`). flpdf-cli's own argv pre-scan
+    // (`arg_parser::expand_arg_files`) must perform that one expansion, and
+    // the `--job-json-file` preflight (`preflight_qpdf_cli_events`) must not
+    // expand a second time. An `@marker` token that survives the first
+    // expansion (because it came from inside an already-expanded file) has
+    // to stay a literal argument in both qpdf and flpdf, not become the
+    // `--linearize` option `marker` happens to contain.
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(directory.path().join("marker"), b"--linearize\n").unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"out.pdf"}"#,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("outer"),
+        b"--job-json-file=job.json\n@marker\n",
+    )
+    .unwrap();
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg("@outer")
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg("@outer")
+        .output()
+        .unwrap();
+
+    assert_eq!(qpdf.status.code(), Some(2), "qpdf: {qpdf:?}");
+    assert_eq!(flpdf.status.code(), qpdf.status.code(), "flpdf: {flpdf:?}");
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert!(!directory.path().join("out.pdf").exists());
+}
+
+#[test]
 fn job_json_file_show_attachment_matches_qpdf_without_output_file() {
     if !qpdf_available() {
         return;

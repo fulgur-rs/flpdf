@@ -17,7 +17,21 @@ use std::path::{Path, PathBuf};
 /// Initialize one job from the already-byte-preserved argv vector.
 pub(super) fn initialize(job: &mut QPDFJob, argv: Vec<Vec<u8>>) -> Result<()> {
     let expanded = expand_arg_files(argv)?;
+    initialize_expanded(job, expanded)
+}
 
+/// Initialize one job from an argv vector the caller has already run through
+/// qpdf's one-level `@file` expansion (see [`expand_arg_files`]).
+///
+/// qpdf's `QPDFArgParser::parseArgs` calls `handleArgFileArguments` exactly
+/// once per parse (`QPDFArgParser.cc:437`); [`initialize`] mirrors that by
+/// expanding before doing anything else. This entry point exists only for a
+/// caller that has already performed that expansion itself and must not
+/// repeat it — flpdf-cli's own argv pre-scan (needed to recognize its native
+/// clap subcommand grammar and qpdf's named-segment boundaries before this
+/// parser can run) is the one such caller; qpdf has no equivalent two-pass
+/// argv boundary to translate.
+pub(super) fn initialize_expanded(job: &mut QPDFJob, expanded: Vec<Vec<u8>>) -> Result<()> {
     job.configuration = qpdf_default_job_configuration();
     // qpdf's Config defaults `require_outfile` to true for the argv boundary;
     // inspection selectors and JSON output options turn it off explicitly
@@ -2623,6 +2637,42 @@ mod tests {
     fn os_string_bytes_preserves_the_completion_executable() {
         let executable = OsString::from("/tmp/qpdf");
         assert_eq!(os_string_bytes(&executable), b"/tmp/qpdf");
+    }
+
+    #[test]
+    fn expanded_raw_argv_does_not_re_expand_an_at_token() {
+        // A caller of `initialize_from_expanded_raw_argv` has already run
+        // qpdf's one-level `@file` expansion itself (flpdf-cli's own argv
+        // pre-scan is the one production caller). An `@marker` token in its
+        // input must therefore be treated as an ordinary literal argument,
+        // never opened and expanded a second time -- unlike
+        // `initialize_from_raw_argv`, which performs that one expansion
+        // itself and so *does* open and expand the same file.
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let marker_path = directory.path().join("marker");
+        std::fs::write(&marker_path, b"--linearize\n").expect("write marker file");
+        let marker_token = format!("@{}", marker_path.display()).into_bytes();
+
+        let mut expanding = QPDFJob::new();
+        expanding
+            .initialize_from_raw_argv(&[
+                b"qpdfjob".to_vec(),
+                b"in.pdf".to_vec(),
+                marker_token.clone(),
+                b"out.pdf".to_vec(),
+            ])
+            .expect("expansion turns @marker into the valid --linearize option");
+
+        let mut not_expanding = QPDFJob::new();
+        let error = not_expanding
+            .initialize_from_expanded_raw_argv(&[
+                b"qpdfjob".to_vec(),
+                b"in.pdf".to_vec(),
+                marker_token,
+                b"out.pdf".to_vec(),
+            ])
+            .expect_err("an unexpanded @marker is a third positional argument, not an option");
+        assert_eq!(error.to_string(), "unknown argument out.pdf");
     }
 
     #[test]
