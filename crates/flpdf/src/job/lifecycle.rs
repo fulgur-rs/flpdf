@@ -2473,7 +2473,7 @@ impl QPDFJob {
             // non-UTF-8 password bytes and (for a file with no trailing
             // newline at all) can differ on whether a lone final line counts.
             let bytes = std::fs::read(&path)
-                .map_err(|error| Error::file_io("read password file", path.clone(), error))?;
+                .map_err(|error| Error::file_io("open", path.clone(), error))?;
             let first_line_len = bytes
                 .iter()
                 .position(|&byte| byte == b'\n')
