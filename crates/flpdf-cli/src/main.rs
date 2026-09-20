@@ -9345,6 +9345,18 @@ fn open_error_with_file(
 /// omit Rust's numeric `(os error N)` suffix. qpdf uses the portable
 /// not-found wording on every supported host.
 fn qpdf_open_io_error_message(error: &std::io::Error) -> String {
+    // A real syscall failure on a `strerror`-rendering host already carries
+    // exactly the text qpdf prints, so use it rather than the table below.
+    // The table keys on `ErrorKind`, which is coarser than `errno`: `EPERM`
+    // and `EACCES` share `PermissionDenied` but print "Operation not
+    // permitted" and "Permission denied" respectively, and only the raw code
+    // tells them apart. The table still covers synthetic errors carrying no
+    // `errno`, and every host whose `Display` is not `strerror` -- which is
+    // the Windows wording this table exists for.
+    #[cfg(unix)]
+    if error.raw_os_error().is_some() {
+        return strerror_from_display(error);
+    }
     let message = match error.kind() {
         std::io::ErrorKind::NotFound => Some("No such file or directory"),
         std::io::ErrorKind::PermissionDenied => Some("Permission denied"),
@@ -9357,6 +9369,12 @@ fn qpdf_open_io_error_message(error: &std::io::Error) -> String {
     if let Some(message) = message {
         return message.to_owned();
     }
+    strerror_from_display(error)
+}
+
+/// Render `error` through its own `Display`, less the ` (os error N)` suffix
+/// Rust appends and `strerror` does not.
+fn strerror_from_display(error: &std::io::Error) -> String {
     let rendered = error.to_string();
     error
         .raw_os_error()
@@ -10274,6 +10292,23 @@ mod tests {
             error.to_string(),
             "bad.pdf: parse error at byte 0: malformed PDF"
         );
+    }
+
+    /// `ErrorKind` is coarser than `errno`: `EPERM` and `EACCES` both map to
+    /// `PermissionDenied`, but `strerror` prints "Operation not permitted"
+    /// for the first and "Permission denied" for the second, and qpdf prints
+    /// whichever `strerror(errno)` returns
+    /// (`QPDFSystemError::createWhat`, `QPDFSystemError.cc:13-29`). A real
+    /// syscall failure carries the raw code, so it must not be flattened
+    /// through the `ErrorKind` table.
+    #[cfg(unix)]
+    #[test]
+    fn qpdf_open_io_error_keeps_errno_wording_error_kind_cannot_distinguish() {
+        for (code, expected) in [(1, "Operation not permitted"), (13, "Permission denied")] {
+            let error = std::io::Error::from_raw_os_error(code);
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(qpdf_open_io_error_message(&error), expected, "errno {code}");
+        }
     }
 
     #[test]
