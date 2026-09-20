@@ -4931,6 +4931,10 @@ impl ObjectHandle {
 
     /// Insert one item into the live array and return the same handle back.
     ///
+    /// The handle comes back whether or not the insertion happened: a
+    /// document-owned non-array receiver, or an index past the array's
+    /// length, warns and leaves the receiver untouched.
+    ///
     /// Follows the same insertion/warning/ownership path as
     /// [`Self::insert_array_item`]. A direct-cycle rejection is propagated
     /// as [`Error::Internal`], so no handle is returned for a mutation that
@@ -4973,6 +4977,10 @@ impl ObjectHandle {
     }
 
     /// Append one item to the live array and return the same handle back.
+    ///
+    /// The handle comes back whether or not the append happened: a
+    /// document-owned non-array receiver warns and leaves the receiver
+    /// untouched.
     ///
     /// Follows the same append/warning/ownership path as
     /// [`Self::append_array_item`]. A direct-cycle rejection is propagated

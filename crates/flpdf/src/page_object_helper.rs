@@ -1228,7 +1228,10 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         self.parse_contents(callbacks)
     }
 
-    /// Parse decoded page contents into callback-visited objects.
+    /// Parse this helper's decoded contents into callback-visited objects.
+    ///
+    /// A helper built over a Form XObject parses that Form's own
+    /// content stream rather than a page's.
     ///
     /// qpdf's old name for [`Self::parse_page_contents`], kept as an alias.
     pub fn parse_contents<C: ObjectHandleParserCallbacks>(
@@ -1243,7 +1246,10 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         }
     }
 
-    /// Apply a lexical token filter to decoded page contents.
+    /// Apply a lexical token filter to this helper's decoded contents.
+    ///
+    /// A helper built over a Form XObject filters that Form's own
+    /// content stream rather than a page's.
     pub fn filter_page_contents<'b>(
         &mut self,
         filter: &'b mut dyn TokenFilter,
@@ -1252,7 +1258,10 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         self.filter_contents(filter, next)
     }
 
-    /// Apply a lexical token filter to decoded page contents.
+    /// Apply a lexical token filter to this helper's decoded contents.
+    ///
+    /// A helper built over a Form XObject filters that Form's own
+    /// content stream rather than a page's.
     ///
     /// qpdf's old name for [`Self::filter_page_contents`], kept as an alias.
     pub fn filter_contents<'b>(
@@ -1268,12 +1277,18 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         }
     }
 
-    /// Pipe decoded page contents into a pipeline.
+    /// Pipe this helper's decoded contents into a pipeline.
+    ///
+    /// A helper built over a Form XObject pipes that Form's own
+    /// content stream rather than a page's.
     pub fn pipe_page_contents(&mut self, pipeline: &mut dyn Pipeline) -> Result<()> {
         self.pipe_contents(pipeline)
     }
 
-    /// Pipe decoded page contents into a pipeline.
+    /// Pipe this helper's decoded contents into a pipeline.
+    ///
+    /// A helper built over a Form XObject pipes that Form's own
+    /// content stream rather than a page's.
     ///
     /// qpdf's old name for [`Self::pipe_page_contents`], kept as an alias.
     pub fn pipe_contents(&mut self, pipeline: &mut dyn Pipeline) -> Result<()> {

@@ -635,8 +635,14 @@ fn emit_password_write_notices(
 // and `--requires-password` (0/2/3) once those subcommands are added.
 // ---------------------------------------------------------------------------
 
-/// The CLI's process exit code, reflecting whether the job hit errors or
-/// warnings.
+/// The CLI's process exit status.
+///
+/// The variant names describe what a normal job reports; the numeric values
+/// are what actually reaches the shell, and a few subcommands reuse them for
+/// their own classification results rather than for errors or warnings --
+/// `--is-encrypted` exits 2 for an unencrypted file, and
+/// `--requires-password` exits 3 when the supplied password is correct.
+/// Each such construction site documents its own meaning.
 ///
 /// - `Ok` = 0: success, no errors or warnings
 /// - `Errors` = 2: errors detected (file invalid / unprocessable)
