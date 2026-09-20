@@ -3,7 +3,7 @@
 //! the corresponding API is lossy; resource lookup, font selection, and
 //! password policy remain owned by their respective modules.
 //!
-//! qpdf correspondence: `QUtil.cc` integer conversion, filesystem identity, and UTF-8 single-byte encoding primitives.
+//! qpdf correspondence: `QUtil.cc` integer conversion, filesystem identity, and UTF-8 single-byte encoding primitives, used by form appearance generation per `libqpdf/QPDFFormFieldObjectHelper.cc:811-849`.
 //!
 //!
 
