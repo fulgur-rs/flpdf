@@ -883,16 +883,22 @@ pub struct LinearizationPlan {
     /// page 1 and at least one other page).
     /// Computed by `from_pdf`.
     pub part3_objects: Vec<ObjectRef>,
-    /// qpdf part7: objects private to exactly one other page (pages 2..N).
+    /// Objects private to exactly one other page (pages 2..N).
     ///
     /// Ordered by page index, then by BFS closure order within each page.
+    ///
+    /// qpdf correspondence: linearization part7.
     pub part4_other_pages_private: Vec<ObjectRef>,
-    /// qpdf part8: objects shared by two or more other pages (pages 2..N),
-    /// but NOT reachable from page 1.
+    /// Objects shared by two or more other pages (pages 2..N), but NOT
+    /// reachable from page 1.
+    ///
+    /// qpdf correspondence: linearization part8.
     pub part4_other_pages_shared: Vec<ObjectRef>,
-    /// qpdf part9: all Part-4 objects that are not in part7 or part8.
+    /// All Part-4 objects that are not in part7 or part8.
     /// Includes the Pages tree, Info dict, lc_other objects, and any objects
     /// not reachable from any page closure (trailer-only refs, etc.).
+    ///
+    /// qpdf correspondence: linearization part9.
     pub part4_rest: Vec<ObjectRef>,
 
     // ------------------------------------------------------------------

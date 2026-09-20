@@ -55,12 +55,14 @@ fn path_description_bytes(path: &Path) -> Vec<u8> {
     }
 }
 
-/// qpdf's `flattenAnnotations` job setting.
+/// Select which annotations `--flatten-annotations` bakes into page content.
 ///
 /// The three modes map to the `required` and `forbidden` annotation flag masks
 /// used by `QPDFPageDocumentHelper::flattenAnnotations`
 /// (`libqpdf/QPDFJob_config.cc:190-200`). Keeping the choice and its masks in
 /// the job layer gives both job JSON and the CLI one canonical qpdf mapping.
+///
+/// qpdf correspondence: `flattenAnnotations` job setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlattenAnnotationsMode {
     /// Flatten all annotations except Invisible and Hidden annotations.
@@ -1449,7 +1451,7 @@ fn parse_job_page_labels(
     Ok(entries)
 }
 
-/// qpdf-compatible status returned by a completed job.
+/// The status a completed job returns, mapped to the CLI's process exit code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum JobExitCode {

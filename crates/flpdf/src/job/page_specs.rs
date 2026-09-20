@@ -42,7 +42,7 @@ pub struct PageSpecInput {
     /// Index of the source document in
     /// [`QPDFJob::handle_page_specs`](super::QPDFJob::handle_page_specs).
     pub source_index: usize,
-    /// qpdf page-range expression for this source occurrence.
+    /// Page-range expression selecting pages from this source occurrence.
     pub range: PageRange,
 }
 

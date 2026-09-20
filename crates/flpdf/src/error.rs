@@ -66,7 +66,7 @@ fn usage_what(message: &[u8]) -> String {
     .into_owned()
 }
 
-/// The qpdf error-code family carried by [`QpdfExc`].
+/// Classify the failure carried by a [`QpdfExc`] without parsing its message.
 ///
 /// These values mirror `qpdf_error_code_e` in `include/qpdf/Constants.h:84-95`.
 /// The code is deliberately separate from the rendered message: qpdf exposes

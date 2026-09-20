@@ -8,13 +8,15 @@ use crate::{
     tokenizer::Token,
 };
 
-/// qpdf's lexical content-token filter callback.
+/// Rewrite a content stream one lexical token at a time.
 ///
 /// The callback receives the shared tokenizer's parsed/raw token view. It may
 /// forward the original token with [`TokenFilterOutput::write_token`], emit
 /// replacement bytes, or discard the token by writing nothing. The EOF token
-/// is delivered through [`Self::handle_token`] before [`Self::handle_eof`],
-/// matching `QPDFObjectHandle::TokenFilter` and `Pl_QPDFTokenizer`.
+/// is delivered through [`Self::handle_token`] before [`Self::handle_eof`].
+///
+/// qpdf correspondence: `QPDFObjectHandle::TokenFilter` and
+/// `Pl_QPDFTokenizer`.
 pub trait TokenFilter {
     /// Handle one content token and optionally forward output downstream.
     fn handle_token(

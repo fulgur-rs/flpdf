@@ -1228,7 +1228,9 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         self.parse_contents(callbacks)
     }
 
-    /// qpdf's old name for [`Self::parse_page_contents`].
+    /// Parse decoded page contents into callback-visited objects.
+    ///
+    /// qpdf's old name for [`Self::parse_page_contents`], kept as an alias.
     pub fn parse_contents<C: ObjectHandleParserCallbacks>(
         &mut self,
         callbacks: &mut C,
@@ -1250,7 +1252,9 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         self.filter_contents(filter, next)
     }
 
-    /// qpdf's old name for [`Self::filter_page_contents`].
+    /// Apply a lexical token filter to decoded page contents.
+    ///
+    /// qpdf's old name for [`Self::filter_page_contents`], kept as an alias.
     pub fn filter_contents<'b>(
         &mut self,
         filter: &'b mut dyn TokenFilter,
@@ -1269,7 +1273,9 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         self.pipe_contents(pipeline)
     }
 
-    /// qpdf's old name for [`Self::pipe_page_contents`].
+    /// Pipe decoded page contents into a pipeline.
+    ///
+    /// qpdf's old name for [`Self::pipe_page_contents`], kept as an alias.
     pub fn pipe_contents(&mut self, pipeline: &mut dyn Pipeline) -> Result<()> {
         let (target, is_form) = self.resolved_attribute_target()?;
         if is_form {
@@ -1452,7 +1458,10 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         Ok(result)
     }
 
-    /// qpdf's old `getPageImages` name for [`Self::get_images`].
+    /// Return direct image XObjects keyed by their resource names.
+    ///
+    /// qpdf's old `getPageImages` name for [`Self::get_images`], kept as an
+    /// alias.
     pub fn get_page_images(&mut self) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
         self.get_images()
     }

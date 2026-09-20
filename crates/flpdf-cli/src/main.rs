@@ -635,12 +635,14 @@ fn emit_password_write_notices(
 // and `--requires-password` (0/2/3) once those subcommands are added.
 // ---------------------------------------------------------------------------
 
-/// qpdf-compatible CLI exit codes.
+/// The CLI's process exit code, reflecting whether the job hit errors or
+/// warnings.
 ///
-/// Matches `qpdf_exit_code_e` from `qpdf/include/qpdf/Constants.h`:
 /// - `Ok` = 0: success, no errors or warnings
 /// - `Errors` = 2: errors detected (file invalid / unprocessable)
 /// - `Warnings` = 3: warnings found but no errors (recoverable issues)
+///
+/// qpdf correspondence: `qpdf_exit_code_e` from `qpdf/include/qpdf/Constants.h`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitCode {
     /// 0 — no errors or warnings detected.

@@ -484,14 +484,16 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         Ok(Some(result))
     }
 
-    /// qpdf `getLabelsForPageRange` compatibility view: collect the label entries needed to
-    /// reproduce the labels of pages `start_idx..=end_idx` if they were
-    /// renumbered to begin at `new_start_idx`. Returns `(new_index, LabelRange)`
-    /// pairs (the first entry plus every explicit entry in the source range),
-    /// renumbered by `new_start_idx - start_idx`. Read-only; intended for
+    /// Collect the label entries needed to reproduce the labels of pages
+    /// `start_idx..=end_idx` if they were renumbered to begin at
+    /// `new_start_idx`. Returns `(new_index, LabelRange)` pairs (the first
+    /// entry plus every explicit entry in the source range), renumbered by
+    /// `new_start_idx - start_idx`. Read-only; intended for
     /// page-extraction/subsetting call sites that reconstruct a document's
     /// `/PageLabels` for a new page range (pair with
     /// [`PageLabelDocumentHelper::write_reconstructed_labels`]).
+    ///
+    /// qpdf correspondence: `QPDFPageLabelDocumentHelper::getLabelsForPageRange`.
     ///
     /// `start_idx` must be `<= end_idx`. An inverted span (`start_idx >
     /// end_idx`) is a caller bug: this returns only the first-page label
