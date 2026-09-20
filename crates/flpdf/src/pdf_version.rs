@@ -139,6 +139,11 @@ pub(crate) fn leading_major_minor(value: &str) -> Result<(i32, i32), Error> {
         digit_run_to_i32(minor_digits)?,
     ) {
         (Some(major), Some(minor)) => Ok((major, minor)),
+        // cov:ignore: unreachable via this caller -- major_digits/minor_digits
+        // are always non-empty ASCII-digit substrings by construction (the
+        // preceding index == major_start/minor_start checks already return
+        // FALLBACK for an empty run), so digit_run_to_i32 can only return
+        // Some(_) or propagate Err via `?` above, never NoDigits's None.
         _ => Ok(FALLBACK),
     }
 }
@@ -147,6 +152,8 @@ fn digit_run_to_i32(digits: &str) -> Result<Option<i32>, Error> {
     match qpdf_string_to_int_checked(digits) {
         QpdfIntParse::Value(value) => Ok(Some(value)),
         QpdfIntParse::Overflow(message) => Err(Error::System(message)),
+        // cov:ignore: unreachable via leading_major_minor, this function's
+        // only caller -- it always passes a non-empty ASCII-digit substring.
         QpdfIntParse::NoDigits => Ok(None),
     }
 }
