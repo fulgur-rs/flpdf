@@ -839,24 +839,52 @@ class Checker:
                     "expected exactly 1 `route-matrix-aggregate: document-tally` "
                     f"table, found {found}",
                 )
-        if (matrix_dir / "README.md").is_file():
-            readme = matrix_dir / "README.md"
-            for kind in REPOSITORY_WIDE_KINDS:
-                found = len(self._tables_of(kind))
-                if found != 1:
+        readme = matrix_dir / "README.md"
+        readme_exists = readme.is_file()
+        # A populated matrix owes the three repository-wide aggregates. Without
+        # this, deleting `README.md` outright takes all three with it and the
+        # per-kind loop below has nothing left to complain about -- the whole
+        # point of the loop is that a deleted table must fail rather than
+        # silently opt out. Keyed on area documents existing so that a minimal
+        # fixture (no `[a-e]-*.md` at all) still has nothing to check.
+        if not readme_exists and self._area_documents(matrix_dir):
+            self.report.note(
+                matrix_dir,
+                "has area documents but no `README.md` to hold the "
+                + ", ".join(f"`route-matrix-aggregate: {k}`" for k in REPOSITORY_WIDE_KINDS)
+                + " tables",
+            )
+        for kind in REPOSITORY_WIDE_KINDS:
+            found_tables = self._tables_of(kind)
+            if readme_exists:
+                if len(found_tables) != 1:
                     self.report.note(
                         matrix_dir,
-                        f"expected exactly 1 `route-matrix-aggregate: {kind}` table, "
-                        f"found {found}",
+                        f"expected exactly 1 `route-matrix-aggregate: {kind}` "
+                        f"table, found {len(found_tables)}",
                     )
-                for table in self._tables_of(kind):
+                for table in found_tables:
                     if table.doc != readme:
                         self.report.error(
                             table.doc,
                             table.marker_line,
-                            f"`route-matrix-aggregate: {kind}` must live in `README.md`, "
-                            f"not `{table.doc.name}`",
+                            f"`route-matrix-aggregate: {kind}` must live in "
+                            f"`README.md`, not `{table.doc.name}`",
                         )
+            else:
+                # No README.md to hold these tables. A matrix directory that
+                # also has none of this kind anywhere has nothing to check
+                # (this is the state most test fixtures are in). One that
+                # does have `kind` tables elsewhere is the bug this branch
+                # exists for: those tables have no legitimate home to be
+                # placed in, so flag every one of them.
+                for table in found_tables:
+                    self.report.error(
+                        table.doc,
+                        table.marker_line,
+                        f"`route-matrix-aggregate: {kind}` must live in "
+                        f"`README.md`, but `{matrix_dir}` has no `README.md`",
+                    )
         detail_documents = {
             row.doc
             for row in self.report.classification_rows
@@ -895,9 +923,21 @@ class Checker:
                     )
 
     def _check_classification_row_id_collisions(self) -> None:
-        rows_by_table: dict[tuple[Path, int, str], list[ClassificationRow]] = {}
+        # Keyed by (doc, table_kind, row_id) rather than including
+        # table_index: a document that splits its classification rows across
+        # more than one table of a *known* kind (e.g. a table per section)
+        # must still keep row ids unique across all of them, not just within
+        # a single physical table.
+        #
+        # `other` is the fallback for a header this checker does not
+        # recognize, so two `other` tables are not known to share a namespace
+        # -- a `scope` table and a `category` table both carrying `X1` are
+        # unrelated. Keep `table_index` in the key for that kind so the
+        # cross-table rule applies only where the shared namespace is known.
+        rows_by_table: dict[tuple[Path, str, str, int], list[ClassificationRow]] = {}
         for row in self.report.classification_rows:
-            key = (row.doc, row.table_index, row.row_id)
+            scope = row.table_index if row.table_kind == "other" else -1
+            key = (row.doc, row.table_kind, row.row_id, scope)
             rows_by_table.setdefault(key, []).append(row)
         for rows in rows_by_table.values():
             if len(rows) < 2:
@@ -1017,11 +1057,26 @@ class Checker:
                 continue
             enumeration = parse_enumeration(remainder or "")
             if enumeration is None:
-                if require_enumeration:
+                # A zero count has nothing to enumerate, so a bare `0` with
+                # nothing after it (not even a `(—)` placeholder) is a
+                # legitimate way to write it. Trailing text that is not a
+                # parenthesized enumeration is not that case: `0 3` is either
+                # a typo or an enumeration written in a shape this checker
+                # does not read, and silently accepting it would put an
+                # unvalidated row id in an aggregate cell.
+                if require_enumeration and declared != 0:
                     self.report.error(
                         table.doc,
                         line_number,
                         f"{context}: `{name}` says {declared} but enumerates no row ids",
+                    )
+                elif declared == 0 and (remainder or "").strip():
+                    self.report.error(
+                        table.doc,
+                        line_number,
+                        f"{context}: `{name}` says 0 but carries unparsed text "
+                        f"`{(remainder or '').strip()}`; write a bare `0` or a "
+                        f"parenthesized enumeration",
                     )
                 continue
             row_ids, reason = parse_row_ids(enumeration)
@@ -1243,13 +1298,24 @@ class Checker:
                     f"{context}: says {declared} but the matrix has {actual[name]}",
                 )
             if declared == 0:
-                row_ids, _ = parse_row_ids(cells[ids_column])
-                if row_ids:
+                # A zero-count cell may carry free-form prose explaining the
+                # count (e.g. "none (A2 already resolved)"), so this does not
+                # require the whole cell to parse as `parse_row_ids` would.
+                # But a comma-separated list that mixes real-looking row ids
+                # with other tokens -- `A1, note` -- must not let the hidden
+                # `A1` escape unnoticed just because the list as a whole
+                # fails to parse cleanly.
+                hidden_ids = [
+                    token
+                    for part in re.split(r"[,、]", normalize_cell(cells[ids_column]))
+                    if (token := normalize_cell(part)) and ROW_ID_RE.fullmatch(token)
+                ]
+                if hidden_ids:
                     self.report.error(
                         table.doc,
                         line_number,
                         f"{context}: says 0 but enumerates row ids "
-                        f"{format_row_ids(set(row_ids))}",
+                        f"{format_row_ids(set(hidden_ids))}",
                     )
                 continue
             row_ids, reason = parse_row_ids(cells[ids_column])
@@ -1308,6 +1374,21 @@ class Checker:
                     "so it cannot be assigned to a range bucket",
                 )
                 continue
+            # `row_id_cases` folds the row id's `/`-separated parts into a
+            # set, which silently drops a repeated case number within the
+            # same row id (e.g. `3/3` collapses to `{3}`) before it ever
+            # reaches the cross-row overlap check below. Catch that here,
+            # without skipping the overlap check itself: the deduplicated
+            # `cases` set is still meaningful, and a row can be both
+            # internally repetitive and overlap an earlier row.
+            raw_parts = row.row_id.split("/")
+            if len(raw_parts) != len(cases):
+                self.report.error(
+                    table.doc,
+                    row.line_number,
+                    f"range-summary: detail row `{row.row_id}` repeats the same "
+                    "case number within itself",
+                )
             overlap_owners: dict[int, str] = {}
             for case in cases:
                 previous = case_owners.get(case)
