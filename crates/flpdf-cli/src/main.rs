@@ -5405,7 +5405,15 @@ impl EncryptSegmentCallbackState {
                     let parameter = match name {
                         "user-password" => "user_password",
                         "owner-password" => "owner_password",
-                        "bits" => "{40,128,256}",
+                        // qpdf's dashed `--bits` shares `auto_job_init.hh`'s
+                        // `choices` set with the top-level `--bits` flag, so a
+                        // missing value renders the same
+                        // `QPDFArgParser::checkCompletion` message
+                        // (`libqpdf/QPDFArgParser.cc:505-522`) as an invalid
+                        // one: dictionary-sorted `{128,256,40}` (the
+                        // `std::set<std::string>` choices are string-ordered,
+                        // not numeric), not the numeric order used below.
+                        "bits" => "{128,256,40}",
                         _ => unreachable!("name was matched above"),
                     };
                     Box::new(UsageError::new(format!(
@@ -5418,7 +5426,7 @@ impl EncryptSegmentCallbackState {
                     "owner-password" => self.owner_password = Some(value.to_vec()),
                     "bits" => {
                         self.key_len =
-                            Some(parse_encrypt_key_len(&String::from_utf8_lossy(value))?);
+                            Some(parse_dashed_encrypt_bits(&String::from_utf8_lossy(value))?);
                         self.key_len_seen = true;
                     }
                     _ => unreachable!("name was matched above"),
@@ -5777,6 +5785,26 @@ fn parse_encrypt_key_len(value: &str) -> CliResult<u32> {
         // `ArgParser::usage`, whose output carries the leading blank line and
         // the trailing "For help:" block that `usage_exit` models.
         _ => Err(UsageError::new("encryption key length must be 40, 128, or 256").into()),
+    }
+}
+
+/// The dashed `--bits=value` form of `--encrypt` never reaches
+/// `ArgParser::argEncBits`'s own validation: qpdf's `job.yml` registers
+/// `bits`'s `choices` (`enc_bits: [40, 128, 256]`) on the named option
+/// itself (`table: encryption`, `required_choices: {bits: enc_bits}`), so an
+/// invalid or missing dashed value is caught first by
+/// `QPDFArgParser::checkCompletion`'s generic choices check
+/// (`libqpdf/QPDFArgParser.cc:505-522`), which never calls into
+/// `argEncBits` at all. That check's `choices` set is a
+/// `std::set<std::string>`, so the message lists the three values in
+/// dictionary order (`128,256,40`), not the numeric order
+/// `parse_encrypt_key_len`'s positional-path message uses.
+fn parse_dashed_encrypt_bits(value: &str) -> CliResult<u32> {
+    match value {
+        "40" => Ok(40),
+        "128" => Ok(128),
+        "256" => Ok(256),
+        _ => Err(UsageError::new("--bits must be given as --bits={128,256,40}").into()),
     }
 }
 
