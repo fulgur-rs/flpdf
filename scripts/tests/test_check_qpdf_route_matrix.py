@@ -612,6 +612,25 @@ class AggregateTableTests(unittest.TestCase):
             result = repo.check()
             self.assertEqual(0, result.returncode, result.stdout + result.stderr)
 
+    def test_zero_count_row_id_cell_does_not_hide_a_real_id_in_a_mixed_list(
+        self,
+    ) -> None:
+        # Free-form prose is allowed (see the prose test above), but a
+        # comma-separated list that mixes a real-looking row id with other
+        # tokens must not let the row id escape unnoticed just because the
+        # list as a whole does not parse cleanly.
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write_matrix()
+            repo.write(
+                "a-x.md",
+                A_DOCUMENT.replace("| unknown | 0 | — |", "| unknown | 0 | A1, note |"),
+            )
+            result = repo.check()
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("says 0 but enumerates row ids", result.stdout)
+            self.assertIn("A1", result.stdout)
+
     def test_missing_document_tally_marker_is_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             repo = SyntheticRepository(Path(temporary_directory))
@@ -919,6 +938,47 @@ class AggregateTableTests(unittest.TestCase):
             self.assertIn("area-total", result.stdout)
             self.assertIn("README.md", result.stdout)
 
+    def test_repository_wide_aggregate_with_no_readme_at_all_is_still_error(
+        self,
+    ) -> None:
+        # A prior version of this check only validated placement/inventory
+        # of area-total/logical-total/per-file inside an `if README.md
+        # exists` guard, so deleting README.md entirely -- not just moving
+        # one table out of it -- let these tables escape both checks no
+        # matter where they lived.
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write_matrix()
+            area_total = (
+                "<!-- route-matrix-aggregate: area-total unit=area-physical -->\n\n"
+                "| canonical | bridge | mixed | unknown | 合計 |\n"
+                "|---|---|---|---|---|\n"
+                "| 2 | 0 | 2 | 0 | 4 |\n"
+            )
+            (repo.root / "docs" / "qpdf-route-matrix" / "README.md").unlink()
+            repo.write("a-x.md", A_DOCUMENT + "\n" + area_total)
+
+            result = repo.check()
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("area-total", result.stdout)
+            self.assertIn("README.md", result.stdout)
+
+    def test_no_repository_wide_aggregate_tables_and_no_readme_is_not_flagged(
+        self,
+    ) -> None:
+        # A matrix directory with neither README.md nor any
+        # area-total/logical-total/per-file table anywhere has nothing for
+        # this check to validate -- it must stay silent rather than treat
+        # the absence of README.md itself as an error.
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write("a.md", HEADER + area_row("A1", "canonical"))
+
+            result = repo.check()
+
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+
     def test_zero_document_tally_cell_must_not_enumerate_a_row_id(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             repo = SyntheticRepository(Path(temporary_directory))
@@ -951,6 +1011,28 @@ class AggregateTableTests(unittest.TestCase):
             self.assertNotEqual(0, result.returncode)
             self.assertIn("range-summary", result.stdout)
             self.assertIn("zero", result.stdout)
+
+    def test_bare_zero_range_summary_cell_without_an_enumeration_is_accepted(
+        self,
+    ) -> None:
+        # A zero count has nothing to enumerate, so a bare `0` (no
+        # parenthesized text at all, not even the `(—)` placeholder) must be
+        # accepted -- only a non-zero count omitting its enumeration is an
+        # error under `require_enumeration`.
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write_matrix()
+            repo.write(
+                "b-x.md",
+                B_DOCUMENT.replace(
+                    "| 0/1, 2 | 2 | 1（0/1） | 1（2） | 0（—） | 0（—） |",
+                    "| 0/1, 2 | 2 | 1（0/1） | 1（2） | 0 | 0 |",
+                ),
+            )
+
+            result = repo.check()
+
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
 
     def test_per_file_link_must_target_an_area_document(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -992,6 +1074,27 @@ class AggregateTableTests(unittest.TestCase):
             self.assertNotEqual(0, result.returncode)
             self.assertIn("row id `A1` appears more than once", result.stdout)
 
+    def test_duplicate_area_row_id_across_split_tables_in_one_document_is_error(
+        self,
+    ) -> None:
+        # A document that splits its `area` classification rows across more
+        # than one physical table (e.g. one table per section) must still
+        # keep row ids unique across all of them, not just within a single
+        # table -- the uniqueness key used to key `table_index` alone, which
+        # let the same row id reappear once per table.
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write_matrix()
+            split_a = A_DOCUMENT + "\n## second section\n\n" + HEADER + area_row(
+                "A1", "canonical"
+            )
+            repo.write("a-x.md", split_a)
+
+            result = repo.check()
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("row id `A1` appears more than once", result.stdout)
+
     def test_overlapping_detail_case_sets_are_error_even_when_range_counts_match(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             repo = SyntheticRepository(Path(temporary_directory))
@@ -1020,6 +1123,32 @@ class AggregateTableTests(unittest.TestCase):
 
             self.assertNotEqual(0, result.returncode)
             self.assertIn("case set", result.stdout)
+
+    def test_detail_row_id_repeating_its_own_case_number_is_error(self) -> None:
+        # `row_id_cases` folds a row id's `/`-separated parts into a set, so
+        # `3/3` collapses to `{3}` -- the same set a plain `3` would produce.
+        # Because it is the only row covering case 3, it never collides with
+        # an earlier row's case set, so the cross-row overlap check alone
+        # cannot catch it; the row id's self-repetition must be flagged
+        # directly.
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write_matrix()
+            duplicate_b = B_DOCUMENT.replace(
+                detail_row("3", "canonical"), detail_row("3/3", "canonical")
+            ).replace(
+                "| 3 | 1 | 1（3） | 0（—） | 0（—） | 0（—） |",
+                "| 3 | 1 | 1（3/3） | 0（—） | 0（—） | 0（—） |",
+            )
+            repo.write("b-x.md", duplicate_b)
+
+            result = repo.check()
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn(
+                "detail row `3/3` repeats the same case number within itself",
+                result.stdout,
+            )
 
     def test_range_summary_buckets_must_partition_the_detail_rows(self) -> None:
         # Two detail rows with the same case number are covered by the bucket's
