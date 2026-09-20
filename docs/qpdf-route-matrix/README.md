@@ -7,7 +7,7 @@
 「経路（route）」軸を足したもので、対応表の行を置き換えない）/ Beads `flpdf-3yn9.41`（親 epic `flpdf-3yn9`）
 **調査日:** 2026-09-17（再監査 `flpdf-3yn9.48`、文書更新 `flpdf-3yn9.48.139`）。
 現行 `origin/main=c9fc97ebda542ddd231e0a14fd58495674513b19` と pinned qpdf source に基づき、領域別表の分類・責務境界・既存issueとの対応を更新した。
-160行は履歴上の行集合を維持している。今回の分類更新は全行の parity テスト合格を意味しない。
+161行は履歴上の行集合を維持している（B35 追加前は 160 行）。今回の分類更新は全行の parity テスト合格を意味しない。
 未更新の行番号は過去snapshotを含む。
 
 `scripts/check-qpdf-route-matrix.py` は
@@ -27,10 +27,10 @@ container-above-max だった — `flpdf-hi08` / PR #1486）。本表は残る m
 
 ための preflight である。production semantics・public API はこの文書では変えない。
 
-### A〜E route matrix aggregate（履歴上の160行）
+### A〜E route matrix aggregate（履歴上の161行）
 
 領域 A〜E の 5 ファイルを合わせた分類の内訳。**分類別の内訳を記載するのは本表と §4 の
-領域別表だけ**で、§3 / §6 の散文と領域ファイルの散文は総数（160 / 259 / 領域別の分母）
+領域別表だけ**で、§3 / §6 の散文と領域ファイルの散文は総数（161 / 260 / 領域別の分母）
 しか書かない。同じ内訳を 4 箇所に独立して再掲していた結果、4 箇所が独立に drift した
 （実例: `flpdf-3yn9.48.148`。当時は checker が分類別内訳を検査していなかった）ので、
 記載箇所を 2 つに絞り、両方を checker で検証する。
@@ -124,8 +124,8 @@ done | sort | uniq -c
 2026-09-17 の current-main audit anchor は `origin/main=c9fc97ebda542ddd231e0a14fd58495674513b19`、pinned qpdf は
 11.9.0 commit `3b97c9bd266b7c32ea36d3536e22dab77412886d` である。checker の実測は
 **今回の変更を適用した tree で** 2201 qpdf citations / 910 flpdf citations /
-259 logical rows。A〜E の160行だけを数える上の領域別集計は 160 行なので、checker
-の259 logical rowsと混同しない。分類別の内訳は §1 の 2 表と §4 だけに書く
+260 logical rows。A〜E の161行だけを数える上の領域別集計は 161 行なので、checker
+の260 logical rowsと混同しない。分類別の内訳は §1 の 2 表と §4 だけに書く
 （実測は `scripts/check-qpdf-route-matrix.py --stats` で出せる）。
 
 履歴行の例外: D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は当該pre-write sweep撤去完了としてcanonicalに分類する。
@@ -219,9 +219,9 @@ C44は public facade と deferred blob の責務分離を追跡する mixed owne
 ## 6. 二重正本トラッカー
 
 追跡対象の symbol manifest は [tracked-symbols.txt](tracked-symbols.txt)。この matrix revision の
-classified row は 259 行である（分類別の内訳は §1 の 2 表と §4 を見る。ここには再掲しない）。
-領域別の分母は A=24 / B=34 / C=42 / D=31 / E=128（E 表 29 行 + qtest exception 表 99 行）。
-`scripts/check-qpdf-route-matrix.py` も259行を報告する。classification tableの途中に散文行が
+classified row は 260 行である（分類別の内訳は §1 の 2 表と §4 を見る。ここには再掲しない）。
+領域別の分母は A=24 / B=35 / C=42 / D=31 / E=128（E 表 29 行 + qtest exception 表 99 行）。
+`scripts/check-qpdf-route-matrix.py` も260行を報告する。classification tableの途中に散文行が
 入っても同じtableの状態を保持し、qtest exception tableの物理1行 `0/1` は論理2 caseとして数える。
 manifest は行集合の完全な機械変換ではなく、削除済みsymbolの0確認とcanonical側の分母も保持する。
 B7 は `.48.14` でObjStm header用の専用token consumerを追加した。C44 は `ObjectHandle::get_stream_json` を owner とする。B29 は `Pdf::get_warnings` / `any_warnings` / `num_warnings` の canonical API と、後続移行対象の `repair_diagnostics` snapshot を区別する。
