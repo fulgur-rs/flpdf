@@ -2145,12 +2145,27 @@ pages")`（"missing required PDF entry: document has no pages"）という
 
 `qpdf-deviation`マーカーを`page_plan.rs::build`のガードに付け、
 `job_json_file_open_error`（上記2件）と同じ理由
-（toolchain実装詳細の再現対象外）であることを明記した。compat fixture
-175件を3モード（`--deterministic-id --linearize`/`--qdf --static-id`/
-`--object-streams=generate --static-id --deterministic-id`は関係なく
-`--static-id --pages`単体）で掃引し、byte・rcは全件一致、stderrのみ
-0ページ文書12件で不一致（qpdfのlibstdc++ artifact vs flpdfの安定診断）
-であることを確認した。新しいparser・bridge・side-file cacheは追加しない。
+（toolchain実装詳細の再現対象外）であることを明記した。
+
+`tests/fixtures/compat/*.pdf` 178件を `--static-id --pages <f> 1 -- <f> out`
+で掃引した実測（qpdf 11.9.0 / flpdf、2026-09-20）:
+
+- **exit code は178件すべて一致**。
+- **出力バイトは、決定的に比較できる162件すべて一致**。両者が出力を書かない
+  13件（0ページ文書12件と1件）は比較対象外。encryptedの3件
+  （`encrypted-r4-three-page`/`encrypted-recovered-eol`/
+  `encrypted-recovered-eol-valid`）は `--static-id` でも
+  **qpdf自身が実行ごとに異なるバイトを出す**ため、この掃引では比較しない。
+- **stderr が一致しないのは33件**で、内訳は2つだけ:
+  - **12件**が本項のdeviation（0ページ文書。qpdfのlibstdc++ artifact vs
+    flpdfの安定診断）。
+  - 残り**21件**は `operation succeeded with warnings` 行の先頭が
+    `qpdf: ` か `flpdf: ` かの違いのみ。qpdfは `QUtil::getWhoami(argv[0])`
+    を前置する（`qpdf/qpdf.cc:29,40`）ので、flpdfが自分のprogram nameを
+    前置するのは対応関係として正しい。WARNING行自体は全件byte一致で、
+    prefixを揃えると21件すべて完全一致する。
+
+新しいparser・bridge・side-file cacheは追加しない。
 
 ### job-json non-UTF-8 fatal path boundary (`flpdf-ktd5p`, 2026-09-16)
 
