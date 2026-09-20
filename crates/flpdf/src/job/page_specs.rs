@@ -187,10 +187,15 @@ fn collate_values_for_specs(
 /// Apply qpdf's same-document duplicate-page annotation copy while adding a
 /// repeated primary page. `QPDFJob.cc:2564-2585` calls
 /// `QPDFAcroFormDocumentHelper::fixCopiedAnnotations`
-/// (`QPDFAcroFormDocumentHelper.cc:1017-1044`) here, not `copyAnnotations`;
-/// both are thin wrappers around the same `transformAnnotations`, so the
-/// field/annotation semantics this function mirrors are identical either
-/// way.
+/// (`QPDFAcroFormDocumentHelper.cc:1017-1047`) here, not `copyAnnotations`.
+///
+/// Both run the same `transformAnnotations`, but they differ on what they do
+/// with the destination's existing `/Annots`: `fixCopiedAnnotations` replaces
+/// the array outright (`:1040`), while `copyAnnotations` appends to it
+/// (`QPDFPageObjectHelper.cc:1032-1037`). This function reaches the same
+/// result only because it clears `/Annots` on the destination page before
+/// calling [`PageObjectHelper::copy_annotations`] -- removing that step would
+/// reintroduce the difference.
 pub fn copy_duplicate_page_annotations<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     result: &RebuildResult,
