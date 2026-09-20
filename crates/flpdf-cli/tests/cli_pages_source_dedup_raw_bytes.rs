@@ -284,3 +284,61 @@ fn dot_shorthand_does_not_absorb_other_directory_spellings() {
         );
     }
 }
+
+/// `rewrite --pages` classifies external sources separately from the
+/// library. A raw-distinct spelling of an encrypted primary is a secondary
+/// source to the library, so the CLI must route it through the multi-source
+/// path; the single-source path rebuilds from the merged document and drops
+/// the primary's encryption.
+#[test]
+fn rewrite_keeps_primary_encryption_for_a_raw_distinct_spelling() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("dir");
+    std::fs::create_dir(&dir).unwrap();
+    let source = dir.join("f.pdf");
+    let plain = temp.path().join("plain.pdf");
+    std::fs::copy(fixture("link-annot-no-acroform.pdf"), &plain).unwrap();
+
+    let encrypt = run_qpdf(&[
+        "--static-id",
+        "--allow-weak-crypto",
+        "--encrypt",
+        "",
+        "",
+        "128",
+        "--",
+        plain.to_str().unwrap(),
+        source.to_str().unwrap(),
+    ]);
+    assert_success(&encrypt, "build the encrypted primary");
+
+    for spec in [
+        source.to_str().unwrap().to_owned(),
+        dir.join("./f.pdf").to_str().unwrap().to_owned(),
+    ] {
+        let output = temp.path().join("out.pdf");
+        let _ = std::fs::remove_file(&output);
+        let flpdf = run_flpdf(&[
+            "rewrite",
+            "--static-id",
+            "--pages",
+            &spec,
+            "1",
+            "--",
+            source.to_str().unwrap(),
+            output.to_str().unwrap(),
+        ]);
+        assert_success(&flpdf, &format!("rewrite with spec {spec}"));
+
+        let shown = run_qpdf(&["--show-encryption", output.to_str().unwrap()]);
+        let text = String::from_utf8_lossy(&shown.stdout);
+        assert!(
+            !text.contains("File is not encrypted"),
+            "{spec}: the primary's encryption must survive, got {text}"
+        );
+    }
+}
