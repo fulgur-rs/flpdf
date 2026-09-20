@@ -185,7 +185,28 @@ fn collate_values_for_specs(
 }
 
 /// Apply qpdf's same-document duplicate-page annotation copy while adding a
-/// repeated primary page (`QPDFJob.cc:2564-2585`).
+/// repeated primary page. `QPDFJob.cc:2564-2585` calls
+/// `QPDFAcroFormDocumentHelper::fixCopiedAnnotations`
+/// (`QPDFAcroFormDocumentHelper.cc:1017-1047`) here, not `copyAnnotations`.
+///
+/// Both run the same `transformAnnotations`, but they differ on what they do
+/// with the destination's existing `/Annots`: `fixCopiedAnnotations` replaces
+/// the array outright (`:1040`), while `copyAnnotations` appends to it
+/// (`QPDFPageObjectHelper.cc:1032-1037`). Clearing `/Annots` on the
+/// destination page before calling [`PageObjectHelper::copy_annotations`]
+/// lines the two up when the source's `/Annots` is a non-empty array or is
+/// absent, which is what the qtest and compat corpora contain; removing that
+/// step would reintroduce the difference.
+///
+/// The two part ways on two of the inputs `fixCopiedAnnotations` early-returns
+/// on (`:1024-1026`): a present but non-array `/Annots` (`null`, say) and an
+/// empty array. An absent `/Annots` takes that same return, but there the
+/// clear is a no-op and both sides leave the key off, so it stays in the
+/// agreeing set above. qpdf leaves whatever page copying installed
+/// alone; clearing first drops it, after which `copy_annotations` either
+/// returns on its own non-array check
+/// (`QPDFPageObjectHelper.cc:999-1001`) or, for an empty array, installs a
+/// fresh direct one that no longer shares the original's identity.
 pub fn copy_duplicate_page_annotations<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     result: &RebuildResult,
