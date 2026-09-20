@@ -5,11 +5,14 @@
 //! qpdf's `parse_xrefEntry` warns using `InputSource::readLine`'s
 //! `last_offset`, which is the file position at the *start* of the entry
 //! line, before it was read (`libqpdf/InputSource.cc:20-41`). This
-//! divergence no longer reproduces on `main` (fixed alongside
-//! eaf81385a's classic-table start-position alignment, verified
-//! independently of this test), but nothing pinned the exact offset value
-//! -- the existing unit coverage in `crates/flpdf/src/xref.rs` only asserts
-//! the warning's message text, which would still pass with a wrong offset.
+//! divergence no longer reproduces on `main`: bisecting the fixture below
+//! over every commit touching `xref.rs` puts the change at dd91ad0c0
+//! ("fix qpdf specific-bugs parity", 2026-09-11), whose parent reports
+//! offset 193 where it and qpdf both report 194.
+//!
+//! Nothing pinned the exact offset value, though: the existing unit
+//! coverage in `crates/flpdf/src/xref.rs` only asserts the warning's
+//! message text, which still passes with the offset off by one.
 //! This locks in full stdout+stderr byte-equality against real qpdf for
 //! three independent malformations (leading/double whitespace at object 0,
 //! at a later object, and a short digit-field width at a later object).
