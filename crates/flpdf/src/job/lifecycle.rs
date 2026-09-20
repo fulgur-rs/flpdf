@@ -682,10 +682,9 @@ fn read_job_json_file(path: &Path) -> Result<crate::json::Json> {
     // via `QUtil::read_file_into_string` -> `QUtil::safe_fopen`
     // (`QPDFJob_config.cc:776`, `libqpdf/QUtil.cc:490-519,1167-1172`) and
     // reports a missing/unreadable file with portable `strerror` wording, not
-    // Rust's `io::Error` text. Both routes share one owner for that rendering:
-    // `strerror_text` alone keeps Rust's Display, which on Windows is "The
-    // system cannot find the file specified." rather than qpdf's
-    // `strerror(ENOENT)`.
+    // Rust's `io::Error` text. `argv::job_json_file_open_error` routes
+    // through `qutil::strerror_text` for that rendering, and also carries
+    // the byte-preserving path this call site needs.
     let bytes = std::fs::read(path).map_err(|error| argv::job_json_file_open_error(path, error))?;
     let value =
         crate::json::Json::parse(&bytes).map_err(|error| Error::System(error.to_string()))?;
@@ -4732,13 +4731,13 @@ impl QPDFJob {
                 rendered.push(b' ');
                 rendered.extend_from_slice(&path_description_bytes(path));
                 rendered.extend_from_slice(b": ");
-                rendered.extend_from_slice(qpdf_file_io_source_message(source).as_bytes());
+                rendered.extend_from_slice(crate::qutil::strerror_text(source).as_bytes());
                 rendered
             }
             Error::Io(error) if !self.input_name_bytes.is_empty() => {
                 let mut rendered = self.input_name_bytes.clone();
                 rendered.extend_from_slice(b": ");
-                rendered.extend_from_slice(qpdf_file_io_source_message(error).as_bytes());
+                rendered.extend_from_slice(crate::qutil::strerror_text(error).as_bytes());
                 rendered
             }
             Error::Parse { offset, message } if !self.input_name_bytes.is_empty() => {
@@ -4774,10 +4773,10 @@ impl QPDFJob {
                 path,
                 source,
             } => {
-                let source = qpdf_file_io_source_message(source);
+                let source = crate::qutil::strerror_text(source);
                 format!("{operation} {}: {source}", path.display()).into_bytes()
             }
-            Error::Io(error) => qpdf_file_io_source_message(error).into_bytes(),
+            Error::Io(error) => crate::qutil::strerror_text(error).into_bytes(),
             Error::Encrypted(crate::EncryptedError::BadPassword) => b"invalid password".to_vec(),
             _ => error.to_string().into_bytes(),
         }
@@ -5243,34 +5242,6 @@ impl QPDFJob {
         self.complete(false)?;
         Ok(self.get_exit_code())
     }
-}
-
-/// Render a filesystem error at qpdf's `QPDFSystemError::createWhat` boundary.
-///
-/// qpdf uses its portable C-runtime spelling for a missing path even on
-/// Windows (`QPDFSystemError.cc:13-29`); Rust's Windows `io::Error` display
-/// otherwise exposes the native `The system cannot find...` text. Keep the
-/// existing native fallback for error kinds that qpdf does not normalize here,
-/// while removing Rust's numeric suffix from both forms.
-pub(crate) fn qpdf_file_io_source_message(source: &std::io::Error) -> String {
-    let message = match source.kind() {
-        std::io::ErrorKind::NotFound => Some("No such file or directory"),
-        std::io::ErrorKind::PermissionDenied => Some("Permission denied"),
-        std::io::ErrorKind::AlreadyExists => Some("File exists"),
-        std::io::ErrorKind::InvalidInput => Some("Invalid argument"),
-        std::io::ErrorKind::IsADirectory => Some("Is a directory"),
-        std::io::ErrorKind::NotADirectory => Some("Not a directory"),
-        _ => None,
-    };
-    if let Some(message) = message {
-        return message.to_owned();
-    }
-    let rendered = source.to_string();
-    source
-        .raw_os_error()
-        .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
-        .unwrap_or(&rendered)
-        .to_owned()
 }
 
 impl QPDFJobConfig<'_> {

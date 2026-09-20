@@ -23,7 +23,6 @@ mod inspection;
 mod json;
 mod json_sections;
 mod lifecycle;
-pub(crate) use lifecycle::qpdf_file_io_source_message;
 mod outline_dest_remap;
 mod overlay;
 #[cfg(test)]

@@ -367,18 +367,21 @@ pub enum JsonOutput<'a> {
     File(&'a mut dyn Write),
 }
 
+/// Render a `--json-stream-prefix` side-file open failure with qpdf's
+/// portable wording.
+///
+/// qpdf's `writeJSONStreamFile` opens each stream-data side file through
+/// `QUtil::safe_fopen` (`libqpdf/QPDF_json.cc:844`), the same
+/// `QPDFSystemError`/`strerror`-based boundary as every other qpdf
+/// filesystem failure, so this routes through [`crate::qutil::strerror_text`]
+/// rather than `io::Error`'s own platform-native `Display`.
 pub(crate) fn side_file_io_error(
     operation: &'static str,
     path: &[u8],
     source: std::io::Error,
 ) -> JsonOutputError {
     let raw_path = path.to_vec();
-    let rendered = source.to_string();
-    let message = source
-        .raw_os_error()
-        .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
-        .unwrap_or(&rendered)
-        .to_owned();
+    let message = crate::qutil::strerror_text(&source);
     JsonOutputError::SideFileIo {
         operation,
         path: String::from_utf8_lossy(&raw_path).into_owned(),

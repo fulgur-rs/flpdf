@@ -112,13 +112,50 @@ pub fn safe_fopen(filename: &str, mode: &str) -> crate::Result<File> {
 /// wording instead of Rust's own `Display`.
 ///
 /// `QPDFSystemError::createWhat` (`libqpdf/QPDFSystemError.cc:13-29`) formats
-/// every qpdf filesystem failure as `strerror(errno)`. Rust's `io::Error`
-/// `Display` already reproduces that same POSIX text on Unix hosts but
-/// appends a `(os error N)` suffix `strerror` does not produce, so strip it
-/// here. Any qpdf-compatible caller that reports a raw filesystem failure
-/// (not just [`safe_fopen`]) should route it through this instead of
+/// every qpdf filesystem failure as `strerror(errno)`, which is the same
+/// C-runtime text on every host qpdf builds for, including Windows. Rust's
+/// `io::Error` `Display` reproduces that same POSIX text on Unix hosts
+/// (modulo an appended `(os error N)` suffix `strerror` does not produce,
+/// stripped below), but on Windows it instead renders the native Win32
+/// `FormatMessage` wording (e.g. "The system cannot find the file
+/// specified." for a missing path) rather than the `strerror` text qpdf
+/// itself prints there. Map the common kinds to that fixed portable wording
+/// first; every kind below was confirmed against a real syscall failure on
+/// Unix to already agree with the suffix-stripped `Display` text there, so
+/// this changes only the platforms whose native wording diverges from
+/// `strerror`. Any qpdf-compatible caller that reports a raw filesystem
+/// failure (not just [`safe_fopen`]) should route it through this instead of
 /// `io::Error`'s own `Display`.
 pub(crate) fn strerror_text(error: &std::io::Error) -> String {
+    // A real syscall failure on a `strerror`-rendering host already carries
+    // exactly the text qpdf prints, so use it rather than the table below.
+    // The table keys on `ErrorKind`, which is coarser than `errno`: `EPERM`
+    // and `EACCES` share `PermissionDenied` but print "Operation not
+    // permitted" and "Permission denied" respectively, and only the raw code
+    // tells them apart. The table still covers synthetic errors carrying no
+    // `errno`, and every host whose `Display` is not `strerror`.
+    #[cfg(unix)]
+    if error.raw_os_error().is_some() {
+        return strerror_from_display(error);
+    }
+    let message = match error.kind() {
+        std::io::ErrorKind::NotFound => Some("No such file or directory"),
+        std::io::ErrorKind::PermissionDenied => Some("Permission denied"),
+        std::io::ErrorKind::AlreadyExists => Some("File exists"),
+        std::io::ErrorKind::InvalidInput => Some("Invalid argument"),
+        std::io::ErrorKind::IsADirectory => Some("Is a directory"),
+        std::io::ErrorKind::NotADirectory => Some("Not a directory"),
+        _ => None,
+    };
+    if let Some(message) = message {
+        return message.to_owned();
+    }
+    strerror_from_display(error)
+}
+
+/// Render `error` through its own `Display`, less the ` (os error N)` suffix
+/// Rust appends and `strerror` does not.
+fn strerror_from_display(error: &std::io::Error) -> String {
     let rendered = error.to_string();
     error
         .raw_os_error()
@@ -851,6 +888,57 @@ mod tests {
     fn strerror_text_passes_through_an_error_without_a_raw_os_code() {
         let error = std::io::Error::other("custom failure");
         assert_eq!(strerror_text(&error), "custom failure");
+    }
+
+    /// `strerror_text` maps qpdf's common `strerror(errno)` kinds to fixed
+    /// portable wording rather than `std::io::Error`'s platform-native
+    /// `Display` (`QPDFSystemError::createWhat`, `QPDFSystemError.cc:13-29`).
+    /// A synthetic [`std::io::Error::from`] carries no `raw_os_error()`, so
+    /// this specifically exercises the `ErrorKind` match arms rather than
+    /// the suffix-stripped `Display` fallback -- the fallback path a real
+    /// syscall failure exercises is covered separately by
+    /// `safe_fopen_missing_path_is_a_qpdf_system_error` on Unix.
+    /// `ErrorKind` is coarser than `errno`: `EPERM` and `EACCES` both map to
+    /// `PermissionDenied`, but `strerror` prints "Operation not permitted"
+    /// for the first and "Permission denied" for the second, and qpdf prints
+    /// whichever `strerror(errno)` returns. A real syscall failure carries
+    /// the raw code, so it must not be flattened through the `ErrorKind`
+    /// table.
+    #[cfg(unix)]
+    #[test]
+    fn strerror_text_keeps_errno_wording_that_error_kind_cannot_distinguish() {
+        for (code, expected) in [
+            (libc_eperm(), "Operation not permitted"),
+            (libc_eacces(), "Permission denied"),
+        ] {
+            let error = std::io::Error::from_raw_os_error(code);
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(strerror_text(&error), expected, "errno {code}");
+        }
+    }
+
+    #[cfg(unix)]
+    fn libc_eperm() -> i32 {
+        1
+    }
+
+    #[cfg(unix)]
+    fn libc_eacces() -> i32 {
+        13
+    }
+
+    #[test]
+    fn strerror_text_maps_common_error_kinds_to_qpdf_wording() {
+        for (kind, expected) in [
+            (std::io::ErrorKind::NotFound, "No such file or directory"),
+            (std::io::ErrorKind::PermissionDenied, "Permission denied"),
+            (std::io::ErrorKind::AlreadyExists, "File exists"),
+            (std::io::ErrorKind::InvalidInput, "Invalid argument"),
+            (std::io::ErrorKind::IsADirectory, "Is a directory"),
+            (std::io::ErrorKind::NotADirectory, "Not a directory"),
+        ] {
+            assert_eq!(strerror_text(&std::io::Error::from(kind)), expected);
+        }
     }
 
     #[test]
