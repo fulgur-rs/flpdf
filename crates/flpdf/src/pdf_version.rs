@@ -5,18 +5,22 @@
 //! Public API: qpdf 11.9.0 include/qpdf/PDFVersion.hh.
 
 use crate::qutil::{qpdf_string_to_int_checked, QpdfIntParse};
+use crate::Error;
 
 /// A PDF major/minor version paired with an optional extension level.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PdfVersion {
-    major: u8,
-    minor: u8,
+    major: i32,
+    minor: i32,
     extension_level: i64,
 }
 
 impl PdfVersion {
     /// Creates a PDF version value.
-    pub const fn new(major: u8, minor: u8, extension_level: i64) -> Self {
+    ///
+    /// qpdf's `PDFVersion` stores `major_version`/`minor_version` as `int`
+    /// (`include/qpdf/PDFVersion.hh:60-62`), not a narrower type.
+    pub const fn new(major: i32, minor: i32, extension_level: i64) -> Self {
         Self {
             major,
             minor,
@@ -25,9 +29,20 @@ impl PdfVersion {
     }
 
     /// Parses the existing flpdf `M.m` version syntax with extension level 0.
+    ///
+    /// This has no qpdf counterpart (unlike the crate-internal digit-run
+    /// prefix parser mirroring `QPDF::getVersionAsPDFVersion`'s regex and
+    /// i32 range), so it keeps its pre-existing `u8`-bounded numeric range
+    /// deliberately: a major or minor run of 3+ digits still parses to
+    /// `None`, matching this function's own prior behavior rather than
+    /// widening as a side effect of [`PdfVersion`]'s field type.
     pub fn parse(value: &str) -> Option<Self> {
         let (major, minor) = value.split_once('.')?;
-        Some(Self::new(major.parse().ok()?, minor.parse().ok()?, 0))
+        Some(Self::new(
+            i32::from(major.parse::<u8>().ok()?),
+            i32::from(minor.parse::<u8>().ok()?),
+            0,
+        ))
     }
 
     /// Replaces this value when `other` is greater.
@@ -46,12 +61,12 @@ impl PdfVersion {
     }
 
     /// Returns the major version.
-    pub const fn major(self) -> u8 {
+    pub const fn major(self) -> i32 {
         self.major
     }
 
     /// Returns the minor version.
-    pub const fn minor(self) -> u8 {
+    pub const fn minor(self) -> i32 {
         self.minor
     }
 
@@ -81,16 +96,19 @@ pub fn parse_pdf_version(value: &str) -> Option<PdfVersion> {
 /// `QPDF::getVersionAsPDFVersion`'s regex
 /// (`^[[:space:]]*([0-9]+)\.([0-9]+)`, `libqpdf/QPDF.cc:2305-2320`): skip
 /// leading whitespace, take a digit run, a literal `.`, and a following
-/// digit run. Falls back to `(1, 3)` when the string does not start that
-/// way, or when a captured digit run overflows `QUtil::string_to_int`'s i32
-/// range -- matching this file's own [`parse_qpdf_writer_version`]
-/// overflow-to-`None` handling for the same qpdf primitive, rather than
-/// qpdf's own uncaught-exception behavior for that case. Unlike qpdf's
-/// `int` fields, [`PdfVersion`]'s `major`/`minor` are `u8`; a digit run
-/// within i32 range but outside u8 range saturates to `u8::MAX` rather than
-/// wrapping.
-pub(crate) fn leading_major_minor(value: &str) -> (u8, u8) {
-    const FALLBACK: (u8, u8) = (1, 3);
+/// digit run. Falls back to `Ok((1, 3))` when the string does not start that
+/// way (the regex simply does not match). A captured digit run that
+/// overflows `QUtil::string_to_int`'s i32 range instead becomes `Err`: qpdf
+/// calls `QUtil::string_to_int` uncaught here (`QPDF.cc:2314,2317`), so the
+/// `std::range_error` it throws propagates out of `getVersionAsPDFVersion`
+/// rather than falling back to a default.
+///
+/// # Errors
+///
+/// Returns [`Error::System`] when a captured digit run overflows i32,
+/// carrying qpdf's own `integer out of range converting ...` text.
+pub(crate) fn leading_major_minor(value: &str) -> Result<(i32, i32), Error> {
+    const FALLBACK: (i32, i32) = (1, 3);
     let bytes = value.as_bytes();
     let mut index = 0;
     while bytes
@@ -104,7 +122,7 @@ pub(crate) fn leading_major_minor(value: &str) -> (u8, u8) {
         index += 1;
     }
     if index == major_start || bytes.get(index) != Some(&b'.') {
-        return FALLBACK;
+        return Ok(FALLBACK);
     }
     let major_digits = &value[major_start..index];
     index += 1; // skip '.'
@@ -113,19 +131,30 @@ pub(crate) fn leading_major_minor(value: &str) -> (u8, u8) {
         index += 1;
     }
     if index == minor_start {
-        return FALLBACK;
+        return Ok(FALLBACK);
     }
     let minor_digits = &value[minor_start..index];
-    match (digit_run_to_u8(major_digits), digit_run_to_u8(minor_digits)) {
-        (Some(major), Some(minor)) => (major, minor),
-        _ => FALLBACK,
+    match (
+        digit_run_to_i32(major_digits)?,
+        digit_run_to_i32(minor_digits)?,
+    ) {
+        (Some(major), Some(minor)) => Ok((major, minor)),
+        // major_digits/minor_digits are always non-empty ASCII-digit
+        // substrings by construction (the preceding index ==
+        // major_start/minor_start checks above already return FALLBACK for
+        // an empty run), so digit_run_to_i32 can only return Some(_) or
+        // propagate Err via `?`, never NoDigits's None.
+        _ => Ok(FALLBACK), // cov:ignore: unreachable via this caller, see comment above
     }
 }
 
-fn digit_run_to_u8(digits: &str) -> Option<u8> {
+fn digit_run_to_i32(digits: &str) -> Result<Option<i32>, Error> {
     match qpdf_string_to_int_checked(digits) {
-        QpdfIntParse::Value(value) => Some(u8::try_from(value).unwrap_or(u8::MAX)),
-        QpdfIntParse::Overflow(_) | QpdfIntParse::NoDigits => None,
+        QpdfIntParse::Value(value) => Ok(Some(value)),
+        QpdfIntParse::Overflow(message) => Err(Error::System(message)),
+        // Unreachable via leading_major_minor, this function's only caller:
+        // it always passes a non-empty ASCII-digit substring.
+        QpdfIntParse::NoDigits => Ok(None), // cov:ignore: unreachable via this caller, see comment above
     }
 }
 
@@ -211,45 +240,55 @@ mod tests {
 
     #[test]
     fn leading_major_minor_reads_the_ordinary_header_form() {
-        assert_eq!(leading_major_minor("1.7"), (1, 7));
-        assert_eq!(leading_major_minor("2.0"), (2, 0));
+        assert_eq!(leading_major_minor("1.7").unwrap(), (1, 7));
+        assert_eq!(leading_major_minor("2.0").unwrap(), (2, 0));
     }
 
     #[test]
     fn leading_major_minor_skips_leading_whitespace() {
-        assert_eq!(leading_major_minor("  \t\n1.4"), (1, 4));
+        assert_eq!(leading_major_minor("  \t\n1.4").unwrap(), (1, 4));
     }
 
     #[test]
     fn leading_major_minor_ignores_trailing_bytes_after_the_prefix_match() {
-        assert_eq!(leading_major_minor("1.7extra garbage"), (1, 7));
+        assert_eq!(leading_major_minor("1.7extra garbage").unwrap(), (1, 7));
     }
 
     #[test]
     fn leading_major_minor_falls_back_to_1_3_without_a_digit_run() {
-        assert_eq!(leading_major_minor(""), (1, 3));
-        assert_eq!(leading_major_minor("abc"), (1, 3));
+        assert_eq!(leading_major_minor("").unwrap(), (1, 3));
+        assert_eq!(leading_major_minor("abc").unwrap(), (1, 3));
     }
 
     #[test]
     fn leading_major_minor_falls_back_to_1_3_without_a_dot() {
-        assert_eq!(leading_major_minor("17"), (1, 3));
+        assert_eq!(leading_major_minor("17").unwrap(), (1, 3));
     }
 
     #[test]
     fn leading_major_minor_falls_back_to_1_3_with_an_empty_minor_run() {
-        assert_eq!(leading_major_minor("1."), (1, 3));
-        assert_eq!(leading_major_minor("1.abc"), (1, 3));
+        assert_eq!(leading_major_minor("1.").unwrap(), (1, 3));
+        assert_eq!(leading_major_minor("1.abc").unwrap(), (1, 3));
     }
 
+    /// A digit run within i32 range but outside `u8`'s prior range is no
+    /// longer saturated: qpdf's own `int` fields store 300 as 300
+    /// (`include/qpdf/PDFVersion.hh:60-62`).
     #[test]
-    fn leading_major_minor_saturates_a_digit_run_past_u8_range() {
-        assert_eq!(leading_major_minor("300.7"), (u8::MAX, 7));
-        assert_eq!(leading_major_minor("1.9999"), (1, u8::MAX));
+    fn leading_major_minor_widens_a_digit_run_past_the_former_u8_range() {
+        assert_eq!(leading_major_minor("300.7").unwrap(), (300, 7));
+        assert_eq!(leading_major_minor("1.9999").unwrap(), (1, 9999));
     }
 
+    /// A digit run outside i32 range propagates as qpdf's own uncaught
+    /// `QUtil::string_to_int` failure, not a silent fallback
+    /// (`QPDF.cc:2314,2317`).
     #[test]
-    fn leading_major_minor_falls_back_to_1_3_on_i32_overflow() {
-        assert_eq!(leading_major_minor("99999999999.7"), (1, 3));
+    fn leading_major_minor_errors_on_i32_overflow() {
+        let error = leading_major_minor("99999999999.7").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "integer out of range converting 99999999999 from a 8-byte signed type to a 4-byte signed type"
+        );
     }
 }

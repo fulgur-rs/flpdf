@@ -509,10 +509,12 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// # Errors
     ///
-    /// Propagates [`Self::get_extension_level`]'s errors.
+    /// Propagates [`Self::get_extension_level`]'s errors, plus qpdf's own
+    /// uncaught `integer out of range` failure when the header's major or
+    /// minor digit run overflows i32.
     pub fn get_version_as_pdf_version(&mut self) -> Result<PdfVersion> {
         let extension_level = self.get_extension_level()?;
-        let (major, minor) = leading_major_minor(self.version());
+        let (major, minor) = leading_major_minor(self.version())?;
         Ok(PdfVersion::new(major, minor, i64::from(extension_level)))
     }
 
