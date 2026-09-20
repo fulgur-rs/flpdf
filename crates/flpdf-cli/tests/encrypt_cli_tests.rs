@@ -1434,6 +1434,67 @@ fn encrypt_incompatible_subflags_for_key_len_are_rejected() {
     }
 }
 
+/// The dashed `--bits=value` form of `--encrypt` never reaches
+/// `ArgParser::argEncBits`'s own validation (`libqpdf/QPDFJob_argv.cc:211-229`,
+/// which produces "encryption key length must be 40, 128, or 256" and is
+/// correctly used for the *positional* `--encrypt user owner <bits>` form).
+/// qpdf's `job.yml` instead registers `bits`'s `choices` (`enc_bits: [40, 128,
+/// 256]`) on the named option itself, so `QPDFArgParser::checkCompletion`'s
+/// generic choices check (`libqpdf/QPDFArgParser.cc:505-522`) catches a
+/// missing or invalid dashed value first, with a different, dictionary-sorted
+/// message (`{128,256,40}`, not the positional path's numeric-order wording).
+#[test]
+fn encrypt_dashed_bits_uses_qpdf_choices_wording_not_positional_wording() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let cases: &[(&[&str], &str)] = &[
+        (&["--bits"], "--bits must be given as --bits={128,256,40}"),
+        (
+            &["--bits=999"],
+            "--bits must be given as --bits={128,256,40}",
+        ),
+    ];
+    for (enc_args, expected_line) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("nope.pdf");
+
+        let mut qpdf_cmd = ShellCommand::new("qpdf");
+        qpdf_cmd.arg("--encrypt");
+        for a in *enc_args {
+            qpdf_cmd.arg(a);
+        }
+        qpdf_cmd
+            .arg("--")
+            .arg(fixture(UNENCRYPTED_FIXTURE))
+            .arg(&output);
+        let qpdf_output = qpdf_cmd.output().expect("run qpdf --encrypt");
+
+        let mut flpdf_cmd = Command::cargo_bin("flpdf").unwrap();
+        flpdf_cmd.env("FLPDF_PROGNAME", "qpdf").arg("--encrypt");
+        for a in *enc_args {
+            flpdf_cmd.arg(a);
+        }
+        flpdf_cmd
+            .arg("--")
+            .arg(fixture(UNENCRYPTED_FIXTURE))
+            .arg(&output);
+        let flpdf_output = flpdf_cmd.output().expect("run flpdf --encrypt");
+
+        assert_eq!(flpdf_output.status.code(), qpdf_output.status.code());
+        assert_eq!(
+            normalize_text_newlines(&flpdf_output.stderr),
+            normalize_text_newlines(&qpdf_output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&qpdf_output.stderr).contains(expected_line),
+            "qpdf oracle itself no longer contains the expected line {expected_line:?}: {:?}",
+            String::from_utf8_lossy(&qpdf_output.stderr)
+        );
+        assert!(!output.exists());
+    }
+}
+
 /// A zero-token `--encrypt --` segment must be rejected the same as an
 /// absent one is accepted — clap's `num_args = 0..` means both an omitted
 /// `--encrypt` and one given with no sub-arguments produce an empty list, so
