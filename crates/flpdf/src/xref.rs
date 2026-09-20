@@ -1020,6 +1020,9 @@ fn load_xref_state_from_window(
             options.clone(),
             initial_diagnostics,
             None,
+            // No section has been read yet at all, so nothing could have
+            // tripped the flag before this reconstruction attempt.
+            false,
             canonical_trailer_owner,
         )?;
         recovered.header_offset = header_offset;
@@ -1027,6 +1030,7 @@ fn load_xref_state_from_window(
     }
 
     let mut observed_first_xref_item_offset = None;
+    let mut observed_uncompressed_after_compressed = false;
     // No caller-local diagnostic sink: the owner is the single warning sink
     // for this read, matching qpdf's one `m->warnings`
     // (`libqpdf/QPDF.cc:487-494`). The initial section's own warnings are
@@ -1042,6 +1046,7 @@ fn load_xref_state_from_window(
         &mut registration,
         None,
         Some(&mut observed_first_xref_item_offset),
+        Some(&mut observed_uncompressed_after_compressed),
         true,
         canonical_trailer_owner,
     ) {
@@ -1063,6 +1068,7 @@ fn load_xref_state_from_window(
                 options.clone(),
                 initial_diagnostics,
                 observed_first_xref_item_offset,
+                observed_uncompressed_after_compressed,
                 canonical_trailer_owner,
             )?;
             recovered.header_offset = header_offset;
@@ -1095,6 +1101,7 @@ fn load_xref_state_from_window(
         &mut registration,
         Some(&mut previous_parse_diagnostics),
         Some(&mut observed_first_xref_item_offset),
+        Some(&mut observed_uncompressed_after_compressed),
         canonical_trailer_owner,
     ) {
         if allow_repair {
@@ -1113,6 +1120,7 @@ fn load_xref_state_from_window(
                 options.clone(),
                 previous_parse_diagnostics,
                 observed_first_xref_item_offset,
+                observed_uncompressed_after_compressed,
                 canonical_trailer_owner,
             )?;
             let mut recovered = merge_recovered_qpdf_state(recovered, loaded);
@@ -1166,6 +1174,12 @@ fn load_xref_state_from_window(
             options.clone(),
             diagnostics,
             None,
+            // Nothing failed mid-scan on this path (the trigger is a later
+            // /Size resolution issue, not a section-parse error), so there is
+            // no pre-reconstruction flag to carry here; `loaded`'s own
+            // already-successfully-parsed value is folded in below via
+            // `merge_recovered_qpdf_state`.
+            false,
             canonical_trailer_owner,
         )?; // cov:ignore: recover_xref_entries has no fallible branch; retain defensive propagation
         let mut recovered = merge_recovered_qpdf_state(recovered, loaded);
@@ -1261,6 +1275,7 @@ fn parse_xref_from_start_with_owner(
     registration: &mut XrefRegistration,
     error_diagnostics_sink: Option<&mut Diagnostics>,
     first_xref_item_offset_sink: Option<&mut Option<u64>>,
+    uncompressed_after_compressed_sink: Option<&mut bool>,
     validate_current_classic_trailer: bool,
     canonical_trailer_owner: &dyn CanonicalTrailerOwner,
 ) -> Result<LoadedXrefState> {
@@ -1274,6 +1289,7 @@ fn parse_xref_from_start_with_owner(
         registration,
         error_diagnostics_sink,
         first_xref_item_offset_sink,
+        uncompressed_after_compressed_sink,
         validate_current_classic_trailer,
         canonical_trailer_owner,
         None,
@@ -1291,6 +1307,7 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
     registration: &mut XrefRegistration,
     error_diagnostics_sink: Option<&mut Diagnostics>,
     first_xref_item_offset_sink: Option<&mut Option<u64>>,
+    uncompressed_after_compressed_sink: Option<&mut bool>,
     validate_current_classic_trailer: bool,
     canonical_trailer_owner: &dyn CanonicalTrailerOwner,
     hybrid_build_diagnostics_sink: Option<&mut Diagnostics>,
@@ -1447,6 +1464,7 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
             options.clone(),
             registration,
             error_diagnostics_sink,
+            uncompressed_after_compressed_sink,
             canonical_trailer_owner,
             hybrid_build_diagnostics_sink,
         )?;
@@ -1472,6 +1490,7 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
         version.to_string(),
         options.clone(),
         registration,
+        uncompressed_after_compressed_sink,
         canonical_trailer_owner,
     ) {
         Ok(state) => Ok(state),
@@ -1530,6 +1549,7 @@ fn merge_xref_stream_from_classic_trailer_with_build_diagnostics(
     options: XrefLoadOptions,
     registration: &mut XrefRegistration,
     mut error_diagnostics_sink: Option<&mut Diagnostics>,
+    uncompressed_after_compressed_sink: Option<&mut bool>,
     canonical_trailer_owner: &dyn CanonicalTrailerOwner,
     hybrid_build_diagnostics_sink: Option<&mut Diagnostics>,
 ) -> Result<()> {
@@ -1593,6 +1613,7 @@ fn merge_xref_stream_from_classic_trailer_with_build_diagnostics(
         loaded.loaded.version.clone(),
         options.clone(),
         registration,
+        uncompressed_after_compressed_sink,
         canonical_trailer_owner,
     ) {
         Ok(hybrid) => hybrid,
@@ -1666,6 +1687,7 @@ fn merge_previous_xref_sections(
         registration,
         error_diagnostics_sink,
         None,
+        None,
         canonical_trailer_owner,
     )
 }
@@ -1680,6 +1702,7 @@ fn merge_previous_xref_sections_with_observer(
     registration: &mut XrefRegistration,
     mut error_diagnostics_sink: Option<&mut Diagnostics>,
     mut first_xref_item_offset_sink: Option<&mut Option<u64>>,
+    mut uncompressed_after_compressed_sink: Option<&mut bool>,
     canonical_trailer_owner: &dyn CanonicalTrailerOwner,
 ) -> Result<()> {
     let mut visited = HashSet::new();
@@ -1740,6 +1763,7 @@ fn merge_previous_xref_sections_with_observer(
             registration,
             Some(&mut previous_error_diagnostics),
             first_xref_item_offset_sink.as_deref_mut(),
+            uncompressed_after_compressed_sink.as_deref_mut(),
             false,
             canonical_trailer_owner,
             Some(&mut previous_build_diagnostics),
@@ -1952,6 +1976,14 @@ fn recover_xref_from_linear_scan(
     options: XrefLoadOptions,
     mut repair_diagnostics: Diagnostics,
     observed_first_xref_item_offset: Option<u64>,
+    // qpdf mutates `m->uncompressed_after_compressed` (a sibling member set
+    // right next to `m->first_xref_item_offset`, `QPDF.cc:1112` vs
+    // `:1117-1119`) while scanning the section whose later row triggered
+    // this reconstruction, so it survives the exception the same way. Unlike
+    // the offset, this flag is sticky and OR-accumulates rather than being
+    // superseded by the reconstruction scan's own result -- there is no
+    // "unset" state to fall back from.
+    observed_uncompressed_after_compressed: bool,
     canonical_trailer_owner: &dyn CanonicalTrailerOwner,
 ) -> Result<LoadedXrefState> {
     // qpdf mutates `m->first_xref_item_offset` while reading object 0's row,
@@ -2079,6 +2111,8 @@ fn recover_xref_from_linear_scan(
     };
     let recovered_first_xref_item_offset =
         observed_first_xref_item_offset.unwrap_or(recovered_first_xref_item_offset);
+    let recovered_uncompressed_after_compressed =
+        observed_uncompressed_after_compressed || recovered_uncompressed_after_compressed;
 
     let mut trailer_references = collect_trailer_references(&trailer);
     trailer_references.extend(extra_trailer_references);
@@ -2473,6 +2507,11 @@ fn recover_trailer_from_xref_stream_candidate(
         options.clone(),
         &mut reentry_registration,
         Some(&mut reentry_error_diagnostics),
+        None,
+        // Matches the `first_xref_item_offset_sink: None` immediately above:
+        // a failed re-entry here is a terminal reconstruction failure
+        // (`Error::QpdfExc` below), not one with a fallback path that could
+        // use a partially-observed flag.
         None,
         false,
         canonical_trailer_owner,
@@ -3312,6 +3351,7 @@ fn parse_xref_stream(
     version: String,
     options: XrefLoadOptions,
     registration: &mut XrefRegistration,
+    uncompressed_after_compressed_sink: Option<&mut bool>,
     canonical_trailer_owner: &dyn CanonicalTrailerOwner,
 ) -> std::result::Result<LoadedXrefState, Box<XrefStreamFailure>> {
     // qpdf's `read_xrefStream` wraps its whole body in
@@ -3331,6 +3371,7 @@ fn parse_xref_stream(
         version,
         options,
         registration,
+        uncompressed_after_compressed_sink,
         canonical_trailer_owner,
     )
     .map_err(XrefStreamFailure::new)
@@ -3357,6 +3398,7 @@ fn build_xref_stream(
     xref_pos: usize,
     object: XrefStreamObjectRead,
     registration: &mut XrefRegistration,
+    uncompressed_after_compressed_sink: Option<&mut bool>,
 ) -> Result<XrefStreamBuild> {
     let XrefStreamObjectRead {
         object_ref,
@@ -3472,6 +3514,7 @@ fn build_xref_stream(
         widths,
         stream_data_offset,
         registration,
+        uncompressed_after_compressed_sink,
     )?;
     let trailer_references = collect_trailer_references(&trailer);
 
@@ -3490,6 +3533,7 @@ fn parse_xref_stream_with_canonical_owner(
     version: String,
     options: XrefLoadOptions,
     registration: &mut XrefRegistration,
+    uncompressed_after_compressed_sink: Option<&mut bool>,
     owner: &dyn CanonicalTrailerOwner,
 ) -> Result<LoadedXrefState> {
     owner.install_xref_entries(registration.snapshot());
@@ -3529,6 +3573,7 @@ fn parse_xref_stream_with_canonical_owner(
             stream_data_offset,
         },
         registration,
+        uncompressed_after_compressed_sink,
     );
     let reconstruction_trigger = context.take_reconstruction_trigger();
     let mut diagnostics = Diagnostics::default();
@@ -3696,6 +3741,7 @@ fn parse_xref_entries(
     widths: XrefWidths,
     stream_data_offset: Option<usize>,
     registration: &mut XrefRegistration,
+    mut uncompressed_after_compressed_sink: Option<&mut bool>,
 ) -> Result<(Vec<ParsedXrefEntry>, bool)> {
     let (w0, w1, w2) = widths;
     let entry_width = w0 + w1 + w2;
@@ -3706,7 +3752,12 @@ fn parse_xref_entries(
     let mut entries = Vec::new();
     // qpdf's `saw_first_compressed_object` (`QPDF.cc:1070`): local to one
     // xref stream section, feeding the sticky `m->uncompressed_after_compressed`
-    // the caller ORs into the document-wide flag.
+    // the caller ORs into the document-wide flag. qpdf mutates `m` directly as
+    // soon as an entry trips this (`QPDF.cc:1112`), before a later entry in
+    // the same section can throw (`insertXrefEntry`'s unknown-type arm,
+    // `QPDF.cc:1181`); the member survives that exception. Rust's `Result::Err`
+    // cannot carry a successful prefix, so this sink is the explicit side
+    // channel that plays the same role as `first_xref_item_offset_sink`.
     let mut saw_first_compressed_object = false;
     let mut uncompressed_after_compressed = false;
     for &(start, count) in ranges {
@@ -3736,6 +3787,9 @@ fn parse_xref_entries(
             if saw_first_compressed_object {
                 if object_type != 2 {
                     uncompressed_after_compressed = true;
+                    if let Some(sink) = uncompressed_after_compressed_sink.as_deref_mut() {
+                        *sink = true;
+                    }
                 }
             } else if object_type == 2 {
                 saw_first_compressed_object = true;
@@ -4172,6 +4226,7 @@ mod final_handle_tests {
             &mut registration,
             None,
             None,
+            None,
             false,
             resolver.as_ref(),
         )
@@ -4331,9 +4386,15 @@ mod final_handle_tests {
     fn xref_stream_index_rows_are_not_rejected_only_for_exceeding_size() {
         let mut cursor = ByteCursor::new(&[1, 0], 0);
         let mut registration = XrefRegistration::default();
-        let (entries, uncompressed_after_compressed) =
-            parse_xref_entries(&mut cursor, &[(35, 1)], (1, 0, 1), None, &mut registration)
-                .expect("qpdf accepts an /Index row beyond the reported /Size");
+        let (entries, uncompressed_after_compressed) = parse_xref_entries(
+            &mut cursor,
+            &[(35, 1)],
+            (1, 0, 1),
+            None,
+            &mut registration,
+            None,
+        )
+        .expect("qpdf accepts an /Index row beyond the reported /Size");
 
         assert!(!uncompressed_after_compressed);
         assert!(matches!(
@@ -4355,9 +4416,15 @@ mod final_handle_tests {
         // type 2, then type 1: trips.
         let mut cursor = ByteCursor::new(&[2, 0, 1, 0], 0);
         let mut registration = XrefRegistration::default();
-        let (_, flagged) =
-            parse_xref_entries(&mut cursor, &[(0, 2)], (1, 0, 1), None, &mut registration)
-                .expect("two-entry section parses");
+        let (_, flagged) = parse_xref_entries(
+            &mut cursor,
+            &[(0, 2)],
+            (1, 0, 1),
+            None,
+            &mut registration,
+            None,
+        )
+        .expect("two-entry section parses");
         assert!(
             flagged,
             "an uncompressed entry after a compressed one must trip the flag"
@@ -4366,9 +4433,15 @@ mod final_handle_tests {
         // type 1, then type 2: qpdf's own layout convention, never trips.
         let mut cursor = ByteCursor::new(&[1, 0, 2, 0], 0);
         let mut registration = XrefRegistration::default();
-        let (_, flagged) =
-            parse_xref_entries(&mut cursor, &[(10, 2)], (1, 0, 1), None, &mut registration)
-                .expect("two-entry section parses");
+        let (_, flagged) = parse_xref_entries(
+            &mut cursor,
+            &[(10, 2)],
+            (1, 0, 1),
+            None,
+            &mut registration,
+            None,
+        )
+        .expect("two-entry section parses");
         assert!(
             !flagged,
             "an uncompressed entry strictly before the first compressed one must not trip the flag"
@@ -4377,9 +4450,15 @@ mod final_handle_tests {
         // type 2, then type 2: no uncompressed entry at all, never trips.
         let mut cursor = ByteCursor::new(&[2, 0, 2, 0], 0);
         let mut registration = XrefRegistration::default();
-        let (_, flagged) =
-            parse_xref_entries(&mut cursor, &[(20, 2)], (1, 0, 1), None, &mut registration)
-                .expect("two-entry section parses");
+        let (_, flagged) = parse_xref_entries(
+            &mut cursor,
+            &[(20, 2)],
+            (1, 0, 1),
+            None,
+            &mut registration,
+            None,
+        )
+        .expect("two-entry section parses");
         assert!(!flagged, "two compressed entries must not trip the flag");
     }
 
@@ -4470,6 +4549,7 @@ mod final_handle_tests {
             &mut registration,
             Some(&mut diagnostics),
             None,
+            None,
             false,
             resolver.as_ref(),
         )
@@ -4541,6 +4621,7 @@ mod final_handle_tests {
                 ..XrefLoadOptions::default()
             },
             &mut registration,
+            None,
             None,
             None,
             false,
@@ -4774,6 +4855,7 @@ mod final_handle_tests {
             &mut registration,
             Some(&mut diagnostics),
             None,
+            None,
             true,
             resolver.as_ref(),
         )
@@ -4808,6 +4890,7 @@ mod final_handle_tests {
             &mut registration,
             None,
             None,
+            None,
             true,
             resolver.as_ref(),
         )
@@ -4832,6 +4915,7 @@ mod final_handle_tests {
             "1.5".to_owned(),
             XrefLoadOptions::default(),
             &mut registration,
+            None,
             resolver.as_ref(),
         )
         .expect_err("a malformed xref-stream object header must fail framing");
@@ -5521,6 +5605,7 @@ mod final_handle_tests {
                 stream_data_offset: Some(20),
             },
             &mut registration,
+            None,
         )
         .is_err());
 
@@ -5534,6 +5619,7 @@ mod final_handle_tests {
                 stream_data_offset: Some(21),
             },
             &mut registration,
+            None,
         )
         .is_err());
     }
@@ -5565,6 +5651,7 @@ mod final_handle_tests {
                 stream_data_offset: None,
             },
             &mut registration,
+            None,
         )
         .expect_err("qpdf rejects a zero-sized xref-stream entry");
 
@@ -5604,6 +5691,7 @@ mod final_handle_tests {
             "1.4".to_owned(),
             XrefLoadOptions::default(),
             &mut registration,
+            None,
             resolver.as_ref(),
         )
         .expect("a recovered canonical xref stream should still parse its one free entry");
@@ -5700,6 +5788,7 @@ mod final_handle_tests {
                 "1.4".to_owned(),
                 XrefLoadOptions::default(),
                 &mut registration,
+                None,
                 &owner,
             )
             .expect_err("synthetic owner read must fail");
@@ -5922,6 +6011,7 @@ mod final_handle_tests {
             "1.4".to_owned(),
             XrefLoadOptions::default(),
             &mut registration,
+            None,
             resolver.as_ref(),
         )
         .expect_err("an unknown xref entry type must fail the canonical build");
@@ -6352,6 +6442,7 @@ mod final_handle_tests {
             &mut registration,
             None,
             None,
+            None,
             true,
             resolver.as_ref(),
         )
@@ -6373,6 +6464,7 @@ mod final_handle_tests {
             "1.4",
             XrefLoadOptions::default(),
             &mut registration,
+            None,
             None,
             None,
             true,
@@ -6540,6 +6632,63 @@ mod final_handle_tests {
             "an older /Prev section's uncompressed-after-compressed ordering \
              must OR into the document-wide sticky flag even though the \
              current section's own scan never sets it"
+        );
+    }
+
+    /// flpdf-8yho0: an xref stream whose section trips
+    /// `uncompressed_after_compressed` on its second entry (type-2 then
+    /// type-1), then fails outright on its third (an unknown entry type,
+    /// `QPDF.cc:1181`'s `insertXrefEntry` default arm). A classic `trailer`
+    /// keyword after it lets reconstruction's line scan recover a usable
+    /// trailer despite the failed stream.
+    fn xref_stream_trips_flag_then_fails_entirely() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+        let xref_stream_offset = bytes.len();
+        let mut stream_data = Vec::new();
+        stream_data.extend_from_slice(&xref_stream_entry(2, 99, 0));
+        stream_data.extend_from_slice(&xref_stream_entry(1, xref_stream_offset as u16, 0));
+        stream_data.extend_from_slice(&xref_stream_entry(5, 0, 0));
+        bytes.extend_from_slice(b"2 0 obj\n");
+        bytes.extend_from_slice(
+            format!(
+                "<< /Type /XRef /W [1 2 1] /Index [1 3] /Size 4 /Root 1 0 R /Length {} >>",
+                stream_data.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(b"\nstream\n");
+        bytes.extend_from_slice(&stream_data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        bytes.extend_from_slice(b"trailer\n<< /Size 4 /Root 1 0 R >>\n");
+        bytes.extend_from_slice(format!("startxref\n{xref_stream_offset}\n%%EOF\n").as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn uncompressed_after_compressed_survives_a_mid_section_parse_failure() {
+        let bytes = xref_stream_trips_flag_then_fails_entirely();
+        let (_owner, result) = load_xref_state_through_canonical_owner(
+            std::io::Cursor::new(bytes),
+            true,
+            XrefLoadOptions::default(),
+            crate::QPDFLogger::create(),
+            true,
+            72,
+        );
+        let state = result.expect(
+            "the trailing classic trailer lets reconstruction recover a usable state \
+             despite the xref stream's own unknown-entry-type failure",
+        );
+        assert!(
+            state.uncompressed_after_compressed,
+            "qpdf mutates m->uncompressed_after_compressed directly during the \
+             entry scan, before the unknown-type entry throws, and \
+             reconstruct_xref never resets it (QPDF.cc:1112 vs :1181); a \
+             Result::Err that discards the local flag instead of carrying it \
+             through reconstruction would diverge from that"
         );
     }
 }
