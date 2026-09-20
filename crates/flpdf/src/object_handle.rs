@@ -6126,7 +6126,14 @@ impl ObjectHandle {
 
             let mut last_char = Count::new("last character", &mut buffer);
             let mut filtering_attempted = false;
-            let succeeded = stream.pipe_stream_data(
+            // qpdf's five-argument `pipeStreamData` overload
+            // (`QPDFObjectHandle.cc:1313-1324`) discards the inner six-
+            // argument overload's own success return and reports only
+            // whether filtering was attempted, so this discards it too: a
+            // decode failure whose filter still ran is not itself a content
+            // stream failure here, matching qpdf's caller
+            // (`QPDFObjectHandle.cc:1719-1729`), which checks only that.
+            let _ = stream.pipe_stream_data(
                 &mut last_char,
                 &mut filtering_attempted,
                 0,
@@ -6134,10 +6141,7 @@ impl ObjectHandle {
                 false,
                 false,
             )?;
-            // qpdf's five-argument pipeStreamData overload returns whether
-            // filtering was attempted, so an unknown filter is a content
-            // stream decode failure even when the raw source was readable.
-            if !succeeded || !filtering_attempted {
+            if !filtering_attempted {
                 return Err(Error::QpdfExc(QpdfExc::new(
                     QpdfErrorCode::DamagedPdf,
                     b"content stream",
