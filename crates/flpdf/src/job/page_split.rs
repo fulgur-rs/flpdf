@@ -340,12 +340,21 @@ impl QPDFJob {
             // `QPDFJob.cc:3019-3021`). Preserve that failure ordering so an
             // unusable output path wins over write-time crypto validation.
             writer.set_output_file(&output_path)?;
-            // qpdf invokes setWriterOptions for the first fresh chunk only
+            // qpdf invokes setWriterOptions inside this same per-chunk loop,
             // after the split resource/page-copy work above
-            // (`QPDFJob.cc:2976-3022`). Normalize passwords here so the
-            // write-time notice is ordered after those diagnostics, and
-            // mutate the shared configuration once so later chunks do not
-            // repeat the notice.
+            // (`QPDFJob.cc:2976-3022`), so password normalization and
+            // weak-crypto validation run once per chunk, not once overall.
+            // Reusing the same `writer_configuration` across chunks (rather
+            // than rebuilding it per chunk) matches qpdf's own member-
+            // mutation semantics for `m->user_password`/`m->owner_password`
+            // (`QPDFJob::maybeFixWritePassword`, `QPDFJob.cc:2655-2724`):
+            // whether a later chunk's notice repeats, is suppressed by an
+            // already-idempotent conversion, or double-processes an
+            // already-converted password (confirmed against qpdf 11.9.0:
+            // `--password-mode=hex-bytes` only opens the first split chunk
+            // with the original hex-decoded password) depends on that
+            // shared, chunk-to-chunk mutated state, not on how many times
+            // this call itself runs.
             self.prepare_writer_configuration(&mut writer_configuration)?;
             writer_configuration.apply_to(&mut writer);
             if let Some(version) = source_version.as_deref() {
@@ -609,7 +618,9 @@ mod tests {
     use crate::job::resource_pruning::SharedResourceFinding;
     use crate::pages::page_refs;
     use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
-    use crate::{ObjectHandle, Pdf, PdfOpenOptions, QPDFLogger};
+    use crate::{
+        EncryptMethod, EncryptParams, ObjectHandle, PasswordMode, Pdf, PdfOpenOptions, QPDFLogger,
+    };
     use std::io::Cursor;
     use std::sync::{Arc, Mutex};
 
@@ -1094,6 +1105,55 @@ mod tests {
             String::from_utf8_lossy(&recorded.lock().unwrap())
                 .contains("this widget annotation is not reachable from /AcroForm"),
             "an unsuppressed source's orphan-widget warning must reach the job's logger"
+        );
+    }
+
+    #[test]
+    fn split_pages_repeats_the_unicode_password_warning_once_per_chunk() {
+        // qpdf calls setEncryptionOptions (which calls maybeFixWritePassword)
+        // from inside its own per-chunk split loop (`QPDFJob::doSplitPages`,
+        // `QPDFJob.cc:2976-3022`), not once for the whole split. Confirmed
+        // against qpdf 11.9.0 (`--password-mode=auto --allow-weak-crypto
+        // --split-pages --encrypt <unicode> "" 128`): a 3-page source split
+        // into 3 one-page chunks prints the "WARNING: supplied password
+        // looks like a Unicode password..." notice exactly 3 times, not once.
+        let src = build_n_page_pdf(3);
+        let mut source = Pdf::open_mem_owned(src).expect("fixture should parse");
+
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let logger = QPDFLogger::create();
+        logger.set_error(Some(PipelineHandle::new(RecordingWarningSink(Arc::clone(
+            &recorded,
+        )))));
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.set_password_mode(PasswordMode::Auto);
+        job.set_allow_weak_crypto(true);
+
+        let mut configuration = WriterConfiguration::default();
+        configuration.set_encryption_parameters(EncryptParams::rc4(
+            EncryptMethod::V2Rc4128,
+            "\u{1f600}not-encodable".as_bytes().to_vec(),
+            Vec::new(),
+        ));
+
+        job.split_pages(
+            &mut source,
+            SplitPageOptions::new(1, temp.path().join("out.pdf"))
+                .with_writer_configuration(configuration),
+        )
+        .expect("split job should succeed despite the non-encodable password");
+
+        let delivered = String::from_utf8_lossy(&recorded.lock().unwrap()).into_owned();
+        let occurrences = delivered
+            .matches("WARNING: supplied password looks like a Unicode password")
+            .count();
+        assert_eq!(
+            occurrences, 3,
+            "each of the 3 one-page chunks must repeat the notice independently, \
+             matching qpdf's own per-chunk setEncryptionOptions call: got {delivered:?}"
         );
     }
 
