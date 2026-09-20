@@ -1054,10 +1054,10 @@ fn path_description_bytes(path: &Path) -> Vec<u8> {
 pub(crate) fn job_json_file_open_error(path: &Path, error: std::io::Error) -> Error {
     // qpdf-deviation: qpdf 11.9.0 leaks libstdc++'s basic_string::_M_create for
     // directory job-JSON paths; that toolchain artifact has no qpdf semantic
-    // contract to reproduce in Rust. `qpdf_file_io_source_message` maps
+    // contract to reproduce in Rust. `qutil::strerror_text` maps
     // `IsADirectory` to qpdf's `strerror(EISDIR)` spelling, which is what the
     // non-leaking hosts print.
-    let message = super::qpdf_file_io_source_message(&error);
+    let message = crate::qutil::strerror_text(&error);
     let mut raw = b"open ".to_vec();
     raw.extend_from_slice(&path_description_bytes(path));
     raw.extend_from_slice(b": ");

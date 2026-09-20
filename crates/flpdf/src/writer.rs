@@ -130,7 +130,7 @@ fn stdio_sink_failure(identifier: Option<&'static str>, source: &io::Error) -> O
         Error::SystemBytes(
             format!(
                 "{identifier}: Pl_StdioFile::write: {}",
-                crate::job::qpdf_file_io_source_message(source)
+                crate::qutil::strerror_text(source)
             )
             .into_bytes(),
         )
