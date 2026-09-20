@@ -356,8 +356,18 @@ fn handle_single_source_page_specs<R: Read + Seek>(
     // everPushedInheritedAttributesToPages state as qpdf.
     crate::PageDocumentHelper::new(source).push_inherited_attributes_to_pages()?;
     let selected_refs: Vec<_> = selected.iter().map(|page| page.page_ref).collect();
-    let result = crate::pages::tree_rebuild::rebuild_page_tree(source, &selected_refs)?;
-    copy_duplicate_page_annotations(source, &result)?;
+    let mut copy_duplicate_annotations =
+        |pdf: &mut Pdf<R>, source_page_ref: ObjectRef, new_page: ObjectRef| -> Result<()> {
+            let source_page = pdf.get_object_handle(source_page_ref);
+            let destination_page = pdf.get_object_handle(new_page);
+            destination_page.remove_key(b"/Annots");
+            PageObjectHelper::new(new_page, pdf).copy_annotations(source_page, Matrix::default())
+        };
+    let result = crate::pages::tree_rebuild::rebuild_page_tree_with_duplicate_hook(
+        source,
+        &selected_refs,
+        &mut copy_duplicate_annotations,
+    )?; // cov:ignore: llvm-cov attributes this executed multiline call to its closing delimiter
 
     let mut labels = source.page_labels();
     if labels.has_page_labels()? {
@@ -1437,6 +1447,13 @@ mod tests {
         .expect("open inherited-resources fixture")
     }
 
+    fn link_annot_no_acroform_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        Pdf::open_mem_owned(
+            include_bytes!("../../../../tests/fixtures/compat/link-annot-no-acroform.pdf").to_vec(),
+        )
+        .expect("open link-annot-no-acroform fixture")
+    }
+
     #[test]
     fn page_spec_report_reuses_one_decision_per_source_identity() {
         let (job, output) = verbose_job();
@@ -1858,6 +1875,70 @@ mod tests {
                     .as_dictionary()
                     .is_some(),
                 "qpdf --pages default copies inherited /Resources directly onto the page"
+            );
+        }
+    }
+
+    /// qpdf allocates each duplicate page's clone and its annotation clone
+    /// back to back, before moving on to the next occurrence
+    /// (`QPDFJob.cc:2537-2585`: `shallowCopyPage` immediately followed by
+    /// `fixCopiedAnnotations` within the same loop iteration). Pin that
+    /// interleaved allocation order rather than only checking that the final
+    /// annotation content is correct. Uses the real in-place single-source
+    /// dispatch (`QPDFJob::handle_page_specs`), not the test-only
+    /// `handle_page_specs` free function above, which always merges into a
+    /// fresh empty target and so never reaches
+    /// `handle_single_source_page_specs`.
+    #[test]
+    fn handle_page_specs_interleaves_duplicate_page_and_annotation_clone_allocation() {
+        let mut sources = vec![link_annot_no_acroform_pdf()];
+        let specs = [PageSpecInput::new(
+            0,
+            PageRange::parse_numrange("1,1,1").unwrap(),
+        )];
+        let mut job = QPDFJob::new();
+
+        let output = job
+            .handle_page_specs(
+                &mut sources,
+                &specs,
+                None,
+                RemoveUnreferencedResources::Auto,
+                false,
+            )
+            .expect("triple-duplicate single-source page job");
+        assert!(matches!(&output, PageSpecJobOutput::InPlace { .. }));
+        let PageSpecJobOutput::InPlace { pdf, .. } = output else {
+            unreachable!("asserted InPlace above") // cov:ignore: prior assert! makes this arm unreachable
+        };
+
+        let page_refs = crate::pages::page_refs(pdf).expect("read merged page tree");
+        assert_eq!(page_refs.len(), 3);
+
+        let mut annot_refs = Vec::with_capacity(3);
+        for &page_ref in &page_refs {
+            let page = resolved_object(pdf, page_ref);
+            let annots = resolved_key(&page, b"/Annots");
+            let annot_array = annots.as_array().expect("/Annots is an array");
+            assert_eq!(annot_array.len(), 1);
+            let annot_ref = annot_array[0]
+                .object_ref()
+                .expect("annotation is an indirect reference");
+            annot_refs.push(annot_ref);
+        }
+
+        assert_eq!(
+            annot_refs.iter().collect::<BTreeSet<_>>().len(),
+            3,
+            "each duplicated page must get its own annotation clone: {annot_refs:?}"
+        );
+
+        for (page_ref, annot_ref) in page_refs.iter().skip(1).zip(annot_refs.iter().skip(1)) {
+            assert_eq!(
+                annot_ref.number,
+                page_ref.number + 1,
+                "annotation clone must be allocated immediately after its page clone, \
+                 matching qpdf's interleaved order: pages={page_refs:?} annots={annot_refs:?}"
             );
         }
     }

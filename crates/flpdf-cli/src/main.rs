@@ -5,8 +5,8 @@ mod arg_parser;
 use clap::{Args as ClapArgs, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use flpdf::fix_qdf;
 use flpdf::job::{
-    copy_duplicate_page_annotations, AttachmentAddOptions, CheckError, FlattenAnnotationsMode,
-    ImageOptimizationOptions, JobExitCode, JsonStreamData, QPDFJob, RemoveUnreferencedResources,
+    AttachmentAddOptions, CheckError, FlattenAnnotationsMode, ImageOptimizationOptions,
+    JobExitCode, JsonStreamData, QPDFJob, RemoveUnreferencedResources,
 };
 use flpdf::pipeline::{FlateAction, Pipeline, PipelineHandle, PlFlate, PlStdioFile};
 use flpdf::qutil::same_file as qpdf_same_file;
@@ -16,13 +16,13 @@ use flpdf::PasswordWriteNotice;
 use flpdf::{
     json_inspect::{DecodeLevel, JsonKey},
     normalize_content_stream, pages, parse_pdf_version, CompressStreams, CopyEncryptionSource,
-    EncryptMethod, EncryptParams, Error, NewlineBeforeEndstream, ObjectHandle, ObjectKeyAlg,
-    ObjectRef, ObjectStreamMode, PasswordMode, Pdf, PdfOpenOptions, PdfVersion, PermissionsConfig,
-    PrintPermission, QPDFLogger, R2PermissionsConfig, StreamDataMode, UsageError,
-    WriterConfiguration,
+    EncryptMethod, EncryptParams, Error, Matrix, NewlineBeforeEndstream, ObjectHandle,
+    ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageObjectHelper, PasswordMode, Pdf, PdfOpenOptions,
+    PdfVersion, PermissionsConfig, PrintPermission, QPDFLogger, R2PermissionsConfig,
+    StreamDataMode, UsageError, WriterConfiguration,
 };
 use flpdf::{
-    pages::tree_rebuild::{rebuild_page_tree, RebuildResult},
+    pages::tree_rebuild::{rebuild_page_tree_with_duplicate_hook, RebuildResult},
     qutil::parse_numrange,
     PageRange,
 };
@@ -7897,8 +7897,17 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         // a second time and split identities that qpdf preserves. Keep the
         // original mode for the later doSplitPages preflight, but make this
         // post-copy completion a resource no-op.
-        let result = rebuild_page_tree(pdf, &selected)?;
-        copy_duplicate_page_annotations(pdf, &result)?;
+        let mut copy_duplicate_annotations = |pdf: &mut Pdf<R>,
+                                              source_page_ref: ObjectRef,
+                                              new_page: ObjectRef|
+         -> flpdf::Result<()> {
+            let source_page = pdf.get_object_handle(source_page_ref);
+            let destination_page = pdf.get_object_handle(new_page);
+            destination_page.remove_key(b"/Annots");
+            PageObjectHelper::new(new_page, pdf).copy_annotations(source_page, Matrix::default())
+        };
+        let result =
+            rebuild_page_tree_with_duplicate_hook(pdf, &selected, &mut copy_duplicate_annotations)?;
         (result, RemoveUnreferencedResources::No)
     };
     QPDFJob::complete_in_place_page_selection(pdf, &result, prune_mode)?;
