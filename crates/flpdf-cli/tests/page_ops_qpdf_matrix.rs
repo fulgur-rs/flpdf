@@ -2378,6 +2378,19 @@ fn zero_page_pages_source_exits_2_like_qpdf_with_a_documented_stderr_deviation()
         .expect("qpdf should spawn");
     assert_eq!(q_result.status.code(), Some(2));
     assert!(!q_out.exists(), "qpdf must write no output for this source");
+    let q_stderr = String::from_utf8_lossy(&q_result.stderr);
+    // The exact text is libstdc++'s, so pin only what identifies it as an
+    // out-of-range leak rather than a diagnostic qpdf composed: a range
+    // check naming an empty container. Another STL would word this
+    // differently, which is the whole reason flpdf does not reproduce it.
+    assert!(
+        q_stderr.contains("_M_range_check") || q_stderr.contains("out_of_range"),
+        "qpdf is expected to leak its STL's out-of-range text here: {q_stderr}"
+    );
+    assert!(
+        !q_stderr.contains("document has no pages"),
+        "qpdf composes no diagnostic for this case: {q_stderr}"
+    );
 
     let f_result = Command::cargo_bin("flpdf")
         .unwrap()
@@ -2398,6 +2411,13 @@ fn zero_page_pages_source_exits_2_like_qpdf_with_a_documented_stderr_deviation()
     assert!(
         f_stderr.contains("missing required PDF entry: document has no pages"),
         "flpdf's documented diagnostic must still be present: {f_stderr}"
+    );
+    // The deviation this test documents is that the two texts differ. If they
+    // ever converge, the `qpdf-deviation` marker on `PagePlan::build` and the
+    // `docs/qpdf-correspondence.md` entry both need revisiting.
+    assert_ne!(
+        q_stderr, f_stderr,
+        "the documented stderr deviation is gone; revisit the qpdf-deviation marker"
     );
 }
 
