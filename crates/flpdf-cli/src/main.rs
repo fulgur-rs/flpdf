@@ -10281,6 +10281,29 @@ mod tests {
         );
     }
 
+    /// The four kinds this helper previously fell through on. It now shares
+    /// `qpdf_open_io_error_message`'s table, which renders qpdf's portable
+    /// `strerror` wording on every host rather than Rust's native text.
+    /// A synthetic error carries no `errno`, so this exercises the table
+    /// itself rather than the raw-code path a real syscall failure takes.
+    #[test]
+    fn json_input_open_error_uses_qpdf_wording_for_every_kind() {
+        for (kind, expected) in [
+            (std::io::ErrorKind::PermissionDenied, "Permission denied"),
+            (std::io::ErrorKind::AlreadyExists, "File exists"),
+            (std::io::ErrorKind::InvalidInput, "Invalid argument"),
+            (std::io::ErrorKind::NotADirectory, "Not a directory"),
+        ] {
+            let error =
+                qpdf_json_input_open_error(Path::new("in.json"), std::io::Error::from(kind));
+            assert_eq!(
+                error.to_string(),
+                format!("open in.json: {expected}"),
+                "{kind:?}"
+            );
+        }
+    }
+
     #[test]
     fn open_error_with_file_keeps_non_io_errors_outside_open_prefix() {
         let error = open_error_with_file(
