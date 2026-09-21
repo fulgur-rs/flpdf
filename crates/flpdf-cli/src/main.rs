@@ -3292,7 +3292,20 @@ fn main() {
             &overlay_specs,
             &attachment_segments,
         )
-    } else if args.json.is_some() || args.json_output.is_some() {
+    // `QPDFJob::writeQPDF` chooses one of three arms -- `doInspection`,
+    // `doSplitPages`, `writeOutfile` (`libqpdf/QPDFJob.cc:486-491`) -- and the
+    // JSON document is written from inside `writeOutfile`. A truthy
+    // `--split-pages` therefore claims the run before JSON output is
+    // reachable, so this route steps aside and the page-operation dispatch
+    // below owns the split, the way it already does for the `--empty` rewrite
+    // and `--linearize` routes above. The JSON selectors leave no trace on
+    // that output: `Config::jsonOutput` lowers `decode_level` without setting
+    // `decode_level_set` (`libqpdf/QPDFJob_config.cc:312-326`), which is the
+    // only flag `setWriterOptions` would replay (`libqpdf/QPDFJob.cc:2873`),
+    // and every other JSON option is consumed by `writeJSON` alone.
+    } else if (args.json.is_some() || args.json_output.is_some())
+        && !split_pages_active(args.page_ops.split_pages.as_deref())
+    {
         run_json(
             &args,
             top_level_inspection_transform_options,

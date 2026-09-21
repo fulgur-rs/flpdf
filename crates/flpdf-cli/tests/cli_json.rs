@@ -2829,3 +2829,95 @@ fn json_page_selection_honors_the_create_stage_job_configuration() {
         "an empty selection must not flatten the target page tree: {empty_json}"
     );
 }
+
+/// qpdf names split chunks from the template's `.pdf` suffix
+/// (`libqpdf/QPDFJob.cc:2950-2959`), so a three-page run yields `-1`/`-2`/`-3`.
+fn split_chunk(directory: &std::path::Path, index: usize) -> std::path::PathBuf {
+    directory.join(format!("out_{index}.pdf"))
+}
+
+#[test]
+fn split_pages_takes_precedence_over_the_json_output_selectors() {
+    // `QPDFJob::writeQPDF` dispatches three ways -- inspection,
+    // `doSplitPages`, `writeOutfile` (`libqpdf/QPDFJob.cc:486-491`) -- and
+    // JSON output is reached only from `writeOutfile`. A split run therefore
+    // never produces JSON: the output name stays a split template and every
+    // chunk is an ordinary PDF.
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/three-page.pdf");
+
+    for selector in ["--json=2", "--json-output=2"] {
+        let tempdir = tempfile::tempdir().unwrap();
+        let template = tempdir.path().join("out_%d.pdf");
+
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .arg(selector)
+            .arg("--split-pages=1")
+            .arg(&fixture)
+            .arg(&template)
+            .assert()
+            .success()
+            .stdout(predicate::str::is_empty());
+
+        assert!(
+            !template.exists(),
+            "{selector}: the split template must not be written as a literal file name"
+        );
+        for index in 1..=3 {
+            let chunk = split_chunk(tempdir.path(), index);
+            let bytes = std::fs::read(&chunk)
+                .unwrap_or_else(|error| panic!("{selector}: read {}: {error}", chunk.display()));
+            assert!(
+                bytes.starts_with(b"%PDF-"),
+                "{selector}: chunk {index} must be a PDF, not JSON text"
+            );
+        }
+        assert!(
+            !split_chunk(tempdir.path(), 4).exists(),
+            "{selector}: a three-page input splits into exactly three chunks"
+        );
+    }
+}
+
+#[test]
+fn a_zero_split_size_leaves_json_output_in_charge() {
+    // qpdf's dispatch tests `m->split_pages` for truth, so `--split-pages=0`
+    // falls through to `writeOutfile` and its JSON destination exactly as if
+    // the option had never been given (`libqpdf/QPDFJob.cc:486-491`).
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/three-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let with_zero = tempdir.path().join("zero.json");
+    let without = tempdir.path().join("plain.json");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json=2", "--split-pages=0"])
+        .arg(&fixture)
+        .arg(&with_zero)
+        .assert()
+        .success();
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("--json=2")
+        .arg(&fixture)
+        .arg(&without)
+        .assert()
+        .success();
+
+    let with_zero = std::fs::read(&with_zero).expect("read zero-split json");
+    assert!(
+        with_zero.starts_with(b"{"),
+        "a zero split size must still produce the JSON document"
+    );
+    assert_eq!(
+        with_zero,
+        std::fs::read(&without).expect("read plain json"),
+        "a zero split size must not change the JSON document"
+    );
+    assert!(
+        !split_chunk(tempdir.path(), 1).exists(),
+        "a zero split size must not write split chunks"
+    );
+}
