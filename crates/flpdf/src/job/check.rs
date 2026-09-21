@@ -311,8 +311,14 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     // Catalog /Type warning in the correct position (`QPDFJob.cc:745-754`).
     pdf.set_check_mode(true);
 
+    // qpdf's doCheck reads `getExtensionLevel()` twice -- once into a local
+    // for the `> 0` guard, once more (redundantly) as the `cout <<` operand
+    // that prints it (`QPDFJob.cc:753-758`). Each call independently clamps
+    // and warns (`QPDF::getExtensionLevel`, `libqpdf/QPDF.cc:2328-2346`), so
+    // a huge `/ExtensionLevel` that needs clamping produces the same warning
+    // twice; reusing one cached value here would silently drop the second.
     let extension_diagnostics_seen = diagnostic_count(pdf);
-    let extension_level = match pdf.adobe_extension_level() {
+    let extension_level = match pdf.get_extension_level() {
         Ok(level) => level,
         Err(error) => {
             return Err(map_check_error(
@@ -324,12 +330,27 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
             ));
         }
     };
-    match extension_level {
-        Some(level) if level > 0 => {
-            let version = format!("PDF Version: {} extension level {level}\n", pdf.version());
-            logger.info(version)?;
-        }
-        Some(_) | None => logger.info(format!("PDF Version: {}\n", pdf.version()))?,
+    if extension_level > 0 {
+        let printed_diagnostics_seen = diagnostic_count(pdf);
+        let printed_level = match pdf.get_extension_level() {
+            Ok(level) => level,
+            Err(error) => {
+                return Err(map_check_error(
+                    logger,
+                    message_prefix,
+                    input_name,
+                    error,
+                    logger_failure_since(pdf, printed_diagnostics_seen),
+                ));
+            }
+        };
+        let version = format!(
+            "PDF Version: {} extension level {printed_level}\n",
+            pdf.version()
+        );
+        logger.info(version)?;
+    } else {
+        logger.info(format!("PDF Version: {}\n", pdf.version()))?;
     }
     // `check()` only ever renders this report for a document that already
     // opened successfully, so the password-derived `user_password_matched`/
@@ -1407,6 +1428,35 @@ mod tests {
         pdf
     }
 
+    /// Like [`extension_level_pdf_bytes`] but with an `/ExtensionLevel`
+    /// beyond `i32::MAX`, matching the fixture qpdf 11.9.0 was probed with
+    /// for [`Pdf::get_extension_level`]'s own clamp test.
+    fn extension_level_overflow_pdf_bytes() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let off1 = pdf.len();
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions << /ADBE << /BaseVersion /1.7 /ExtensionLevel 5000000000 >> >> >>\nendobj\n",
+        );
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len();
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let xref_start = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
     fn page_tree_warning_pdf_bytes() -> Vec<u8> {
         let mut pdf = b"%PDF-1.4\n".to_vec();
         let off1 = pdf.len();
@@ -1853,6 +1903,56 @@ mod tests {
         assert!(outcome.warnings);
         let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
         assert!(output.contains("WARNING: linearized.pdf: first page object (/O) mismatch\n"));
+    }
+
+    #[test]
+    fn document_check_clamps_an_overflow_extension_level_and_warns_three_times() {
+        // Measured with qpdf 11.9.0 (`qpdf --check` on an equivalent
+        // fixture): the printed extension level is clamped to `i32::MAX` and
+        // "requested value of integer is too big; returning INT_MAX" appears
+        // three times from this entry point. Two come from `doCheck` itself,
+        // which calls `getExtensionLevel()` once for the `> 0` guard and once
+        // more (redundantly) to print it (`QPDFJob.cc:753-758`); the third
+        // comes from the linearization check below, which reaches the same
+        // read through the writer's version floor (`QPDFWriter.cc:2176`).
+        // Each call clamps and warns independently. The raw
+        // `adobe_extension_level` accessor this replaced never warned at all.
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let mut pdf = Pdf::open(Cursor::new(extension_level_overflow_pdf_bytes()))
+            .expect("overflow fixture should open");
+        let outcome = check_document(&mut pdf, &logger, "qpdf", "extension-overflow.pdf")
+            .expect("overflow extension level is a warning, not an error");
+        assert!(outcome.warnings);
+        let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
+        assert!(output.contains("PDF Version: 1.7 extension level 2147483647\n"));
+        assert_eq!(
+            output
+                .matches("requested value of integer is too big; returning INT_MAX")
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn document_check_propagates_the_second_extension_level_warning_delivery_failure() {
+        // The first `get_extension_level()` call's clamp warning delivers
+        // fine; the second (redundant, print-time) call's identical warning
+        // is the one whose delivery fails here, exercising the
+        // `printed_level` error arm distinct from the first call's.
+        let mut pdf = Pdf::open(Cursor::new(extension_level_overflow_pdf_bytes()))
+            .expect("overflow fixture should open");
+        let document_logger = QPDFLogger::create();
+        document_logger.set_warn(Some(PipelineHandle::new(
+            crate::pipeline::test_support::NthWriteFailure::new(2),
+        )));
+        pdf.set_logger(document_logger);
+
+        let report_output = Arc::new(Mutex::new(Vec::new()));
+        let report_logger = logger_with_capture(Arc::clone(&report_output));
+        let result = check_document(&mut pdf, &report_logger, "qpdf", "extension-overflow.pdf");
+
+        assert!(result.is_err());
     }
 
     #[test]

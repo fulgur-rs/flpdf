@@ -902,6 +902,63 @@ fn qpdf_ctest_1_reports_plaintext_metadata_and_ignores_outfile() {
 }
 
 #[test]
+fn qpdf_ctest_1_clamps_and_double_warns_an_overflow_extension_level() {
+    // qpdf-ctest.c:139-141 calls `qpdf_get_pdf_extension_level` once for the
+    // `> 0` guard and again (redundantly) to print it; each call
+    // independently clamps to `i32::MAX` and warns on overflow
+    // (`QPDF::getExtensionLevel`, `libqpdf/QPDF.cc:2328-2346`), so a huge
+    // `/ExtensionLevel` produces the same warning twice.
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("ext-overflow.pdf");
+    let mut body = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    offsets.push(body.len());
+    body.extend_from_slice(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions << /ADBE << /ExtensionLevel 5000000000 >> >> >>\nendobj\n",
+    );
+    offsets.push(body.len());
+    body.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+    let xref_offset = body.len();
+    let n = offsets.len() + 1;
+    let mut xref = format!("xref\n0 {n}\n0000000000 65535 f \n").into_bytes();
+    for offset in &offsets {
+        xref.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    body.extend_from_slice(&xref);
+    body.extend_from_slice(
+        format!("trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+            .as_bytes(),
+    );
+    fs::write(&input, body).expect("write overflow fixture");
+    let output = directory.path().join("unused-output.pdf");
+
+    let result = Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args([
+            "1",
+            input.to_str().expect("input path is UTF-8"),
+            "",
+            output.to_str().expect("output path is UTF-8"),
+        ])
+        .output()
+        .expect("qpdf-ctest should spawn");
+
+    assert!(result.status.success());
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.contains("extension level: 2147483647\n"), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("text: requested value of integer is too big; returning INT_MAX")
+            .count(),
+        2,
+        "{stdout}"
+    );
+    assert!(stdout.ends_with("C test 1 done\n"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(stderr.matches("WARNING: ").count(), 2, "{stderr}");
+}
+
+#[test]
 fn qpdf_ctest_1_reports_retained_repair_errors_after_metadata() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let output = directory.path().join("unused-output.pdf");
