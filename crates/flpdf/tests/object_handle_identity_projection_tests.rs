@@ -166,3 +166,55 @@ fn swapping_objects_preserves_the_object_number_zero_handle() {
     assert_eq!(other.object_ref(), Some(other_ref));
     assert!(other.is_indirect());
 }
+
+/// Every accessor that qpdf routes through `dereference()` must settle object
+/// number zero on the null fallback, against a real document rather than a
+/// stand-in resolver. Each accessor opens its own `Pdf` so that none of them
+/// observes resolution another one already performed.
+#[test]
+fn object_number_zero_resolves_to_null_through_a_real_pdf() {
+    let mut pdf = open();
+    let handle = pdf.get_object_handle(object_zero());
+    assert!(!handle.is_resolved());
+    assert!(
+        handle.try_is_null().expect("null resolution"),
+        "object number zero did not settle on qpdf's null fallback"
+    );
+    assert!(handle.is_resolved());
+
+    // Assert serialization through the fallible twin: `unparse_resolved` maps
+    // a failed serialization onto a literal `null`, so only
+    // `try_unparse_resolved` distinguishes real null resolution from that
+    // fallback.
+    let mut pdf = open();
+    let handle = pdf.get_object_handle(object_zero());
+    assert_eq!(
+        handle.try_unparse_resolved().expect("unparse"),
+        b"null".to_vec()
+    );
+
+    // `QPDFObjectHandle::unparse` emits the `N G R` form only for an indirect
+    // handle and otherwise delegates to `unparseResolved`
+    // (`libqpdf/QPDFObjectHandle.cc:1574-1584`).
+    let mut pdf = open();
+    let handle = pdf.get_object_handle(object_zero());
+    assert_eq!(handle.unparse(), b"null".to_vec());
+
+    // `QPDFObjectHandle::writeJSON` gates only the reference form on
+    // `isIndirect()` and otherwise falls through to an unconditional
+    // `dereference()` (`libqpdf/QPDFObjectHandle.cc:1630-1639`,
+    // `:2376-2383`), so object number zero serializes as JSON null under
+    // either `dereference_indirect` setting.
+    for dereference_indirect in [true, false] {
+        let mut pdf = open();
+        let handle = pdf.get_object_handle(object_zero());
+        let json = handle
+            .get_json(2, dereference_indirect)
+            .expect("object number zero must serialize as JSON null");
+        assert!(
+            json.is_null(),
+            "object number zero serialized as something other than JSON null \
+             with dereference_indirect={dereference_indirect}"
+        );
+    }
+}

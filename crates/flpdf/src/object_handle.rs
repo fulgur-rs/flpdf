@@ -8155,28 +8155,36 @@ impl<'a> ObjectJsonWriter<'a> {
         if !state.initialized {
             return Err(ObjectJsonError::Uninitialized);
         }
-        if let Some(object_gen) = state
-            .object_gen
-            .filter(|object_gen| object_gen.is_indirect())
-        {
-            if !dereference_indirect {
+        // qpdf gates only the *reference form* on `isIndirect()`; every other
+        // path falls through to an unconditional `dereference()`
+        // (`libqpdf/QPDFObjectHandle.cc:1630-1639`), which resolves whatever
+        // identity the handle carries without consulting `isIndirect()` at all
+        // (`libqpdf/QPDFObjectHandle.cc:2376-2383`, `QPDFObject::resolve`,
+        // `libqpdf/qpdf/QPDFObject_private.hh:160-166`). Object number zero
+        // carries a cache identity while not being an indirect reference
+        // (`include/qpdf/QPDFObjGen.hh:77-81`), and `QPDF::resolve` settles it
+        // on the unknown-object null fallback (`libqpdf/QPDF.cc:1743-1747`),
+        // so it must reach the value dispatch below as a null rather than as
+        // an unresolved value.
+        if !dereference_indirect {
+            if let Some(object_gen) = state
+                .object_gen
+                .filter(|object_gen| object_gen.is_indirect())
+            {
                 return self.write_qpdf_obj_gen_reference(object_gen);
-            }
-            if state.reserved {
-                return Err(ObjectJsonError::Reserved);
-            }
-            if state.unresolved {
-                if !state.resolver_present {
-                    return Err(ObjectJsonError::Uninitialized);
-                }
-                handle
-                    .try_dereference()
-                    .map_err(|error| ObjectJsonError::Pdf(error.to_string()))?;
             }
         }
 
         if state.reserved {
             return Err(ObjectJsonError::Reserved);
+        }
+        if state.object_gen.is_some() && state.unresolved {
+            if !state.resolver_present {
+                return Err(ObjectJsonError::Uninitialized);
+            }
+            handle
+                .try_dereference()
+                .map_err(|error| ObjectJsonError::Pdf(error.to_string()))?;
         }
         let container = handle.with_value(|value| match value {
             Some(ObjectValue::Null | ObjectValue::Operator(_) | ObjectValue::InlineImage(_)) => {
