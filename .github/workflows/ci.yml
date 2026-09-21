@@ -390,6 +390,13 @@ jobs:
           # chunks stay byte-identical to qpdf's whichever JSON selector is
           # also given (flpdf-zj5ny).
           cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_json_split_pages_precedence_qpdf
+          # Pins --encrypt + --split-pages: every chunk gets its own writer
+          # options (QPDFJob::doSplitPages, QPDFJob.cc:3019-3021), so the
+          # reproducible handlers (R2/R3/R4) stay byte-identical to qpdf and
+          # R6, whose file key and salts qpdf itself draws randomly
+          # (QPDF_encryption.cc:1180-1198), matches everywhere qpdf is
+          # reproducible (flpdf-cqd44).
+          cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_encrypt_split_pages_qpdf
           # Pins top-level no-pages rotate/split transformation handoff
           # (generate-appearances and flatten-annotations) against qpdf's
           # createQPDF -> writeQPDF boundary (flpdf-m6kt).
