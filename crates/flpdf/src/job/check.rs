@@ -1906,15 +1906,17 @@ mod tests {
     }
 
     #[test]
-    fn document_check_clamps_an_overflow_extension_level_and_warns_twice() {
+    fn document_check_clamps_an_overflow_extension_level_and_warns_three_times() {
         // Measured with qpdf 11.9.0 (`qpdf --check` on an equivalent
-        // fixture): the printed extension level is clamped to `i32::MAX`
-        // and "requested value of integer is too big; returning INT_MAX"
-        // appears twice from doCheck's own contribution alone, because
-        // `getExtensionLevel()` is called once for the `> 0` guard and once
-        // more (redundantly) to print it (`QPDFJob.cc:753-758`), and each
-        // call clamps and warns independently. The raw `adobe_extension_level`
-        // accessor this replaced never warned at all.
+        // fixture): the printed extension level is clamped to `i32::MAX` and
+        // "requested value of integer is too big; returning INT_MAX" appears
+        // three times from this entry point. Two come from `doCheck` itself,
+        // which calls `getExtensionLevel()` once for the `> 0` guard and once
+        // more (redundantly) to print it (`QPDFJob.cc:753-758`); the third
+        // comes from the linearization check below, which reaches the same
+        // read through the writer's version floor (`QPDFWriter.cc:2176`).
+        // Each call clamps and warns independently. The raw
+        // `adobe_extension_level` accessor this replaced never warned at all.
         let output = Arc::new(Mutex::new(Vec::new()));
         let logger = logger_with_capture(Arc::clone(&output));
         let mut pdf = Pdf::open(Cursor::new(extension_level_overflow_pdf_bytes()))
@@ -1928,7 +1930,7 @@ mod tests {
             output
                 .matches("requested value of integer is too big; returning INT_MAX")
                 .count(),
-            2
+            3
         );
     }
 

@@ -91,7 +91,11 @@ fn write_plain_live<R: Read + Seek>(
     // does.
     let has_object_stream_hint = !object_streams.is_empty();
     let source_version = pdf.version().to_string();
-    let source_extension_level = pdf.adobe_extension_level()?.unwrap_or(0);
+    // qpdf's `QPDFWriter::doWriteSetup` takes this through
+    // `QPDF::getExtensionLevel` (`QPDFWriter.cc:2176`), which clamps to i32
+    // and warns via `getIntValueAsInt`. Reading the raw value by hand would
+    // skip that warning and carry an out-of-range level into the floor.
+    let source_extension_level = i64::from(pdf.get_extension_level()?);
     let (effective_version, final_extension_level) =
         crate::writer::effective_pdf_version_and_ext_with_encryption(
             &source_version,
