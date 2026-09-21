@@ -11368,7 +11368,7 @@ mod tests {
 
     #[test]
     fn extract_attachment_groups_discards_the_equals_value_like_qpdfs_bare_option() {
-        // qpdf's `--add-attachment` is a bare option (QPDFJob_argv.cc:38's
+        // qpdf's `--add-attachment` is a bare option (auto_job_init.hh:38's
         // addBare): `QPDFArgParser` silently discards any `=value` attached
         // to the flag itself, so a later plain positional token becomes the
         // file. Confirmed against /usr/bin/qpdf 11.9.0: `--add-attachment=
