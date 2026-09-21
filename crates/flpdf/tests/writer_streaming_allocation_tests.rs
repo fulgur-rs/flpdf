@@ -1754,7 +1754,7 @@ fn linearized_stream_emission_uses_the_length_override_owner() {
     let source = include_str!("../src/linearization/writer.rs");
     assert!(
         source.contains(
-            "write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length"
+            "unparse_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length"
         ),
         "linearized stream emission must use the writer-owned length override primitive"
     );

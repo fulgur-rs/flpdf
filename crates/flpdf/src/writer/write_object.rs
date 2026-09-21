@@ -316,7 +316,7 @@ mod tests {
                         let length_ref =
                             (!self.direct_stream_lengths).then_some(ObjectRef::new(2, 0));
                         object
-                            .write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+                            .unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
                                 out,
                                 0,
                                 &|object| Ok(object),
@@ -325,7 +325,7 @@ mod tests {
                                 crate::writer::StreamDictionaryOptions::preserve(),
                             )?;
                     } else {
-                        object.write_stream_body(out, false)?;
+                        object.unparse_stream_body(out, false)?;
                     }
                     serialize::write_stream_payload_with_qdf(
                         out,
@@ -342,11 +342,11 @@ mod tests {
                 Ok(())
             } else if self.qdf.is_some() {
                 crate::writer::output::with_buffer_sink(&mut self.bytes, |out| {
-                    object.write_object_qdf(out, 0)
+                    object.unparse_object_qdf(out, 0)
                 })
             } else {
                 crate::writer::output::with_buffer_sink(&mut self.bytes, |out| {
-                    ObjectWriterEmission::write_object(object, out)
+                    ObjectWriterEmission::unparse_object(object, out)
                 })
             }
         }

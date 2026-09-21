@@ -13455,7 +13455,7 @@ mod unparse_object_tests {
             (b"Contents".to_vec(), ObjectHandle::string(b"hi".to_vec())),
         ]);
         let mut out = Vec::new();
-        dict.write_object(&mut out).unwrap();
+        dict.unparse_object(&mut out).unwrap();
         assert_eq!(out, b"<< /ByteRange [ ] /Contents <6869> /Type /Sig >>");
     }
 
@@ -13467,7 +13467,7 @@ mod unparse_object_tests {
             (b"Contents".to_vec(), ObjectHandle::string(b"hi".to_vec())),
         ]);
         let mut out = Vec::new();
-        dict.write_object(&mut out).unwrap();
+        dict.unparse_object(&mut out).unwrap();
         assert_eq!(out, b"<< /ByteRange [ ] /Contents (hi) /Type /Page >>");
     }
 
@@ -13478,7 +13478,7 @@ mod unparse_object_tests {
             (b"Contents".to_vec(), ObjectHandle::string(b"hi".to_vec())),
         ]);
         let mut out = Vec::new();
-        dict.write_object(&mut out).unwrap();
+        dict.unparse_object(&mut out).unwrap();
         assert_eq!(out, b"<< /Contents (hi) /Type /Sig >>");
     }
 
@@ -13497,7 +13497,7 @@ mod unparse_object_tests {
             (b"Contents".to_vec(), indirect_contents),
         ]);
         let mut out = Vec::new();
-        dict.write_object(&mut out).unwrap();
+        dict.unparse_object(&mut out).unwrap();
         assert_eq!(out, b"<< /ByteRange [ ] /Contents 20 0 R /Type /Sig >>");
     }
 
@@ -13514,7 +13514,7 @@ mod unparse_object_tests {
             (b"Contents".to_vec(), ObjectHandle::integer(7)),
         ]);
         let mut out = Vec::new();
-        dict.write_object(&mut out).unwrap();
+        dict.unparse_object(&mut out).unwrap();
         assert_eq!(out, b"<< /ByteRange [ ] /Contents 7 /Type /Sig >>");
     }
 
@@ -13568,7 +13568,7 @@ mod unparse_object_tests {
             (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
         ]);
         let mut out = Vec::new();
-        let error = dict.write_object(&mut out).unwrap_err();
+        let error = dict.unparse_object(&mut out).unwrap_err();
         assert_eq!(error.to_string(), "object 99 0 belongs to a dropped PDF");
     }
 
@@ -13580,7 +13580,7 @@ mod unparse_object_tests {
             (b"Contents".to_vec(), ObjectHandle::string(b"hi".to_vec())),
         ]);
         let mut out = Vec::new();
-        dict.write_object_qdf(&mut out, 0).unwrap();
+        dict.unparse_object_qdf(&mut out, 0).unwrap();
         assert_eq!(
             out,
             b"<<\n  /ByteRange [\n  ]\n  /Contents <6869>\n  /Type /Sig\n>>"
@@ -13605,7 +13605,7 @@ mod unparse_object_tests {
             (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
         ]);
         let mut out = Vec::new();
-        let error = dict.write_object_qdf(&mut out, 0).unwrap_err();
+        let error = dict.unparse_object_qdf(&mut out, 0).unwrap_err();
         assert_eq!(error.to_string(), "object 99 0 belongs to a dropped PDF");
     }
 
@@ -13623,7 +13623,7 @@ mod unparse_object_tests {
             (b"Length".to_vec(), ObjectHandle::integer(2)),
         ]);
         let mut out = Vec::new();
-        dict.write_stream_body(&mut out, false).unwrap();
+        dict.unparse_stream_body(&mut out, false).unwrap();
         assert_eq!(
             out,
             b"<< /ByteRange [ ] /Contents <6869> /Type /Sig /Length 2 >>"
@@ -13651,7 +13651,7 @@ mod unparse_object_tests {
             (b"Length".to_vec(), ObjectHandle::integer(0)),
         ]);
         let mut out = Vec::new();
-        let error = dict.write_stream_body(&mut out, false).unwrap_err();
+        let error = dict.unparse_stream_body(&mut out, false).unwrap_err();
         assert_eq!(error.to_string(), "object 99 0 belongs to a dropped PDF");
     }
 
@@ -13673,24 +13673,28 @@ mod unparse_object_tests {
     #[test]
     fn unparse_object_writes_a_scalar() {
         let mut out = Vec::new();
-        ObjectHandle::integer(42).write_object(&mut out).unwrap();
+        ObjectHandle::integer(42).unparse_object(&mut out).unwrap();
         assert_eq!(out, b"42");
     }
 
     #[test]
     fn unparse_object_writes_a_boolean() {
         let mut out = Vec::new();
-        ObjectHandle::boolean(true).write_object(&mut out).unwrap();
+        ObjectHandle::boolean(true)
+            .unparse_object(&mut out)
+            .unwrap();
         assert_eq!(out, b"true");
         out.clear();
-        ObjectHandle::boolean(false).write_object(&mut out).unwrap();
+        ObjectHandle::boolean(false)
+            .unparse_object(&mut out)
+            .unwrap();
         assert_eq!(out, b"false");
     }
 
     #[test]
     fn unparse_object_writes_a_real() {
         let mut out = Vec::new();
-        ObjectHandle::real(0.5).write_object(&mut out).unwrap();
+        ObjectHandle::real(0.5).unparse_object(&mut out).unwrap();
         assert_eq!(out, b"0.5");
     }
 
@@ -13698,7 +13702,7 @@ mod unparse_object_tests {
     fn unparse_object_writes_a_string() {
         let mut out = Vec::new();
         ObjectHandle::string(b"hi".to_vec())
-            .write_object(&mut out)
+            .unparse_object(&mut out)
             .unwrap();
         assert_eq!(out, b"(hi)");
     }
@@ -13709,7 +13713,7 @@ mod unparse_object_tests {
         // path, so this one case covers both bindings.
         let mut out = Vec::new();
         ObjectHandle::operator(b"q".to_vec())
-            .write_object(&mut out)
+            .unparse_object(&mut out)
             .unwrap();
         assert_eq!(out, b"q");
     }
@@ -13719,7 +13723,7 @@ mod unparse_object_tests {
         let string_payload = vec![b's'; 256 * 1024];
         let mut out = Vec::new();
         ObjectHandle::string(string_payload.clone())
-            .write_object(&mut out)
+            .unparse_object(&mut out)
             .unwrap();
         assert_eq!(out.len(), string_payload.len() + 2);
         assert_eq!(out.first(), Some(&b'('));
@@ -13728,14 +13732,14 @@ mod unparse_object_tests {
         let operator_payload = vec![b'o'; 256 * 1024];
         out.clear();
         ObjectHandle::operator(operator_payload.clone())
-            .write_object(&mut out)
+            .unparse_object(&mut out)
             .unwrap();
         assert_eq!(out, operator_payload);
 
         let inline_image_payload = vec![b'i'; 256 * 1024];
         out.clear();
         ObjectHandle::inline_image(inline_image_payload.clone())
-            .write_object_qdf(&mut out, 0)
+            .unparse_object_qdf(&mut out, 0)
             .unwrap();
         assert_eq!(out, inline_image_payload);
     }
@@ -13747,7 +13751,7 @@ mod unparse_object_tests {
         // outside an indirect object), so there is no byte-parity oracle
         // here. This pins down the same "inline the dictionary, do not
         // write the `stream`/`endstream` framing" behavior for which
-        // `write_stream_body` is separately responsible, and stays consistent with
+        // `unparse_stream_body` is separately responsible, and stays consistent with
         // that primitive's scope rather than reproducing framing logic here.
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
         let handle = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
@@ -13760,7 +13764,7 @@ mod unparse_object_tests {
             stream_length: 0,
         })));
         let mut out = Vec::new();
-        handle.write_object(&mut out).unwrap();
+        handle.unparse_object(&mut out).unwrap();
         assert_eq!(out, b"<< /Length 2 >>");
     }
 
@@ -13768,14 +13772,14 @@ mod unparse_object_tests {
     fn unparse_object_on_an_indirect_handle_resolving_to_a_stream_inlines_the_dictionary() {
         // Unlike the direct-stream case above, this *is* a real, reachable
         // qpdf shape: an indirect object whose resolved value is a stream.
-        // `write_object`/`unparse_object_walk` dispatch on `self` directly
+        // `unparse_object`/`unparse_object_walk` dispatch on `self` directly
         // (never through `write_child`'s indirect-reference short-circuit,
         // which only applies to *child* positions during recursion), so
         // this reaches the same `ObjectValue::Stream` arm as the direct
         // case and inlines just the dictionary -- not qpdf's real
         // stream-writing output at this position (see
-        // `ObjectHandle::write_object`'s own doc). Pins today's actual
-        // behavior; `write_stream_body` is the primitive that implements the
+        // `ObjectHandle::unparse_object`'s own doc). Pins today's actual
+        // behavior; `unparse_stream_body` is the primitive that implements the
         // real stream-writing path.
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
         let (indirect, _resolver) =
@@ -13789,7 +13793,7 @@ mod unparse_object_tests {
                 stream_length: 0,
             })));
         let mut out = Vec::new();
-        indirect.write_object(&mut out).unwrap();
+        indirect.unparse_object(&mut out).unwrap();
         assert_eq!(out, b"<< /Length 2 >>");
     }
 
@@ -13797,7 +13801,7 @@ mod unparse_object_tests {
     fn unparse_object_writes_a_name_escaped() {
         let mut out = Vec::new();
         ObjectHandle::name(b"application/pdf".to_vec())
-            .write_object(&mut out)
+            .unparse_object(&mut out)
             .unwrap();
         assert_eq!(out, b"/application#2fpdf");
     }
@@ -13806,7 +13810,7 @@ mod unparse_object_tests {
     fn unparse_object_writes_a_real_literal_when_safe() {
         let mut out = Vec::new();
         ObjectHandle::real_literal(0.4, b".4".to_vec())
-            .write_object(&mut out)
+            .unparse_object(&mut out)
             .unwrap();
         assert_eq!(out, b".4");
     }
@@ -13815,7 +13819,7 @@ mod unparse_object_tests {
     fn unparse_object_falls_back_to_canonical_when_literal_is_unsafe() {
         let mut out = Vec::new();
         ObjectHandle::real_literal(0.4, b"nope".to_vec())
-            .write_object(&mut out)
+            .unparse_object(&mut out)
             .unwrap();
         assert_eq!(out, b"0.4");
     }
@@ -13824,14 +13828,16 @@ mod unparse_object_tests {
     fn unparse_object_writes_an_array_with_qpdf_spacing() {
         let handle = ObjectHandle::array(vec![ObjectHandle::integer(1), ObjectHandle::integer(2)]);
         let mut out = Vec::new();
-        handle.write_object(&mut out).unwrap();
+        handle.unparse_object(&mut out).unwrap();
         assert_eq!(out, b"[ 1 2 ]");
     }
 
     #[test]
     fn unparse_object_writes_an_empty_array() {
         let mut out = Vec::new();
-        ObjectHandle::array(vec![]).write_object(&mut out).unwrap();
+        ObjectHandle::array(vec![])
+            .unparse_object(&mut out)
+            .unwrap();
         assert_eq!(out, b"[ ]");
     }
 
@@ -13842,7 +13848,7 @@ mod unparse_object_tests {
             (b"B".to_vec(), ObjectHandle::null()),
         ]);
         let mut out = Vec::new();
-        handle.write_object(&mut out).unwrap();
+        handle.unparse_object(&mut out).unwrap();
         assert_eq!(out, b"<< /A 1 >>");
     }
 
@@ -13854,7 +13860,7 @@ mod unparse_object_tests {
             (b"RefNull".to_vec(), indirect_null),
         ]);
         let mut out = Vec::new();
-        handle.write_object(&mut out).unwrap();
+        handle.unparse_object(&mut out).unwrap();
         assert_eq!(out, b"<< /A 1 >>");
     }
 
@@ -13862,7 +13868,7 @@ mod unparse_object_tests {
     fn unparse_object_writes_an_empty_dict_when_every_entry_is_suppressed() {
         let handle = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::null())]);
         let mut out = Vec::new();
-        handle.write_object(&mut out).unwrap();
+        handle.unparse_object(&mut out).unwrap();
         assert_eq!(out, b"<< >>");
     }
 
@@ -13871,7 +13877,7 @@ mod unparse_object_tests {
         let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Integer(7));
         let handle = ObjectHandle::dictionary(vec![(b"A".to_vec(), indirect)]);
         let mut out = Vec::new();
-        handle.write_object(&mut out).unwrap();
+        handle.unparse_object(&mut out).unwrap();
         assert_eq!(out, b"<< /A 20 0 R >>");
     }
 
@@ -13880,7 +13886,7 @@ mod unparse_object_tests {
         let (indirect, resolver) = resolver_bearing_handle(ObjectValue::Null);
         drop(resolver);
         let mut out = Vec::new();
-        assert!(indirect.write_object(&mut out).is_err());
+        assert!(indirect.unparse_object(&mut out).is_err());
     }
 
     #[test]
@@ -13898,7 +13904,7 @@ mod unparse_object_tests {
         let mut out = Vec::new();
         let mut callback = compact_string_hook;
         handle
-            .write_object_with_string_writer(&mut out, &mut callback)
+            .unparse_object_with_string_writer(&mut out, &mut callback)
             .unwrap();
         assert_eq!(
             out,
@@ -13919,7 +13925,7 @@ mod unparse_object_tests {
         let mut out = Vec::new();
         let mut callback = qdf_string_hook;
         handle
-            .write_object_qdf_with_string_writer(&mut out, 4, &mut callback)
+            .unparse_object_qdf_with_string_writer(&mut out, 4, &mut callback)
             .unwrap();
         assert_eq!(
             out,
@@ -13929,7 +13935,7 @@ mod unparse_object_tests {
         let mut compact = Vec::new();
         let mut compact_callback = compact_string_hook;
         handle
-            .write_object_with_string_writer(&mut compact, &mut compact_callback)
+            .unparse_object_with_string_writer(&mut compact, &mut compact_callback)
             .unwrap();
         assert_eq!(
             compact,
@@ -13939,7 +13945,7 @@ mod unparse_object_tests {
         let mut stream_compact = Vec::new();
         let mut stream_compact_callback = compact_string_hook;
         handle
-            .write_stream_body_with_string_writer(
+            .unparse_stream_body_with_string_writer(
                 &mut stream_compact,
                 false,
                 &mut stream_compact_callback,
@@ -13953,7 +13959,11 @@ mod unparse_object_tests {
         let mut stream_qdf = Vec::new();
         let mut stream_qdf_callback = qdf_string_hook;
         handle
-            .write_stream_body_qdf_with_string_writer(&mut stream_qdf, 0, &mut stream_qdf_callback)
+            .unparse_stream_body_qdf_with_string_writer(
+                &mut stream_qdf,
+                0,
+                &mut stream_qdf_callback,
+            )
             .unwrap();
         assert_eq!(
             stream_qdf,
@@ -13979,7 +13989,7 @@ mod unparse_object_tests {
         ]);
         let mut compact = Vec::new();
         let mut compact_callback = compact_string_hook;
-        dict.write_stream_body_with_string_writer(&mut compact, false, &mut compact_callback)
+        dict.unparse_stream_body_with_string_writer(&mut compact, false, &mut compact_callback)
             .unwrap();
         assert_eq!(
             compact,
@@ -13988,7 +13998,7 @@ mod unparse_object_tests {
 
         let mut qdf = Vec::new();
         let mut qdf_callback = qdf_string_hook;
-        dict.write_stream_body_qdf_with_string_writer(&mut qdf, 2, &mut qdf_callback)
+        dict.unparse_stream_body_qdf_with_string_writer(&mut qdf, 2, &mut qdf_callback)
             .unwrap();
         assert_eq!(
             qdf,
@@ -14017,7 +14027,7 @@ mod unparse_object_tests {
         let mut compact = Vec::new();
         let mut compact_callback = compact_string_hook;
         stream
-            .write_object_with_string_writer(&mut compact, &mut compact_callback)
+            .unparse_object_with_string_writer(&mut compact, &mut compact_callback)
             .expect("direct stream object callback emission");
         assert!(compact
             .windows(b"<hook:stream>".len())
@@ -14026,7 +14036,7 @@ mod unparse_object_tests {
         let mut qdf = Vec::new();
         let mut qdf_callback = qdf_string_hook;
         stream
-            .write_object_qdf_with_string_writer(&mut qdf, 2, &mut qdf_callback)
+            .unparse_object_qdf_with_string_writer(&mut qdf, 2, &mut qdf_callback)
             .expect("direct stream object QDF callback emission");
         assert!(qdf
             .windows(b"{hook:stream}".len())
@@ -14035,7 +14045,7 @@ mod unparse_object_tests {
         let mut stream_body = Vec::new();
         let mut stream_body_callback = compact_string_hook;
         stream
-            .write_stream_body_with_string_writer(
+            .unparse_stream_body_with_string_writer(
                 &mut stream_body,
                 false,
                 &mut stream_body_callback,
@@ -14048,7 +14058,7 @@ mod unparse_object_tests {
         let mut refiltered = Vec::new();
         let mut refiltered_callback = compact_string_hook;
         stream_dict
-            .write_stream_body_with_string_writer(&mut refiltered, true, &mut refiltered_callback)
+            .unparse_stream_body_with_string_writer(&mut refiltered, true, &mut refiltered_callback)
             .expect("refiltered stream dictionary callback emission");
         assert!(!refiltered
             .windows(b"DecodeParms".len())
@@ -14060,7 +14070,11 @@ mod unparse_object_tests {
         let mut stream_qdf = Vec::new();
         let mut stream_qdf_callback = qdf_string_hook;
         stream
-            .write_stream_body_qdf_with_string_writer(&mut stream_qdf, 1, &mut stream_qdf_callback)
+            .unparse_stream_body_qdf_with_string_writer(
+                &mut stream_qdf,
+                1,
+                &mut stream_qdf_callback,
+            )
             .expect("stream value QDF body callback emission");
         assert!(stream_qdf
             .windows(b"{hook:stream}".len())
@@ -14070,7 +14084,7 @@ mod unparse_object_tests {
         let mut scalar_stream_body = Vec::new();
         let mut scalar_stream_callback = compact_string_hook;
         scalar_stream
-            .write_stream_body_with_string_writer(
+            .unparse_stream_body_with_string_writer(
                 &mut scalar_stream_body,
                 false,
                 &mut scalar_stream_callback,
@@ -14080,7 +14094,7 @@ mod unparse_object_tests {
         let mut scalar_stream_qdf_body = Vec::new();
         let mut scalar_stream_qdf_callback = qdf_string_hook;
         scalar_stream
-            .write_stream_body_qdf_with_string_writer(
+            .unparse_stream_body_qdf_with_string_writer(
                 &mut scalar_stream_qdf_body,
                 1,
                 &mut scalar_stream_qdf_callback,
@@ -14091,13 +14105,13 @@ mod unparse_object_tests {
         let mut scalar_body = Vec::new();
         let mut scalar_callback = compact_string_hook;
         ObjectHandle::integer(1)
-            .write_stream_body_with_string_writer(&mut scalar_body, false, &mut scalar_callback)
+            .unparse_stream_body_with_string_writer(&mut scalar_body, false, &mut scalar_callback)
             .expect("non-dictionary stream body degrades to an empty dictionary");
         assert_eq!(scalar_body, b"<< >>");
         let mut scalar_qdf_body = Vec::new();
         let mut scalar_qdf_callback = qdf_string_hook;
         ObjectHandle::integer(1)
-            .write_stream_body_qdf_with_string_writer(
+            .unparse_stream_body_qdf_with_string_writer(
                 &mut scalar_qdf_body,
                 1,
                 &mut scalar_qdf_callback,
@@ -14109,16 +14123,24 @@ mod unparse_object_tests {
         let mut reserved_out = Vec::new();
         let mut reserved_callback = compact_string_hook;
         assert!(reserved
-            .write_object_with_string_writer(&mut reserved_out, &mut reserved_callback)
+            .unparse_object_with_string_writer(&mut reserved_out, &mut reserved_callback)
             .is_err());
         assert!(reserved
-            .write_object_qdf_with_string_writer(&mut reserved_out, 0, &mut reserved_callback,)
+            .unparse_object_qdf_with_string_writer(&mut reserved_out, 0, &mut reserved_callback,)
             .is_err());
         assert!(reserved
-            .write_stream_body_with_string_writer(&mut reserved_out, false, &mut reserved_callback,)
+            .unparse_stream_body_with_string_writer(
+                &mut reserved_out,
+                false,
+                &mut reserved_callback,
+            )
             .is_err());
         assert!(reserved
-            .write_stream_body_qdf_with_string_writer(&mut reserved_out, 0, &mut reserved_callback,)
+            .unparse_stream_body_qdf_with_string_writer(
+                &mut reserved_out,
+                0,
+                &mut reserved_callback,
+            )
             .is_err());
 
         let non_string_sig = ObjectHandle::dictionary(vec![
@@ -14129,7 +14151,10 @@ mod unparse_object_tests {
         let mut non_string_sig_out = Vec::new();
         let mut non_string_sig_callback = compact_string_hook;
         non_string_sig
-            .write_object_with_string_writer(&mut non_string_sig_out, &mut non_string_sig_callback)
+            .unparse_object_with_string_writer(
+                &mut non_string_sig_out,
+                &mut non_string_sig_callback,
+            )
             .expect("non-string signature contents use the ordinary child writer");
         assert!(non_string_sig_out
             .windows(b"/Contents 7".len())
@@ -14145,7 +14170,7 @@ mod unparse_object_tests {
         let mut indirect_sig_out = Vec::new();
         let mut indirect_sig_callback = qdf_string_hook;
         indirect_sig
-            .write_object_qdf_with_string_writer(
+            .unparse_object_qdf_with_string_writer(
                 &mut indirect_sig_out,
                 0,
                 &mut indirect_sig_callback,
@@ -14160,7 +14185,7 @@ mod unparse_object_tests {
     fn unparse_object_qdf_writes_a_scalar_like_plain_unparse() {
         let mut out = Vec::new();
         ObjectHandle::integer(42)
-            .write_object_qdf(&mut out, 0)
+            .unparse_object_qdf(&mut out, 0)
             .unwrap();
         assert_eq!(out, b"42");
     }
@@ -14169,7 +14194,7 @@ mod unparse_object_tests {
     fn unparse_object_qdf_writes_an_array_with_newline_indent() {
         let handle = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
         let mut out = Vec::new();
-        handle.write_object_qdf(&mut out, 0).unwrap();
+        handle.unparse_object_qdf(&mut out, 0).unwrap();
         assert_eq!(out, b"[\n  1\n]");
     }
 
@@ -14180,7 +14205,7 @@ mod unparse_object_tests {
             (b"B".to_vec(), ObjectHandle::null()),
         ]);
         let mut out = Vec::new();
-        handle.write_object_qdf(&mut out, 0).unwrap();
+        handle.unparse_object_qdf(&mut out, 0).unwrap();
         assert_eq!(out, b"<<\n  /A 1\n>>");
     }
 
@@ -14191,7 +14216,7 @@ mod unparse_object_tests {
             ObjectHandle::array(vec![ObjectHandle::integer(1)]),
         )]);
         let mut out = Vec::new();
-        handle.write_object_qdf(&mut out, 0).unwrap();
+        handle.unparse_object_qdf(&mut out, 0).unwrap();
         assert_eq!(out, b"<<\n  /Kids [\n    1\n  ]\n>>");
     }
 
@@ -14204,7 +14229,7 @@ mod unparse_object_tests {
         let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Integer(7));
         let handle = ObjectHandle::dictionary(vec![(b"A".to_vec(), indirect)]);
         let mut out = Vec::new();
-        handle.write_object_qdf(&mut out, 0).unwrap();
+        handle.unparse_object_qdf(&mut out, 0).unwrap();
         assert_eq!(out, b"<<\n  /A 20 0 R\n>>");
     }
 
@@ -14226,7 +14251,7 @@ mod unparse_object_tests {
                 stream_length: 0,
             })));
         let mut out = Vec::new();
-        indirect.write_object_qdf(&mut out, 0).unwrap();
+        indirect.unparse_object_qdf(&mut out, 0).unwrap();
         assert_eq!(out, b"<<\n  /Length 2\n>>");
     }
 
@@ -14242,7 +14267,7 @@ mod unparse_object_tests {
             ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]),
         )]);
         let mut out = Vec::new();
-        handle.write_object_qdf(&mut out, 0).unwrap();
+        handle.unparse_object_qdf(&mut out, 0).unwrap();
         assert_eq!(out, b"<<\n  /D <<\n    /A 1\n  >>\n>>");
     }
 
@@ -14251,7 +14276,7 @@ mod unparse_object_tests {
         let (indirect, resolver) = resolver_bearing_handle(ObjectValue::Null);
         drop(resolver);
         let mut out = Vec::new();
-        assert!(indirect.write_object_qdf(&mut out, 0).is_err());
+        assert!(indirect.unparse_object_qdf(&mut out, 0).is_err());
     }
 
     #[test]
@@ -14266,7 +14291,7 @@ mod unparse_object_tests {
         // at `indent + 2`) both prove the argument actually reached them.
         let handle = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
         let mut out = Vec::new();
-        handle.write_object_qdf(&mut out, 4).unwrap();
+        handle.unparse_object_qdf(&mut out, 4).unwrap();
         assert_eq!(out, b"<<\n      /A 1\n    >>");
     }
 
@@ -14280,7 +14305,7 @@ mod unparse_object_tests {
         // default `0`.
         let handle = ObjectHandle::dictionary(vec![]);
         let mut out = Vec::new();
-        handle.write_object_qdf(&mut out, 4).unwrap();
+        handle.unparse_object_qdf(&mut out, 4).unwrap();
         assert_eq!(out, b"<<\n    >>");
     }
 
@@ -14307,7 +14332,7 @@ mod unparse_object_tests {
             (b"Length".to_vec(), ObjectHandle::integer(3)),
         ]);
         let mut out = Vec::new();
-        dict.write_stream_body(&mut out, false).unwrap();
+        dict.unparse_stream_body(&mut out, false).unwrap();
         assert_eq!(
             out,
             b"<< /DecodeParms << >> /Filter /FlateDecode /Length 3 >>"
@@ -14331,7 +14356,7 @@ mod unparse_object_tests {
             (b"Length".to_vec(), ObjectHandle::integer(3)),
         ]);
         let mut out = Vec::new();
-        dict.write_stream_body(&mut out, true).unwrap();
+        dict.unparse_stream_body(&mut out, true).unwrap();
         assert_eq!(out, b"<< /Length 3 /Filter /FlateDecode >>");
     }
 
@@ -14361,7 +14386,7 @@ mod unparse_object_tests {
             (b"Length".to_vec(), ObjectHandle::integer(3)),
         ]);
         let mut out = Vec::new();
-        dict.write_stream_body(&mut out, true).unwrap();
+        dict.unparse_stream_body(&mut out, true).unwrap();
         assert_eq!(out, b"<< /Length 3 /Filter /FlateDecode >>");
     }
 
@@ -14381,7 +14406,7 @@ mod unparse_object_tests {
             (b"Length".to_vec(), ObjectHandle::integer(3)),
         ]);
         let mut out = Vec::new();
-        assert!(dict.write_stream_body(&mut out, false).is_err());
+        assert!(dict.unparse_stream_body(&mut out, false).is_err());
     }
 
     #[test]
@@ -14397,7 +14422,7 @@ mod unparse_object_tests {
         ]);
         let mut out = Vec::new();
         let error = dict
-            .write_stream_body(&mut out, true)
+            .unparse_stream_body(&mut out, true)
             .expect_err("qpdf probes DecodeParms before the filtered removal branch");
         assert_eq!(error.to_string(), "resolver failed");
     }
@@ -14417,13 +14442,13 @@ mod unparse_object_tests {
 
         let mut object = Vec::new();
         stream
-            .write_object_with_ref_map_and_removed(&mut object, &map, &BTreeSet::new())
+            .unparse_object_with_ref_map_and_removed(&mut object, &map, &BTreeSet::new())
             .unwrap();
         assert_eq!(object, b"<< /Child 8 0 R /Length 2 >>");
 
         let mut body = Vec::new();
         stream
-            .write_stream_body_with_ref_map_and_removed(&mut body, false, &map, &BTreeSet::new())
+            .unparse_stream_body_with_ref_map_and_removed(&mut body, false, &map, &BTreeSet::new())
             .unwrap();
         assert_eq!(body, b"<< /Child 8 0 R /Length 2 >>");
 
@@ -14437,7 +14462,7 @@ mod unparse_object_tests {
         );
         let mut signature_body = Vec::new();
         signature
-            .write_stream_body_with_ref_map_and_removed(
+            .unparse_stream_body_with_ref_map_and_removed(
                 &mut signature_body,
                 false,
                 &map,
@@ -14451,7 +14476,7 @@ mod unparse_object_tests {
 
         let mut nested_non_dictionary = Vec::new();
         ObjectHandle::stream(ObjectHandle::integer(5), Rc::new(b"ab".to_vec()))
-            .write_stream_body_with_ref_map_and_removed(
+            .unparse_stream_body_with_ref_map_and_removed(
                 &mut nested_non_dictionary,
                 false,
                 &map,
@@ -14462,7 +14487,7 @@ mod unparse_object_tests {
 
         let mut non_dictionary = Vec::new();
         ObjectHandle::integer(5)
-            .write_stream_body_with_ref_map_and_removed(
+            .unparse_stream_body_with_ref_map_and_removed(
                 &mut non_dictionary,
                 false,
                 &map,
@@ -14490,7 +14515,7 @@ mod unparse_object_tests {
             (b"Removed".to_vec(), removed.clone()),
         ]);
         let mut object = Vec::new();
-        dict.write_object_with_ref_map_and_removed(&mut object, &map, &removed_refs)
+        dict.unparse_object_with_ref_map_and_removed(&mut object, &map, &removed_refs)
             .unwrap();
         assert_eq!(object, b"<< /Mapped 8 0 R >>");
 
@@ -14504,7 +14529,7 @@ mod unparse_object_tests {
         );
         let mut body = Vec::new();
         stream
-            .write_stream_body_with_ref_map_and_removed(&mut body, false, &map, &removed_refs)
+            .unparse_stream_body_with_ref_map_and_removed(&mut body, false, &map, &removed_refs)
             .unwrap();
         assert_eq!(body, b"<< /Mapped 8 0 R /Length 2 >>");
     }
@@ -14548,7 +14573,7 @@ mod unparse_object_tests {
 
         let mut compact = Vec::new();
         stream
-            .write_stream_body_with_ref_map_and_removed_with_string_writer(
+            .unparse_stream_body_with_ref_map_and_removed_with_string_writer(
                 &mut compact,
                 false,
                 &map,
@@ -14564,7 +14589,7 @@ mod unparse_object_tests {
 
         let mut refiltered = Vec::new();
         stream
-            .write_stream_body_with_ref_map_and_removed_with_string_writer(
+            .unparse_stream_body_with_ref_map_and_removed_with_string_writer(
                 &mut refiltered,
                 true,
                 &map,
@@ -14579,7 +14604,7 @@ mod unparse_object_tests {
 
         let mut qdf_source_length = Vec::new();
         stream
-            .write_stream_body_qdf_with_ref_map_and_removed_and_length(
+            .unparse_stream_body_qdf_with_ref_map_and_removed_and_length(
                 &mut qdf_source_length,
                 2,
                 &map,
@@ -14593,7 +14618,7 @@ mod unparse_object_tests {
 
         let mut qdf_synthetic_length = Vec::new();
         stream
-            .write_stream_body_qdf_with_ref_map_and_removed_and_length(
+            .unparse_stream_body_qdf_with_ref_map_and_removed_and_length(
                 &mut qdf_synthetic_length,
                 2,
                 &map,
@@ -14605,7 +14630,7 @@ mod unparse_object_tests {
 
         let mut qdf_encrypted_source_length = Vec::new();
         stream
-            .write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
+            .unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
                 &mut qdf_encrypted_source_length,
                 2,
                 &map,
@@ -14620,7 +14645,7 @@ mod unparse_object_tests {
 
         let mut qdf_encrypted_synthetic_length = Vec::new();
         stream
-            .write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
+            .unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
                 &mut qdf_encrypted_synthetic_length,
                 2,
                 &map,
@@ -14634,7 +14659,7 @@ mod unparse_object_tests {
         let scalar = ObjectHandle::integer(5);
         let mut scalar_qdf = Vec::new();
         scalar
-            .write_stream_body_qdf_with_ref_map_and_removed_and_length(
+            .unparse_stream_body_qdf_with_ref_map_and_removed_and_length(
                 &mut scalar_qdf,
                 0,
                 &map,
@@ -14645,7 +14670,7 @@ mod unparse_object_tests {
         assert_eq!(scalar_qdf, b"<<\n>>");
         let mut scalar_qdf_encrypted = Vec::new();
         scalar
-            .write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
+            .unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
                 &mut scalar_qdf_encrypted,
                 0,
                 &map,
@@ -14657,7 +14682,7 @@ mod unparse_object_tests {
         assert_eq!(scalar_qdf_encrypted, b"<<\n  /Length null\n>>");
         let mut scalar_compact_encrypted = Vec::new();
         scalar
-            .write_stream_body_with_ref_map_and_removed_with_string_writer(
+            .unparse_stream_body_with_ref_map_and_removed_with_string_writer(
                 &mut scalar_compact_encrypted,
                 false,
                 &map,
@@ -14673,7 +14698,7 @@ mod unparse_object_tests {
         )]);
         let mut no_length_qdf = Vec::new();
         no_length
-            .write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
+            .unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
                 &mut no_length_qdf,
                 0,
                 &map,
@@ -14687,7 +14712,7 @@ mod unparse_object_tests {
         let reserved = ObjectHandle::new_reserved_direct();
         let mut reserved_out = Vec::new();
         assert!(reserved
-            .write_stream_body_qdf_with_ref_map_and_removed_and_length(
+            .unparse_stream_body_qdf_with_ref_map_and_removed_and_length(
                 &mut reserved_out,
                 0,
                 &map,
@@ -14696,7 +14721,7 @@ mod unparse_object_tests {
             )
             .is_err());
         assert!(reserved
-            .write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
+            .unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
                 &mut reserved_out,
                 0,
                 &map,
@@ -14706,7 +14731,7 @@ mod unparse_object_tests {
             )
             .is_err());
         assert!(reserved
-            .write_stream_body_with_ref_map_and_removed_with_string_writer(
+            .unparse_stream_body_with_ref_map_and_removed_with_string_writer(
                 &mut reserved_out,
                 false,
                 &map,
@@ -14719,7 +14744,7 @@ mod unparse_object_tests {
             ObjectHandle::stream(ObjectHandle::integer(1), Rc::new(Vec::new()));
         let mut non_dictionary_dict_qdf = Vec::new();
         stream_with_non_dictionary_dict
-            .write_stream_body_qdf_with_ref_map_and_removed_and_length(
+            .unparse_stream_body_qdf_with_ref_map_and_removed_and_length(
                 &mut non_dictionary_dict_qdf,
                 0,
                 &map,
@@ -14730,7 +14755,7 @@ mod unparse_object_tests {
         assert_eq!(non_dictionary_dict_qdf, b"<<\n>>");
         let mut non_dictionary_dict_qdf_string = Vec::new();
         stream_with_non_dictionary_dict
-            .write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
+            .unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
                 &mut non_dictionary_dict_qdf_string,
                 0,
                 &map,
@@ -14742,7 +14767,7 @@ mod unparse_object_tests {
         assert_eq!(non_dictionary_dict_qdf_string, b"<<\n  /Length null\n>>");
         let mut non_dictionary_dict_compact_string = Vec::new();
         stream_with_non_dictionary_dict
-            .write_stream_body_with_ref_map_and_removed_with_string_writer(
+            .unparse_stream_body_with_ref_map_and_removed_with_string_writer(
                 &mut non_dictionary_dict_compact_string,
                 false,
                 &map,
@@ -14760,7 +14785,7 @@ mod unparse_object_tests {
             (b"Metadata".to_vec(), ObjectHandle::null()),
         ]);
         let mut out = Vec::new();
-        dict.write_stream_body(&mut out, false).unwrap();
+        dict.unparse_stream_body(&mut out, false).unwrap();
         assert_eq!(out, b"<< /Length 3 >>");
     }
 
@@ -14769,11 +14794,11 @@ mod unparse_object_tests {
         // Mirrors unparse_object_inlines_only_the_dictionary_of_a_direct_stream_value
         // above: a *direct* Stream ObjectValue has no qpdf counterpart (a
         // real QPDFObjectHandle's resolved value is never itself a stream
-        // outside an indirect object), but `write_stream_body` must still
+        // outside an indirect object), but `unparse_stream_body` must still
         // use its `stream_dict`'s entries rather than falling into the
         // non-dictionary-self `<< >>` degrade below -- keeping the promise
-        // those two `write_object`/`write_object_qdf` tests made on this
-        // primitive's behalf (`write_stream_body` is separately responsible
+        // those two `unparse_object`/`unparse_object_qdf` tests made on this
+        // primitive's behalf (`unparse_stream_body` is separately responsible
         // for this).
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
         let handle = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
@@ -14786,7 +14811,7 @@ mod unparse_object_tests {
             stream_length: 0,
         })));
         let mut out = Vec::new();
-        handle.write_stream_body(&mut out, false).unwrap();
+        handle.unparse_stream_body(&mut out, false).unwrap();
         assert_eq!(out, b"<< /Length 2 >>");
     }
 
@@ -14811,7 +14836,7 @@ mod unparse_object_tests {
                 stream_length: 0,
             })));
         let mut out = Vec::new();
-        indirect.write_stream_body(&mut out, false).unwrap();
+        indirect.unparse_stream_body(&mut out, false).unwrap();
         assert_eq!(out, b"<< /Length 2 >>");
     }
 
@@ -14833,7 +14858,7 @@ mod unparse_object_tests {
         ));
         let handle = ObjectHandle::stream(inner, Rc::new(b"ab".to_vec()));
         let mut out = Vec::new();
-        handle.write_stream_body(&mut out, false).unwrap();
+        handle.unparse_stream_body(&mut out, false).unwrap();
         assert_eq!(out, b"<< /Length 2 >>");
     }
 
@@ -14851,7 +14876,7 @@ mod unparse_object_tests {
         drop(resolver);
         let handle = ObjectHandle::stream(inner, Rc::new(b"ab".to_vec()));
         let mut out = Vec::new();
-        assert!(handle.write_stream_body(&mut out, false).is_err());
+        assert!(handle.unparse_stream_body(&mut out, false).is_err());
     }
 
     #[test]
@@ -14865,7 +14890,7 @@ mod unparse_object_tests {
         // `stream_dict`'s own resolved value.
         let handle = ObjectHandle::stream(ObjectHandle::integer(5), Rc::new(b"ab".to_vec()));
         let mut out = Vec::new();
-        handle.write_stream_body(&mut out, false).unwrap();
+        handle.unparse_stream_body(&mut out, false).unwrap();
         assert_eq!(out, b"<< >>");
     }
 
@@ -14877,7 +14902,7 @@ mod unparse_object_tests {
         // writes an empty `<< >>` rather than panicking or erroring.
         let mut out = Vec::new();
         ObjectHandle::integer(5)
-            .write_stream_body(&mut out, false)
+            .unparse_stream_body(&mut out, false)
             .unwrap();
         assert_eq!(out, b"<< >>");
     }
@@ -14891,11 +14916,11 @@ mod unparse_object_tests {
         let (indirect, resolver) = resolver_bearing_handle(ObjectValue::Null);
         drop(resolver);
         let mut out = Vec::new();
-        assert!(indirect.write_stream_body(&mut out, false).is_err());
+        assert!(indirect.unparse_stream_body(&mut out, false).is_err());
     }
 
     // QDF-mode sibling suite of the `unparse_stream_body_*` tests above,
-    // for `write_stream_body_qdf`. Every hardcoded expected byte string
+    // for `unparse_stream_body_qdf`. Every hardcoded expected byte string
     // below was cross-checked against a live call to
     // `Dictionary::write_pdf_stream_qdf` (`object.rs`) with an equivalent
     // dictionary before being pinned here, not hand-derived from reading
@@ -14906,7 +14931,7 @@ mod unparse_object_tests {
     #[test]
     fn unparse_stream_body_qdf_writes_length_last_preserved() {
         // No `refiltered` dimension exists for the QDF shape (see
-        // `write_stream_body_qdf`'s own doc for why), so unlike its
+        // `unparse_stream_body_qdf`'s own doc for why), so unlike its
         // compact sibling this has only one shape to pin: every other key
         // stays at its natural alphabetical position, and `/Length` is
         // pulled out and written last, immediately before the closing
@@ -14931,7 +14956,7 @@ mod unparse_object_tests {
             (b"Width".to_vec(), ObjectHandle::integer(100)),
         ]);
         let mut out = Vec::new();
-        dict.write_stream_body_qdf(&mut out, 0).unwrap();
+        dict.unparse_stream_body_qdf(&mut out, 0).unwrap();
         assert_eq!(
             out,
             b"<<\n  /DecodeParms <<\n  >>\n  /Filter /FlateDecode\n  /Width 100\n  /Length 3\n>>"
@@ -14952,7 +14977,7 @@ mod unparse_object_tests {
             (b"Length".to_vec(), ObjectHandle::integer(2)),
         ]);
         let mut out = Vec::new();
-        dict.write_stream_body_qdf(&mut out, 0).unwrap();
+        dict.unparse_stream_body_qdf(&mut out, 0).unwrap();
         assert_eq!(
             out,
             b"<<\n  /ByteRange [\n  ]\n  /Contents <6869>\n  /Type /Sig\n  /Length 2\n>>"
@@ -14979,7 +15004,7 @@ mod unparse_object_tests {
             (b"Length".to_vec(), ObjectHandle::integer(0)),
         ]);
         let mut out = Vec::new();
-        let error = dict.write_stream_body_qdf(&mut out, 0).unwrap_err();
+        let error = dict.unparse_stream_body_qdf(&mut out, 0).unwrap_err();
         assert_eq!(error.to_string(), "object 99 0 belongs to a dropped PDF");
     }
 
@@ -14990,7 +15015,7 @@ mod unparse_object_tests {
             (b"Metadata".to_vec(), ObjectHandle::null()),
         ]);
         let mut out = Vec::new();
-        dict.write_stream_body_qdf(&mut out, 0).unwrap();
+        dict.unparse_stream_body_qdf(&mut out, 0).unwrap();
         // Cross-checked against a direct `Dictionary::write_pdf_stream_qdf`
         // call on the equivalent dict *without* the null key removed: that
         // call writes `/Metadata null` verbatim (`write_pdf_stream_qdf`
@@ -15007,7 +15032,7 @@ mod unparse_object_tests {
     fn unparse_stream_body_qdf_writes_an_empty_dict_when_every_entry_is_suppressed() {
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::null())]);
         let mut out = Vec::new();
-        dict.write_stream_body_qdf(&mut out, 0).unwrap();
+        dict.unparse_stream_body_qdf(&mut out, 0).unwrap();
         // No surviving entries and no `/Length`: matches
         // `write_pdf_stream_qdf`'s own empty-input shape `<<\n>>` (no
         // interior spaces at indent 0 -- `push_spaces(indent)` only adds
@@ -15032,7 +15057,7 @@ mod unparse_object_tests {
             (b"Length".to_vec(), ObjectHandle::integer(2)),
         ]);
         let mut out = Vec::new();
-        dict.write_stream_body_qdf(&mut out, 4).unwrap();
+        dict.unparse_stream_body_qdf(&mut out, 4).unwrap();
         assert_eq!(out, b"<<\n      /A 1\n      /Length 2\n    >>");
     }
 
@@ -15058,7 +15083,7 @@ mod unparse_object_tests {
             (b"Length".to_vec(), ObjectHandle::integer(3)),
         ]);
         let mut out = Vec::new();
-        dict.write_stream_body_qdf(&mut out, 4).unwrap();
+        dict.unparse_stream_body_qdf(&mut out, 4).unwrap();
         assert_eq!(
             out,
             b"<<\n      /DecodeParms <<\n        /Predictor 12\n      >>\n      /Length 3\n    >>"
@@ -15077,7 +15102,7 @@ mod unparse_object_tests {
             (b"Length".to_vec(), ObjectHandle::integer(2)),
         ]);
         let mut out = Vec::new();
-        dict.write_stream_body_qdf(&mut out, 0).unwrap();
+        dict.unparse_stream_body_qdf(&mut out, 0).unwrap();
         assert_eq!(out, b"<<\n  /A 20 0 R\n  /Length 2\n>>");
     }
 
@@ -15098,7 +15123,7 @@ mod unparse_object_tests {
             stream_length: 0,
         })));
         let mut out = Vec::new();
-        handle.write_stream_body_qdf(&mut out, 0).unwrap();
+        handle.unparse_stream_body_qdf(&mut out, 0).unwrap();
         assert_eq!(out, b"<<\n  /Length 2\n>>");
     }
 
@@ -15120,7 +15145,7 @@ mod unparse_object_tests {
                 stream_length: 0,
             })));
         let mut out = Vec::new();
-        indirect.write_stream_body_qdf(&mut out, 0).unwrap();
+        indirect.unparse_stream_body_qdf(&mut out, 0).unwrap();
         assert_eq!(out, b"<<\n  /Length 2\n>>");
     }
 
@@ -15141,7 +15166,7 @@ mod unparse_object_tests {
         ));
         let handle = ObjectHandle::stream(inner, Rc::new(b"ab".to_vec()));
         let mut out = Vec::new();
-        handle.write_stream_body_qdf(&mut out, 0).unwrap();
+        handle.unparse_stream_body_qdf(&mut out, 0).unwrap();
         assert_eq!(out, b"<<\n  /Length 2\n>>");
     }
 
@@ -15156,7 +15181,7 @@ mod unparse_object_tests {
         drop(resolver);
         let handle = ObjectHandle::stream(inner, Rc::new(b"ab".to_vec()));
         let mut out = Vec::new();
-        assert!(handle.write_stream_body_qdf(&mut out, 0).is_err());
+        assert!(handle.unparse_stream_body_qdf(&mut out, 0).is_err());
     }
 
     #[test]
@@ -15167,7 +15192,7 @@ mod unparse_object_tests {
         // a `Dictionary`.
         let handle = ObjectHandle::stream(ObjectHandle::integer(5), Rc::new(b"ab".to_vec()));
         let mut out = Vec::new();
-        handle.write_stream_body_qdf(&mut out, 0).unwrap();
+        handle.unparse_stream_body_qdf(&mut out, 0).unwrap();
         assert_eq!(out, b"<<\n>>");
     }
 
@@ -15177,7 +15202,7 @@ mod unparse_object_tests {
         // pins the doc comment's typed-input-assumption claim.
         let mut out = Vec::new();
         ObjectHandle::integer(5)
-            .write_stream_body_qdf(&mut out, 0)
+            .unparse_stream_body_qdf(&mut out, 0)
             .unwrap();
         assert_eq!(out, b"<<\n>>");
     }
@@ -15192,7 +15217,7 @@ mod unparse_object_tests {
         let (indirect, resolver) = resolver_bearing_handle(ObjectValue::Null);
         drop(resolver);
         let mut out = Vec::new();
-        assert!(indirect.write_stream_body_qdf(&mut out, 0).is_err());
+        assert!(indirect.unparse_stream_body_qdf(&mut out, 0).is_err());
     }
 
     #[test]

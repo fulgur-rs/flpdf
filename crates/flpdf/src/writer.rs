@@ -5437,7 +5437,7 @@ mod final_handle_writer_tests {
         let removed = BTreeSet::new();
         let mut output = Vec::new();
         output::with_buffer_sink(&mut output, |out| {
-            root.write_root_object_with_ref_map_and_removed(out, &map, &removed, "1.7", 8, true)
+            root.unparse_root_object_with_ref_map_and_removed(out, &map, &removed, "1.7", 8, true)
         })
         .expect("root output succeeds");
         assert_eq!(
@@ -5453,7 +5453,7 @@ mod final_handle_writer_tests {
 
         output.clear();
         output::with_buffer_sink(&mut output, |out| {
-            root.write_root_object_with_ref_map_and_removed(out, &map, &removed, "1.7", 0, true)
+            root.unparse_root_object_with_ref_map_and_removed(out, &map, &removed, "1.7", 0, true)
         })
         .expect("root output succeeds");
         assert!(extensions.try_get_key(b"/ADBE").unwrap().is_null());
@@ -5480,7 +5480,7 @@ mod final_handle_writer_tests {
         ]);
         let map = |_| Err(Error::Internal("test reference mapping failure".into()));
         let result = output::with_buffer_sink(&mut Vec::new(), |out| {
-            root.write_root_object_with_ref_map_and_removed(
+            root.unparse_root_object_with_ref_map_and_removed(
                 out,
                 &map,
                 &BTreeSet::new(),
@@ -5518,7 +5518,7 @@ mod final_handle_writer_tests {
         let map = |object_ref| Ok(object_ref);
         let removed = BTreeSet::new();
         output::with_buffer_sink(&mut output, |out| {
-            root.write_root_object_with_ref_map_and_removed(out, &map, &removed, "1.7", 8, true)
+            root.unparse_root_object_with_ref_map_and_removed(out, &map, &removed, "1.7", 8, true)
         })
         .expect("root output succeeds");
 
