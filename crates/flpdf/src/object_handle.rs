@@ -7663,6 +7663,7 @@ impl ObjectHandle {
             json_version,
             dereference_indirect,
             depth,
+            ObjectJsonDispatch::Handle,
         )
     }
 
@@ -8074,6 +8075,27 @@ struct JsonDispatchState {
     resolver_present: bool,
 }
 
+/// Which of qpdf's two JSON entry points a value is being written through.
+///
+/// qpdf reaches the same serializer by two routes that differ in exactly one
+/// respect: whether the receiver is resolved first.
+/// `QPDFObjectHandle::writeJSON` dereferences it
+/// (`libqpdf/QPDFObjectHandle.cc:1630-1639`, `:2376-2383`), while
+/// `QPDF_Array::writeJSON` bypasses the handle and writes each element through
+/// `QPDFObject::writeJSON`, which never resolves
+/// (`libqpdf/QPDF_Array.cc:163-169`).
+///
+/// The two coincide for every identity but object number zero: an indirect
+/// identity takes the reference-form branch before either route can resolve
+/// anything, and a direct value is never unresolved to begin with.
+#[derive(Clone, Copy)]
+enum ObjectJsonDispatch {
+    /// `QPDFObjectHandle::writeJSON`: resolve the receiver, then serialize.
+    Handle,
+    /// `QPDFObject::writeJSON`: serialize the value exactly as it stands.
+    Value,
+}
+
 const LIVE_DICTIONARY_KEY_INLINE_CAPACITY: usize = 32;
 
 pub(crate) struct LiveDictionaryKeyBuffer {
@@ -8130,6 +8152,7 @@ impl<'a> ObjectJsonWriter<'a> {
         json_version: i32,
         dereference_indirect: bool,
         depth: usize,
+        dispatch: ObjectJsonDispatch,
     ) -> std::result::Result<(), ObjectJsonError> {
         if depth > crate::parser::MAX_PARSE_DEPTH {
             return Err(ObjectJsonError::Pdf(format!(
@@ -8140,7 +8163,7 @@ impl<'a> ObjectJsonWriter<'a> {
         stacker::maybe_grow(
             OBJECT_JSON_STACK_RED_ZONE,
             OBJECT_JSON_STACK_GROWTH_SIZE,
-            || self.write_handle_inner(handle, json_version, dereference_indirect, depth),
+            || self.write_handle_inner(handle, json_version, dereference_indirect, depth, dispatch),
         )
     }
 
@@ -8150,33 +8173,48 @@ impl<'a> ObjectJsonWriter<'a> {
         json_version: i32,
         dereference_indirect: bool,
         depth: usize,
+        dispatch: ObjectJsonDispatch,
     ) -> std::result::Result<(), ObjectJsonError> {
         let state = handle.json_dispatch_state();
         if !state.initialized {
             return Err(ObjectJsonError::Uninitialized);
         }
-        if let Some(object_gen) = state
-            .object_gen
-            .filter(|object_gen| object_gen.is_indirect())
-        {
-            if !dereference_indirect {
+        // qpdf gates only the *reference form* on `isIndirect()`; every other
+        // path falls through to `dereference()`
+        // (`libqpdf/QPDFObjectHandle.cc:1630-1639`), which resolves whatever
+        // identity the handle carries without consulting `isIndirect()` at all
+        // (`libqpdf/QPDFObjectHandle.cc:2376-2383`, `QPDFObject::resolve`,
+        // `libqpdf/qpdf/QPDFObject_private.hh:160-166`). Object number zero
+        // carries a cache identity while not being an indirect reference
+        // (`include/qpdf/QPDFObjGen.hh:77-81`), and `QPDF::resolve` settles it
+        // on the unknown-object null fallback (`libqpdf/QPDF.cc:1743-1747`),
+        // so on the handle route it must reach the value dispatch below as a
+        // null rather than as an unresolved value. On the value route
+        // (`QPDFObject::writeJSON`) qpdf performs no resolution at all, and an
+        // unresolved value raises its own error instead
+        // (`libqpdf/QPDF_Unresolved.cc:29-33`).
+        if !dereference_indirect {
+            if let Some(object_gen) = state
+                .object_gen
+                .filter(|object_gen| object_gen.is_indirect())
+            {
                 return self.write_qpdf_obj_gen_reference(object_gen);
-            }
-            if state.reserved {
-                return Err(ObjectJsonError::Reserved);
-            }
-            if state.unresolved {
-                if !state.resolver_present {
-                    return Err(ObjectJsonError::Uninitialized);
-                }
-                handle
-                    .try_dereference()
-                    .map_err(|error| ObjectJsonError::Pdf(error.to_string()))?;
             }
         }
 
         if state.reserved {
             return Err(ObjectJsonError::Reserved);
+        }
+        if matches!(dispatch, ObjectJsonDispatch::Handle)
+            && state.object_gen.is_some()
+            && state.unresolved
+        {
+            if !state.resolver_present {
+                return Err(ObjectJsonError::Uninitialized);
+            }
+            handle
+                .try_dereference()
+                .map_err(|error| ObjectJsonError::Pdf(error.to_string()))?;
         }
         let container = handle.with_value(|value| match value {
             Some(ObjectValue::Null | ObjectValue::Operator(_) | ObjectValue::InlineImage(_)) => {
@@ -8230,7 +8268,17 @@ impl<'a> ObjectJsonWriter<'a> {
                 while !cursor.is_end() {
                     self.write_next()?;
                     let child = cursor.current();
-                    self.write_handle(&child, json_version, false, depth + 1)?;
+                    // `QPDF_Array::writeJSON` writes each element through
+                    // `QPDFObject::writeJSON`, not through the handle
+                    // (`libqpdf/QPDF_Array.cc:163-169`), so an element is
+                    // never resolved on the way out.
+                    self.write_handle(
+                        &child,
+                        json_version,
+                        false,
+                        depth + 1,
+                        ObjectJsonDispatch::Value,
+                    )?;
                     cursor.next();
                 }
                 self.write_end(b']')
@@ -8273,7 +8321,15 @@ impl<'a> ObjectJsonWriter<'a> {
                         continue;
                     }
                     self.write_key(current_key.as_slice(), json_version)?;
-                    self.write_handle(&child, json_version, false, depth + 1)?;
+                    // `QPDF_Dictionary::writeJSON` keeps the handle route for
+                    // its values (`libqpdf/QPDF_Dictionary.cc:72-92`).
+                    self.write_handle(
+                        &child,
+                        json_version,
+                        false,
+                        depth + 1,
+                        ObjectJsonDispatch::Handle,
+                    )?;
                     first_entry = false;
                 }
                 self.write_end(b'}')
@@ -8282,7 +8338,13 @@ impl<'a> ObjectJsonWriter<'a> {
                 // QPDF_Stream::writeJSON writes only its dictionary. The
                 // outer stream wrapper belongs to QPDF_Stream::writeStreamJSON
                 // and the document JSON layer.
-                self.write_handle(&dictionary, json_version, false, depth)
+                self.write_handle(
+                    &dictionary,
+                    json_version,
+                    false,
+                    depth,
+                    ObjectJsonDispatch::Handle,
+                )
             }
         }
     }
