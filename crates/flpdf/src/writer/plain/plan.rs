@@ -496,7 +496,10 @@ impl PlainWritePlan {
             XrefForm::Table
         };
         let source_version = pdf.version().to_string();
-        let source_extension_level = pdf.adobe_extension_level()?.unwrap_or(0);
+        // Same source floor qpdf's `doWriteSetup` applies to every writer
+        // (`QPDFWriter.cc:2176`): `QPDF::getExtensionLevel` clamps to i32 and
+        // warns, where the raw accessor keeps the 64-bit value silently.
+        let source_extension_level = i64::from(pdf.get_extension_level()?);
         let (effective_version, final_extension_level) =
             crate::writer::effective_pdf_version_and_ext(
                 &source_version,

@@ -4485,10 +4485,19 @@ fn write_linearized_impl<R: Read + Seek>(
     // computed from the identical `(eff_version, eff_ext)` pair. `source_ver`
     // is cloned to an owned `String` first so the borrow-checker sees no
     // conflict between the immutable `pdf.version()` read and the `&mut self`
-    // `pdf.adobe_extension_level()` call just below it (mirrors the flat
+    // `pdf.get_extension_level()` call just below it (mirrors the flat
     // writer's own `source_ver`/`source_ext` locals).
+    //
+    // qpdf's `QPDFWriter::doWriteSetup` floors every writer instance from its
+    // own document with
+    // `setMinimumPDFVersion(m->pdf.getPDFVersion(), m->pdf.getExtensionLevel())`
+    // (`QPDFWriter.cc:2176`), linearizing writers included. `getExtensionLevel`
+    // reads the level through `getIntValueAsInt`, which clamps to i32 range
+    // and warns on the way; the raw accessor keeps the full 64-bit value
+    // silently and would carry it into the `/Extensions /ADBE` this pass
+    // stamps back onto the Catalog.
     let source_ver = pdf.version().to_string();
-    let source_ext = pdf.adobe_extension_level()?.unwrap_or(0);
+    let source_ext = i64::from(pdf.get_extension_level()?);
     let (eff_version, eff_ext) =
         effective_pdf_version_and_ext(&source_ver, source_ext, options, emits_object_streams);
     let part1 = Part1Bytes::build(plan, renumber, eff_version);
