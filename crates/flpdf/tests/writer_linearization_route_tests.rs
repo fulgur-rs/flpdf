@@ -1,4 +1,10 @@
 //! Route contracts for the writer and linearization ObjectHandle paths.
+//!
+//! These are structural claims about which route the code takes, and they are
+//! checked by reading the production source. Claims about what the route
+//! *costs* — ownership, residency, allocation counts — do not belong here,
+//! because a source match cannot see a reintroduced copy that is spelled
+//! differently: `linearization_allocation_tests.rs` measures those instead.
 
 fn production_source(source: &str, test_module: &str) -> String {
     let source = source.replace("\r\n", "\n");
@@ -84,38 +90,6 @@ fn linearization_id_construction_is_handle_native() {
 }
 
 #[test]
-fn linearization_pass_one_is_metadata_only_and_uses_counted_output() {
-    let source = include_str!("../src/linearization/writer.rs").replace("\r\n", "\n");
-    let metadata = source
-        .split_once("struct LinearizedPassOutput")
-        .and_then(|(_, rest)| rest.split_once("/// Perform a complete single-pass write"))
-        .map(|(definition, _)| definition)
-        .expect("linearized pass metadata exists");
-    assert!(
-        !metadata.contains("bytes: Vec<u8>"),
-        "pass metadata must not own the complete pass-1 body"
-    );
-
-    let write_pass = source
-        .split_once("fn do_write_pass")
-        .and_then(|(_, rest)| rest.split_once("/// Compute per-object byte lengths"))
-        .map(|(function, _)| function)
-        .expect("linearized pass writer exists");
-    assert!(
-        write_pass.contains("output: &mut OutputSink<'_>"),
-        "both layout passes must use the counted output boundary"
-    );
-    assert!(
-        !write_pass.contains("let mut bytes: Vec<u8>"),
-        "do_write_pass must not allocate a document-sized body Vec"
-    );
-    assert!(
-        !source.contains("pass1_output.bytes"),
-        "pass-1 consumers must use metadata and incremental digest state"
-    );
-}
-
-#[test]
 fn linearization_final_route_does_not_clone_complete_xref_maps() {
     let source = production_source(
         include_str!("../src/linearization/writer.rs"),
@@ -145,26 +119,6 @@ fn linearization_final_route_does_not_clone_complete_xref_maps() {
     assert!(
         !source.contains("let mut virtual_offsets = xref_offsets.clone()"),
         "first-page xref encoding must not clone the complete physical xref map"
-    );
-}
-
-#[test]
-fn linearization_moves_the_writer_owned_renumber_map_into_the_two_pass_route() {
-    let source = production_source(
-        include_str!("../src/linearization/writer.rs"),
-        "\n#[cfg(test)]\nmod tests {",
-    );
-    let implementation = source
-        .split_once("fn write_linearized_impl")
-        .map(|(_, rest)| rest)
-        .expect("linearization implementation exists");
-    assert!(
-        implementation.contains("renumber: RenumberMap"),
-        "the canonical two-pass writer must own the qpdf-shaped renumber map"
-    );
-    assert!(
-        !implementation.contains("let mut local_renumber = renumber.clone()"),
-        "linearization must not clone the complete renumber map before pass 1"
     );
 }
 
@@ -250,23 +204,6 @@ fn objstm_page_ownership_uses_the_canonical_object_user_map() {
     assert!(
         !container_filter.contains("let page_private_sets: Vec<BTreeSet<ObjectRef>>"),
         "hint construction must not materialize a second page-private ownership table"
-    );
-}
-
-#[test]
-fn optimization_reverse_user_sets_use_compact_ordered_storage() {
-    let source = include_str!("../src/optimization.rs").replace("\r\n", "\n");
-    assert!(
-        source.contains("CompactObjectUserSet {"),
-        "object-user reverse values need a compact ordered-set owner"
-    );
-    assert!(
-        source.contains("BTreeSet<ObjectUser>"),
-        "large object-user cardinalities must retain a tree-backed ordered fallback"
-    );
-    assert!(
-        !source.contains("object_to_users: BTreeMap<ObjectRef, BTreeSet<ObjectUser>>"),
-        "the reverse table must not allocate a full BTreeSet value for every object"
     );
 }
 

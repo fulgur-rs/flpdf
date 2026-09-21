@@ -1195,12 +1195,22 @@ mod reverse_containment_layout_tests {
         assert!(std::mem::size_of::<ObjectSlot>() < 40);
     }
 
+    /// A slot costs one shared pointer and the flag that says whether it
+    /// points at anything — nothing per name/number tree.
+    ///
+    /// qpdf's name/number tree keeps its owning `QPDF` on the tree itself
+    /// (`NNTreeImpl::qpdf`, `libqpdf/qpdf/NNTree.hh:125`); the document claim
+    /// belongs to the tree, not to every object handle in the file. Measuring
+    /// the slot rather than searching this file for a field name keeps the
+    /// claim attached to what it costs: an `Option<NonZeroU64>` claim per slot
+    /// grew `ObjectSlot` from 16 to 24 bytes on a 64-bit target. The looser
+    /// bounds above (`< 56`, `< 40`) do not reject that growth.
     #[test]
     fn tree_document_claim_does_not_live_in_production_slots() {
-        let source = include_str!("object_handle.rs");
-        let tree_claim_field = ["tree_", "pdf_", "unique_id"].concat();
         assert!(
-            !source.contains(&tree_claim_field),
+            std::mem::size_of::<ObjectSlot>()
+                <= std::mem::size_of::<Rc<RefCell<SharedValueState>>>()
+                    + std::mem::size_of::<usize>(),
             "name/number-tree ownership belongs to NNTree, not every ObjectSlot"
         );
     }
