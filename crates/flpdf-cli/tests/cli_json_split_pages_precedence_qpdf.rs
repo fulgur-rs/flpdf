@@ -205,3 +205,109 @@ fn a_split_json_run_matches_qpdf_for_a_fresh_page_selection_target() {
         "a page-selection split with --json must match qpdf byte for byte"
     );
 }
+
+/// Which route claims the run is decided by qpdf's own integer conversion,
+/// not by Rust's `str::parse`.
+///
+/// `Config::splitPages` (`libqpdf/QPDFJob_config.cc:604-609`) sends a
+/// non-empty parameter through `QUtil::string_to_int`, whose `strtoll` stage
+/// (`libqpdf/QUtil.cc:373-393`) reads a leading digit run and converts
+/// nothing -- returning zero -- when there is none. So `--split-pages=garbage`
+/// is a falsy split and the JSON document still reaches stdout, while
+/// `--split-pages=2x` is a real split of two. Both are measured against real
+/// qpdf here because a `parse::<usize>()` gate gets each one backwards.
+#[test]
+fn split_pages_activation_follows_qpdf_integer_conversion() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let input = fixture("three-page.pdf");
+
+    for value in ["garbage", "0abc", "0"] {
+        let flag = format!("--split-pages={value}");
+        let qpdf = ShellCommand::new("qpdf")
+            .args(["--static-id", "--json=2", &flag])
+            .arg(&input)
+            .output()
+            .expect("qpdf should spawn");
+        let flpdf = Command::cargo_bin("flpdf")
+            .expect("flpdf binary should build")
+            .args(["--static-id", "--json=2", &flag])
+            .arg(&input)
+            .output()
+            .expect("flpdf should spawn");
+        assert!(
+            qpdf.status.success(),
+            "qpdf {flag} failed ({:?}): {}",
+            qpdf.status,
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+        assert!(
+            !qpdf.stdout.is_empty(),
+            "oracle guard: qpdf must treat {flag} as a falsy split and still write JSON"
+        );
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "{flag}: exit status must match qpdf; stderr:\n{}",
+            String::from_utf8_lossy(&flpdf.stderr)
+        );
+        assert_eq!(
+            flpdf.stdout, qpdf.stdout,
+            "{flag}: the JSON document must match qpdf byte for byte"
+        );
+    }
+
+    // A digit run followed by garbage really does select a split, so the
+    // written chunks have to follow qpdf rather than the value being
+    // rejected. `--split-pages=2` names its outputs by page range, so read
+    // the directory rather than guessing the file names.
+    let qpdf_chunks = split_named_chunks("qpdf", "qpdf", &input);
+    assert_eq!(
+        qpdf_chunks.len(),
+        2,
+        "oracle guard: qpdf must read 2 out of \"2x\" and split a three-page file into two chunks"
+    );
+    let flpdf_chunks = split_named_chunks("flpdf", "flpdf", &input);
+    assert_eq!(
+        flpdf_chunks, qpdf_chunks,
+        "\"2x\" must produce the same chunk names and bytes qpdf does"
+    );
+}
+
+/// Run `--json=2 --split-pages=2x` into a fresh directory and return every
+/// written chunk as `(file name, bytes)`, sorted by name.
+fn split_named_chunks(label: &str, program: &str, input: &Path) -> Vec<(String, Vec<u8>)> {
+    let directory = tempfile::tempdir().expect("temporary split directory");
+    let template = directory.path().join("out_%d.pdf");
+    let arguments = ["--static-id", "--json=2", "--split-pages=2x"];
+    let output = if program == "qpdf" {
+        ShellCommand::new("qpdf")
+            .args(arguments)
+            .arg(input)
+            .arg(&template)
+            .output()
+            .expect("qpdf should spawn")
+    } else {
+        Command::cargo_bin("flpdf")
+            .expect("flpdf binary should build")
+            .args(arguments)
+            .arg(input)
+            .arg(&template)
+            .output()
+            .expect("flpdf should spawn")
+    };
+    assert_success(&format!("{label} --split-pages=2x"), &output);
+    let mut chunks: Vec<(String, Vec<u8>)> = std::fs::read_dir(directory.path())
+        .expect("read split directory")
+        .map(|entry| {
+            let entry = entry.expect("split directory entry");
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                std::fs::read(entry.path()).expect("read split chunk"),
+            )
+        })
+        .collect();
+    chunks.sort_by(|left, right| left.0.cmp(&right.0));
+    chunks
+}
