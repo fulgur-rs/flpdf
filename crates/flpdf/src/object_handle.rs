@@ -13245,12 +13245,12 @@ mod unparse_object_tests {
     use super::identity_tests::{error_resolving_handle, resolver_bearing_handle};
     use super::*;
     use crate::writer::object::{
-        dict_is_sig_with_byte_range, visible_dict_entries, write_child as write_child_to_sink,
+        dict_is_sig_with_byte_range, unparse_child as unparse_child_to_sink, visible_dict_entries,
         ObjectWriterEmissionVecTestExt,
     };
 
-    fn write_child(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
-        crate::writer::output::with_buffer_sink(out, |out| write_child_to_sink(handle, out))
+    fn unparse_child(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
+        crate::writer::output::with_buffer_sink(out, |out| unparse_child_to_sink(handle, out))
     }
 
     fn compact_string_hook(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
@@ -13656,17 +13656,17 @@ mod unparse_object_tests {
     }
 
     #[test]
-    fn write_child_writes_indirect_handle_as_reference_form() {
+    fn unparse_child_writes_indirect_handle_as_reference_form() {
         let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Integer(7));
         let mut out = Vec::new();
-        write_child(&indirect, &mut out).unwrap();
+        unparse_child(&indirect, &mut out).unwrap();
         assert_eq!(out, b"20 0 R");
     }
 
     #[test]
-    fn write_child_recurses_into_a_direct_scalar() {
+    fn unparse_child_recurses_into_a_direct_scalar() {
         let mut out = Vec::new();
-        write_child(&ObjectHandle::integer(7), &mut out).unwrap();
+        unparse_child(&ObjectHandle::integer(7), &mut out).unwrap();
         assert_eq!(out, b"7");
     }
 
@@ -13773,7 +13773,7 @@ mod unparse_object_tests {
         // Unlike the direct-stream case above, this *is* a real, reachable
         // qpdf shape: an indirect object whose resolved value is a stream.
         // `unparse_object`/`unparse_object_walk` dispatch on `self` directly
-        // (never through `write_child`'s indirect-reference short-circuit,
+        // (never through `unparse_child`'s indirect-reference short-circuit,
         // which only applies to *child* positions during recursion), so
         // this reaches the same `ObjectValue::Stream` arm as the direct
         // case and inlines just the dictionary -- not qpdf's real
@@ -14223,7 +14223,7 @@ mod unparse_object_tests {
     #[test]
     fn unparse_object_qdf_writes_a_retained_indirect_entry_as_reference_form() {
         // QDF-mode sibling of unparse_object_writes_a_retained_indirect_entry_as_reference_form:
-        // exercises write_child_qdf's indirect arm, which the four
+        // exercises unparse_child_qdf's indirect arm, which the four
         // plan-specified literals above never reach (every handle in them is
         // direct).
         let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Integer(7));
@@ -15046,7 +15046,7 @@ mod unparse_object_tests {
         // every other QDF test in this suite pins `indent = 0`, which would
         // still pass with a stray hardcoded `0` inside the function body.
         // Both values here are scalars, so this alone does not prove the
-        // `indent + 2` passed to `write_child_qdf` for each entry actually
+        // `indent + 2` passed to `unparse_child_qdf` for each entry actually
         // carries the caller's `indent` -- a scalar ignores that argument
         // entirely (see `unparse_stream_body_qdf_respects_a_nonzero_indent_for_a_nested_container_value`
         // below for the test that does). Cross-checked against
@@ -15066,7 +15066,7 @@ mod unparse_object_tests {
         // The test above only proves `indent` reaches the closing `>>`'s
         // own `push_spaces` and the entry lines' *leading* `push_spaces(out,
         // indent + 2)` -- both scalar values in it ignore the `indent + 2`
-        // this primitive also threads through `write_child_qdf(value,
+        // this primitive also threads through `unparse_child_qdf(value,
         // indent + 2, out)` for each entry (a scalar's own QDF form does
         // not depend on indent at all). A nested container value does: its
         // own children land at `(indent + 2) + 2`, and a hardcoded `2` in
@@ -15093,7 +15093,7 @@ mod unparse_object_tests {
     #[test]
     fn unparse_stream_body_qdf_writes_a_retained_indirect_entry_as_reference_form() {
         // QDF-mode sibling of unparse_stream_body_writes_length_last_preserved
-        // that exercises write_child_qdf's indirect arm instead of a direct
+        // that exercises unparse_child_qdf's indirect arm instead of a direct
         // scalar -- unreached by the tests above, whose every value is
         // direct.
         let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Integer(7));
@@ -15373,7 +15373,7 @@ mod unparse_object_tests {
     #[test]
     fn unparse_trailer_id_writer_none_falls_back_for_scalar_id() {
         // Mirrors write_id_style_value_falls_back_for_unexpected_shapes
-        // (object.rs): a non-array /ID value is delegated to write_child
+        // (object.rs): a non-array /ID value is delegated to unparse_child
         // verbatim rather than being routed through the compact-pair path.
         let dict = ObjectHandle::dictionary(vec![(b"ID".to_vec(), ObjectHandle::integer(7))]);
         let mut out = Vec::new();
@@ -15387,7 +15387,7 @@ mod unparse_object_tests {
         // in write_id_style_value_handle: an indirect /ID value (not a
         // shape real qpdf itself ever produces, but nothing at the type
         // level rules it out) writes as its own "N G R" form, the same
-        // reference-vs-recurse split write_child applies everywhere else
+        // reference-vs-recurse split unparse_child applies everywhere else
         // in this primitive family -- never inlined as compact hex even
         // though it would resolve to a matching Array([String, String])
         // shape.

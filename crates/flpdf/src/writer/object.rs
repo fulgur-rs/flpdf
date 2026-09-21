@@ -958,7 +958,7 @@ impl ObjectWriterEmission for ObjectHandle {
     ///
     /// If `self` is an *indirect* handle whose resolved value is a `Stream`,
     /// this call reaches `unparse_object_value`'s `Stream` arm directly (it
-    /// does not go through [`write_child`]'s indirect-reference check the
+    /// does not go through [`unparse_child`]'s indirect-reference check the
     /// way a *child* position would) and inlines just the stream's
     /// dictionary — `<< ... >>` with no `stream`/`endstream` framing and no
     /// `/Length`-last repositioning. That is not what qpdf's real
@@ -1896,7 +1896,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// directly on `ObjectHandle` rather
     /// than bridged through `Object` -- see `write_id_style_value_handle`
     /// below); an indirect `/ID` value writes as its own `"N G R"`
-    /// reference form instead, matching `write_child`'s reference-vs-recurse
+    /// reference form instead, matching `unparse_child`'s reference-vs-recurse
     /// split rather than being inlined.
     ///
     /// `self` must resolve to a `Dictionary`; a non-dictionary value
@@ -2378,12 +2378,12 @@ fn unparse_stream_dict_entries(
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
-            write_child(value, out)?;
+            unparse_child(value, out)?;
         }
     }
     if let Some(length) = length_value {
         out.write_bytes(b" /Length ")?;
-        write_child(length, out)?;
+        unparse_child(length, out)?;
     }
     if options.add_flate_filter {
         out.write_bytes(b" /Filter /FlateDecode")?;
@@ -2430,14 +2430,14 @@ fn unparse_stream_dict_entries_qdf(
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
-            write_child_qdf(value, indent + 2, out)?;
+            unparse_child_qdf(value, indent + 2, out)?;
         }
         out.write_bytes(b"\n")?;
     }
     if let Some(length) = length_value {
         push_spaces(out, indent + 2)?;
         out.write_bytes(b"/Length ")?;
-        write_child_qdf(length, indent + 2, out)?;
+        unparse_child_qdf(length, indent + 2, out)?;
         out.write_bytes(b"\n")?;
     }
     push_spaces(out, indent)?;
@@ -2475,7 +2475,7 @@ fn unparse_stream_dict_entries_qdf_with_ref_map(
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
-            write_child_qdf_with_ref_map(value, indent + 2, out, map, removed_refs)?;
+            unparse_child_qdf_with_ref_map(value, indent + 2, out, map, removed_refs)?;
         }
         out.write_bytes(b"\n")?;
     }
@@ -2487,7 +2487,7 @@ fn unparse_stream_dict_entries_qdf_with_ref_map(
     } else if let Some(length) = length_value {
         push_spaces(out, indent + 2)?;
         out.write_bytes(b"/Length ")?;
-        write_child_qdf_with_ref_map(length, indent + 2, out, map, removed_refs)?;
+        unparse_child_qdf_with_ref_map(length, indent + 2, out, map, removed_refs)?;
         out.write_bytes(b"\n")?;
     }
     if options.add_flate_filter {
@@ -2536,7 +2536,7 @@ where
             out.write_bytes(b"\n")?;
             continue;
         }
-        write_child_qdf_with_ref_map_and_string_writer(
+        unparse_child_qdf_with_ref_map_and_string_writer(
             value,
             indent + 2,
             out,
@@ -2551,7 +2551,7 @@ where
     if let Some(length_ref) = length_ref {
         write_object_ref(out, length_ref)?;
     } else if let Some(length) = length_value {
-        write_child_qdf_with_ref_map_and_string_writer(
+        unparse_child_qdf_with_ref_map_and_string_writer(
             length,
             indent + 2,
             out,
@@ -2601,11 +2601,11 @@ where
         if try_write_sig_contents_with_string_writer(value, force_hex_string, out)? {
             continue;
         }
-        write_child_with_string_writer(value, out, write_string)?;
+        unparse_child_with_string_writer(value, out, write_string)?;
     }
     if let Some(length) = length_value {
         out.write_bytes(b" /Length ")?;
-        write_child_with_string_writer(length, out, write_string)?;
+        unparse_child_with_string_writer(length, out, write_string)?;
     }
     if refiltered {
         out.write_bytes(b" /Filter /FlateDecode")?;
@@ -2640,13 +2640,13 @@ where
             out.write_bytes(b"\n")?;
             continue;
         }
-        write_child_qdf_with_string_writer(value, indent + 2, out, write_string)?;
+        unparse_child_qdf_with_string_writer(value, indent + 2, out, write_string)?;
         out.write_bytes(b"\n")?;
     }
     if let Some(length) = length_value {
         push_spaces(out, indent + 2)?;
         out.write_bytes(b"/Length ")?;
-        write_child_qdf_with_string_writer(length, indent + 2, out, write_string)?;
+        unparse_child_qdf_with_string_writer(length, indent + 2, out, write_string)?;
         out.write_bytes(b"\n")?;
     }
     push_spaces(out, indent)?;
@@ -2714,7 +2714,7 @@ fn unparse_stream_dict_entries_with_ref_map_and_length(
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
-            write_child_with_ref_map(value, out, map, removed_refs)?;
+            unparse_child_with_ref_map(value, out, map, removed_refs)?;
         }
     }
     if let Some(length) = length_override {
@@ -2722,7 +2722,7 @@ fn unparse_stream_dict_entries_with_ref_map_and_length(
         write_decimal_u64(out, length as u64)?;
     } else if let Some(length) = length_value {
         out.write_bytes(b" /Length ")?;
-        write_child_with_ref_map(length, out, map, removed_refs)?;
+        unparse_child_with_ref_map(length, out, map, removed_refs)?;
     }
     if options.add_flate_filter {
         out.write_bytes(b" /Filter /FlateDecode")?;
@@ -2816,7 +2816,7 @@ fn unparse_stream_dictionary_live_with_qpdf_obj_gen_map_and_removed_and_length(
                 continue;
             }
         }
-        write_child_with_ref_map(&value, out, map, removed_refs)?;
+        unparse_child_with_ref_map(&value, out, map, removed_refs)?;
         first_entry = false;
     }
 
@@ -2862,11 +2862,11 @@ where
         if try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             continue;
         }
-        write_child_with_ref_map_and_string_writer(value, out, map, removed_refs, write_string)?;
+        unparse_child_with_ref_map_and_string_writer(value, out, map, removed_refs, write_string)?;
     }
     if let Some(length) = length_value {
         out.write_bytes(b" /Length ")?;
-        write_child_with_ref_map_and_string_writer(length, out, map, removed_refs, write_string)?;
+        unparse_child_with_ref_map_and_string_writer(length, out, map, removed_refs, write_string)?;
     }
     if options.add_flate_filter {
         out.write_bytes(b" /Filter /FlateDecode")?;
@@ -2897,7 +2897,7 @@ where
 // runs on whatever handle it is entered with, top-level `self` or a
 // recursed-into direct child alike -- this function does not need its own
 // copy of that check to get the same result.
-pub(crate) fn write_child(handle: &ObjectHandle, out: &mut OutputSink<'_>) -> Result<()> {
+pub(crate) fn unparse_child(handle: &ObjectHandle, out: &mut OutputSink<'_>) -> Result<()> {
     // `QPDFWriter::unparseChild` branches on `isIndirect()`
     // (`libqpdf/QPDFWriter.cc:1148`), which is `obj != 0`
     // (`include/qpdf/QPDFObjGen.hh:78-81`) and never inspects the generation.
@@ -3052,7 +3052,7 @@ fn root_output_copy_with_adbe(
 // the parser enforces on parsed input. Also forces resolution of `handle`
 // itself before inspecting its value: every call into this hub either comes
 // from `unparse_object`'s top-level entry point (whose argument may still be
-// an unresolved indirect handle) or from a direct child that `write_child`
+// an unresolved indirect handle) or from a direct child that `unparse_child`
 // has already filtered past its own indirect check (so `handle` here is
 // always already direct in that case, making the call a no-op) — mirroring
 // qpdf's own implicit `dereference()` on `object`'s first `isXxx()` type
@@ -3102,7 +3102,7 @@ fn is_direct_scalar_handle(handle: &ObjectHandle) -> bool {
     // `is_direct()` is not the predicate this fast path needs. qpdf treats
     // object number 0 as non-indirect, so a handle carrying a raw `0 G`
     // identity answers `is_direct() == true` while
-    // `write_child_with_dynamic_ref_map_and_string_writer` emits `null` for
+    // `unparse_child_with_dynamic_ref_map_and_string_writer` emits `null` for
     // it (`!object_gen.is_indirect()`). Require the absence of any raw
     // identity so such a child keeps taking the slow path and the two routes
     // agree byte for byte.
@@ -3197,7 +3197,7 @@ fn unparse_container(container: UnparseContainer, out: &mut OutputSink<'_>) -> R
             out.write_bytes(b"[")?;
             for child in children {
                 out.write_bytes(b" ")?;
-                write_child(&child, out)?;
+                unparse_child(&child, out)?;
             }
             out.write_bytes(b" ]")?;
         }
@@ -3274,7 +3274,7 @@ pub(crate) fn unparse_object_value(value: &ObjectValue, out: &mut OutputSink<'_>
             out.write_bytes(b"[")?;
             for child in children {
                 out.write_bytes(b" ")?;
-                write_child(child, out)?;
+                unparse_child(child, out)?;
             }
             out.write_bytes(b" ]")?;
             // cov:ignore-end
@@ -3295,8 +3295,8 @@ pub(crate) fn unparse_object_value(value: &ObjectValue, out: &mut OutputSink<'_>
             // resolves to a stream (a real, reachable qpdf shape -- see
             // `ObjectHandle::unparse_object`'s own doc). The latter is
             // reachable here because `unparse_object`/`unparse_object_walk`
-            // call this dispatch directly on `self`, bypassing `write_child`
-            // entirely; `write_child` only gates *child* positions (array
+            // call this dispatch directly on `self`, bypassing `unparse_child`
+            // entirely; `unparse_child` only gates *child* positions (array
             // elements, dictionary values) during recursion, where it never
             // recurses into an indirect handle -- so an *indirect* child
             // resolving to a stream short-circuits to its own `"N G R"`
@@ -3344,12 +3344,12 @@ pub(crate) fn qpdf_obj_gen_set_from_object_ref_set(
         .collect()
 }
 
-// Ref-map sibling of `write_child` above -- same reference-vs-recurse split
+// Ref-map sibling of `unparse_child` above -- same reference-vs-recurse split
 // on `handle.object_ref()` alone, so the same reasoning applies: an
 // *indirect* reserved child takes this `Some` branch (writing its mapped
 // reference token, or `null` if renumbering removed it, per the
 // qpdf-rewrite null-handling below) without ever being dereferenced here.
-// See `write_child`'s own doc for why no separate reserved check belongs in
+// See `unparse_child`'s own doc for why no separate reserved check belongs in
 // a child-position function at all: the `None` branch below recurses into
 // `unparse_object_walk_with_ref_map`, whose own `is_reserved` check already
 // rejects a *direct* reserved child the same way it rejects a reserved
@@ -3361,7 +3361,7 @@ pub(crate) fn qpdf_obj_gen_set_from_object_ref_set(
 // can share this exact reference-vs-direct-value dispatch for its own
 // non-structural trailer values (D14: one child-value serializer instead of
 // linearization retyping the indirect-reference branch independently).
-pub(crate) fn write_child_with_ref_map(
+pub(crate) fn unparse_child_with_ref_map(
     handle: &ObjectHandle,
     out: &mut OutputSink<'_>,
     map: &QpdfObjGenMap<'_>,
@@ -3478,7 +3478,7 @@ fn unparse_array_with_ref_map(
     while !cursor.is_end() {
         out.write_bytes(b" ")?;
         let child = cursor.current();
-        write_child_with_ref_map(&child, out, map, removed_refs)?;
+        unparse_child_with_ref_map(&child, out, map, removed_refs)?;
         cursor.next();
     }
     out.write_bytes(b" ]")?;
@@ -3518,7 +3518,7 @@ fn unparse_dictionary_with_ref_map(
         let force_hex_string =
             current_key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range_handle(handle)?;
         if !try_write_sig_contents_hex_string(&value, force_hex_string, out)? {
-            write_child_with_ref_map(&value, out, map, removed_refs)?;
+            unparse_child_with_ref_map(&value, out, map, removed_refs)?;
         }
         first_entry = false;
     }
@@ -3538,7 +3538,7 @@ fn unparse_object_value_with_ref_map(
             out.write_bytes(b"[")?;
             for child in children {
                 out.write_bytes(b" ")?;
-                write_child_with_ref_map(child, out, map, removed_refs)?;
+                unparse_child_with_ref_map(child, out, map, removed_refs)?;
             }
             out.write_bytes(b" ]")?;
             // cov:ignore-end
@@ -3580,7 +3580,7 @@ fn unparse_dict_entries_with_ref_map(
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
-            write_child_with_ref_map(value, out, map, removed_refs)?;
+            unparse_child_with_ref_map(value, out, map, removed_refs)?; // cov:ignore: this function's only caller (unparse_object_value_with_ref_map's dictionary arm) is itself unreachable in production -- the ref-map recursion hub always snapshots and walks a dictionary's entries before that fallback is entered.
         }
     }
     out.write_bytes(b" >>")?;
@@ -3759,7 +3759,7 @@ pub(crate) fn unparse_object_with_ref_map_and_direct_streams(
     )
 }
 
-fn write_child_with_dynamic_ref_map_and_string_writer<F>(
+fn unparse_child_with_dynamic_ref_map_and_string_writer<F>(
     handle: &ObjectHandle,
     out: &mut OutputSink<'_>,
     map: &mut DynamicObjectRefMap<'_>,
@@ -3890,7 +3890,7 @@ where
                 out.write_bytes(b"[")?;
                 for child in children {
                     out.write_bytes(b" ")?;
-                    write_child_with_dynamic_ref_map_and_string_writer(
+                    unparse_child_with_dynamic_ref_map_and_string_writer(
                         &child,
                         out,
                         map,
@@ -3965,7 +3965,7 @@ where
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
-            write_child_with_dynamic_ref_map_and_string_writer(
+            unparse_child_with_dynamic_ref_map_and_string_writer(
                 value,
                 out,
                 map,
@@ -4007,7 +4007,7 @@ where
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
-            write_child_with_dynamic_ref_map_and_string_writer(
+            unparse_child_with_dynamic_ref_map_and_string_writer(
                 value,
                 out,
                 map,
@@ -4019,7 +4019,7 @@ where
     }
     if let Some(length) = length_value {
         out.write_bytes(b" /Length ")?;
-        write_child_with_dynamic_ref_map_and_string_writer(
+        unparse_child_with_dynamic_ref_map_and_string_writer(
             length,
             out,
             map,
@@ -4034,7 +4034,7 @@ where
     out.write_bytes(b" >>")
 }
 
-fn write_child_with_dynamic_ref_map(
+fn unparse_child_with_dynamic_ref_map(
     handle: &ObjectHandle,
     out: &mut OutputSink<'_>,
     map: &mut DynamicObjectRefMap<'_>,
@@ -4121,7 +4121,7 @@ fn unparse_object_walk_with_dynamic_ref_map(
                 out.write_bytes(b"[")?;
                 for child in children {
                     out.write_bytes(b" ")?;
-                    write_child_with_dynamic_ref_map(&child, out, map, removed_refs)?;
+                    unparse_child_with_dynamic_ref_map(&child, out, map, removed_refs)?;
                 }
                 out.write_bytes(b" ]")?;
             }
@@ -4166,7 +4166,7 @@ fn unparse_dict_entries_with_dynamic_ref_map(
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
-            write_child_with_dynamic_ref_map(value, out, map, removed_refs)?; // cov:ignore: LLVM attributes this child-call terminator to callback cleanup.
+            unparse_child_with_dynamic_ref_map(value, out, map, removed_refs)?; // cov:ignore: LLVM attributes this child-call terminator to callback cleanup.
         } // cov:ignore: LLVM attributes this child-call terminator to callback cleanup.
     }
     out.write_bytes(b" >>")?;
@@ -4197,12 +4197,12 @@ fn unparse_stream_dict_entries_with_dynamic_ref_map(
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
-            write_child_with_dynamic_ref_map(value, out, map, removed_refs)?; // cov:ignore: LLVM attributes this child-call terminator to callback cleanup.
+            unparse_child_with_dynamic_ref_map(value, out, map, removed_refs)?; // cov:ignore: LLVM attributes this child-call terminator to callback cleanup.
         } // cov:ignore: LLVM attributes this child-call terminator to callback cleanup.
     }
     if let Some(length) = length_value {
         out.write_bytes(b" /Length ")?;
-        write_child_with_dynamic_ref_map(length, out, map, removed_refs)?; // cov:ignore: LLVM attributes this length-call terminator to callback cleanup.
+        unparse_child_with_dynamic_ref_map(length, out, map, removed_refs)?; // cov:ignore: LLVM attributes this length-call terminator to callback cleanup.
     } // cov:ignore: LLVM attributes this length-call terminator to callback cleanup.
     if options.add_flate_filter {
         out.write_bytes(b" /Filter /FlateDecode")?;
@@ -4259,7 +4259,7 @@ pub(crate) fn dict_is_sig_with_byte_range(entries: &[(Vec<u8>, ObjectHandle)]) -
 
 // Applies qpdf's `/Contents`-in-a-signature-dictionary hex-string special
 // case (`QPDFWriter.cc:1490-1504`) to a single dict-value child in place of
-// the ordinary `write_child`/`write_child_qdf` call, when `force_hex_string`
+// the ordinary `unparse_child`/`unparse_child_qdf` call, when `force_hex_string`
 // is set (every call site below passes `key.as_slice() == b"Contents" &&
 // dict_is_sig_with_byte_range(entries)?`, matching the `key == "/Contents" &&
 // object.isDictionaryOfType(...) && object.hasKey(...)` guard at the same
@@ -4370,7 +4370,7 @@ fn unparse_dict_entries(
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
-            write_child(value, out)?;
+            unparse_child(value, out)?;
         }
     }
     out.write_bytes(b" >>")?;
@@ -4395,7 +4395,7 @@ fn push_spaces(out: &mut OutputSink<'_>, mut n: usize) -> Result<()> {
     Ok(())
 }
 
-// QDF-mode sibling of `write_child` above: an indirect child always writes
+// QDF-mode sibling of `unparse_child` above: an indirect child always writes
 // as its own `"N G R"` reference form regardless of QDF mode — qpdf never
 // inlines an indirect object at a child position in either mode, the same
 // unconditional child/reference split already applies. A direct
@@ -4405,14 +4405,14 @@ fn push_spaces(out: &mut OutputSink<'_>, mut n: usize) -> Result<()> {
 // `unparse_object_value_qdf`'s own Array/Dictionary arms for where that
 // `+ 2` is actually applied before calling this).
 //
-// No separate reserved check either, for the identical reason `write_child`
+// No separate reserved check either, for the identical reason `unparse_child`
 // has none (see its own doc for the full trace): an *indirect* reserved
 // child always takes the reference-token branch below without ever being
 // dereferenced here, and a *direct* one is still rejected one level down,
 // by `unparse_object_walk_qdf`'s own `is_reserved` check on whatever
 // handle the `None` branch below recurses into.
-fn write_child_qdf(handle: &ObjectHandle, indent: usize, out: &mut OutputSink<'_>) -> Result<()> {
-    // Same raw-identity boundary as `write_child` above: QDF changes the
+fn unparse_child_qdf(handle: &ObjectHandle, indent: usize, out: &mut OutputSink<'_>) -> Result<()> {
+    // Same raw-identity boundary as `unparse_child` above: QDF changes the
     // formatting, not which children are written as references.
     if let Some(object_gen) = handle
         .qpdf_obj_gen()
@@ -4480,7 +4480,7 @@ fn unparse_container_qdf(
             out.write_bytes(b"\n")?;
             for child in children {
                 push_spaces(out, indent + 2)?;
-                write_child_qdf(&child, indent + 2, out)?;
+                unparse_child_qdf(&child, indent + 2, out)?;
                 out.write_bytes(b"\n")?;
             }
             push_spaces(out, indent)?;
@@ -4519,7 +4519,7 @@ fn unparse_object_value_qdf(
             out.write_bytes(b"\n")?;
             for child in children {
                 push_spaces(out, indent + 2)?;
-                write_child_qdf(child, indent + 2, out)?;
+                unparse_child_qdf(child, indent + 2, out)?;
                 out.write_bytes(b"\n")?;
             }
             push_spaces(out, indent)?;
@@ -4602,7 +4602,7 @@ fn unparse_dict_entries_qdf(
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
-            write_child_qdf(value, indent + 2, out)?;
+            unparse_child_qdf(value, indent + 2, out)?;
         }
         out.write_bytes(b"\n")?;
     }
@@ -4611,7 +4611,7 @@ fn unparse_dict_entries_qdf(
     Ok(())
 }
 
-fn write_child_qdf_with_ref_map(
+fn unparse_child_qdf_with_ref_map(
     handle: &ObjectHandle,
     indent: usize,
     out: &mut OutputSink<'_>,
@@ -4683,7 +4683,7 @@ fn unparse_array_qdf_with_ref_map(
     while !cursor.is_end() {
         push_spaces(out, indent + 2)?;
         let child = cursor.current();
-        write_child_qdf_with_ref_map(&child, indent + 2, out, map, removed_refs)?;
+        unparse_child_qdf_with_ref_map(&child, indent + 2, out, map, removed_refs)?;
         out.write_bytes(b"\n")?;
         cursor.next();
     }
@@ -4721,7 +4721,7 @@ fn unparse_dictionary_qdf_with_ref_map(
         let force_hex_string =
             current_key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range_handle(handle)?;
         if !try_write_sig_contents_hex_string(&value, force_hex_string, out)? {
-            write_child_qdf_with_ref_map(&value, indent + 2, out, map, removed_refs)?;
+            unparse_child_qdf_with_ref_map(&value, indent + 2, out, map, removed_refs)?;
         }
         out.write_bytes(b"\n")?;
         first_entry = false;
@@ -4790,7 +4790,7 @@ fn unparse_object_walk_qdf_with_dynamic_ref_map(
                 while !cursor.is_end() {
                     push_spaces(out, indent + 2)?;
                     let child = cursor.current();
-                    write_child_qdf_with_dynamic_ref_map(
+                    unparse_child_qdf_with_dynamic_ref_map(
                         &child,
                         indent + 2,
                         out,
@@ -4827,7 +4827,7 @@ fn unparse_object_walk_qdf_with_dynamic_ref_map(
                     let force_hex_string = current_key.as_slice() == b"/Contents"
                         && dict_is_sig_with_byte_range_handle(handle)?;
                     if !try_write_sig_contents_hex_string(&value, force_hex_string, out)? {
-                        write_child_qdf_with_dynamic_ref_map(
+                        unparse_child_qdf_with_dynamic_ref_map(
                             &value,
                             indent + 2,
                             out,
@@ -4856,7 +4856,7 @@ fn unparse_object_walk_qdf_with_dynamic_ref_map(
     })
 }
 
-fn write_child_qdf_with_dynamic_ref_map(
+fn unparse_child_qdf_with_dynamic_ref_map(
     handle: &ObjectHandle,
     indent: usize,
     out: &mut OutputSink<'_>,
@@ -4919,7 +4919,7 @@ fn unparse_object_value_qdf_with_ref_map(
     unparse_object_value(value, out)
 }
 
-fn write_child_with_ref_map_and_string_writer<F>(
+fn unparse_child_with_ref_map_and_string_writer<F>(
     handle: &ObjectHandle,
     out: &mut OutputSink<'_>,
     map: &QpdfObjGenMap<'_>,
@@ -5005,7 +5005,7 @@ where
             out.write_bytes(b"[")?;
             for child in children {
                 out.write_bytes(b" ")?;
-                write_child_with_ref_map_and_string_writer(
+                unparse_child_with_ref_map_and_string_writer(
                     &child,
                     out,
                     map,
@@ -5081,13 +5081,13 @@ where
         if try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             continue;
         }
-        write_child_with_ref_map_and_string_writer(value, out, map, removed_refs, write_string)?;
+        unparse_child_with_ref_map_and_string_writer(value, out, map, removed_refs, write_string)?;
     }
     out.write_bytes(b" >>")?;
     Ok(())
 }
 
-fn write_child_qdf_with_ref_map_and_string_writer<F>(
+fn unparse_child_qdf_with_ref_map_and_string_writer<F>(
     handle: &ObjectHandle,
     indent: usize,
     out: &mut OutputSink<'_>,
@@ -5187,7 +5187,7 @@ where
             out.write_bytes(b"\n")?;
             for child in children {
                 push_spaces(out, indent + 2)?;
-                write_child_qdf_with_ref_map_and_string_writer(
+                unparse_child_qdf_with_ref_map_and_string_writer(
                     &child,
                     indent + 2,
                     out,
@@ -5271,7 +5271,7 @@ where
             out.write_bytes(b"\n")?;
             continue;
         }
-        write_child_qdf_with_ref_map_and_string_writer(
+        unparse_child_qdf_with_ref_map_and_string_writer(
             value,
             indent + 2,
             out,
@@ -5287,7 +5287,7 @@ where
 }
 
 #[cfg(test)]
-fn write_child_with_string_writer<F>(
+fn unparse_child_with_string_writer<F>(
     handle: &ObjectHandle,
     out: &mut OutputSink<'_>,
     write_string: &mut F,
@@ -5316,7 +5316,7 @@ where
             out.write_bytes(b"[")?;
             for child in children {
                 out.write_bytes(b" ")?;
-                write_child_with_string_writer(&child, out, write_string)?;
+                unparse_child_with_string_writer(&child, out, write_string)?;
             }
             out.write_bytes(b" ]")?;
         }
@@ -5426,14 +5426,14 @@ where
         if try_write_sig_contents_with_string_writer(value, force_hex_string, out)? {
             continue;
         }
-        write_child_with_string_writer(value, out, write_string)?;
+        unparse_child_with_string_writer(value, out, write_string)?;
     }
     out.write_bytes(b" >>")?;
     Ok(())
 }
 
 #[cfg(test)]
-fn write_child_qdf_with_string_writer<F>(
+fn unparse_child_qdf_with_string_writer<F>(
     handle: &ObjectHandle,
     indent: usize,
     out: &mut OutputSink<'_>,
@@ -5465,7 +5465,7 @@ where
             out.write_bytes(b"\n")?;
             for child in children {
                 push_spaces(out, indent + 2)?;
-                write_child_qdf_with_string_writer(&child, indent + 2, out, write_string)?;
+                unparse_child_qdf_with_string_writer(&child, indent + 2, out, write_string)?;
                 out.write_bytes(b"\n")?;
             }
             push_spaces(out, indent)?;
@@ -5559,7 +5559,7 @@ where
             out.write_bytes(b"\n")?;
             continue;
         }
-        write_child_qdf_with_string_writer(value, indent + 2, out, write_string)?;
+        unparse_child_qdf_with_string_writer(value, indent + 2, out, write_string)?;
         out.write_bytes(b"\n")?;
     }
     push_spaces(out, indent)?;
@@ -5607,7 +5607,7 @@ fn unparse_trailer_entries(
         out.write_bytes(b" ")?;
         write_dictionary_key(out, key)?;
         out.write_bytes(b" ")?;
-        write_child(value, out)?;
+        unparse_child(value, out)?;
     }
     if let Some(value) = id_value {
         out.write_bytes(b" /ID ")?;
@@ -5618,7 +5618,7 @@ fn unparse_trailer_entries(
     }
     if let Some(value) = encrypt_value {
         out.write_bytes(b" /Encrypt ")?;
-        write_child(value, out)?;
+        unparse_child(value, out)?;
     }
     out.write_bytes(b" >>")?;
     Ok(())
@@ -5689,22 +5689,22 @@ fn unparse_trailer_entries_with_ref_map(
             // `unparseChild` recurses into that direct dictionary, so preserve
             // the direct `/Root` shape while applying the caller's map below.
             if qdf {
-                write_child_qdf_with_ref_map(value, 2, out, &qpdf_map, &qpdf_removed_refs)?;
+                unparse_child_qdf_with_ref_map(value, 2, out, &qpdf_map, &qpdf_removed_refs)?;
             } else {
-                write_child_with_ref_map(value, out, &qpdf_map, &qpdf_removed_refs)?;
+                unparse_child_with_ref_map(value, out, &qpdf_map, &qpdf_removed_refs)?;
             }
         } else if matches!(key.as_slice(), b"/Root" | b"/Encrypt") {
             // An indirect `/Root` or `/Encrypt` installed by the writer already
             // carries an output-space reference and must not be remapped again.
             if qdf {
-                write_child_qdf(value, 2, out)?; // cov:ignore: writer-owned indirect /Root or /Encrypt references are emitted through the dedicated xref-stream path in production.
+                unparse_child_qdf(value, 2, out)?; // cov:ignore: writer-owned indirect /Root or /Encrypt references are emitted through the dedicated xref-stream path in production.
             } else {
-                write_child(value, out)?;
+                unparse_child(value, out)?;
             }
         } else if qdf {
-            write_child_qdf_with_ref_map(value, 2, out, &qpdf_map, &qpdf_removed_refs)?;
+            unparse_child_qdf_with_ref_map(value, 2, out, &qpdf_map, &qpdf_removed_refs)?;
         } else {
-            write_child_with_ref_map(value, out, &qpdf_map, &qpdf_removed_refs)?;
+            unparse_child_with_ref_map(value, out, &qpdf_map, &qpdf_removed_refs)?;
         }
         if qdf {
             out.write_bytes(b"\n")?;
@@ -5726,7 +5726,7 @@ fn unparse_trailer_entries_with_ref_map(
     }
     if let Some(value) = encrypt_value {
         out.write_bytes(b" /Encrypt ")?;
-        write_child(value, out)?;
+        unparse_child(value, out)?;
     }
 
     if qdf {
@@ -5862,7 +5862,7 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
         out.write_bytes(b" ")?;
         if key.as_slice() == b"/Root" && value.object_ref().is_none() {
             if qdf {
-                write_child_qdf_with_ref_map(value, 2, out, &qpdf_map, &qpdf_removed_refs)?;
+                unparse_child_qdf_with_ref_map(value, 2, out, &qpdf_map, &qpdf_removed_refs)?;
             } else if let Some(direct_root) = direct_root {
                 unparse_object_with_ref_map_and_direct_streams(
                     direct_root,
@@ -5872,18 +5872,18 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
                     false,
                 )?; // cov:ignore: LLVM maps this covered direct-root serializer continuation to the call setup.
             } else {
-                write_child_with_ref_map(value, out, &qpdf_map, &qpdf_removed_refs)?;
+                unparse_child_with_ref_map(value, out, &qpdf_map, &qpdf_removed_refs)?;
             }
         } else if key.as_slice() == b"/Root" {
             if qdf {
-                write_child_qdf(value, 2, out)?;
+                unparse_child_qdf(value, 2, out)?;
             } else {
-                write_child(value, out)?;
+                unparse_child(value, out)?;
             }
         } else if qdf {
-            write_child_qdf_with_ref_map(value, 2, out, &qpdf_map, &qpdf_removed_refs)?;
+            unparse_child_qdf_with_ref_map(value, 2, out, &qpdf_map, &qpdf_removed_refs)?;
         } else {
-            write_child_with_ref_map(value, out, &qpdf_map, &qpdf_removed_refs)?;
+            unparse_child_with_ref_map(value, out, &qpdf_map, &qpdf_removed_refs)?;
         }
         if qdf {
             out.write_bytes(b"\n")?;
@@ -5905,7 +5905,7 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
     }
     if let Some(value) = encrypt_value {
         out.write_bytes(b" /Encrypt ")?;
-        write_child(value, out)?;
+        unparse_child(value, out)?;
     }
     if qdf {
         if id_value.is_some() || encrypt_value.is_some() {
@@ -5958,9 +5958,9 @@ fn unparse_dictionary_entries_with_ref_map_and_id_writer(
                 )?, // cov:ignore: llvm-cov does not attribute this test-only /ID fallback continuation to the exercised call.
             }
         } else if matches!(key.as_slice(), b"/Root" | b"/Encrypt") {
-            write_child(value, out)?; // cov:ignore: test-only dictionary serializer receives writer-owned indirect references only in defensive unit shapes.
+            unparse_child(value, out)?; // cov:ignore: test-only dictionary serializer receives writer-owned indirect references only in defensive unit shapes.
         } else {
-            write_child_with_ref_map(value, out, &qpdf_map, &qpdf_removed_refs)?;
+            unparse_child_with_ref_map(value, out, &qpdf_map, &qpdf_removed_refs)?;
         }
     }
     out.write_bytes(b" >>")?;
@@ -5974,17 +5974,17 @@ fn unparse_dictionary_entries_with_ref_map_and_id_writer(
 // `ObjectHandle` shape directly: an indirect `value` (an `/ID` array stored as
 // a reference -- not a shape real qpdf itself ever produces, but nothing
 // at the type level rules it out) writes as its own `"N G R"` form via
-// `write_child`, checked before any shape inspection, matching
-// `write_child`'s own reference-vs-recurse split and never inlining an
+// `unparse_child`, checked before any shape inspection, matching
+// `unparse_child`'s own reference-vs-recurse split and never inlining an
 // indirect value regardless of what it resolves to. A direct
 // `Array([String, String])` gets the compact hex-pair form; any other
 // direct shape (wrong arity, non-string elements) falls back to
-// `write_child`'s generic form rather than silently truncating -- the
+// `unparse_child`'s generic form rather than silently truncating -- the
 // same "fall back, don't truncate" choice `write_id_style_value` makes.
 #[cfg(test)]
 fn write_id_style_value_handle(value: &ObjectHandle, out: &mut OutputSink<'_>) -> Result<()> {
     if value.object_ref().is_some() {
-        return write_child(value, out);
+        return unparse_child(value, out);
     }
     let compact: Option<(Vec<u8>, Vec<u8>)> = value.with_value(|v| match v {
         Some(ObjectValue::Array(items)) if items.len() == 2 => {
@@ -6009,7 +6009,7 @@ fn write_id_style_value_handle(value: &ObjectHandle, out: &mut OutputSink<'_>) -
             out.write_bytes(b"]")?;
             Ok(())
         }
-        None => write_child(value, out),
+        None => unparse_child(value, out),
     }
 }
 
@@ -6023,7 +6023,7 @@ fn write_id_style_value_handle_with_ref_map(
         .qpdf_obj_gen()
         .is_some_and(|object_gen| object_gen.is_indirect())
     {
-        return write_child_with_ref_map(value, out, map, removed_refs);
+        return unparse_child_with_ref_map(value, out, map, removed_refs);
     }
     let compact: Option<(Vec<u8>, Vec<u8>)> = value.with_value(|v| match v {
         Some(ObjectValue::Array(items)) if items.len() == 2 => {
@@ -6171,21 +6171,21 @@ mod tests {
         let mut ordinary = Vec::new();
         assert!(
             super::super::output::with_buffer_sink(&mut ordinary, |out| {
-                write_child(&handle, out)
+                unparse_child(&handle, out)
             })
             .is_err()
         );
 
         let mut mapped = Vec::new();
         assert!(super::super::output::with_buffer_sink(&mut mapped, |out| {
-            write_child_with_ref_map(&handle, out, &map, &removed)
+            unparse_child_with_ref_map(&handle, out, &map, &removed)
         })
         .is_err());
 
         let mut dynamic_map = |_: &ObjectHandle| Ok::<ObjectRef, Error>(ObjectRef::new(1, 0));
         let mut dynamic = Vec::new();
         assert!(super::super::output::with_buffer_sink(&mut dynamic, |out| {
-            write_child_with_dynamic_ref_map(&handle, out, &mut dynamic_map, &BTreeSet::new())
+            unparse_child_with_dynamic_ref_map(&handle, out, &mut dynamic_map, &BTreeSet::new())
         })
         .is_err());
 
@@ -6204,7 +6204,7 @@ mod tests {
         let mut dynamic_strings = Vec::new();
         assert!(
             super::super::output::with_buffer_sink(&mut dynamic_strings, |out| {
-                write_child_with_dynamic_ref_map_and_string_writer(
+                unparse_child_with_dynamic_ref_map_and_string_writer(
                     &handle,
                     out,
                     &mut string_map,
@@ -6251,7 +6251,7 @@ mod tests {
         };
         let mut bytes = Vec::new();
         super::super::output::with_buffer_sink(&mut bytes, |out| {
-            write_child_with_dynamic_ref_map_and_string_writer(
+            unparse_child_with_dynamic_ref_map_and_string_writer(
                 &array,
                 out,
                 &mut map,
@@ -7318,6 +7318,70 @@ mod tests {
         assert!(text.contains("  /ID [<61><62>] /Encrypt 8 0 R\n"));
         assert!(text.contains(" /Encrypt 8 0 R\n>>\n"));
         assert!(!text.contains("/Removed"));
+        Ok(())
+    }
+
+    #[test]
+    fn classic_trailer_with_ref_map_emits_direct_root_id_encrypt_and_custom_values() -> Result<()> {
+        let root = ObjectHandle::dictionary(vec![(
+            b"/Type".to_vec(),
+            ObjectHandle::name(b"Catalog".to_vec()),
+        )]);
+        let trailer = ObjectHandle::dictionary(vec![
+            (b"/Root".to_vec(), root),
+            (b"/Custom".to_vec(), ObjectHandle::integer(9)),
+            (
+                b"/Removed".to_vec(),
+                ObjectHandle::new_indirect_unresolved(ObjectRef::new(10, 0), -1),
+            ),
+            (
+                b"/ID".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(b"a".to_vec()),
+                    ObjectHandle::string(b"b".to_vec()),
+                ]),
+            ),
+            (
+                b"/Encrypt".to_vec(),
+                ObjectHandle::new_indirect_unresolved(ObjectRef::new(8, 0), -1),
+            ),
+        ]);
+        let mut output = Vec::new();
+        let map = |object_ref| Ok(object_ref);
+        let removed_refs = [ObjectRef::new(10, 0)].into_iter().collect();
+
+        super::super::output::with_buffer_sink(&mut output, |out| {
+            trailer.write_trailer_with_ref_map(out, false, false, None, &map, &removed_refs, false)
+        })?;
+
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.starts_with("trailer <<"));
+        assert!(!text.starts_with("trailer <<\n"));
+        assert!(text.contains(" /Root <<"));
+        assert!(text.contains(" /Custom 9"));
+        assert!(text.contains(" /ID [<61><62>] /Encrypt 8 0 R"));
+        assert!(text.ends_with(" >>"));
+        assert!(!text.contains("\n"));
+        assert!(!text.contains("/Removed"));
+        Ok(())
+    }
+
+    #[test]
+    fn classic_trailer_with_ref_map_emits_an_indirect_root_by_reference() -> Result<()> {
+        let trailer = ObjectHandle::dictionary(vec![(
+            b"/Root".to_vec(),
+            ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1),
+        )]);
+        let mut output = Vec::new();
+        let map = |object_ref| Ok(object_ref);
+        let removed_refs = BTreeSet::new();
+
+        super::super::output::with_buffer_sink(&mut output, |out| {
+            trailer.write_trailer_with_ref_map(out, false, false, None, &map, &removed_refs, false)
+        })?;
+
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(text, "trailer << /Root 1 0 R >>");
         Ok(())
     }
 
