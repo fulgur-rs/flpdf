@@ -385,6 +385,11 @@ jobs:
           # byte-identical to qpdf on both CLI routes while the merge skips
           # the primary orphan copy every chunk would discard (flpdf-yk1n).
           cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_split_pages_preserve_unreferenced_qpdf
+          # Pins that a truthy --split-pages claims the run before JSON output
+          # is reachable (QPDFJob::writeQPDF, QPDFJob.cc:486-491), so the split
+          # chunks stay byte-identical to qpdf's whichever JSON selector is
+          # also given (flpdf-zj5ny).
+          cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_json_split_pages_precedence_qpdf
           # Pins top-level no-pages rotate/split transformation handoff
           # (generate-appearances and flatten-annotations) against qpdf's
           # createQPDF -> writeQPDF boundary (flpdf-m6kt).

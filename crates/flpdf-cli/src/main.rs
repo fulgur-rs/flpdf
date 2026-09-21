@@ -3292,7 +3292,20 @@ fn main() {
             &overlay_specs,
             &attachment_segments,
         )
-    } else if args.json.is_some() || args.json_output.is_some() {
+    // `QPDFJob::writeQPDF` chooses one of three arms -- `doInspection`,
+    // `doSplitPages`, `writeOutfile` (`libqpdf/QPDFJob.cc:486-491`) -- and the
+    // JSON document is written from inside `writeOutfile`. A truthy
+    // `--split-pages` therefore claims the run before JSON output is
+    // reachable, so this route steps aside and the page-operation dispatch
+    // below owns the split, the way it already does for the `--empty` rewrite
+    // and `--linearize` routes above. The JSON selectors leave no trace on
+    // that output: `Config::jsonOutput` lowers `decode_level` without setting
+    // `decode_level_set` (`libqpdf/QPDFJob_config.cc:312-326`), which is the
+    // only flag `setWriterOptions` would replay (`libqpdf/QPDFJob.cc:2873`),
+    // and every other JSON option is consumed by `writeJSON` alone.
+    } else if (args.json.is_some() || args.json_output.is_some())
+        && !split_pages_active(args.page_ops.split_pages.as_deref())
+    {
         run_json(
             &args,
             top_level_inspection_transform_options,
@@ -8210,10 +8223,23 @@ fn parse_split_n(raw: &str) -> CliResult<usize> {
 /// Whether `--split-pages` selects qpdf's chunk-writing path.
 ///
 /// qpdf stores the parsed value in a signed field and dispatches only when it
-/// is truthy. Invalid values remain active here so `parse_split_n` can report a
-/// usage error instead of silently selecting the ordinary rewrite path.
+/// is truthy (`if (m->split_pages)`). The value comes from
+/// `Config::splitPages` (`libqpdf/QPDFJob_config.cc:604-609`): an empty
+/// parameter is one page, and anything else goes through
+/// `QUtil::string_to_int`, whose `strtoll` stage (`libqpdf/QUtil.cc:373-393`)
+/// reads a leading digit run and performs no conversion at all -- returning
+/// zero -- for a value that has none. `--split-pages=garbage` is therefore an
+/// ordinary unsplit write in qpdf, not a usage error, while
+/// `--split-pages=2x` really is a split of two. A value that overflows stays
+/// active so `parse_split_n` reports the same range error qpdf's
+/// `QIntC::to_int` raises.
 fn split_pages_active(raw: Option<&str>) -> bool {
-    raw.is_some_and(|value| value.parse::<usize>().map_or(true, |size| size > 0))
+    raw.is_some_and(|value| {
+        if value.is_empty() {
+            return true;
+        }
+        qpdf_selector_integer(value).map_or(true, |size| size != 0)
+    })
 }
 
 /// Apply `--rotate` / `--split-pages` to a plain (no `--pages`) rewrite.
