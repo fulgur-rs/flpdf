@@ -1,8 +1,8 @@
 use flpdf::job::{AttachmentAddOptions, JobDocument, JobExitCode, PageSpecInput, QPDFJob};
 use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
 use flpdf::{
-    EncryptParams, EncryptedError, Error, ObjectHandle, PageRange, Pdf, PdfOpenOptions, PdfWriter,
-    QPDFLogger, WriterConfiguration,
+    EncryptParams, EncryptedError, Error, ObjectHandle, ObjectStreamMode, PageRange, Pdf,
+    PdfOpenOptions, PdfWriter, QPDFLogger, WriterConfiguration,
 };
 use std::fs::File;
 use std::io::{BufReader, Cursor, Write};
@@ -6474,5 +6474,99 @@ fn argv_initialization_after_a_run_keeps_later_job_json_layering() {
     assert!(
         second_output.exists(),
         "the second run must write its output"
+    );
+}
+
+/// Build the multi-source `--pages` merge target for a
+/// `--preserve-unreferenced` job and return its written bytes.
+///
+/// `split_pages` carries qpdf's raw `--split-pages` parameter, so `Some("0")`
+/// reproduces qpdf's falsy value (`if (m->split_pages)`) rather than an
+/// absent option.
+fn preserve_unreferenced_merge_target(split_pages: Option<&str>) -> Vec<u8> {
+    let primary = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/null-visible-preserve-unreachable.pdf");
+    let secondary =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut json = serde_json::json!({
+        "inputFile": primary,
+        "outputFile": tempdir.path().join("merged.pdf"),
+        "preserveUnreferenced": "",
+        "pages": [
+            {"file": ".", "range": "1"},
+            {"file": secondary, "range": "1"}
+        ]
+    });
+    if let Some(parameter) = split_pages {
+        json["splitPages"] = serde_json::Value::String(parameter.to_owned());
+    }
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json.to_string()).unwrap();
+    let mut merged = job
+        .create_qpdf()
+        .unwrap()
+        .expect("the multi-source merge must succeed");
+
+    // Write the intermediate itself, with the writer option still on, so the
+    // assertion sees exactly what the merge copied rather than what a later
+    // stage would have kept.
+    let mut writer = PdfWriter::new(&mut merged);
+    writer.set_static_id(true);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_preserve_unreferenced_objects(true);
+    writer.set_output_memory().expect("configure memory output");
+    writer.write().expect("write the merge target");
+    writer.get_buffer().expect("writer output")
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// `--preserve-unreferenced` must not make the merge resolve and copy the
+/// primary's unreferenced objects when `--split-pages` will discard them.
+///
+/// qpdf's `--preserve-unreferenced` is a writer option
+/// (`libqpdf/QPDFWriter.cc:2907-2913`) and `QPDFJob::handlePageSpecs` keeps
+/// the primary `QPDF` as the output document, so the writer finds those
+/// objects in place. flpdf's multi-source route merges into a fresh target
+/// and copies them across to match. `QPDFJob::doSplitPages`
+/// (`libqpdf/QPDFJob.cc:2940-3027`) instead builds every chunk from its own
+/// `emptyPDF()` populated only by `addPage(page, false)`, so no chunk can
+/// ever contain them and the copy is work the split throws away.
+#[test]
+fn a_split_run_skips_the_discarded_primary_orphan_copy() {
+    let merged = preserve_unreferenced_merge_target(None);
+    assert!(
+        contains_bytes(&merged, b"unreachable root"),
+        "an ordinary multi-source --preserve-unreferenced merge keeps the primary's \
+         unreferenced objects"
+    );
+
+    let split = preserve_unreferenced_merge_target(Some("1"));
+    assert!(
+        !contains_bytes(&split, b"unreachable root"),
+        "a --split-pages run must not copy primary orphans no chunk can hold"
+    );
+    assert!(
+        !contains_bytes(&split, b"unreachable child"),
+        "the whole unreferenced closure must be skipped, not just its root"
+    );
+}
+
+/// qpdf's `--split-pages=0` is falsy in `if (m->split_pages)`, so it writes
+/// one ordinary output and the merge must still preserve the primary's
+/// unreferenced objects.
+#[test]
+fn a_falsy_split_pages_value_still_preserves_primary_orphans() {
+    let merged = preserve_unreferenced_merge_target(Some("0"));
+    assert!(
+        contains_bytes(&merged, b"unreachable root"),
+        "--split-pages=0 never splits, so the writer still reaches the primary's \
+         unreferenced objects"
     );
 }

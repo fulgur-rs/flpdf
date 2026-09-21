@@ -381,6 +381,10 @@ jobs:
           # canonicalized) is not deduplicated by flpdf's own dedup, which
           # must key on the same raw OsStr bytes (flpdf-6z22).
           cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_pages_source_dedup_raw_bytes
+          # Pins that --pages + --preserve-unreferenced + --split-pages stays
+          # byte-identical to qpdf on both CLI routes while the merge skips
+          # the primary orphan copy every chunk would discard (flpdf-yk1n).
+          cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_split_pages_preserve_unreferenced_qpdf
           # Pins top-level no-pages rotate/split transformation handoff
           # (generate-appearances and flatten-annotations) against qpdf's
           # createQPDF -> writeQPDF boundary (flpdf-m6kt).

@@ -3596,7 +3596,17 @@ source preparation と live-handle による destination `/Parent` replacement �
 選択 page graph の legacy pre-closed copy を削除した。primary の document-level /
 AcroForm / PageLabels merge は Catalog/trailer の各 direct value を同じ persistent
 foreign map でコピーし、`--preserve-unreferenced` は qpdf の live object cache を
-`copy_foreign_object` で列挙する。removed-page nulling と `/Pages` 再構築も canonical
+`copy_foreign_object` で列挙する。ただし `--split-pages` と併用された場合、この列挙は
+行わない（`job/lifecycle.rs::preserve_unreferenced_for_page_merge`）。qpdf の
+`QPDFJob::doSplitPages`（`QPDFJob.cc:2940-3027`）は各 chunk を `emptyPDF()` +
+`addPage(page, false)` だけで構築するため、chunk の object cache に primary の
+unreferenced object は入らず、chunk writer へ再適用される writer option
+（`QPDFJob.cc:3021` → `QPDFJob.cc:2856`）は enqueue 対象を持たない。実 qpdf の
+split 出力も preserved primary orphan を持たないので、この skip は
+byte-identical を崩さず、捨てられる copy を省くだけである。CLI 側は top-level route
+がこの job 内判定を通り、`rewrite` route（split を CLI 自身が行う）は create-stage の
+writer configuration で同じ bit を落とす（`main.rs::run_page_extraction_from_multiple_sources`）。
+removed-page nulling と `/Pages` 再構築も canonical
 handle mutation で行うため、page merge に raw metadata closure bridge は残さない。
 `Object::Reference` を値として保持する `Pdf::set_object` holder chain は qpdf の
 `copyForeignObject` が拒否する shape であり、後方互換 adapter は追加せず明示的 rejection
