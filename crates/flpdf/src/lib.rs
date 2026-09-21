@@ -65,15 +65,18 @@
 //!     [`PageLabelDocumentHelper::write_reconstructed_labels`] — the
 //!     [`extract_pages`] and [`merge_documents`] pipelines assemble
 //!     that combination for you.
-//!   - [`merge_documents`] preserves outlines and both dest sources for
-//!     the PRIMARY input only (matching qpdf `--pages`), and reconstructs
-//!     `/PageLabels` across every input's selected pages.
+//!   - [`merge_documents`] preserves outlines, both dest sources, and the
+//!     trailer `/Info` dictionary for the PRIMARY input only (matching qpdf
+//!     `--pages`), and reconstructs `/PageLabels` across every input's
+//!     selected pages.
 //!   - [`extract_pages`] returns a new document whose serialized output is
 //!     minimal and intentionally omits catalog-level navigation — `/Outlines`,
-//!     catalog `/Dests`, and `/Names /Dests` are all dropped. Only
-//!     `/PageLabels` is reconstructed for the selection. Callers who need
-//!     outlines/dests preserved should use [`merge_documents`] with a single
-//!     input.
+//!     catalog `/Dests`, and `/Names /Dests` are all dropped — as well as the
+//!     source's trailer `/Info`, because it builds on an empty document and
+//!     copies pages rather than document-level data (matching qpdf
+//!     `--empty --pages`). Only `/PageLabels` is reconstructed for the
+//!     selection. Callers who need outlines, dests, or `/Info` preserved
+//!     should use [`merge_documents`] with a single input.
 //! - **Raw outline keys are preserved.** Ordinary rewriting keeps `/SE`,
 //!   `/Dest`, `/A`, and unknown outline dictionary keys as PDF objects rather
 //!   than applying flpdf-specific validation or pruning policy.

@@ -7,8 +7,9 @@
 //! `QPDFPageDocumentHelper::addPage` copies pages rather than document-level
 //! data. [`flpdf::merge_documents`] is the primary-input form and
 //! [`flpdf::extract_pages`] is the `--empty` form, so these tests pin both
-//! sides of that split, plus the public-handle route a caller uses to install
-//! an `/Info` of its own.
+//! sides of that split, the primary-only rule that a later input's `/Info`
+//! never wins, and the public-handle route a caller uses to install an
+//! `/Info` of its own.
 
 use flpdf::{extract_pages, merge_documents, MergeInput, Pdf, PdfWriter};
 use std::collections::BTreeMap;
@@ -75,6 +76,14 @@ fn two_page_pdf_with_direct_info() -> Vec<u8> {
 /// Two pages and no `/Info` at all.
 fn two_page_pdf_without_info() -> Vec<u8> {
     build_pdf(PAGE_OBJECTS, 1, "")
+}
+
+/// A second document whose `/Info` carries a distinguishable `/Title`, used
+/// as a non-primary merge input.
+fn two_page_donor_pdf_with_info() -> Vec<u8> {
+    let mut objects = PAGE_OBJECTS.to_vec();
+    objects.push((5, "<< /Title (Donor Title) /Producer (donor) >>"));
+    build_pdf(&objects, 1, " /Info 5 0 R")
 }
 
 fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
@@ -145,19 +154,51 @@ fn merge_documents_carries_a_direct_primary_info_dictionary() {
 }
 
 #[test]
+fn merge_documents_ignores_a_later_inputs_info_dictionary() {
+    let mut primary = open(two_page_pdf_with_indirect_info());
+    let mut donor = open(two_page_donor_pdf_with_info());
+    let mut inputs = [
+        MergeInput {
+            source: &mut primary,
+            pages: vec![0],
+        },
+        MergeInput {
+            source: &mut donor,
+            pages: vec![0],
+        },
+    ];
+    let mut merged = merge_documents(&mut inputs).expect("merge two inputs");
+    let mut written = round_trip(&mut merged);
+
+    assert_eq!(
+        written_info_title(&mut written).as_deref(),
+        Some(b"Indirect Title".as_slice()),
+        "document-level data is taken from inputs[0] only, so a later input's \
+         /Info must not replace the primary's"
+    );
+}
+
+#[test]
 fn merge_documents_adds_no_info_when_the_primary_has_none() {
-    let mut source = open(two_page_pdf_without_info());
-    let mut inputs = [MergeInput {
-        source: &mut source,
-        pages: vec![0],
-    }];
-    let mut merged = merge_documents(&mut inputs).expect("merge single input");
+    let mut primary = open(two_page_pdf_without_info());
+    let mut donor = open(two_page_donor_pdf_with_info());
+    let mut inputs = [
+        MergeInput {
+            source: &mut primary,
+            pages: vec![0],
+        },
+        MergeInput {
+            source: &mut donor,
+            pages: vec![0],
+        },
+    ];
+    let mut merged = merge_documents(&mut inputs).expect("merge two inputs");
     let mut written = round_trip(&mut merged);
 
     assert_eq!(
         written_info_title(&mut written),
         None,
-        "a primary without /Info must not gain one"
+        "a primary without /Info must not gain one from a later input"
     );
 }
 
