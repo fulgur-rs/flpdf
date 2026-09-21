@@ -831,6 +831,71 @@ impl ObjectWriterEmissionVecTestExt for ObjectHandle {
 const UNPARSE_STACK_RED_ZONE: usize = 32 * 1024;
 const UNPARSE_STACK_GROWTH_SIZE: usize = 1024 * 1024;
 
+// Active recursion depth of this module's `unparse_object_walk*` family.
+//
+// `stacker::maybe_grow` swaps stack segments without leaving the current
+// thread, so a thread-local counter observes every level of one walk and
+// never mixes two concurrent writes.
+//
+// qpdf's `QPDFWriter::unparseObject` (`libqpdf/QPDFWriter.cc:1318-1325`)
+// validates only that its `level` is non-negative. Nothing bounds the walk
+// from above and nothing records the nodes already on the path, so a pair of
+// *direct* dictionaries holding each other recurses until the process runs
+// out of memory. Parsed input cannot reach that shape -- `parser.rs` caps
+// container nesting at `MAX_PARSE_DEPTH` and the direct containers it builds
+// are trees -- but `ObjectHandle::replace_key` accepts it from a library
+// caller, since it refuses only the single-hop self-insert and not the
+// two-hop pair `a.replace_key(b"/B", b)` plus `b.replace_key(b"/A", a)`.
+// Bounding every hub at the parser's own limit turns such a graph into a
+// diagnostic instead of resource exhaustion, and leaves every graph the
+// parser can produce untouched. The live body writer's direct-seed collector
+// (`writer/plain/body.rs`) already refuses the same nesting before emission
+// starts, so this makes the remaining emission routes agree with it.
+thread_local! {
+    static UNPARSE_WALK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// Counts one active level of the walk and restores the count when the level
+// unwinds, on the error path as well as the success path.
+struct UnparseWalkDepthGuard;
+
+impl UnparseWalkDepthGuard {
+    fn enter() -> Result<Self> {
+        let depth = UNPARSE_WALK_DEPTH.with(|depth| {
+            let entered = depth.get();
+            depth.set(entered + 1);
+            entered
+        });
+        // Constructed before the bound is tested so the count is restored
+        // even when this level is rejected.
+        let guard = Self;
+        if depth > crate::parser::MAX_PARSE_DEPTH {
+            return Err(Error::Unsupported(format!(
+                "writer: direct object nesting exceeds maximum of {}",
+                crate::parser::MAX_PARSE_DEPTH
+            )));
+        }
+        Ok(guard)
+    }
+}
+
+impl Drop for UnparseWalkDepthGuard {
+    fn drop(&mut self) {
+        UNPARSE_WALK_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// Run one level of an `unparse_object_walk*` recursion with the family's
+/// shared stack growth and nesting bound.
+///
+/// Every hub in the family routes its body through here, so a direct
+/// container graph that never reaches an indirect boundary is rejected at
+/// the same depth wherever it is met.
+fn unparse_object_walk_hub<T>(body: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _depth = UnparseWalkDepthGuard::enter()?;
+    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, body)
+}
+
 fn reserved_unparse_error() -> Error {
     Error::System("QPDFObjectHandle: attempting to unparse a reserved object".to_owned())
 }
@@ -3134,7 +3199,7 @@ fn unparse_container(container: UnparseContainer, out: &mut OutputSink<'_>) -> R
 }
 
 fn unparse_object_walk(handle: &ObjectHandle, out: &mut OutputSink<'_>) -> Result<()> {
-    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+    unparse_object_walk_hub(|| {
         if handle.is_reserved() {
             return Err(reserved_unparse_error());
         }
@@ -3340,7 +3405,7 @@ fn unparse_object_walk_with_ref_map(
     map: &QpdfObjGenMap<'_>,
     removed_refs: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
-    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+    unparse_object_walk_hub(|| {
         if handle.is_reserved() {
             return Err(reserved_unparse_error());
         }
@@ -3778,7 +3843,7 @@ fn unparse_object_walk_with_dynamic_ref_map_and_string_writer<F>(
 where
     F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()> + ?Sized,
 {
-    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+    unparse_object_walk_hub(|| {
         if handle.is_reserved() {
             return Err(reserved_unparse_error());
         }
@@ -4015,7 +4080,7 @@ fn unparse_object_walk_with_dynamic_ref_map(
     map: &mut DynamicObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
-    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+    unparse_object_walk_hub(|| {
         if handle.is_reserved() {
             return Err(reserved_unparse_error());
         }
@@ -4355,7 +4420,7 @@ fn unparse_object_walk_qdf(
     indent: usize,
     out: &mut OutputSink<'_>,
 ) -> Result<()> {
-    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+    unparse_object_walk_hub(|| {
         if handle.is_reserved() {
             return Err(reserved_unparse_error());
         }
@@ -4556,7 +4621,7 @@ fn unparse_object_walk_qdf_with_ref_map(
     map: &QpdfObjGenMap<'_>,
     removed_refs: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
-    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+    unparse_object_walk_hub(|| {
         if handle.is_reserved() {
             return Err(reserved_unparse_error());
         }
@@ -4679,7 +4744,7 @@ fn unparse_object_walk_qdf_with_dynamic_ref_map(
     map: &mut DynamicObjectRefMap<'_>,
     removed_refs: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
-    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+    unparse_object_walk_hub(|| {
         handle.try_dereference()?;
         let container = handle.with_value(|value| -> Result<QdfDynamicContainer> {
             match value {
@@ -4870,7 +4935,7 @@ fn unparse_object_walk_with_ref_map_and_string_writer<F>(
 where
     F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
-    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+    unparse_object_walk_hub(|| {
         if handle.is_reserved() {
             return Err(reserved_unparse_error());
         }
@@ -5047,7 +5112,7 @@ fn unparse_object_walk_qdf_with_ref_map_and_string_writer<F>(
 where
     F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
-    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+    unparse_object_walk_hub(|| {
         // cov:ignore: reserved precondition closure has no independent LLVM counter
         if handle.is_reserved() {
             return Err(reserved_unparse_error());
@@ -5259,7 +5324,7 @@ fn unparse_object_walk_with_string_writer<F>(
 where
     F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
-    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+    unparse_object_walk_hub(|| {
         if handle.is_reserved() {
             return Err(reserved_unparse_error());
         }
@@ -5411,7 +5476,7 @@ fn unparse_object_walk_qdf_with_string_writer<F>(
 where
     F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
-    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+    unparse_object_walk_hub(|| {
         if handle.is_reserved() {
             return Err(reserved_unparse_error());
         }
@@ -7234,6 +7299,118 @@ mod tests {
         assert!(text.contains("  /ID [<61><62>] /Encrypt 8 0 R\n"));
         assert!(text.contains(" /Encrypt 8 0 R\n>>\n"));
         assert!(!text.contains("/Removed"));
+        Ok(())
+    }
+
+    // Two direct dictionaries holding each other: `a` under `/B` holds `b`,
+    // and `b` under `/A` holds `a`. Neither handle is indirect, so no walk
+    // ever meets the indirect boundary that normally terminates a descent.
+    // `replace_key` refuses only the single-hop self-insert, so this two-hop
+    // shape does close into a real cycle -- asserted here so the walk
+    // assertions below cannot pass against an unaliased pair.
+    fn reciprocal_direct_dictionary_cycle() -> Result<ObjectHandle> {
+        let a = ObjectHandle::dictionary(vec![]);
+        let b = ObjectHandle::dictionary(vec![]);
+        a.replace_key(b"/B", b.clone())?;
+        b.replace_key(b"/A", a.clone())?;
+        assert!(
+            a.try_get_key(b"/B")?
+                .try_get_key(b"/A")?
+                .is_same_object_as(&a),
+            "the reciprocal replace_key pair must close into a direct cycle"
+        );
+        Ok(a)
+    }
+
+    // `n` nested direct dictionaries around a scalar leaf. Only the
+    // dictionaries enter a walk hub; the leaf is written by the direct-scalar
+    // fast path, so the nesting count equals the hub depth reached.
+    fn nested_direct_dictionaries(n: usize) -> ObjectHandle {
+        let mut handle = ObjectHandle::integer(1);
+        for _ in 0..n {
+            handle = ObjectHandle::dictionary(vec![(b"/K".to_vec(), handle)]);
+        }
+        handle
+    }
+
+    #[test]
+    fn direct_dictionary_cycle_is_rejected_by_the_unparse_hub_family() -> Result<()> {
+        let cycle = reciprocal_direct_dictionary_cycle()?;
+
+        let plain = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
+            ObjectWriterEmission::write_object(&cycle, out)
+        })
+        .expect_err("a direct cycle must not be walked by the plain hub");
+        assert!(
+            matches!(plain, Error::Unsupported(_)),
+            "unexpected error kind: {plain:?}"
+        );
+        assert!(
+            plain
+                .to_string()
+                .contains("direct object nesting exceeds maximum of"),
+            "unexpected message: {plain}"
+        );
+
+        let qdf = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
+            ObjectWriterEmission::write_object_qdf(&cycle, out, 0)
+        })
+        .expect_err("a direct cycle must not be walked by the qdf hub");
+        assert!(matches!(qdf, Error::Unsupported(_)));
+
+        let dynamic = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
+            cycle.write_object_with_dynamic_ref_map(
+                out,
+                &mut |_: &ObjectHandle| Ok(ObjectRef::new(1, 0)),
+                &BTreeSet::new(),
+            )
+        })
+        .expect_err("a direct cycle must not be walked by the dynamic ref-map hub");
+        assert!(matches!(dynamic, Error::Unsupported(_)));
+
+        // Every rejected level restores the shared counter on its way out,
+        // so a later write starts from zero instead of inheriting the
+        // exhausted budget of the refused walk.
+        assert_eq!(UNPARSE_WALK_DEPTH.with(std::cell::Cell::get), 0);
+        let mut output = Vec::new();
+        let deep = nested_direct_dictionaries(crate::parser::MAX_PARSE_DEPTH + 1);
+        super::super::output::with_buffer_sink(&mut output, |out| {
+            ObjectWriterEmission::write_object(&deep, out)
+        })?;
+        assert_eq!(
+            String::from_utf8_lossy(&output).matches("/K").count(),
+            crate::parser::MAX_PARSE_DEPTH + 1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn acyclic_direct_nesting_is_bounded_at_the_parser_limit() -> Result<()> {
+        let bound = crate::parser::MAX_PARSE_DEPTH;
+
+        let mut output = Vec::new();
+        let within_bound = nested_direct_dictionaries(bound + 1);
+        super::super::output::with_buffer_sink(&mut output, |out| {
+            ObjectWriterEmission::write_object(&within_bound, out)
+        })?;
+        assert_eq!(
+            String::from_utf8_lossy(&output).matches("/K").count(),
+            bound + 1,
+            "every level within the bound must still be written"
+        );
+
+        let past_bound = nested_direct_dictionaries(bound + 2);
+        let error = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
+            ObjectWriterEmission::write_object(&past_bound, out)
+        })
+        .expect_err("nesting past the bound must be reported");
+        assert!(matches!(error, Error::Unsupported(_)));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "unsupported PDF feature: writer: direct object nesting exceeds maximum of {bound}"
+            )
+        );
         Ok(())
     }
 }
