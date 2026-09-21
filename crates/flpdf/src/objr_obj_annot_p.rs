@@ -58,6 +58,7 @@
 
 use crate::object_handle::ObjectHandle;
 use crate::pages::tree_rebuild::RebuildResult;
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::{ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -106,7 +107,7 @@ pub fn drop_objr_obj_annot_dangling_p<R: Read + Seek>(
         .iter()
         .filter_map(|(&old, new_refs)| new_refs.first().map(|&new| (old, new)))
         .collect();
-    let removed_pages = &result.removed_pages;
+    let removed_pages = &result.removed_page_objgens;
 
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     for &start in objr_obj_targets {
@@ -138,19 +139,22 @@ fn remap_or_drop_annot_p<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     annot: &ObjectHandle,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
-    removed_pages: &BTreeSet<ObjectRef>,
+    removed_pages: &BTreeSet<QpdfObjGen>,
 ) -> Result<bool> {
     let Some(p) = raw_child(annot, b"/P")? else {
         return Ok(false);
     };
-    let Some(page_ref) = p.object_ref() else {
+    let Some(page_gen) = p.qpdf_obj_gen() else {
         return Ok(false);
     };
-    if !surviving.contains_key(&page_ref) && !removed_pages.contains(&page_ref) {
+    let surviving_entry = page_gen
+        .to_object_ref()
+        .and_then(|page_ref| surviving.get(&page_ref).map(|&new| (page_ref, new)));
+    if surviving_entry.is_none() && !removed_pages.contains(&page_gen) {
         return Ok(false);
     }
-    match surviving.get(&page_ref) {
-        Some(&new) => {
+    match surviving_entry {
+        Some((page_ref, new)) => {
             if new != page_ref {
                 annot.replace_key(b"/P", pdf.get_object_handle(new))?;
                 return Ok(true);
@@ -230,8 +234,7 @@ mod tests {
         RebuildResult {
             new_kids: vec![ObjectRef::new(3, 0), ObjectRef::new(5, 0)],
             ref_map,
-            removed_pages: [ObjectRef::new(4, 0)].into_iter().collect(),
-            ..Default::default()
+            removed_page_objgens: [QpdfObjGen::new(4, 0)].into_iter().collect(),
         }
     }
 

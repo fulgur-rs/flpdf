@@ -77,6 +77,7 @@
 
 use crate::object_handle::ObjectHandle;
 use crate::pages::tree_rebuild::RebuildResult;
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::{ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -86,8 +87,8 @@ use std::io::{Read, Seek};
 ///
 /// `result` is the [`RebuildResult`] returned by
 /// [`crate::pages::tree_rebuild::rebuild_page_tree`]. Its `ref_map` encodes the
-/// old → new page reference mapping, while `removed_pages` is the exact set of
-/// original page-tree leaves dropped by the rebuild.
+/// old → new page reference mapping, while `removed_page_objgens` is the
+/// exact set of original page-tree leaves dropped by the rebuild.
 ///
 /// The walk is seeded from both the catalog `/Threads` article list and every
 /// surviving page's `/B` bead array, then follows the ring through `/N` and
@@ -114,7 +115,7 @@ pub fn drop_thread_bead_dangling_p<R: Read + Seek>(
         .iter()
         .filter_map(|(&old, new_refs)| new_refs.first().map(|&new| (old, new)))
         .collect();
-    let removed_pages = &result.removed_pages;
+    let removed_pages = &result.removed_page_objgens;
 
     // Seed the bead walk from every entry point qpdf reaches a ring through:
     // the catalog /Threads article list and each surviving page's /B array.
@@ -228,13 +229,13 @@ fn seed_from_surviving_pages<R: Read + Seek>(
 /// `/P` is by spec an indirect reference to the page the bead belongs to,
 /// possibly through a reference chain. The chain is resolved to its terminal
 /// ref; surviving targets are remapped, and only refs in the exact
-/// `RebuildResult::removed_pages` set are dropped. Other targets, including
-/// non-page and page-tree-external objects, remain unchanged.
+/// `RebuildResult::removed_page_objgens` set are dropped. Other targets,
+/// including non-page and page-tree-external objects, remain unchanged.
 fn remap_or_drop_bead_p<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     bead: &ObjectHandle,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
-    removed_pages: &BTreeSet<ObjectRef>,
+    removed_pages: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
     let Some(p_val) = bead
         .try_as_dictionary()?
@@ -242,16 +243,19 @@ fn remap_or_drop_bead_p<R: Read + Seek>(
     else {
         return Ok(());
     };
-    let p_terminal = p_val.object_ref();
+    let p_terminal = p_val.qpdf_obj_gen();
     p_val.try_dereference()?;
-    let Some(page_ref) = p_terminal else {
+    let Some(page_gen) = p_terminal else {
         return Ok(()); // Non-reference /P: malformed, left unchanged.
     };
-    if !surviving.contains_key(&page_ref) && !removed_pages.contains(&page_ref) {
+    let surviving_entry = page_gen
+        .to_object_ref()
+        .and_then(|page_ref| surviving.get(&page_ref).map(|&new| (page_ref, new)));
+    if surviving_entry.is_none() && !removed_pages.contains(&page_gen) {
         return Ok(());
     }
-    match surviving.get(&page_ref) {
-        Some(&new) if new != page_ref => {
+    match surviving_entry {
+        Some((page_ref, new)) if new != page_ref => {
             bead.replace_key(b"/P", pdf.get_object_handle(new))?;
             Ok(())
         }
@@ -402,8 +406,7 @@ mod tests {
         RebuildResult {
             new_kids: vec![ObjectRef::new(3, 0), ObjectRef::new(5, 0)],
             ref_map,
-            removed_pages: [ObjectRef::new(4, 0)].into_iter().collect(),
-            ..Default::default()
+            removed_page_objgens: [QpdfObjGen::new(4, 0)].into_iter().collect(),
         }
     }
 
@@ -471,8 +474,7 @@ mod tests {
         let result = RebuildResult {
             new_kids: vec![ObjectRef::new(7, 0), ObjectRef::new(5, 0)],
             ref_map,
-            removed_pages: [ObjectRef::new(4, 0)].into_iter().collect(),
-            ..Default::default()
+            removed_page_objgens: [QpdfObjGen::new(4, 0)].into_iter().collect(),
         };
 
         drop_thread_bead_dangling_p(&mut pdf, &result).expect("bead /P remap");
@@ -515,8 +517,7 @@ mod tests {
                 ObjectRef::new(5, 0),
             ],
             ref_map,
-            removed_pages: [ObjectRef::new(4, 0)].into_iter().collect(),
-            ..Default::default()
+            removed_page_objgens: [QpdfObjGen::new(4, 0)].into_iter().collect(),
         };
 
         drop_thread_bead_dangling_p(&mut pdf, &result).expect("duplicate-page bead /P");
@@ -561,11 +562,10 @@ mod tests {
         let result = RebuildResult {
             new_kids: vec![ObjectRef::new(6, 0)],
             ref_map,
-            removed_pages: [3, 4, 5]
+            removed_page_objgens: [3, 4, 5]
                 .into_iter()
-                .map(|number| ObjectRef::new(number, 0))
+                .map(|number| QpdfObjGen::new(number, 0))
                 .collect(),
-            ..Default::default()
         };
 
         drop_thread_bead_dangling_p(&mut pdf, &result).expect("all-dangling drop");
@@ -931,8 +931,7 @@ mod tests {
                 ObjectRef::new(5, 0),
             ],
             ref_map,
-            removed_pages: [ObjectRef::new(4, 0)].into_iter().collect(),
-            ..Default::default()
+            removed_page_objgens: [QpdfObjGen::new(4, 0)].into_iter().collect(),
         };
 
         drop_thread_bead_dangling_p(&mut pdf, &result).expect("dedup");

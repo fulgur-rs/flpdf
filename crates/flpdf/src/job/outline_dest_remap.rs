@@ -411,8 +411,8 @@ fn remap_goto_action<R: Read + Seek>(
 
 /// Replace every removed original page leaf with `null` in place (qpdf null-out).
 ///
-/// `result.removed_pages` is the set of original page-tree leaves the rebuild
-/// dropped — exactly the objects qpdf's `--pages` nulls (`QPDFJob` enumerates
+/// `result.removed_page_objgens` is the set of original page-tree leaves the
+/// rebuild dropped — exactly the objects qpdf's `--pages` nulls (`QPDFJob` enumerates
 /// the original page tree and `replaceObject`s each unselected `/Page`). This is
 /// page-driven, never destination-driven: a removed page reached only through a
 /// reference holder (`[40 0 R]` with `40 0 obj` = `4 0 R`) or a non-page wrapper
@@ -421,16 +421,6 @@ fn remap_goto_action<R: Read + Seek>(
 /// is never in this set and is left untouched. The subsequent subset sweep
 /// drops any nulled page that no surviving destination still references.
 fn null_removed_pages<R: Read + Seek>(pdf: &mut Pdf<R>, result: &RebuildResult) -> Result<()> {
-    if result.removed_page_objgens.is_empty() {
-        // Keep hand-built RebuildResult values used by internal callers and
-        // tests on the legacy projection while canonical rebuilds use the raw
-        // identity set below.
-        for &removed in &result.removed_pages {
-            pdf.replace_object(removed, ObjectHandle::null())?;
-        }
-        return Ok(());
-    }
-
     for object_gen in &result.removed_page_objgens {
         let page =
             pdf.get_object_handle_by_raw_identity(object_gen.get_obj(), object_gen.get_gen());

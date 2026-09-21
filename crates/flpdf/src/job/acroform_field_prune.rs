@@ -67,6 +67,7 @@
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
 use crate::page_object_helper::PageObjectHelper;
 use crate::pages::tree_rebuild::RebuildResult;
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::{ObjectRef, Pdf, Result};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Seek};
@@ -226,7 +227,7 @@ pub(crate) fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
     // GCs it (qpdf 11.9.0 observed: B2 had no /P in pages-1,2 output).
     let retained_page_refs: BTreeSet<ObjectRef> = result.new_kids.iter().copied().collect();
     for (widget, _) in widget_to_page.values() {
-        remove_stale_widget_page_ref(widget, &retained_page_refs, &result.removed_pages)?;
+        remove_stale_widget_page_ref(widget, &retained_page_refs, &result.removed_page_objgens)?;
     }
     // Collect all widgets reachable from kept fields; strip /P from any that
     // are NOT in widget_to_page (i.e. live in a kept field's /Kids but were on
@@ -390,19 +391,22 @@ fn field_has_retained_widget<R: Read + Seek>(
 fn remove_stale_widget_page_ref(
     widget: &ObjectHandle,
     retained_page_refs: &BTreeSet<ObjectRef>,
-    removed_pages: &BTreeSet<ObjectRef>,
+    removed_pages: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
     if !widget.try_is_dictionary()? || !widget.try_has_key(b"/P")? {
         return Ok(());
     }
     let existing = widget.try_get_key(b"/P")?;
-    let Some(existing_ref) = existing.object_ref() else {
+    let Some(existing_gen) = existing.qpdf_obj_gen() else {
         return Ok(());
     };
-    if retained_page_refs.contains(&existing_ref) {
+    if existing_gen
+        .to_object_ref()
+        .is_some_and(|existing_ref| retained_page_refs.contains(&existing_ref))
+    {
         return Ok(());
     }
-    if removed_pages.contains(&existing_ref) {
+    if removed_pages.contains(&existing_gen) {
         widget.remove_key(b"/P");
         return Ok(());
     }
@@ -737,13 +741,13 @@ mod tests {
         // `remap_outline_and_dests` null-out pass. Simulate that ordering:
         // widget 11's `/P 5 0 R` target (page 5) is still a live dictionary
         // (never nulled), but page 5 is a genuinely dropped original leaf, so
-        // it is reported via `removed_pages`. The removal must not depend on
+        // it is reported via `removed_page_objgens`. The removal must not depend on
         // the target's null state to match qpdf's actual removal set.
         let mut pdf = open(build_acroform_pdf());
         let widget = pdf.get_object_handle(ObjectRef::new(11, 0));
         widget.try_is_scalar().unwrap();
         let retained = BTreeSet::from([ObjectRef::new(3, 0), ObjectRef::new(4, 0)]);
-        let removed_pages = BTreeSet::from([ObjectRef::new(5, 0)]);
+        let removed_pages = BTreeSet::from([QpdfObjGen::new(5, 0)]);
 
         remove_stale_widget_page_ref(&widget, &retained, &removed_pages).unwrap();
 

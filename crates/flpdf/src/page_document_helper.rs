@@ -9,6 +9,7 @@
 
 use crate::object_handle::DocumentResolver;
 use crate::pages::tree_rebuild::{rebuild_page_tree, RebuildResult};
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::{
     Error, ObjectHandle, ObjectRef, PageObjectHelper, Pdf, QpdfErrorCode, QpdfExc, Result,
 };
@@ -329,7 +330,15 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// `rebuild_page_tree`, so this method only performs the final empty-tree
     /// mutation that qpdf's `removePage` leaves behind.
     fn clear_page_tree(&mut self) -> Result<RebuildResult> {
-        let removed_pages: BTreeSet<ObjectRef> = self.get_all_pages()?.into_iter().collect();
+        // `get_all_pages` is the public `ObjectRef` reference-spelling
+        // boundary; a page number outside qpdf's signed-int domain is
+        // dropped here, matching the canonical rebuild constructor's own
+        // `try_from_object_ref(...).ok()` filter (`pages/tree_rebuild.rs`).
+        let removed_page_objgens: BTreeSet<QpdfObjGen> = self
+            .get_all_pages()?
+            .into_iter()
+            .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok())
+            .collect();
         let catalog = self.pdf.root_handle()?;
         let Some(catalog_dict) = catalog.as_dictionary() else {
             // cov:ignore-start: remove obtains pages through get_all_pages, which proves /Root is a dictionary before clear_page_tree runs
@@ -371,8 +380,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         Ok(RebuildResult {
             new_kids: Vec::new(),
             ref_map: BTreeMap::new(),
-            removed_pages,
-            ..Default::default()
+            removed_page_objgens,
         })
     }
 }
