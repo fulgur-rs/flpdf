@@ -195,7 +195,7 @@ pub(crate) fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
     for field in fields_arr {
         if field.object_ref().is_none() {
             // qpdf's AcroForm traversal ignores direct field entries
-            // (`QPDFAcroFormDocumentHelper.cc:289-308`).
+            // (`QPDFAcroFormDocumentHelper.cc:297-301`).
             continue;
         }
 
