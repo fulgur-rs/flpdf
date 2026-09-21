@@ -22,7 +22,7 @@
 //! cross-reference row of its own — settles on the unknown-object null
 //! fallback (`QPDF::resolve`, `libqpdf/QPDF.cc:1743-1747`).
 
-use flpdf::{ObjectRef, Pdf};
+use flpdf::{ObjectHandle, ObjectRef, Pdf};
 
 fn open() -> Pdf<std::io::Cursor<Vec<u8>>> {
     let bytes = std::fs::read("../../tests/fixtures/minimal.pdf").expect("fixture");
@@ -217,4 +217,34 @@ fn object_number_zero_resolves_to_null_through_a_real_pdf() {
              with dereference_indirect={dereference_indirect}"
         );
     }
+}
+
+/// An array element does not take the handle route out of qpdf.
+/// `QPDF_Array::writeJSON` writes each element through `QPDFObject::writeJSON`
+/// (`libqpdf/QPDF_Array.cc:163-169`), which performs no resolution, so an
+/// unresolved element raises `QPDF_Unresolved::writeJSON`'s own error rather
+/// than settling on the null fallback the handle route would reach
+/// (`libqpdf/QPDF_Unresolved.cc:29-33`).
+///
+/// Object number zero is the only identity that can tell the two routes apart:
+/// an indirect element takes the reference-form branch before either route
+/// resolves anything, and a direct element is never unresolved.
+///
+/// Such an element is reachable only programmatically. qpdf's parser rejects
+/// `id < 1` and substitutes a null (`libqpdf/QPDFParser.cc:166-176`), so
+/// `0 G R` never becomes a reference in a parsed document.
+#[test]
+fn an_unresolved_object_number_zero_array_element_is_not_resolved_for_json() {
+    let mut pdf = open();
+    let zero = pdf.get_object_handle(object_zero());
+    let array = ObjectHandle::array(vec![zero, ObjectHandle::integer(1)]);
+
+    let error = array
+        .get_json(2, true)
+        .expect_err("the value route must not resolve an array element");
+
+    assert_eq!(
+        error.to_string(),
+        "attempted to get JSON from an unresolved QPDFObjectHandle"
+    );
 }
