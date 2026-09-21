@@ -107,8 +107,9 @@ pub struct RebuildResult {
     pub new_kids: Vec<ObjectRef>,
     /// Source page ref → every new leaf ref derived from it (selection order).
     pub ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>>,
-    /// Every original page-tree leaf that the rebuild dropped: the source page
-    /// leaves (qpdf `getAllPages`) that are absent from `ref_map`.
+    /// Every original page-tree leaf that the rebuild dropped, in qpdf's raw
+    /// identity domain: the source page leaves (qpdf `getAllPages`) that are
+    /// absent from `ref_map`.
     ///
     /// This is the exact set qpdf nulls during `--pages` (`QPDFJob` enumerates
     /// the original page tree and replaces each unselected `/Page` object with
@@ -117,10 +118,13 @@ pub struct RebuildResult {
     /// genuine removed page — never an arbitrary non-page object it happens to
     /// reference. Membership is captured from the **original** tree before the
     /// rebuild reparents leaves, so it cannot be reconstructed afterwards.
-    pub removed_pages: BTreeSet<ObjectRef>,
-    /// The same dropped-page set in qpdf's raw identity domain. Internal
-    /// consumers use this to null a page whose generation cannot project to a
-    /// valid PDF `N G R` reference.
+    ///
+    /// Raw `QpdfObjGen` identity, not `ObjectRef`, because qpdf's own
+    /// `QPDFObjGen` has no "cannot represent this generation" failure mode
+    /// (`include/qpdf/QPDFObjGen.hh`); a page with generation >= 65535
+    /// (reachable only through the library API, never through parsing --
+    /// qpdf's parser nulls such references, `QPDFParser.cc:159-176`) would
+    /// otherwise be silently absent from this set.
     pub(crate) removed_page_objgens: BTreeSet<QpdfObjGen>,
 }
 
@@ -666,15 +670,10 @@ fn rebuild_page_tree_canonical<R: Read + Seek>(
         .into_iter()
         .filter(|object_gen| !retained_page_objgens.contains(object_gen))
         .collect();
-    let removed_pages = removed_page_objgens
-        .iter()
-        .filter_map(|object_gen| object_gen.to_object_ref())
-        .collect();
 
     Ok(RebuildResult {
         new_kids,
         ref_map,
-        removed_pages,
         removed_page_objgens,
     })
 }
@@ -934,10 +933,6 @@ mod tests {
         assert!(result
             .removed_page_objgens
             .contains(&QpdfObjGen::new(11, 65_535)));
-        assert!(result
-            .removed_pages
-            .iter()
-            .all(|object_ref| { object_ref.number != 11 || object_ref.generation != 65_535 }));
         crate::job::remap_outline_and_dests(&mut pdf, &result).expect("raw removed page null-out");
 
         assert!(
@@ -1015,11 +1010,11 @@ mod tests {
 
         assert!(result.new_kids.is_empty());
         assert_eq!(
-            result.removed_pages,
+            result.removed_page_objgens,
             BTreeSet::from([
-                ObjectRef::new(4, 0),
-                ObjectRef::new(5, 0),
-                ObjectRef::new(6, 0),
+                QpdfObjGen::new(4, 0),
+                QpdfObjGen::new(5, 0),
+                QpdfObjGen::new(6, 0),
             ])
         );
 

@@ -41,6 +41,7 @@
 
 use crate::object_handle::ObjectHandle;
 use crate::pages::tree_rebuild::RebuildResult;
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::{Error, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -136,7 +137,7 @@ pub fn drop_struct_elem_dangling_pg_with_max_depth<R: Read + Seek>(
         .iter()
         .filter_map(|(&old, new_refs)| new_refs.first().map(|&new| (old, new)))
         .collect();
-    let removed_pages = &result.removed_pages;
+    let removed_pages = &result.removed_page_objgens;
     let mut state = WalkState::default();
 
     let catalog_ref = match pdf.root_ref() {
@@ -176,7 +177,7 @@ fn walk_kids<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     k: &ObjectHandle,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
-    removed_pages: &BTreeSet<ObjectRef>,
+    removed_pages: &BTreeSet<QpdfObjGen>,
     depth: usize,
     max_depth: usize,
     state: &mut WalkState,
@@ -224,21 +225,26 @@ fn process_elem_dict<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dict: &ObjectHandle,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
-    removed_pages: &BTreeSet<ObjectRef>,
+    removed_pages: &BTreeSet<QpdfObjGen>,
     depth: usize,
     max_depth: usize,
     state: &mut WalkState,
 ) -> Result<()> {
     // /Pg is by spec an indirect reference to a page object; any other form is
     // malformed and left unchanged. A surviving target is remapped to its new
-    // ref; only an original page-tree leaf in removed_pages is dropped.
+    // ref; only an original page-tree leaf in removed_pages is dropped. The
+    // removed check uses the raw qpdf identity (surviving stays keyed by the
+    // valid-reference projection: a page that changed object number always
+    // gets a fresh, in-range identity, so surviving pages never need the raw
+    // domain).
     if let Some(pg) = raw_child(dict, b"/Pg")? {
-        if let Some(pg_ref) = pg.object_ref() {
-            match surviving.get(&pg_ref) {
-                Some(&new) if new != pg_ref => {
+        if let Some(pg_gen) = pg.qpdf_obj_gen() {
+            let pg_ref = pg_gen.to_object_ref();
+            match pg_ref.and_then(|pg_ref| surviving.get(&pg_ref).map(|&new| (pg_ref, new))) {
+                Some((pg_ref, new)) if new != pg_ref => {
                     dict.replace_key(b"/Pg", pdf.get_object_handle(new))?;
                 }
-                None if removed_pages.contains(&pg_ref) => {
+                None if removed_pages.contains(&pg_gen) => {
                     dict.remove_key(b"/Pg");
                 }
                 _ => {}
@@ -393,8 +399,7 @@ mod tests {
         RebuildResult {
             new_kids: vec![ObjectRef::new(3, 0), ObjectRef::new(5, 0)],
             ref_map,
-            removed_pages: [ObjectRef::new(4, 0)].into_iter().collect(),
-            ..Default::default()
+            removed_page_objgens: [QpdfObjGen::new(4, 0)].into_iter().collect(),
         }
     }
 
