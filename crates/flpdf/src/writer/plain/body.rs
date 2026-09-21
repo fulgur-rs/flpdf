@@ -2401,7 +2401,25 @@ where
 // `CONTENT_EMIT_STACK_RED_ZONE`'s doc for why this needs the same
 // protection those walkers already have.
 fn has_direct_stream_in_value(value: &ObjectHandle) -> crate::Result<bool> {
-    content_emit_walk_hub(|| {
+    // The caller is already inside a hub level for this very node --
+    // `ContentEmitter::emit_value` probes the node it is currently at -- so
+    // charging the probe's own root would count that node twice. A parsed
+    // `/Contents` holder that is its own indirect object gets a fresh
+    // `MAX_PARSE_DEPTH` parse budget, so it can legitimately carry the full
+    // 500 containers; double-charging the root rejected exactly that shape
+    // one level short of the bound while qpdf wrote it. Descendants charge
+    // normally through `has_direct_stream_in_value_charged`.
+    has_direct_stream_in_value_body(value)
+}
+
+// One charged level of the probe: every descent below the root goes through
+// here so the walk is still bounded.
+fn has_direct_stream_in_value_charged(value: &ObjectHandle) -> crate::Result<bool> {
+    content_emit_walk_hub(|| has_direct_stream_in_value_body(value))
+}
+
+fn has_direct_stream_in_value_body(value: &ObjectHandle) -> crate::Result<bool> {
+    {
         if value.is_indirect() {
             return Ok(false);
         }
@@ -2411,19 +2429,19 @@ fn has_direct_stream_in_value(value: &ObjectHandle) -> crate::Result<bool> {
         }
         if let Some(items) = value.as_array() {
             for item in items {
-                if has_direct_stream_in_value(&item)? {
+                if has_direct_stream_in_value_charged(&item)? {
                     return Ok(true);
                 }
             }
         } else if let Some(entries) = value.as_dictionary() {
             for (_, child) in entries {
-                if has_direct_stream_in_value(&child)? {
+                if has_direct_stream_in_value_charged(&child)? {
                     return Ok(true);
                 } // cov:ignore: LLVM does not attribute this successful nested dictionary scan continuation
             }
         }
         Ok(false)
-    })
+    }
 }
 
 fn is_removed_content_reference(
@@ -3210,11 +3228,11 @@ mod final_handle_tests {
             ..WriterOptions::default()
         };
         // The emitter runs its shape probe on the node it is already
-        // positioned at, so both charge that node to the shared counter: a
-        // chain of `n` holder dictionaries, wrapped in the content container
-        // and terminating in a direct stream, reaches hub level `n + 2`.
-        // `MAX_PARSE_DEPTH` is the last level admitted.
-        let within_bound = crate::parser::MAX_PARSE_DEPTH - 2;
+        // positioned at, and the probe's own root does not charge that node a
+        // second time, so a chain of `n` holder dictionaries, wrapped in the
+        // content container and terminating in a direct stream, reaches hub
+        // level `n + 1`. `MAX_PARSE_DEPTH` is the last level admitted.
+        let within_bound = crate::parser::MAX_PARSE_DEPTH - 1;
 
         let within = content_holder(nested_direct_content_dictionaries(within_bound));
         let emitted = emit_content_container(&within, &options)?;
@@ -3328,6 +3346,67 @@ mod final_handle_tests {
             direct_array_depth(&reread.get_object_handle(page).try_get_key(b"/Contents")?),
             deepest,
             "every nested level must round-trip"
+        );
+        Ok(())
+    }
+
+    /// A `/Contents` holder that is its own indirect object is parsed with a
+    /// fresh frame budget, so it can carry a full `MAX_PARSE_DEPTH`
+    /// containers -- one more than an inline page value, whose page
+    /// dictionary spends a frame. Measured against qpdf 11.9.0: it writes
+    /// such a file, so the emitter must too.
+    fn indirect_contents_holder_pdf(depth: usize) -> Vec<u8> {
+        let mut holder = String::from("0");
+        for _ in 0..depth {
+            holder = format!("[{holder}]");
+        }
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>\nendobj\n",
+        );
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("4 0 obj\n{holder}\nendobj\n").as_bytes());
+        let xref = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn deepest_parseable_indirect_contents_holder_still_writes() -> crate::Result<()> {
+        // The holder object carries no enclosing dictionary, so the parser
+        // admits the full budget here -- one deeper than the inline shape.
+        let deepest = crate::parser::MAX_PARSE_DEPTH;
+        let mut source =
+            crate::Pdf::open(std::io::Cursor::new(indirect_contents_holder_pdf(deepest)))?;
+        let page = crate::PageDocumentHelper::new(&mut source).get_all_pages()?[0];
+        let holder = source.get_object_handle(page).try_get_key(b"/Contents")?;
+        holder.try_dereference()?;
+        assert_eq!(
+            direct_array_depth(&holder),
+            deepest,
+            "the parser must accept the full budget here, or this test is \
+             not measuring the shape qpdf accepts"
+        );
+
+        // The emitter probes the node it is already charged for, so charging
+        // the probe's own root too would reject this exact depth.
+        let written = write_with_content_normalization(indirect_contents_holder_pdf(deepest))?;
+        assert_eq!(
+            String::from_utf8_lossy(&written).matches("[ 0 ]").count(),
+            1,
+            "the innermost content array must survive the write"
         );
         Ok(())
     }
