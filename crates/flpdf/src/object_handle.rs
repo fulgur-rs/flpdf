@@ -4697,13 +4697,16 @@ impl ObjectHandle {
     /// key, while an indirect null or dangling indirect reference is retained
     /// as the dictionary value. Also a no-op if `value` is a direct handle
     /// sharing `self`'s value state — inserting it into the dictionary would
-    /// otherwise create a direct cycle that none of this crate's recursive
-    /// walkers (`shallow_copy`, `materialize`, `Debug`) guard against, since
-    /// they only stop recursion at an indirect-handle boundary. This does
-    /// not detect a multi-hop reciprocal cycle built from two or more
-    /// `replace_key` calls across distinct direct dictionaries. `key` must be
-    /// qpdf's decoded, canonical dictionary key including its leading `/`; this
-    /// API does not normalize slashless input.
+    /// otherwise create a direct cycle, which this crate's recursive walkers
+    /// would meet as unbounded recursion because they stop only at an
+    /// indirect-handle boundary. This check does not detect a multi-hop
+    /// reciprocal cycle built from two or more `replace_key` calls across
+    /// distinct direct dictionaries. Those walkers survive such a cycle
+    /// anyway: [`Self::shallow_copy`] and [`Self::unparse_resolved`] stop at
+    /// the parser's container-nesting limit and report
+    /// [`Error::Unsupported`] rather than recursing without end.
+    /// `key` must be qpdf's decoded, canonical dictionary key including its
+    /// leading `/`; this API does not normalize slashless input.
     ///
     /// This mutates the live handle graph directly. If `self`'s ref has
     /// already been read through canonical ObjectHandle resolution, resolution
@@ -5483,7 +5486,7 @@ impl ObjectHandle {
             return Ok(ObjectHandle::new_reserved_direct());
         }
         self.try_dereference()?;
-        stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+        direct_graph_walk_hub(|| {
             self.with_value(|value| match value {
                 Some(v) => Ok(ObjectHandle::new_direct_preserving_dictionary_keys(
                     shallow_copy_value(v)?,
@@ -7826,7 +7829,7 @@ impl ObjectHandle {
 // `QPDF_Dictionary::unparse` (`libqpdf/QPDF_Dictionary.cc:58-68`), while array
 // elements retain nulls (`libqpdf/QPDF_Array.cc:122-149`).
 fn unparse_resolved_into(handle: &ObjectHandle, out: &mut Vec<u8>, strict: bool) -> Result<()> {
-    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+    direct_graph_walk_hub(|| {
         handle.try_dereference()?;
         let value = handle
             .with_value(|value| value.cloned())
@@ -7977,8 +7980,102 @@ fn write_unparse_dictionary_key(out: &mut Vec<u8>, key: &[u8]) -> Result<()> {
 
 // Stack growth uses the same red-zone and growth size for direct serialization,
 // makeDirect, and the other recursive ObjectHandle walkers in this module.
+// The direct-graph walkers reach them through `direct_graph_walk_hub` below,
+// which adds the nesting bound they need; `make_direct` uses them on its own.
 const UNPARSE_STACK_RED_ZONE: usize = 32 * 1024;
 const UNPARSE_STACK_GROWTH_SIZE: usize = 1024 * 1024;
+
+// Active recursion depth of this module's direct-graph walkers
+// (`ObjectHandle::shallow_copy` and `unparse_resolved_into`).
+//
+// `stacker::maybe_grow` swaps stack segments without leaving the current
+// thread, so a thread-local counter observes every level of one walk and
+// never mixes two concurrent copies or serializations.
+//
+// Neither walker records the nodes already on its path, and neither does
+// qpdf: `QPDF_Dictionary::copy`/`QPDF_Array::copy`
+// (`libqpdf/QPDF_Dictionary.cc:36-48`, `libqpdf/QPDF_Array.cc:74-99`) call
+// `shallowCopy` on every direct child, and
+// `QPDF_Dictionary::unparse`/`QPDF_Array::unparse`
+// (`libqpdf/QPDF_Dictionary.cc:58-68`, `libqpdf/QPDF_Array.cc:122-149`)
+// unparse every direct child, with no depth argument and no visited set in
+// either pair. A pair of *direct* dictionaries holding each other therefore
+// recurses until the process runs out of memory. Parsed input cannot reach
+// that shape -- `parser.rs` caps direct container nesting at
+// `MAX_PARSE_DEPTH` and the direct containers it builds are trees -- but
+// [`ObjectHandle::replace_key`] accepts it from a library caller, since it
+// refuses only the single-hop self-insert and not the two-hop pair
+// `a.replace_key(b"/B", b)` plus `b.replace_key(b"/A", a)`. The array
+// mutators reject it already ([`ObjectHandle::set_array_item`] and its
+// siblings gate on `would_create_direct_cycle`, a full reachability walk),
+// so the dictionary path is the only way in. Bounding both walkers at the
+// parser's own limit turns such a graph into a diagnostic instead of
+// resource exhaustion, and leaves every graph the parser can produce
+// untouched.
+//
+// `ObjectHandle::make_direct` deliberately stays outside this hub even
+// though it shares the stack constants above. It is the one walker here
+// that recurses *through* indirect boundaries
+// (`Self::make_direct_copy` dereferences every child), so its depth tracks
+// indirect chain length, which `MAX_PARSE_DEPTH` does not cap -- a parsed
+// file may legally chain far more indirect objects than that. It carries a
+// per-call `ObjectHandleIdentity` visited set instead, which already
+// rejects a direct cycle as well as an indirect one.
+//
+// The count starts at zero for the outermost hub, so `MAX_PARSE_DEPTH + 1`
+// hub levels are admitted rather than exactly `MAX_PARSE_DEPTH`. That extra
+// level is not slack. Both walkers re-enter the hub for a direct *scalar*
+// child as well (`unparse_resolved_child` and `shallow_copy_child` recurse
+// for everything that is not indirect), so the maximally nested container
+// the parser admits -- `MAX_PARSE_DEPTH` containers around a scalar leaf --
+// needs `MAX_PARSE_DEPTH + 1` levels to finish. A direct stream spends a
+// further level on its own dictionary (`unparse_resolved_value`'s `Stream`
+// arm re-enters the walk with `stream_dict`), but that shape comes from the
+// value factories rather than the parser, which owns streams indirectly.
+thread_local! {
+    static DIRECT_GRAPH_WALK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// Counts one active level of a direct-graph walk and restores the count when
+// the level unwinds, on the error path as well as the success path.
+struct DirectGraphWalkDepthGuard;
+
+impl DirectGraphWalkDepthGuard {
+    fn enter() -> Result<Self> {
+        let depth = DIRECT_GRAPH_WALK_DEPTH.with(|depth| {
+            let entered = depth.get();
+            depth.set(entered + 1);
+            entered
+        });
+        // Constructed before the bound is tested so the count is restored
+        // even when this level is rejected.
+        let guard = Self;
+        if depth > crate::parser::MAX_PARSE_DEPTH {
+            return Err(Error::Unsupported(format!(
+                "object handle: direct object nesting exceeds maximum of {}",
+                crate::parser::MAX_PARSE_DEPTH
+            )));
+        }
+        Ok(guard)
+    }
+}
+
+impl Drop for DirectGraphWalkDepthGuard {
+    fn drop(&mut self) {
+        DIRECT_GRAPH_WALK_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// Run one level of a direct-graph `ObjectHandle` recursion with this
+/// module's shared stack growth and nesting bound.
+///
+/// Both hubs in the family route their bodies through here, so a direct
+/// container graph that never reaches an indirect boundary is rejected at
+/// the same depth whether it is being copied or serialized.
+fn direct_graph_walk_hub<T>(body: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _depth = DirectGraphWalkDepthGuard::enter()?;
+    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, body)
+}
 
 fn reserved_unparse_error() -> Error {
     Error::System("QPDFObjectHandle: attempting to unparse a reserved object".to_owned())
@@ -9347,8 +9444,8 @@ mod object_json_writer_tests {
 
 // `ObjectHandle::shallow_copy`'s per-variant dispatch: an Array/Dictionary
 // child is recursively shallow-copied through `shallow_copy_child` (which
-// re-enters `ObjectHandle::shallow_copy`, the recursion hub carrying its
-// own `stacker::maybe_grow` wrap — the same hub-per-call shape as
+// re-enters `ObjectHandle::shallow_copy`, the recursion hub routed through
+// `direct_graph_walk_hub` — the same hub-per-call shape as
 // `unparse_resolved_into`/`unparse_resolved_child` above), mirroring
 // `QPDF_Dictionary::copy`/`QPDF_Array::copy`, which call `shallowCopy` on
 // each direct child and keep an indirect one shared. A `Stream` has no
@@ -22064,5 +22161,154 @@ mod drop_tests {
 
         drop(identity);
         assert!(leaf.containing_object_refs().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod direct_graph_walk_bound_tests {
+    use super::*;
+
+    // Two direct dictionaries holding each other: `a` under `/B` holds `b`,
+    // and `b` under `/A` holds `a`. Neither handle is indirect, so no walk
+    // ever meets the indirect boundary that normally terminates a descent.
+    // `replace_key` refuses only the single-hop self-insert, so this two-hop
+    // shape does close into a real cycle -- asserted here so the walk
+    // assertions below cannot pass against an unaliased pair.
+    fn reciprocal_direct_dictionary_cycle() -> Result<ObjectHandle> {
+        let a = ObjectHandle::dictionary(vec![]);
+        let b = ObjectHandle::dictionary(vec![]);
+        a.replace_key(b"/B", b.clone())?;
+        b.replace_key(b"/A", a.clone())?;
+        assert!(
+            a.try_get_key(b"/B")?
+                .try_get_key(b"/A")?
+                .is_same_object_as(&a),
+            "the reciprocal replace_key pair must close into a direct cycle"
+        );
+        Ok(a)
+    }
+
+    // `n` nested direct dictionaries around a scalar leaf. Both walkers in
+    // this family re-enter the hub for a direct scalar child as well
+    // (`shallow_copy_child` and `unparse_resolved_child` recurse for every
+    // non-indirect child), so the hub depth reached spans the whole chain,
+    // leaf included.
+    fn nested_direct_dictionaries(n: usize) -> ObjectHandle {
+        let mut handle = ObjectHandle::integer(1);
+        for _ in 0..n {
+            handle = ObjectHandle::dictionary(vec![(b"/K".to_vec(), handle)]);
+        }
+        handle
+    }
+
+    #[test]
+    fn direct_dictionary_cycle_is_rejected_by_the_direct_graph_walk_family() -> Result<()> {
+        let cycle = reciprocal_direct_dictionary_cycle()?;
+
+        let copied = cycle
+            .shallow_copy()
+            .expect_err("a direct cycle must not be walked by the shallow-copy hub");
+        assert!(
+            matches!(copied, Error::Unsupported(_)),
+            "unexpected error kind: {copied:?}"
+        );
+        assert!(
+            copied
+                .to_string()
+                .contains("direct object nesting exceeds maximum of"),
+            "unexpected message: {copied}"
+        );
+
+        let unparsed = cycle
+            .try_unparse_resolved()
+            .expect_err("a direct cycle must not be walked by the unparse hub");
+        assert!(
+            matches!(unparsed, Error::Unsupported(_)),
+            "unexpected error kind: {unparsed:?}"
+        );
+        assert!(
+            unparsed
+                .to_string()
+                .contains("direct object nesting exceeds maximum of"),
+            "unexpected message: {unparsed}"
+        );
+
+        // The non-fallible facade keeps its established null fallback for
+        // the refused walk instead of exhausting memory.
+        assert_eq!(cycle.unparse_resolved(), b"null".to_vec());
+
+        // `make_direct` stays outside the hub because it recurses through
+        // indirect boundaries; its own visited set already refuses the same
+        // shape, with qpdf's loop message rather than the nesting bound.
+        let mut direct = cycle.clone();
+        let loop_error = direct
+            .make_direct(false)
+            .expect_err("the visited set must still refuse a direct cycle");
+        assert!(
+            matches!(
+                &loop_error,
+                Error::System(message)
+                    if message == "loop detected while converting object from indirect to direct"
+            ),
+            "unexpected error: {loop_error:?}"
+        );
+
+        // Every rejected level restores the shared counter on its way out,
+        // so a later walk starts from zero instead of inheriting the
+        // exhausted budget of the refused one.
+        assert_eq!(DIRECT_GRAPH_WALK_DEPTH.with(std::cell::Cell::get), 0);
+        let deep = nested_direct_dictionaries(crate::parser::MAX_PARSE_DEPTH);
+        assert_eq!(
+            String::from_utf8_lossy(&deep.try_unparse_resolved()?)
+                .matches("/K")
+                .count(),
+            crate::parser::MAX_PARSE_DEPTH
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn acyclic_direct_nesting_is_bounded_at_the_parser_limit() -> Result<()> {
+        let bound = crate::parser::MAX_PARSE_DEPTH;
+
+        let within_bound = nested_direct_dictionaries(bound);
+        assert_eq!(
+            String::from_utf8_lossy(&within_bound.try_unparse_resolved()?)
+                .matches("/K")
+                .count(),
+            bound,
+            "every level within the bound must still be serialized"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&within_bound.shallow_copy()?.try_unparse_resolved()?)
+                .matches("/K")
+                .count(),
+            bound,
+            "every level within the bound must still be copied"
+        );
+
+        let past_bound = nested_direct_dictionaries(bound + 1);
+        let unparse_error = past_bound
+            .try_unparse_resolved()
+            .expect_err("nesting past the bound must be reported by the unparse hub");
+        assert!(matches!(unparse_error, Error::Unsupported(_)));
+        assert_eq!(
+            unparse_error.to_string(),
+            format!(
+                "unsupported PDF feature: object handle: direct object nesting exceeds maximum of {bound}"
+            )
+        );
+
+        let copy_error = past_bound
+            .shallow_copy()
+            .expect_err("nesting past the bound must be reported by the shallow-copy hub");
+        assert!(matches!(copy_error, Error::Unsupported(_)));
+        assert_eq!(
+            copy_error.to_string(),
+            format!(
+                "unsupported PDF feature: object handle: direct object nesting exceeds maximum of {bound}"
+            )
+        );
+        Ok(())
     }
 }
