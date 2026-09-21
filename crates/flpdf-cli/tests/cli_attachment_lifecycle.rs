@@ -827,15 +827,21 @@ fn check_add_show_roundtrip(label: &str, payload: &[u8], key: &str, filename: &s
         .success();
 
     // show → stdout bytes match payload exactly
-    let stdout_bytes = CargoCommand::cargo_bin("flpdf")
+    let show_output = CargoCommand::cargo_bin("flpdf")
         .unwrap()
         .args([
             &format!("--show-attachment={key}"),
             out_pdf.to_str().unwrap(),
         ])
         .output()
-        .unwrap()
-        .stdout;
+        .unwrap();
+    assert!(
+        show_output.status.success(),
+        "{label}: flpdf --show-attachment={key} exited {:?}; stderr:\n{}",
+        show_output.status.code(),
+        String::from_utf8_lossy(&show_output.stderr)
+    );
+    let stdout_bytes = show_output.stdout;
 
     assert_eq!(
         stdout_bytes,
@@ -943,15 +949,18 @@ fn lifecycle_3_remove_then_list_flpdf_and_qpdf() {
         .success();
 
     // flpdf list: keepkey present, dropkey absent.
-    let listing = String::from_utf8(
-        CargoCommand::cargo_bin("flpdf")
-            .unwrap()
-            .args(["--list-attachments", after_remove.to_str().unwrap()])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
+    let list_output = CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", after_remove.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        list_output.status.success(),
+        "flpdf --list-attachments {after_remove:?} exited {:?}; stderr:\n{}",
+        list_output.status.code(),
+        String::from_utf8_lossy(&list_output.stderr)
+    );
+    let listing = String::from_utf8(list_output.stdout).unwrap();
     assert!(
         listing.contains("keepkey"),
         "flpdf: keepkey should still be present; listing: {listing}"
@@ -1029,12 +1038,18 @@ fn lifecycle_4_copy_preserves_payload_and_metadata() {
         .success();
 
     // Verify payload byte-identity.
-    let extracted = CargoCommand::cargo_bin("flpdf")
+    let show_output = CargoCommand::cargo_bin("flpdf")
         .unwrap()
         .args(["--show-attachment=cpykey", dst_pdf.to_str().unwrap()])
         .output()
-        .unwrap()
-        .stdout;
+        .unwrap();
+    assert!(
+        show_output.status.success(),
+        "flpdf --show-attachment=cpykey {dst_pdf:?} exited {:?}; stderr:\n{}",
+        show_output.status.code(),
+        String::from_utf8_lossy(&show_output.stderr)
+    );
+    let extracted = show_output.stdout;
     assert_eq!(
         extracted,
         png,
@@ -1044,15 +1059,18 @@ fn lifecycle_4_copy_preserves_payload_and_metadata() {
     );
 
     // Verify metadata in verbose listing.
-    let verbose = String::from_utf8(
-        CargoCommand::cargo_bin("flpdf")
-            .unwrap()
-            .args(["--list-attachments", "--verbose", dst_pdf.to_str().unwrap()])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
+    let verbose_output = CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", "--verbose", dst_pdf.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        verbose_output.status.success(),
+        "flpdf --list-attachments --verbose {dst_pdf:?} exited {:?}; stderr:\n{}",
+        verbose_output.status.code(),
+        String::from_utf8_lossy(&verbose_output.stderr)
+    );
+    let verbose = String::from_utf8(verbose_output.stdout).unwrap();
 
     assert!(
         verbose.contains("cpykey"),
@@ -1092,15 +1110,18 @@ fn lifecycle_4_copy_preserves_payload_and_metadata() {
 
     // /Size has no line in qpdf's doListAttachments output, so assert it
     // where qpdf does report it: the JSON v2 dump.
-    let objects = String::from_utf8(
-        CargoCommand::cargo_bin("flpdf")
-            .unwrap()
-            .args(["--json=2", dst_pdf.to_str().unwrap()])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
+    let json_output = CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json=2", dst_pdf.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        json_output.status.success(),
+        "flpdf --json=2 {dst_pdf:?} exited {:?}; stderr:\n{}",
+        json_output.status.code(),
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+    let objects = String::from_utf8(json_output.stdout).unwrap();
     assert!(
         objects.contains(&format!("\"/Size\": {}", png.len())),
         "copy: /Size={} must be preserved; got: {objects}",
@@ -1154,13 +1175,18 @@ fn lifecycle_4b_copy_with_prefix() {
         .stdout(predicates::str::contains("x-original"));
 
     // Payload should still round-trip.
-    let extracted = CargoCommand::cargo_bin("flpdf")
+    let show_output = CargoCommand::cargo_bin("flpdf")
         .unwrap()
         .args(["--show-attachment=x-original", dst_pdf.to_str().unwrap()])
         .output()
-        .unwrap()
-        .stdout;
-    assert_eq!(extracted, b"prefix test content");
+        .unwrap();
+    assert!(
+        show_output.status.success(),
+        "flpdf --show-attachment=x-original {dst_pdf:?} exited {:?}; stderr:\n{}",
+        show_output.status.code(),
+        String::from_utf8_lossy(&show_output.stderr)
+    );
+    assert_eq!(show_output.stdout, b"prefix test content");
 }
 
 #[test]
@@ -1224,7 +1250,12 @@ fn lifecycle_4c_copy_from_repeated_donor_groups() {
         .args(["--list-attachments", output.to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(listing.status.success());
+    assert!(
+        listing.status.success(),
+        "flpdf --list-attachments {output:?} exited {:?}; stderr:\n{}",
+        listing.status.code(),
+        String::from_utf8_lossy(&listing.stderr)
+    );
     let listing = String::from_utf8(listing.stdout).unwrap();
     assert!(listing.contains("from-a"), "listing: {listing}");
     assert!(listing.contains("from-b"), "listing: {listing}");
@@ -1241,7 +1272,12 @@ fn lifecycle_4c_copy_from_repeated_donor_groups() {
             ])
             .output()
             .unwrap();
-        assert!(extracted.status.success());
+        assert!(
+            extracted.status.success(),
+            "flpdf --show-attachment={key} {output:?} exited {:?}; stderr:\n{}",
+            extracted.status.code(),
+            String::from_utf8_lossy(&extracted.stderr)
+        );
         assert_eq!(extracted.stdout, payload);
     }
 }
@@ -1288,19 +1324,22 @@ fn lifecycle_5_metadata_survives_plain_rewrite() {
         .success();
 
     // Verbose listing on rewritten file must preserve all metadata.
-    let verbose = String::from_utf8(
-        CargoCommand::cargo_bin("flpdf")
-            .unwrap()
-            .args([
-                "--list-attachments",
-                "--verbose",
-                rewritten.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
+    let verbose_output = CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--list-attachments",
+            "--verbose",
+            rewritten.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        verbose_output.status.success(),
+        "flpdf --list-attachments --verbose {rewritten:?} exited {:?}; stderr:\n{}",
+        verbose_output.status.code(),
+        String::from_utf8_lossy(&verbose_output.stderr)
+    );
+    let verbose = String::from_utf8(verbose_output.stdout).unwrap();
 
     assert!(
         verbose.contains("metakey"),
@@ -1324,14 +1363,19 @@ fn lifecycle_5_metadata_survives_plain_rewrite() {
     );
 
     // Payload must also survive rewrite.
-    let extracted = CargoCommand::cargo_bin("flpdf")
+    let show_output = CargoCommand::cargo_bin("flpdf")
         .unwrap()
         .args(["--show-attachment=metakey", rewritten.to_str().unwrap()])
         .output()
-        .unwrap()
-        .stdout;
+        .unwrap();
+    assert!(
+        show_output.status.success(),
+        "flpdf --show-attachment=metakey {rewritten:?} exited {:?}; stderr:\n{}",
+        show_output.status.code(),
+        String::from_utf8_lossy(&show_output.stderr)
+    );
     assert_eq!(
-        extracted, b"metadata content",
+        show_output.stdout, b"metadata content",
         "rewrite: payload must be byte-identical after rewrite"
     );
 }
@@ -1369,29 +1413,37 @@ fn lifecycle_6_qpdf_authored_readable_by_flpdf() {
     assert!(ok, "qpdf --add-attachment failed during test setup");
 
     // flpdf list → key present.
-    let listing = String::from_utf8(
-        CargoCommand::cargo_bin("flpdf")
-            .unwrap()
-            .args(["--list-attachments", qpdf_made.to_str().unwrap()])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
+    let list_output = CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", qpdf_made.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        list_output.status.success(),
+        "flpdf --list-attachments {qpdf_made:?} exited {:?}; stderr:\n{}",
+        list_output.status.code(),
+        String::from_utf8_lossy(&list_output.stderr)
+    );
+    let listing = String::from_utf8(list_output.stdout).unwrap();
     assert!(
         listing.contains("qpdfkey"),
         "flpdf must list 'qpdfkey' from qpdf-produced PDF; listing: {listing}"
     );
 
     // flpdf show → bytes match original.
-    let extracted = CargoCommand::cargo_bin("flpdf")
+    let show_output = CargoCommand::cargo_bin("flpdf")
         .unwrap()
         .args(["--show-attachment=qpdfkey", qpdf_made.to_str().unwrap()])
         .output()
-        .unwrap()
-        .stdout;
+        .unwrap();
+    assert!(
+        show_output.status.success(),
+        "flpdf --show-attachment=qpdfkey {qpdf_made:?} exited {:?}; stderr:\n{}",
+        show_output.status.code(),
+        String::from_utf8_lossy(&show_output.stderr)
+    );
     assert_eq!(
-        extracted, png,
+        show_output.stdout, png,
         "flpdf must extract the original PNG payload from qpdf-produced PDF byte-identically"
     );
 
@@ -1533,12 +1585,24 @@ fn assert_listing_matches_qpdf(pdf_path: &Path, args: &[&str]) -> Option<String>
         .arg(pdf_path)
         .output()
         .expect("qpdf is available but failed to spawn");
+    assert!(
+        qpdf_out.status.success(),
+        "qpdf {args:?} {pdf_path:?} exited {:?}; stderr:\n{}",
+        qpdf_out.status.code(),
+        String::from_utf8_lossy(&qpdf_out.stderr)
+    );
     let flpdf_out = CargoCommand::cargo_bin("flpdf")
         .unwrap()
         .args(args)
         .arg(pdf_path)
         .output()
         .unwrap();
+    assert!(
+        flpdf_out.status.success(),
+        "flpdf {args:?} {pdf_path:?} exited {:?}; stderr:\n{}",
+        flpdf_out.status.code(),
+        String::from_utf8_lossy(&flpdf_out.stderr)
+    );
     assert_eq!(
         String::from_utf8_lossy(&flpdf_out.stdout).replace("\r\n", "\n"),
         String::from_utf8_lossy(&qpdf_out.stdout).replace("\r\n", "\n"),
@@ -1590,15 +1654,18 @@ fn plain_listing_is_one_line_per_attachment() {
         .assert()
         .success();
 
-    let listing = String::from_utf8(
-        CargoCommand::cargo_bin("flpdf")
-            .unwrap()
-            .args(["--list-attachments", with_attachment.to_str().unwrap()])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
+    let list_output = CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", with_attachment.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        list_output.status.success(),
+        "flpdf --list-attachments {with_attachment:?} exited {:?}; stderr:\n{}",
+        list_output.status.code(),
+        String::from_utf8_lossy(&list_output.stderr)
+    );
+    let listing = String::from_utf8(list_output.stdout).unwrap();
 
     let lines: Vec<&str> = listing.lines().collect();
     assert_eq!(
