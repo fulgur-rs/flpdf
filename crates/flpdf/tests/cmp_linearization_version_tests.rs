@@ -207,3 +207,128 @@ fn linearize_omits_size_and_prev_when_the_trailer_key_is_misspelled() {
         "misspelled-size linearized output must remain byte-identical to qpdf"
     );
 }
+
+/// A one-page fixture whose Catalog carries an `/Extensions /ADBE` developer
+/// extension level larger than `i32` can hold.
+fn one_page_pdf_with_extension_level(version: &str, level: &str) -> Vec<u8> {
+    let mut bytes = build_pdf(
+        &[
+            (
+                1,
+                format!(
+                    "<< /Type /Catalog /Pages 2 0 R /Extensions \
+                     << /ADBE << /BaseVersion /{version} /ExtensionLevel {level} >> >> >>"
+                ),
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>".to_owned(),
+            ),
+        ],
+        1,
+    );
+    let header = format!("%PDF-{version}");
+    bytes[..header.len()].copy_from_slice(header.as_bytes());
+    bytes
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// The linearized writer must take the source extension level through qpdf's
+/// clamping accessor, exactly as the plain writer does.
+///
+/// `QPDFWriter::doWriteSetup` ends with
+/// `setMinimumPDFVersion(m->pdf.getPDFVersion(), m->pdf.getExtensionLevel())`
+/// (`QPDFWriter.cc:2176`) for every writer instance, linearizing ones
+/// included, and `QPDF::getExtensionLevel` reads `/Extensions /ADBE
+/// /ExtensionLevel` through `getIntValueAsInt` (`QPDF.cc:2329-2345`), which
+/// clamps to `INT_MAX` and warns on the way
+/// (`QPDFObjectHandle.cc:527-543`). That clamped level becomes
+/// `m->final_extension_level`, which `writeObject` stamps back into the
+/// Catalog's `/ADBE` whenever the source dictionary does not already match it
+/// (`QPDFWriter.cc:1415-1431`) -- so reading the raw 64-bit value instead both
+/// loses the warning and writes the unclamped number into the output.
+#[test]
+fn linearize_clamps_an_out_of_range_source_extension_level_like_qpdf() {
+    if !qpdf_available() {
+        eprintln!("skipping qpdf differential: qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let bytes = one_page_pdf_with_extension_level("1.7", "5000000000");
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("input.pdf");
+    let qpdf_output_path = directory.path().join("qpdf.pdf");
+    std::fs::write(&input, &bytes).expect("write overflow extension-level fixture");
+
+    let qpdf = Command::new("qpdf")
+        .args(["--warning-exit-0", "--static-id", "--linearize"])
+        .arg(&input)
+        .arg(&qpdf_output_path)
+        .output()
+        .expect("qpdf 11.9.0 must run");
+    assert!(
+        qpdf.status.success(),
+        "qpdf linearization failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    let qpdf_output = std::fs::read(&qpdf_output_path).expect("read qpdf output");
+    assert!(
+        contains(
+            &qpdf_output,
+            b"/ADBE << /BaseVersion /1.7 /ExtensionLevel 2147483647 >>"
+        ),
+        "oracle guard: qpdf must clamp the written extension level to INT_MAX"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&qpdf.stderr)
+            .matches("requested value of integer is too big; returning INT_MAX")
+            .count(),
+        2,
+        "oracle guard: qpdf reads the level once for its own version floor and \
+         once inside the writer's doWriteSetup"
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("open overflow extension-level fixture");
+    let settings = WriterTestSettings {
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
+    let flpdf_output =
+        write_linearized_with_settings(&mut pdf, &settings).expect("flpdf linearization succeeds");
+
+    assert!(
+        contains(
+            &flpdf_output,
+            b"/ADBE << /BaseVersion /1.7 /ExtensionLevel 2147483647 >>"
+        ),
+        "flpdf must stamp qpdf's clamped extension level into /ADBE"
+    );
+    assert!(
+        !contains(&flpdf_output, b"5000000000"),
+        "the unclamped source value must not survive into the output"
+    );
+    assert_eq!(
+        pdf.repair_diagnostics()
+            .entries()
+            .iter()
+            .filter(|entry| {
+                String::from_utf8_lossy(entry.what_bytes())
+                    .contains("requested value of integer is too big; returning INT_MAX")
+            })
+            .count(),
+        1,
+        "the linearizing writer reads the level exactly once, like doWriteSetup"
+    );
+    #[cfg(feature = "qpdf-zlib-compat")]
+    assert_eq!(
+        flpdf_output, qpdf_output,
+        "clamped extension-level linearized output must remain byte-identical to qpdf"
+    );
+}

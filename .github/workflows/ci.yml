@@ -356,6 +356,11 @@ jobs:
           # iterating its object-user map, so the page dictionary precedes its
           # own descendants even though that map is sorted by object id.
           cargo test -p flpdf --features qpdf-zlib-compat --test cmp_linearize_later_page_order_tests
+          # Pins the linearized header version/extension-level pair against a
+          # live qpdf 11.9.0 run, including the clamped /Extensions /ADBE
+          # /ExtensionLevel the writer's own source floor produces. The
+          # whole-output comparisons are behind the qpdf-zlib-compat cfg.
+          cargo test -p flpdf --features qpdf-zlib-compat --test cmp_linearization_version_tests
           # Pins overlay copy-annotations output byte-identity vs committed qpdf
           # goldens. The placement families run through the CLI gate below; this
           # family has no CLI counterpart and lives in lib unit tests
