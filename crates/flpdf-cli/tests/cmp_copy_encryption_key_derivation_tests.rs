@@ -11,6 +11,14 @@
 //! `--password-is-hex-key` (whose padded user password stays empty,
 //! `QPDF_encryption.cc:930-934`) yields a key derived from the empty password.
 //!
+//! The same function also consumes the donor's `/O` and `/U` verbatim
+//! (`QPDFWriter.cc:693-694` reads `getStringValue()`, not the padded copy the
+//! reader built), so a donor storing fewer than 32 bytes in either entry
+//! reaches the NUL padding of `pad_short_parameter`
+//! (`QPDF_encryption.cc:316-321`, applied at `:807-808`) on the way in and is
+//! re-emitted at its stored length on the way out. Those cases are pinned here
+//! too.
+//!
 //! Both `--copy-encryption` and preserve-encryption of the primary input reach
 //! the same function (`QPDFWriter.cc:2099-2101`), so every case is pinned on
 //! both routes.
@@ -92,6 +100,88 @@ fn donor_with_patched_length(
     );
     bytes[offsets[0]..offsets[0] + new_length.len()].copy_from_slice(new_length);
     std::fs::write(&path, bytes).expect("write patched donor");
+    path
+}
+
+/// Build an encrypted donor whose `/O` or `/U` stores fewer than 32 bytes,
+/// keeping every xref offset valid.
+///
+/// qpdf writes both entries as a fixed-width hex string (`<` + 64 hex digits +
+/// `>`, 66 bytes), and PDF allows arbitrary whitespace between dictionary
+/// entries, so dropping `32 - kept_bytes` bytes of value and appending twice as
+/// many spaces is a same-width rewrite: the file length, the `/Encrypt` object's
+/// extent, the xref table and `startxref` all stay as qpdf wrote them. No
+/// decrypt / re-encrypt round trip is needed to reach a genuinely short stored
+/// entry.
+///
+/// `dropped_tail_must_be_nul` states which entry is being shortened.
+/// Algorithm 2 hashes the padded `/O` (`QPDF_encryption.cc:385`), so
+/// truncating `/O` keeps the donor authenticatable only when the bytes dropped
+/// are already NUL and the padding restores them exactly; the caller picks an
+/// owner password that produces such an `/O`. `/U` carries no such constraint
+/// at R>=3, where `check_user_password_V4` compares only the leading
+/// `sizeof(MD5::Digest)` bytes (`QPDF_encryption.cc:511-518`).
+fn donor_with_truncated_uo_parameter(
+    directory: &Path,
+    name: &str,
+    encrypt_args: &[&str],
+    key: &str,
+    kept_bytes: usize,
+    dropped_tail_must_be_nul: bool,
+) -> PathBuf {
+    assert!(kept_bytes < 32, "{name}: a full-width entry is not short");
+    let path = directory.join(format!("{name}.pdf"));
+    let path_string = path.to_str().expect("temporary path must be UTF-8");
+    let mut args = vec!["--static-id", "--allow-weak-crypto", "--encrypt"];
+    args.extend_from_slice(encrypt_args);
+    args.extend_from_slice(&["--", PLAIN_FIXTURE, path_string]);
+    run_qpdf(&args);
+
+    let bytes = std::fs::read(&path).expect("read encrypted donor");
+    let marker = format!("/{key} <");
+    let starts: Vec<usize> = bytes
+        .windows(marker.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == marker.as_bytes()).then_some(index))
+        .collect();
+    assert_eq!(
+        starts.len(),
+        1,
+        "{name}: donor must contain exactly one {marker:?} marker"
+    );
+    let value_start = starts[0] + marker.len();
+    let value = &bytes[value_start..value_start + 64];
+    assert!(
+        value.iter().all(u8::is_ascii_hexdigit),
+        "{name}: /{key} must be a 32-byte hex string"
+    );
+    assert_eq!(
+        bytes[value_start + 64],
+        b'>',
+        "{name}: /{key} must be exactly 32 bytes wide"
+    );
+    if dropped_tail_must_be_nul {
+        assert!(
+            value[kept_bytes * 2..].iter().all(|digit| *digit == b'0'),
+            "{name}: the /{key} bytes this truncation drops are {:?}, not NUL, so NUL padding \
+             would not restore the value the donor was encrypted with; pick a password whose \
+             /{key} ends in NUL",
+            String::from_utf8_lossy(&value[kept_bytes * 2..])
+        );
+    }
+
+    let mut rewritten = Vec::with_capacity(bytes.len());
+    rewritten.extend_from_slice(&bytes[..value_start]);
+    rewritten.extend_from_slice(&value[..kept_bytes * 2]);
+    rewritten.push(b'>');
+    rewritten.resize(value_start + 65, b' ');
+    rewritten.extend_from_slice(&bytes[value_start + 65..]);
+    assert_eq!(
+        rewritten.len(),
+        bytes.len(),
+        "{name}: the rewrite must not move any xref offset"
+    );
+    std::fs::write(&path, rewritten).expect("write truncated donor");
     path
 }
 
@@ -272,6 +362,82 @@ fn copy_encryption_rederives_the_key_across_the_full_short_length_range() {
         );
         assert_both_routes(directory.path(), &case, &donor, "u");
     }
+}
+
+/// A donor that really stores fewer than 32 bytes in `/O` or `/U` and still
+/// authenticates under real qpdf 11.9.0.
+///
+/// `pad_short_parameter` (`QPDF_encryption.cc:316-321`) NUL-pads a short V<5
+/// `/O` / `/U` up to 32 bytes at `:807-808` before the exact-length check, so
+/// the padding is not confined to hand-built dictionaries: a plain file with a
+/// short entry reaches it. Both entries reach it from a donor that opens, but
+/// for different reasons, and the two cases discriminate different things.
+///
+/// `/U` shortened to its leading 16 bytes: `check_user_password_V4`
+/// (`QPDF_encryption.cc:511-518`) compares `to_compare = (R >= 3) ? 16 : 32`
+/// bytes, so at R>=3 the dropped tail is never examined and the donor opens
+/// with its original password. Nothing in the V<5 path consumes `/U[16..32]`
+/// afterwards -- the file key comes from `/O`, `/P` and `/ID[0]` -- and
+/// `copyEncryptionParameters` re-emits the stored 16 bytes verbatim
+/// (`QPDFWriter.cc:694` reads `getStringValue()`). This case pins reachability
+/// and non-rejection, not the padding's effect on any derived value. It needs
+/// R>=3: an R=2 donor compares all 32 bytes and would reject the same
+/// truncation.
+///
+/// `/O` shortened to 31 bytes: this one is load-bearing. Algorithm 2 hashes
+/// the padded `/O` into the file key (`QPDF_encryption.cc:385`), so an
+/// implementation that fed 31 bytes in would derive a different key and diverge
+/// in the output bytes. Keeping the donor authenticatable requires an `/O`
+/// whose last byte is already NUL, which `compute_O_value`
+/// (`QPDF_encryption.cc:428-450`) fixes from the two passwords, R and the key
+/// length alone -- no `/ID`, no randomness. Owner password `o295` is the first
+/// of `o0`, `o1`, ... that yields one for user password `u` at RC4-128 R=3
+/// under qpdf 11.9.0; `donor_with_truncated_uo_parameter` asserts that
+/// precondition rather than trusting it.
+#[test]
+fn copy_encryption_carries_a_short_uo_parameter_from_an_authenticated_donor() {
+    if !qpdf_available() {
+        eprintln!("skipping qpdf differential: qpdf 11.9.0 is not available");
+        return;
+    }
+    let directory = tempfile::tempdir().expect("temporary directory");
+
+    // V=2 R=3: /U truncated to the 16 bytes the R>=3 user-password check reads.
+    let rc4_128: &[&str] = &[
+        "--user-password=u",
+        "--owner-password=o",
+        "--bits=128",
+        "--use-aes=n",
+    ];
+    let short_u_v2 =
+        donor_with_truncated_uo_parameter(directory.path(), "v2-u16", rc4_128, "U", 16, false);
+    assert_both_routes(directory.path(), "v2-u16", &short_u_v2, "u");
+
+    // V=4 R=4 reaches the same padding through the AES branch of the writer.
+    let aes_128: &[&str] = &[
+        "--user-password=u",
+        "--owner-password=o",
+        "--bits=128",
+        "--use-aes=y",
+    ];
+    let short_u_v4 =
+        donor_with_truncated_uo_parameter(directory.path(), "v4-u16", aes_128, "U", 16, false);
+    assert_both_routes(directory.path(), "v4-u16", &short_u_v4, "u");
+
+    // /O truncated to 31 bytes: the NUL padding has to restore the 32nd byte
+    // for Algorithm 2, on the user-password route and on the owner-password
+    // route that RC4-decrypts the padded /O (`QPDF_encryption.cc:542-567`,
+    // reading all 32 bytes at `:550`).
+    let nul_tailed_o: &[&str] = &[
+        "--user-password=u",
+        "--owner-password=o295",
+        "--bits=128",
+        "--use-aes=n",
+    ];
+    let short_o =
+        donor_with_truncated_uo_parameter(directory.path(), "v2-o31", nul_tailed_o, "O", 31, true);
+    assert_both_routes(directory.path(), "v2-o31-user", &short_o, "u");
+    assert_both_routes(directory.path(), "v2-o31-owner", &short_o, "o295");
 }
 
 #[test]

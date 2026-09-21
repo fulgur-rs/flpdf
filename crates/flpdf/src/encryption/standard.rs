@@ -140,11 +140,19 @@ fn pad_password(password: &[u8]) -> [u8; 32] {
 /// `required_v_lt_5_32_byte_string_from_handle`, qpdf's
 /// `pad_short_parameter`, `QPDF_encryption.cc:316-321`).
 ///
-/// Neither arm is reachable from a donor that authenticated: both readers
-/// NUL-pad a short V<5 `/O`//`U` and then require exactly 32 bytes
+/// The truncating arm is not reachable from a donor that authenticated: both
+/// readers NUL-pad a short V<5 `/O`//`U` and then require exactly 32 bytes
 /// (`QPDF_encryption.cc:805-813`), so a longer entry fails at open in qpdf
-/// and in flpdf alike. The projection matters only for a caller that builds
-/// a copy-encryption source from an arbitrary dictionary.
+/// and in flpdf alike. It matters only for a caller that builds a
+/// copy-encryption source from an arbitrary dictionary.
+///
+/// The NUL-padding arm is reachable from such a donor, because
+/// `copyEncryptionParameters` re-reads the raw entry from the donor's
+/// dictionary (`QPDFWriter.cc:693-694`) instead of the padded copy the reader
+/// built. A file whose `/U` stores only the leading 16 bytes the R>=3
+/// user-password check compares (`QPDF_encryption.cc:511-518`), or whose `/O`
+/// drops trailing NUL bytes that this padding restores, opens normally and
+/// arrives here at its stored length.
 pub(crate) fn v_lt_5_32_byte_parameter(bytes: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     let len = bytes.len().min(32);
