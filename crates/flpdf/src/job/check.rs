@@ -1933,6 +1933,27 @@ mod tests {
     }
 
     #[test]
+    fn document_check_propagates_the_second_extension_level_warning_delivery_failure() {
+        // The first `get_extension_level()` call's clamp warning delivers
+        // fine; the second (redundant, print-time) call's identical warning
+        // is the one whose delivery fails here, exercising the
+        // `printed_level` error arm distinct from the first call's.
+        let mut pdf = Pdf::open(Cursor::new(extension_level_overflow_pdf_bytes()))
+            .expect("overflow fixture should open");
+        let document_logger = QPDFLogger::create();
+        document_logger.set_warn(Some(PipelineHandle::new(
+            crate::pipeline::test_support::NthWriteFailure::new(2),
+        )));
+        pdf.set_logger(document_logger);
+
+        let report_output = Arc::new(Mutex::new(Vec::new()));
+        let report_logger = logger_with_capture(Arc::clone(&report_output));
+        let result = check_document(&mut pdf, &report_logger, "qpdf", "extension-overflow.pdf");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn document_check_omits_zero_adobe_extension_level_like_qpdf() {
         let output = Arc::new(Mutex::new(Vec::new()));
         let logger = logger_with_capture(Arc::clone(&output));
