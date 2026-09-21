@@ -278,10 +278,15 @@ fn update_input_version_floor<R: Read + Seek>(
     pdf: &mut Pdf<R>,
 ) -> CliResult<()> {
     if let Some(source_version) = parse_pdf_version(pdf.version()) {
+        // `get_extension_level` clamps to `i32` range and warns on overflow,
+        // matching qpdf's `getExtensionLevel` (`libqpdf/QPDF.cc:2328-2346`)
+        // that `getVersionAsPDFVersion` calls here; the raw
+        // `adobe_extension_level` accessor this replaced kept the full
+        // 64-bit value and never warned.
         let candidate = PdfVersion::new(
             source_version.major(),
             source_version.minor(),
-            pdf.adobe_extension_level()?.unwrap_or(0),
+            i64::from(pdf.get_extension_level()?),
         );
         if floor.is_none_or(|current| current < candidate) {
             *floor = Some(candidate);
@@ -10573,6 +10578,47 @@ mod tests {
         let chunks = chunks.lock().unwrap();
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks.concat(), b"page 1: 3 0 R\n  content:\n    7 0 R\n");
+    }
+
+    #[test]
+    fn update_input_version_floor_clamps_an_overflow_extension_level() {
+        // Measured with qpdf 11.9.0's `getVersionAsPDFVersion` (which
+        // `QPDFJob::doProcessOnce` feeds into `max_input_version`,
+        // `QPDFJob.cc:1712-1714`): a huge `/ExtensionLevel` is clamped to
+        // `i32::MAX` and warns via `getExtensionLevel`
+        // (`libqpdf/QPDF.cc:2328-2346`). The raw `adobe_extension_level`
+        // accessor this replaced kept the full 64-bit value and never
+        // warned, so the accumulated floor would silently carry an
+        // extension level qpdf itself could never produce.
+        let mut body = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        offsets.push(body.len());
+        body.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions << /ADBE << /ExtensionLevel 5000000000 >> >> >>\nendobj\n",
+        );
+        offsets.push(body.len());
+        body.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        let xref_offset = body.len();
+        let n = offsets.len() + 1;
+        let mut xref = format!("xref\n0 {n}\n0000000000 65535 f \n").into_bytes();
+        for offset in &offsets {
+            xref.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        body.extend_from_slice(&xref);
+        body.extend_from_slice(
+            format!("trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        let mut pdf = Pdf::open_mem_owned(body).expect("well-formed overflow fixture must parse");
+
+        let mut floor = None;
+        update_input_version_floor(&mut floor, &mut pdf).expect("floor update should succeed");
+
+        assert_eq!(floor, Some(PdfVersion::new(1, 7, i64::from(i32::MAX))));
+        assert!(pdf.repair_diagnostics().entries().iter().any(|entry| {
+            String::from_utf8_lossy(entry.what_bytes())
+                .contains("requested value of integer is too big; returning INT_MAX")
+        }));
     }
 
     #[test]

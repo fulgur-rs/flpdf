@@ -593,7 +593,11 @@ fn run_test1(input_arg: &std::ffi::OsStr, password_arg: &std::ffi::OsStr) -> Res
     // Match qpdf-ctest.c:test01's accessor order: version, extension level,
     // linearization, encryption, then the encrypted-only projections.
     let version = pdf.version().to_owned();
-    let extension_level = pdf.adobe_extension_level()?;
+    // `qpdf_get_pdf_extension_level` (`qpdf-c.cc:319-324`) wraps
+    // `QPDF::getExtensionLevel`, which clamps to `i32` range and warns on
+    // overflow (`libqpdf/QPDF.cc:2328-2346`); the raw `adobe_extension_level`
+    // accessor this replaced kept the full 64-bit value and never warned.
+    let extension_level = pdf.get_extension_level()?;
     let linearized = pdf.is_linearized()?;
     let encrypted = pdf.is_encrypted();
     let encryption_revision = encrypted
@@ -621,8 +625,14 @@ fn run_test1(input_arg: &std::ffi::OsStr, password_arg: &std::ffi::OsStr) -> Res
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
     writeln!(stdout, "version: {version}")?;
-    if let Some(extension_level) = extension_level.filter(|level| *level > 0) {
-        writeln!(stdout, "extension level: {extension_level}")?;
+    if extension_level > 0 {
+        // qpdf-ctest.c:139-141 calls `qpdf_get_pdf_extension_level` a second
+        // time here (redundantly) to print it; each call independently
+        // clamps and warns, so a value that needs clamping is warned about
+        // twice. Re-reading here instead of reusing `extension_level`
+        // reproduces that second warning.
+        let printed_extension_level = pdf.get_extension_level()?;
+        writeln!(stdout, "extension level: {printed_extension_level}")?;
     }
     writeln!(stdout, "linearized: {}", u8::from(linearized))?;
     writeln!(stdout, "encrypted: {}", u8::from(encrypted))?;

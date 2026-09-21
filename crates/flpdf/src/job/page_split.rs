@@ -243,7 +243,13 @@ impl QPDFJob {
         let has_acro_form = source.acroform()?.has_acro_form()?;
         let source_version =
             crate::parse_pdf_version(source.version()).map(|version| version.get_version().0);
-        let source_extension_level = source.adobe_extension_level()?.unwrap_or(0);
+        // qpdf's `getExtensionLevel` (`libqpdf/QPDF.cc:2328-2346`) clamps the
+        // value to `i32` range and warns on overflow (`QPDFObjectHandle.cc:527-543`);
+        // the raw `adobe_extension_level` accessor keeps the full 64-bit value
+        // and never warns, which would silently pass a huge `/ExtensionLevel`
+        // through to `set_minimum_pdf_version` instead of reproducing qpdf's
+        // clamp and diagnostic.
+        let source_extension_level = i64::from(source.get_extension_level()?);
         let mut writer_configuration = options.writer_configuration;
         let mut written = Vec::new();
 
@@ -951,6 +957,67 @@ mod tests {
             .split_pages(&mut source, options)
             .expect("Auto resource finding should split");
         assert_eq!(written.len(), 1);
+    }
+
+    /// A well-formed one-page PDF whose `/Extensions /ADBE /ExtensionLevel`
+    /// exceeds `i32::MAX`, matching the fixture qpdf 11.9.0 was probed with
+    /// for [`crate::Pdf::get_extension_level`]'s own clamp test.
+    fn open_extension_level_overflow_fixture() -> Pdf<Cursor<Vec<u8>>> {
+        let mut body = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        offsets.push(body.len());
+        body.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions << /ADBE << /ExtensionLevel 5000000000 >> >> >>\nendobj\n",
+        );
+        offsets.push(body.len());
+        body.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n");
+        offsets.push(body.len());
+        body.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> >>\nendobj\n",
+        );
+        let xref_offset = body.len();
+        let n = offsets.len() + 1;
+        let mut xref = format!("xref\n0 {n}\n0000000000 65535 f \n").into_bytes();
+        for offset in &offsets {
+            xref.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        body.extend_from_slice(&xref);
+        body.extend_from_slice(
+            format!("trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        Pdf::open_mem_owned(body).expect("well-formed overflow fixture must parse")
+    }
+
+    #[test]
+    fn split_pages_clamps_the_source_extension_level_like_qpdf() {
+        // Measured with qpdf 11.9.0 (`qpdf --split-pages=1` on an equivalent
+        // fixture): exactly one "requested value of integer is too big;
+        // returning INT_MAX" warning is emitted -- qpdf's doSplitPages reads
+        // the source's extension level once (via `getExtensionLevel`, which
+        // clamps and warns), not once per output chunk. The raw
+        // `adobe_extension_level` accessor this replaced kept the full 64-bit
+        // value and never warned, silently diverging from qpdf's clamp.
+        let mut source = open_extension_level_overflow_fixture();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let written = QPDFJob::new()
+            .split_pages(
+                &mut source,
+                SplitPageOptions::new(1, temp.path().join("out.pdf")),
+            )
+            .expect("split job should succeed despite the clamp warning");
+        assert_eq!(written.len(), 1);
+        assert_eq!(
+            source
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .filter(|entry| entry
+                    .message_string()
+                    .contains("requested value of integer is too big; returning INT_MAX"))
+                .count(),
+            1
+        );
     }
 
     #[test]
