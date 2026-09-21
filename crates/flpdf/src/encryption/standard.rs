@@ -565,8 +565,11 @@ pub(crate) fn check_user_password(
         cipher.process_in_place(&mut data);
 
         // 3. Apply 19 further RC4 passes with (file_key XOR i) for i = 1..=19.
+        let mut xor_key = file_key.clone();
         for i in 1_u8..=19 {
-            let xor_key: Vec<u8> = file_key.iter().map(|&byte| byte ^ i).collect();
+            for (byte, &orig) in xor_key.iter_mut().zip(&file_key) {
+                *byte = orig ^ i;
+            }
             let mut cipher = Rc4::new(&xor_key)?;
             cipher.process_in_place(&mut data);
         }
@@ -595,8 +598,11 @@ pub(crate) fn check_user_password_v4(
     let mut data = digest;
     let mut cipher = Rc4::new(&file_key)?;
     cipher.process_in_place(&mut data);
+    let mut xor_key = file_key.clone();
     for i in 1_u8..=19 {
-        let xor_key: Vec<u8> = file_key.iter().map(|&byte| byte ^ i).collect();
+        for (byte, &orig) in xor_key.iter_mut().zip(&file_key) {
+            *byte = orig ^ i;
+        }
         let mut cipher = Rc4::new(&xor_key)?;
         cipher.process_in_place(&mut data);
     }
@@ -639,8 +645,11 @@ pub(crate) fn check_owner_password_with_user_password(
         cipher.process_in_place(&mut candidate);
     } else {
         // 20 passes in DESCENDING order (i = 19..=0).
+        let mut xor_key = rc4_key.clone();
         for i in (0_u8..=19).rev() {
-            let xor_key: Vec<u8> = rc4_key.iter().map(|&byte| byte ^ i).collect();
+            for (byte, &orig) in xor_key.iter_mut().zip(&rc4_key) {
+                *byte = orig ^ i;
+            }
             let mut cipher = Rc4::new(&xor_key)?;
             cipher.process_in_place(&mut candidate);
         }
@@ -672,8 +681,11 @@ pub(crate) fn check_owner_password_v4_with_user_password(
     }
     let rc4_key = &digest[..n];
     let mut candidate = *inputs.o;
+    let mut xor_key = rc4_key.to_vec();
     for i in (0_u8..=19).rev() {
-        let xor_key: Vec<u8> = rc4_key.iter().map(|&byte| byte ^ i).collect();
+        for (byte, &orig) in xor_key.iter_mut().zip(rc4_key) {
+            *byte = orig ^ i;
+        }
         let mut cipher = Rc4::new(&xor_key)?;
         cipher.process_in_place(&mut candidate);
     }
@@ -764,8 +776,11 @@ fn compute_u_first_16_r3plus(file_key: &[u8], id0: &[u8]) -> Result<[u8; 16]> {
 
     let mut cipher = Rc4::new(file_key)?;
     cipher.process_in_place(&mut data);
+    let mut xor_key = file_key.to_vec();
     for i in 1_u8..=19 {
-        let xor_key: Vec<u8> = file_key.iter().map(|&byte| byte ^ i).collect();
+        for (byte, &orig) in xor_key.iter_mut().zip(file_key) {
+            *byte = orig ^ i;
+        }
         let mut cipher = Rc4::new(&xor_key)?;
         cipher.process_in_place(&mut data);
     }
@@ -869,8 +884,11 @@ pub(crate) fn compute_o_entry(
         let mut cipher = Rc4::new(&rc4_key)?;
         cipher.process_in_place(&mut buf);
     } else {
+        let mut xor_key = rc4_key.clone();
         for i in 0_u8..=19 {
-            let xor_key: Vec<u8> = rc4_key.iter().map(|&byte| byte ^ i).collect();
+            for (byte, &orig) in xor_key.iter_mut().zip(&rc4_key) {
+                *byte = orig ^ i;
+            }
             let mut cipher = Rc4::new(&xor_key)?;
             cipher.process_in_place(&mut buf);
         }
