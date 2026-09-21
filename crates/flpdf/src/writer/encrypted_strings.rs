@@ -106,7 +106,7 @@ impl EncryptedStringEmitter {
                     )
                 };
                 if qdf {
-                    object.write_object_qdf_with_ref_map_and_removed_with_string_writer(
+                    object.unparse_object_qdf_with_ref_map_and_removed_with_string_writer(
                         out,
                         0,
                         map,
@@ -114,7 +114,7 @@ impl EncryptedStringEmitter {
                         &mut write_string,
                     )
                 } else {
-                    object.write_object_with_ref_map_and_removed_with_string_writer(
+                    object.unparse_object_with_ref_map_and_removed_with_string_writer(
                         out,
                         map,
                         removed_refs,
@@ -185,7 +185,7 @@ impl EncryptedStringEmitter {
                     )
                 };
                 if qdf {
-                    object.write_object_qdf_with_qpdf_obj_gen_map_and_removed_with_string_writer(
+                    object.unparse_object_qdf_with_qpdf_obj_gen_map_and_removed_with_string_writer(
                         out,
                         0,
                         map,
@@ -193,7 +193,7 @@ impl EncryptedStringEmitter {
                         &mut write_string,
                     )
                 } else {
-                    object.write_object_with_qpdf_obj_gen_map_and_removed_with_string_writer(
+                    object.unparse_object_with_qpdf_obj_gen_map_and_removed_with_string_writer(
                         out,
                         map,
                         removed_refs,
@@ -235,7 +235,7 @@ impl EncryptedStringEmitter {
                         plaintext,
                     )
                 };
-                crate::writer::object::write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+                crate::writer::object::unparse_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
                     object,
                     out,
                     map,
@@ -356,7 +356,7 @@ impl EncryptedStringEmitter {
         if !options.encrypt_strings {
             if options.qdf {
                 return dict
-                    .write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+                    .unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
                         out,
                         0,
                         map,
@@ -365,7 +365,7 @@ impl EncryptedStringEmitter {
                         options.dictionary,
                     );
             }
-            return dict.write_stream_body_with_ref_map_and_removed_with_options(
+            return dict.unparse_stream_body_with_ref_map_and_removed_with_options(
                 out,
                 options.dictionary,
                 map,
@@ -389,7 +389,7 @@ impl EncryptedStringEmitter {
                     )
                 };
                 if options.qdf {
-                    dict.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options(
+                    dict.unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options(
                         out,
                         0,
                         map,
@@ -399,7 +399,7 @@ impl EncryptedStringEmitter {
                         &mut write_string,
                     )
                 } else {
-                    dict.write_stream_body_with_ref_map_and_removed_with_options_and_string_writer(
+                    dict.unparse_stream_body_with_ref_map_and_removed_with_options_and_string_writer(
                         out,
                         options.dictionary,
                         map,
@@ -425,7 +425,7 @@ impl EncryptedStringEmitter {
     ) -> crate::Result<()> {
         if options.qdf && !options.encrypt_strings {
             return dict
-                .write_stream_body_qdf_with_qpdf_obj_gen_map_and_removed_and_length_with_options(
+                .unparse_stream_body_qdf_with_qpdf_obj_gen_map_and_removed_and_length_with_options(
                     out,
                     0,
                     map,
@@ -436,7 +436,7 @@ impl EncryptedStringEmitter {
         }
 
         if !options.qdf && !options.encrypt_strings {
-            return dict.write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options(
+            return dict.unparse_stream_body_with_qpdf_obj_gen_map_and_removed_with_options(
                 out,
                 options.dictionary,
                 map,
@@ -460,7 +460,7 @@ impl EncryptedStringEmitter {
                     )
                 };
                 if options.qdf {
-                    dict.write_stream_body_qdf_with_qpdf_obj_gen_map_and_removed_and_length_with_string_writer_with_options(
+                    dict.unparse_stream_body_qdf_with_qpdf_obj_gen_map_and_removed_and_length_with_string_writer_with_options(
                         out,
                         0,
                         map,
@@ -470,7 +470,7 @@ impl EncryptedStringEmitter {
                         &mut write_string,
                     )
                 } else {
-                    dict.write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_string_writer(
+                    dict.unparse_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_string_writer(
                         out,
                         options.dictionary,
                         map,
@@ -592,7 +592,7 @@ pub(crate) fn write_encryption_dictionary_handle(
                 continue;
             } // cov:ignore: LLVM attributes the covered hex-key string branch to its continue terminator.
         } // cov:ignore: LLVM attributes the covered non-string encryption-key fallback to this closing branch.
-        value.write_object(out)?;
+        value.unparse_object(out)?;
     }
     out.write_bytes(b" >>")
 }

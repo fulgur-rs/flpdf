@@ -8,6 +8,12 @@
 //! owns traversal, output-reference remapping, null visibility, QDF framing,
 //! and emission-time string policy.  Keeping this boundary in `writer/`
 //! prevents the object model from growing a second writer responsibility.
+//!
+//! Every entry point here is named after qpdf's `unparseObject` (value-only
+//! serialization) or `writeTrailer`, never after `writeObject`: the indirect
+//! object envelope (`N 0 obj` … `endobj`) that qpdf's `writeObject` adds
+//! around an `unparseObject` call belongs to
+//! [`crate::writer::write_object::WriteObject::write_object`] instead.
 
 use super::output::{
     decimal_u64_len, write_decimal_i64, write_decimal_u64, write_object_ref, OutputSink,
@@ -92,9 +98,9 @@ impl StreamDictionaryOptions {
 /// identity, payload, and mutation responsibilities.
 #[allow(dead_code)]
 pub(crate) trait ObjectWriterEmission {
-    fn write_object(&self, out: &mut OutputSink<'_>) -> Result<()>;
+    fn unparse_object(&self, out: &mut OutputSink<'_>) -> Result<()>;
     #[cfg(test)]
-    fn write_object_with_string_writer<F>(
+    fn unparse_object_with_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         write_string: &mut F,
@@ -102,15 +108,15 @@ pub(crate) trait ObjectWriterEmission {
     where
         F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
     #[cfg(test)]
-    fn write_object_qdf(&self, out: &mut OutputSink<'_>, indent: usize) -> Result<()>;
-    fn write_object_qdf_with_ref_map_and_removed(
+    fn unparse_object_qdf(&self, out: &mut OutputSink<'_>, indent: usize) -> Result<()>;
+    fn unparse_object_qdf_with_ref_map_and_removed(
         &self,
         out: &mut OutputSink<'_>,
         indent: usize,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()>;
-    fn write_object_qdf_with_qpdf_obj_gen_map_and_removed(
+    fn unparse_object_qdf_with_qpdf_obj_gen_map_and_removed(
         &self,
         out: &mut OutputSink<'_>,
         indent: usize,
@@ -118,7 +124,7 @@ pub(crate) trait ObjectWriterEmission {
         removed_refs: &BTreeSet<QpdfObjGen>,
     ) -> Result<()>;
     #[cfg(test)]
-    fn write_object_qdf_with_string_writer<F>(
+    fn unparse_object_qdf_with_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         indent: usize,
@@ -126,20 +132,20 @@ pub(crate) trait ObjectWriterEmission {
     ) -> Result<()>
     where
         F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
-    fn write_object_with_ref_map_and_removed(
+    fn unparse_object_with_ref_map_and_removed(
         &self,
         out: &mut OutputSink<'_>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()>;
-    fn write_object_with_qpdf_obj_gen_map_and_removed(
+    fn unparse_object_with_qpdf_obj_gen_map_and_removed(
         &self,
         out: &mut OutputSink<'_>,
         map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<QpdfObjGen>,
     ) -> Result<()>;
     #[cfg(test)]
-    fn write_root_object_with_ref_map_and_removed(
+    fn unparse_root_object_with_ref_map_and_removed(
         &self,
         out: &mut OutputSink<'_>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
@@ -168,7 +174,7 @@ pub(crate) trait ObjectWriterEmission {
     /// Live-queue emission variant: the callback receives the complete child
     /// handle before its output reference is assigned, so owner checks and
     /// first-seen queue insertion happen at qpdf's `unparseChild` boundary.
-    fn write_object_with_dynamic_ref_map(
+    fn unparse_object_with_dynamic_ref_map(
         &self,
         out: &mut OutputSink<'_>,
         map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
@@ -179,7 +185,7 @@ pub(crate) trait ObjectWriterEmission {
             "dynamic writer map is unavailable for this emission owner".into(),
         ))
     }
-    fn write_root_object_with_dynamic_ref_map(
+    fn unparse_root_object_with_dynamic_ref_map(
         &self,
         out: &mut OutputSink<'_>,
         map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
@@ -200,7 +206,7 @@ pub(crate) trait ObjectWriterEmission {
             "dynamic root writer map is unavailable for this emission owner".into(),
         ))
     }
-    fn write_stream_body_with_dynamic_ref_map(
+    fn unparse_stream_body_with_dynamic_ref_map(
         &self,
         out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
@@ -213,7 +219,7 @@ pub(crate) trait ObjectWriterEmission {
         ))
     }
     #[allow(clippy::type_complexity)]
-    fn write_stream_body_with_dynamic_ref_map_and_string_writer<F>(
+    fn unparse_stream_body_with_dynamic_ref_map_and_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
@@ -225,7 +231,7 @@ pub(crate) trait ObjectWriterEmission {
     where
         F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()> + ?Sized;
     // cov:ignore-end
-    fn write_object_with_ref_map_and_removed_with_string_writer<F>(
+    fn unparse_object_with_ref_map_and_removed_with_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
@@ -234,7 +240,7 @@ pub(crate) trait ObjectWriterEmission {
     ) -> Result<()>
     where
         F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
-    fn write_object_with_qpdf_obj_gen_map_and_removed_with_string_writer<F>(
+    fn unparse_object_with_qpdf_obj_gen_map_and_removed_with_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
@@ -243,7 +249,7 @@ pub(crate) trait ObjectWriterEmission {
     ) -> Result<()>
     where
         F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
-    fn write_object_qdf_with_ref_map_and_removed_with_string_writer<F>(
+    fn unparse_object_qdf_with_ref_map_and_removed_with_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         indent: usize,
@@ -253,7 +259,7 @@ pub(crate) trait ObjectWriterEmission {
     ) -> Result<()>
     where
         F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
-    fn write_object_qdf_with_qpdf_obj_gen_map_and_removed_with_string_writer<F>(
+    fn unparse_object_qdf_with_qpdf_obj_gen_map_and_removed_with_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         indent: usize,
@@ -264,9 +270,9 @@ pub(crate) trait ObjectWriterEmission {
     where
         F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
 
-    fn write_stream_body(&self, out: &mut OutputSink<'_>, refiltered: bool) -> Result<()>;
+    fn unparse_stream_body(&self, out: &mut OutputSink<'_>, refiltered: bool) -> Result<()>;
     #[cfg(test)]
-    fn write_stream_body_with_string_writer<F>(
+    fn unparse_stream_body_with_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         refiltered: bool,
@@ -275,9 +281,9 @@ pub(crate) trait ObjectWriterEmission {
     where
         F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
     #[cfg(test)]
-    fn write_stream_body_qdf(&self, out: &mut OutputSink<'_>, indent: usize) -> Result<()>;
+    fn unparse_stream_body_qdf(&self, out: &mut OutputSink<'_>, indent: usize) -> Result<()>;
     #[cfg(test)]
-    fn write_stream_body_qdf_with_ref_map_and_removed_and_length(
+    fn unparse_stream_body_qdf_with_ref_map_and_removed_and_length(
         &self,
         out: &mut OutputSink<'_>,
         indent: usize,
@@ -285,7 +291,7 @@ pub(crate) trait ObjectWriterEmission {
         removed_refs: &BTreeSet<ObjectRef>,
         length_ref: Option<ObjectRef>,
     ) -> Result<()>;
-    fn write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+    fn unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
         &self,
         out: &mut OutputSink<'_>,
         indent: usize,
@@ -294,7 +300,7 @@ pub(crate) trait ObjectWriterEmission {
         length_ref: Option<ObjectRef>,
         options: StreamDictionaryOptions,
     ) -> Result<()>;
-    fn write_stream_body_qdf_with_qpdf_obj_gen_map_and_removed_and_length_with_options(
+    fn unparse_stream_body_qdf_with_qpdf_obj_gen_map_and_removed_and_length_with_options(
         &self,
         out: &mut OutputSink<'_>,
         indent: usize,
@@ -304,7 +310,7 @@ pub(crate) trait ObjectWriterEmission {
         options: StreamDictionaryOptions,
     ) -> Result<()>;
     #[cfg(test)]
-    fn write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer<F>(
+    fn unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         indent: usize,
@@ -316,7 +322,7 @@ pub(crate) trait ObjectWriterEmission {
     where
         F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
     #[allow(clippy::too_many_arguments)]
-    fn write_stream_body_qdf_with_qpdf_obj_gen_map_and_removed_and_length_with_string_writer_with_options<
+    fn unparse_stream_body_qdf_with_qpdf_obj_gen_map_and_removed_and_length_with_string_writer_with_options<
         F,
     >(
         &self,
@@ -331,7 +337,7 @@ pub(crate) trait ObjectWriterEmission {
     where
         F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
     #[allow(clippy::too_many_arguments)]
-    fn write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options<
+    fn unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options<
         F,
     >(
         &self,
@@ -346,7 +352,7 @@ pub(crate) trait ObjectWriterEmission {
     where
         F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
     #[cfg(test)]
-    fn write_stream_body_qdf_with_string_writer<F>(
+    fn unparse_stream_body_qdf_with_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         indent: usize,
@@ -355,21 +361,21 @@ pub(crate) trait ObjectWriterEmission {
     where
         F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
     #[cfg(test)]
-    fn write_stream_body_with_ref_map_and_removed(
+    fn unparse_stream_body_with_ref_map_and_removed(
         &self,
         out: &mut OutputSink<'_>,
         refiltered: bool,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()>;
-    fn write_stream_body_with_ref_map_and_removed_with_options(
+    fn unparse_stream_body_with_ref_map_and_removed_with_options(
         &self,
         out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()>;
-    fn write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options(
+    fn unparse_stream_body_with_qpdf_obj_gen_map_and_removed_with_options(
         &self,
         out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
@@ -380,7 +386,7 @@ pub(crate) trait ObjectWriterEmission {
     /// override. The source dictionary's top-level keys remain unchanged,
     /// matching qpdf's writer-side stream length calculation; nested filter
     /// arrays retain the existing qpdf shallow-copy alias cleanup semantics.
-    fn write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
+    fn unparse_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
         &self,
         out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
@@ -392,7 +398,7 @@ pub(crate) trait ObjectWriterEmission {
     /// The source handle remains unchanged; this mirrors qpdf's stream writer,
     /// which computes the emitted length from the bytes supplied to its pipe.
     #[cfg(test)]
-    fn write_stream_body_with_ref_map_and_removed_and_length(
+    fn unparse_stream_body_with_ref_map_and_removed_and_length(
         &self,
         out: &mut OutputSink<'_>,
         refiltered: bool,
@@ -401,7 +407,7 @@ pub(crate) trait ObjectWriterEmission {
         length: usize,
     ) -> Result<()>;
     #[cfg(test)]
-    fn write_stream_body_with_ref_map_and_removed_and_length_with_options(
+    fn unparse_stream_body_with_ref_map_and_removed_and_length_with_options(
         &self,
         out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
@@ -410,7 +416,7 @@ pub(crate) trait ObjectWriterEmission {
         length: usize,
     ) -> Result<()>;
     #[cfg(test)]
-    fn write_stream_body_with_ref_map_and_removed_with_string_writer<F>(
+    fn unparse_stream_body_with_ref_map_and_removed_with_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         refiltered: bool,
@@ -420,7 +426,7 @@ pub(crate) trait ObjectWriterEmission {
     ) -> Result<()>
     where
         F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
-    fn write_stream_body_with_ref_map_and_removed_with_options_and_string_writer<F>(
+    fn unparse_stream_body_with_ref_map_and_removed_with_options_and_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
@@ -430,7 +436,7 @@ pub(crate) trait ObjectWriterEmission {
     ) -> Result<()>
     where
         F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
-    fn write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_string_writer<F>(
+    fn unparse_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
@@ -502,16 +508,16 @@ pub(crate) trait ObjectWriterEmission {
 /// invocation still traverses that sink surface.
 #[cfg(test)]
 pub(crate) trait ObjectWriterEmissionVecTestExt {
-    fn write_object(&self, out: &mut Vec<u8>) -> Result<()>;
-    fn write_object_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()>;
-    fn write_object_with_string_writer<F>(
+    fn unparse_object(&self, out: &mut Vec<u8>) -> Result<()>;
+    fn unparse_object_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()>;
+    fn unparse_object_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
         write_string: &mut F,
     ) -> Result<()>
     where
         F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
-    fn write_object_qdf_with_string_writer<F>(
+    fn unparse_object_qdf_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
         indent: usize,
@@ -519,14 +525,14 @@ pub(crate) trait ObjectWriterEmissionVecTestExt {
     ) -> Result<()>
     where
         F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
-    fn write_object_with_ref_map_and_removed(
+    fn unparse_object_with_ref_map_and_removed(
         &self,
         out: &mut Vec<u8>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()>;
-    fn write_stream_body(&self, out: &mut Vec<u8>, refiltered: bool) -> Result<()>;
-    fn write_stream_body_with_string_writer<F>(
+    fn unparse_stream_body(&self, out: &mut Vec<u8>, refiltered: bool) -> Result<()>;
+    fn unparse_stream_body_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
         refiltered: bool,
@@ -534,8 +540,8 @@ pub(crate) trait ObjectWriterEmissionVecTestExt {
     ) -> Result<()>
     where
         F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
-    fn write_stream_body_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()>;
-    fn write_stream_body_qdf_with_string_writer<F>(
+    fn unparse_stream_body_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()>;
+    fn unparse_stream_body_qdf_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
         indent: usize,
@@ -543,14 +549,14 @@ pub(crate) trait ObjectWriterEmissionVecTestExt {
     ) -> Result<()>
     where
         F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
-    fn write_stream_body_with_ref_map_and_removed(
+    fn unparse_stream_body_with_ref_map_and_removed(
         &self,
         out: &mut Vec<u8>,
         refiltered: bool,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()>;
-    fn write_stream_body_with_ref_map_and_removed_with_string_writer<F>(
+    fn unparse_stream_body_with_ref_map_and_removed_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
         refiltered: bool,
@@ -560,7 +566,7 @@ pub(crate) trait ObjectWriterEmissionVecTestExt {
     ) -> Result<()>
     where
         F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
-    fn write_stream_body_qdf_with_ref_map_and_removed_and_length(
+    fn unparse_stream_body_qdf_with_ref_map_and_removed_and_length(
         &self,
         out: &mut Vec<u8>,
         indent: usize,
@@ -568,7 +574,7 @@ pub(crate) trait ObjectWriterEmissionVecTestExt {
         removed_refs: &BTreeSet<ObjectRef>,
         length_ref: Option<ObjectRef>,
     ) -> Result<()>;
-    fn write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer<F>(
+    fn unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
         indent: usize,
@@ -590,17 +596,17 @@ pub(crate) trait ObjectWriterEmissionVecTestExt {
 
 #[cfg(test)]
 impl ObjectWriterEmissionVecTestExt for ObjectHandle {
-    fn write_object(&self, out: &mut Vec<u8>) -> Result<()> {
-        super::output::with_buffer_sink(out, |out| ObjectWriterEmission::write_object(self, out))
+    fn unparse_object(&self, out: &mut Vec<u8>) -> Result<()> {
+        super::output::with_buffer_sink(out, |out| ObjectWriterEmission::unparse_object(self, out))
     }
 
-    fn write_object_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()> {
+    fn unparse_object_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()> {
         super::output::with_buffer_sink(out, |out| {
-            ObjectWriterEmission::write_object_qdf(self, out, indent)
+            ObjectWriterEmission::unparse_object_qdf(self, out, indent)
         })
     }
 
-    fn write_object_with_string_writer<F>(
+    fn unparse_object_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
         write_string: &mut F,
@@ -614,11 +620,11 @@ impl ObjectWriterEmissionVecTestExt for ObjectHandle {
             out.write_bytes(&bytes)
         };
         super::output::with_buffer_sink(out, |out| {
-            ObjectWriterEmission::write_object_with_string_writer(self, out, &mut sink_writer)
+            ObjectWriterEmission::unparse_object_with_string_writer(self, out, &mut sink_writer)
         })
     }
 
-    fn write_object_qdf_with_string_writer<F>(
+    fn unparse_object_qdf_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
         indent: usize,
@@ -633,7 +639,7 @@ impl ObjectWriterEmissionVecTestExt for ObjectHandle {
             out.write_bytes(&bytes)
         };
         super::output::with_buffer_sink(out, |out| {
-            ObjectWriterEmission::write_object_qdf_with_string_writer(
+            ObjectWriterEmission::unparse_object_qdf_with_string_writer(
                 self,
                 out,
                 indent,
@@ -642,14 +648,14 @@ impl ObjectWriterEmissionVecTestExt for ObjectHandle {
         })
     }
 
-    fn write_object_with_ref_map_and_removed(
+    fn unparse_object_with_ref_map_and_removed(
         &self,
         out: &mut Vec<u8>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()> {
         super::output::with_buffer_sink(out, |out| {
-            ObjectWriterEmission::write_object_with_ref_map_and_removed(
+            ObjectWriterEmission::unparse_object_with_ref_map_and_removed(
                 self,
                 out,
                 map,
@@ -658,13 +664,13 @@ impl ObjectWriterEmissionVecTestExt for ObjectHandle {
         })
     }
 
-    fn write_stream_body(&self, out: &mut Vec<u8>, refiltered: bool) -> Result<()> {
+    fn unparse_stream_body(&self, out: &mut Vec<u8>, refiltered: bool) -> Result<()> {
         super::output::with_buffer_sink(out, |out| {
-            ObjectWriterEmission::write_stream_body(self, out, refiltered)
+            ObjectWriterEmission::unparse_stream_body(self, out, refiltered)
         })
     }
 
-    fn write_stream_body_with_string_writer<F>(
+    fn unparse_stream_body_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
         refiltered: bool,
@@ -679,7 +685,7 @@ impl ObjectWriterEmissionVecTestExt for ObjectHandle {
             out.write_bytes(&bytes)
         };
         super::output::with_buffer_sink(out, |out| {
-            ObjectWriterEmission::write_stream_body_with_string_writer(
+            ObjectWriterEmission::unparse_stream_body_with_string_writer(
                 self,
                 out,
                 refiltered,
@@ -688,13 +694,13 @@ impl ObjectWriterEmissionVecTestExt for ObjectHandle {
         })
     }
 
-    fn write_stream_body_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()> {
+    fn unparse_stream_body_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()> {
         super::output::with_buffer_sink(out, |out| {
-            ObjectWriterEmission::write_stream_body_qdf(self, out, indent)
+            ObjectWriterEmission::unparse_stream_body_qdf(self, out, indent)
         })
     }
 
-    fn write_stream_body_qdf_with_string_writer<F>(
+    fn unparse_stream_body_qdf_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
         indent: usize,
@@ -709,7 +715,7 @@ impl ObjectWriterEmissionVecTestExt for ObjectHandle {
             out.write_bytes(&bytes)
         };
         super::output::with_buffer_sink(out, |out| {
-            ObjectWriterEmission::write_stream_body_qdf_with_string_writer(
+            ObjectWriterEmission::unparse_stream_body_qdf_with_string_writer(
                 self,
                 out,
                 indent,
@@ -718,7 +724,7 @@ impl ObjectWriterEmissionVecTestExt for ObjectHandle {
         })
     }
 
-    fn write_stream_body_with_ref_map_and_removed(
+    fn unparse_stream_body_with_ref_map_and_removed(
         &self,
         out: &mut Vec<u8>,
         refiltered: bool,
@@ -726,7 +732,7 @@ impl ObjectWriterEmissionVecTestExt for ObjectHandle {
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()> {
         super::output::with_buffer_sink(out, |out| {
-            ObjectWriterEmission::write_stream_body_with_ref_map_and_removed(
+            ObjectWriterEmission::unparse_stream_body_with_ref_map_and_removed(
                 self,
                 out,
                 refiltered,
@@ -736,7 +742,7 @@ impl ObjectWriterEmissionVecTestExt for ObjectHandle {
         })
     }
 
-    fn write_stream_body_with_ref_map_and_removed_with_string_writer<F>(
+    fn unparse_stream_body_with_ref_map_and_removed_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
         refiltered: bool,
@@ -753,7 +759,7 @@ impl ObjectWriterEmissionVecTestExt for ObjectHandle {
             out.write_bytes(&bytes)
         };
         super::output::with_buffer_sink(out, |out| {
-            ObjectWriterEmission::write_stream_body_with_ref_map_and_removed_with_string_writer(
+            ObjectWriterEmission::unparse_stream_body_with_ref_map_and_removed_with_string_writer(
                 self,
                 out,
                 refiltered,
@@ -764,7 +770,7 @@ impl ObjectWriterEmissionVecTestExt for ObjectHandle {
         })
     }
 
-    fn write_stream_body_qdf_with_ref_map_and_removed_and_length(
+    fn unparse_stream_body_qdf_with_ref_map_and_removed_and_length(
         &self,
         out: &mut Vec<u8>,
         indent: usize,
@@ -773,7 +779,7 @@ impl ObjectWriterEmissionVecTestExt for ObjectHandle {
         length_ref: Option<ObjectRef>,
     ) -> Result<()> {
         super::output::with_buffer_sink(out, |out| {
-            ObjectWriterEmission::write_stream_body_qdf_with_ref_map_and_removed_and_length(
+            ObjectWriterEmission::unparse_stream_body_qdf_with_ref_map_and_removed_and_length(
                 self,
                 out,
                 indent,
@@ -784,7 +790,7 @@ impl ObjectWriterEmissionVecTestExt for ObjectHandle {
         })
     }
 
-    fn write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer<F>(
+    fn unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
         indent: usize,
@@ -802,7 +808,7 @@ impl ObjectWriterEmissionVecTestExt for ObjectHandle {
             out.write_bytes(&bytes)
         };
         super::output::with_buffer_sink(out, |out| {
-            ObjectWriterEmission::write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(self, out, indent, map, removed_refs, length_ref, &mut sink_writer)
+            ObjectWriterEmission::unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(self, out, indent, map, removed_refs, length_ref, &mut sink_writer)
         })
     }
 
@@ -959,18 +965,18 @@ impl ObjectWriterEmission for ObjectHandle {
     /// stream-writing call produces at this position; this primitive simply
     /// does not implement qpdf's stream-writing path
     /// (`QPDFWriter::unparseObject` entered with `f_stream` flags). The
-    /// dedicated primitive for that is `write_stream_body`, which current
+    /// dedicated primitive for that is `unparse_stream_body`, which current
     /// writer routes call when stream framing is required; calling
-    /// `write_object` directly on a stream-resolving handle
+    /// `unparse_object` directly on a stream-resolving handle
     /// is an underspecified, undocumented-by-qpdf shape whose current output
     /// is pinned, in `unparse_object_tests`, by
     /// `unparse_object_on_an_indirect_handle_resolving_to_a_stream_inlines_the_dictionary`
     /// rather than derived from any qpdf oracle.
-    fn write_object(&self, out: &mut OutputSink<'_>) -> Result<()> {
+    fn unparse_object(&self, out: &mut OutputSink<'_>) -> Result<()> {
         unparse_object_walk(self, out)
     }
 
-    /// Writer-emission counterpart of [`Self::write_object`] that routes
+    /// Writer-emission counterpart of [`Self::unparse_object`] that routes
     /// every ordinary direct PDF string through `write_string`. The qpdf
     /// signature `/Contents` exception remains cleartext hexadecimal because
     /// `QPDFWriter.cc:1501` supplies `f_hex_string | f_no_encryption`; it is
@@ -980,7 +986,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// remain owned by `ObjectHandle`, while the caller supplies only the
     /// string representation policy.
     #[cfg(test)]
-    fn write_object_with_string_writer<F>(
+    fn unparse_object_with_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         write_string: &mut F,
@@ -991,7 +997,7 @@ impl ObjectWriterEmission for ObjectHandle {
         unparse_object_walk_with_string_writer(self, out, write_string)
     }
 
-    /// QDF-mode counterpart of [`Self::write_object`] — same qpdf function
+    /// QDF-mode counterpart of [`Self::unparse_object`] — same qpdf function
     /// and the same call shape (`QPDFWriter::unparseObject`,
     /// `QPDFWriter.cc:1318-1527`, `level=0, flags=0`), but with the writer's
     /// own `m->qdf_mode` member set to `true` rather than `false` — a mode
@@ -1006,30 +1012,30 @@ impl ObjectWriterEmission for ObjectHandle {
     /// a resolved indirect handle) writes byte-identically to the non-QDF form; only array,
     /// dictionary, and stream-dictionary-inlining framing differ.
     ///
-    /// Applies the exact same null-suppression rule as [`Self::write_object`]
+    /// Applies the exact same null-suppression rule as [`Self::unparse_object`]
     /// (dictionary entries only — `QPDFWriter.cc:1490-1491`; an array keeps
     /// null elements verbatim, `QPDF_Array::unparse` has no such rule) via
     /// the same [`visible_dict_entries`] helper, and the same forced
     /// top-level resolution of `self` before dispatch. See
-    /// [`Self::write_object`]'s own doc for the identical
+    /// [`Self::unparse_object`]'s own doc for the identical
     /// indirect-handle-resolving-to-a-`Stream` caveat: this call dispatches
     /// on `self` directly, bypassing the child-position reference check, so
     /// it inlines just the dictionary rather than implementing qpdf's real
     /// stream-writing framing. The dedicated primitive for *this* (QDF-mode)
-    /// shape is [`Self::write_stream_body_qdf`] -- not
-    /// [`Self::write_stream_body`], which has no `indent` parameter and
+    /// shape is [`Self::unparse_stream_body_qdf`] -- not
+    /// [`Self::unparse_stream_body`], which has no `indent` parameter and
     /// only ever produces the compact single-line form; that one is the
-    /// dedicated primitive for [`Self::write_object`]'s own (non-QDF)
+    /// dedicated primitive for [`Self::unparse_object`]'s own (non-QDF)
     /// identical caveat instead. Do not conflate the two when fixing this
     /// shape at a real call site.
     #[cfg(test)]
-    fn write_object_qdf(&self, out: &mut OutputSink<'_>, indent: usize) -> Result<()> {
+    fn unparse_object_qdf(&self, out: &mut OutputSink<'_>, indent: usize) -> Result<()> {
         unparse_object_walk_qdf(self, indent, out)
     }
 
     /// QDF writer emission with output-reference remapping and qpdf null
     /// visibility for references removed during this write.
-    fn write_object_qdf_with_ref_map_and_removed(
+    fn unparse_object_qdf_with_ref_map_and_removed(
         &self,
         out: &mut OutputSink<'_>,
         indent: usize,
@@ -1041,7 +1047,7 @@ impl ObjectWriterEmission for ObjectHandle {
         unparse_object_walk_qdf_with_ref_map(self, indent, out, &map, &removed_refs)
     }
 
-    fn write_object_qdf_with_qpdf_obj_gen_map_and_removed(
+    fn unparse_object_qdf_with_qpdf_obj_gen_map_and_removed(
         &self,
         out: &mut OutputSink<'_>,
         indent: usize,
@@ -1051,10 +1057,10 @@ impl ObjectWriterEmission for ObjectHandle {
         unparse_object_walk_qdf_with_ref_map(self, indent, out, map, removed_refs)
     }
 
-    /// QDF-mode counterpart of [`Self::write_object_with_string_writer`],
+    /// QDF-mode counterpart of [`Self::unparse_object_with_string_writer`],
     /// including its cleartext hexadecimal signature `/Contents` exception.
     #[cfg(test)]
-    fn write_object_qdf_with_string_writer<F>(
+    fn unparse_object_qdf_with_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         indent: usize,
@@ -1071,7 +1077,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// `renumber_qpdf_refs_in_place_with_removed` for live handle graphs: an
     /// array keeps the position as `null`, while dictionary visibility drops
     /// the null-valued key.
-    fn write_object_with_ref_map_and_removed(
+    fn unparse_object_with_ref_map_and_removed(
         &self,
         out: &mut OutputSink<'_>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
@@ -1082,7 +1088,7 @@ impl ObjectWriterEmission for ObjectHandle {
         unparse_object_walk_with_ref_map(self, out, &map, &removed_refs)
     }
 
-    fn write_object_with_qpdf_obj_gen_map_and_removed(
+    fn unparse_object_with_qpdf_obj_gen_map_and_removed(
         &self,
         out: &mut OutputSink<'_>,
         map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
@@ -1099,7 +1105,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// replacing or removing ADBE there also changes the live graph. Creating
     /// or removing the root's Extensions key changes only the output copy.
     #[cfg(test)]
-    fn write_root_object_with_ref_map_and_removed(
+    fn unparse_root_object_with_ref_map_and_removed(
         &self,
         out: &mut OutputSink<'_>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
@@ -1119,7 +1125,7 @@ impl ObjectWriterEmission for ObjectHandle {
         unparse_object_walk_with_ref_map(&root, out, &map, &removed_refs)
     }
 
-    fn write_object_with_dynamic_ref_map(
+    fn unparse_object_with_dynamic_ref_map(
         &self,
         out: &mut OutputSink<'_>,
         map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
@@ -1128,7 +1134,7 @@ impl ObjectWriterEmission for ObjectHandle {
         unparse_object_walk_with_dynamic_ref_map(self, out, map, removed_refs)
     }
 
-    fn write_root_object_with_dynamic_ref_map(
+    fn unparse_root_object_with_dynamic_ref_map(
         &self,
         out: &mut OutputSink<'_>,
         map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
@@ -1160,7 +1166,7 @@ impl ObjectWriterEmission for ObjectHandle {
         )
     }
 
-    fn write_stream_body_with_dynamic_ref_map(
+    fn unparse_stream_body_with_dynamic_ref_map(
         &self,
         out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
@@ -1171,7 +1177,7 @@ impl ObjectWriterEmission for ObjectHandle {
         unparse_stream_dict_entries_with_dynamic_ref_map(&entries, options, out, map, removed_refs)
     }
 
-    fn write_stream_body_with_dynamic_ref_map_and_string_writer<F>(
+    fn unparse_stream_body_with_dynamic_ref_map_and_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
@@ -1196,10 +1202,10 @@ impl ObjectWriterEmission for ObjectHandle {
     }
 
     /// Encrypted writer counterpart of
-    /// [`Self::write_object_with_ref_map_and_removed`]. Reference identity,
+    /// [`Self::unparse_object_with_ref_map_and_removed`]. Reference identity,
     /// qpdf null visibility, and string encryption are all applied while the
     /// live handle graph is walked.
-    fn write_object_with_ref_map_and_removed_with_string_writer<F>(
+    fn unparse_object_with_ref_map_and_removed_with_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
@@ -1220,7 +1226,7 @@ impl ObjectWriterEmission for ObjectHandle {
         )
     }
 
-    fn write_object_with_qpdf_obj_gen_map_and_removed_with_string_writer<F>(
+    fn unparse_object_with_qpdf_obj_gen_map_and_removed_with_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
@@ -1240,8 +1246,8 @@ impl ObjectWriterEmission for ObjectHandle {
     }
 
     /// QDF/encrypted counterpart of
-    /// [`Self::write_object_with_ref_map_and_removed_with_string_writer`].
-    fn write_object_qdf_with_ref_map_and_removed_with_string_writer<F>(
+    /// [`Self::unparse_object_with_ref_map_and_removed_with_string_writer`].
+    fn unparse_object_qdf_with_ref_map_and_removed_with_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         indent: usize,
@@ -1264,7 +1270,7 @@ impl ObjectWriterEmission for ObjectHandle {
         )
     }
 
-    fn write_object_qdf_with_qpdf_obj_gen_map_and_removed_with_string_writer<F>(
+    fn unparse_object_qdf_with_qpdf_obj_gen_map_and_removed_with_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         indent: usize,
@@ -1294,7 +1300,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// `1488-1527` is the dictionary-branch loop that writes the surviving
     /// keys, `/Length`, and, when `refiltered`, a fresh `/Filter
     /// /FlateDecode`) -- plus the same null-suppression rule as
-    /// [`Self::write_object`], since this delegation target is the
+    /// [`Self::unparse_object`], since this delegation target is the
     /// identical dictionary branch.
     ///
     /// Like `write_pdf_stream` itself, this primitive does not replicate
@@ -1312,7 +1318,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// `self` normally resolves to a `Dictionary` directly -- this
     /// primitive's usual caller already holds an already-resolved stream's
     /// dictionary handle (see below). It also accepts `self` resolving to a
-    /// `Stream { stream_dict, .. }`, the same shape [`Self::write_object`]'s
+    /// `Stream { stream_dict, .. }`, the same shape [`Self::unparse_object`]'s
     /// own `Stream` arm accepts when an indirect handle resolves to a stream
     /// (see that primitive's own doc for why this shape is reachable): in
     /// that case `stream_dict` -- itself an [`ObjectHandle`], not
@@ -1328,7 +1334,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// crate's writer never calls it on anything else).
     ///
     /// Forces resolution of `self` before dispatch, the same as
-    /// [`Self::write_object`]'s own top-level entry point -- this primitive's
+    /// [`Self::unparse_object`]'s own top-level entry point -- this primitive's
     /// usual caller already
     /// holds an already-resolved stream's dictionary handle, but nothing
     /// enforces that at the type level, and an as-yet-unresolved indirect
@@ -1337,7 +1343,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// unresolved [`Self::with_value`] read alone would (see
     /// `unparse_stream_body_propagates_a_dropped_document_error`, which
     /// fails without this call).
-    fn write_stream_body(&self, out: &mut OutputSink<'_>, refiltered: bool) -> Result<()> {
+    fn unparse_stream_body(&self, out: &mut OutputSink<'_>, refiltered: bool) -> Result<()> {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
         }
@@ -1350,12 +1356,12 @@ impl ObjectWriterEmission for ObjectHandle {
     }
 
     /// Stream-dictionary counterpart of
-    /// [`Self::write_stream_body`] that routes ordinary direct PDF strings
+    /// [`Self::unparse_stream_body`] that routes ordinary direct PDF strings
     /// through `write_string` while retaining qpdf's `/Length` and refilter
     /// ordering. A signature `/Contents` value remains cleartext hexadecimal,
     /// matching qpdf's `f_hex_string | f_no_encryption` flags.
     #[cfg(test)]
-    fn write_stream_body_with_string_writer<F>(
+    fn unparse_stream_body_with_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         refiltered: bool,
@@ -1371,9 +1377,9 @@ impl ObjectWriterEmission for ObjectHandle {
         unparse_stream_dict_entries_with_string_writer(&entries, refiltered, out, write_string)
     }
 
-    /// QDF-mode counterpart of [`Self::write_stream_body`] -- same
+    /// QDF-mode counterpart of [`Self::unparse_stream_body`] -- same
     /// delegation-target dimension as the QDF object writer is to
-    /// [`Self::write_object`] (`m->qdf_mode` set to `true` inside the
+    /// [`Self::unparse_object`] (`m->qdf_mode` set to `true` inside the
     /// same `QPDFWriter::unparseObject` dictionary branch,
     /// `QPDFWriter.cc:1346-1527`; the `f_stream`/`f_filtered` handling at
     /// `:1440-1455` and the `/Length`-then-`/Filter` tail at `:1508-1524`
@@ -1384,10 +1390,10 @@ impl ObjectWriterEmission for ObjectHandle {
     /// surviving key at `indent + 2` with a trailing `\n`, closing `>>` at
     /// `indent`), with `/Length` pulled out of the iteration and written
     /// last, immediately before `>>` -- plus the same null-suppression
-    /// rule as the QDF object writer and [`Self::write_stream_body`],
+    /// rule as the QDF object writer and [`Self::unparse_stream_body`],
     /// via the same [`visible_dict_entries`] helper.
     ///
-    /// Unlike [`Self::write_stream_body`], this primitive has **no
+    /// Unlike [`Self::unparse_stream_body`], this primitive has **no
     /// `refiltered` parameter** -- matching `Dictionary::write_pdf_stream_qdf`'s
     /// own signature exactly, which has none either. This is not fixed by
     /// the caller already holding a settled `/Filter`/`/Length`: unlike a
@@ -1406,7 +1412,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// simplified) shape, the same convention every other primitive in
     /// this family follows for the legacy function it ports.
     ///
-    /// `self` accepts the same two shapes [`Self::write_stream_body`]
+    /// `self` accepts the same two shapes [`Self::unparse_stream_body`]
     /// does -- a `Dictionary` directly, or a `Stream { stream_dict, .. }`
     /// whose (possibly still-unresolved) `stream_dict` is forced to
     /// resolve -- with the identical error-propagation behavior for every
@@ -1416,7 +1422,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// exactly except for the QDF layout and the missing `refiltered`
     /// parameter.
     #[cfg(test)]
-    fn write_stream_body_qdf(&self, out: &mut OutputSink<'_>, indent: usize) -> Result<()> {
+    fn unparse_stream_body_qdf(&self, out: &mut OutputSink<'_>, indent: usize) -> Result<()> {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
         }
@@ -1425,7 +1431,7 @@ impl ObjectWriterEmission for ObjectHandle {
     }
 
     #[cfg(test)]
-    fn write_stream_body_qdf_with_ref_map_and_removed_and_length(
+    fn unparse_stream_body_qdf_with_ref_map_and_removed_and_length(
         &self,
         out: &mut OutputSink<'_>,
         indent: usize,
@@ -1433,7 +1439,7 @@ impl ObjectWriterEmission for ObjectHandle {
         removed_refs: &BTreeSet<ObjectRef>,
         length_ref: Option<ObjectRef>,
     ) -> Result<()> {
-        self.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+        self.unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
             out,
             indent,
             map,
@@ -1449,7 +1455,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// qpdf writes a fresh holder immediately after the stream body. Keeping
     /// that override at the serializer boundary avoids manufacturing a fake
     /// source handle for an output-only object number.
-    fn write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+    fn unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
         &self,
         out: &mut OutputSink<'_>,
         indent: usize,
@@ -1475,7 +1481,7 @@ impl ObjectWriterEmission for ObjectHandle {
         )
     }
 
-    fn write_stream_body_qdf_with_qpdf_obj_gen_map_and_removed_and_length_with_options(
+    fn unparse_stream_body_qdf_with_qpdf_obj_gen_map_and_removed_and_length_with_options(
         &self,
         out: &mut OutputSink<'_>,
         indent: usize,
@@ -1500,7 +1506,7 @@ impl ObjectWriterEmission for ObjectHandle {
     }
 
     #[cfg(test)]
-    fn write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer<F>(
+    fn unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         indent: usize,
@@ -1512,7 +1518,7 @@ impl ObjectWriterEmission for ObjectHandle {
     where
         F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
     {
-        self.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options(
+        self.unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options(
             out,
             indent,
             map,
@@ -1526,7 +1532,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// QDF stream-dictionary emission that combines output-reference
     /// remapping, removed-reference null visibility, and encrypted string
     /// serialization.
-    fn write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options<
+    fn unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options<
         F,
     >(
         &self,
@@ -1559,7 +1565,7 @@ impl ObjectWriterEmission for ObjectHandle {
         )
     }
 
-    fn write_stream_body_qdf_with_qpdf_obj_gen_map_and_removed_and_length_with_string_writer_with_options<
+    fn unparse_stream_body_qdf_with_qpdf_obj_gen_map_and_removed_and_length_with_string_writer_with_options<
         F,
     >(
         &self,
@@ -1591,10 +1597,10 @@ impl ObjectWriterEmission for ObjectHandle {
     }
 
     /// QDF-mode stream-dictionary counterpart of
-    /// [`Self::write_stream_body_with_string_writer`], including its
+    /// [`Self::unparse_stream_body_with_string_writer`], including its
     /// cleartext hexadecimal signature `/Contents` exception.
     #[cfg(test)]
-    fn write_stream_body_qdf_with_string_writer<F>(
+    fn unparse_stream_body_qdf_with_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         indent: usize,
@@ -1632,14 +1638,14 @@ impl ObjectWriterEmission for ObjectHandle {
     }
 
     #[cfg(test)]
-    fn write_stream_body_with_ref_map_and_removed(
+    fn unparse_stream_body_with_ref_map_and_removed(
         &self,
         out: &mut OutputSink<'_>,
         refiltered: bool,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()> {
-        self.write_stream_body_with_ref_map_and_removed_with_options(
+        self.unparse_stream_body_with_ref_map_and_removed_with_options(
             out,
             StreamDictionaryOptions::from_refiltered(refiltered),
             map,
@@ -1649,7 +1655,7 @@ impl ObjectWriterEmission for ObjectHandle {
 
     /// Stream-dictionary writer emission with output reference remapping and
     /// qpdf null visibility for references removed during this write.
-    fn write_stream_body_with_ref_map_and_removed_with_options(
+    fn unparse_stream_body_with_ref_map_and_removed_with_options(
         &self,
         out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
@@ -1665,7 +1671,7 @@ impl ObjectWriterEmission for ObjectHandle {
         unparse_stream_dict_entries_with_ref_map(&entries, options, out, &map, &removed_refs)
     }
 
-    fn write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options(
+    fn unparse_stream_body_with_qpdf_obj_gen_map_and_removed_with_options(
         &self,
         out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
@@ -1679,7 +1685,7 @@ impl ObjectWriterEmission for ObjectHandle {
         unparse_stream_dict_entries_with_ref_map(&entries, options, out, map, removed_refs)
     }
 
-    fn write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
+    fn unparse_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
         &self,
         out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
@@ -1715,7 +1721,7 @@ impl ObjectWriterEmission for ObjectHandle {
     }
 
     #[cfg(test)]
-    fn write_stream_body_with_ref_map_and_removed_and_length(
+    fn unparse_stream_body_with_ref_map_and_removed_and_length(
         &self,
         out: &mut OutputSink<'_>,
         refiltered: bool,
@@ -1723,7 +1729,7 @@ impl ObjectWriterEmission for ObjectHandle {
         removed_refs: &BTreeSet<ObjectRef>,
         length: usize,
     ) -> Result<()> {
-        self.write_stream_body_with_ref_map_and_removed_and_length_with_options(
+        self.unparse_stream_body_with_ref_map_and_removed_and_length_with_options(
             out,
             StreamDictionaryOptions::from_refiltered(refiltered),
             map,
@@ -1733,7 +1739,7 @@ impl ObjectWriterEmission for ObjectHandle {
     }
 
     #[cfg(test)]
-    fn write_stream_body_with_ref_map_and_removed_and_length_with_options(
+    fn unparse_stream_body_with_ref_map_and_removed_and_length_with_options(
         &self,
         out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
@@ -1758,7 +1764,7 @@ impl ObjectWriterEmission for ObjectHandle {
     }
 
     #[cfg(test)]
-    fn write_stream_body_with_ref_map_and_removed_with_string_writer<F>(
+    fn unparse_stream_body_with_ref_map_and_removed_with_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         refiltered: bool,
@@ -1769,7 +1775,7 @@ impl ObjectWriterEmission for ObjectHandle {
     where
         F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
     {
-        self.write_stream_body_with_ref_map_and_removed_with_options_and_string_writer(
+        self.unparse_stream_body_with_ref_map_and_removed_with_options_and_string_writer(
             out,
             StreamDictionaryOptions::from_refiltered(refiltered),
             map,
@@ -1780,7 +1786,7 @@ impl ObjectWriterEmission for ObjectHandle {
 
     /// Compact stream-dictionary emission with output-reference remapping,
     /// removed-reference null visibility, and encrypted string serialization.
-    fn write_stream_body_with_ref_map_and_removed_with_options_and_string_writer<F>(
+    fn unparse_stream_body_with_ref_map_and_removed_with_options_and_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
@@ -1807,7 +1813,7 @@ impl ObjectWriterEmission for ObjectHandle {
         )
     }
 
-    fn write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_string_writer<F>(
+    fn unparse_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
@@ -1842,7 +1848,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// `unparseObject` or this primitive at all), an unconditional
     /// per-key loop with no `isNull` suppression (`:1174-1192` has no
     /// such check, unlike `unparseObject`'s dictionary branch that
-    /// [`Self::write_object`]/[`Self::write_stream_body`] all apply through
+    /// [`Self::unparse_object`]/[`Self::unparse_stream_body`] all apply through
     /// `visible_dict_entries`), `/ID` and `/Encrypt` excluded from that
     /// loop and forced last in that order when present, and the closing
     /// `>>` (`:1235`, written unconditionally in both `xref_stream`
@@ -1895,8 +1901,8 @@ impl ObjectWriterEmission for ObjectHandle {
     ///
     /// `self` must resolve to a `Dictionary`; a non-dictionary value
     /// (including `self` itself, forced via `try_dereference`, the same
-    /// top-level-entry-point pattern [`Self::write_object`]/
-    /// [`Self::write_stream_body`] already use) degrades to an empty
+    /// top-level-entry-point pattern [`Self::unparse_object`]/
+    /// [`Self::unparse_stream_body`] already use) degrades to an empty
     /// trailer shell, mirroring `write_pdf_stream`/`write_pdf_trailer`'s
     /// own typed-input assumption.
     ///
@@ -2321,7 +2327,7 @@ fn dictionary_entry_handle(dictionary: &ObjectHandle, key: &[u8]) -> Option<Obje
     })
 }
 
-// Writes a stream dictionary's own body -- `write_stream_body`'s sole
+// Writes a stream dictionary's own body -- `unparse_stream_body`'s sole
 // callee -- matching `Dictionary::write_pdf_stream`'s established shape
 // (`object.rs`) with `visible_dict_entries`'s null-suppression layered on
 // top, the same delegation `unparse_dict_entries` above makes to that
@@ -2387,7 +2393,7 @@ fn unparse_stream_dict_entries(
 }
 
 // QDF-mode sibling of `unparse_stream_dict_entries` above --
-// `write_stream_body_qdf`'s sole callee -- matching
+// `unparse_stream_body_qdf`'s sole callee -- matching
 // `Dictionary::write_pdf_stream_qdf`'s established shape (`object.rs`)
 // with `visible_dict_entries`'s null-suppression layered on top, the same
 // delegation `unparse_dict_entries_qdf` makes to that helper for the
@@ -2395,7 +2401,7 @@ fn unparse_stream_dict_entries(
 // the single suppressed-entries pass and written last, at `indent + 2`,
 // immediately before the closing `>>` at `indent` -- no `refiltered`
 // dimension exists here, matching `write_pdf_stream_qdf`'s own signature
-// (see `write_stream_body_qdf`'s own doc for why). Verified byte-for-byte
+// (see `unparse_stream_body_qdf`'s own doc for why). Verified byte-for-byte
 // against `write_pdf_stream_qdf` (`object.rs`) before this primitive's
 // tests were written. Applies the same `/Contents`-in-a-`/Sig`-dictionary
 // hex-string special case `unparse_stream_dict_entries` applies, for the
@@ -3040,12 +3046,12 @@ fn root_output_copy_with_adbe(
 }
 
 // The sole recursion hub for the plain unparse family (`ObjectHandle::
-// write_object` and its callees below), mirroring the unparse walk's
+// unparse_object` and its callees below), mirroring the unparse walk's
 // own single-hub pattern above for the same stack-growth reason: an
 // `ObjectHandle` tree built through public factories carries no depth bound
 // the parser enforces on parsed input. Also forces resolution of `handle`
 // itself before inspecting its value: every call into this hub either comes
-// from `write_object`'s top-level entry point (whose argument may still be
+// from `unparse_object`'s top-level entry point (whose argument may still be
 // an unresolved indirect handle) or from a direct child that `write_child`
 // has already filtered past its own indirect check (so `handle` here is
 // always already direct in that case, making the call a no-op) — mirroring
@@ -3198,7 +3204,7 @@ fn unparse_container(container: UnparseContainer, out: &mut OutputSink<'_>) -> R
         UnparseContainer::Dictionary(entries) => unparse_dict_entries(&entries, out)?,
         UnparseContainer::Stream(stream_dict) => {
             // This primitive inlines only a stream's dictionary; stream
-            // framing remains `write_stream_body`'s responsibility.
+            // framing remains `unparse_stream_body`'s responsibility.
             unparse_object_walk(&stream_dict, out)?;
         }
     }
@@ -3285,10 +3291,10 @@ pub(crate) fn unparse_object_value(value: &ObjectValue, out: &mut OutputSink<'_>
             // Reachable two ways, not just one: a *direct* Stream value (no
             // qpdf counterpart -- a real QPDFObjectHandle's resolved value
             // is never itself a stream outside an indirect object), and an
-            // *indirect* `self` at the top level of `write_object` that
+            // *indirect* `self` at the top level of `unparse_object` that
             // resolves to a stream (a real, reachable qpdf shape -- see
-            // `ObjectHandle::write_object`'s own doc). The latter is
-            // reachable here because `write_object`/`unparse_object_walk`
+            // `ObjectHandle::unparse_object`'s own doc). The latter is
+            // reachable here because `unparse_object`/`unparse_object_walk`
             // call this dispatch directly on `self`, bypassing `write_child`
             // entirely; `write_child` only gates *child* positions (array
             // elements, dictionary values) during recursion, where it never
@@ -3300,7 +3306,7 @@ pub(crate) fn unparse_object_value(value: &ObjectValue, out: &mut OutputSink<'_>
             // Either way, this arm inlines only the dictionary, deliberately
             // not the `stream`/`endstream` framing: that framing (and the
             // `/Length`-last, optionally re-filtered stream-dictionary
-            // layout it wraps) is `write_stream_body`'s own, separately
+            // layout it wraps) is `unparse_stream_body`'s own, separately
             // scoped responsibility -- this generic dispatch does not
             // implement qpdf's real
             // stream-writing path for the indirect case either.
@@ -3667,7 +3673,7 @@ impl DynamicDirectStreamWriter for DefaultDynamicDirectStreamWriter {
 /// live reference discovery and stream framing on the writer-owned boundary
 /// without rebuilding the complete PDF in a `Vec`.
 #[allow(clippy::type_complexity)]
-pub(crate) fn write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer<F>(
+pub(crate) fn unparse_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer<F>(
     handle: &ObjectHandle,
     out: &mut OutputSink<'_>,
     map: &mut DynamicObjectRefMap<'_>,
@@ -3689,7 +3695,9 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn write_root_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer<F>(
+pub(crate) fn unparse_root_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer<
+    F,
+>(
     source: &ObjectHandle,
     out: &mut OutputSink<'_>,
     map: &mut DynamicObjectRefMap<'_>,
@@ -3709,7 +3717,7 @@ where
         final_extension_level,
         apply_adbe_reconciliation,
     )?; // cov:ignore: the root-copy success continuation is covered by the direct-root writer differential.
-    write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+    unparse_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
         &root,
         out,
         map,
@@ -3722,7 +3730,7 @@ where
 /// Plain live-root serializer used by xref output when the source trailer has
 /// a direct Catalog. It retains the compact trailer/root layout while routing
 /// nested direct streams through the same writer-owned framing hook.
-pub(crate) fn write_object_with_ref_map_and_direct_streams(
+pub(crate) fn unparse_object_with_ref_map_and_direct_streams(
     handle: &ObjectHandle,
     out: &mut OutputSink<'_>,
     map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
@@ -3741,7 +3749,7 @@ pub(crate) fn write_object_with_ref_map_and_direct_streams(
         newline_before_endstream: Some(crate::writer::NewlineBeforeEndstream::Never),
         qdf_mode: qdf,
     };
-    write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+    unparse_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
         handle,
         out,
         &mut dynamic_map,
@@ -4315,7 +4323,7 @@ pub(crate) fn dict_is_sig_with_byte_range(entries: &[(Vec<u8>, ObjectHandle)]) -
 // encryption state to route around in the first place here; wiring an
 // actual encryption pipeline around these bytes is a future
 // consumer-migration/encryption-integration concern this primitive does not
-// implement, matching the scope limits `write_stream_body`/
+// implement, matching the scope limits `unparse_stream_body`/
 // `write_trailer` already document for their own out-of-scope qpdf steps
 // (e.g. the `t_lin_second` branch, the `/Crypt`-filter stripping logic).
 fn try_write_sig_contents_hex_string(
@@ -4529,10 +4537,10 @@ fn unparse_object_value_qdf(
         ObjectValue::Stream(stream) => {
             // Same reachability and "inlines only the dictionary" caveat as
             // `unparse_object_value`'s own `Stream` arm (see its doc) --
-            // but note that arm's doc names `write_stream_body` (the
+            // but note that arm's doc names `unparse_stream_body` (the
             // *compact* primitive) as the dedicated responsible primitive
             // for its own caveat; for *this* QDF arm the dedicated
-            // primitive is `write_stream_body_qdf` instead, not that one
+            // primitive is `unparse_stream_body_qdf` instead, not that one
             // (it has no `indent` parameter and only ever produces the
             // compact single-line form). This recurses into the stream's
             // dictionary handle at the *same* `indent`, not `indent + 2` --
@@ -4727,7 +4735,7 @@ fn unparse_dictionary_qdf_with_ref_map(
 /// the QDF counterpart of the dynamic compact writer above: it keeps container
 /// edges live, preserves dictionary null suppression, and avoids a detached
 /// edge snapshot or a separate pre-walk of the member value.
-pub(crate) fn write_object_qdf_with_dynamic_ref_map(
+pub(crate) fn unparse_object_qdf_with_dynamic_ref_map(
     handle: &ObjectHandle,
     indent: usize,
     out: &mut OutputSink<'_>,
@@ -5856,7 +5864,7 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
             if qdf {
                 write_child_qdf_with_ref_map(value, 2, out, &qpdf_map, &qpdf_removed_refs)?;
             } else if let Some(direct_root) = direct_root {
-                write_object_with_ref_map_and_direct_streams(
+                unparse_object_with_ref_map_and_direct_streams(
                     direct_root,
                     out,
                     map,
@@ -6275,7 +6283,7 @@ mod tests {
         let mut map = |_: &ObjectHandle| Ok::<ObjectRef, Error>(ObjectRef::new(9, 0));
         let mut output = Vec::new();
         super::super::output::with_buffer_sink(&mut output, |out| {
-            write_object_qdf_with_dynamic_ref_map(&stream, 0, out, &mut map, &removed_refs)
+            unparse_object_qdf_with_dynamic_ref_map(&stream, 0, out, &mut map, &removed_refs)
         })?;
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains("/Keep"));
@@ -6287,7 +6295,7 @@ mod tests {
         let mut scalar_output = Vec::new();
         let mut scalar_map = |_: &ObjectHandle| Ok::<ObjectRef, Error>(ObjectRef::new(1, 0));
         super::super::output::with_buffer_sink(&mut scalar_output, |out| {
-            write_object_qdf_with_dynamic_ref_map(
+            unparse_object_qdf_with_dynamic_ref_map(
                 &ObjectHandle::integer(3),
                 0,
                 out,
@@ -6340,7 +6348,7 @@ mod tests {
         let mut output = Vec::new();
 
         super::super::output::with_buffer_sink(&mut output, |out| {
-            ObjectWriterEmission::write_object_with_qpdf_obj_gen_map_and_removed(
+            ObjectWriterEmission::unparse_object_with_qpdf_obj_gen_map_and_removed(
                 &value,
                 out,
                 &|object_gen| {
@@ -6359,7 +6367,7 @@ mod tests {
     fn compact_stream_ref_map_rejects_a_reserved_object() {
         let reserved = ObjectHandle::new_reserved_direct();
         let error = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
-            ObjectWriterEmission::write_stream_body_with_ref_map_and_removed_with_options(
+            ObjectWriterEmission::unparse_stream_body_with_ref_map_and_removed_with_options(
                 &reserved,
                 out,
                 StreamDictionaryOptions::preserve(),
@@ -6424,7 +6432,7 @@ mod tests {
         let map = |object_ref: ObjectRef| Ok(object_ref);
 
         super::super::output::with_buffer_sink(&mut output, |out| {
-            stream.write_stream_body_with_ref_map_and_removed_and_length(
+            stream.unparse_stream_body_with_ref_map_and_removed_and_length(
                 out, false, &map, &removed, 3,
             )
         })?; // cov:ignore: LLVM attributes this successful stream-emission continuation to the test call cleanup.
@@ -6435,7 +6443,7 @@ mod tests {
             ObjectHandle::dictionary(vec![(b"/Keep".to_vec(), ObjectHandle::integer(1))]);
         let mut dictionary_output = Vec::new();
         super::super::output::with_buffer_sink(&mut dictionary_output, |out| {
-            dictionary.write_stream_body_with_ref_map_and_removed_and_length(
+            dictionary.unparse_stream_body_with_ref_map_and_removed_and_length(
                 out, false, &map, &removed, 2,
             )
         })?; // cov:ignore: LLVM attributes this successful dictionary-emission continuation to the test call cleanup.
@@ -6444,7 +6452,7 @@ mod tests {
         let scalar = ObjectHandle::integer(1);
         let mut scalar_output = Vec::new();
         super::super::output::with_buffer_sink(&mut scalar_output, |out| {
-            scalar.write_stream_body_with_ref_map_and_removed_and_length(
+            scalar.unparse_stream_body_with_ref_map_and_removed_and_length(
                 out, false, &map, &removed, 1,
             )
         })?; // cov:ignore: LLVM attributes this successful scalar-emission continuation to the test call cleanup.
@@ -6454,7 +6462,7 @@ mod tests {
             ObjectHandle::stream(ObjectHandle::integer(1), Rc::new(b"x".to_vec()));
         let mut malformed_output = Vec::new();
         super::super::output::with_buffer_sink(&mut malformed_output, |out| {
-            malformed_stream.write_stream_body_with_ref_map_and_removed_and_length(
+            malformed_stream.unparse_stream_body_with_ref_map_and_removed_and_length(
                 out, false, &map, &removed, 1,
             )
         })?; // cov:ignore: LLVM attributes this successful malformed-stream fallback continuation to test cleanup.
@@ -6463,7 +6471,7 @@ mod tests {
         let reserved = ObjectHandle::new_reserved_direct();
         // cov:ignore-start: reserved validation returns before invoking this callback.
         let error = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
-            reserved.write_stream_body_with_ref_map_and_removed_and_length(
+            reserved.unparse_stream_body_with_ref_map_and_removed_and_length(
                 out, false, &map, &removed, 0,
             )
         })
@@ -6489,7 +6497,7 @@ mod tests {
         };
         let mut output = Vec::new();
         super::super::output::with_buffer_sink(&mut output, |out| {
-            ObjectWriterEmission::write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
+            ObjectWriterEmission::unparse_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
                 &dictionary,
                 out,
                 StreamDictionaryOptions::preserve(),
@@ -6504,7 +6512,7 @@ mod tests {
         assert!(dictionary_entry_handle(&scalar, b"/Missing").is_none());
         let mut scalar_output = Vec::new();
         super::super::output::with_buffer_sink(&mut scalar_output, |out| {
-            ObjectWriterEmission::write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
+            ObjectWriterEmission::unparse_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
                 &scalar,
                 out,
                 StreamDictionaryOptions::preserve(),
@@ -6528,7 +6536,7 @@ mod tests {
         ]);
         let mut signature_output = Vec::new();
         super::super::output::with_buffer_sink(&mut signature_output, |out| {
-            ObjectWriterEmission::write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
+            ObjectWriterEmission::unparse_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
                 &signature,
                 out,
                 StreamDictionaryOptions::preserve(),
@@ -6552,7 +6560,7 @@ mod tests {
         ]);
         let mut non_string_signature_output = Vec::new();
         super::super::output::with_buffer_sink(&mut non_string_signature_output, |out| {
-            ObjectWriterEmission::write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
+            ObjectWriterEmission::unparse_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
                 &non_string_signature,
                 out,
                 StreamDictionaryOptions::preserve(),
@@ -6568,7 +6576,7 @@ mod tests {
 
         let reserved = ObjectHandle::new_reserved_direct();
         let reserved_error = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
-            ObjectWriterEmission::write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
+            ObjectWriterEmission::unparse_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
                 &reserved,
                 out,
                 StreamDictionaryOptions::preserve(),
@@ -6605,7 +6613,7 @@ mod tests {
         };
         let mut output = Vec::new();
         super::super::output::with_buffer_sink(&mut output, |out| {
-            ObjectWriterEmission::write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
+            ObjectWriterEmission::unparse_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
                 &dictionary,
                 out,
                 StreamDictionaryOptions::preserve(),
@@ -6635,7 +6643,7 @@ mod tests {
         )?; // cov:ignore: test setup mutation has no independent branch
         let map = |object_ref: ObjectRef| Ok(object_ref);
         let missing_decode_error = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
-            stream.write_stream_body_with_ref_map_and_removed_with_options(
+            stream.unparse_stream_body_with_ref_map_and_removed_with_options(
                 out,
                 StreamDictionaryOptions::preserve(),
                 &map,
@@ -6653,7 +6661,7 @@ mod tests {
             .replace_key(b"/DecodeParms", ObjectHandle::array(Vec::new()))?;
         let mut compact = Vec::new();
         super::super::output::with_buffer_sink(&mut compact, |out| {
-            stream.write_stream_body_with_ref_map_and_removed_with_options(
+            stream.unparse_stream_body_with_ref_map_and_removed_with_options(
                 out,
                 StreamDictionaryOptions::preserve(),
                 &map,
@@ -6665,7 +6673,7 @@ mod tests {
         let policy = StreamDictionaryOptions::new(true, true);
         let mut qdf = Vec::new();
         super::super::output::with_buffer_sink(&mut qdf, |out| {
-            stream.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+            stream.unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
                 out,
                 0,
                 &map,
@@ -6683,7 +6691,7 @@ mod tests {
         let mut callback = |out: &mut OutputSink<'_>, value: &[u8]| out.write_bytes(value);
         // cov:ignore-end
         super::super::output::with_buffer_sink(&mut qdf_string, |out| {
-            stream.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options(
+            stream.unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options(
                 out,
                 0,
                 &map,
@@ -6721,7 +6729,7 @@ mod tests {
         let mut output = Vec::new();
         let removed = [removed_child.object_ref().unwrap()].into_iter().collect();
         super::super::output::with_buffer_sink(&mut output, |out| {
-            array.write_object_with_dynamic_ref_map(out, &mut map, &removed)
+            array.unparse_object_with_dynamic_ref_map(out, &mut map, &removed)
         })?;
         assert_eq!(mapped, vec![child.object_ref().unwrap()]);
         assert!(String::from_utf8_lossy(&output).contains(&child.object_ref().unwrap().to_string()));
@@ -6743,7 +6751,7 @@ mod tests {
             qdf_mode: false,
         };
         super::super::output::with_buffer_sink(&mut string_output, |out| {
-            write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+            unparse_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
                 &array,
                 out,
                 &mut string_map,
@@ -6757,7 +6765,7 @@ mod tests {
         let reserved = ObjectHandle::new_reserved_direct();
         // cov:ignore-start: reserved validation returns before invoking this callback.
         let error = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
-            reserved.write_object_with_dynamic_ref_map(
+            reserved.unparse_object_with_dynamic_ref_map(
                 out,
                 &mut |_| Ok(ObjectRef::new(1, 0)),
                 &BTreeSet::new(),
@@ -6775,7 +6783,7 @@ mod tests {
         let mut dictionary_map =
             |handle: &ObjectHandle| Ok(handle.object_ref().expect("dictionary child is indirect"));
         super::super::output::with_buffer_sink(&mut dictionary_output, |out| {
-            dictionary.write_object_with_dynamic_ref_map(out, &mut dictionary_map, &removed)
+            dictionary.unparse_object_with_dynamic_ref_map(out, &mut dictionary_map, &removed)
         })?; // cov:ignore: LLVM attributes this dictionary-call terminator to callback cleanup.
         let dictionary_text = String::from_utf8_lossy(&dictionary_output);
         assert!(dictionary_text.contains("/Mapped"));
@@ -6783,7 +6791,7 @@ mod tests {
 
         let mut string_dictionary_output = Vec::new();
         super::super::output::with_buffer_sink(&mut string_dictionary_output, |out| {
-            write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+            unparse_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
                 &dictionary,
                 out,
                 &mut string_map,
@@ -6807,7 +6815,11 @@ mod tests {
         let mut stream_object_map =
             |handle: &ObjectHandle| Ok(handle.object_ref().expect("stream child is indirect"));
         super::super::output::with_buffer_sink(&mut stream_object_output, |out| {
-            stream.write_object_with_dynamic_ref_map(out, &mut stream_object_map, &BTreeSet::new())
+            stream.unparse_object_with_dynamic_ref_map(
+                out,
+                &mut stream_object_map,
+                &BTreeSet::new(),
+            )
         })?; // cov:ignore: LLVM attributes this stream-call terminator to callback cleanup.
         assert!(String::from_utf8_lossy(&stream_object_output).contains("/Child"));
 
@@ -6836,7 +6848,7 @@ mod tests {
             stream
                 .as_stream_dict()
                 .unwrap()
-                .write_stream_body_with_dynamic_ref_map(
+                .unparse_stream_body_with_dynamic_ref_map(
                     out,
                     StreamDictionaryOptions::new(false, true),
                     &mut stream_map,
@@ -6856,7 +6868,7 @@ mod tests {
             stream
                 .as_stream_dict()
                 .unwrap()
-                .write_stream_body_with_dynamic_ref_map_and_string_writer(
+                .unparse_stream_body_with_dynamic_ref_map_and_string_writer(
                     out,
                     StreamDictionaryOptions::new(false, true),
                     &mut dynamic_string_map,
@@ -6912,7 +6924,7 @@ mod tests {
                 qdf_mode,
             };
             super::super::output::with_buffer_sink(&mut output, |out| {
-                write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+                unparse_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
                     &value,
                     out,
                     &mut map,
@@ -6943,7 +6955,7 @@ mod tests {
 
         let mut compact = Vec::new();
         super::super::output::with_buffer_sink(&mut compact, |out| {
-            ObjectWriterEmission::write_object(&array, out)
+            ObjectWriterEmission::unparse_object(&array, out)
         })?;
         assert!(String::from_utf8_lossy(&compact).contains("[ 7"));
 
@@ -6953,7 +6965,7 @@ mod tests {
         };
         let mut mapped = Vec::new();
         super::super::output::with_buffer_sink(&mut mapped, |out| {
-            ObjectWriterEmission::write_object_with_ref_map_and_removed(
+            ObjectWriterEmission::unparse_object_with_ref_map_and_removed(
                 &array,
                 out,
                 &map,
@@ -6964,7 +6976,7 @@ mod tests {
 
         let mut qdf = Vec::new();
         super::super::output::with_buffer_sink(&mut qdf, |out| {
-            array.write_object_qdf_with_ref_map_and_removed(out, 2, &map, &removed_refs)
+            array.unparse_object_qdf_with_ref_map_and_removed(out, 2, &map, &removed_refs)
         })?;
         assert_eq!(qdf, b"[\n    7\n    21 0 R\n    null\n  ]");
 
@@ -6977,7 +6989,7 @@ mod tests {
             ObjectHandle::array(vec![ObjectHandle::string(b"value".to_vec()), removed]);
         let mut qdf_strings = Vec::new();
         super::super::output::with_buffer_sink(&mut qdf_strings, |out| {
-            string_array.write_object_qdf_with_ref_map_and_removed_with_string_writer(
+            string_array.unparse_object_qdf_with_ref_map_and_removed_with_string_writer(
                 out,
                 0,
                 &map,
@@ -6995,7 +7007,7 @@ mod tests {
             out.write_bytes(b">")
         };
         super::super::output::with_buffer_sink(&mut plain_qdf_strings, |out| {
-            ObjectWriterEmission::write_object_qdf_with_string_writer(
+            ObjectWriterEmission::unparse_object_qdf_with_string_writer(
                 &string_array,
                 out,
                 0,
@@ -7024,7 +7036,7 @@ mod tests {
         let mut output = Vec::new();
 
         super::super::output::with_buffer_sink(&mut output, |out| {
-            array.write_object_with_ref_map_and_removed_with_string_writer(
+            array.unparse_object_with_ref_map_and_removed_with_string_writer(
                 out,
                 &|object_ref| {
                     assert_eq!(object_ref, kept_ref);
@@ -7059,7 +7071,7 @@ mod tests {
         };
 
         super::super::output::with_buffer_sink(&mut output, |out| {
-            signature.write_object_qdf_with_ref_map_and_removed_with_string_writer(
+            signature.unparse_object_qdf_with_ref_map_and_removed_with_string_writer(
                 out,
                 0,
                 &|object_ref| Ok(object_ref),
@@ -7095,7 +7107,7 @@ mod tests {
         };
 
         super::super::output::with_buffer_sink(&mut output, |out| {
-            write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+            unparse_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
                 &signature,
                 out,
                 &mut map,
@@ -7122,7 +7134,7 @@ mod tests {
             qdf_mode: false,
         };
         super::super::output::with_buffer_sink(&mut fallback_output, |out| {
-            write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+            unparse_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
                 &non_string_contents,
                 out,
                 &mut fallback_map,
@@ -7159,7 +7171,7 @@ mod tests {
         };
         // cov:ignore-end
         let error = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
-            reserved.write_object_with_ref_map_and_removed_with_string_writer(
+            reserved.unparse_object_with_ref_map_and_removed_with_string_writer(
                 out,
                 &|object_ref| Ok(object_ref), // cov:ignore: reserved validation returns before invoking this test callback.
                 &BTreeSet::new(),
@@ -7345,7 +7357,7 @@ mod tests {
         let cycle = reciprocal_direct_dictionary_cycle()?;
 
         let plain = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
-            ObjectWriterEmission::write_object(&cycle, out)
+            ObjectWriterEmission::unparse_object(&cycle, out)
         })
         .expect_err("a direct cycle must not be walked by the plain hub");
         assert!(
@@ -7360,7 +7372,7 @@ mod tests {
         );
 
         let qdf = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
-            ObjectWriterEmission::write_object_qdf(&cycle, out, 0)
+            ObjectWriterEmission::unparse_object_qdf(&cycle, out, 0)
         })
         .expect_err("a direct cycle must not be walked by the qdf hub");
         assert!(matches!(qdf, Error::Unsupported(_)));
@@ -7372,7 +7384,7 @@ mod tests {
 
         let mut map = |_: &ObjectHandle| Ok(ObjectRef::new(1, 0));
         let dynamic = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
-            cycle.write_object_with_dynamic_ref_map(out, &mut map, &BTreeSet::new())
+            cycle.unparse_object_with_dynamic_ref_map(out, &mut map, &BTreeSet::new())
         })
         .expect_err("a direct cycle must not be walked by the dynamic ref-map hub");
         assert!(matches!(dynamic, Error::Unsupported(_)));
@@ -7391,7 +7403,7 @@ mod tests {
             -1,
         )]);
         super::super::output::with_buffer_sink(&mut mapped, |out| {
-            indirect_child.write_object_with_dynamic_ref_map(out, &mut map, &BTreeSet::new())
+            indirect_child.unparse_object_with_dynamic_ref_map(out, &mut map, &BTreeSet::new())
         })?;
         assert_eq!(mapped, b"[ 1 0 R ]");
 
@@ -7402,7 +7414,7 @@ mod tests {
         let mut output = Vec::new();
         let deep = nested_direct_dictionaries(crate::parser::MAX_PARSE_DEPTH + 1);
         super::super::output::with_buffer_sink(&mut output, |out| {
-            ObjectWriterEmission::write_object(&deep, out)
+            ObjectWriterEmission::unparse_object(&deep, out)
         })?;
         assert_eq!(
             String::from_utf8_lossy(&output).matches("/K").count(),
@@ -7418,7 +7430,7 @@ mod tests {
         let mut output = Vec::new();
         let within_bound = nested_direct_dictionaries(bound + 1);
         super::super::output::with_buffer_sink(&mut output, |out| {
-            ObjectWriterEmission::write_object(&within_bound, out)
+            ObjectWriterEmission::unparse_object(&within_bound, out)
         })?;
         assert_eq!(
             String::from_utf8_lossy(&output).matches("/K").count(),
@@ -7428,7 +7440,7 @@ mod tests {
 
         let past_bound = nested_direct_dictionaries(bound + 2);
         let error = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
-            ObjectWriterEmission::write_object(&past_bound, out)
+            ObjectWriterEmission::unparse_object(&past_bound, out)
         })
         .expect_err("nesting past the bound must be reported");
         assert!(matches!(error, Error::Unsupported(_)));

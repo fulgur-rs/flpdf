@@ -476,7 +476,7 @@ fn append_objstm_container_object<R: Read + Seek>(
         &members,
         &mut |out, _member_index, _object_ref, handle| {
             crate::writer::output::with_buffer_sink(out, |out| {
-                handle.write_object_with_qpdf_obj_gen_map_and_removed(out, &map, removed_refs)
+                handle.unparse_object_with_qpdf_obj_gen_map_and_removed(out, &map, removed_refs)
             })
         },
     )?;
@@ -514,17 +514,17 @@ fn append_objstm_container_object<R: Read + Seek>(
     let offset = out.position_usize()?;
     write_indirect_object_header(out, ObjectRef::new(container.container_new_num, 0))?;
     out.write_bytes(b"<< /Type ")?;
-    stream_dict.try_get_key(b"/Type")?.write_object(out)?;
+    stream_dict.try_get_key(b"/Type")?.unparse_object(out)?;
     out.write_bytes(b" /Length ")?;
-    stream_dict.try_get_key(b"/Length")?.write_object(out)?;
+    stream_dict.try_get_key(b"/Length")?.unparse_object(out)?;
     if filtered {
         out.write_bytes(b" /Filter ")?;
-        stream_dict.try_get_key(b"/Filter")?.write_object(out)?;
+        stream_dict.try_get_key(b"/Filter")?.unparse_object(out)?;
     }
     out.write_bytes(b" /N ")?;
-    stream_dict.try_get_key(b"/N")?.write_object(out)?;
+    stream_dict.try_get_key(b"/N")?.unparse_object(out)?;
     out.write_bytes(b" /First ")?;
-    stream_dict.try_get_key(b"/First")?.write_object(out)?;
+    stream_dict.try_get_key(b"/First")?.unparse_object(out)?;
     if let Some(extends) = extends {
         out.write_bytes(b" /Extends ")?;
         write_object_ref(out, extends)?;
@@ -831,7 +831,7 @@ impl WriteObject for LinearizedObjectEmitter<'_, '_> {
                     removed_refs,
                 ), // cov:ignore: canonical handle emission only errors for an invalid source graph.
                 None => {
-                    object.write_object_with_qpdf_obj_gen_map_and_removed(out, &map, removed_refs)
+                    object.unparse_object_with_qpdf_obj_gen_map_and_removed(out, &map, removed_refs)
                 }
             };
         }
@@ -886,7 +886,7 @@ impl WriteObject for LinearizedObjectEmitter<'_, '_> {
             )?; // cov:ignore: canonical stream-dictionary emission only errors for an invalid source graph.
         } else {
             stream_dict
-                .write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
+                .unparse_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
                     out,
                     dictionary_options,
                     &map,

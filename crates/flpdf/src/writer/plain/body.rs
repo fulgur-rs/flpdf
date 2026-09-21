@@ -886,7 +886,7 @@ impl crate::writer::object::DynamicDirectStreamWriter for LiveDirectStreamWriter
                 // cov:ignore-end
             })?), // cov:ignore: allocatable direct stream lengths fit the i64 PDF length domain.
         )?; // cov:ignore: LLVM attributes the successful direct-stream dictionary replacement continuation separately.
-        dict.write_stream_body_with_dynamic_ref_map_and_string_writer(
+        dict.unparse_stream_body_with_dynamic_ref_map_and_string_writer(
             out,
             dictionary_options,
             map,
@@ -1108,7 +1108,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> crate::writer::write_object
                         )?; // cov:ignore: LLVM maps the covered encrypted dynamic root call continuation to this line
                     }
                 } else {
-                    root.write_object_qdf_with_qpdf_obj_gen_map_and_removed(
+                    root.unparse_object_qdf_with_qpdf_obj_gen_map_and_removed(
                         self.out,
                         0,
                         &raw_static_map,
@@ -1138,7 +1138,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> crate::writer::write_object
                 let mut write_string = |out: &mut OutputSink<'_>, value: &[u8]| {
                     crate::pdf_syntax::write_string_value(out, value)
                 };
-                crate::writer::object::write_root_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+                crate::writer::object::unparse_root_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
                     object,
                     self.out,
                     &mut map,
@@ -1223,7 +1223,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> crate::writer::write_object
                         Some(holder),
                     )?; // cov:ignore: LLVM maps the covered QDF encrypted stream-dictionary call continuation to this line
                 } else {
-                    dict.write_stream_body_qdf_with_qpdf_obj_gen_map_and_removed_and_length_with_options(
+                    dict.unparse_stream_body_qdf_with_qpdf_obj_gen_map_and_removed_and_length_with_options(
                         self.out,
                         0,
                         &raw_static_map,
@@ -1285,7 +1285,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> crate::writer::write_object
                         None,
                     )?; // cov:ignore: LLVM maps the covered compact encrypted stream-payload call continuation to this line
                 } else {
-                    dict.write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options(
+                    dict.unparse_stream_body_with_qpdf_obj_gen_map_and_removed_with_options(
                         self.out,
                         dictionary_options,
                         &raw_static_map,
@@ -1342,7 +1342,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> crate::writer::write_object
                     )?; // cov:ignore: LLVM maps the covered encrypted dynamic ordinary-object call continuation to this line
                 }
             } else {
-                object.write_object_qdf_with_qpdf_obj_gen_map_and_removed(
+                object.unparse_object_qdf_with_qpdf_obj_gen_map_and_removed(
                     self.out,
                     0,
                     &raw_static_map,
@@ -1372,7 +1372,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> crate::writer::write_object
             let mut write_string = |out: &mut OutputSink<'_>, value: &[u8]| {
                 crate::pdf_syntax::write_string_value(out, value)
             };
-            crate::writer::object::write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+            crate::writer::object::unparse_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
                 object,
                 self.out,
                 &mut map,
@@ -1448,7 +1448,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
             source.clone()
         };
         let result = if handle.object_ref() == self.root_source {
-            handle.write_root_object_with_dynamic_ref_map(
+            handle.unparse_root_object_with_dynamic_ref_map(
                 out,
                 &mut map,
                 &self.removed_refs,
@@ -1457,7 +1457,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
                 true,
             )
         } else {
-            handle.write_object_with_dynamic_ref_map(out, &mut map, &self.removed_refs)
+            handle.unparse_object_with_dynamic_ref_map(out, &mut map, &self.removed_refs)
         };
         if report_after && result.is_ok() {
             // cov:ignore: this qpdf ObjStm consumer always uses the two-pass path, so report_after is never true.
@@ -1749,7 +1749,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
                     self.final_extension_level,
                     true,
                 )?; // cov:ignore: LLVM maps the covered QDF ObjStm root-copy continuation to this line
-                crate::writer::object::write_object_qdf_with_dynamic_ref_map(
+                crate::writer::object::unparse_object_qdf_with_dynamic_ref_map(
                     &root,
                     0,
                     out,
@@ -1757,7 +1757,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
                     &raw_removed_refs,
                 ) // cov:ignore: LLVM maps the covered QDF ObjStm root serializer continuation to this line
             } else {
-                crate::writer::object::write_object_qdf_with_dynamic_ref_map(
+                crate::writer::object::unparse_object_qdf_with_dynamic_ref_map(
                     &handle_to_write,
                     0,
                     out,
@@ -2230,7 +2230,7 @@ where
     // ([`Self::emit_direct_stream`]) wherever it is reached while walking
     // this container -- not only nested under `/Contents` -- because the
     // ordinary per-object `ObjectHandle` serializer this call falls back to
-    // otherwise (`write_object_with_ref_map_and_removed_with_string_writer`
+    // otherwise (`unparse_object_with_ref_map_and_removed_with_string_writer`
     // and its QDF sibling) deliberately inlines only a stream's dictionary
     // at a child position (`unparse_container`'s own doc,
     // `crate::object_handle`). The pre-existing materialized-`Object`
@@ -2286,7 +2286,7 @@ where
             }
 
             if self.qdf {
-                value.write_object_qdf_with_qpdf_obj_gen_map_and_removed_with_string_writer(
+                value.unparse_object_qdf_with_qpdf_obj_gen_map_and_removed_with_string_writer(
                     self.out,
                     indent,
                     self.map,
@@ -2294,7 +2294,7 @@ where
                     self.write_string,
                 )
             } else {
-                value.write_object_with_qpdf_obj_gen_map_and_removed_with_string_writer(
+                value.unparse_object_with_qpdf_obj_gen_map_and_removed_with_string_writer(
                     self.out,
                     self.map,
                     self.removed_refs,
@@ -2369,7 +2369,7 @@ where
             // cov:ignore-end
         })?; // cov:ignore: the preceding stream shape probe makes this defensive error unreachable
         if self.qdf {
-            dict.write_object_qdf_with_qpdf_obj_gen_map_and_removed_with_string_writer(
+            dict.unparse_object_qdf_with_qpdf_obj_gen_map_and_removed_with_string_writer(
                 self.out,
                 indent,
                 self.map,
@@ -2377,7 +2377,7 @@ where
                 self.write_string,
             )?; // cov:ignore: LLVM does not attribute the successful QDF dictionary continuation
         } else {
-            dict.write_object_with_qpdf_obj_gen_map_and_removed_with_string_writer(
+            dict.unparse_object_with_qpdf_obj_gen_map_and_removed_with_string_writer(
                 self.out,
                 self.map,
                 self.removed_refs,
@@ -3793,7 +3793,7 @@ mod object_emitter_tests {
                 .expect("live QDF object-stream emitter end");
         let body = &source[start..end];
         assert!(
-            body.contains("write_object_qdf_with_dynamic_ref_map"),
+            body.contains("unparse_object_qdf_with_dynamic_ref_map"),
             "QDF ObjStm members must assign child references while serializing"
         );
         assert!(

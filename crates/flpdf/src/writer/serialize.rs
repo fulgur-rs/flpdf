@@ -36,7 +36,7 @@ pub fn write_stream_to_buf(
 ) -> crate::Result<()> {
     let data = stream.get_raw_stream_data()?;
     super::output::with_buffer_sink(out, |out| {
-        stream.write_stream_body(out, false)?;
+        stream.unparse_stream_body(out, false)?;
         write_stream_payload(out, &data, policy)
     })
 }
