@@ -7679,11 +7679,22 @@ fn run_page_extraction_from_multiple_sources(
     // `create_qpdf`/`prepare_document` and is superseded by the separate
     // writer configuration `run_page_extraction_after_plan` builds for the
     // actual write.
-    job.set_writer_configuration(writer_configuration_unnormalized(
-        &options,
-        linearize,
-        linearize_pass1,
-    )?);
+    let mut create_stage_writer =
+        writer_configuration_unnormalized(&options, linearize, linearize_pass1)?;
+    if split_pages_active(page_ops.split_pages.as_deref()) {
+        // `QPDFJob::doSplitPages` (`libqpdf/QPDFJob.cc:2940-3027`) builds
+        // every chunk from a fresh `QPDF`/`emptyPDF()` populated only by
+        // `addPage(page, false)`, so the primary's page-tree-unreferenced
+        // objects never reach a chunk's object cache and the writer option
+        // it re-applies per chunk (`QPDFJob.cc:3021` reaching
+        // `QPDFJob.cc:2856`) has nothing extra to enqueue. Copying that
+        // object graph into the merged intermediate below would be resolved
+        // and then discarded, so clear the bit for the create stage only. The
+        // per-chunk writers `run_page_extraction_after_plan` configures keep
+        // it, exactly as qpdf's `setWriterOptions` does.
+        create_stage_writer.set_preserve_unreferenced_objects(false);
+    }
+    job.set_writer_configuration(create_stage_writer);
     // `check_configuration` runs inside `create_qpdf`, so the create-stage
     // job needs the flag too -- the writer configuration above carries the
     // encryption parameters it gates on.

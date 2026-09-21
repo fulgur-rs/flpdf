@@ -1186,6 +1186,28 @@ fn parse_job_split_pages(value: &[u8]) -> Result<i32> {
     }
 }
 
+/// Whether a multi-source page selection must copy the primary's
+/// page-tree-unreferenced objects into its fresh merge target.
+///
+/// `--preserve-unreferenced` is a writer option in qpdf
+/// (`libqpdf/QPDFWriter.cc:2907-2913`), and `QPDFJob::handlePageSpecs` keeps
+/// the primary `QPDF` itself as the output document, so the writer simply
+/// finds those objects still in place. flpdf's multi-source route merges into
+/// a fresh target instead, and copies that unreferenced set across to match.
+///
+/// A split run never writes that target. `QPDFJob::doSplitPages`
+/// (`libqpdf/QPDFJob.cc:2940-3027`) builds every chunk from its own
+/// `QPDF`/`emptyPDF()` populated only by `addPage(page, false)`, so the
+/// unreferenced objects are not in the chunk's object cache and the writer
+/// option it re-applies per chunk (`QPDFJob.cc:3021` reaching
+/// `QPDFJob.cc:2856`) has nothing extra to enqueue. Real qpdf's split output
+/// therefore carries no preserved primary orphans; resolving and copying that
+/// graph into the intermediate document is work the split discards.
+fn preserve_unreferenced_for_page_merge(configuration: &JobConfiguration) -> bool {
+    configuration.writer.preserves_unreferenced_objects()
+        && !configuration.split_pages.is_some_and(|size| size != 0)
+}
+
 fn parse_job_compression_level(value: &[u8]) -> Result<i32> {
     let text = String::from_utf8_lossy(value);
     match qpdf_string_to_int_checked(&text) {
@@ -3309,7 +3331,7 @@ impl QPDFJob {
             &specs,
             configuration.collate.as_deref(),
             configuration.remove_unreferenced_resources,
-            configuration.writer.preserves_unreferenced_objects(),
+            preserve_unreferenced_for_page_merge(configuration),
             target,
         )?; // cov:ignore: llvm-cov attributes this covered multi-source call continuation to the opening expression
         let mut primary = match page_output {
@@ -7901,6 +7923,45 @@ mod tests {
         assert_eq!(rotation.angle, 90);
         assert!(rotation.relative);
         assert_eq!(job.configuration.split_pages, Some(2));
+    }
+
+    /// The merge-side preserve decision follows qpdf's own
+    /// `if (m->split_pages)` truthiness, not `Option::is_some`.
+    ///
+    /// A falsy `0` writes one ordinary output, so the primary's unreferenced
+    /// objects still have to reach the writer; a negative value is truthy and
+    /// dispatches to `QPDFJob::doSplitPages`, whose per-chunk documents can
+    /// never hold them.
+    #[test]
+    fn page_merge_preserve_follows_qpdf_split_pages_truthiness() {
+        let mut configuration = JobConfiguration::default();
+        assert!(
+            !preserve_unreferenced_for_page_merge(&configuration),
+            "an unset writer option never preserves"
+        );
+
+        configuration.writer.set_preserve_unreferenced_objects(true);
+        assert!(preserve_unreferenced_for_page_merge(&configuration));
+
+        configuration.split_pages = Some(0);
+        assert!(
+            preserve_unreferenced_for_page_merge(&configuration),
+            "qpdf's falsy --split-pages=0 writes one ordinary output"
+        );
+
+        configuration.split_pages = Some(1);
+        assert!(!preserve_unreferenced_for_page_merge(&configuration));
+
+        configuration.split_pages = Some(-1);
+        assert!(
+            !preserve_unreferenced_for_page_merge(&configuration),
+            "a negative value is truthy in qpdf's own split dispatch"
+        );
+
+        configuration
+            .writer
+            .set_preserve_unreferenced_objects(false);
+        assert!(!preserve_unreferenced_for_page_merge(&configuration));
     }
 
     #[test]
