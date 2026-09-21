@@ -801,6 +801,25 @@ fn required_32_byte_string_from_handle(dict: &ObjectHandle, key: &'static str) -
     })
 }
 
+/// Read a V<5 `/O` or `/U` entry as the fixed 32-byte value qpdf authenticates
+/// against, NUL-padding a shorter stored string.
+///
+/// qpdf's `initializeEncryption` runs `pad_short_parameter`
+/// (`QPDF_encryption.cc:316-321`) over both entries at `:807-808` and only then
+/// requires exactly 32 bytes, so a longer entry is rejected while a shorter one
+/// is accepted and padded.
+///
+/// The short case is reachable from an ordinary file that authenticates, not
+/// only from a synthetic dictionary. At R>=3 `check_user_password_V4`
+/// (`QPDF_encryption.cc:511-518`) compares only the leading 16 bytes of `/U`,
+/// so a file storing just those 16 bytes opens with its original password; at
+/// R=2 the comparison covers all 32 bytes and the same truncation would be
+/// rejected. A short `/O` is reachable as well, but only when the bytes it
+/// drops are already NUL, because Algorithm 2 hashes the padded `/O` into the
+/// file key (`QPDF_encryption.cc:385`) and any other truncation changes the key
+/// the file was encrypted with. Such a file keeps its stored length on the way
+/// out: `copyEncryptionParameters` re-emits the raw entry
+/// (`QPDFWriter.cc:693-694`) rather than this padded projection.
 fn required_v_lt_5_32_byte_string_from_handle(
     dict: &ObjectHandle,
     key: &'static str,
