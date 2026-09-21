@@ -851,6 +851,13 @@ const UNPARSE_STACK_GROWTH_SIZE: usize = 1024 * 1024;
 // parser can produce untouched. The live body writer's direct-seed collector
 // (`writer/plain/body.rs`) already refuses the same nesting before emission
 // starts, so this makes the remaining emission routes agree with it.
+//
+// The count starts at zero for the outermost hub, so `MAX_PARSE_DEPTH + 1`
+// hub levels are admitted rather than exactly `MAX_PARSE_DEPTH`. That extra
+// level is not slack: a top-level indirect stream spends one hub on the
+// stream itself and a second on its dictionary (`UnparseContainer::Stream`
+// re-enters the walk with `stream_dict`), so a maximally nested parsed
+// stream dictionary would otherwise trip a bound set at the parser's count.
 thread_local! {
     static UNPARSE_WALK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -7357,16 +7364,36 @@ mod tests {
         })
         .expect_err("a direct cycle must not be walked by the qdf hub");
         assert!(matches!(qdf, Error::Unsupported(_)));
+        assert!(
+            qdf.to_string()
+                .contains("direct object nesting exceeds maximum of"),
+            "unexpected message: {qdf}"
+        );
 
+        let mut map = |_: &ObjectHandle| Ok(ObjectRef::new(1, 0));
         let dynamic = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
-            cycle.write_object_with_dynamic_ref_map(
-                out,
-                &mut |_: &ObjectHandle| Ok(ObjectRef::new(1, 0)),
-                &BTreeSet::new(),
-            )
+            cycle.write_object_with_dynamic_ref_map(out, &mut map, &BTreeSet::new())
         })
         .expect_err("a direct cycle must not be walked by the dynamic ref-map hub");
         assert!(matches!(dynamic, Error::Unsupported(_)));
+        assert!(
+            dynamic
+                .to_string()
+                .contains("direct object nesting exceeds maximum of"),
+            "unexpected message: {dynamic}"
+        );
+
+        // The same callback still serves an ordinary indirect child, so the
+        // rejection above is the only behavior the cycle adds to this route.
+        let mut mapped = Vec::new();
+        let indirect_child = ObjectHandle::array(vec![ObjectHandle::new_indirect_unresolved(
+            ObjectRef::new(4, 0),
+            -1,
+        )]);
+        super::super::output::with_buffer_sink(&mut mapped, |out| {
+            indirect_child.write_object_with_dynamic_ref_map(out, &mut map, &BTreeSet::new())
+        })?;
+        assert_eq!(mapped, b"[ 1 0 R ]");
 
         // Every rejected level restores the shared counter on its way out,
         // so a later write starts from zero instead of inheriting the
