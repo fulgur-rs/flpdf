@@ -1165,7 +1165,9 @@ mod tests {
         // (per dr_map) would silently clobber the pre-existing, unrelated
         // `F1_1` font if the collision were not detected. qpdf handles this
         // by minting a fresh name for the displaced value
-        // (`libqpdf/QPDFAcroFormDocumentHelper.cc:791-807`) and extending
+        // (`libqpdf/QPDFObjectHandle.cc:1108-1127`'s conflict branch of
+        // `mergeResources`, reached via `adjustAppearanceStream`'s re-merge
+        // call at `QPDFAcroFormDocumentHelper.cc:672`) and extending
         // its local `dr_map` so content that already said `/F1_1` follows
         // it there too. The fresh name is `getUniqueResourceName("F1_1_",
         // ...)`'s first free suffix, `F1_1_1` — NOT `F1_2`, since the
@@ -1381,8 +1383,8 @@ mod tests {
         // content rewrite cannot run at all. This asserts flpdf's ACTUAL
         // (verified) qpdf-matching behavior: qpdf performs the /Resources
         // rename BEFORE its own try/catch'd tokenize step
-        // (`libqpdf/QPDFAcroFormDocumentHelper.cc:791-807` runs before
-        // `:824-849`), and does NOT roll the rename back when the
+        // (`libqpdf/QPDFAcroFormDocumentHelper.cc:625-678` runs before
+        // `:680-695`), and does NOT roll the rename back when the
         // subsequent tokenize fails. A rollback would have been the qpdf
         // DIVERGENCE. The test documents the verified,
         // matching (if internally inconsistent-looking) result: the dict
@@ -1505,7 +1507,7 @@ mod tests {
         // collides under the destination's own pre-existing F1_1). This
         // stream's own /Resources/Font has both F1 and F1_1 locally.
         //
-        // qpdf's rename loop (`libqpdf/QPDFAcroFormDocumentHelper.cc:781-803`)
+        // qpdf's rename loop (`libqpdf/QPDFAcroFormDocumentHelper.cc:644-669`)
         // mutates the sub-dictionary IN PLACE: processing F1->F1_1 first
         // (dr_map is
         // sorted, "F1" < "F1_1") moves F1's value into the F1_1 slot,
@@ -1513,7 +1515,7 @@ mod tests {
         // side-map. Processing F1_1->F1_1_1 next then reads the ALREADY-
         // overwritten F1_1 slot (now holding F1's value, not the true
         // original) and moves THAT into F1_1_1. The re-merge step
-        // (`:805-807`) then re-lands the side-mapped, true original F1_1
+        // (`:672`) then re-lands the side-mapped, true original F1_1
         // value back into ITS OWN name, F1_1 — which is free again, since
         // phase 1 vacated it. The two resources end up CROSS-WIRED between
         // the dict and content: this is qpdf's actual, verified output for
@@ -1570,7 +1572,7 @@ mod tests {
 
     #[test]
     fn adjust_appearance_stream_reuses_existing_key_for_same_object_on_new_conflict() {
-        // The conflict-resolution pass (`libqpdf/QPDFAcroFormDocumentHelper.cc:805-807`'s
+        // The conflict-resolution pass (`libqpdf/QPDFAcroFormDocumentHelper.cc:672`'s
         // `resources.mergeResources(merge_with, &dr_map)`, `QPDFObjectHandle::mergeResources`'s
         // `og_to_name` reuse) is exercised here: /Resources/Font has F1 and
         // F2 BOTH pointing at the SAME object, plus F3 at a different

@@ -693,7 +693,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         } else {
             // qpdf replaces a malformed /Fields value with an empty array
             // after warning through the live /AcroForm object
-            // (`QPDFAcroFormDocumentHelper.cc:247-254`). Keep the warning at
+            // (`QPDFAcroFormDocumentHelper.cc:246-250`). Keep the warning at
             // this canonical analysis boundary so every consumer observes it.
             acroform.warn_if_possible(
                 "/Fields key of /AcroForm dictionary is not an array; ignoring",
@@ -1014,7 +1014,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         };
         // qpdf copies the source `/DR` unconditionally up front, before the
         // annotation loop, whenever the source is foreign
-        // (`QPDFAcroFormDocumentHelper.cc:729-737`). Preserve that ordering:
+        // (`QPDFAcroFormDocumentHelper.cc:736-754`). Preserve that ordering:
         // `copyForeignObject` allocates destination identities in this phase,
         // and QDF exposes those identities through its
         // `%% Original object ID` comments. Only the *merge* into the
@@ -1056,7 +1056,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                     // qpdf's `maybe_copy_object(top_field)` allocates the
                     // mutable field clone before the first field walk lazily
                     // initializes the destination `/AcroForm` and `/DR`
-                    // (`QPDFAcroFormDocumentHelper.cc:811-823,914-917`).
+                    // (`QPDFAcroFormDocumentHelper.cc:884,920`).
                     // Keep that allocation order visible to QDF's original
                     // object-ID comments.
                     let copied_top = self
@@ -1073,7 +1073,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                     } else {
                         // qpdf copies the top field and its immediate /Kids before
                         // lazily creating the destination /AcroForm and /DR
-                        // (`QPDFAcroFormDocumentHelper.cc:811-823,914-917`).
+                        // (`QPDFAcroFormDocumentHelper.cc:884,920`).
                         // Preparing resources before the tree walk would assign
                         // those identities before the first widget.
                         let (copied_top, resources) = self
@@ -1586,7 +1586,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// Append copied top-level fields and rename conflicting qualified names.
     ///
     /// This is qpdf's public `addAndRenameFormFields` API
-    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:62-115`). The reserved-name
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:62-110`). The reserved-name
     /// variant remains an internal page-selection route because qpdf's live
     /// primary-name reservation is owned by `QPDFJob::handlePageSpecs`, not by
     /// this public helper boundary.
@@ -1664,7 +1664,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let mut conflicts = ResourceConflicts::new();
         destination_resources.make_resources_indirect(self.pdf)?;
         // A missing source `/DR` mirrors qpdf's null `from_dr`
-        // (`QPDFAcroFormDocumentHelper.cc:730-732`): the destination `/DR`
+        // (`QPDFAcroFormDocumentHelper.cc:735`): the destination `/DR`
         // still gets created/promoted above, but there is nothing to merge.
         if let Some(source_resources) = source_resources {
             source_resources.make_resources_indirect(self.pdf)?;
@@ -1785,7 +1785,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// incremental field-tree update did not register.
     ///
     /// qpdf's `copyAnnotations` calls `addAndRenameFormFields` before it
-    /// appends the copied annotations (`QPDFAcroFormDocumentHelper.cc:992-1035`).
+    /// appends the copied annotations (`QPDFPageObjectHelper.cc:992-1039`,
+    /// `QPDFPageObjectHelper::copyAnnotations`, not
+    /// `QPDFAcroFormDocumentHelper.cc`).
     /// That call updates the warm association cache for every Widget reachable
     /// through a newly added field's `/Kids` tree. A Widget without such a
     /// field remains visible only to qpdf's full page orphan scan, so the
