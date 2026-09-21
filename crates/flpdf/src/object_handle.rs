@@ -8391,19 +8391,21 @@ impl<'a> ObjectJsonWriter<'a> {
                 ) {
                     std::mem::swap(&mut current_key, &mut next_key);
                     // QPDF_Dictionary::writeJSON calls isNull() before
-                    // emitting a key. isNull() resolves an indirect child,
-                    // so missing/dangling values disappear from the JSON
-                    // object while non-null indirect children still emit
-                    // their own reference form below.
+                    // emitting a key. isNull() dereferences unconditionally,
+                    // not gated on isIndirect() (`QPDFObjectHandle.cc:353-356`,
+                    // `:2376-2383`), so missing/dangling values disappear
+                    // from the JSON object while non-null indirect children
+                    // still emit their own reference form below. Object
+                    // number zero carries a cache identity while not being
+                    // indirect (`object_gen.is_some()` without
+                    // `is_indirect()`), and it settles on the same
+                    // unknown-object null fallback, so it must be dropped
+                    // here the same way a dangling indirect child is.
                     let child_state = child.json_dispatch_state();
                     if child_state.reserved {
                         // A reserved child is not null; its non-dereferenced
                         // identity is still a valid JSON reference.
-                    } else if child_state
-                        .object_gen
-                        .is_some_and(|object_gen| object_gen.is_indirect())
-                        && child_state.unresolved
-                    {
+                    } else if child_state.object_gen.is_some() && child_state.unresolved {
                         if !child_state.resolver_present {
                             return Err(ObjectJsonError::Uninitialized);
                         }

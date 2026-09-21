@@ -248,3 +248,36 @@ fn an_unresolved_object_number_zero_array_element_is_not_resolved_for_json() {
         "attempted to get JSON from an unresolved QPDFObjectHandle"
     );
 }
+
+/// `QPDF_Dictionary::writeJSON` filters each entry with `isNull()` before
+/// emitting its key (`libqpdf/QPDF_Dictionary.cc:72-92`); `isNull()`
+/// dereferences unconditionally (`libqpdf/QPDFObjectHandle.cc:353-356`,
+/// `:2376-2383`), so a dangling entry's key disappears from the output
+/// entirely rather than surviving with a `null` value. A dangling *indirect*
+/// child already matched this before object number zero was resolved for
+/// JSON (`flpdf-e7d0f`); this pins that the object-zero case matches too,
+/// since it is the one identity `object_gen.is_some()` admits without also
+/// being indirect.
+#[test]
+fn a_dictionary_value_at_object_number_zero_is_omitted_from_json_like_qpdf() {
+    let mut pdf = open();
+    let zero = pdf.get_object_handle(object_zero());
+    let dictionary = ObjectHandle::dictionary(vec![
+        (b"/Keep".to_vec(), ObjectHandle::integer(1)),
+        (b"/Zero".to_vec(), zero),
+    ]);
+
+    let json = dictionary
+        .get_json(2, true)
+        .expect("object number zero settles to null on the handle route, not an error");
+
+    let mut keys = Vec::new();
+    json.for_each_dict_item(|key, _value| keys.push(key.to_vec()));
+
+    assert_eq!(
+        keys,
+        vec![b"/Keep".to_vec()],
+        "a dictionary value at object number zero resolves to null and must drop its \
+         key entirely, matching qpdf, instead of surviving as \"/Zero\": null"
+    );
+}
