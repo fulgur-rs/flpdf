@@ -109,12 +109,25 @@ fn round_trip<R: std::io::Read + std::io::Seek + 'static>(
 fn written_info_title<R: std::io::Read + std::io::Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Option<Vec<u8>> {
+    written_info_field(pdf, b"/Title")
+}
+
+/// The string value of one `/Info` key in `pdf`, or `None` when the written
+/// document carries no `/Info` at all.
+fn written_info_field<R: std::io::Read + std::io::Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    key: &[u8],
+) -> Option<Vec<u8>> {
     let info = pdf.trailer_key_handle(b"Info");
     if info.try_is_null().expect("probe /Info") {
         return None;
     }
-    let title = info.try_get_key(b"/Title").expect("read /Info /Title");
-    Some(title.try_get_string_value().expect("/Title is a string"))
+    let value = info.try_get_key(key).expect("read /Info key");
+    Some(
+        value
+            .try_get_string_value()
+            .expect("/Info value is a string"),
+    )
 }
 
 #[test]
@@ -175,6 +188,14 @@ fn merge_documents_ignores_a_later_inputs_info_dictionary() {
         Some(b"Indirect Title".as_slice()),
         "document-level data is taken from inputs[0] only, so a later input's \
          /Info must not replace the primary's"
+    );
+    // The donor's /Producer differs from the primary's, so asserting /Title
+    // alone would still pass if a later input's fields were merged in
+    // key by key. Pin every field the fixtures distinguish.
+    assert_eq!(
+        written_info_field(&mut written, b"/Producer").as_deref(),
+        Some(b"probe".as_slice()),
+        "a later input's /Info must not contribute individual keys either"
     );
 }
 
@@ -240,5 +261,49 @@ fn an_extracted_document_can_adopt_the_source_info_through_the_public_handle_api
         Some(b"Indirect Title".as_slice()),
         "the live trailer handle is writable and the writer serializes the \
          installed /Info"
+    );
+}
+
+#[test]
+fn an_extracted_document_can_adopt_a_direct_source_info_after_promotion() {
+    let mut source = open(two_page_pdf_with_direct_info());
+    let mut extracted = extract_pages(&mut source, &[0]).expect("extract page");
+
+    // qpdf's `QPDF::copyForeignObject` refuses a direct handle, and flpdf
+    // carries that refusal, so a trailer whose `/Info` is written inline
+    // cannot go straight through the copier.
+    let source_info = source.trailer_key_handle(b"Info");
+    assert!(
+        !source_info.is_null(),
+        "probe source carries a direct /Info"
+    );
+    let direct_copy = extracted
+        .copy_foreign_object(&source_info)
+        .expect_err("a direct handle is not a copyForeign input");
+    assert!(
+        direct_copy
+            .to_string()
+            .contains("copyForeign called with direct object handle"),
+        "unexpected error: {direct_copy}"
+    );
+
+    // `QPDF::makeIndirectObject` is the public promotion step that turns it
+    // into one, after which the same copy route applies.
+    let promoted = source
+        .make_indirect_object_handle(source_info)
+        .expect("promote the direct /Info in its own document");
+    let copied = extracted
+        .copy_foreign_object(&promoted)
+        .expect("copy the promoted /Info across documents");
+    extracted
+        .trailer()
+        .replace_key(b"/Info", copied)
+        .expect("install /Info on the extracted trailer");
+
+    let mut written = round_trip(&mut extracted);
+    assert_eq!(
+        written_info_title(&mut written).as_deref(),
+        Some(b"Direct Title".as_slice()),
+        "the promoted direct /Info reaches the extracted document"
     );
 }
