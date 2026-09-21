@@ -47,7 +47,6 @@ pub(crate) struct EncryptedStringEmitter {
     encrypt_ref: ObjectRef,
 }
 
-#[allow(dead_code)]
 impl EncryptedStringEmitter {
     pub(crate) fn from_context(ctx: &EncryptionContext) -> Self {
         Self::from_context_with_boxed_iv_generator(ctx, Box::new(|iv| getrandom::fill(iv)))
@@ -70,58 +69,6 @@ impl EncryptedStringEmitter {
             aes_iv_generator,
             encrypt_ref: ctx.encrypt_ref,
         }
-    }
-
-    /// Handle-based object emission with the writer's output reference map and
-    /// qpdf's removed-reference null policy threaded through the same string
-    /// encryption lifecycle.
-    #[allow(clippy::too_many_arguments)] // emission identity, qdf layout, mapping, and encryption remain separate qpdf dimensions
-    pub(crate) fn write_handle_object_with_ref_map(
-        &mut self,
-        out: &mut OutputSink<'_>,
-        emitted_ref: ObjectRef,
-        object_stream_index: Option<u32>,
-        object: &ObjectHandle,
-        qdf: bool,
-        map: &dyn Fn(ObjectRef) -> crate::Result<ObjectRef>,
-        removed_refs: &std::collections::BTreeSet<ObjectRef>,
-    ) -> crate::Result<()> {
-        if emitted_ref == self.encrypt_ref {
-            return write_encryption_dictionary_handle(out, object); // cov:ignore: the canonical body emits /Encrypt outside the current-object string-key scope.
-        }
-
-        let cipher = self.cipher;
-        let static_aes_iv = self.static_aes_iv;
-        let aes_iv_generator = self.aes_iv_generator.as_mut();
-        self.state
-            .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
-                let mut write_string = |out: &mut OutputSink<'_>, plaintext: &[u8]| {
-                    write_encrypted_or_plain_string(
-                        state,
-                        cipher,
-                        static_aes_iv,
-                        aes_iv_generator,
-                        out,
-                        plaintext,
-                    )
-                };
-                if qdf {
-                    object.unparse_object_qdf_with_ref_map_and_removed_with_string_writer(
-                        out,
-                        0,
-                        map,
-                        removed_refs,
-                        &mut write_string,
-                    )
-                } else {
-                    object.unparse_object_with_ref_map_and_removed_with_string_writer(
-                        out,
-                        map,
-                        removed_refs,
-                        &mut write_string,
-                    )
-                }
-            })
     }
 
     /// QDF object emission variant keyed by qpdf's complete raw source
@@ -335,78 +282,6 @@ impl EncryptedStringEmitter {
                     removed_refs,
                     &mut write_string,
                 )
-            })
-    }
-
-    /// Handle-based stream-dictionary emission with output-reference mapping
-    /// and removed-reference visibility. `length_ref` is used only by QDF's
-    /// synthetic stream-length holder.
-    #[allow(clippy::too_many_arguments)] // keeps the qpdf stream-dictionary contract explicit at this boundary
-    pub(crate) fn write_handle_stream_dict_with_ref_map(
-        &mut self,
-        out: &mut OutputSink<'_>,
-        emitted_ref: ObjectRef,
-        object_stream_index: Option<u32>,
-        dict: &ObjectHandle,
-        options: StreamDictOptions,
-        map: &dyn Fn(ObjectRef) -> crate::Result<ObjectRef>,
-        removed_refs: &std::collections::BTreeSet<ObjectRef>,
-        length_ref: Option<ObjectRef>,
-    ) -> crate::Result<()> {
-        if !options.encrypt_strings {
-            if options.qdf {
-                return dict
-                    .unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
-                        out,
-                        0,
-                        map,
-                        removed_refs,
-                        length_ref,
-                        options.dictionary,
-                    );
-            }
-            return dict.unparse_stream_body_with_ref_map_and_removed_with_options(
-                out,
-                options.dictionary,
-                map,
-                removed_refs,
-            );
-        }
-
-        let cipher = self.cipher;
-        let static_aes_iv = self.static_aes_iv;
-        let aes_iv_generator = self.aes_iv_generator.as_mut();
-        self.state
-            .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
-                let mut write_string = |out: &mut OutputSink<'_>, plaintext: &[u8]| {
-                    write_encrypted_or_plain_string(
-                        state,
-                        cipher,
-                        static_aes_iv,
-                        aes_iv_generator,
-                        out,
-                        plaintext,
-                    )
-                };
-                if options.qdf {
-                    dict.unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options(
-                        out,
-                        0,
-                        map,
-                        removed_refs,
-                        length_ref,
-                        options.dictionary,
-                        &mut write_string,
-                    )
-                } else {
-                    dict.unparse_stream_body_with_ref_map_and_removed_with_options_and_string_writer(
-                        out,
-                        options.dictionary,
-                        map,
-                        removed_refs,
-                        &mut write_string,
-                    )
-                }
             })
     }
 
