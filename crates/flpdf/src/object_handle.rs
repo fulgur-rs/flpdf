@@ -12379,66 +12379,39 @@ mod resolution_state_tests {
     /// so `disconnect` takes it out under the borrow and drops it after.
     #[test]
     fn disconnect_releases_a_provider_whose_drop_reads_its_own_stream() {
-        use std::cell::RefCell;
-
-        struct SelfReadingProvider {
-            stream: RefCell<Option<ObjectHandle>>,
+        // The reader runs from `Drop`, so it reaches the stream while
+        // `disconnect` is walking it. `CallbackProvider` supplies the
+        // `StreamDataProvider` half; this only adds the destructor.
+        struct ReadOnDrop {
+            stream: ObjectHandle,
             dropped: Rc<std::cell::Cell<bool>>,
         }
 
-        impl Drop for SelfReadingProvider {
+        impl Drop for ReadOnDrop {
             fn drop(&mut self) {
-                if let Some(stream) = self.stream.borrow().as_ref() {
-                    let _ = stream.type_code();
-                }
+                let _ = self.stream.type_code();
                 self.dropped.set(true);
-            }
-        }
-
-        impl StreamDataProvider for SelfReadingProvider {
-            fn provide_stream_data_by_id(
-                &self,
-                _object_number: u32,
-                _generation: u16,
-                _pipeline: &mut dyn Pipeline,
-            ) -> Result<()> {
-                Ok(())
             }
         }
 
         let stream = ObjectHandle::stream(ObjectHandle::dictionary(vec![]), Rc::new(Vec::new()));
         let dropped = Rc::new(std::cell::Cell::new(false));
-        let provider = Rc::new(SelfReadingProvider {
-            stream: RefCell::new(Some(stream.clone())),
+        let reader = ReadOnDrop {
+            stream: stream.clone(),
             dropped: Rc::clone(&dropped),
+        };
+        let provider: Rc<dyn StreamDataProvider> = Rc::new(CallbackProvider {
+            callback: move |_: &mut dyn Pipeline| {
+                let _ = &reader;
+                Ok(())
+            },
         });
         stream.with_value_mut(|value| {
             if let Some(ObjectValue::Stream(stream)) = value {
                 stream.stream_data = None;
-                stream.stream_provider = Some(provider.clone());
+                stream.stream_provider = Some(Rc::clone(&provider));
             }
         });
-
-        // Exercise the provider itself so the registered data path is a real
-        // one rather than a stub the gate never enters.
-        struct CountingSink(usize);
-        impl Pipeline for CountingSink {
-            fn identifier(&self) -> &str {
-                "disconnect provider probe sink"
-            }
-            fn write(&mut self, data: &[u8]) -> crate::pipeline::PipelineResult<()> {
-                self.0 += data.len();
-                Ok(())
-            }
-            fn finish(&mut self) -> crate::pipeline::PipelineResult<()> {
-                Ok(())
-            }
-        }
-        let mut sink = CountingSink(0);
-        provider
-            .provide_stream_data_by_id(3, 0, &mut sink)
-            .expect("the probe provider writes nothing and succeeds");
-        assert_eq!(sink.0, 0);
         drop(provider);
 
         stream.disconnect();
