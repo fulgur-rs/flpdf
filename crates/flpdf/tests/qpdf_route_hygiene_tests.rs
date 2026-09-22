@@ -1748,6 +1748,37 @@ fn f<R>((_index, pdf): Pair<&mut Pdf<R>>) {
     );
 }
 
+/// A default a component only *contains* -- `&'a mut T`, not `T` -- cannot be
+/// swapped into the component list: the type to pair against would have to be
+/// built rather than borrowed from the alias that declares it. That shape
+/// keeps the fail-closed fallback to the whole written type, so both
+/// subpatterns are reported and the document is over-reported rather than
+/// dropped.
+///
+/// What rescues it is the default walk inside [`type_mentions_pdf`], reached
+/// through that fallback -- not the component substitution. Narrowing the
+/// walk to defaults the body names at its root would turn this over-report
+/// into a silent miss, which is why the shape is pinned here rather than
+/// argued in a comment.
+#[test]
+fn a_default_reached_inside_a_component_falls_back_to_the_whole_type() {
+    let source = "\
+type Pair<'a, R, T = Pdf<R>> = (usize, &'a mut T);
+fn f<R>((_n, _pdf): Pair<'_, R>) {}
+";
+    let mut aliases = AliasIndex::new();
+    collect_aliases(source, &mut aliases);
+    assert_eq!(
+        dead_pdf_carriers_with_aliases(source, &aliases)
+            .iter()
+            .map(|carrier| carrier.binding.clone())
+            .collect::<Vec<_>>(),
+        vec!["_n".to_owned(), "_pdf".to_owned()],
+        "`&'a mut T` is not the parameter itself, so every subpattern pairs \
+         with the whole alias -- the document must not be the one that is lost"
+    );
+}
+
 /// An attribute that shares its line with the declaration must not take the
 /// declaration with it: only the columns the attribute occupies are skipped.
 ///
