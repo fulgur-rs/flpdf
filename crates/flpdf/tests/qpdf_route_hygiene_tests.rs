@@ -441,7 +441,20 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// are indexed too. `syn` does not evaluate `cfg`, so they are in the tree
 /// either way, and keeping them can only widen what the search resolves --
 /// never narrow it. An alias that names no document costs nothing here.
-type AliasIndex = BTreeMap<String, Vec<syn::Type>>;
+type AliasIndex = BTreeMap<String, Vec<AliasDefinition>>;
+
+/// One `type X<P..> = T;` declaration: the type it stands for, and the names
+/// of its own type parameters.
+///
+/// The parameter names are kept because following an alias does not
+/// substitute its arguments. A component that is still a bare parameter
+/// after resolution carries whatever the use site passed in, which the
+/// resolved type no longer shows.
+#[derive(Debug, Clone)]
+struct AliasDefinition {
+    ty: syn::Type,
+    parameters: BTreeSet<String>,
+}
 
 /// Parse `source` and return every `_`-prefixed binding whose type mentions
 /// `Pdf`, in source order, resolving no aliases.
@@ -469,7 +482,14 @@ fn collect_aliases(source: &str, index: &mut AliasIndex) {
             self.0
                 .entry(strip_raw(&node.ident))
                 .or_default()
-                .push((*node.ty).clone());
+                .push(AliasDefinition {
+                    ty: (*node.ty).clone(),
+                    parameters: node
+                        .generics
+                        .type_params()
+                        .map(|parameter| strip_raw(&parameter.ident))
+                        .collect(),
+                });
             syn::visit::visit_item_type(self, node);
         }
     }
@@ -735,12 +755,40 @@ fn tuple_components<'a>(ty: &'a syn::Type, aliases: &'a AliasIndex) -> Option<Ve
                 if !seen.insert(name) {
                     return None;
                 }
-                walk(only, aliases, seen)
+                let components = walk(&only.ty, aliases, seen)?;
+                // Arguments are not substituted, so a component that is
+                // still one of the alias's own parameters stands for
+                // whatever the use site passed in -- possibly a document.
+                // Pairing against it would lose that carrier, so keep the
+                // whole type instead.
+                if components.iter().any(|component| {
+                    !type_mentions_pdf(component, aliases)
+                        && type_names_any(component, &only.parameters)
+                }) {
+                    return None;
+                }
+                Some(components)
             }
             _ => None,
         }
     }
     walk(ty, aliases, &mut BTreeSet::new())
+}
+
+/// Whether `ty` mentions any of `names` -- used to spot an alias component
+/// that is still an unsubstituted type parameter.
+fn type_names_any(ty: &syn::Type, names: &BTreeSet<String>) -> bool {
+    struct Idents<'a>(&'a BTreeSet<String>, bool);
+    impl Visit<'_> for Idents<'_> {
+        fn visit_ident(&mut self, node: &proc_macro2::Ident) {
+            if self.0.contains(&strip_raw(node)) {
+                self.1 = true;
+            }
+        }
+    }
+    let mut idents = Idents(names, false);
+    Visit::visit_type(&mut idents, ty);
+    idents.1
 }
 
 /// Whether `ty` names `Pdf` anywhere, so `&Pdf<R>`, `&'a mut Pdf<R>`,
@@ -770,7 +818,11 @@ fn type_mentions_pdf(ty: &syn::Type, aliases: &AliasIndex) -> bool {
                 continue;
             };
             // `seen` stops `type A = B; type B = A;` from recursing forever.
-            if seen.insert(ident) && aliased.iter().any(|aliased| walk(aliased, aliases, seen)) {
+            if seen.insert(ident)
+                && aliased
+                    .iter()
+                    .any(|aliased| walk(&aliased.ty, aliases, seen))
+            {
                 return true;
             }
         }
@@ -820,18 +872,7 @@ impl CarrierScan<'_> {
                 // not name, so index-based pairing only holds up to the rest
                 // position. Walk the prefix forwards and the suffix
                 // backwards, the way the language matches them.
-                // Aliases are followed without substituting type
-                // arguments, so `type Pair<R> = (usize, R)` used as
-                // `Pair<&mut Pdf<X>>` would resolve to components that no
-                // longer mention the document. Losing it that way is a
-                // miss, so when the whole type names `Pdf` and no component
-                // does, keep the whole type instead.
-                let components = tuple_components(ty, self.aliases).filter(|types| {
-                    !type_mentions_pdf(ty, self.aliases)
-                        || types
-                            .iter()
-                            .any(|component| type_mentions_pdf(component, self.aliases))
-                });
+                let components = tuple_components(ty, self.aliases);
                 let elems: Vec<&syn::Pat> = tuple.elems.iter().collect();
                 let rest = elems
                     .iter()
@@ -1421,6 +1462,29 @@ fn f<R>((index, _pdf): Pair<'_, R>) {
             .collect::<Vec<_>>(),
         vec!["_pdf".to_owned()],
         "the aliased tuple's document component must still be reported"
+    );
+}
+
+/// An alias may mix a generic component with a concrete document one:
+/// `type Pair<T> = (T, Pdf<R>)`. The concrete component mentioning `Pdf` says
+/// nothing about `T`, which at the use site carries the real carrier, so the
+/// fallback is decided per component rather than over the tuple as a whole.
+#[test]
+fn a_mixed_alias_still_falls_back_for_its_generic_component() {
+    let source = "\
+type Pair<T> = (T, Pdf<R>);
+fn f<X>((_document, live): Pair<&mut Pdf<X>>) {
+    let _ = live;
+}
+";
+    let mut aliases = AliasIndex::new();
+    collect_aliases(source, &mut aliases);
+    assert!(
+        dead_pdf_carriers_with_aliases(source, &aliases)
+            .iter()
+            .any(|carrier| carrier.binding == "_document"),
+        "`_document` receives the document through the alias's `T`; a \
+         component that mentions `Pdf` elsewhere must not excuse it"
     );
 }
 
