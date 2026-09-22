@@ -25,6 +25,9 @@ mod support;
 #[path = "support/eol.rs"]
 mod eol;
 use eol::EOL;
+#[path = "support/text_newlines.rs"]
+mod text_newlines;
+use text_newlines::normalize_text_newlines;
 
 use assert_cmd::Command as CargoCommand;
 use std::io::Write;
@@ -41,22 +44,6 @@ fn minimal_pdf_temp() -> tempfile::NamedTempFile {
     f.write_all(include_bytes!("../../../tests/fixtures/minimal.pdf"))
         .unwrap();
     f
-}
-
-/// Normalize text-mode CRLF output from qpdf on Windows to LF.
-fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(bytes.len());
-    let mut remaining = bytes;
-    while let Some((&byte, rest)) = remaining.split_first() {
-        if byte == b'\r' && rest.first() == Some(&b'\n') {
-            normalized.push(b'\n');
-            remaining = &rest[1..];
-        } else {
-            normalized.push(byte);
-            remaining = rest;
-        }
-    }
-    normalized
 }
 
 /// A minimal PNG-like binary payload (valid PNG header + 1×1 RGBA).

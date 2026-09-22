@@ -8,6 +8,9 @@ use std::process::Command as ShellCommand;
 #[path = "support/eol.rs"]
 mod eol;
 use eol::EOL;
+#[path = "support/text_newlines.rs"]
+mod text_newlines;
+use text_newlines::normalize_text_newlines;
 
 const ONE_PAGE_PDF: &str = "../../tests/fixtures/compat/one-page.pdf";
 const REPAIRABLE_PDF: &str = "../../tests/fixtures/test_driver/repairable_input.pdf";
@@ -28,22 +31,6 @@ fn skip_if_qpdf_missing() -> bool {
     eprintln!("skipping ordinary inspection oracle: qpdf 11.9.0 is not available");
     true
 }
-
-fn normalize_newlines(bytes: &[u8]) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(bytes.len());
-    let mut remaining = bytes;
-    while let Some((&byte, rest)) = remaining.split_first() {
-        if byte == b'\r' && rest.first() == Some(&b'\n') {
-            normalized.push(b'\n');
-            remaining = &rest[1..];
-        } else {
-            normalized.push(byte);
-            remaining = rest;
-        }
-    }
-    normalized
-}
-
 fn one_page_with_image_pdf() -> Vec<u8> {
     let objects = [
         b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".as_slice(),
@@ -178,12 +165,12 @@ fn ordinary_show_npages_matches_qpdf_11_9() {
 
     assert_eq!(flpdf.status.code(), qpdf.status.code());
     assert_eq!(
-        normalize_newlines(&flpdf.stdout),
-        normalize_newlines(&qpdf.stdout)
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout)
     );
     assert_eq!(
-        normalize_newlines(&flpdf.stderr),
-        normalize_newlines(&qpdf.stderr)
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr)
     );
 }
 
@@ -236,12 +223,12 @@ fn ordinary_show_pages_matches_qpdf_11_9() {
 
     assert_eq!(flpdf.status.code(), qpdf.status.code());
     assert_eq!(
-        normalize_newlines(&flpdf.stdout),
-        normalize_newlines(&qpdf.stdout)
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout)
     );
     assert_eq!(
-        normalize_newlines(&flpdf.stderr),
-        normalize_newlines(&qpdf.stderr)
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr)
     );
 }
 
@@ -269,12 +256,12 @@ fn ordinary_show_pages_with_images_matches_qpdf_11_9() {
 
     assert_eq!(flpdf.status.code(), qpdf.status.code());
     assert_eq!(
-        normalize_newlines(&flpdf.stdout),
-        normalize_newlines(&qpdf.stdout)
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout)
     );
     assert_eq!(
-        normalize_newlines(&flpdf.stderr),
-        normalize_newlines(&qpdf.stderr)
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr)
     );
 }
 
@@ -302,12 +289,12 @@ fn ordinary_show_pages_with_images_and_optimize_matches_qpdf_11_9() {
 
     assert_eq!(flpdf.status.code(), qpdf.status.code());
     assert_eq!(
-        normalize_newlines(&flpdf.stdout),
-        normalize_newlines(&qpdf.stdout)
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout)
     );
     assert_eq!(
-        normalize_newlines(&flpdf.stderr),
-        normalize_newlines(&qpdf.stderr)
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr)
     );
 }
 
@@ -335,12 +322,12 @@ fn ordinary_check_with_optimize_images_matches_qpdf_11_9() {
 
     assert_eq!(flpdf.status.code(), qpdf.status.code());
     assert_eq!(
-        normalize_newlines(&flpdf.stdout),
-        normalize_newlines(&qpdf.stdout)
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout)
     );
     assert_eq!(
-        normalize_newlines(&flpdf.stderr),
-        normalize_newlines(&qpdf.stderr)
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr)
     );
 }
 
@@ -367,12 +354,12 @@ fn optimize_images_does_not_touch_a_page_without_resources() {
 
     assert_eq!(flpdf.status.code(), qpdf.status.code());
     assert_eq!(
-        normalize_newlines(&flpdf.stdout),
-        normalize_newlines(&qpdf.stdout)
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout)
     );
     assert_eq!(
-        normalize_newlines(&flpdf.stderr),
-        normalize_newlines(&qpdf.stderr)
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr)
     );
 }
 
@@ -400,12 +387,12 @@ fn ordinary_show_npages_with_optimize_images_matches_qpdf_warning_status() {
 
     assert_eq!(flpdf.status.code(), qpdf.status.code());
     assert_eq!(
-        normalize_newlines(&flpdf.stdout),
-        normalize_newlines(&qpdf.stdout)
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout)
     );
     assert_eq!(
-        normalize_newlines(&flpdf.stderr),
-        normalize_newlines(&qpdf.stderr)
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr)
     );
 }
 
@@ -428,12 +415,12 @@ fn ordinary_show_pages_with_images_omits_empty_image_section_like_qpdf() {
 
     assert_eq!(flpdf.status.code(), qpdf.status.code());
     assert_eq!(
-        normalize_newlines(&flpdf.stdout),
-        normalize_newlines(&qpdf.stdout)
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout)
     );
     assert_eq!(
-        normalize_newlines(&flpdf.stderr),
-        normalize_newlines(&qpdf.stderr)
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr)
     );
 }
 
@@ -457,12 +444,12 @@ fn ordinary_show_npages_completes_repair_warnings_with_status_three() {
     assert_eq!(qpdf.status.code(), Some(3));
     assert_eq!(flpdf.status.code(), Some(3));
     assert_eq!(
-        normalize_newlines(&flpdf.stdout),
-        normalize_newlines(&qpdf.stdout)
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout)
     );
     assert_eq!(
-        normalize_newlines(&flpdf.stderr),
-        normalize_newlines(&qpdf.stderr)
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr)
     );
 }
 
@@ -496,8 +483,8 @@ fn ordinary_show_npages_matches_qpdf_without_weak_crypto_advisory() {
     assert!(qpdf.status.success());
     assert_eq!(flpdf.status.code(), Some(0));
     assert_eq!(
-        normalize_newlines(&flpdf.stdout),
-        normalize_newlines(&qpdf.stdout)
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout)
     );
     assert!(!String::from_utf8_lossy(&flpdf.stderr).contains("encrypted PDF uses weak crypto"));
 }
@@ -572,12 +559,12 @@ fn ordinary_show_pages_reports_malformed_contents_like_qpdf() {
 
     assert_eq!(flpdf.status.code(), qpdf.status.code());
     assert_eq!(
-        normalize_newlines(&flpdf.stdout),
-        normalize_newlines(&qpdf.stdout)
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout)
     );
     assert_eq!(
-        normalize_newlines(&flpdf.stderr),
-        normalize_newlines(&qpdf.stderr)
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr)
     );
 }
 
@@ -635,12 +622,12 @@ fn assert_show_npages_matches_qpdf(path: &std::path::Path) {
         flpdf.stderr
     );
     assert_eq!(
-        normalize_newlines(&flpdf.stdout),
-        normalize_newlines(&qpdf.stdout)
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout)
     );
     assert_eq!(
-        normalize_newlines(&flpdf.stderr),
-        normalize_newlines(&qpdf.stderr)
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr)
     );
 }
 

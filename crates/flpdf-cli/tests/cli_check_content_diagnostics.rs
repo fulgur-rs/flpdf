@@ -4,6 +4,10 @@ use assert_cmd::Command;
 use std::io::Write;
 use std::process::{Command as ProcessCommand, Output};
 
+#[path = "support/text_newlines.rs"]
+mod text_newlines;
+use text_newlines::normalize_text_newlines;
+
 const EXPECTED_QPDF_VERSION: &str = "qpdf version 11.9.0";
 
 fn qpdf_available() -> bool {
@@ -77,22 +81,6 @@ fn run_flpdf(args: &[&str]) -> Output {
         .output()
         .expect("flpdf should spawn")
 }
-
-fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(bytes.len());
-    let mut remaining = bytes;
-    while let Some((&byte, rest)) = remaining.split_first() {
-        if byte == b'\r' && rest.first() == Some(&b'\n') {
-            normalized.push(b'\n');
-            remaining = &rest[1..];
-        } else {
-            normalized.push(byte);
-            remaining = rest;
-        }
-    }
-    normalized
-}
-
 fn assert_check_matches_qpdf(content: &[u8], extra_args: &[&str], expected_warning: Option<&str>) {
     if !qpdf_available() {
         return;

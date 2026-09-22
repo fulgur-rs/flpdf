@@ -7,6 +7,9 @@ use std::process::{Command as ProcessCommand, Output};
 #[path = "support/eol.rs"]
 mod eol;
 use eol::EOL;
+#[path = "support/text_newlines.rs"]
+mod text_newlines;
+use text_newlines::normalize_text_newlines;
 
 const MINIMAL: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -100,24 +103,6 @@ fn run_merged_check(program: impl AsRef<std::ffi::OsStr>, args: &[&str], input: 
         .output()
         .unwrap()
 }
-
-fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(bytes.len());
-    let mut remaining = bytes;
-
-    while let Some((&byte, rest)) = remaining.split_first() {
-        if byte == b'\r' && rest.first() == Some(&b'\n') {
-            normalized.push(b'\n');
-            remaining = &rest[1..];
-        } else {
-            normalized.push(byte);
-            remaining = rest;
-        }
-    }
-
-    normalized
-}
-
 fn split_at_marker<'a>(bytes: &'a [u8], marker: &[u8]) -> Option<(&'a [u8], &'a [u8])> {
     let index = bytes
         .windows(marker.len())
@@ -144,6 +129,10 @@ fn assert_observables_equal(label: &str, qpdf: &Output, flpdf: &Output, text_out
     }
 }
 
+// Single contract test for the shared `support/text_newlines.rs` helper: a
+// lone `\r` must survive so genuine carriage returns inside a text payload
+// still compare. Lives here because the logger owns the CRLF text transport
+// this helper compensates for.
 #[test]
 fn text_newline_normalization_only_collapses_crlf_pairs() {
     assert_eq!(

@@ -16,30 +16,12 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command as ShellCommand;
 
-/// Collapse a live qpdf subprocess's CRLF-terminated text lines to bare `\n`.
-/// On Windows, `qpdf.exe`'s own C-runtime stdout is opened in text mode and
-/// translates every `\n` write to `\r\n`; flpdf's CLI writes plain `\n`
-/// everywhere, matching qpdf's C++ source (`cout << "...\n"`) rather than
-/// that platform-specific translation. Comparing raw bytes on Windows would
-/// therefore flag a line-ending artifact of the oracle process, not a real
-/// content difference (see the identical pattern already established in
-/// `cli_logger_routing.rs`/`cli_attachment_lifecycle.rs`).
-fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(bytes.len());
-    let mut remaining = bytes;
-
-    while let Some((&byte, rest)) = remaining.split_first() {
-        if byte == b'\r' && rest.first() == Some(&b'\n') {
-            normalized.push(b'\n');
-            remaining = &rest[1..];
-        } else {
-            normalized.push(byte);
-            remaining = rest;
-        }
-    }
-
-    normalized
-}
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
+#[path = "support/text_newlines.rs"]
+mod text_newlines;
+use text_newlines::normalize_text_newlines;
 
 const UNENCRYPTED_FIXTURE: &str = "../../tests/fixtures/minimal.pdf";
 const ONE_PAGE_FIXTURE: &str = "../../tests/fixtures/compat/one-page.pdf";
@@ -148,8 +130,8 @@ fn assert_unencrypted_output(output: &Path) {
         String::from_utf8_lossy(&show.stderr)
     );
     assert_eq!(
-        normalize_text_newlines(&show.stdout),
-        b"File is not encrypted\n"
+        show.stdout,
+        format!("File is not encrypted{EOL}").into_bytes()
     );
 
     let check = ShellCommand::new("qpdf")
@@ -2922,10 +2904,9 @@ fn copy_encryption_failure_stderr(donor: &Path, password: Option<&str>, out: &Pa
     // The logger's diagnostic sink runs its stderr writes through qpdf's own
     // Windows text-mode `\n` -> `\r\n` conversion (`crates/flpdf/src/logger.rs`
     // `TextModeWriter`, matching `QPDFLogger.cc:43-50`'s C-runtime text
-    // stream). Collapse it the same way the existing flpdf-vs-qpdf comparisons
-    // in this file do before pinning the line against a bare `\n` literal.
-    let stderr =
-        String::from_utf8_lossy(&normalize_text_newlines(&assert.get_output().stderr)).into_owned();
+    // stream). Callers pin that observable line ending with `{EOL}` rather
+    // than collapsing it here; `str::lines()` already tolerates either form.
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
     assert!(
         !stderr.contains("--copy-encryption:"),
         "donor failures must not carry an option-specific prefix qpdf never \
@@ -2946,7 +2927,7 @@ fn copy_encryption_wrong_password_is_rejected() {
     let stderr = copy_encryption_failure_stderr(&donor, Some("wrongpw"), &out);
     assert_eq!(
         stderr,
-        format!("flpdf: {}: invalid password\n", donor.display())
+        format!("flpdf: {}: invalid password{EOL}", donor.display())
     );
     assert!(!out.exists());
 }
@@ -2961,7 +2942,7 @@ fn copy_encryption_missing_password_reports_invalid_password() {
     let stderr = copy_encryption_failure_stderr(&donor, None, &out);
     assert_eq!(
         stderr,
-        format!("flpdf: {}: invalid password\n", donor.display())
+        format!("flpdf: {}: invalid password{EOL}", donor.display())
     );
     assert!(!out.exists());
 }
@@ -2978,7 +2959,7 @@ fn copy_encryption_missing_donor_reports_open_failure() {
     assert_eq!(
         stderr,
         format!(
-            "flpdf: open {}: No such file or directory\n",
+            "flpdf: open {}: No such file or directory{EOL}",
             donor.display()
         )
     );
@@ -2997,9 +2978,9 @@ fn copy_encryption_missing_donor_reports_open_failure() {
         .failure()
         .code(2);
     assert_eq!(
-        String::from_utf8_lossy(&normalize_text_newlines(&assert.get_output().stderr)),
+        String::from_utf8_lossy(&assert.get_output().stderr),
         format!(
-            "qpdf: open {}: No such file or directory\n",
+            "qpdf: open {}: No such file or directory{EOL}",
             donor.display()
         )
     );
@@ -3050,7 +3031,7 @@ fn copy_encryption_directory_donor_reports_read_failure() {
     let stderr = copy_encryption_failure_stderr(&donor, None, &out);
     assert_eq!(
         stderr,
-        format!("flpdf: {}: read 1024 bytes\n", donor.display())
+        format!("flpdf: {}: read 1024 bytes{EOL}", donor.display())
     );
     assert!(!out.exists());
 }
@@ -4294,8 +4275,8 @@ fn top_level_show_encryption_no_warn_suppresses_all_warning_output() {
         String::from_utf8_lossy(&no_warn.stderr)
     );
     assert_eq!(
-        normalize_text_newlines(&no_warn.stdout),
-        b"File is not encrypted\n",
+        no_warn.stdout,
+        format!("File is not encrypted{EOL}").into_bytes(),
         "--no-warn --show-encryption must print only the qpdf report body"
     );
 }
