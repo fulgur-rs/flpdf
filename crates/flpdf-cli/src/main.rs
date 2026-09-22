@@ -7596,8 +7596,6 @@ fn run_empty_page_extraction(
         linearize_pass1,
         verbose,
         standard_output,
-        false,
-        None,
         source_warnings,
         None,
         selected_pages,
@@ -7622,18 +7620,10 @@ fn run_empty_page_extraction(
 /// `createQPDF` → `handlePageSpecs` call order (`QPDFJob.cc:428-467`): the
 /// primary and every distinct secondary source are opened by the job itself,
 /// keyed by literal filename exactly as qpdf's page heap is, and
-/// `prepare_document` resolves and copies every page spec (including qpdf's
-/// resource-pruning decision) into a fresh merged target before returning.
-///
-/// The merge always produces a fresh, unencrypted target
-/// (`docs/qpdf-correspondence.md`, `flpdf-clq9`), unlike qpdf's own
-/// `handlePageSpecs`, which mutates the primary `QPDF` in place
-/// (`libqpdf/QPDFJob.cc:2359-2362`) and so never needs to answer the
-/// primary's encryption after the fact. `QPDFJob::encryption_status`/
-/// `take_primary_copy_encryption` recover that pre-merge snapshot, needed
-/// here because the final write below completes on a separate `QPDFJob`
-/// instance (see [`run_page_extraction_after_plan`]) rather than this job's
-/// own `write_qpdf`.
+/// `prepare_document` resolves and applies every page spec to the primary
+/// document in place before returning (`QPDFJob.cc:2359-2632`). The final
+/// write below uses a separate Job for CLI-specific completion, but receives
+/// that same primary document, including its `/Encrypt` state.
 #[allow(clippy::too_many_arguments)]
 fn run_page_extraction_from_multiple_sources(
     primary_input: &Path,
@@ -7729,8 +7719,6 @@ fn run_page_extraction_from_multiple_sources(
             }))
         }
     };
-    let (primary_encrypted, _) = job.encryption_status();
-    let primary_copy_encryption = job.take_primary_copy_encryption();
     let source_warnings = job.has_warnings();
     // qpdf raises the writer floor from every input processed by the job
     // (`QPDFJob.cc:1714-1715`) and applies that floor before explicit
@@ -7747,11 +7735,9 @@ fn run_page_extraction_from_multiple_sources(
         );
     }
 
-    // The merge job has already rebuilt the target page tree and copied the
-    // primary document-level structures. Represent its current output pages
-    // as a local selection so the shared post-selection consumer can apply
-    // rotate, cleanup, overlays, split naming, and writer options without
-    // reintroducing source-document ObjectRefs.
+    // The Job has already mutated the primary page tree and copied selected
+    // foreign pages into that same document. Use its resulting page list for
+    // the CLI-specific post-selection transformations.
     let selected_pages = pages::page_refs(&mut merged)?;
 
     let result = run_page_extraction_after_plan(
@@ -7774,8 +7760,6 @@ fn run_page_extraction_from_multiple_sources(
         linearize_pass1,
         verbose,
         standard_output,
-        primary_encrypted,
-        primary_copy_encryption,
         source_warnings,
         None,
         selected_pages,
@@ -7867,8 +7851,6 @@ fn run_page_extraction_from_single_source(
         }
     };
     pdf.set_suppress_warnings(no_warn);
-    let primary_encrypted = pdf.is_encrypted();
-    let primary_copy_encryption = pdf.writer_copy_encryption_source()?;
     let source_warnings = job.has_warnings();
 
     finish_page_extraction(
@@ -7885,8 +7867,6 @@ fn run_page_extraction_from_single_source(
         linearize,
         linearize_pass1,
         verbose,
-        primary_encrypted,
-        primary_copy_encryption,
         source_warnings,
         image_options,
         coalesce_contents,
@@ -7913,8 +7893,6 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     linearize_pass1: Option<&Path>,
     verbose: bool,
     _standard_output: Option<PipelineWriter>,
-    primary_encrypted: bool,
-    primary_copy_encryption: Option<CopyEncryptionSource>,
     prior_warnings: bool,
     page_job_result: Option<(RebuildResult, RemoveUnreferencedResources)>,
     selected_pages: Vec<ObjectRef>,
@@ -7933,7 +7911,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     } else {
         // Multi-source and empty-primary page jobs already performed qpdf's
         // Auto|Yes|No resource decision on each source before copying pages
-        // (`QPDFJob.cc:2251-2455`). The merged target is only being presented
+        // (`QPDFJob.cc:2251-2455`). The primary is only being presented
         // to the shared completion boundary here; running the page-local
         // resource pass again would mutate shared page/appearance resources
         // a second time and split identities that qpdf preserves. Keep the
@@ -7968,8 +7946,6 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         linearize,
         linearize_pass1,
         verbose,
-        primary_encrypted,
-        primary_copy_encryption,
         prior_warnings,
         image_options,
         coalesce_contents,
@@ -8001,8 +7977,6 @@ fn finish_page_extraction<R: Read + Seek + 'static>(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     verbose: bool,
-    primary_encrypted: bool,
-    primary_copy_encryption: Option<CopyEncryptionSource>,
     prior_warnings: bool,
     image_options: ImageTransformOptions,
     coalesce_contents: bool,
@@ -8019,16 +7993,10 @@ fn finish_page_extraction<R: Read + Seek + 'static>(
         .transpose()?;
     let split_pages_active = split_pages.is_some_and(|size| size > 0);
     options.preserve_encryption =
-        options.preserve_encryption && primary_encrypted && !split_pages_active && !decrypt;
-    // qpdf keeps the authenticated primary input as the output/base document
-    // for `--pages` (libqpdf/QPDFJob.cc:2360-2633). The multi-source job has
-    // already copied selected pages into a fresh plaintext Pdf, so its writer
-    // cannot rediscover the primary's encryption from the merged document.
-    // Carry the authenticated donor explicitly to the final writer; split
-    // chunks remain cleartext, matching qpdf's fresh chunk writers. Gate on
-    // the decrypt flag as well: qpdf clears encryption preservation at this
-    // same writer boundary when the output is explicitly decrypted
-    // (QPDFJob.cc:2847-2877).
+        options.preserve_encryption && pdf.is_encrypted() && !split_pages_active && !decrypt;
+    // The selected page graph still belongs to qpdf's primary document, so
+    // the writer reads its live `/Encrypt` state directly. Split chunks and
+    // explicit decryption remain cleartext (`QPDFJob.cc:2847-2877`).
     // the same conditions as `PdfWriter::prepared_write_options`'s implicit
     // `can_preserve` (`writer.rs:645-652`) so an explicit source
     // doesn't bypass qpdf's QDF-is-always-cleartext contract
@@ -8039,25 +8007,6 @@ fn finish_page_extraction<R: Read + Seek + 'static>(
     // and an explicit non-`none` `--decode-level` does the same directly,
     // both of which `can_preserve` would likewise refuse to auto-preserve
     // through.
-    // An explicit --encrypt wins over the implicit donor carryover. The two
-    // are mutually exclusive in the writer -- `copy_encryption_parameters`
-    // clears `encryption_parameters` (`writer.rs:451-453`) -- so letting the
-    // carryover run here would silently drop the requested passwords and leave
-    // the output openable with the source credentials instead.
-    if options.preserve_encryption
-        && !split_pages_active
-        && options.encrypt.is_none()
-        && options.copy_encryption.is_none()
-        && !options.qdf
-        && !options.content_normalization
-        && !matches!(
-            options.stream_data,
-            Some(StreamDataMode::Uncompress) | Some(StreamDataMode::Compress)
-        )
-        && !(options.decode_level_set && options.decode_level != StreamDecodeLevel::None)
-    {
-        options.copy_encryption = primary_copy_encryption;
-    }
     // qpdf keeps a provider-backed source QPDF alive when
     // `copyForeignObject` copies a Form XObject whose data comes from a
     // `StreamDataProvider` (`libqpdf/QPDF.cc:2248-2257`). Retain one

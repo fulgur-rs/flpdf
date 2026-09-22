@@ -50,7 +50,7 @@ markdown だけを読むので `--no-qpdf`（CI の形）でも完全に動く�
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 138 | 0 | 23 | 0 | 161 |
+| 139 | 0 | 22 | 0 | 161 |
 
 ### checker logical aggregate（260 rows）
 
@@ -63,7 +63,7 @@ rowsを検証する。2026-09-20（`flpdf-ycb6l`、`QPDF::isLinearized` のB35�
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 229 | 0 | 31 | 0 | 260 |
+| 230 | 0 | 30 | 0 | 260 |
 
 したがって、161行の領域別表と260 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
@@ -144,7 +144,7 @@ C44は public facade と deferred blob の責務分離を追跡する mixed owne
 | [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 35 | 29 | 0 | 6 | 0 |
 | [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 42 | 0 | 0 | 0 |
 | [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 26 | 0 | 5 | 0 |
-| [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 21 | 0 | 8 | 0 |
+| [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 22 | 0 | 7 | 0 |
 
 ## 5. 責任境界と不変条件
 

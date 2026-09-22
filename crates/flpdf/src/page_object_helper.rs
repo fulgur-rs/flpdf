@@ -1004,7 +1004,9 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// contains those page copies when this replay starts, so a fresh full
     /// `analyze()` would report their not-yet-added widgets as orphaned. Keep
     /// the canonical field-tree copy/rename route, but defer the page orphan
-    /// scan to the completed output boundary.
+    /// scan to the completed output boundary. This helper is retained only by
+    /// tests of the former fresh-target merge.
+    #[cfg(test)]
     pub(crate) fn copy_annotations_with_field_tree_only(
         &mut self,
         from_page: ObjectHandle,
@@ -1012,6 +1014,36 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         reserved_names: &BTreeSet<Vec<u8>>,
     ) -> Result<()> {
         self.copy_annotations_with_reserved_names_impl(from_page, cm, reserved_names, true)
+    }
+
+    /// Replace copied annotations using qpdf's same-document
+    /// `QPDFAcroFormDocumentHelper::fixCopiedAnnotations` boundary. The page
+    /// already has its shallow-copied `/Annots`; qpdf clones the source
+    /// annotation/field tree and replaces that array after each repeated page
+    /// occurrence (`QPDFAcroFormDocumentHelper.cc:1017-1047`).
+    pub(crate) fn fix_copied_annotations_with_field_tree_only(
+        &mut self,
+        from_page: ObjectHandle,
+        reserved_names: &BTreeSet<Vec<u8>>,
+    ) -> Result<()> {
+        let destination = self.resolved_page_handle()?;
+        self.require_page_ref()?;
+        validate_same_document_page_handle(self.pdf, &from_page)?;
+        let old_annots = from_page.try_get_key(b"/Annots")?;
+        if !old_annots.try_is_array()? {
+            return Ok(());
+        }
+        let transformed = {
+            let mut acroform = crate::AcroFormDocumentHelper::new_for_field_tree(self.pdf)?;
+            let transformed = acroform.transform_annotations(old_annots, Matrix::default())?;
+            acroform.add_and_rename_form_fields_with_reserved_names(
+                transformed.new_fields.clone(),
+                reserved_names,
+            )?; // cov:ignore: malformed field-copy errors are covered by AcroForm transform tests.
+            transformed
+        };
+        destination.replace_key(b"/Annots", ObjectHandle::array(transformed.new_annotations))?;
+        Ok(())
     }
 
     fn copy_annotations_with_reserved_names_impl(
@@ -1103,6 +1135,39 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         Ok(())
     }
 
+    /// Foreign-page variant of qpdf's `fixCopiedAnnotations` that keeps the
+    /// destination's page-orphan scan deferred until page selection finishes.
+    /// The persistent foreign object copier supplies the shared source identity
+    /// map; `field_tree_only` preserves qpdf's per-occurrence field-copy order
+    /// without treating page annotations pending replacement as orphans.
+    pub(crate) fn fix_copied_annotations_from_with_field_tree_only<RS: Read + Seek>(
+        &mut self,
+        from_page: ObjectHandle,
+        source: &mut Pdf<RS>,
+        reserved_names: &BTreeSet<Vec<u8>>,
+    ) -> Result<()> {
+        let destination = self.resolved_page_handle()?;
+        self.require_page_ref()?;
+        validate_foreign_page_handle(source, self.pdf, &from_page)?;
+        let old_annots = from_page.try_get_key(b"/Annots")?;
+        if !old_annots.try_is_array()? {
+            return Ok(());
+        }
+        let transformed = {
+            let mut acroform = crate::AcroFormDocumentHelper::new_for_field_tree(self.pdf)?;
+            let transformed =
+                acroform.transform_annotations_from(old_annots, Matrix::default(), source)?;
+            acroform.add_and_rename_form_fields_with_reserved_names(
+                transformed.new_fields.clone(),
+                reserved_names,
+            )?; // cov:ignore: malformed field-copy errors are covered by AcroForm transform tests.
+            transformed
+        };
+        destination.replace_key(b"/Annots", ObjectHandle::array(transformed.new_annotations))?;
+        *self.pdf.acroform_cache.borrow_mut() = None;
+        Ok(())
+    }
+
     /// Foreign-document annotation copy with qpdf's still-live primary
     /// field-name reservations applied to collision renaming.
     pub(crate) fn copy_annotations_from_with_reserved_names<RS: Read + Seek>(
@@ -1124,6 +1189,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// Foreign annotation copy for qpdf's page-selection replay. See
     /// [`Self::copy_annotations_with_field_tree_only`] for why the destination
     /// helper must defer its page orphan scan while copied pages are pending.
+    #[cfg(test)]
     pub(crate) fn copy_annotations_from_with_field_tree_only<RS: Read + Seek>(
         &mut self,
         from_page: ObjectHandle,

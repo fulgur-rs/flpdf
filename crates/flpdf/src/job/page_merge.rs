@@ -1,6 +1,10 @@
-//! Merge selected pages from multiple PDF documents into one new document.
+//! Merge selected pages from multiple PDF documents into a new document.
 //!
-//! qpdf correspondence: QPDFJob.cc page-selection merge pipeline split across page-operation modules.
+//! qpdf correspondence: `QPDF::copyForeignObject` and page-insertion primitives.
+//!
+//! Production `QPDFJob::handlePageSpecs` keeps the primary document in place in
+//! [`super::page_specs`]; this module's [`merge_documents`] is a separate
+//! fresh-target Rust API.
 //!
 //! [`merge_documents`] copies selected pages from N source documents into one
 //! fresh target. `inputs[0]` is the primary: its Catalog/trailer state is the
@@ -1121,14 +1125,12 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary_into<
     )
 }
 
-/// Merge pages for qpdf's `QPDFJob::handlePageSpecs` consumer.
+/// Exercise the old fresh-target page merge in unit tests.
 ///
-/// qpdf does not build a source-grouped AcroForm before its per-occurrence
-/// `fixCopiedAnnotations` loop (`QPDFJob.cc:2517-2585`). Foreign fields are
-/// therefore left on the copied page graph and are introduced only by that
-/// replay. The generic public merge primitive keeps its existing grouped-field
-/// behavior; this job-owned entry point selects the qpdf page-selection
-/// boundary without adding a second object-copy implementation.
+/// Production `QPDFJob::handlePageSpecs` now mutates the primary document and
+/// copies foreign pages in occurrence order. This wrapper remains only for
+/// focused tests of the lower-level grouped merge implementation.
+#[cfg(test)]
 pub(crate) fn merge_documents_for_page_specs_into<R: Read + Seek, T: Read + Seek>(
     inputs: &mut [MergeInput<'_, R>],
     remove_resources: &[bool],
@@ -1883,7 +1885,7 @@ mod tests {
     #[test]
     fn page_merge_production_route_has_no_legacy_borrowed_resolution() {
         let production = include_str!("page_merge.rs")
-            .split_once("#[cfg(test)]")
+            .split_once("#[cfg(test)]\nmod tests")
             .expect("page_merge test module marker")
             .0;
         assert_eq!(
@@ -1896,7 +1898,7 @@ mod tests {
     #[test]
     fn install_primary_object_stream_membership_routes_through_get_object_stream_data() {
         let production = include_str!("page_merge.rs")
-            .split_once("#[cfg(test)]")
+            .split_once("#[cfg(test)]\nmod tests")
             .expect("page_merge test module marker")
             .0;
         let body = production

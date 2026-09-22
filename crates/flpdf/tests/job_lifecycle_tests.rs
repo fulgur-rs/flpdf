@@ -1,8 +1,8 @@
-use flpdf::job::{AttachmentAddOptions, JobDocument, JobExitCode, PageSpecInput, QPDFJob};
+use flpdf::job::{AttachmentAddOptions, JobDocument, JobExitCode, QPDFJob};
 use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
 use flpdf::{
-    EncryptParams, EncryptedError, Error, ObjectHandle, ObjectStreamMode, PageRange, Pdf,
-    PdfOpenOptions, PdfWriter, QPDFLogger, WriterConfiguration,
+    EncryptParams, EncryptedError, Error, ObjectHandle, ObjectStreamMode, Pdf, PdfOpenOptions,
+    PdfWriter, QPDFLogger,
 };
 use std::fs::File;
 use std::io::{BufReader, Cursor, Write};
@@ -1087,63 +1087,6 @@ fn qpdfjob_error_report_uses_qpdf_invalid_password_wording() {
     job.report_job_error(&Error::Encrypted(flpdf::EncryptedError::BadPassword))
         .unwrap();
     assert_eq!(state.lock().unwrap().bytes, b"qpdf: invalid password\n");
-}
-
-#[test]
-fn keep_files_open_policy_counts_distinct_page_sources_and_honors_overrides() {
-    let range = PageRange::parse_numrange("1").unwrap();
-    let one_source = [
-        PageSpecInput::new(1, range.clone()),
-        PageSpecInput::new(1, range.clone()),
-    ];
-    let two_sources = [
-        PageSpecInput::new(1, range.clone()),
-        PageSpecInput::new(2, range),
-    ];
-
-    let mut job = QPDFJob::new();
-    job.set_keep_files_open_threshold(1);
-    assert!(job.keep_files_open_for_page_specs(&one_source));
-    assert!(!job.keep_files_open_for_page_specs(&two_sources));
-
-    job.set_keep_files_open(true);
-    assert!(job.keep_files_open_for_page_specs(&two_sources));
-    job.set_keep_files_open(false);
-    assert!(!job.keep_files_open_for_page_specs(&one_source));
-
-    assert_eq!(
-        QPDFJob::parse_keep_files_open_threshold("+50junk").unwrap(),
-        50
-    );
-}
-
-#[test]
-fn keep_files_open_policy_is_parsed_at_argv_and_json_job_boundaries() {
-    let range = PageRange::parse_numrange("1").unwrap();
-    let specs = [PageSpecInput::new(1, range.clone())];
-
-    let mut argv_job = QPDFJob::new();
-    argv_job
-        .initialize_from_argv(&[
-            "qpdfjob".to_owned(),
-            "input.pdf".to_owned(),
-            "output.pdf".to_owned(),
-            "--keep-files-open=n".to_owned(),
-            "--keep-files-open-threshold=+50junk".to_owned(),
-        ])
-        .unwrap();
-    assert!(!argv_job.keep_files_open_for_page_specs(&specs));
-
-    let json = serde_json::json!({
-        "inputFile": "input.pdf",
-        "outputFile": "output.pdf",
-        "keepFilesOpen": "n",
-        "keepFilesOpenThreshold": "50junk"
-    })
-    .to_string();
-    let mut json_job = QPDFJob::new();
-    json_job.initialize_from_json(&json).unwrap();
-    assert!(!json_job.keep_files_open_for_page_specs(&specs));
 }
 
 #[test]
@@ -3321,7 +3264,7 @@ fn create_qpdf_write_qpdf_preserves_a_between_stage_mutation() {
 }
 
 #[test]
-fn create_qpdf_returns_an_erased_multi_source_document_for_later_write() {
+fn create_qpdf_returns_the_primary_with_multi_source_pages_for_later_write() {
     let primary =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
     let secondary = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3343,7 +3286,7 @@ fn create_qpdf_returns_an_erased_multi_source_document_for_later_write() {
     let mut pdf = job
         .create_qpdf()
         .unwrap()
-        .expect("createQPDF should return an erased merged document");
+        .expect("createQPDF should return the primary JobDocument");
     assert_eq!(flpdf::pages::page_refs(&mut pdf).unwrap().len(), 2);
 
     job.write_qpdf(&mut pdf).unwrap();
@@ -3352,20 +3295,9 @@ fn create_qpdf_returns_an_erased_multi_source_document_for_later_write() {
     assert_eq!(flpdf::pages::page_refs(&mut written).unwrap().len(), 2);
 }
 
-/// A multi-source merge replaces `create_qpdf`'s returned document with a
-/// fresh, unencrypted target (`docs/qpdf-correspondence.md`, `flpdf-clq9`),
-/// so a caller that still needs the encrypted primary's own encryption bits
-/// after `create_qpdf` returns cannot read them back from that document.
-/// A failed `create_qpdf` must not leave a previous document's encryption
-/// snapshot visible.
-///
-/// qpdf carries no such snapshot: `handlePageSpecs` mutates the primary
-/// `QPDF` in place (`libqpdf/QPDFJob.cc:2359-2362`), so a later `createQPDF`
-/// cannot observe an earlier document's `/Encrypt` state. These fields exist
-/// only because flpdf's merge builds a fresh target, which makes clearing
-/// them flpdf's responsibility.
+/// A failed `create_qpdf` must reset the status from its previous document.
 #[test]
-fn a_failed_create_clears_the_previous_encryption_snapshot() {
+fn a_failed_create_clears_the_previous_encryption_status() {
     let primary = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
     let secondary =
@@ -3392,8 +3324,8 @@ fn a_failed_create_clears_the_previous_encryption_snapshot() {
         "the first create records the primary's encryption bit"
     );
 
-    // Reuse the *same* job for a document that cannot be opened. qpdf has no
-    // snapshot to go stale here; flpdf must clear its own.
+    // Reuse the same job for a document that cannot be opened; its status
+    // must reset rather than report the previous document's encryption.
     let missing = tempdir.path().join("no-such-input.pdf");
     let second = serde_json::json!({
         "inputFile": missing,
@@ -3407,19 +3339,15 @@ fn a_failed_create_clears_the_previous_encryption_snapshot() {
         !job.encryption_status().0,
         "a create that never opened a document must not report encryption"
     );
-    assert!(
-        job.take_primary_copy_encryption().is_none(),
-        "a create that never opened a document must not offer a copy-encryption donor"
-    );
 }
 
-/// The public creation factories clear the snapshots too.
+/// The public creation factories reset qpdf's encryption status too.
 ///
 /// `create_empty_document` and `create_from_json_document` are advertised
-/// entry points that do not run through `create_qpdf`, so each has to clear
-/// what a previous document left behind.
+/// entry points that do not run through `create_qpdf`, so each resets the
+/// status left by a previous document.
 #[test]
-fn the_public_factories_clear_the_previous_encryption_snapshot() {
+fn the_public_factories_clear_the_previous_encryption_status() {
     let primary = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
     let secondary =
@@ -3446,13 +3374,12 @@ fn the_public_factories_clear_the_previous_encryption_snapshot() {
         !job.encryption_status().0,
         "create_empty_document must not inherit the previous document's encryption"
     );
-    assert!(job.take_primary_copy_encryption().is_none());
 }
 
-/// `QPDFJob::encryption_status`/`take_primary_copy_encryption` expose the
-/// pre-merge snapshot for exactly that case (flpdf-3yn9.48.192).
+/// qpdf keeps the primary QPDF as the multi-source page-operation result, so
+/// its encryption remains live on the document returned by `createQPDF`.
 #[test]
-fn create_qpdf_captures_the_primary_encryption_snapshot_before_a_multi_source_merge() {
+fn create_qpdf_multi_source_keeps_primary_encryption_live() {
     let primary = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
     let secondary =
@@ -3474,13 +3401,8 @@ fn create_qpdf_captures_the_primary_encryption_snapshot_before_a_multi_source_me
     let mut pdf = job
         .create_qpdf()
         .unwrap()
-        .expect("createQPDF should return an erased merged document");
-
-    // The fresh merged target cannot answer the primary's own question.
-    assert!(
-        !pdf.is_encrypted(),
-        "the multi-source merge target is always a fresh, unencrypted document"
-    );
+        .expect("createQPDF should return the primary document");
+    assert!(pdf.is_encrypted());
 
     let (encrypted, password_incorrect) = job.encryption_status();
     assert!(
@@ -3489,30 +3411,12 @@ fn create_qpdf_captures_the_primary_encryption_snapshot_before_a_multi_source_me
     );
     assert!(!password_incorrect);
 
-    let donor = job.take_primary_copy_encryption().expect(
-        "a multi-source merge of an encrypted primary must snapshot a copy-encryption donor",
-    );
-    assert!(
-        job.take_primary_copy_encryption().is_none(),
-        "the snapshot is consumed by the first take"
-    );
-
-    // Feed the snapshot to a *separate* job's writer configuration, the way
-    // a caller that completes the write on a different `QPDFJob` instance
-    // (rather than this same job's own `write_qpdf`) must.
-    let mut writer_configuration = WriterConfiguration::default();
-    writer_configuration.copy_encryption_parameters(donor);
-    let mut write_job = QPDFJob::new();
-    write_job.set_output_file(&output).unwrap();
-    write_job
-        .config()
-        .writer_configuration(writer_configuration);
-    write_job.write_qpdf(&mut pdf).unwrap();
+    job.write_qpdf(&mut pdf).unwrap();
 
     let written = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     assert!(
         written.is_encrypted(),
-        "the copied donor must reproduce the primary's encryption on the output"
+        "writeQPDF must preserve encryption from the still-live primary"
     );
 }
 
@@ -3831,7 +3735,7 @@ fn build_outline_fixture() -> Vec<u8> {
 
 /// A single-source `--pages . 1` job (qpdf's own-file page selection) takes
 /// the in-place `QPDFJob::handle_page_specs` route
-/// (`PageSpecJobOutput::InPlace`). Before this test, `QPDFJob::run`'s
+/// through the same primary document. Before this test, `QPDFJob::run`'s
 /// in-place branch pruned the subset without first calling
 /// `remap_outline_and_dests`, leaving the outline's `/Dest` pointing at the
 /// now-removed, ungutted page 2 object instead of the null-and-kept-live
@@ -6483,22 +6387,26 @@ fn argv_initialization_after_a_run_keeps_later_job_json_layering() {
     );
 }
 
-/// Build the multi-source `--pages` merge target for a
-/// `--preserve-unreferenced` job and return its written bytes.
-///
-/// `split_pages` carries qpdf's raw `--split-pages` parameter, so `Some("0")`
-/// reproduces qpdf's falsy value (`if (m->split_pages)`) rather than an
-/// absent option.
-fn preserve_unreferenced_merge_target(split_pages: Option<&str>) -> Vec<u8> {
+/// Create a multi-source page job with `--preserve-unreferenced` and expose
+/// the primary cache through an uncompressed QDF writer. A truthy split uses
+/// the configured Job writer, whose chunks must omit primary orphans.
+fn preserve_unreferenced_page_job_output(split_pages: Option<&str>) -> Vec<Vec<u8>> {
     let primary = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat/null-visible-preserve-unreachable.pdf");
     let secondary =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
     let tempdir = tempfile::tempdir().unwrap();
+    let split = split_pages.is_some_and(|value| value != "0");
+    let output = if split {
+        tempdir.path().join("chunk-%d.pdf")
+    } else {
+        tempdir.path().join("merged.pdf")
+    };
     let mut json = serde_json::json!({
         "inputFile": primary,
-        "outputFile": tempdir.path().join("merged.pdf"),
+        "outputFile": output.clone(),
         "preserveUnreferenced": "",
+        "qdf": "",
         "pages": [
             {"file": ".", "range": "1"},
             {"file": secondary, "range": "1"}
@@ -6515,16 +6423,25 @@ fn preserve_unreferenced_merge_target(split_pages: Option<&str>) -> Vec<u8> {
         .unwrap()
         .expect("the multi-source merge must succeed");
 
-    // Write the intermediate itself, with the writer option still on, so the
-    // assertion sees exactly what the merge copied rather than what a later
-    // stage would have kept.
-    let mut writer = PdfWriter::new(&mut merged);
-    writer.set_static_id(true);
-    writer.set_object_stream_mode(ObjectStreamMode::Disable);
-    writer.set_preserve_unreferenced_objects(true);
-    writer.set_output_memory().expect("configure memory output");
-    writer.write().expect("write the merge target");
-    writer.get_buffer().expect("writer output")
+    if split {
+        job.write_qpdf(&mut merged).unwrap();
+        (1..=9)
+            .map_while(|index| {
+                let path = tempdir.path().join(format!("chunk-{index}.pdf"));
+                path.exists()
+                    .then(|| std::fs::read(path).expect("read split chunk"))
+            })
+            .collect()
+    } else {
+        let mut writer = PdfWriter::new(&mut merged);
+        writer.set_static_id(true);
+        writer.set_qdf_mode(true);
+        writer.set_object_stream_mode(ObjectStreamMode::Disable);
+        writer.set_preserve_unreferenced_objects(true);
+        writer.set_output_memory().expect("configure memory output");
+        writer.write().expect("write primary object cache");
+        vec![writer.get_buffer().expect("read QDF output")]
+    }
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
@@ -6533,33 +6450,35 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-/// `--preserve-unreferenced` must not make the merge resolve and copy the
-/// primary's unreferenced objects when `--split-pages` will discard them.
+/// qpdf keeps primary orphans in its object cache and lets the writer decide
+/// whether a split chunk can reach them.
 ///
 /// qpdf's `--preserve-unreferenced` is a writer option
 /// (`libqpdf/QPDFWriter.cc:2907-2913`) and `QPDFJob::handlePageSpecs` keeps
-/// the primary `QPDF` as the output document, so the writer finds those
-/// objects in place. flpdf's multi-source route merges into a fresh target
-/// and copies them across to match. `QPDFJob::doSplitPages`
+/// the primary `QPDF` as the output document. `QPDFJob::doSplitPages`
 /// (`libqpdf/QPDFJob.cc:2940-3027`) instead builds every chunk from its own
 /// `emptyPDF()` populated only by `addPage(page, false)`, so no chunk can
 /// ever contain them and the copy is work the split throws away.
 #[test]
-fn a_split_run_skips_the_discarded_primary_orphan_copy() {
-    let merged = preserve_unreferenced_merge_target(None);
+fn a_split_run_skips_primary_orphans_but_ordinary_output_preserves_them() {
+    let merged = preserve_unreferenced_page_job_output(None);
     assert!(
-        contains_bytes(&merged, b"unreachable root"),
-        "an ordinary multi-source --preserve-unreferenced merge keeps the primary's \
-         unreferenced objects"
+        contains_bytes(&merged[0], b"unreachable root"),
+        "the in-place primary cache retains its unreferenced objects"
     );
 
-    let split = preserve_unreferenced_merge_target(Some("1"));
+    let split = preserve_unreferenced_page_job_output(Some("1"));
+    assert!(!split.is_empty(), "split pages must produce output chunks");
     assert!(
-        !contains_bytes(&split, b"unreachable root"),
+        split
+            .iter()
+            .all(|chunk| !contains_bytes(chunk, b"unreachable root")),
         "a --split-pages run must not copy primary orphans no chunk can hold"
     );
     assert!(
-        !contains_bytes(&split, b"unreachable child"),
+        split
+            .iter()
+            .all(|chunk| !contains_bytes(chunk, b"unreachable child")),
         "the whole unreferenced closure must be skipped, not just its root"
     );
 }
@@ -6569,9 +6488,9 @@ fn a_split_run_skips_the_discarded_primary_orphan_copy() {
 /// unreferenced objects.
 #[test]
 fn a_falsy_split_pages_value_still_preserves_primary_orphans() {
-    let merged = preserve_unreferenced_merge_target(Some("0"));
+    let merged = preserve_unreferenced_page_job_output(Some("0"));
     assert!(
-        contains_bytes(&merged, b"unreachable root"),
+        contains_bytes(&merged[0], b"unreachable root"),
         "--split-pages=0 never splits, so the writer still reaches the primary's \
          unreferenced objects"
     );

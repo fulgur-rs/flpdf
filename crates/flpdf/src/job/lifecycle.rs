@@ -12,7 +12,7 @@ use super::overlay::{
     handle_under_overlay, overlay_verbose_report, OverlayKind, OverlaySpec, OverlayVerbosePage,
 };
 use super::page_range::PageRange;
-use super::page_specs::{PageSpecInput, PageSpecJobOutput};
+use super::page_specs::PageSpecInput;
 use super::page_split::SplitPageOptions;
 use super::resource_pruning::RemoveUnreferencedResources;
 use super::rotate::flatten_rotation_on_pages;
@@ -1186,23 +1186,17 @@ fn parse_job_split_pages(value: &[u8]) -> Result<i32> {
     }
 }
 
-/// Whether a multi-source page selection must copy the primary's
-/// page-tree-unreferenced objects into its fresh merge target.
+/// Whether the old test-only fresh-target merge includes the primary's
+/// page-tree-unreferenced objects.
 ///
-/// `--preserve-unreferenced` is a writer option in qpdf
-/// (`libqpdf/QPDFWriter.cc:2907-2913`), and `QPDFJob::handlePageSpecs` keeps
-/// the primary `QPDF` itself as the output document, so the writer simply
-/// finds those objects still in place. flpdf's multi-source route merges into
-/// a fresh target instead, and copies that unreferenced set across to match.
+/// Production page selection keeps the primary document in place, so
+/// `--preserve-unreferenced` remains solely a writer option
+/// (`libqpdf/QPDFWriter.cc:2907-2913`).
 ///
-/// A split run never writes that target. `QPDFJob::doSplitPages`
-/// (`libqpdf/QPDFJob.cc:2940-3027`) builds every chunk from its own
-/// `QPDF`/`emptyPDF()` populated only by `addPage(page, false)`, so the
-/// unreferenced objects are not in the chunk's object cache and the writer
-/// option it re-applies per chunk (`QPDFJob.cc:3021` reaching
-/// `QPDFJob.cc:2856`) has nothing extra to enqueue. Real qpdf's split output
-/// therefore carries no preserved primary orphans; resolving and copying that
-/// graph into the intermediate document is work the split discards.
+/// A split run writes each chunk from its own `QPDF`/`emptyPDF()` populated
+/// only by `addPage(page, false)` (`QPDFJob.cc:2940-3027`); the writer option
+/// therefore has no primary orphan graph to enqueue for those chunks.
+#[cfg(test)]
 fn preserve_unreferenced_for_page_merge(configuration: &JobConfiguration) -> bool {
     configuration.writer.preserves_unreferenced_objects()
         && !configuration.split_pages.is_some_and(|size| size != 0)
@@ -1527,19 +1521,14 @@ pub struct QPDFJob {
     warnings_exit_zero: bool,
     progress_handler: Option<SharedProgressHandler>,
     configuration: JobConfiguration,
-    /// Source documents retained by the create-stage page merge. The copied
-    /// document may contain provider-backed streams that are intentionally
-    /// read only when the later write stage consumes them.
+    /// Foreign page sources retained only for provider-backed stream reads
+    /// during the write stage. The primary remains the returned document,
+    /// and foreign object handles are disconnected when createQPDF ends like
+    /// qpdf's local `page_heap` (`QPDFJob.cc:465-480`).
     page_source_documents: Vec<JobDocument>,
     /// Overlay and underlay donors retained through the write boundary for
     /// the same deferred foreign-stream contract.
     overlay_sources: Vec<OverlaySpec<Box<dyn ReadSeek>>>,
-    /// Encryption captured from an encrypted primary before a multi-source
-    /// page merge replaces it with a fresh target. qpdf's writer preserves
-    /// that primary encryption after `createQPDF` has built the merged
-    /// document, so keep the authenticated snapshot on the job until
-    /// `write_qpdf` (`QPDFJob.cc:2891-2920`).
-    primary_copy_encryption: Option<crate::CopyEncryptionSource>,
     /// qpdf's status bits consumed by the side-effect-free exit-code query.
     encryption_status: EncryptionStatus,
     /// Whether the last create stage returned qpdf's successful null document
@@ -1660,7 +1649,6 @@ impl QPDFJob {
             configuration: qpdf_default_job_configuration(),
             page_source_documents: Vec::new(),
             overlay_sources: Vec::new(),
-            primary_copy_encryption: None,
             encryption_status: EncryptionStatus::default(),
             create_qpdf_succeeded_without_document: false,
             empty_primary_created: false,
@@ -1999,7 +1987,7 @@ impl QPDFJob {
     /// already assigned one source index to each literal filename, so the
     /// distinct source-index count is the same observable set operation.
     #[must_use]
-    pub fn keep_files_open_for_page_specs(&self, specs: &[PageSpecInput]) -> bool {
+    pub(crate) fn keep_files_open_for_page_specs(&self, specs: &[PageSpecInput]) -> bool {
         self.configuration.keep_files_open.unwrap_or_else(|| {
             let distinct_sources = specs
                 .iter()
@@ -2014,18 +2002,12 @@ impl QPDFJob {
         })
     }
 
-    /// Return the configured qpdf object-stream mode for page selection.
-    #[must_use]
-    pub(crate) fn object_stream_mode_for_page_specs(&self) -> crate::ObjectStreamMode {
-        self.configuration.writer.object_stream_mode()
-    }
-
     /// Emit qpdf's automatic keep-open selection line for a page-spec job.
     ///
     /// qpdf reports this before opening foreign page sources and only when the
     /// caller did not explicitly configure `--keep-files-open`
     /// (`libqpdf/QPDFJob.cc:2374-2386`).
-    pub fn report_page_spec_selection(&self, specs: &[PageSpecInput]) -> Result<()> {
+    pub(crate) fn report_page_spec_selection(&self, specs: &[PageSpecInput]) -> Result<()> {
         if !self.configuration.verbose || self.configuration.keep_files_open.is_some() {
             return Ok(());
         }
@@ -3046,23 +3028,15 @@ impl QPDFJob {
         Ok(pdf)
     }
 
-    /// Discard the encryption snapshots a previous document left behind.
-    ///
-    /// qpdf holds nothing to go stale here: `handlePageSpecs` mutates the
-    /// primary `QPDF` in place (`libqpdf/QPDFJob.cc:2359-2362`), so a later
-    /// creation can never observe an earlier document's `/Encrypt` state.
-    /// These fields exist only because flpdf's merge builds a fresh target,
-    /// and `finish_created_document` clears them only after a successful
-    /// open -- so every creation entry point clears them on the way in.
-    fn reset_encryption_snapshots(&mut self) {
-        self.primary_copy_encryption = None;
+    /// Reset qpdf's encryption status before a new create operation.
+    fn reset_encryption_status(&mut self) {
         self.encryption_status = EncryptionStatus::default();
     }
 
     /// Create qpdf's canonical empty document through the same job document
     /// boundary as file and JSON input.
     pub fn create_empty_document(&mut self) -> Result<JobDocument> {
-        self.reset_encryption_snapshots();
+        self.reset_encryption_status();
         // qpdf's `Config::emptyInput` uses the empty string as the page-spec
         // source-map key while `QPDF::emptyPDF` names the diagnostic source
         // "empty PDF" (`libqpdf/QPDFJob_config.cc:27-38`;
@@ -3122,7 +3096,7 @@ impl QPDFJob {
     where
         S: Read + Seek + 'static,
     {
-        self.reset_encryption_snapshots();
+        self.reset_encryption_status();
         let input_name = input_name.as_ref().to_vec();
         self.set_input_name_bytes(&input_name);
         // See `create_empty_document`: qpdf applies `noWarn` to every
@@ -3145,7 +3119,6 @@ impl QPDFJob {
     fn finish_created_document(&mut self, mut pdf: JobDocument) -> Result<JobDocument> {
         self.page_source_documents.clear();
         self.overlay_sources.clear();
-        self.primary_copy_encryption = None;
         self.encryption_status = EncryptionStatus {
             encrypted: pdf.is_encrypted(),
             password_incorrect: false,
@@ -3183,11 +3156,10 @@ impl QPDFJob {
 
     /// Apply qpdf's create-stage page operation and document transformations.
     ///
-    /// Multi-source page selection returns a fresh target, while the
-    /// one-source case keeps qpdf's in-place page identity. Secondary page
-    /// documents and overlay donors are retained on `self` because flpdf's
-    /// canonical foreign copier may defer provider-backed stream reads until
-    /// the later `write_qpdf` call.
+    /// Page selection mutates the primary QPDF in place for both one-source
+    /// and multi-source specifications. Secondary page documents are retained
+    /// only as owners for provider-backed stream reads deferred until the
+    /// later `write_qpdf` call.
     fn prepare_document(
         &mut self,
         primary: JobDocument,
@@ -3278,44 +3250,18 @@ impl QPDFJob {
             page_sources.push(source);
         }
 
-        // qpdf's page-operation target is fresh when more than one distinct
-        // source participates. In that case the target no longer carries the
-        // primary's `/Encrypt` state, but `writeQPDF` still preserves the
-        // authenticated primary encryption unless a writer option disables
-        // it. Snapshot the source while the primary document is still live;
-        // the later writer stage owns the precedence decision.
-        let primary_copy_encryption = if page_sources.len() > 1 {
-            page_sources[0].writer_copy_encryption_source()?
-        } else {
-            None
-        };
-
         if page_sources.len() == 1 && specs.iter().all(|spec| spec.source_index == 0) {
             {
-                let page_output = self.handle_page_specs(
+                let (result, prune_mode) = self.handle_page_specs(
                     &mut page_sources,
                     &specs,
                     configuration.collate.as_deref(),
                     configuration.remove_unreferenced_resources,
-                    configuration.writer.preserves_unreferenced_objects(),
                 )?; // cov:ignore: this successful in-place page selection continuation is covered by the public lifecycle tests
-                match page_output {
-                    PageSpecJobOutput::InPlace {
-                        pdf,
-                        result,
-                        prune_mode,
-                    } => {
-                        QPDFJob::complete_in_place_page_selection(pdf, &result, prune_mode)?;
-                    }
-                    PageSpecJobOutput::Merged(_) => {
-                        // cov:ignore-start: the method's single-source
-                        // predicate guarantees the in-place variant.
-                        return Err(Error::Internal(
-                            "single-source page selection returned a merged target".to_owned(),
-                        ));
-                        // cov:ignore-end
-                    }
-                }
+                let primary = page_sources
+                    .first_mut()
+                    .ok_or_else(|| Error::Internal("page selection lost its primary".to_owned()))?;
+                QPDFJob::complete_in_place_page_selection(primary, &result, prune_mode)?;
             }
             let mut primary = page_sources
                 .pop()
@@ -3325,60 +3271,44 @@ impl QPDFJob {
             return Ok(primary);
         }
 
-        let target = self.create_page_selection_target()?;
-        let page_output = self.handle_page_specs_with_target(
-            &mut page_sources,
-            &specs,
-            configuration.collate.as_deref(),
-            configuration.remove_unreferenced_resources,
-            preserve_unreferenced_for_page_merge(configuration),
-            target,
-        )?; // cov:ignore: llvm-cov attributes this covered multi-source call continuation to the opening expression
-        let mut primary = match page_output {
-            PageSpecJobOutput::Merged(merged) => {
-                // qpdf's page_heap is destroyed when createQPDF returns
-                // (`QPDF.cc:465-480`). Disconnect the source object graphs at
-                // that same boundary so direct values copied into the fresh
-                // target retain qpdf's destroyed-owner behavior at write time.
-                // Keep the erased Pdf wrappers only for the replace-input
-                // close boundary; file-backed foreign streams already capture
-                // their input and stream metadata in the canonical provider.
-                for source in page_sources.iter().skip(1) {
-                    source.resolver.disconnect_all();
-                }
-                self.page_source_documents = page_sources;
-                self.primary_copy_encryption = primary_copy_encryption;
-                *merged
-            }
-            PageSpecJobOutput::InPlace { .. } => {
-                // cov:ignore-start: a multi-source request always selects the
-                // caller-provided merged target.
-                return Err(Error::Internal(
-                    "multi-source page selection returned an in-place target".to_owned(),
-                ));
-                // cov:ignore-end
-            }
-        };
+        {
+            let _page_output = self.handle_page_specs(
+                &mut page_sources,
+                &specs,
+                configuration.collate.as_deref(),
+                configuration.remove_unreferenced_resources,
+            )?;
+        }
+        if page_sources.is_empty() {
+            // cov:ignore-start: handle_page_specs rejects missing sources and never removes its primary document.
+            return Err(Error::Internal(
+                "page selection lost its primary".to_owned(),
+            ));
+            // cov:ignore-end
+        }
+        let mut primary = page_sources.remove(0);
+        for source in &page_sources {
+            // qpdf destroys `page_heap` when createQPDF returns
+            // (`QPDFJob.cc:465-480`). Foreign stream providers retain their
+            // source bytes independently; indirect handles that escaped via
+            // page labels must observe the same destroyed-owner boundary.
+            source.resolver.disconnect_all();
+        }
+        // Foreign stream providers remain backed by their source documents
+        // through writeQPDF. qpdf owns one QPDF per source and copies foreign
+        // streams into the primary's page graph before page_heap is destroyed
+        // (`QPDFJob.cc:2396-2427,2514-2585`).
+        self.page_source_documents = page_sources;
         self.apply_configured_rotations(&mut primary, configuration)?;
         self.prepare_document_transformations(&mut primary, configuration)?;
         Ok(primary)
-    }
-
-    /// Create the empty target used by qpdf's multi-source page merge without
-    /// changing the job's configured primary input state.
-    fn create_page_selection_target(&self) -> Result<JobDocument> {
-        let mut options = self.configured_open_options(Vec::new());
-        options.logger = Some(self.logger.clone());
-        options.suppress_warnings = self.suppress_warnings;
-        options.description = b"empty PDF".to_vec();
-        crate::engine::open_empty_with_options_erased(options)
     }
 
     /// Create the configured input document, returning `None` after qpdf-style
     /// error reporting for a missing or malformed input.
     pub fn create_qpdf(&mut self) -> Result<Option<JobDocument>> {
         self.create_qpdf_succeeded_without_document = false;
-        self.reset_encryption_snapshots();
+        self.reset_encryption_status();
         match self.check_configuration() {
             Ok(()) => {}
             Err(error @ Error::Usage(_)) => return Err(error),
@@ -3505,41 +3435,15 @@ impl QPDFJob {
     /// `password_incorrect`) carries the same two bits as an idiomatic Rust
     /// tuple instead of a C-style bitmask.
     ///
-    /// A multi-source page-spec merge replaces `create_qpdf`'s returned
-    /// document with a fresh, unencrypted target
-    /// (`docs/qpdf-correspondence.md`, `flpdf-clq9`), so a caller that still
-    /// needs the primary's own encryption bits after `create_qpdf` returns
-    /// cannot read them back from that document; this snapshot, captured
-    /// before the merge, is the only remaining source.
+    /// Multi-source page selection keeps the primary document as the returned
+    /// `create_qpdf` value, so its `/Encrypt` state remains live for
+    /// `write_qpdf`; this status separately mirrors qpdf's Job-level getter.
     #[must_use]
     pub fn encryption_status(&self) -> (bool, bool) {
         (
             self.encryption_status.encrypted,
             self.encryption_status.password_incorrect,
         )
-    }
-
-    /// Take the copy-encryption donor snapshot captured when a multi-source
-    /// page-spec merge replaced the primary with a fresh target.
-    ///
-    /// qpdf's `handlePageSpecs` mutates the primary `QPDF` object in place
-    /// instead of building a fresh merged document
-    /// (`libqpdf/QPDFJob.cc:2359-2362`), so `writeQPDF` simply reads the
-    /// still-live primary's `/Encrypt` state directly and has no counterpart
-    /// accessor for this. flpdf's canonical multi-source merge necessarily
-    /// creates a fresh target instead (`docs/qpdf-correspondence.md`,
-    /// `flpdf-clq9`): [`Self::write_qpdf`] already consumes this snapshot
-    /// internally (via the same field) when it writes through *this* job. A
-    /// caller that completes the write on a *different* `QPDFJob` instance
-    /// must take the snapshot here first, before configuring that instance.
-    // qpdf-deviation: qpdf's `handlePageSpecs` mutates the primary `QPDF` in
-    // place (`libqpdf/QPDFJob.cc:2359-2362`), so `writeQPDF` reads the still-live
-    // primary's `/Encrypt` state and qpdf has no accessor to correspond to. This
-    // snapshot exists only because flpdf's canonical multi-source merge builds a
-    // fresh target (`flpdf-clq9`); it is CLAUDE.md deviation class (C), not (B),
-    // since there is no qpdf concept whose container is being substituted.
-    pub fn take_primary_copy_encryption(&mut self) -> Option<crate::CopyEncryptionSource> {
-        self.primary_copy_encryption.take()
     }
 
     /// Write a created document through the configured qpdf writer and
@@ -3623,18 +3527,6 @@ impl QPDFJob {
                     self.report_job_error(&error)?;
                     return Err(error);
                 }
-            }
-        }
-        if self.configuration.copy_encryption.is_none()
-            && !pdf.is_encrypted()
-            && !splitting
-            && writer_configuration.can_preserve_encryption()
-        {
-            if let Some(source) = self.primary_copy_encryption.take() {
-                // The explicit donor above wins when configured. This branch
-                // is qpdf's implicit primary-encryption preservation for a
-                // fresh multi-source page-operation target.
-                writer_configuration.copy_encryption_parameters(source);
             }
         }
         writer_configuration.set_linearization(self.configuration.linearize);
@@ -5965,6 +5857,63 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn keep_files_open_policy_counts_distinct_page_sources_and_honors_overrides() {
+        let range = PageRange::parse_numrange("1").unwrap();
+        let one_source = [
+            PageSpecInput::new(1, range.clone()),
+            PageSpecInput::new(1, range.clone()),
+        ];
+        let two_sources = [
+            PageSpecInput::new(1, range.clone()),
+            PageSpecInput::new(2, range),
+        ];
+
+        let mut job = QPDFJob::new();
+        job.set_keep_files_open_threshold(1);
+        assert!(job.keep_files_open_for_page_specs(&one_source));
+        assert!(!job.keep_files_open_for_page_specs(&two_sources));
+
+        job.set_keep_files_open(true);
+        assert!(job.keep_files_open_for_page_specs(&two_sources));
+        job.set_keep_files_open(false);
+        assert!(!job.keep_files_open_for_page_specs(&one_source));
+
+        assert_eq!(
+            QPDFJob::parse_keep_files_open_threshold("+50junk").unwrap(),
+            50
+        );
+    }
+
+    #[test]
+    fn keep_files_open_policy_is_parsed_at_argv_and_json_job_boundaries() {
+        let range = PageRange::parse_numrange("1").unwrap();
+        let specs = [PageSpecInput::new(1, range)];
+
+        let mut argv_job = QPDFJob::new();
+        argv_job
+            .initialize_from_argv(&[
+                "qpdfjob".to_owned(),
+                "input.pdf".to_owned(),
+                "output.pdf".to_owned(),
+                "--keep-files-open=n".to_owned(),
+                "--keep-files-open-threshold=+50junk".to_owned(),
+            ])
+            .unwrap();
+        assert!(!argv_job.keep_files_open_for_page_specs(&specs));
+
+        let json = serde_json::json!({
+            "inputFile": "input.pdf",
+            "outputFile": "output.pdf",
+            "keepFilesOpen": "n",
+            "keepFilesOpenThreshold": "50junk"
+        })
+        .to_string();
+        let mut json_job = QPDFJob::new();
+        json_job.initialize_from_json(&json).unwrap();
+        assert!(!json_job.keep_files_open_for_page_specs(&specs));
+    }
+
+    #[test]
     fn config_verbose_enables_the_job_verbose_setting() {
         let mut job = QPDFJob::new();
         job.config().verbose();
@@ -6731,7 +6680,8 @@ mod tests {
             .create_qpdf()
             .expect("create qpdf")
             .expect("primary document");
-        assert_eq!(job.page_source_documents.len(), 2);
+        assert_eq!(job.page_source_documents.len(), 1);
+        assert!(!pdf.resolver.input_source_closed());
         assert!(job
             .page_source_documents
             .iter()
@@ -6739,6 +6689,7 @@ mod tests {
 
         job.write_qpdf(&mut pdf)
             .expect("replace-input write succeeds");
+        assert!(pdf.resolver.input_source_closed());
         assert!(job.page_source_documents.iter().all(|source| {
             source.resolver.input_source_closed()
                 && source

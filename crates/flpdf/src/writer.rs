@@ -413,31 +413,6 @@ impl WriterConfiguration {
         self.settings.encryption_parameters.as_ref()
     }
 
-    /// Whether qpdf can preserve source encryption at the writer boundary.
-    ///
-    /// This is the setting-only half of `QPDFWriter::doWriteSetup`: the
-    /// attached document is checked separately by the writer, while qdf,
-    /// content normalization, decoding, PCLm, and explicit encryption all
-    /// disable implicit source preservation (`QPDFWriter.cc:1980-2048`). A
-    /// `QPDFJob` uses this predicate when a multi-source page operation has
-    /// replaced the encrypted primary with a fresh target and must carry the
-    /// primary's encryption snapshot to `writeQPDF`.
-    pub(crate) fn can_preserve_encryption(&self) -> bool {
-        let mut options = self.settings.to_write_options();
-        if self.settings.linearization {
-            // qpdf clears QDF before selecting its linearized writer
-            // (`QPDFWriter.cc:2036-2038`).
-            options.qdf = false;
-        }
-        self.settings.preserve_encryption
-            && self.settings.encryption_parameters.is_none()
-            && self.settings.copy_encryption.is_none()
-            && !options.qdf
-            && !options.content_normalization
-            && options.decode_level == DecodeLevel::None
-            && !self.settings.pclm
-    }
-
     /// Apply qpdf's `QPDFJob::maybeFixWritePassword` policy to configured
     /// encryption passwords before a writer emits its encryption dictionary.
     ///
@@ -514,12 +489,6 @@ impl WriterConfiguration {
     #[must_use]
     pub const fn preserves_unreferenced_objects(&self) -> bool {
         self.settings.preserve_unreferenced_objects
-    }
-
-    /// Return qpdf's requested object-stream mode for job page selection.
-    #[must_use]
-    pub(crate) const fn object_stream_mode(&self) -> ObjectStreamMode {
-        self.settings.object_stream_mode
     }
 }
 
