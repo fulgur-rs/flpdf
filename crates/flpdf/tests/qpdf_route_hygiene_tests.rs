@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -207,6 +207,33 @@ fn ownerless_xref_api_is_removed_in_favor_of_the_canonical_pdf_route() {
 /// function parameter, closure parameter, or struct/enum field -- whose type
 /// mentions `Pdf` is reported.
 ///
+/// Type aliases are followed: `JobDocument` (`job/lifecycle.rs`) is
+/// `Pdf<Box<dyn ReadSeek>>`, so a binding declared with the alias reads as the
+/// document it is. The index is built from every free `type X = T;` in the two
+/// scanned roots, and a chain of aliases is followed to its end.
+///
+/// # What this search cannot see
+///
+/// The walk is syntactic. It knows what a binding's type is *written as*, not
+/// what the type checker would make of it, and three shapes therefore stay out
+/// of reach. They are recorded here rather than left for the next reader to
+/// rediscover, because an undocumented gap is what makes a guard like this
+/// accrete one special case per review round:
+///
+/// * **A field reached through a destructuring parameter.** `fn f(Holder {
+///   _pdf }: Holder)` would need the field types of `Holder`. It is left open
+///   because it is not a new carrier: a `Holder` whose own field is
+///   `_pdf: Pdf<R>` is already reported where that field is *declared*, by the
+///   same walk. Destructuring only re-binds a carrier the guard has seen.
+/// * **A closure parameter with no type annotation.** `|_pdf| ...` has no type
+///   to read; only the inference engine has one. It is left open because a
+///   closure is not a signature qpdf mirrors -- the carriers this guard exists
+///   to fence out were function parameters and struct fields, which is where
+///   flpdf's shapes answer to qpdf's. An annotated closure parameter is still
+///   checked.
+/// * **A binding name produced by a macro.** `bind!(_pdf)` is a `Pat::Macro`,
+///   and the name only exists after expansion.
+///
 /// `crates/flpdf-qtest-tools/src` is outside those two roots and so is not
 /// scanned at all. Its `run_test_NN` dispatch table binds every parameter with
 /// a leading underscore because qpdf's `test_driver.cc` gives every test the
@@ -221,13 +248,14 @@ fn ownerless_xref_api_is_removed_in_favor_of_the_canonical_pdf_route() {
 /// and stating why.
 #[test]
 fn no_underscore_bound_pdf_carriers_remain_outside_marked_exceptions() {
+    let aliases = scanned_alias_index();
     let mut reported: Vec<String> = Vec::new();
     for file in scanned_source_files() {
         let source = fs::read_to_string(&file)
             .unwrap_or_else(|error| panic!("read {}: {error}", file.display()))
             .replace("\r\n", "\n");
         let display = file.display().to_string();
-        for carrier in unmarked_dead_pdf_carriers(&source, &display) {
+        for carrier in unmarked_dead_pdf_carriers_with_aliases(&source, &display, &aliases) {
             reported.push(format!(
                 "{display}:{} -- `{}` in {} carries a Pdf it never reads",
                 carrier.line, carrier.binding, carrier.owner
@@ -403,13 +431,84 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Every free `type X = T;` alias in the scanned roots, by alias name.
+///
+/// A name maps to *all* the types declared under it, because two modules may
+/// each declare their own `type XrefWidths = ...`. Keeping both and reporting
+/// if any of them reaches `Pdf` is the fail-closed reading of a collision.
+///
+/// Aliases declared inside `#[cfg(test)]` modules and inside function bodies
+/// are indexed too. `syn` does not evaluate `cfg`, so they are in the tree
+/// either way, and keeping them can only widen what the search resolves --
+/// never narrow it. An alias that names no document costs nothing here.
+type AliasIndex = BTreeMap<String, Vec<AliasDefinition>>;
+
+/// One `type X<P..> = T;` declaration: the type it stands for, and the names
+/// of its own type parameters.
+///
+/// The parameter names are kept because following an alias does not
+/// substitute its arguments. A component that is still a bare parameter
+/// after resolution carries whatever the use site passed in, which the
+/// resolved type no longer shows.
+#[derive(Debug, Clone)]
+struct AliasDefinition {
+    ty: syn::Type,
+    parameters: BTreeSet<String>,
+}
+
 /// Parse `source` and return every `_`-prefixed binding whose type mentions
-/// `Pdf`, in source order.
+/// `Pdf`, in source order, resolving no aliases.
 fn dead_pdf_carriers(source: &str) -> Vec<DeadPdfCarrier> {
+    dead_pdf_carriers_with_aliases(source, &AliasIndex::new())
+}
+
+/// [`dead_pdf_carriers`], resolving type aliases through `aliases`.
+fn dead_pdf_carriers_with_aliases(source: &str, aliases: &AliasIndex) -> Vec<DeadPdfCarrier> {
     let file = syn::parse_file(source).expect("scanned source must parse as Rust");
-    let mut scan = CarrierScan::default();
+    let mut scan = CarrierScan {
+        owners: Vec::new(),
+        found: Vec::new(),
+        aliases,
+    };
     Visit::visit_file(&mut scan, &file);
     scan.found
+}
+
+/// Add every free type alias declared in `source` to `index`.
+fn collect_aliases(source: &str, index: &mut AliasIndex) {
+    struct Collect<'a>(&'a mut AliasIndex);
+    impl<'ast> Visit<'ast> for Collect<'_> {
+        fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
+            self.0
+                .entry(strip_raw(&node.ident))
+                .or_default()
+                .push(AliasDefinition {
+                    ty: (*node.ty).clone(),
+                    parameters: node
+                        .generics
+                        .type_params()
+                        .map(|parameter| strip_raw(&parameter.ident))
+                        .collect(),
+                });
+            syn::visit::visit_item_type(self, node);
+        }
+    }
+    let Ok(file) = syn::parse_file(source) else {
+        return;
+    };
+    Visit::visit_file(&mut Collect(index), &file);
+}
+
+/// The alias index of the two scanned crate roots.
+fn scanned_alias_index() -> AliasIndex {
+    let mut index = AliasIndex::new();
+    for file in scanned_source_files() {
+        let source = fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("read {}: {error}", file.display()))
+            .replace("\r\n", "\n");
+        collect_aliases(&source, &mut index);
+    }
+    index
 }
 
 /// The carriers of `source` that no exclusion marker covers.
@@ -420,7 +519,16 @@ fn dead_pdf_carriers(source: &str) -> Vec<DeadPdfCarrier> {
 /// silently excuse the new one, which is the file-level allowlist this guard
 /// replaced, reintroduced one line at a time.
 fn unmarked_dead_pdf_carriers(source: &str, display: &str) -> Vec<DeadPdfCarrier> {
-    let carriers = dead_pdf_carriers(source);
+    unmarked_dead_pdf_carriers_with_aliases(source, display, &AliasIndex::new())
+}
+
+/// [`unmarked_dead_pdf_carriers`], resolving type aliases through `aliases`.
+fn unmarked_dead_pdf_carriers_with_aliases(
+    source: &str,
+    display: &str,
+    aliases: &AliasIndex,
+) -> Vec<DeadPdfCarrier> {
+    let carriers = dead_pdf_carriers_with_aliases(source, aliases);
     let marked = marked_bindings(source, display);
     for (line, (_, binding)) in &marked {
         assert!(
@@ -445,6 +553,7 @@ fn unmarked_dead_pdf_carriers(source: &str, display: &str) -> Vec<DeadPdfCarrier
 fn marked_bindings(source: &str, display: &str) -> BTreeMap<usize, (usize, String)> {
     let comment = format!("// {ALLOW_MARKER}");
     let lines: Vec<&str> = source.lines().collect();
+    let attributes = attribute_extents(source);
     let mut marked = BTreeMap::new();
     for (index, line) in lines.iter().enumerate() {
         if !line.contains(ALLOW_MARKER) {
@@ -472,35 +581,26 @@ fn marked_bindings(source: &str, display: &str) -> BTreeMap<usize, (usize, Strin
             "{display}:{}: `{ALLOW_MARKER}` needs a reason after `{binding}`",
             index + 1
         );
-        // An attribute between the marker and the declaration may span
-        // several lines once rustfmt has wrapped it, so skip to the line
-        // that closes the bracket rather than only its opening line.
+        // Blank lines, further comments, and attributes stand between a
+        // marker and the declaration it excuses. Attribute extents come from
+        // the syntax tree rather than from counting `[` and `]`, because a
+        // bracket inside a string literal (`#[doc = "["]`) is not a
+        // delimiter and a raw character count never returns to depth zero.
         let mut cursor = index + 1;
         let target = loop {
             let Some(next) = lines.get(cursor) else {
                 break None;
             };
             let trimmed = next.trim_start();
-            if trimmed.is_empty() || trimmed.starts_with("//") {
+            if is_only_comment_trivia(trimmed)
+                || line_holds_only_attributes(next, cursor + 1, &attributes)
+            {
                 cursor += 1;
                 continue;
             }
-            if trimmed.starts_with("#[") {
-                let mut depth = 0i32;
-                loop {
-                    let line = lines.get(cursor).copied().unwrap_or_default();
-                    depth += line.matches('[').count() as i32;
-                    depth -= line.matches(']').count() as i32;
-                    cursor += 1;
-                    if depth <= 0 || cursor >= lines.len() {
-                        break;
-                    }
-                }
-                continue;
-            }
-            break Some((cursor, next));
+            break Some(cursor);
         };
-        let (target, _) = target.unwrap_or_else(|| {
+        let target = target.unwrap_or_else(|| {
             panic!(
                 "{display}:{}: `{ALLOW_MARKER}` precedes no declaration",
                 index + 1
@@ -527,6 +627,136 @@ fn marked_bindings(source: &str, display: &str) -> BTreeMap<usize, (usize, Strin
     marked
 }
 
+/// One attribute's source extent: 1-based start and end lines with the
+/// 0-based, end-exclusive columns the attribute occupies on each.
+#[derive(Debug, Clone, Copy)]
+struct AttributeExtent {
+    start_line: usize,
+    start_column: usize,
+    end_line: usize,
+    end_column: usize,
+}
+
+/// The source extent of every attribute in `source`.
+///
+/// Returns nothing for a source that does not parse. That is not a silent
+/// degradation of the guard: every scanned file is parsed by
+/// [`dead_pdf_carriers`] with an `expect`, and the only inputs that reach
+/// here without parsing are the synthetic marker-grammar cases below, whose
+/// assertions all fire before an attribute could matter.
+fn attribute_extents(source: &str) -> Vec<AttributeExtent> {
+    #[derive(Default)]
+    struct Collect(Vec<AttributeExtent>);
+    impl<'ast> Visit<'ast> for Collect {
+        fn visit_attribute(&mut self, node: &'ast syn::Attribute) {
+            // `#` opens the attribute and the closing `]` of the bracket
+            // group ends it; taking both from their own tokens avoids
+            // relying on how spans join across a multi-line attribute.
+            let start = node.pound_token.span.start();
+            let end = node.bracket_token.span.close().end();
+            self.0.push(AttributeExtent {
+                start_line: start.line,
+                start_column: start.column,
+                end_line: end.line,
+                end_column: end.column,
+            });
+            syn::visit::visit_attribute(self, node);
+        }
+    }
+    let Ok(file) = syn::parse_file(source) else {
+        return Vec::new();
+    };
+    let mut collect = Collect::default();
+    Visit::visit_file(&mut collect, &file);
+    collect.0
+}
+
+/// Whether `line` (1-based `number`) holds nothing but attribute text.
+///
+/// Column-aware on purpose: `#[inline] fn f(_pdf: &mut Pdf<R>) {}` puts an
+/// attribute and a declaration on one line, and skipping that whole line
+/// would step over the declaration the marker is meant to cover.
+fn line_holds_only_attributes(line: &str, number: usize, attributes: &[AttributeExtent]) -> bool {
+    let mut covered: Vec<bool> = vec![false; line.chars().count()];
+    let mut touched = false;
+    for extent in attributes {
+        if number < extent.start_line || number > extent.end_line {
+            continue;
+        }
+        touched = true;
+        let from = if number == extent.start_line {
+            extent.start_column
+        } else {
+            0
+        };
+        let to = if number == extent.end_line {
+            extent.end_column.min(covered.len())
+        } else {
+            covered.len()
+        };
+        for slot in covered.iter_mut().take(to).skip(from) {
+            *slot = true;
+        }
+    }
+    if !touched {
+        return false;
+    }
+    // Everything the attributes do not cover has to be blank -- except a
+    // trailing line comment. `#[allow(dead_code)] // rationale` is a style
+    // the scanned sources already use, and its comment characters sit
+    // outside the attribute's own extent.
+    let mut rest = String::new();
+    for (character, inside) in line.chars().zip(&covered) {
+        if !*inside {
+            rest.push(character);
+        }
+    }
+    is_only_comment_trivia(&rest)
+}
+
+/// Whether `text` holds nothing but comment trivia.
+///
+/// A line comment runs to the end of the line, so it ends the question. A
+/// block comment has to close on this line: one left open takes the
+/// declaration below it with it, and one that closes before a declaration on
+/// the same line must not hide that declaration. Nesting is counted because
+/// Rust allows it.
+fn is_only_comment_trivia(text: &str) -> bool {
+    let mut rest = text.trim_start();
+    loop {
+        if rest.is_empty() || rest.starts_with("//") {
+            return true;
+        }
+        let Some(inner) = rest.strip_prefix("/*") else {
+            return false;
+        };
+        let bytes = inner.as_bytes();
+        let mut depth = 1usize;
+        let mut cursor = 0;
+        while cursor + 1 < bytes.len() {
+            match (bytes[cursor], bytes[cursor + 1]) {
+                (b'/', b'*') => {
+                    depth += 1;
+                    cursor += 2;
+                }
+                (b'*', b'/') => {
+                    depth -= 1;
+                    cursor += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => cursor += 1,
+            }
+        }
+        if depth != 0 {
+            return false;
+        }
+        // `cursor` sits just past an ASCII `*/`, so it is a char boundary.
+        rest = inner[cursor..].trim_start();
+    }
+}
+
 /// An identifier's text without the raw-identifier prefix. `r#_pdf` is an
 /// underscore-prefixed binding as far as rustc's unused-variable diagnostic
 /// is concerned, and `r#Pdf` names the same type as `Pdf`, so both spellings
@@ -539,37 +769,116 @@ fn strip_raw(ident: &proc_macro2::Ident) -> String {
 /// The element types of a tuple type, seen through references and parens, so
 /// `(&mut Pdf<R>, usize)` and `&(&mut Pdf<R>, usize)` both pair a tuple
 /// pattern's subpatterns with their own component types.
-fn tuple_components(ty: &syn::Type) -> Option<Vec<&syn::Type>> {
-    match ty {
-        syn::Type::Tuple(tuple) => Some(tuple.elems.iter().collect()),
-        syn::Type::Reference(reference) => tuple_components(&reference.elem),
-        syn::Type::Paren(paren) => tuple_components(&paren.elem),
-        syn::Type::Group(group) => tuple_components(&group.elem),
-        _ => None,
+fn tuple_components<'a>(ty: &'a syn::Type, aliases: &'a AliasIndex) -> Option<Vec<&'a syn::Type>> {
+    fn walk<'a>(
+        ty: &'a syn::Type,
+        aliases: &'a AliasIndex,
+        seen: &mut BTreeSet<String>,
+    ) -> Option<Vec<&'a syn::Type>> {
+        match ty {
+            syn::Type::Tuple(tuple) => Some(tuple.elems.iter().collect()),
+            syn::Type::Reference(reference) => walk(&reference.elem, aliases, seen),
+            syn::Type::Paren(paren) => walk(&paren.elem, aliases, seen),
+            syn::Type::Group(group) => walk(&group.elem, aliases, seen),
+            // A tuple written through an alias -- `type Pair<'a, R> =
+            // (usize, &'a mut Pdf<R>)` -- has to be followed, or every
+            // subpattern is paired with the whole alias and an unrelated
+            // binding reads as a document carrier.
+            syn::Type::Path(path) if path.qself.is_none() => {
+                let name = strip_raw(&path.path.segments.last()?.ident);
+                // A colliding name resolves fail-closed: with more than one
+                // candidate there is no single component list to pair
+                // against, so the caller keeps the whole type.
+                let [only] = aliases.get(&name)?.as_slice() else {
+                    return None;
+                };
+                // `seen` stops `type A = B; type B = A;` from recursing forever.
+                if !seen.insert(name) {
+                    return None;
+                }
+                let components = walk(&only.ty, aliases, seen)?;
+                // Arguments are not substituted, so a component that is
+                // still one of the alias's own parameters stands for
+                // whatever the use site passed in -- possibly a document.
+                // Pairing against it would lose that carrier, so keep the
+                // whole type instead.
+                if components.iter().any(|component| {
+                    !type_mentions_pdf(component, aliases)
+                        && type_names_any(component, &only.parameters)
+                }) {
+                    return None;
+                }
+                Some(components)
+            }
+            _ => None,
+        }
     }
+    walk(ty, aliases, &mut BTreeSet::new())
+}
+
+/// Whether `ty` mentions any of `names` -- used to spot an alias component
+/// that is still an unsubstituted type parameter.
+fn type_names_any(ty: &syn::Type, names: &BTreeSet<String>) -> bool {
+    struct Idents<'a>(&'a BTreeSet<String>, bool);
+    impl Visit<'_> for Idents<'_> {
+        fn visit_ident(&mut self, node: &proc_macro2::Ident) {
+            if self.0.contains(&strip_raw(node)) {
+                self.1 = true;
+            }
+        }
+    }
+    let mut idents = Idents(names, false);
+    Visit::visit_type(&mut idents, ty);
+    idents.1
 }
 
 /// Whether `ty` names `Pdf` anywhere, so `&Pdf<R>`, `&'a mut Pdf<R>`,
 /// `crate::Pdf<R>` and `Option<&mut Pdf<R>>` are one case rather than four.
-fn type_mentions_pdf(ty: &syn::Type) -> bool {
-    struct PdfIdent(bool);
-    impl Visit<'_> for PdfIdent {
-        fn visit_ident(&mut self, node: &proc_macro2::Ident) {
-            self.0 |= strip_raw(node) == "Pdf";
+///
+/// A name that `aliases` knows is followed to the type it stands for, so
+/// `JobDocument` (`job/lifecycle.rs`: `pub type JobDocument =
+/// Pdf<Box<dyn ReadSeek>>`) reads as the document it is rather than as an
+/// unrelated identifier. Following is by path *segment*, so the qualified
+/// `flpdf::job::JobDocument` resolves as readily as the bare spelling, and a
+/// chain of aliases is followed to its end.
+fn type_mentions_pdf(ty: &syn::Type, aliases: &AliasIndex) -> bool {
+    fn walk(ty: &syn::Type, aliases: &AliasIndex, seen: &mut BTreeSet<String>) -> bool {
+        struct Idents(Vec<String>);
+        impl Visit<'_> for Idents {
+            fn visit_ident(&mut self, node: &proc_macro2::Ident) {
+                self.0.push(strip_raw(node));
+            }
         }
+        let mut idents = Idents(Vec::new());
+        Visit::visit_type(&mut idents, ty);
+        for ident in idents.0 {
+            if ident == "Pdf" {
+                return true;
+            }
+            let Some(aliased) = aliases.get(&ident) else {
+                continue;
+            };
+            // `seen` stops `type A = B; type B = A;` from recursing forever.
+            if seen.insert(ident)
+                && aliased
+                    .iter()
+                    .any(|aliased| walk(&aliased.ty, aliases, seen))
+            {
+                return true;
+            }
+        }
+        false
     }
-    let mut finder = PdfIdent(false);
-    Visit::visit_type(&mut finder, ty);
-    finder.0
+    walk(ty, aliases, &mut BTreeSet::new())
 }
 
-#[derive(Default)]
-struct CarrierScan {
+struct CarrierScan<'a> {
     owners: Vec<String>,
     found: Vec<DeadPdfCarrier>,
+    aliases: &'a AliasIndex,
 }
 
-impl CarrierScan {
+impl CarrierScan<'_> {
     fn owner(&self) -> String {
         self.owners
             .last()
@@ -604,7 +913,7 @@ impl CarrierScan {
                 // not name, so index-based pairing only holds up to the rest
                 // position. Walk the prefix forwards and the suffix
                 // backwards, the way the language matches them.
-                let components = tuple_components(ty);
+                let components = tuple_components(ty, self.aliases);
                 let elems: Vec<&syn::Pat> = tuple.elems.iter().collect();
                 let rest = elems
                     .iter()
@@ -670,7 +979,7 @@ impl CarrierScan {
             }
             _ => return,
         };
-        if !type_mentions_pdf(ty) {
+        if !type_mentions_pdf(ty, self.aliases) {
             return;
         }
         self.found.push(DeadPdfCarrier {
@@ -687,7 +996,7 @@ impl CarrierScan {
     }
 }
 
-impl<'ast> Visit<'ast> for CarrierScan {
+impl<'ast> Visit<'ast> for CarrierScan<'_> {
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         self.scoped(format!("fn {}", node.sig.ident), |scan| {
             scan.record_inputs(node.sig.inputs.iter());
@@ -741,7 +1050,7 @@ impl<'ast> Visit<'ast> for CarrierScan {
         // Raw spellings reach the same classification here too: `r#_pdf` is
         // an underscore-prefixed field as far as rustc is concerned.
         let binding = strip_raw(ident);
-        if binding.starts_with('_') && type_mentions_pdf(&node.ty) {
+        if binding.starts_with('_') && type_mentions_pdf(&node.ty, self.aliases) {
             self.found.push(DeadPdfCarrier {
                 line: ident.span().start().line,
                 binding,
@@ -1028,6 +1337,297 @@ fn raw_identifier_fields_are_classified_like_their_plain_spelling() {
         .map(|carrier| carrier.binding)
         .collect();
     assert_eq!(found, vec!["_pdf".to_owned()]);
+}
+
+/// A binding declared with a type alias is the same dead carrier as one
+/// declared with the type the alias stands for.
+///
+/// The index comes from the real scanned roots rather than from a synthetic
+/// `type Alias = Pdf<R>;`, because what has to hold is that *`JobDocument`*
+/// resolves -- the alias that exists in the tree, one keystroke away from
+/// spelling a dead carrier the earlier search could not see.
+#[test]
+fn type_aliases_resolve_to_the_document_they_stand_for() {
+    let aliases = scanned_alias_index();
+    assert!(
+        aliases.contains_key("JobDocument"),
+        "job/lifecycle.rs declares `pub type JobDocument = Pdf<Box<dyn ReadSeek>>`; \
+         the index of the scanned roots must hold it"
+    );
+
+    let aliased = "fn discard(_document: &mut JobDocument) {}\n";
+    assert_eq!(
+        dead_pdf_carriers(aliased),
+        Vec::new(),
+        "without the index the alias name is just an identifier"
+    );
+    let found: Vec<String> = dead_pdf_carriers_with_aliases(aliased, &aliases)
+        .into_iter()
+        .map(|carrier| carrier.binding)
+        .collect();
+    assert_eq!(
+        found,
+        vec!["_document".to_owned()],
+        "`JobDocument` is `Pdf<Box<dyn ReadSeek>>` and must be reported as one"
+    );
+
+    // A qualified spelling resolves through the same path segment, and an
+    // alias that stands for something else is still not a carrier.
+    assert_eq!(
+        dead_pdf_carriers_with_aliases(
+            "fn discard(_document: &mut flpdf::job::JobDocument) {}\n",
+            &aliases
+        )
+        .len(),
+        1,
+        "the alias resolves by path segment, so a qualified spelling counts too"
+    );
+    assert!(
+        dead_pdf_carriers_with_aliases("fn probe(_widths: XrefWidths) {}\n", &aliases).is_empty(),
+        "an alias that does not stand for a document must not be reported"
+    );
+}
+
+/// Alias chains are followed to their end, a cycle terminates, and two
+/// modules declaring the same alias name are both consulted.
+#[test]
+fn alias_resolution_follows_chains_without_looping() {
+    let mut chained = AliasIndex::new();
+    collect_aliases(
+        "type First = Second;\ntype Second = Pdf<R>;\n",
+        &mut chained,
+    );
+    assert_eq!(
+        dead_pdf_carriers_with_aliases("fn probe(_pdf: &mut First) {}\n", &chained).len(),
+        1,
+        "a chain of aliases must be followed to the document at its end"
+    );
+
+    let mut cyclic = AliasIndex::new();
+    collect_aliases("type Loop = Knot;\ntype Knot = Loop;\n", &mut cyclic);
+    assert!(
+        dead_pdf_carriers_with_aliases("fn probe(_pdf: &mut Loop) {}\n", &cyclic).is_empty(),
+        "a cyclic alias must terminate without reporting a carrier"
+    );
+
+    // Two modules may each declare their own `type Shared = ...`. The index
+    // keeps both, and a document behind either spelling is reported.
+    let mut collided = AliasIndex::new();
+    collect_aliases("type Shared = usize;\n", &mut collided);
+    collect_aliases("type Shared = Pdf<R>;\n", &mut collided);
+    assert_eq!(
+        dead_pdf_carriers_with_aliases("fn probe(_pdf: &mut Shared) {}\n", &collided).len(),
+        1,
+        "a name collision must resolve fail-closed, not to whichever was read last"
+    );
+}
+
+/// An attribute is skipped by the extent the syntax tree gives it, not by
+/// counting `[` and `]`. A bracket inside a string literal is not a
+/// delimiter, and the raw count never returned to depth zero, so the marker
+/// search ran off the end of the file and panicked.
+#[test]
+fn an_unbalanced_bracket_inside_an_attribute_is_not_a_delimiter() {
+    let source = "\
+// route-hygiene-allow: _pdf -- holds the exclusive borrow, not a value.
+#[doc = \"[\"]
+fn kept<R>(_pdf: &mut Pdf<R>) {}
+";
+    assert_eq!(
+        marked_bindings(source, "synthetic"),
+        BTreeMap::from([(3, (1, "_pdf".to_owned()))]),
+        "the marker must key to the declaration below the attribute"
+    );
+    assert!(
+        unmarked_dead_pdf_carriers(source, "synthetic").is_empty(),
+        "a correctly marked declaration must not be reported"
+    );
+}
+
+/// An attribute may carry a trailing line comment. Its comment characters
+/// lie outside the attribute's own extent, so a skip that demanded every
+/// uncovered character be blank stopped on the attribute line and keyed the
+/// marker to it instead of to the declaration below. That style already
+/// appears in the scanned sources.
+#[test]
+fn a_trailing_comment_after_an_attribute_is_still_skipped() {
+    let source = "\
+// route-hygiene-allow: _pdf -- holds the exclusive borrow, not a value.
+#[allow(dead_code)] // the carrier is kept for the route it stands on
+fn kept<R>(_pdf: &mut Pdf<R>) {}
+";
+    assert_eq!(
+        marked_bindings(source, "synthetic"),
+        BTreeMap::from([(3, (1, "_pdf".to_owned()))]),
+        "the marker must reach past the attribute's trailing comment"
+    );
+    assert!(
+        unmarked_dead_pdf_carriers(source, "synthetic").is_empty(),
+        "a correctly marked declaration must not be reported"
+    );
+}
+
+/// A block comment is trivia too. One that closes on the attribute's line is
+/// skipped like a line comment; one that a declaration follows on the same
+/// line must not take the declaration with it, and one left open must not
+/// swallow the line below.
+#[test]
+fn a_block_comment_after_an_attribute_is_skipped_without_hiding_a_declaration() {
+    let closing = "\
+// route-hygiene-allow: _pdf -- holds the exclusive borrow, not a value.
+#[allow(dead_code)] /* rationale /* nested */ */
+fn kept<R>(_pdf: &mut Pdf<R>) {}
+";
+    assert_eq!(
+        marked_bindings(closing, "synthetic"),
+        BTreeMap::from([(3, (1, "_pdf".to_owned()))]),
+        "a block comment that closes on the attribute line is trivia"
+    );
+    assert!(
+        unmarked_dead_pdf_carriers(closing, "synthetic").is_empty(),
+        "a correctly marked declaration must not be reported"
+    );
+
+    let sharing = "\
+// route-hygiene-allow: _pdf -- holds the exclusive borrow, not a value.
+#[inline] /* rationale */ fn kept<R>(_pdf: &mut Pdf<R>) {}
+";
+    assert_eq!(
+        marked_bindings(sharing, "synthetic"),
+        BTreeMap::from([(2, (1, "_pdf".to_owned()))]),
+        "a declaration after the block comment is still on that line"
+    );
+    assert!(
+        unmarked_dead_pdf_carriers(sharing, "synthetic").is_empty(),
+        "a correctly marked declaration must not be reported"
+    );
+}
+
+/// A tuple parameter written through an alias has to be followed, or every
+/// subpattern is paired with the whole alias: `_index` in
+/// `fn f((_index, pdf): Pair<'_, R>)` then reads as a document carrier and
+/// the guard rejects valid code.
+#[test]
+fn a_tuple_alias_pairs_each_subpattern_with_its_own_component() {
+    let source = "\
+type Pair<'a, R> = (usize, &'a mut Pdf<R>);
+fn f<R>((_index, pdf): Pair<'_, R>) {
+    let _ = pdf;
+}
+";
+    let mut aliases = AliasIndex::new();
+    collect_aliases(source, &mut aliases);
+    assert!(
+        dead_pdf_carriers_with_aliases(source, &aliases).is_empty(),
+        "`_index` is a usize: following the alias must pair it with its own \
+         component, not with the whole tuple"
+    );
+
+    // The document component itself still has to be seen through the alias.
+    let carrying = "\
+type Pair<'a, R> = (usize, &'a mut Pdf<R>);
+fn f<R>((index, _pdf): Pair<'_, R>) {
+    let _ = index;
+}
+";
+    let mut aliases = AliasIndex::new();
+    collect_aliases(carrying, &mut aliases);
+    assert_eq!(
+        dead_pdf_carriers_with_aliases(carrying, &aliases)
+            .iter()
+            .map(|carrier| carrier.binding.clone())
+            .collect::<Vec<_>>(),
+        vec!["_pdf".to_owned()],
+        "the aliased tuple's document component must still be reported"
+    );
+}
+
+/// An alias may mix a generic component with a concrete document one:
+/// `type Pair<T> = (T, Pdf<R>)`. The concrete component mentioning `Pdf` says
+/// nothing about `T`, which at the use site carries the real carrier, so the
+/// fallback is decided per component rather than over the tuple as a whole.
+#[test]
+fn a_mixed_alias_still_falls_back_for_its_generic_component() {
+    let source = "\
+type Pair<T> = (T, Pdf<R>);
+fn f<X>((_document, live): Pair<&mut Pdf<X>>) {
+    let _ = live;
+}
+";
+    let mut aliases = AliasIndex::new();
+    collect_aliases(source, &mut aliases);
+    assert!(
+        dead_pdf_carriers_with_aliases(source, &aliases)
+            .iter()
+            .any(|carrier| carrier.binding == "_document"),
+        "`_document` receives the document through the alias's `T`; a \
+         component that mentions `Pdf` elsewhere must not excuse it"
+    );
+}
+
+/// Following an alias does not substitute its type arguments, so a tuple
+/// whose document arrives through a parameter -- `type Pair<R> = (usize, R)`
+/// used as `Pair<&mut Pdf<X>>` -- resolves to components that no longer
+/// mention the document. Dropping it there would be a miss, so the whole
+/// type is kept instead.
+#[test]
+fn an_alias_that_carries_the_document_in_a_type_argument_is_not_lost() {
+    let source = "\
+type Pair<R> = (usize, R);
+fn f<R>((_index, pdf): Pair<&mut Pdf<R>>) {
+    let _ = pdf;
+}
+";
+    let mut aliases = AliasIndex::new();
+    collect_aliases(source, &mut aliases);
+    assert!(
+        dead_pdf_carriers_with_aliases(source, &aliases)
+            .iter()
+            .any(|carrier| carrier.binding == "_index"),
+        "a substitution the alias index cannot perform must fall back to the \
+         whole type rather than silently drop the document"
+    );
+}
+
+/// An attribute that shares its line with the declaration must not take the
+/// declaration with it: only the columns the attribute occupies are skipped.
+///
+/// Both orders are checked. An attribute that opens the line is the common
+/// one; an attribute whose *last* line carries the declaration after its
+/// closing `]` is the inverse, and it is the shape that separates a
+/// column-aware skip from one that discards any line an attribute touches.
+#[test]
+fn an_attribute_sharing_a_line_with_the_declaration_does_not_hide_it() {
+    let leading = "\
+// route-hygiene-allow: _pdf -- holds the exclusive borrow, not a value.
+#[inline] fn kept<R>(_pdf: &mut Pdf<R>) {}
+";
+    assert_eq!(
+        marked_bindings(leading, "synthetic"),
+        BTreeMap::from([(2, (1, "_pdf".to_owned()))]),
+        "the declaration sits on the attribute's own line and must still be found"
+    );
+    assert!(
+        unmarked_dead_pdf_carriers(leading, "synthetic").is_empty(),
+        "a correctly marked declaration must not be reported"
+    );
+
+    let trailing = "\
+// route-hygiene-allow: _pdf -- holds the exclusive borrow, not a value.
+#[allow(
+    dead_code
+)] fn kept<R>(_pdf: &mut Pdf<R>) {}
+";
+    assert_eq!(
+        marked_bindings(trailing, "synthetic"),
+        BTreeMap::from([(4, (1, "_pdf".to_owned()))]),
+        "a wrapped attribute whose closing line carries the declaration must \
+         not skip past it"
+    );
+    assert!(
+        unmarked_dead_pdf_carriers(trailing, "synthetic").is_empty(),
+        "a correctly marked declaration must not be reported"
+    );
 }
 
 /// rustfmt wraps a long attribute across lines. The marker search skipped
