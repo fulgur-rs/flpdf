@@ -338,7 +338,7 @@ fn dead_pdf_carriers(source: &str) -> Vec<DeadPdfCarrier> {
 fn unmarked_dead_pdf_carriers(source: &str, display: &str) -> Vec<DeadPdfCarrier> {
     let carriers = dead_pdf_carriers(source);
     let marked = marked_bindings(source, display);
-    for (line, binding) in &marked {
+    for (line, (_, binding)) in &marked {
         assert!(
             carriers
                 .iter()
@@ -350,12 +350,15 @@ fn unmarked_dead_pdf_carriers(source: &str, display: &str) -> Vec<DeadPdfCarrier
     }
     carriers
         .into_iter()
-        .filter(|carrier| marked.get(&carrier.line) != Some(&carrier.binding))
+        .filter(|carrier| {
+            marked.get(&carrier.line).map(|(_, binding)| binding) != Some(&carrier.binding)
+        })
         .collect()
 }
 
-/// The binding each exclusion marker excuses, by 1-based declaration line.
-fn marked_bindings(source: &str, display: &str) -> BTreeMap<usize, String> {
+/// The binding each exclusion marker excuses, by 1-based declaration line,
+/// paired with the marker's own line so a collision can name both sites.
+fn marked_bindings(source: &str, display: &str) -> BTreeMap<usize, (usize, String)> {
     let comment = format!("// {ALLOW_MARKER}");
     let lines: Vec<&str> = source.lines().collect();
     let mut marked = BTreeMap::new();
@@ -395,9 +398,38 @@ fn marked_bindings(source: &str, display: &str) -> BTreeMap<usize, String> {
                 index + 1
             )
         });
-        marked.insert(target + 1, binding.to_owned());
+        // Two markers resolving to the same declaration would let the later
+        // one overwrite the earlier: a stale marker naming a binding that is
+        // no longer there would then never be rejected. Every marker has to
+        // stand on its own, so refuse the collision instead of collapsing it.
+        if let Some((previous_line, previous_binding)) =
+            marked.insert(target + 1, (index + 1, binding.to_owned()))
+        {
+            panic!(
+                "{display}:{}: `{ALLOW_MARKER} {previous_binding}` and \
+                 {display}:{}: `{ALLOW_MARKER} {binding}` both excuse the \
+                 declaration at line {}; keep exactly one marker per \
+                 declaration so a stale one cannot hide behind a valid one",
+                previous_line,
+                index + 1,
+                target + 1
+            );
+        }
     }
     marked
+}
+
+/// The element types of a tuple type, seen through references and parens, so
+/// `(&mut Pdf<R>, usize)` and `&(&mut Pdf<R>, usize)` both pair a tuple
+/// pattern's subpatterns with their own component types.
+fn tuple_components(ty: &syn::Type) -> Option<Vec<&syn::Type>> {
+    match ty {
+        syn::Type::Tuple(tuple) => Some(tuple.elems.iter().collect()),
+        syn::Type::Reference(reference) => tuple_components(&reference.elem),
+        syn::Type::Paren(paren) => tuple_components(&paren.elem),
+        syn::Type::Group(group) => tuple_components(&group.elem),
+        _ => None,
+    }
 }
 
 /// Whether `ty` names `Pdf` anywhere, so `&Pdf<R>`, `&'a mut Pdf<R>`,
@@ -444,6 +476,59 @@ impl CarrierScan {
             }
             // A bare `_` is the same papering-over as an underscore rename.
             syn::Pat::Wild(_) => "_".to_owned(),
+            // An ordinary destructuring pattern must not hide a carrier:
+            // `fn f<R>((_pdf, _): (&mut Pdf<R>, usize))` binds `_pdf` to the
+            // document just as a plain parameter would. Pair each
+            // subpattern with its own component type where the pattern and
+            // the type line up, and fall back to the whole type otherwise so
+            // a carrier is never dropped for want of an exact component.
+            syn::Pat::Tuple(tuple) => {
+                let components = tuple_components(ty);
+                for (index, element) in tuple.elems.iter().enumerate() {
+                    let component = components
+                        .as_ref()
+                        .and_then(|types| types.get(index).copied())
+                        .unwrap_or(ty);
+                    self.record(element, component);
+                }
+                return;
+            }
+            syn::Pat::Reference(inner) => {
+                self.record(&inner.pat, ty);
+                return;
+            }
+            syn::Pat::Type(inner) => {
+                self.record(&inner.pat, &inner.ty);
+                return;
+            }
+            syn::Pat::Slice(slice) => {
+                for element in &slice.elems {
+                    self.record(element, ty);
+                }
+                return;
+            }
+            syn::Pat::TupleStruct(tuple_struct) => {
+                for element in &tuple_struct.elems {
+                    self.record(element, ty);
+                }
+                return;
+            }
+            syn::Pat::Struct(pattern) => {
+                for field in &pattern.fields {
+                    self.record(&field.pat, ty);
+                }
+                return;
+            }
+            syn::Pat::Or(pattern) => {
+                for case in &pattern.cases {
+                    self.record(case, ty);
+                }
+                return;
+            }
+            syn::Pat::Paren(inner) => {
+                self.record(&inner.pat, ty);
+                return;
+            }
             _ => return,
         };
         if !type_mentions_pdf(ty) {
@@ -644,7 +729,7 @@ struct Held<'a, R> {
 ";
     assert_eq!(
         marked_bindings(source, "synthetic"),
-        BTreeMap::from([(2, "_pdf".to_owned()), (7, "_pdf".to_owned())])
+        BTreeMap::from([(2, (1, "_pdf".to_owned())), (7, (5, "_pdf".to_owned())),])
     );
     let found: Vec<usize> = unmarked_dead_pdf_carriers(source, "synthetic")
         .into_iter()
@@ -653,6 +738,45 @@ struct Held<'a, R> {
     assert_eq!(found, vec![3]);
 }
 
+/// A destructuring parameter must not hide a carrier: `(_pdf, _)` binds the
+/// document exactly as a plain `_pdf` parameter would, and an outer
+/// `Pat::Tuple` used to end the scan before the subpattern was ever seen.
+#[test]
+fn destructured_parameters_still_report_their_pdf_carrier() {
+    let source = "\
+fn tupled<R>((_pdf, _n): (&mut Pdf<R>, usize)) {}
+fn referenced<R>(&(_pdf, _n): &(&mut Pdf<R>, usize)) {}
+fn nested<R>(((_pdf, _n), _m): ((&mut Pdf<R>, usize), usize)) {}
+fn unrelated<R>((_first, _second): (usize, R)) {}
+";
+    let found: Vec<(usize, String)> = dead_pdf_carriers(source)
+        .into_iter()
+        .map(|carrier| (carrier.line, carrier.binding))
+        .collect();
+    assert_eq!(
+        found,
+        vec![
+            (1, "_pdf".to_owned()),
+            (2, "_pdf".to_owned()),
+            (3, "_pdf".to_owned()),
+        ],
+        "each destructured `_pdf` must be reported, and a tuple of unrelated \
+         types must not be"
+    );
+}
+
+/// Two markers resolving to one declaration used to collapse into a single
+/// map entry, so a stale marker could ride along behind a valid one.
+#[test]
+#[should_panic(expected = "both excuse the declaration")]
+fn two_markers_for_one_declaration_are_rejected() {
+    let source = "\
+// route-hygiene-allow: _stale -- names a binding that is not here
+// route-hygiene-allow: _pdf -- holds the exclusive borrow, not a value.
+fn kept<R>(_pdf: &mut Pdf<R>) {}
+";
+    let _ = marked_bindings(source, "synthetic");
+}
 #[test]
 #[should_panic(expected = "must name the binding it excuses")]
 fn an_exclusion_marker_that_names_no_binding_is_rejected() {
