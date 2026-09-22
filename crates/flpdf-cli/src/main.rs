@@ -4144,9 +4144,7 @@ fn parse_qpdf_unsigned_option(value: &[u8]) -> CliResult<usize> {
 /// counterpart and every other flpdf-cli diagnostic already goes through
 /// [`progname`] instead of the raw executable name.
 fn preflight_qpdf_cli_events(args: &[arg_parser::RawArg]) -> CliResult<QpdfCliPreflight> {
-    let has_job_json = args
-        .iter()
-        .any(|argument| argument.as_bytes().starts_with(b"--job-json-file="));
+    let has_job_json = args.iter().any(arg_parser::is_job_json_file_argument);
     // These two are CLI-only spellings with no qpdf main-table entry, so they
     // must not reach `initialize_from_raw_argv`. Drop them only while scanning
     // the main table: inside a named segment qpdf's sub-parser owns the token
@@ -10344,6 +10342,97 @@ mod tests {
         assert_eq!(
             count, 2,
             "raw_residual_args must retain every --add-attachment group"
+        );
+    }
+
+    #[test]
+    fn preprocess_qpdf_args_retains_overlay_group_in_raw_residual_args_under_job_json() {
+        // Unlike every other segment kind, `--overlay`/`--underlay` are
+        // stripped from `raw_residual_args` outside job-json mode
+        // (flpdf-cli's own native overlay application reads `overlay_specs`
+        // from `SegmentHandler`, not from the reconstructed residual
+        // tokens), because flpdf-cli's own subcommand routing -- not
+        // qpdf -- rejects `--overlay`/`--underlay` on subcommands other than
+        // `rewrite`, and clap must not see the raw token there. Under
+        // `--job-json-file`, though, `preflight_qpdf_cli_events` parses
+        // `raw_residual_args` through the qpdf-compatible unified argv
+        // parser directly, so a group left out here is silently dropped
+        // instead of applied (this was flpdf-g9uy9).
+        let preprocessed = preprocess_qpdf_args(strs(&[
+            "flpdf",
+            "--job-json-file=job.json",
+            "--overlay",
+            "src.pdf",
+            "--",
+            "in.pdf",
+            "out.pdf",
+        ]))
+        .expect("qpdf accepts an overlay group under --job-json-file");
+        let count = preprocessed
+            .raw_residual_args
+            .iter()
+            .filter(|argument| argument.as_bytes() == b"--overlay")
+            .count();
+        assert_eq!(
+            count, 1,
+            "raw_residual_args must retain the --overlay group under --job-json-file"
+        );
+    }
+
+    #[test]
+    fn preprocess_qpdf_args_retains_overlay_group_under_the_single_dash_job_json_spelling() {
+        // `QPDFArgParser::parseArgs` strips one leading `-` and then one
+        // more if it is there (`libqpdf/QPDFArgParser.cc:460-476`), so
+        // `-job-json-file=` names the same option as `--job-json-file=` and
+        // real qpdf applies the overlay under both. A scan keyed to the
+        // double-dash spelling alone left the single-dash form dropping the
+        // group again, silently.
+        for spelling in ["--job-json-file=job.json", "-job-json-file=job.json"] {
+            let preprocessed = preprocess_qpdf_args(strs(&[
+                "flpdf",
+                spelling,
+                "--overlay",
+                "src.pdf",
+                "--",
+                "in.pdf",
+                "out.pdf",
+            ]))
+            .expect("qpdf accepts an overlay group under either spelling");
+            let count = preprocessed
+                .raw_residual_args
+                .iter()
+                .filter(|argument| argument.as_bytes() == b"--overlay")
+                .count();
+            assert_eq!(
+                count, 1,
+                "raw_residual_args must retain the --overlay group under `{spelling}`"
+            );
+        }
+    }
+
+    #[test]
+    fn preprocess_qpdf_args_drops_overlay_group_from_raw_residual_args_without_job_json() {
+        // Outside job-json mode the native route applies overlay via
+        // `overlay_specs`, and retaining the raw tokens here would leak an
+        // `--overlay` token into clap's view of a subcommand that never
+        // declared it (see the job-json variant above).
+        let preprocessed = preprocess_qpdf_args(strs(&[
+            "flpdf",
+            "--overlay",
+            "src.pdf",
+            "--",
+            "in.pdf",
+            "out.pdf",
+        ]))
+        .expect("qpdf accepts a bare overlay group");
+        let count = preprocessed
+            .raw_residual_args
+            .iter()
+            .filter(|argument| argument.as_bytes() == b"--overlay")
+            .count();
+        assert_eq!(
+            count, 0,
+            "raw_residual_args must not retain --overlay outside job-json mode"
         );
     }
 
