@@ -1005,25 +1005,27 @@ fn type_mentions_pdf(ty: &syn::Type, aliases: &AliasIndex) -> bool {
             };
             let supplied = names.supplied.get(ident);
             // `seen` stops `type A = B; type B = A;` -- and a default that
-            // names its own alias -- from recursing forever.
+            // names its own alias -- from recursing forever. It is kept
+            // *path-local*: the name is removed once this branch finishes,
+            // so one branch that already resolved an alias cannot hide a
+            // sibling branch that reaches the same alias with a different
+            // argument list (and therefore different defaults in force).
             if !seen.insert(ident.clone()) {
                 continue;
             }
-            for definition in aliased {
-                if walk(&definition.ty, aliases, seen) {
-                    return true;
-                }
-                // The body shows only the parameter; what the use site left
-                // out is the default behind it.
-                let defaults = supplied
-                    .into_iter()
-                    .flatten()
-                    .flat_map(|count| definition.defaults_in_force(*count));
-                for (_, default) in defaults {
-                    if walk(default, aliases, seen) {
-                        return true;
-                    }
-                }
+            let found = aliased.iter().any(|definition| {
+                walk(&definition.ty, aliases, seen)
+                    // The body shows only the parameter; what the use site
+                    // left out is the default behind it.
+                    || supplied
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|count| definition.defaults_in_force(*count))
+                        .any(|(_, default)| walk(default, aliases, seen))
+            });
+            seen.remove(ident);
+            if found {
+                return true;
             }
         }
         false
@@ -1817,6 +1819,48 @@ fn an_attribute_sharing_a_line_with_the_declaration_does_not_hide_it() {
     assert!(
         unmarked_dead_pdf_carriers(trailing, "synthetic").is_empty(),
         "a correctly marked declaration must not be reported"
+    );
+}
+
+/// Cycle detection is path-local. One branch resolving an alias with an
+/// explicit argument must not hide a sibling branch that reaches the same
+/// alias with the argument omitted -- the two have different defaults in
+/// force, so a shared `seen` set would drop a real carrier.
+#[test]
+fn a_resolved_sibling_branch_does_not_hide_a_later_default() {
+    let source = "\
+type Defaulted<T = Pdf<u8>> = T;
+type Outer<T = Defaulted> = (Defaulted<usize>, T);
+fn f(_outer: Outer) {}
+";
+    let mut aliases = AliasIndex::new();
+    collect_aliases(source, &mut aliases);
+    assert!(
+        dead_pdf_carriers_with_aliases(source, &aliases)
+            .iter()
+            .any(|carrier| carrier.binding == "_outer"),
+        "`Outer`'s omitted argument takes the `Defaulted` default, whose own \
+         default is a document; the earlier `Defaulted<usize>` branch must \
+         not suppress it"
+    );
+}
+
+/// Removing a name after its branch must not cost termination: a two-alias
+/// cycle and an alias whose default names itself both still stop.
+#[test]
+fn path_local_cycle_detection_still_terminates() {
+    let source = "\
+type A = B;
+type B = A;
+type SelfDefault<T = SelfDefault> = T;
+fn f(_a: A) {}
+fn g(_s: SelfDefault) {}
+";
+    let mut aliases = AliasIndex::new();
+    collect_aliases(source, &mut aliases);
+    assert!(
+        dead_pdf_carriers_with_aliases(source, &aliases).is_empty(),
+        "neither cycle names a document, and neither may recurse forever"
     );
 }
 
