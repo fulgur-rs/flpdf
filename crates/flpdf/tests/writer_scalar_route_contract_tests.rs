@@ -7,7 +7,7 @@ fn dynamic_child_writer_has_a_direct_scalar_boundary() {
         fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/writer/object.rs"))
             .expect("writer/object.rs must be readable");
     let start = source
-        .find("fn write_child_with_dynamic_ref_map_and_string_writer<F>(")
+        .find("fn unparse_child_with_dynamic_ref_map_and_string_writer<F>(")
         .expect("dynamic child writer must exist");
     let end = start
         + source[start..]
@@ -27,17 +27,17 @@ fn ordinary_child_walkers_have_direct_scalar_boundaries() {
             .expect("writer/object.rs must be readable");
     for (start_marker, end_marker, helper) in [
         (
-            "pub(crate) fn write_child(handle: &ObjectHandle",
+            "pub(crate) fn unparse_child(handle: &ObjectHandle",
             "fn visible_dict_entries",
             "write_direct_child(",
         ),
         (
-            "fn write_child_with_ref_map(",
+            "fn unparse_child_with_ref_map(",
             "fn unparse_object_walk_with_ref_map(",
             "write_direct_child_with_ref_map(",
         ),
         (
-            "fn write_child_with_dynamic_ref_map(",
+            "fn unparse_child_with_dynamic_ref_map(",
             "fn unparse_object_walk_with_dynamic_ref_map(",
             "write_direct_child_with_dynamic_ref_map(",
         ),

@@ -1525,7 +1525,7 @@ struct FinalFirstPageXref<'a> {
 /// `crate::writer::object::TRIMMED_TRAILER_KEYS`, the same qpdf
 /// `getTrimmedTrailer` list `crate::writer::build_writer_trailer_handle`
 /// removes for the other two routes, and a surviving value's serialization
-/// calls the shared `crate::writer::object::write_child_with_ref_map`
+/// calls the shared `crate::writer::object::unparse_child_with_ref_map`
 /// dispatch rather than retyping its indirect-reference-vs-direct-value
 /// split.
 fn canonical_linearization_trailer_entries(
@@ -1549,7 +1549,7 @@ fn canonical_linearization_trailer_entries(
         }
         let mut value_bytes = Vec::new();
         crate::writer::output::with_buffer_sink(&mut value_bytes, |out| {
-            crate::writer::object::write_child_with_ref_map(&value, out, map, removed_refs)
+            crate::writer::object::unparse_child_with_ref_map(&value, out, map, removed_refs)
         })?;
         serialized.push((key, value_bytes));
     }
