@@ -25,6 +25,40 @@ fn dead_qpdf_routes_are_removed_and_canonical_owners_remain() {
 
     let standard = read_source("encryption/standard.rs");
     assert!(!standard.contains("keys::per_object_key"));
+
+    // qpdf keeps crypt-filter state in one bare
+    // `std::map<std::string, encryption_method_e>` (`QPDF.hh:912`); the parallel
+    // `CryptFilter*` table that duplicated it could not represent `/AESV3` or
+    // qpdf's `e_unknown` at all, so only the `EncryptionMode` owners remain and
+    // the module needs no blanket dead-code allow.
+    let crypt_filters = read_source("encryption/crypt_filters.rs");
+    assert!(!crypt_filters.contains("#![allow(dead_code)]"));
+    for dead in [
+        "enum CryptFilterMethod",
+        "struct CryptFilter ",
+        "enum CryptFilterRef",
+        "struct V4UseSiteSelectors",
+        "fn eff_or_stm(",
+        "fn select_crypt_filter",
+        "fn cfm_to_object_key_alg(",
+    ] {
+        assert!(
+            !crypt_filters.contains(dead),
+            "non-qpdf crypt-filter surface remains: {dead}"
+        );
+    }
+    for owner in [
+        "fn interpret_cf_name(",
+        "fn interpret_cf_from_handle(",
+        "fn interpret_cf_selector_from_handle(",
+        "fn crypt_filter_modes_from_handle(",
+        "fn crypt_filter_method_from_handle(",
+    ] {
+        assert!(
+            crypt_filters.contains(owner),
+            "canonical crypt-filter owner missing: {owner}"
+        );
+    }
     let primitives = read_source("encryption/primitives.rs");
     assert!(primitives.contains("fn compute_data_key("));
     assert!(!read_source("encryption/state.rs").contains("fn compute_data_key("));
