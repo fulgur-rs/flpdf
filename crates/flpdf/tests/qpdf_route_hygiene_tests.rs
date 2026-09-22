@@ -275,6 +275,56 @@ fn qpdf_read_token_calls_route_through_one_allow_bad_entrypoint() {
     }
 }
 
+/// qpdf has one owner-password entry point, `check_owner_password`
+/// (`QPDF_encryption.cc:582-590`), and it always yields the recovered user
+/// password through its `std::string& user_password` out-parameter
+/// (`:542-567`), which its only call site (`:912`) consumes right away. qpdf
+/// likewise has no identity cipher: `decryptString` (`:985-986`) and
+/// `decryptStream` (`:1106-1107`) return on `e_none` before deriving a key, so
+/// the pass-through decision belongs to the method-selection switch, not to the
+/// cipher enums. The overloads that discarded the recovered user password and
+/// the `Identity` cipher variants had no qpdf counterpart and are removed.
+#[test]
+fn standard_handler_has_no_owner_password_or_identity_cipher_overloads() {
+    let standard = read_source("encryption/standard.rs");
+    for dead in [
+        // The `(` suffix keeps each pin off the retained `_with_user_password`
+        // (and, for the first, the `_v4`/`_r5`/`_r6`) definitions.
+        "fn check_owner_password(",
+        "fn check_owner_password_v4(",
+        // The cipher pins name the match arms rather than the bare variant
+        // declarations: a re-added variant without its arm does not compile,
+        // so pinning the arms covers both halves.
+        "StringCipher::Identity",
+        "StringEncryptCipher::Identity",
+    ] {
+        assert!(
+            !standard.contains(dead),
+            "standard-handler surface without a qpdf counterpart remains: {dead}"
+        );
+    }
+    assert!(
+        !standard.contains("#![allow(dead_code)]"),
+        "standard.rs no longer has dead items and must not carry a blanket allow"
+    );
+    for owner in [
+        "fn check_owner_password_with_user_password(",
+        "fn check_owner_password_v4_with_user_password(",
+    ] {
+        assert!(
+            standard.contains(owner),
+            "canonical owner-password port missing: {owner}"
+        );
+    }
+
+    // qpdf's `e_none` lives in the `decryptString`/`decryptStream` method
+    // switch, so this is where flpdf must keep the pass-through decision.
+    assert!(
+        read_source("encryption/state.rs").contains("EncryptionMode::Identity => (None, false)"),
+        "the /Identity crypt filter must stay a method-selection no-op, not a cipher variant"
+    );
+}
+
 #[test]
 fn canonical_pdf_open_does_not_snapshot_the_complete_source_for_xref() {
     let engine = read_source("engine.rs");

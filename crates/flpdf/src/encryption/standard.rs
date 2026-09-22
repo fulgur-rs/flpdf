@@ -37,12 +37,21 @@
 //! comments) to verify algorithmic correctness rather than full
 //! qpdf-compatible fixture testing against real encrypted PDF files.
 //!
-//! # Dead-code notice
-//! Some items in this module are not yet wired up to a call site. They
-//! become live as the string-decryption, stream-decryption, and CLI
-//! `--password` paths are added. The module-level `allow(dead_code)`
-//! keeps the lint quiet here without silencing it elsewhere.
-#![allow(dead_code)]
+//! # Entry points that qpdf does not have
+//! Owner-password authentication has exactly one qpdf entry point,
+//! `check_owner_password` (`QPDF_encryption.cc:582-590`), and it always yields
+//! the recovered user password through its `std::string& user_password`
+//! out-parameter (`QPDF_encryption.cc:542-567`), because the single call site
+//! consumes that password immediately afterwards. The tuple-returning
+//! [`check_owner_password_with_user_password`] and
+//! [`check_owner_password_v4_with_user_password`] are therefore the whole
+//! owner-password surface here; no variant discards the recovered password.
+//!
+//! Likewise there is no identity cipher. qpdf treats a `/Identity` crypt
+//! filter by returning from `decryptString` and `decryptStream` before any
+//! cipher is constructed (`QPDF_encryption.cc:985-986,1106-1107`), so
+//! [`StringCipher`] and [`StringEncryptCipher`] carry cipher material only;
+//! the pass-through decision is made by the caller that selects the method.
 
 pub(crate) use super::keys::ObjectKeyAlg;
 use crate::encryption::primitives::md5;
@@ -615,19 +624,13 @@ pub(crate) fn check_user_password_v4(
     Ok(file_key)
 }
 
-/// PDF 1.7 §7.6.3.3 Algorithm 7 — Authenticate the owner password.
+/// PDF 1.7 §7.6.3.3 Algorithm 7 — Authenticate the owner password and retain
+/// the recovered padded user password for qpdf's `getTrimmedUserPassword`
+/// inspection contract.
 ///
-/// Returns the file encryption key on success, or
-/// `Error::Encrypted(EncryptedError::BadPassword)` if the password does not match.
-pub(crate) fn check_owner_password(
-    password: &[u8],
-    inputs: &StandardHandlerInputs<'_>,
-) -> Result<Vec<u8>> {
-    check_owner_password_with_user_password(password, inputs).map(|(file_key, _)| file_key)
-}
-
-/// Authenticate an owner password and retain the recovered padded user
-/// password for qpdf's `getTrimmedUserPassword` inspection contract.
+/// Returns the file encryption key and the recovered padded user password on
+/// success, or `Error::Encrypted(EncryptedError::BadPassword)` if the password
+/// does not match.
 pub(crate) fn check_owner_password_with_user_password(
     password: &[u8],
     inputs: &StandardHandlerInputs<'_>,
@@ -662,13 +665,7 @@ pub(crate) fn check_owner_password_with_user_password(
 }
 
 /// PDF 1.7 §7.6.3.3 Algorithm 7 for V=4/R=4 Standard handler inputs.
-pub(crate) fn check_owner_password_v4(
-    password: &[u8],
-    inputs: &StandardHandlerInputs<'_>,
-) -> Result<Vec<u8>> {
-    check_owner_password_v4_with_user_password(password, inputs).map(|(file_key, _)| file_key)
-}
-
+///
 /// V=4/R=4 counterpart of [`check_owner_password_with_user_password`].
 pub(crate) fn check_owner_password_v4_with_user_password(
     password: &[u8],
@@ -855,7 +852,8 @@ fn ensure_v_lt_5_revision(r: i64, entry: &str) -> Result<()> {
 /// an RC4 key from the owner password (using [`derive_owner_password_rc4_key`])
 /// and encrypts the padded user password with it (single pass for R=2; 20
 /// ascending passes for R≥3, the inverse of Algorithm 7's descending passes
-/// in [`check_owner_password`] / [`check_owner_password_v4`]).
+/// in [`check_owner_password_with_user_password`] /
+/// [`check_owner_password_v4_with_user_password`]).
 ///
 /// Accepts r ∈ {2, 3, 4}; any other revision is rejected with
 /// [`EncryptedError::Malformed`]. V=4/R=4 uses the same Algorithm 3 path as
@@ -1521,10 +1519,13 @@ pub(crate) fn build_v5_r5_encrypt_dict(
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Cipher material selected for decrypting string objects at a given use site.
+///
+/// A `/Identity` crypt filter has no representation here: qpdf returns from
+/// `decryptString` before deriving a key or constructing a cipher
+/// (`QPDF_encryption.cc:985-986`), and the flpdf caller mirrors that by
+/// skipping [`decrypt_cipher_bytes`] entirely.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum StringCipher<'a> {
-    /// No-op crypt filter.
-    Identity,
     /// RC4 with an already-derived object key (V<5) or selected CF key.
     Rc4 { key: &'a [u8] },
     /// AES-128-CBC with an already-derived object key. PDF string bytes include the IV.
@@ -1537,7 +1538,6 @@ pub(crate) enum StringCipher<'a> {
 
 pub(crate) fn decrypt_cipher_bytes(bytes: &mut Vec<u8>, cipher: StringCipher<'_>) -> Result<()> {
     match cipher {
-        StringCipher::Identity => Ok(()),
         StringCipher::Rc4 { key } => {
             let mut cipher = Rc4::new(key)?;
             cipher.process_in_place(bytes);
@@ -1582,10 +1582,12 @@ pub(crate) fn decrypt_cipher_bytes(bytes: &mut Vec<u8>, cipher: StringCipher<'_>
 /// For V<5, the per-object key from
 /// [`super::primitives::compute_data_key`] is the key material.
 /// For V=5, the file key itself or a selected `/CF` key is used directly.
+///
+/// Like [`StringCipher`], this carries no pass-through variant: the writer
+/// emits the plain string before reaching cipher selection whenever no data
+/// key is in force.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum StringEncryptCipher<'a> {
-    /// No-op crypt filter — bytes pass through unchanged.
-    Identity,
     /// RC4 (V=1, V=2, V=4 `/CFM /V2`) with an already-derived per-object key.
     /// IV is unused (RC4 is a stream cipher with no IV).
     Rc4 { key: &'a [u8] },
@@ -1602,7 +1604,6 @@ pub(crate) enum StringEncryptCipher<'a> {
 ///
 /// Behavior by cipher:
 ///
-/// - `Identity`: no-op.
 /// - `Rc4`: RC4-encrypts `bytes` in place; the buffer length is unchanged.
 ///   `iv` is ignored.
 /// - `Aes128` / `Aes256`: PKCS#7-pads `bytes` to a 16-byte block boundary,
@@ -1619,7 +1620,6 @@ pub(crate) fn encrypt_cipher_bytes(
     iv: &[u8; 16],
 ) -> Result<()> {
     match cipher {
-        StringEncryptCipher::Identity => Ok(()),
         StringEncryptCipher::Rc4 { key } => {
             let mut cipher = Rc4::new(key)?;
             cipher.process_in_place(bytes);
