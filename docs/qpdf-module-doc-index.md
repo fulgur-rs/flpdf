@@ -45,7 +45,7 @@
 | `crates/flpdf/src/job/outline_dest_remap.rs` | correspondence | QPDFJob.cc page selection and QPDFWriter.cc null visibility specialized for surviving destinations |
 | `crates/flpdf/src/job/overlay.rs` | correspondence | QPDFPageObjectHelper.cc placement and QPDFJob.cc overlay orchestration responsibilities |
 | `crates/flpdf/src/job/page_combine.rs` | correspondence | \`QPDFJob.cc\` \`handlePageSpecs\` multi-input selection support used by the internal page-operation tests |
-| `crates/flpdf/src/job/page_merge.rs` | correspondence | QPDFJob.cc page-selection merge pipeline split across page-operation modules |
+| `crates/flpdf/src/job/page_merge.rs` | correspondence | \`QPDF::copyForeignObject\` and page-insertion primitives |
 | `crates/flpdf/src/job/page_plan.rs` | correspondence | QPDFJob.cc handlePageSpecs single-document selection planning |
 | `crates/flpdf/src/job/page_range.rs` | correspondence | QPDFJob.cc page-range parsing split from page-operation orchestration |
 | `crates/flpdf/src/job/page_specs.rs` | correspondence | \`QPDFJob::handlePageSpecs\` page-selection boundary |

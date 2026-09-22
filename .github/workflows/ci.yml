@@ -377,6 +377,11 @@ jobs:
           cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_linearize_multi_source_qpdf
           cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_pages_objstm_order_qpdf
           cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_pages_numrange_alloc_qpdf
+          # Pins that a multi-source --pages job keeps the primary's object
+          # cache, so its JSON object map and its written PDF both match qpdf
+          # (flpdf-3yn9.48.210). The byte-identity half is gated behind
+          # qpdf-zlib-compat and is compiled out of the default test workflow.
+          cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_json_multi_source_pages_qpdf
           # Pins that qpdf's raw-filename-string --pages source map (never
           # canonicalized) is not deduplicated by flpdf's own dedup, which
           # must key on the same raw OsStr bytes (flpdf-6z22).

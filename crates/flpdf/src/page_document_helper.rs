@@ -203,6 +203,110 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         Ok(result)
     }
 
+    /// Remove one page from a page tree that qpdf has already flattened for
+    /// `QPDFJob::handlePageSpecs`.
+    ///
+    /// qpdf's `findPage` calls `flattenPagesTree` once, then `removePage`
+    /// erases the matching `/Kids` entry and updates `/Count` in place
+    /// (`QPDF_pages.cc:253-266,303-320`). `current_pages` is the corresponding
+    /// live `m->all_pages` sequence maintained by the caller for this job.
+    pub(crate) fn remove_flattened_page_for_job(
+        &mut self,
+        page: ObjectRef,
+        current_pages: &mut Vec<ObjectRef>,
+    ) -> Result<()> {
+        let Some(index) = current_pages
+            .iter()
+            .position(|&candidate| candidate == page)
+        else {
+            let description_bytes = self.pdf.resolver.input_description();
+            let object = format!("page object: object {} {}", page.number, page.generation);
+            return Err(Error::QpdfExc(QpdfExc::new(
+                QpdfErrorCode::Pages,
+                description_bytes,
+                object,
+                0,
+                b"page object not referenced in /Pages tree",
+            )));
+        };
+
+        let catalog = self.pdf.root_handle()?;
+        let pages = catalog.try_get_key(b"/Pages")?;
+        pages.try_dereference()?;
+        if !pages.try_is_dictionary()? {
+            return Err(Error::Unsupported(
+                "document /Pages root is not a dictionary".into(),
+            ));
+        }
+        let kids = pages.try_get_key(b"/Kids")?;
+        kids.try_erase_array_item_at(i64::try_from(index).map_err(|_| {
+            // cov:ignore-start: a PDF page vector cannot exceed i64::MAX entries in process memory.
+            Error::Unsupported("page index exceeds qpdf's signed array-index range".into())
+            // cov:ignore-end
+        })?)?; // cov:ignore: LLVM maps this continuation to the unreachable page-vector overflow edge.
+        let count = i64::try_from(kids.try_array_len()?.unwrap_or_default()).map_err(|_| {
+            // cov:ignore-start: a PDF Kids array cannot exceed i64::MAX entries in process memory.
+            Error::Unsupported("page count exceeds qpdf's signed integer range".into())
+            // cov:ignore-end
+        })?; // cov:ignore: LLVM maps this continuation to the unreachable page-count overflow edge.
+        pages.replace_key(b"/Count", ObjectHandle::integer(count))?;
+        current_pages.remove(index);
+        self.pdf.invalidate_page_list_cache();
+        *self.pdf.acroform_cache.borrow_mut() = None;
+        Ok(())
+    }
+
+    /// Insert one page at the end of qpdf's already flattened page tree.
+    ///
+    /// This is the page-spec job's direct `QPDF::insertPage` path
+    /// (`QPDF_pages.cc:204-250`): foreign page graphs are copied through the
+    /// canonical per-source copier, repeated page identities become shallow
+    /// page-dictionary copies, and every copy allocates at the primary
+    /// document's live object-cache ceiling before the next occurrence is
+    /// processed.
+    pub(crate) fn append_flattened_page_for_job<RS: Read + Seek>(
+        &mut self,
+        page: PageInput<'_, RS>,
+        current_pages: &mut Vec<ObjectRef>,
+    ) -> Result<ObjectRef> {
+        let mut page_ref = self.materialize_page_input(page)?;
+        if current_pages.contains(&page_ref) {
+            let copy = self.pdf.get_object_handle(page_ref).shallow_copy()?;
+            let duplicate = self.pdf.make_indirect_object_handle(copy)?;
+            page_ref = duplicate
+                .object_ref()
+                .ok_or(Error::Missing("duplicate page did not become indirect"))?;
+        }
+
+        let catalog = self.pdf.root_handle()?;
+        let pages = catalog.try_get_key(b"/Pages")?;
+        pages.try_dereference()?;
+        if !pages.try_is_dictionary()? {
+            return Err(Error::Unsupported(
+                "document /Pages root is not a dictionary".into(),
+            ));
+        }
+        let kids = pages.try_get_key(b"/Kids")?;
+        if !kids.try_is_array()? {
+            return Err(Error::Unsupported(
+                "document /Pages /Kids is not an array".into(),
+            ));
+        }
+        let page_handle = self.pdf.get_object_handle(page_ref);
+        page_handle.replace_key(b"/Parent", pages.clone())?;
+        kids.try_append_array_item(page_handle)?;
+        let count = i64::try_from(kids.try_array_len()?.unwrap_or_default()).map_err(|_| {
+            // cov:ignore-start: a PDF Kids array cannot exceed i64::MAX entries in process memory.
+            Error::Unsupported("page count exceeds qpdf's signed integer range".into())
+            // cov:ignore-end
+        })?; // cov:ignore: LLVM maps this continuation to the unreachable page-count overflow edge.
+        pages.replace_key(b"/Count", ObjectHandle::integer(count))?;
+        current_pages.push(page_ref);
+        self.pdf.invalidate_page_list_cache();
+        *self.pdf.acroform_cache.borrow_mut() = None;
+        Ok(page_ref)
+    }
+
     fn materialize_page_input<RS: Read + Seek>(
         &mut self,
         input: PageInput<'_, RS>,
@@ -382,5 +486,83 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
             ref_map: BTreeMap::new(),
             removed_page_objgens,
         })
+    }
+}
+
+#[cfg(test)]
+mod job_flattened_page_tests {
+    use super::*;
+    use crate::PageInput;
+    use std::io::Cursor;
+
+    fn three_page_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        Pdf::open_mem_owned(
+            include_bytes!("../../../tests/fixtures/compat/three-page.pdf").to_vec(),
+        )
+        .expect("open three-page fixture")
+    }
+
+    #[test]
+    fn remove_flattened_page_reports_missing_page_and_malformed_pages_root() {
+        let mut pdf = three_page_pdf();
+        let page = crate::pages::page_refs(&mut pdf).expect("page refs")[0];
+        assert!(matches!(
+            PageDocumentHelper::new(&mut pdf).remove_flattened_page_for_job(page, &mut Vec::new()),
+            Err(Error::QpdfExc(_))
+        ));
+
+        let mut pdf = three_page_pdf();
+        let page = crate::pages::page_refs(&mut pdf).expect("page refs")[0];
+        pdf.root_handle()
+            .expect("catalog")
+            .replace_key(b"/Pages", ObjectHandle::integer(1))
+            .expect("replace Pages root");
+        assert!(matches!(
+            PageDocumentHelper::new(&mut pdf).remove_flattened_page_for_job(page, &mut vec![page]),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn remove_flattened_page_rejects_non_array_kids() {
+        let mut pdf = three_page_pdf();
+        let page = crate::pages::page_refs(&mut pdf).expect("page refs")[0];
+        let pages = ObjectHandle::dictionary(vec![(b"Kids".to_vec(), ObjectHandle::integer(1))]);
+        pdf.root_handle()
+            .expect("catalog")
+            .replace_key(b"/Pages", pages)
+            .expect("replace Pages root");
+
+        assert!(PageDocumentHelper::new(&mut pdf)
+            .remove_flattened_page_for_job(page, &mut vec![page])
+            .is_err());
+    }
+
+    #[test]
+    fn append_flattened_page_rejects_malformed_pages_root_and_kids() {
+        let mut pdf = three_page_pdf();
+        let page = crate::pages::page_refs(&mut pdf).expect("page refs")[0];
+        pdf.root_handle()
+            .expect("catalog")
+            .replace_key(b"/Pages", ObjectHandle::integer(1))
+            .expect("replace Pages root");
+        assert!(matches!(
+            PageDocumentHelper::new(&mut pdf)
+                .append_flattened_page_for_job(PageInput::existing(page), &mut Vec::new(),),
+            Err(Error::Unsupported(_))
+        ));
+
+        let mut pdf = three_page_pdf();
+        let page = crate::pages::page_refs(&mut pdf).expect("page refs")[0];
+        let pages = ObjectHandle::dictionary(vec![(b"Kids".to_vec(), ObjectHandle::integer(1))]);
+        pdf.root_handle()
+            .expect("catalog")
+            .replace_key(b"/Pages", pages)
+            .expect("replace Pages root");
+        assert!(matches!(
+            PageDocumentHelper::new(&mut pdf)
+                .append_flattened_page_for_job(PageInput::existing(page), &mut Vec::new(),),
+            Err(Error::Unsupported(_))
+        ));
     }
 }

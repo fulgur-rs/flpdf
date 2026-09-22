@@ -563,11 +563,11 @@ impl Pdf<Box<dyn crate::ReadSeek>> {
     /// Open a path through qpdf's reopenable file-source boundary.
     ///
     /// The returned erased document is suitable for a mixed qpdf page job:
-    /// its source can be closed and reopened by
-    /// [`crate::job::QPDFJob::handle_page_specs`] without exposing a concrete
-    /// reader type to the caller. The source is initially kept open so the
-    /// opening parse can complete; the job selects the final policy before
-    /// resolving page specifications.
+    /// its source can be closed and reopened by the page-spec create stage
+    /// (`QPDFJob::create_qpdf`) without exposing a concrete reader type to the
+    /// caller. The source is initially kept open so the opening parse can
+    /// complete; the job selects the final policy before resolving page
+    /// specifications.
     ///
     /// This corresponds to `QPDF::processFile` plus
     /// `ClosedFileInputSource::before`/`after`

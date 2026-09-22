@@ -259,8 +259,8 @@ path があれば `no output file may be given for this option` を返す。
 
 | E-8 | `QPDFJob::doCheck` | `libqpdf/QPDFJob.cc:744-803` | `crates/flpdf/src/job/lifecycle.rs::run_configured_inspection` → `crates/flpdf/src/job/check.rs::QPDFJob::run_check_report`（private）; public `QPDFJob::check` remains a library/test API | prod: `run_check_report` 3 (public `check`/`check_and_show_xref` plus lifecycle dispatcher) / test: 0 | canonical | `crates/flpdf/src/job/check.rs::QPDFJob::run_check_report` inside `QPDFJob::write_qpdf` | **2026-09-17（`flpdf-3yn9.48.145`）**: standalone top-level `--check` と `check` subcommand の CLI direct open/`QPDFJob::check` consumerを撤去し、qpdf の `createQPDF` → no-output `writeQPDF` → `doInspection` → `doCheck` boundaryへ接続した。public `QPDFJob::check` と qtest/C API test consumerは変更せず、combined inspection・JSON・`check-linearization` は別routeとして残す。|
 | E-9 | `QPDFJob::doListAttachments` / `doShowAttachment` / `addAttachments` / `copyAttachments` | `libqpdf/QPDFJob.cc:876-911`, `include/qpdf/QPDFJob.hh:531-532,540-541` | `crates/flpdf/src/job/attachments.rs::QPDFJob::list_attachments`（pub）ほか同 impl の 5 メソッド | `format_attachment_list_with_sink` prod: 1 (`crates/flpdf/src/job/attachments.rs`) / test: 0。`list_attachments` は CLI から呼ばれる public Job method | canonical | `crates/flpdf/src/job/attachments.rs`（`QPDFJob` impl） | `QPDFJob` メソッド側は根拠 2 で legitimate。`.43` で buffer-returning free route `format_attachment_list` / `list_attachment_info` を削除し、`flpdf-xsq1` で残る sink helper を `pub(crate)` に狭め、job/lib.rs と crate-root の public re-export を撤去した。E-9 の caller-zero `AttachmentInfo` public projection も `flpdf-3yn9.48.97` で撤去済み。**2026-09-19（`flpdf-3yn9.48.186`）**: flpdf-cli top-level `--list-attachments`/`--show-attachment` の単一フラグ dispatch を standalone 関数から E-7 の combined `job.config()`+`job.run()` 経路へ統合した（詳細は E-7 行参照）。この変更は dispatch 構造のみで、E-9 の mixed classification 根拠（`format_attachment_list_with_sink` の可視性 debt、`flpdf-xsq1` で別途追跡）には影響しないため、本行の classification は変更しない。 **2026-09-19 再分類（mixed → canonical）**: この行が唯一の mixed 根拠として挙げる `format_attachment_list_with_sink` の可視性 debt は、同じセルが記録するとおり 既に解消済み——`flpdf-xsq1` は CLOSED で、helper は `crates/flpdf/src/job/attachment_list.rs:52` で `pub(crate)`、production caller は `job/attachments.rs:481` の 1 箇所のみ、`lib.rs` と `job/mod.rs` の re-export も 0 件。buffer-returning free route（`format_attachment_list`/`list_attachment_info`）は `.43` で削除済みで、production 実装は sink 経路 1 本。qpdf 側も `QPDFJob::doListAttachments`（`libqpdf/QPDFJob.cc:877`、caller は `:1685` の `doInspection` 1 箇所）の 1 実装なので、1 責務 1 実装で対応する。 |
-| E-10 | `QPDFJob::handlePageSpecs` | `libqpdf/QPDFJob.cc:2359-2633` | `crates/flpdf/src/job/page_specs.rs::QPDFJob::handle_page_specs` | CLI direct `handle_page_specs` prod: 0 (`crates/flpdf-cli/src/main.rs`。**2026-09-20（`flpdf-3yn9.48.194`）**: 最後に残っていた `apply_json_page_specs`（JSON page-selection route、旧 `:4460`）を削除し、`run_json` を `QPDFJob::create_qpdf`/`prepare_document` 経由に統合した。CLI 直接 `handle_page_specs` caller は 0 件になった)。job 内からも到達 | mixed | `crates/flpdf/src/job/page_specs.rs::QPDFJob::handle_page_specs` | `flpdf-hxmj` は closed。single-source をこの job boundary に接続し、standalone collate/CombinedPlan 経路を撤去した限定 slice は完了済み。`flpdf-3yn9.48.146` で rewrite の `--empty --pages` consumerも `QPDFJob::Config::empty_input`/`add_page_spec`/`collate` → `create_qpdf` のsource・password・keep-files-open・copy lifecycleへ cutoverし、CLI側の `open_page_source` / direct `handle_page_specs` callerを1つ減らした。**2026-09-19（`flpdf-3yn9.48.192`）**: 残る3つの直接 caller のうち multi-source page-operation output（`run_page_extraction_from_multiple_sources`）を `QPDFJob::Config::add_page_spec`/`collate`/`remove_unreferenced_resources`/`writer_configuration` → `create_qpdf`（`prepare_document` の merge 分岐、qpdf の `createQPDF` → `handlePageSpecs` と同じ呼び出し順）へ cutover した。`create_qpdf` のマージ分岐はプライマリを消費し fresh target を返すため、呼び出し元は返却文書から `primary_encrypted`/`primary_copy_encryption` を読めない — この issue で新設した `QPDFJob::encryption_status`/`take_primary_copy_encryption`（qpdf の public `getEncryptionStatus`、`include/qpdf/QPDFJob.hh:402`、に対応する 1 個目、対応物の無い 2 個目）がこの pre-merge snapshot を公開する。旧 CLI 直書きの `open_page_source`（reopenable page source 用の direct `open_file_with_options`）はこの cutover で不要になり撤去した。qpdf 実機 11.9.0（`--deterministic-id`、`qpdf-zlib-compat`）との byte 比較、および `cli_preserve_unreferenced_pages.rs` 9/9・`page_job_route_cutover_tests.rs` の新規構造テストで検証済み。**2026-09-19 マージ後訂正**: 残る直接 caller は **1 つ**（JSON page selection の `apply_json_page_specs`、`crates/flpdf-cli/src/main.rs:4459`）。single-source page-operation output は `flpdf-3yn9.48.187`（#2180）で cutover 済みで、本変更が multi-source を移した。この 1 件が残るため行は mixed のままで、別の canonical cutover scope とする。2026-09-08（`flpdf-3yn9.48.8`）: `QPDFJobConfig::add_page_spec` を新設し JSON 経由と byte-identical であることを検証した（`config_add_page_spec_matches_the_json_configured_path_single_source`）。2026-09-10（`flpdf-3yn9.48.76`）: top-level `--pages` と no-output inspection の consumer は `QPDFJobConfig::empty_input`/`add_page_spec`/`collate` と `QPDFJob::run`（`create_qpdf` → `write_qpdf`）へ cutover し、`--empty --pages ... -- --show-pages` の page-selection bypass を解消した。**2026-09-20（`flpdf-3yn9.48.194`）**: 上記の通り CLI 直接 caller は 0 件になったが、行を canonical へ再分類しなかった理由——multi-source page merge（`--empty --pages <file>` を含む）の結果を `--json` で出力すると、qpdf と flpdf でオブジェクトグラフが乖離する（例: `--json=2 --pages a.pdf 1 b.pdf 1 -- a.pdf` で qpdf は `/Size 8`、flpdf は `/Size 3`）。同じ入力の通常 PDF 出力（`write_qpdf`）は byte-identical であることを確認済みで、乖離は JSON 生成専用の `get_all_objects`（object cache 列挙）に限定される。根本原因は qpdf が `handlePageSpecs` で primary document を in-place mutate する（`removePage` 全消去 → `addPage` を選択ページ数だけ繰り返し呼ぶ、各 `addPage`→`insertPage` が primary の allocator を使う）のに対し、flpdf の multi-source merge は新規 fresh target へ一括 merge するため、writer 側は object-number 補正（`page_merge.rs:1192-1204` の `primary_max_object`/`next_foreign_original`）を持つが、object-cache 側には同等の補正が無いこと。詳細は `flpdf-3yn9.48.210` を参照。この issue で `push_inherited_attributes_to_pages` を merge target に対しても呼ぶよう追加し（qpdf の `insertPage`→`flattenPagesTree` 相当）、`pushedinheritedpageresources` フラグの乖離は解消したが、object 数の乖離自体は残る。 |
-E-10 page-merge inherited-attribute note (`flpdf-k4bp`, 2026-09-10): the primary source must pass through the existing qpdf-shaped `push_inherited_attributes_to_pages` preparation before its selected graph is copied into the fresh target. This preserves direct non-scalar `/MediaBox` promotion and leaf inheritance in the multi-source consumer; secondary-source preparation was already canonical. |
+| E-10 | `QPDFJob::handlePageSpecs` | `libqpdf/QPDFJob.cc:2359-2633`; `libqpdf/QPDF_pages.cc:158-178,204-250,297-319`; `libqpdf/QPDF.cc:1286-1294`; `libqpdf/QPDF_json.cc:888-915` | `job/lifecycle.rs::QPDFJob::prepare_document` → `job/page_specs.rs::QPDFJob::handle_page_specs` → `PageDocumentHelper` in-place primary page mutation; JSON consumer `document_json.rs::write_json_key` | prod: 2 Job branches in `prepare_document`; CLI direct: 0; qpdf differential tests | canonical | `job/page_specs.rs` primary object-cache/page-operation owner; `document_json.rs` JSON object map | No bridge callers on the Job route. Multi-source page selection retains primary cache, allocator, Catalog, trailer, and encryption. `cli_json_multi_source_pages_qpdf.rs` checks qpdf JSON v2 object-map/trailer parity, the empty-primary control, and qpdf-zlib deterministic PDF bytes; the page operation, AcroForm, label, and ObjStm suites are qpdf differential gates. Generic `merge_documents` remains a separate fresh-target API. |
+E-10 primary in-place page mutation note (`flpdf-3yn9.48.210`, 2026-09-23): the production Job route flattens and mutates the primary before removing/inserting selected pages, matching qpdf `QPDF::flattenPagesTree`/`removePage`/`insertPage` order (`QPDF_pages.cc:158-178,204-250,297-319`). Foreign page copies enter that same primary allocator; the generic fresh-target `merge_documents` API is not used by `QPDFJob::createQPDF`.
 2026-09-15（`flpdf-kiou0`）: `QPDFPageData` の `getAllPages()` → range resolution 順序
 （`libqpdf/QPDFJob.cc:259-269`）に合わせ、multi-source の各 `PagePlan::build` 前に
 `PageDocumentHelper::get_all_pages` を実行する。これにより既存の canonical page-tree
@@ -670,9 +670,9 @@ qtest exceptionsとrootは対象外。
 
 | 分類 | 件数 | 行 |
 |---|---|---|
-| canonical | 21 | E-1, E-2, E-3, E-4, E-5, E-6, E-8, E-9, E-11, E-12, E-13, E-14, E-16, E-18, E-20, E-22, E-23, E-24, E-25, E-26, E-27 |
+| canonical | 22 | E-1, E-2, E-3, E-4, E-5, E-6, E-8, E-9, E-10, E-11, E-12, E-13, E-14, E-16, E-18, E-20, E-22, E-23, E-24, E-25, E-26, E-27 |
 | bridge | 0 | — |
-| mixed | 8 | E-7, E-10, E-15, E-17, E-19, E-21, E-28, E-29 |
+| mixed | 7 | E-7, E-15, E-17, E-19, E-21, E-28, E-29 |
 | unknown | 0 | — |
 
 （合計 29 行。分類別の内訳は直上の表だけに書く。`E-18` は `mixed` に見えるが、CLI が使わないのは「別の正本がある」からではなく E-17 の帰結であるため `canonical`。`E-4` も同様に `canonical`——一度は `mixed` 側に誤って列挙されていた）
@@ -1528,21 +1528,17 @@ the exact `getTrimmedTrailer` set, including `/F`, `/FFilter`, and
 Catalog value through `getRoot` and `unparseChild`
 (`libqpdf/QPDF.cc:2349-2358`; `libqpdf/QPDFWriter.cc:1144-1155`).
 
-`job/page_merge.rs` owns the fresh-target handoff for this route. It copies
-primary Catalog siblings and root `/Pages` non-structural values through the
-canonical foreign copier, preserves qpdf's trailer key boundary, and restores
-the source direct/indirect `/Root` shape after shared page and AcroForm
-mutations. The primary copier receives the writer-mode boundary: qpdf's
-stale-generation removal is enabled only when Preserve has source ObjStms
-without `--preserve-unreferenced`, or when Generate invokes
-`getCompressibleObjGens`; Disable, Preserve+`--preserve-unreferenced`, and
-ordinary foreign-copy calls retain an absent lower generation as an indirect
-null (`libqpdf/QPDF.cc:1952-1959,2392-2433`; `libqpdf/QPDFWriter.cc:1939-1983`).
-The preserve-unreferenced queue orders imported handles by primary source
-identity before assigning output numbers, matching qpdf's `getAllObjects`
-seed order (`libqpdf/QPDF.cc:1285-1294`; `libqpdf/QPDFWriter.cc:2907-2925`).
-Generic `merge_documents` and the qpdf job consumer retain their separate
-field-selection boundaries.
+Production `QPDFJob::handlePageSpecs` now mutates the parsed primary in place
+through `job/page_specs.rs` and `PageDocumentHelper`: it flattens the primary
+page tree, removes its original pages, then appends selected primary/foreign
+pages in qpdf occurrence order. The primary Catalog, direct/indirect `/Root`,
+trailer entries, original object cache, and encryption remain on that same
+document; foreign graphs use the canonical `copy_foreign_object` map. This
+replaces the previous Job fresh-target handoff. `job/page_merge.rs` still owns
+the generic `merge_documents` API and its separate grouped merge behavior, but
+it is no longer the production `QPDFJob` page-selection owner. The qpdf
+differentials below cover the primary metadata, direct root, Preserve,
+ObjStm-bearing, and unreferenced page-graph boundaries.
 
 The qpdf differential regression
 `crates/flpdf-cli/tests/page_ops_qpdf_matrix.rs::pages_preserves_primary_document_graph_edge_fixtures`
