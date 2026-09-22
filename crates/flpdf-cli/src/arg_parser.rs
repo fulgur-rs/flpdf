@@ -381,9 +381,7 @@ impl ArgParser {
         // Matches `preflight_qpdf_cli_events`'s own has_job_json scan
         // (crates/flpdf-cli/src/main.rs), which runs on this same
         // already-expanded token stream one layer up.
-        let has_job_json = args
-            .iter()
-            .any(|argument| argument.as_bytes().starts_with(b"--job-json-file="));
+        let has_job_json = args.iter().any(is_job_json_file_argument);
         // qpdf has no subcommands. Since flpdf adds a native clap surface, fix
         // the dispatch mode once from the first expanded token: a bare native
         // subcommand at the command position selects clap's native grammar;
@@ -1106,6 +1104,24 @@ fn canonical_segment_non_utf8_option(kind: SegmentKind, token: RawArg) -> RawArg
 /// (`libqpdf/QPDFArgParser.cc:505-534`). Every bare option therefore parses
 /// any `=value` suffix off and discards it, then fires its handler on flag
 /// presence alone — with no per-option exceptions.
+/// Whether `argument` is qpdf's `--job-json-file=...`, in either spelling.
+///
+/// `QPDFArgParser::parseArgs` strips one leading `-`, then one more if it is
+/// there (`libqpdf/QPDFArgParser.cc:460-476`), so `-job-json-file=x` and
+/// `--job-json-file=x` name the same option. Only the `=` form exists:
+/// `addRequiredParameter` makes a spaced parameter a usage error
+/// (`libqpdf/qpdf/auto_job_init.hh:97`).
+pub(crate) fn is_job_json_file_argument(argument: &RawArg) -> bool {
+    let bytes = argument.as_bytes();
+    let Some(rest) = bytes
+        .strip_prefix(b"--")
+        .or_else(|| bytes.strip_prefix(b"-"))
+    else {
+        return false;
+    };
+    rest.starts_with(b"job-json-file=")
+}
+
 fn should_discard_bare_value(arg: &str) -> bool {
     arg.contains('=')
 }
