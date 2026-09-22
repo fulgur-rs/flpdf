@@ -6678,6 +6678,45 @@ fn rewrite_newline_before_endstream_every_spelling_uses_qpdf_bare_flag_behavior(
     }
 }
 
+/// qpdf fires the bare handler once per occurrence inside its single argv
+/// scan (`QPDFArgParser.cc:535-537`), so repeating the flag is accepted and
+/// means the same as passing it once. Verified against qpdf 11.9.0: both
+/// forms below exit 0 there and produce the same bytes as a single flag.
+///
+/// clap rejects a repeated flag as "cannot be used multiple times" unless the
+/// argument self-overrides, so this guards the `overrides_with` that keeps
+/// flpdf accepting the same command lines qpdf does.
+#[test]
+fn rewrite_repeated_newline_before_endstream_is_accepted_like_qpdf() {
+    for repeat in [
+        ["--newline-before-endstream", "--newline-before-endstream"],
+        [
+            "--newline-before-endstream",
+            "--newline-before-endstream=never",
+        ],
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("in.pdf");
+        let output = temp.path().join("out.pdf");
+        std::fs::write(&input, one_page_pdf_with_content(b"q Q")).unwrap();
+
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(["rewrite", "--compress-streams=n"])
+            .args(repeat)
+            .arg(&input)
+            .arg(&output)
+            .assert()
+            .success();
+
+        let output_bytes = std::fs::read(&output).unwrap();
+        assert!(
+            contains(&output_bytes, b"q Q\nendstream"),
+            "repeating {repeat:?} should stay enabled, as qpdf's bare flag does"
+        );
+    }
+}
+
 /// Omitting the flag is the only way to get qpdf's default framing, where
 /// exactly `/Length` bytes sit between `stream` and `endstream`. This is the
 /// counterpart of the spelling sweep above: the writer's "no newline" state

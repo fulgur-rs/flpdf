@@ -1924,8 +1924,12 @@ option に限る** — clap の `value_enum` か、`arg_parser.rs` の
 `--flatten-annotations`、`--keep-files-open`、
 `--password-mode`、`--password-file`、`--json-stream-data`、resource policy）。
 `--json-key` は qpdf 自身が repeatable と明記しているため対象外。
-`--newline-before-endstream` も対象外 — qpdf は `addBare` で登録しており
-（`auto_job_init.hh:58`）値を取らないため、self-override する値が存在しない
+`--newline-before-endstream` はこの「値の last-wins」枠ではない — qpdf は
+`addBare` で登録しており（`auto_job_init.hh:58`）値を取らないため、上書きされる
+値が存在しない。clap 側の `overrides_with` self は別目的で残してある: bool flag が
+繰り返されたときに clap が "cannot be used multiple times" で拒否するのを防ぎ、
+qpdf が occurrence ごとに bare handler を再発火する挙動
+（`QPDFArgParser.cc:535-537`）と同じコマンドラインを受理するため
 （`flpdf-glm2.1`、下記）。
 `--pages`/`--add-attachment`/`--copy-attachments-from` の segment accumulation は
 既存の `ArgParser` 境界に残す。
@@ -1967,12 +1971,21 @@ flpdf-cli は以前 `--newline-before-endstream=never` を「flag 不在と同�
 逆の出力になっていた。`arg_parser.rs` の bare-value discard にも
 `newline-before-endstream` だけ `y`/`n`/`never` の値を残す carve-out があった。
 qpdf 側に対応物の無いこの糖衣は撤去し、clap 側も純粋な bool flag に揃えた
-（`main.rs`）。writer 側の [`NewlineBeforeEndstream::Never`] は無変更で、
+（`main.rs`）。writer 側の `NewlineBeforeEndstream::Never` は無変更で、
 flag を省略すれば qpdf の既定と同じくそのまま到達する。これで `main.rs` の argv
 文法は `job/argv.rs` の `initialize_from_argv`（元から
 `set_newline_before_endstream(true)` を呼ぶ純粋な bare handler）と一致し、
 受理するすべての綴りが実際の qpdf と同じ出力を出す。逸脱ではなく逸脱の解消なので
 `// qpdf-deviation:` マーカーは付けない。
+
+flag の繰り返し（`--newline-before-endstream --newline-before-endstream`）は
+qpdf が exit 0 で受理し単発と同一バイトを出す（`QPDFArgParser.cc:535-537` の
+bare handler は argv 走査の各 occurrence で再発火する）。clap は bool flag の
+重複を既定で拒否するため、`overrides_with` self を残してこれを受理する。
+なお `--qdf` / `--preserve-unreferenced` など他の bare flag は現状この重複を
+usage error にしており、qpdf と乖離している（`flpdf-glm2.1` のスコープ外、
+`flpdf-djmim` で追跡）。`--empty` / `--replace-input` は例外で、
+`QPDFJob_config.cc:27-39,54-62` に従い重複を usage error にするのが正しい。
 
 `flpdf-1qhb` では `--job-json-file` を clap の self-override 対象にせず
 `ArgAction::Append` で occurrence を保持し、`QPDFJob::initialize_from_json_partial_bytes`

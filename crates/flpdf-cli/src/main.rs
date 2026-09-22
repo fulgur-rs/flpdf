@@ -1124,7 +1124,15 @@ struct Cli {
     /// spelling is discarded and the flag's presence alone enables it.
     /// Omitting the flag keeps qpdf's default framing, where exactly
     /// `/Length` bytes sit between `stream` and `endstream`.
-    #[arg(long = "newline-before-endstream")]
+    // `overrides_with` self is clap's idiom for accepting repeated
+    // occurrences. qpdf re-fires the bare handler on every occurrence
+    // (`QPDFArgParser.cc:535-537`), so `--newline-before-endstream` twice is
+    // accepted and means the same as once; without this clap rejects the
+    // second occurrence as "cannot be used multiple times".
+    #[arg(
+        long = "newline-before-endstream",
+        overrides_with = "newline_before_endstream"
+    )]
     newline_before_endstream: bool,
     /// `qpdf --linearize-pass1=PATH` compatibility flag. Writes the
     /// linearization writer's distinct pass-1 intermediate file.
@@ -2032,9 +2040,15 @@ struct RewriteCommand {
     /// required for byte-identical qpdf-equivalent rewrites.
     ///
     /// Only affects the full-rewrite path.
+    // `overrides_with` self is clap's idiom for accepting repeated
+    // occurrences. qpdf re-fires the bare handler on every occurrence
+    // (`QPDFArgParser.cc:535-537`), so `--newline-before-endstream` twice is
+    // accepted and means the same as once; without this clap rejects the
+    // second occurrence as "cannot be used multiple times".
     #[arg(
         long = "newline-before-endstream",
-        help = "For an extra newline before endstream"
+        help = "For an extra newline before endstream",
+        overrides_with = "newline_before_endstream"
     )]
     newline_before_endstream: bool,
 
