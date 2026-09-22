@@ -566,6 +566,10 @@ struct Live<'a, R> {
 }
 
 /// Carriers are found in every binding position, and named by their owner.
+///
+/// The owner is for the failure message only, so an item kind the scan does
+/// not name -- a `union`, below -- still reports its field, just without one.
+/// Reporting is what the guard is for; naming is a convenience.
 #[test]
 fn the_structural_search_reaches_every_binding_position() {
     let source = "\
@@ -583,6 +587,9 @@ fn outer<R>() {
     fn inner<S>(_pdf: &mut Pdf<S>) {}
     let closure = |_pdf: &mut Pdf<R>| ();
 }
+union Untracked<'a, R> {
+    _pdf: &'a mut Pdf<R>,
+}
 ";
     let found: Vec<(usize, String)> = dead_pdf_carriers(source)
         .into_iter()
@@ -597,6 +604,7 @@ fn outer<R>() {
             (9, "enum Carrier".to_owned()),
             (12, "fn inner".to_owned()),
             (13, "fn outer".to_owned()),
+            (16, "file scope".to_owned()),
         ]
     );
 }
