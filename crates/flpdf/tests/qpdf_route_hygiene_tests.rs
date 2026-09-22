@@ -388,10 +388,34 @@ fn marked_bindings(source: &str, display: &str) -> BTreeMap<usize, (usize, Strin
             "{display}:{}: `{ALLOW_MARKER}` needs a reason after `{binding}`",
             index + 1
         );
-        let target = lines.iter().enumerate().skip(index + 1).find(|(_, next)| {
-            let next = next.trim_start();
-            !next.is_empty() && !next.starts_with("//") && !next.starts_with("#[")
-        });
+        // An attribute between the marker and the declaration may span
+        // several lines once rustfmt has wrapped it, so skip to the line
+        // that closes the bracket rather than only its opening line.
+        let mut cursor = index + 1;
+        let target = loop {
+            let Some(next) = lines.get(cursor) else {
+                break None;
+            };
+            let trimmed = next.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with("//") {
+                cursor += 1;
+                continue;
+            }
+            if trimmed.starts_with("#[") {
+                let mut depth = 0i32;
+                loop {
+                    let line = lines.get(cursor).copied().unwrap_or_default();
+                    depth += line.matches('[').count() as i32;
+                    depth -= line.matches(']').count() as i32;
+                    cursor += 1;
+                    if depth <= 0 || cursor >= lines.len() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            break Some((cursor, next));
+        };
         let (target, _) = target.unwrap_or_else(|| {
             panic!(
                 "{display}:{}: `{ALLOW_MARKER}` precedes no declaration",
@@ -630,10 +654,13 @@ impl<'ast> Visit<'ast> for CarrierScan {
         let Some(ident) = node.ident.as_ref() else {
             return;
         };
-        if ident.to_string().starts_with('_') && type_mentions_pdf(&node.ty) {
+        // Raw spellings reach the same classification here too: `r#_pdf` is
+        // an underscore-prefixed field as far as rustc is concerned.
+        let binding = strip_raw(ident);
+        if binding.starts_with('_') && type_mentions_pdf(&node.ty) {
             self.found.push(DeadPdfCarrier {
                 line: ident.span().start().line,
-                binding: ident.to_string(),
+                binding,
                 owner: self.owner(),
             });
         }
@@ -904,5 +931,40 @@ fn raw_identifiers_are_classified_like_their_plain_spelling() {
         dead_pdf_carriers(raw_type).len(),
         1,
         "`r#Pdf` names the same type as `Pdf`"
+    );
+}
+
+/// `r#_pdf` as a struct field is the same dead carrier as `_pdf`; the field
+/// arm compared the raw text and let it through.
+#[test]
+fn raw_identifier_fields_are_classified_like_their_plain_spelling() {
+    let source = "struct Holder<R> {\n    r#_pdf: Pdf<R>,\n}\n";
+    let found: Vec<String> = dead_pdf_carriers(source)
+        .into_iter()
+        .map(|carrier| carrier.binding)
+        .collect();
+    assert_eq!(found, vec!["_pdf".to_owned()]);
+}
+
+/// rustfmt wraps a long attribute across lines. The marker search skipped
+/// only the opening `#[` line and keyed the marker to the continuation,
+/// panicking on a declaration the contract explicitly allows.
+#[test]
+fn a_multiline_attribute_between_marker_and_declaration_is_skipped() {
+    let source = "\
+// route-hygiene-allow: _pdf -- holds the exclusive borrow, not a value.
+#[allow(
+    dead_code
+)]
+fn kept<R>(_pdf: &mut Pdf<R>) {}
+";
+    assert_eq!(
+        marked_bindings(source, "synthetic"),
+        BTreeMap::from([(5, (1, "_pdf".to_owned()))]),
+        "the marker must key to the declaration, not to an attribute line"
+    );
+    assert!(
+        unmarked_dead_pdf_carriers(source, "synthetic").is_empty(),
+        "a correctly marked declaration must not be reported"
     );
 }
