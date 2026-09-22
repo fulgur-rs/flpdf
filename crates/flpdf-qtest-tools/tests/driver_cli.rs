@@ -54,11 +54,35 @@ fn test_50_uses_canonical_resource_merge_accessors() {
     let test_50 = &source[start..end];
 
     assert!(
-        !test_50.contains("pdf.resolve(")
-            && test_50.contains("let d2_k1 = d2.try_get_key(b\"/k1\")?;")
-            && test_50.contains("d1.merge_resources(&d2, None)?;\n    emit_new_diagnostics")
-            && test_50.contains("d1.merge_resources(&d2_k1, None)?;"),
+        !test_50.contains("pdf.resolve("),
         "test 50 must use canonical resource merge and dictionary accessors"
+    );
+
+    // flpdf-v9z62: a fallible resource-merge/lookup call must never sit
+    // directly before its own `?` -- that would return before the pending
+    // diagnostics collected during lazy resolution are flushed, dropping a
+    // repair warning that a subsequent merge/lookup failure would otherwise
+    // still owe the caller (matching qpdf, which logs each warning to
+    // stderr synchronously as it occurs, so a later exception never erases
+    // an earlier one). Every fallible call below must be split from its
+    // `?` by an intervening `emit_new_diagnostics` flush.
+    assert!(
+        test_50.contains(
+            "let merge_result = d1.merge_resources(&d2, None);\n    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;\n    merge_result?;"
+        ),
+        "test 50's first merge_resources call must flush diagnostics before propagating its own failure"
+    );
+    assert!(
+        test_50.contains(
+            "let d2_k1 = d2.try_get_key(b\"/k1\");\n    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;\n    let d2_k1 = d2_k1?;"
+        ),
+        "test 50's try_get_key(\"/k1\") lookup must flush diagnostics before propagating its own failure"
+    );
+    assert!(
+        test_50.contains(
+            "let merge_result = d1.merge_resources(&d2_k1, None);\n    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;\n    merge_result?;"
+        ),
+        "test 50's second merge_resources call must flush diagnostics before propagating its own failure"
     );
 }
 
