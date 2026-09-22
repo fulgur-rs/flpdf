@@ -419,6 +419,15 @@ fn marked_bindings(source: &str, display: &str) -> BTreeMap<usize, (usize, Strin
     marked
 }
 
+/// An identifier's text without the raw-identifier prefix. `r#_pdf` is an
+/// underscore-prefixed binding as far as rustc's unused-variable diagnostic
+/// is concerned, and `r#Pdf` names the same type as `Pdf`, so both spellings
+/// have to reach the same classification.
+fn strip_raw(ident: &proc_macro2::Ident) -> String {
+    let text = ident.to_string();
+    text.strip_prefix("r#").unwrap_or(&text).to_owned()
+}
+
 /// The element types of a tuple type, seen through references and parens, so
 /// `(&mut Pdf<R>, usize)` and `&(&mut Pdf<R>, usize)` both pair a tuple
 /// pattern's subpatterns with their own component types.
@@ -438,7 +447,7 @@ fn type_mentions_pdf(ty: &syn::Type) -> bool {
     struct PdfIdent(bool);
     impl Visit<'_> for PdfIdent {
         fn visit_ident(&mut self, node: &proc_macro2::Ident) {
-            self.0 |= node == "Pdf";
+            self.0 |= strip_raw(node) == "Pdf";
         }
     }
     let mut finder = PdfIdent(false);
@@ -471,8 +480,8 @@ impl CarrierScan {
 
     fn record(&mut self, pat: &syn::Pat, ty: &syn::Type) {
         let binding = match pat {
-            syn::Pat::Ident(ident) if ident.ident.to_string().starts_with('_') => {
-                ident.ident.to_string()
+            syn::Pat::Ident(ident) if strip_raw(&ident.ident).starts_with('_') => {
+                strip_raw(&ident.ident)
             }
             // A bare `_` is the same papering-over as an underscore rename.
             syn::Pat::Wild(_) => "_".to_owned(),
@@ -483,11 +492,33 @@ impl CarrierScan {
             // the type line up, and fall back to the whole type otherwise so
             // a carrier is never dropped for want of an exact component.
             syn::Pat::Tuple(tuple) => {
+                // `..` stands for however many components the pattern does
+                // not name, so index-based pairing only holds up to the rest
+                // position. Walk the prefix forwards and the suffix
+                // backwards, the way the language matches them.
                 let components = tuple_components(ty);
-                for (index, element) in tuple.elems.iter().enumerate() {
-                    let component = components
-                        .as_ref()
-                        .and_then(|types| types.get(index).copied())
+                let elems: Vec<&syn::Pat> = tuple.elems.iter().collect();
+                let rest = elems
+                    .iter()
+                    .position(|element| matches!(element, syn::Pat::Rest(_)));
+                let total = components.as_ref().map(Vec::len);
+                for (index, element) in elems.iter().enumerate() {
+                    if matches!(element, syn::Pat::Rest(_)) {
+                        continue;
+                    }
+                    let position = match (rest, total) {
+                        // After the rest, count back from the tuple's end.
+                        (Some(rest_at), Some(total)) if index > rest_at => {
+                            total.checked_sub(elems.len() - index)
+                        }
+                        _ => Some(index),
+                    };
+                    let component = position
+                        .and_then(|position| {
+                            components
+                                .as_ref()
+                                .and_then(|types| types.get(position).copied())
+                        })
                         .unwrap_or(ty);
                     self.record(element, component);
                 }
@@ -829,5 +860,49 @@ fn an_exclusion_marker_does_not_follow_a_replaced_binding() {
         "// route-hygiene-allow: _pdf -- holds the exclusive borrow.\n\
          fn f<R>(_document: &mut Pdf<R>) {}\n",
         "synthetic",
+    );
+}
+
+/// `..` stands for the components the pattern does not name, so a carrier
+/// after the rest position lines up with the tuple's *end*, not with its
+/// index in the pattern. Index-based pairing paired `_pdf` with a `usize`
+/// and reported nothing.
+#[test]
+fn rest_patterns_pair_suffix_bindings_with_the_tuple_end() {
+    let after = "fn probe<R>((_n, .., _pdf): (usize, usize, usize, &mut Pdf<R>)) {}\n";
+    assert_eq!(
+        dead_pdf_carriers(after).len(),
+        1,
+        "a carrier after `..` must pair with the tuple's final component"
+    );
+    let before = "fn probe<R>((_pdf, ..): (&mut Pdf<R>, usize, usize)) {}\n";
+    assert_eq!(
+        dead_pdf_carriers(before).len(),
+        1,
+        "a carrier before `..` still pairs by its own index"
+    );
+    let neither = "fn probe<R>((_n, .., _m): (usize, usize, usize, usize)) {}\n";
+    assert!(
+        dead_pdf_carriers(neither).is_empty(),
+        "a tuple with no Pdf component must not be reported"
+    );
+}
+
+/// `r#_pdf` is underscore-prefixed as far as rustc's unused-variable
+/// diagnostic is concerned, and `r#Pdf` names the same type as `Pdf`;
+/// `Ident::to_string` keeps the `r#`, so both spellings used to slip past.
+#[test]
+fn raw_identifiers_are_classified_like_their_plain_spelling() {
+    let raw_binding = "fn probe<R>(r#_pdf: &mut Pdf<R>) {}\n";
+    assert_eq!(
+        dead_pdf_carriers(raw_binding).len(),
+        1,
+        "`r#_pdf` is the same dead carrier as `_pdf`"
+    );
+    let raw_type = "fn probe<R>(_pdf: &mut r#Pdf<R>) {}\n";
+    assert_eq!(
+        dead_pdf_carriers(raw_type).len(),
+        1,
+        "`r#Pdf` names the same type as `Pdf`"
     );
 }
