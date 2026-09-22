@@ -32,8 +32,9 @@ pub(crate) fn run_test_50<R: Read + Seek>(
     let d1 = d1_handle.clone();
     let d2 = d2_handle.clone();
 
-    d1.merge_resources(&d2, None)?;
+    let merge_result = d1.merge_resources(&d2, None);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    merge_result?;
 
     // `d1.getJSON(JSON::LATEST)` uses qpdf's default
     // `dereference_indirect = false` (`include/qpdf/QPDFObjectHandle.hh`):
@@ -57,9 +58,12 @@ pub(crate) fn run_test_50<R: Read + Seek>(
     // value's type; whether it turns out to be a no-op depends on the
     // resolved type, matching `merge_resources`'s own no-op contract for a
     // non-dictionary `other`.
-    let d2_k1 = d2.try_get_key(b"/k1")?;
-    d1.merge_resources(&d2_k1, None)?;
+    let d2_k1 = d2.try_get_key(b"/k1");
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let d2_k1 = d2_k1?;
+    let merge_result = d1.merge_resources(&d2_k1, None);
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    merge_result?;
 
     // qpdf iterates `d1`'s top-level keys whose already-merged value is itself
     // a dictionary, printing the sorted names returned by
@@ -738,5 +742,108 @@ mod tests {
             "resource-name output failure must propagate"
         );
         assert!(stderr.is_empty());
+    }
+
+    /// Like [`pdf_with_merge_dictionaries`], but `/Dict1` (object 2) is
+    /// missing its `endobj` keyword, so parsing it lazily during the first
+    /// `merge_resources` call records a repair warning; and `/Dict2` (object
+    /// 3) carries a new resource category (`/ExtGState`, absent from
+    /// `/Dict1`) whose value is a stream object (object 7), which makes
+    /// `merge_resources`'s `shallow_copy` on that new category fail with
+    /// "stream objects cannot be cloned" (`ObjectHandle::shallow_copy`,
+    /// `object_handle.rs:5480-5489`) -- both conditions flpdf-v9z62 needs to
+    /// demonstrate the diagnostic-drop bug in the first merge_resources call.
+    fn pdf_with_merge_dictionaries_and_pending_repair_warning() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = vec![0usize; 8];
+
+        offsets[1] = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 4 0 R >>\nendobj\n");
+
+        // Object 2 (/Dict1): deliberately no "endobj" -- object 3's header
+        // follows directly, so parsing object 2 lazily during the first
+        // merge_resources call must recover and record an "expected endobj"
+        // repair warning.
+        offsets[2] = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\n<< /Font << /F1 5 0 R >> /XObject << >> >>\n");
+
+        offsets[3] = bytes.len();
+        bytes.extend_from_slice(
+            b"3 0 obj\n<< /k1 true /Font << /F2 6 0 R >> /ExtGState 7 0 R >>\nendobj\n",
+        );
+
+        offsets[4] = bytes.len();
+        bytes.extend_from_slice(b"4 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+
+        offsets[5] = bytes.len();
+        bytes.extend_from_slice(b"5 0 obj\n<< >>\nendobj\n");
+
+        offsets[6] = bytes.len();
+        bytes.extend_from_slice(b"6 0 obj\n<< >>\nendobj\n");
+
+        offsets[7] = bytes.len();
+        bytes.extend_from_slice(b"7 0 obj\n<< /Length 0 >>\nstream\n\nendstream\nendobj\n");
+
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 8\n0000000000 65535 f \n");
+        for offset in offsets.into_iter().skip(1) {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 8 /Root 1 0 R /Dict1 2 0 R /Dict2 3 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn dictionary_merge_flushes_a_pending_repair_warning_before_its_own_failure() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            pdf_with_merge_dictionaries_and_pending_repair_warning(),
+            PdfOpenOptions {
+                description: b"merge-dict-pending-warning.pdf".to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open merge dictionary fixture with pending repair warning");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
+
+        let result = run_test_50(
+            &mut pdf,
+            b"merge-dict-pending-warning.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        );
+
+        assert!(
+            result.is_err(),
+            "the /ExtGState stream category must fail merge_resources's shallow_copy"
+        );
+        // This is the regression this test pins: before flpdf-v9z62, the
+        // `?` on `merge_resources` returned before `emit_new_diagnostics`
+        // ever ran, so the "expected endobj" warning recorded while lazily
+        // resolving /Dict1 was silently dropped -- stderr stayed empty even
+        // though a repair diagnostic was pending. qpdf's own logger prints
+        // each warning synchronously as it is recorded, so the warning is
+        // always visible before the subsequent exception, regardless of
+        // whether the merge that provoked it succeeds.
+        assert!(
+            stderr
+                .windows(b"expected endobj".len())
+                .any(|window| window == b"expected endobj"),
+            "the /Dict1 repair warning recorded during the failing merge must still reach stderr: {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert_eq!(
+            pdf.repair_diagnostics().entries().len(),
+            diagnostics_written,
+            "the flushed warning must be marked written so it is not re-emitted by a later flush"
+        );
     }
 }
