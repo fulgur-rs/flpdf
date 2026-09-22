@@ -2717,7 +2717,9 @@ impl ObjectHandle {
     /// direct object retained by an external caller beyond its owning
     /// `Pdf`'s lifetime (e.g. a resolved `/Resources` dictionary held
     /// separately from its owning page) is reached this way rather than
-    /// through the `object_cache` walk itself.
+    /// through the `object_cache` walk itself. A stream additionally releases
+    /// its deferred data provider before its dictionary is walked, as
+    /// `QPDF_Stream::disconnect` does.
     ///
     /// This method alone never converts a value to `Destroyed` --
     /// [`Self::disconnect_and_destroy`] does that, and only for the
@@ -2755,6 +2757,22 @@ impl ObjectHandle {
             let shared = handle.0.borrow().shared.clone();
             if !visited.insert(Rc::as_ptr(&shared)) {
                 continue;
+            }
+            // A stream's deferred data provider retains whatever the provider
+            // captured -- `CopiedStreamDataProvider` holds a handle from the
+            // document the stream was copied out of -- so it is released
+            // before the stream dictionary is handed to the walk, the order
+            // `QPDF_Stream::disconnect` uses (`libqpdf/QPDF_Stream.cc:167-171`).
+            // Only the provider slot is cleared there; replacement bytes and
+            // the write-time filter flag stay. This mutable borrow ends before
+            // the walk collects children, because a direct container that
+            // holds itself makes `append_direct_children` re-enter this same
+            // shared allocation through `ObjectHandle::is_indirect`.
+            {
+                let mut shared = shared.borrow_mut();
+                if let ObjectValue::Stream(stream) = &mut shared.value {
+                    stream.stream_provider = None;
+                }
             }
             {
                 let shared = shared.borrow();
@@ -12587,6 +12605,159 @@ mod resolution_state_tests {
 
         assert_eq!(a.strong_count(), 1, "only this test's own handle remains");
         assert_eq!(b.strong_count(), 1, "only this test's own handle remains");
+    }
+
+    /// Build a direct stream whose data source is a provider retaining
+    /// `source`, the shape `CopiedStreamDataProvider` installs when a stream
+    /// is copied out of another document. The provider `Rc` is created inline
+    /// so the only strong reference to `source` it introduces is the one the
+    /// stream itself holds.
+    fn direct_stream_with_provider_for(source: &ObjectHandle) -> ObjectHandle {
+        let stream = ObjectHandle::stream(ObjectHandle::dictionary(vec![]), Rc::new(Vec::new()));
+        stream.with_value_mut(|value| {
+            if let Some(ObjectValue::Stream(stream)) = value {
+                stream.stream_data = None;
+                stream.stream_provider = Some(copied_stream_data_provider(source.clone()));
+            }
+        });
+        stream
+    }
+
+    #[test]
+    fn disconnect_clears_a_direct_streams_stream_provider() {
+        // A stream data provider retains a handle from the document the
+        // stream was copied out of, so a provider left in place after
+        // teardown keeps that document's object alive. An indirect stream is
+        // replaced wholesale by the `Destroyed` sentinel, which takes its
+        // provider with it; a direct stream a caller still holds survives the
+        // walk, so the walk itself has to clear the provider.
+        let source = ObjectHandle::new_indirect_unresolved(ObjectRef::new(2, 0), 0);
+        source.set_resolved(ObjectValue::Integer(7));
+        let stream = direct_stream_with_provider_for(&source);
+        let owner = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        owner.set_resolved(ObjectValue::Dictionary(
+            [(b"S".to_vec(), stream.clone())].into_iter().collect(),
+        ));
+        assert!(stream.has_stream_data_provider());
+        assert_eq!(
+            source.strong_count(),
+            2,
+            "held by this test and by the stream's provider"
+        );
+
+        owner.disconnect_and_destroy();
+
+        assert!(
+            !stream.has_stream_data_provider(),
+            "the walk must clear a direct stream's provider"
+        );
+        assert_eq!(
+            source.strong_count(),
+            1,
+            "only this test's own handle remains"
+        );
+    }
+
+    #[test]
+    fn disconnect_clears_the_provider_of_a_direct_stream_it_is_called_on() {
+        // The same clearing applies when the walk starts at the stream
+        // rather than reaching it through a container.
+        let source = ObjectHandle::new_indirect_unresolved(ObjectRef::new(2, 0), 0);
+        source.set_resolved(ObjectValue::Integer(7));
+        let stream = direct_stream_with_provider_for(&source);
+        assert_eq!(source.strong_count(), 2);
+
+        stream.disconnect();
+
+        assert!(!stream.has_stream_data_provider());
+        assert_eq!(
+            source.strong_count(),
+            1,
+            "only this test's own handle remains"
+        );
+    }
+
+    #[test]
+    fn disconnect_leaves_a_direct_streams_replacement_data_in_place() {
+        // Only the provider slot is cleared: the replacement buffer and the
+        // dictionary the walk descends into are left as they were.
+        let data = Rc::new(b"stream bytes".to_vec());
+        let stream_dict = ObjectHandle::dictionary(vec![]);
+        let stream = ObjectHandle::stream(stream_dict.clone(), data.clone());
+        let owner = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        owner.set_resolved(ObjectValue::Dictionary(
+            [(b"S".to_vec(), stream.clone())].into_iter().collect(),
+        ));
+
+        owner.disconnect_and_destroy();
+
+        assert!(!stream.has_stream_data_provider());
+        assert!(stream
+            .as_stream_data()
+            .is_some_and(|actual| Rc::ptr_eq(&actual, &data)));
+        assert!(stream
+            .as_stream_dict()
+            .expect("stream dictionary")
+            .is_same_object_as(&stream_dict));
+    }
+
+    #[test]
+    fn disconnect_walks_a_direct_container_that_holds_itself() {
+        // Collecting a node's children reads each child's own shared state to
+        // test `is_indirect`, and a direct container that holds itself makes
+        // that read re-enter the node the walk is already positioned on. The
+        // walk must not be holding a mutable borrow of that node by then.
+        // `replace_key` privatizes the value it stores, so the cycle is
+        // installed on the map directly to keep the entry the very same
+        // allocation as its container.
+        let owner = ObjectHandle::dictionary(vec![]);
+        let self_reference = owner.clone();
+        owner.with_value_mut(|value| {
+            if let Some(ObjectValue::Dictionary(entries)) = value {
+                entries.insert(b"/Self".to_vec(), self_reference);
+            }
+        });
+
+        owner.disconnect();
+
+        let entries = owner.as_dictionary().expect("the container survives");
+        assert_eq!(entries.len(), 1);
+        assert!(entries
+            .values()
+            .next()
+            .expect("its single entry")
+            .is_same_object_as(&owner));
+    }
+
+    #[test]
+    fn disconnect_and_destroy_still_drops_an_indirect_streams_provider() {
+        // The indirect path already released the provider by replacing the
+        // whole value with `Destroyed`; clearing the slot during the walk
+        // must not change that outcome.
+        let source = ObjectHandle::new_indirect_unresolved(ObjectRef::new(2, 0), 0);
+        source.set_resolved(ObjectValue::Integer(7));
+        let stream = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        stream.set_resolved(ObjectValue::Stream(Box::new(StreamValue {
+            stream_dict: ObjectHandle::dictionary(vec![]),
+            stream_data: None,
+            stream_provider: Some(copied_stream_data_provider(source.clone())),
+            filter_on_write: true,
+            stream_length: 0,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
+        })));
+        assert!(stream.has_stream_data_provider());
+        assert_eq!(source.strong_count(), 2);
+
+        stream.disconnect_and_destroy();
+
+        assert!(!stream.has_stream_data_provider());
+        assert_eq!(stream.type_code().expect("type code"), 14);
+        assert_eq!(
+            source.strong_count(),
+            1,
+            "only this test's own handle remains"
+        );
     }
 
     #[test]
