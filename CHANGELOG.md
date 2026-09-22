@@ -232,6 +232,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/fulgur-rs/flpdf/compare/v0.7.0...v0.8.0) - 2026-09-22
+
+### Fixed
+
+- *(json)* drop the dictionary key for an object-number-zero value like qpdf
+- *(writer)* stop double-charging the content probe's own root
+- *(object-handle,writer)* bound the content-emit and direct-graph walkers
+- *(linearize)* floor the linearized writer from the clamped source extension level
+- *(writer)* take the write path's extension level through get_extension_level
+- *(pdf)* migrate hand-written adobe_extension_level() callers to get_extension_level
+- *(job)* match the "." shorthand on raw bytes too
+- *(job)* key --pages source dedup on raw path bytes, matching qpdf
+- *(pages)* reserve qpdf's orphaned indirect /Fields array before counting
+- *(writer)* remember that encryption generated an ID before normalization
+- *(writer)* defer the static-ID deterministic-ID/encryption error past getObjectCount
+- *(job)* correct misleading split-pages writer-config comment; add per-chunk password warning regression test
+- *(object-handle)* drop the redundant !succeeded check in pipe_content_streams
+- *(reader)* flush the shared cursor on a trailing-token read failure
+- *(qutil)* keep the errno wording that ErrorKind cannot distinguish
+- *(qutil)* unify qpdf-strerror wording into one canonical mapper
+- *(cli)* stop double-expanding @file in the --job-json-file preflight
+- *(job)* write the partial xref entry prefix before the type-zero error
+
+### Other
+
+- Merge pull request #2282 from fulgur-rs/test/flpdf-5ktpf-alias-default-type-argument
+- *(route-hygiene)* keep alias cycle detection path-local
+- *(route-hygiene)* pin the fallback for a default inside a component
+- *(route-hygiene)* read an alias parameter's default at the use site
+- Merge pull request #2278 from fulgur-rs/refactor/flpdf-ysg35-route-hygiene-guard-scope
+- *(route-hygiene)* treat block comments as attribute trivia too
+- *(route-hygiene)* decide the alias fallback per component
+- *(route-hygiene)* skip trailing attribute comments and follow tuple aliases
+- *(route-hygiene)* resolve type aliases and take attribute extents from syn
+- Merge pull request #2273 from fulgur-rs/refactor/flpdf-kuaqn-standard-dead-code-audit
+- Merge pull request #2272 from fulgur-rs/refactor/flpdf-dsti-encryption-dead-code-audit
+- *(route-hygiene)* normalize raw fields and skip wrapped attributes
+- *(route-hygiene)* handle rest patterns and raw identifiers
+- *(route-hygiene)* close the destructuring and duplicate-marker bypasses
+- *(route-hygiene)* key each exclusion marker to the binding it names
+- *(route-hygiene)* report a field whose item kind the scan does not name
+- *(route-hygiene)* find dead Pdf carriers structurally, not by literal
+- share one newline normalizer and pin literal EOL expectations
+- *(writer)* rename write_child* to unparse_child*
+- *(writer)* drop the two unreferenced EncryptedStringEmitter helpers
+- *(writer)* name the emission entry points after qpdf's unparseObject
+- *(linearization)* measure the perf guards instead of matching source text
+- *(encryption)* reuse the XOR-key buffer across RC4 19/20-pass loops
+- *(acroform)* fix drifted QPDFAcroFormDocumentHelper.cc citations
+- *(encryption)* pin short /O and /U donors through copy-encryption
+- Merge pull request #2260 from fulgur-rs/fix/flpdf-nog2a-dict-child-object-zero-null-gate
+- Merge pull request #2259 from fulgur-rs/fix/flpdf-qs1cl-content-emit-unparse-resolved-shallow-copy-cycle-guards
+- Merge pull request #2257 from fulgur-rs/test/flpdf-w41i-trailer-info-inheritance
+- *(trailer)* pin /Producer and the direct /Info promotion route
+- *(trailer)* pin the primary-only rule for merged /Info
+- *(trailer)* pin /Info inheritance across the page-assembly primitives
+- *(pages)* guard the final-page removal path's raw removed set
+- *(pages)* drop RebuildResult::removed_pages ObjectRef projection
+- *(check)* cover the second get_extension_level error arm
+- Merge pull request #2248 from fulgur-rs/fix/flpdf-6z22-source-dedup-raw-bytes
+- Merge pull request #2244 from fulgur-rs/fix/flpdf-3o3f-pdfversion-i32-overflow
+- Merge pull request #2242 from fulgur-rs/fix/flpdf-ehl7u-hex-key-length-validation
+- *(encryption)* say the exit-code pairings vary by input, not just by build
+- narrow the aes128_object_key deviation's exit-code claim to --check
+- Merge pull request #2239 from fulgur-rs/fix/flpdf-43qyq-update-from-json-open-error
+- Merge pull request #2238 from fulgur-rs/fix/flpdf-dgei4-password-file-open-error-format
+- Merge pull request #2237 from fulgur-rs/fix/flpdf-cj7vk-item-doc-summaries-qpdf-subject
+- stop two more summaries from promising more than the code does
+- correct three rewritten summaries that overstated their items
+- rewrite public item-doc summaries around flpdf responsibilities
+- Merge pull request #2230 from fulgur-rs/fix/flpdf-8yho0-uncompressed-after-compressed-err-loss
+- Merge pull request #2229 from fulgur-rs/fix/flpdf-wii9o-3yn9-48-211-strerror-consolidation
+- *(page-split)* reattach QPDFJob.cc:340-345 to the clause it documents
+- restore two lost qpdf cross-region citations from #2057
+- *(page-plan)* mark --pages zero-page libstdc++ leak as qpdf-deviation
+- *(xref)* remove the classic-trailer diagnostics forwarding no-op
+- *(xref)* remove unreachable classic-trailer reconstruction handoff
+- Merge pull request #2217 from fulgur-rs/fix/flpdf-ip497-argfile-double-expansion
+- Merge pull request #2214 from fulgur-rs/cleanup/flpdf-c4kwf-annotation-transform-result
+- Merge pull request #2213 from fulgur-rs/fix/flpdf-v923z-show-xref-partial-line
+- Merge pull request #2210 from fulgur-rs/b194-json-pages-cutover-impl
+- give the JSON page route the create-stage job configuration
+- cut over JSON page selection to QPDFJob::create_qpdf (flpdf-3yn9.48.194, E-10)
+- write-through attempt_recovery via CanonicalTrailerOwner (flpdf-3yn9.48.176, B26)
+- port stopOnError invariants for page-private and pages-tree checks (flpdf-rbyc6, :1232, :1283)
+
 ## [0.7.0](https://github.com/fulgur-rs/flpdf/compare/v0.6.0...v0.7.0) - 2026-09-19
 
 ### Added
