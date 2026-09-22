@@ -6724,7 +6724,12 @@ fn rewrite_help_shows_normalize_content_default_n() {
         .assert()
         .success()
         .stdout(predicate::str::contains("normalize-content"))
-        .stdout(predicate::str::contains("default: n"));
+        // `--normalize-content` is an `Option`, so clap renders no
+        // `[default: ...]` line for it and the default lives in the prose,
+        // the same shape the `--compress-streams` sibling above asserts.
+        // The earlier `"default: n"` spelling only ever passed because it was
+        // a prefix of `--newline-before-endstream`'s `[default: never]`.
+        .stdout(predicate::str::contains("`n` (default)"));
 }
 
 #[test]
