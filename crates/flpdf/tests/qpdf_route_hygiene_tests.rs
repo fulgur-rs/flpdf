@@ -679,11 +679,21 @@ fn line_holds_only_attributes(line: &str, number: usize, attributes: &[Attribute
             *slot = true;
         }
     }
-    touched
-        && line
-            .chars()
-            .zip(&covered)
-            .all(|(character, inside)| *inside || character.is_whitespace())
+    if !touched {
+        return false;
+    }
+    // Everything the attributes do not cover has to be blank -- except a
+    // trailing line comment. `#[allow(dead_code)] // rationale` is a style
+    // the scanned sources already use, and its comment characters sit
+    // outside the attribute's own extent.
+    let mut rest = String::new();
+    for (character, inside) in line.chars().zip(&covered) {
+        if !*inside {
+            rest.push(character);
+        }
+    }
+    let rest = rest.trim();
+    rest.is_empty() || rest.starts_with("//")
 }
 
 /// An identifier's text without the raw-identifier prefix. `r#_pdf` is an
@@ -698,14 +708,39 @@ fn strip_raw(ident: &proc_macro2::Ident) -> String {
 /// The element types of a tuple type, seen through references and parens, so
 /// `(&mut Pdf<R>, usize)` and `&(&mut Pdf<R>, usize)` both pair a tuple
 /// pattern's subpatterns with their own component types.
-fn tuple_components(ty: &syn::Type) -> Option<Vec<&syn::Type>> {
-    match ty {
-        syn::Type::Tuple(tuple) => Some(tuple.elems.iter().collect()),
-        syn::Type::Reference(reference) => tuple_components(&reference.elem),
-        syn::Type::Paren(paren) => tuple_components(&paren.elem),
-        syn::Type::Group(group) => tuple_components(&group.elem),
-        _ => None,
+fn tuple_components<'a>(ty: &'a syn::Type, aliases: &'a AliasIndex) -> Option<Vec<&'a syn::Type>> {
+    fn walk<'a>(
+        ty: &'a syn::Type,
+        aliases: &'a AliasIndex,
+        seen: &mut BTreeSet<String>,
+    ) -> Option<Vec<&'a syn::Type>> {
+        match ty {
+            syn::Type::Tuple(tuple) => Some(tuple.elems.iter().collect()),
+            syn::Type::Reference(reference) => walk(&reference.elem, aliases, seen),
+            syn::Type::Paren(paren) => walk(&paren.elem, aliases, seen),
+            syn::Type::Group(group) => walk(&group.elem, aliases, seen),
+            // A tuple written through an alias -- `type Pair<'a, R> =
+            // (usize, &'a mut Pdf<R>)` -- has to be followed, or every
+            // subpattern is paired with the whole alias and an unrelated
+            // binding reads as a document carrier.
+            syn::Type::Path(path) if path.qself.is_none() => {
+                let name = strip_raw(&path.path.segments.last()?.ident);
+                // A colliding name resolves fail-closed: with more than one
+                // candidate there is no single component list to pair
+                // against, so the caller keeps the whole type.
+                let [only] = aliases.get(&name)?.as_slice() else {
+                    return None;
+                };
+                // `seen` stops `type A = B; type B = A;` from recursing forever.
+                if !seen.insert(name) {
+                    return None;
+                }
+                walk(only, aliases, seen)
+            }
+            _ => None,
+        }
     }
+    walk(ty, aliases, &mut BTreeSet::new())
 }
 
 /// Whether `ty` names `Pdf` anywhere, so `&Pdf<R>`, `&'a mut Pdf<R>`,
@@ -785,7 +820,18 @@ impl CarrierScan<'_> {
                 // not name, so index-based pairing only holds up to the rest
                 // position. Walk the prefix forwards and the suffix
                 // backwards, the way the language matches them.
-                let components = tuple_components(ty);
+                // Aliases are followed without substituting type
+                // arguments, so `type Pair<R> = (usize, R)` used as
+                // `Pair<&mut Pdf<X>>` would resolve to components that no
+                // longer mention the document. Losing it that way is a
+                // miss, so when the whole type names `Pdf` and no component
+                // does, keep the whole type instead.
+                let components = tuple_components(ty, self.aliases).filter(|types| {
+                    !type_mentions_pdf(ty, self.aliases)
+                        || types
+                            .iter()
+                            .any(|component| type_mentions_pdf(component, self.aliases))
+                });
                 let elems: Vec<&syn::Pat> = tuple.elems.iter().collect();
                 let rest = elems
                     .iter()
@@ -1313,6 +1359,92 @@ fn kept<R>(_pdf: &mut Pdf<R>) {}
     assert!(
         unmarked_dead_pdf_carriers(source, "synthetic").is_empty(),
         "a correctly marked declaration must not be reported"
+    );
+}
+
+/// An attribute may carry a trailing line comment. Its comment characters
+/// lie outside the attribute's own extent, so a skip that demanded every
+/// uncovered character be blank stopped on the attribute line and keyed the
+/// marker to it instead of to the declaration below. That style already
+/// appears in the scanned sources.
+#[test]
+fn a_trailing_comment_after_an_attribute_is_still_skipped() {
+    let source = "\
+// route-hygiene-allow: _pdf -- holds the exclusive borrow, not a value.
+#[allow(dead_code)] // the carrier is kept for the route it stands on
+fn kept<R>(_pdf: &mut Pdf<R>) {}
+";
+    assert_eq!(
+        marked_bindings(source, "synthetic"),
+        BTreeMap::from([(3, (1, "_pdf".to_owned()))]),
+        "the marker must reach past the attribute's trailing comment"
+    );
+    assert!(
+        unmarked_dead_pdf_carriers(source, "synthetic").is_empty(),
+        "a correctly marked declaration must not be reported"
+    );
+}
+
+/// A tuple parameter written through an alias has to be followed, or every
+/// subpattern is paired with the whole alias: `_index` in
+/// `fn f((_index, pdf): Pair<'_, R>)` then reads as a document carrier and
+/// the guard rejects valid code.
+#[test]
+fn a_tuple_alias_pairs_each_subpattern_with_its_own_component() {
+    let source = "\
+type Pair<'a, R> = (usize, &'a mut Pdf<R>);
+fn f<R>((_index, pdf): Pair<'_, R>) {
+    let _ = pdf;
+}
+";
+    let mut aliases = AliasIndex::new();
+    collect_aliases(source, &mut aliases);
+    assert!(
+        dead_pdf_carriers_with_aliases(source, &aliases).is_empty(),
+        "`_index` is a usize: following the alias must pair it with its own \
+         component, not with the whole tuple"
+    );
+
+    // The document component itself still has to be seen through the alias.
+    let carrying = "\
+type Pair<'a, R> = (usize, &'a mut Pdf<R>);
+fn f<R>((index, _pdf): Pair<'_, R>) {
+    let _ = index;
+}
+";
+    let mut aliases = AliasIndex::new();
+    collect_aliases(carrying, &mut aliases);
+    assert_eq!(
+        dead_pdf_carriers_with_aliases(carrying, &aliases)
+            .iter()
+            .map(|carrier| carrier.binding.clone())
+            .collect::<Vec<_>>(),
+        vec!["_pdf".to_owned()],
+        "the aliased tuple's document component must still be reported"
+    );
+}
+
+/// Following an alias does not substitute its type arguments, so a tuple
+/// whose document arrives through a parameter -- `type Pair<R> = (usize, R)`
+/// used as `Pair<&mut Pdf<X>>` -- resolves to components that no longer
+/// mention the document. Dropping it there would be a miss, so the whole
+/// type is kept instead.
+#[test]
+fn an_alias_that_carries_the_document_in_a_type_argument_is_not_lost() {
+    let source = "\
+type Pair<R> = (usize, R);
+fn f<R>((_index, pdf): Pair<&mut Pdf<R>>) {
+    let _ = pdf;
+}
+";
+    let mut aliases = AliasIndex::new();
+    collect_aliases(source, &mut aliases);
+    assert!(
+        dead_pdf_carriers_with_aliases(source, &aliases)
+            .iter()
+            .any(|carrier| carrier.binding == "_index"),
+        "a substitution the alias index cannot perform must fall back to the \
+         whole type rather than silently drop the document"
     );
 }
 
