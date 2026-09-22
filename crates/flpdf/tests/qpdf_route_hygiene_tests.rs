@@ -210,7 +210,10 @@ fn ownerless_xref_api_is_removed_in_favor_of_the_canonical_pdf_route() {
 /// Type aliases are followed: `JobDocument` (`job/lifecycle.rs`) is
 /// `Pdf<Box<dyn ReadSeek>>`, so a binding declared with the alias reads as the
 /// document it is. The index is built from every free `type X = T;` in the two
-/// scanned roots, and a chain of aliases is followed to its end.
+/// scanned roots, and a chain of aliases is followed to its end. A type
+/// parameter the use site leaves out is read as the default the alias
+/// declares for it, so `type Pair<R, T = Pdf<R>> = (T, usize)` written as
+/// `Pair<R>` carries the document its use site never spells.
 ///
 /// # What this search cannot see
 ///
@@ -443,17 +446,82 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// never narrow it. An alias that names no document costs nothing here.
 type AliasIndex = BTreeMap<String, Vec<AliasDefinition>>;
 
-/// One `type X<P..> = T;` declaration: the type it stands for, and the names
-/// of its own type parameters.
+/// One `type X<P..> = T;` declaration: the type it stands for, and its own
+/// generic parameters.
 ///
-/// The parameter names are kept because following an alias does not
-/// substitute its arguments. A component that is still a bare parameter
-/// after resolution carries whatever the use site passed in, which the
-/// resolved type no longer shows.
+/// The parameters are kept because following an alias does not substitute its
+/// arguments. A component that is still a bare parameter after resolution
+/// carries whatever the use site passed in, which the resolved type no longer
+/// shows.
 #[derive(Debug, Clone)]
 struct AliasDefinition {
     ty: syn::Type,
-    parameters: BTreeSet<String>,
+    /// The alias's own parameters other than lifetimes, in declaration order.
+    ///
+    /// The order is what makes a default reachable: Rust requires defaulted
+    /// parameters to trail the rest, so the positions a use site leaves out
+    /// are exactly the ones past the arguments it writes.
+    parameters: Vec<AliasParameter>,
+}
+
+/// One of an alias's own generic parameters, other than a lifetime.
+#[derive(Debug, Clone)]
+struct AliasParameter {
+    /// The parameter's name, or `None` for a const parameter, which holds an
+    /// argument position without ever naming a type.
+    name: Option<String>,
+    /// The type a use site that omits this argument falls back to.
+    default: Option<syn::Type>,
+}
+
+impl AliasDefinition {
+    /// The names of the alias's own type parameters.
+    fn parameter_names(&self) -> BTreeSet<String> {
+        self.parameters
+            .iter()
+            .filter_map(|parameter| parameter.name.clone())
+            .collect()
+    }
+
+    /// The parameters a use site writing `supplied` arguments leaves out,
+    /// paired with the defaults they fall back to.
+    ///
+    /// A use site is written without the document such a parameter carries:
+    /// `type Pair<R, T = Pdf<R>> = (T, usize)` spelled `Pair<R>` stands for
+    /// `(Pdf<R>, usize)`, and reading the body alone sees only `T`.
+    fn defaults_in_force(&self, supplied: usize) -> Vec<(&str, &syn::Type)> {
+        self.parameters
+            .iter()
+            .skip(supplied)
+            .filter_map(|parameter| Some((parameter.name.as_deref()?, parameter.default.as_ref()?)))
+            .collect()
+    }
+}
+
+/// The number of generic arguments a use site writes for a path segment.
+///
+/// Lifetimes do not consume a parameter position and are not counted;
+/// associated-type bindings (`Item = u8`) name a position instead of holding
+/// one, and are not counted either. Const arguments are counted, because a
+/// const parameter occupies a position in the declaration just as a type
+/// parameter does -- counting both sides the same way is what keeps a
+/// trailing default lined up with the parameter that declares it, whether or
+/// not the syntax can tell a const argument from a type one.
+fn supplied_arguments(arguments: &syn::PathArguments) -> usize {
+    match arguments {
+        syn::PathArguments::AngleBracketed(angle) => angle
+            .args
+            .iter()
+            .filter(|argument| {
+                matches!(
+                    argument,
+                    syn::GenericArgument::Type(_) | syn::GenericArgument::Const(_)
+                )
+            })
+            .count(),
+        // `Fn(A) -> B` is a trait's sugar, not an alias's argument list.
+        syn::PathArguments::Parenthesized(_) | syn::PathArguments::None => 0,
+    }
 }
 
 /// Parse `source` and return every `_`-prefixed binding whose type mentions
@@ -486,8 +554,19 @@ fn collect_aliases(source: &str, index: &mut AliasIndex) {
                     ty: (*node.ty).clone(),
                     parameters: node
                         .generics
-                        .type_params()
-                        .map(|parameter| strip_raw(&parameter.ident))
+                        .params
+                        .iter()
+                        .filter_map(|parameter| match parameter {
+                            syn::GenericParam::Lifetime(_) => None,
+                            syn::GenericParam::Type(parameter) => Some(AliasParameter {
+                                name: Some(strip_raw(&parameter.ident)),
+                                default: parameter.default.clone(),
+                            }),
+                            syn::GenericParam::Const(_) => Some(AliasParameter {
+                                name: None,
+                                default: None,
+                            }),
+                        })
                         .collect(),
                 });
             syn::visit::visit_item_type(self, node);
@@ -785,7 +864,8 @@ fn tuple_components<'a>(ty: &'a syn::Type, aliases: &'a AliasIndex) -> Option<Ve
             // subpattern is paired with the whole alias and an unrelated
             // binding reads as a document carrier.
             syn::Type::Path(path) if path.qself.is_none() => {
-                let name = strip_raw(&path.path.segments.last()?.ident);
+                let segment = path.path.segments.last()?;
+                let name = strip_raw(&segment.ident);
                 // A colliding name resolves fail-closed: with more than one
                 // candidate there is no single component list to pair
                 // against, so the caller keeps the whole type.
@@ -797,14 +877,31 @@ fn tuple_components<'a>(ty: &'a syn::Type, aliases: &'a AliasIndex) -> Option<Ve
                     return None;
                 }
                 let components = walk(&only.ty, aliases, seen)?;
-                // Arguments are not substituted, so a component that is
-                // still one of the alias's own parameters stands for
+                // A parameter the use site leaves out is the one argument the
+                // index does know: it stands for the default the alias
+                // declares for it. Substituting it is what lets `type
+                // Pair<R, T = Pdf<R>> = (T, usize)` written as `Pair<R>` pair
+                // its first subpattern with the document and its second with
+                // the `usize` beside it.
+                let defaults = only.defaults_in_force(supplied_arguments(&segment.arguments));
+                let components: Vec<&syn::Type> = components
+                    .into_iter()
+                    .map(|component| {
+                        bare_parameter_default(component, &defaults).unwrap_or(component)
+                    })
+                    .collect();
+                // Every other argument is not substituted, so a component
+                // that is still one of the alias's own parameters stands for
                 // whatever the use site passed in -- possibly a document.
                 // Pairing against it would lose that carrier, so keep the
-                // whole type instead.
+                // whole type instead. A default that reaches the walk only
+                // through a component's *interior* -- `(Option<T>, usize)` --
+                // lands here too: the component still names `T`, so the whole
+                // type is kept and every subpattern is reported rather than
+                // the document being dropped.
+                let parameters = only.parameter_names();
                 if components.iter().any(|component| {
-                    !type_mentions_pdf(component, aliases)
-                        && type_names_any(component, &only.parameters)
+                    !type_mentions_pdf(component, aliases) && type_names_any(component, &parameters)
                 }) {
                     return None;
                 }
@@ -814,6 +911,34 @@ fn tuple_components<'a>(ty: &'a syn::Type, aliases: &'a AliasIndex) -> Option<Ve
         }
     }
     walk(ty, aliases, &mut BTreeSet::new())
+}
+
+/// The default `ty` falls back to, when `ty` is written as one of the bare
+/// parameter names in `defaults`.
+///
+/// Only a component that *is* the parameter resolves here. One that merely
+/// contains it -- `&'a mut T`, `Option<T>` -- would need a type built out of
+/// the default rather than borrowed from the alias that declares it, and the
+/// caller's fail-closed fallback covers it instead.
+fn bare_parameter_default<'a>(
+    ty: &syn::Type,
+    defaults: &[(&str, &'a syn::Type)],
+) -> Option<&'a syn::Type> {
+    let syn::Type::Path(path) = ty else {
+        return None;
+    };
+    if path.qself.is_some() || path.path.leading_colon.is_some() || path.path.segments.len() != 1 {
+        return None;
+    }
+    let segment = path.path.segments.first()?;
+    if !matches!(segment.arguments, syn::PathArguments::None) {
+        return None;
+    }
+    let name = strip_raw(&segment.ident);
+    defaults
+        .iter()
+        .find(|(parameter, _)| *parameter == name)
+        .map(|(_, default)| *default)
 }
 
 /// Whether `ty` mentions any of `names` -- used to spot an alias component
@@ -841,30 +966,64 @@ fn type_names_any(ty: &syn::Type, names: &BTreeSet<String>) -> bool {
 /// unrelated identifier. Following is by path *segment*, so the qualified
 /// `flpdf::job::JobDocument` resolves as readily as the bare spelling, and a
 /// chain of aliases is followed to its end.
+///
+/// A parameter the use site leaves out is followed too: it stands for the
+/// default the alias declares for it, which is a type like any other and is
+/// walked the same way, under the same cycle guard.
 fn type_mentions_pdf(ty: &syn::Type, aliases: &AliasIndex) -> bool {
     fn walk(ty: &syn::Type, aliases: &AliasIndex, seen: &mut BTreeSet<String>) -> bool {
-        struct Idents(Vec<String>);
-        impl Visit<'_> for Idents {
+        #[derive(Default)]
+        struct Names {
+            idents: Vec<String>,
+            /// How many arguments each name is given where this type writes
+            /// it as a path's final segment. A name can be written more than
+            /// once with different argument lists, so every count is kept.
+            supplied: BTreeMap<String, BTreeSet<usize>>,
+        }
+        impl Visit<'_> for Names {
             fn visit_ident(&mut self, node: &proc_macro2::Ident) {
-                self.0.push(strip_raw(node));
+                self.idents.push(strip_raw(node));
+            }
+            fn visit_path(&mut self, node: &syn::Path) {
+                if let Some(segment) = node.segments.last() {
+                    self.supplied
+                        .entry(strip_raw(&segment.ident))
+                        .or_default()
+                        .insert(supplied_arguments(&segment.arguments));
+                }
+                syn::visit::visit_path(self, node);
             }
         }
-        let mut idents = Idents(Vec::new());
-        Visit::visit_type(&mut idents, ty);
-        for ident in idents.0 {
+        let mut names = Names::default();
+        Visit::visit_type(&mut names, ty);
+        for ident in &names.idents {
             if ident == "Pdf" {
                 return true;
             }
-            let Some(aliased) = aliases.get(&ident) else {
+            let Some(aliased) = aliases.get(ident) else {
                 continue;
             };
-            // `seen` stops `type A = B; type B = A;` from recursing forever.
-            if seen.insert(ident)
-                && aliased
-                    .iter()
-                    .any(|aliased| walk(&aliased.ty, aliases, seen))
-            {
-                return true;
+            let supplied = names.supplied.get(ident);
+            // `seen` stops `type A = B; type B = A;` -- and a default that
+            // names its own alias -- from recursing forever.
+            if !seen.insert(ident.clone()) {
+                continue;
+            }
+            for definition in aliased {
+                if walk(&definition.ty, aliases, seen) {
+                    return true;
+                }
+                // The body shows only the parameter; what the use site left
+                // out is the default behind it.
+                let defaults = supplied
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|count| definition.defaults_in_force(*count));
+                for (_, default) in defaults {
+                    if walk(default, aliases, seen) {
+                        return true;
+                    }
+                }
             }
         }
         false
@@ -1627,6 +1786,172 @@ fn an_attribute_sharing_a_line_with_the_declaration_does_not_hide_it() {
     assert!(
         unmarked_dead_pdf_carriers(trailing, "synthetic").is_empty(),
         "a correctly marked declaration must not be reported"
+    );
+}
+
+/// A type parameter's default is part of what the alias stands for. A use
+/// site that leaves the argument out gets the default, so
+/// `type Pair<R, T = Pdf<R>> = (T, usize)` written as `Pair<R>` carries a
+/// document in its first component. The index kept only the parameter
+/// *names*, so the default never reached the walk: the component read as an
+/// unsubstituted parameter and the carrier was lost.
+///
+/// The document has to be found whether or not a tuple is involved, so both
+/// the plain alias and the tuple component are checked, and the tuple's
+/// unrelated component must still be left alone.
+#[test]
+fn an_alias_default_type_argument_is_substituted_at_the_use_site() {
+    let plain = "\
+type Document<R, T = Pdf<R>> = T;
+fn f<R>(_document: &mut Document<R>) {}
+";
+    let mut aliases = AliasIndex::new();
+    collect_aliases(plain, &mut aliases);
+    assert_eq!(
+        dead_pdf_carriers_with_aliases(plain, &aliases)
+            .iter()
+            .map(|carrier| carrier.binding.clone())
+            .collect::<Vec<_>>(),
+        vec!["_document".to_owned()],
+        "`Document<R>` leaves `T` out, so `T` is the `Pdf<R>` it defaults to"
+    );
+
+    let tupled = "\
+type Pair<R, T = Pdf<R>> = (T, usize);
+fn f<R>((_pdf, _n): Pair<R>) {}
+";
+    let mut aliases = AliasIndex::new();
+    collect_aliases(tupled, &mut aliases);
+    assert_eq!(
+        dead_pdf_carriers_with_aliases(tupled, &aliases)
+            .iter()
+            .map(|carrier| carrier.binding.clone())
+            .collect::<Vec<_>>(),
+        vec!["_pdf".to_owned()],
+        "the defaulted component carries the document; `_n` is the `usize` \
+         beside it and must not be reported with it"
+    );
+}
+
+/// Which parameters a use site leaves out is a matter of counting argument
+/// *positions*, and a lifetime holds none of them. Counting every argument
+/// instead reads `Pair<'_, R>` as supplying both `R` and `T`, and the default
+/// behind `T` is never applied.
+///
+/// A const parameter is the mirror image: it does hold a position, so it has
+/// to be counted on both sides. The syntax cannot tell a const argument
+/// spelled as a bare name from a type argument, which is why the count is of
+/// positions rather than of kinds.
+#[test]
+fn argument_positions_are_counted_without_lifetimes_and_with_consts() {
+    let lifetimes = "\
+type Pair<'a, R, T = Pdf<R>> = (T, &'a usize);
+fn f<R>((_pdf, _n): Pair<'_, R>) {}
+";
+    let mut aliases = AliasIndex::new();
+    collect_aliases(lifetimes, &mut aliases);
+    assert_eq!(
+        dead_pdf_carriers_with_aliases(lifetimes, &aliases)
+            .iter()
+            .map(|carrier| carrier.binding.clone())
+            .collect::<Vec<_>>(),
+        vec!["_pdf".to_owned()],
+        "`Pair<'_, R>` supplies one argument position, so `T` still takes its \
+         default"
+    );
+
+    let filled = "\
+type Pair<'a, R, T = Pdf<R>> = (T, &'a usize);
+fn f<R>((_value, _n): Pair<'_, R, usize>) {}
+";
+    let mut aliases = AliasIndex::new();
+    collect_aliases(filled, &mut aliases);
+    assert_eq!(
+        dead_pdf_carriers_with_aliases(filled, &aliases),
+        Vec::new(),
+        "the lifetime holds no parameter position on either side, so both \
+         `R` and `T` are supplied here"
+    );
+
+    let consts = "\
+type Sized<const N: usize, T = Pdf<u8>> = (T, [u8; N]);
+fn f((_pdf, _n): Sized<4>) {}
+";
+    let mut aliases = AliasIndex::new();
+    collect_aliases(consts, &mut aliases);
+    assert_eq!(
+        dead_pdf_carriers_with_aliases(consts, &aliases)
+            .iter()
+            .map(|carrier| carrier.binding.clone())
+            .collect::<Vec<_>>(),
+        vec!["_pdf".to_owned()],
+        "`Sized<4>` fills the const position, so the default behind `T` is the \
+         one the use site leaves out"
+    );
+
+    let const_filled = "\
+type Sized<const N: usize, T = Pdf<u8>> = (T, [u8; N]);
+fn f((_value, _n): Sized<4, usize>) {}
+";
+    let mut aliases = AliasIndex::new();
+    collect_aliases(const_filled, &mut aliases);
+    assert_eq!(
+        dead_pdf_carriers_with_aliases(const_filled, &aliases),
+        Vec::new(),
+        "a const argument holds the position its parameter declares, so `T` \
+         is supplied here and its default does not stand in"
+    );
+}
+
+/// A default only stands in where the use site leaves the argument out. An
+/// explicit argument overrides it, and substituting the default anyway would
+/// report a binding that carries no document at all.
+#[test]
+fn an_explicit_type_argument_overrides_the_alias_default() {
+    let source = "\
+type Pair<R, T = Pdf<R>> = (T, usize);
+fn f<R>((_value, _n): Pair<R, usize>) {}
+";
+    let mut aliases = AliasIndex::new();
+    collect_aliases(source, &mut aliases);
+    assert_eq!(
+        dead_pdf_carriers_with_aliases(source, &aliases),
+        Vec::new(),
+        "`Pair<R, usize>` supplies `T`, so the alias stands for `(usize, usize)`"
+    );
+}
+
+/// A default is a type like any other: one that names another alias is
+/// followed to the end of that chain, and one that names its own alias
+/// terminates instead of recursing forever.
+#[test]
+fn an_alias_default_is_followed_through_chains_and_cycles() {
+    let chained = "\
+type Inner = Pdf<u8>;
+type Outer<T = Inner> = (T, usize);
+fn f((_pdf, _n): Outer) {}
+";
+    let mut aliases = AliasIndex::new();
+    collect_aliases(chained, &mut aliases);
+    assert_eq!(
+        dead_pdf_carriers_with_aliases(chained, &aliases)
+            .iter()
+            .map(|carrier| carrier.binding.clone())
+            .collect::<Vec<_>>(),
+        vec!["_pdf".to_owned()],
+        "an alias used with no arguments at all still takes its defaults, and \
+         a default that names another alias is followed to the document"
+    );
+
+    let cyclic = "\
+type Loop<T = Loop> = (T, usize);
+fn f((_pdf, _n): Loop) {}
+";
+    let mut aliases = AliasIndex::new();
+    collect_aliases(cyclic, &mut aliases);
+    assert!(
+        dead_pdf_carriers_with_aliases(cyclic, &aliases).is_empty(),
+        "a default that names its own alias must terminate without reporting"
     );
 }
 
