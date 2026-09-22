@@ -276,17 +276,34 @@ fn tokenizer_flushes_objstm_decode_warning_before_propagating_error() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     let warning = "error decoding stream data for object 6 0";
-    let exception = "error getting decoded stream data";
+    // qpdf's QPDF::Pipe::pipeStreamData failure clears the filtering flag as
+    // well as the success flag (`libqpdf/QPDF_Stream.cc:610-621`), so
+    // getStreamData reports the unfilterable-stream exception rather than a
+    // decode-specific one (`libqpdf/QPDF_Stream.cc:344-360`).
+    let exception = "getStreamData called on unfilterable stream";
     let warning_offset = stderr.find(warning).expect("ObjStm decode warning");
     let exception_offset = stderr.find(exception).expect("decode exception");
     assert!(
         warning_offset < exception_offset,
         "the object-specific warning must precede the generic exception: {stderr}"
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("--- BEGIN OBJECT STREAM 6 ---"),
+        "the aborted run must not tokenize the failing object stream: {stdout}"
+    );
 }
 
+/// qpdf's test_tokenizer tokenizes object streams through
+/// `obj.getStreamData(qpdf_dl_specialized)` (`qpdf/test_tokenizer.cc:211`),
+/// which throws when the stream is unfilterable
+/// (`libqpdf/QPDF_Stream.cc:344-360`). `main` wraps the whole `process()` call
+/// in one try/catch that prints the exception and `exit(2)`s
+/// (`qpdf/test_tokenizer.cc:260-265`), so the first unfilterable object stream
+/// aborts the run: its raw bytes are never tokenized and no later object
+/// stream is reached either.
 #[test]
-fn tokenizer_flushes_objstm_success_warning_before_token_output() {
+fn tokenizer_aborts_on_unfilterable_objstm_like_qpdf() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let mut bytes = fs::read(fixture_dir().join("test_driver/stream_flate_error.pdf"))
         .expect("read malformed filter fixture");
@@ -305,15 +322,19 @@ fn tokenizer_flushes_objstm_success_warning_before_token_output() {
 
     let (status, output) = run_merged(&["unfilterable-objstm.pdf"], dir.path());
 
-    assert!(status.success(), "unexpected exit status: {status:?}");
+    assert_eq!(status.code(), Some(2), "unexpected exit status: {status:?}");
     let output = String::from_utf8_lossy(&output);
     let warning = "stream filter type is not name or array";
-    let tokens = "--- BEGIN OBJECT STREAM 6 ---";
+    let exception = "getStreamData called on unfilterable stream";
     let warning_offset = output.find(warning).expect("unfilterable filter warning");
-    let token_offset = output.find(tokens).expect("ObjStm token output");
+    let exception_offset = output.find(exception).expect("unfilterable exception");
     assert!(
-        warning_offset < token_offset,
-        "the filter warning must precede ObjStm token output: {output}"
+        warning_offset < exception_offset,
+        "the filter warning must precede the aborting exception: {output}"
+    );
+    assert!(
+        !output.contains("--- BEGIN OBJECT STREAM 6 ---"),
+        "an unfilterable object stream must not be tokenized from raw bytes: {output}"
     );
 }
 
