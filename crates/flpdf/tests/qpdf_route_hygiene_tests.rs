@@ -1,7 +1,11 @@
+use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-fn source_root() -> std::path::PathBuf {
+use syn::spanned::Spanned;
+use syn::visit::Visit;
+
+fn source_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
@@ -146,28 +150,63 @@ fn ownerless_xref_api_is_removed_in_favor_of_the_canonical_pdf_route() {
     }
 }
 
+/// Handle-only routes must not keep a document they never touch.
+///
+/// This supersedes a narrower guard that searched a hand-written list of ten
+/// flpdf files plus `flpdf-cli/src/main.rs` for the literal `_pdf: &mut Pdf`.
+/// Both halves of that shape leaked:
+///
+/// * The literal missed every other spelling of the same dead carrier. It does
+///   not match `_pdf: &'a mut Pdf<R>` (a lifetime sits between `&` and `mut`),
+///   `_pdf: &Pdf<R>` (a shared borrow), `_document: &mut Pdf<R>` (a different
+///   name), or `_: &mut Pdf<R>` (a wildcard, which is the same papering-over as
+///   an underscore rename).
+/// * The file list could only ever be as complete as its last edit. Three live
+///   carriers -- `pages.rs`, and two in `acroform_document_helper.rs` -- matched
+///   the literal exactly and survived only because those files were never added
+///   to it. That is the same failure that let a carrier in
+///   `flpdf-cli/src/main.rs` through when the list was first written.
+///
+/// So the search is structural rather than textual, and the tree is walked
+/// rather than enumerated: every `.rs` file under `crates/flpdf/src` and
+/// `crates/flpdf-cli/src` is parsed with `syn`, and any `_`-prefixed binding --
+/// function parameter, closure parameter, or struct/enum field -- whose type
+/// mentions `Pdf` is reported.
+///
+/// `crates/flpdf-qtest-tools/src` is outside those two roots and so is not
+/// scanned at all. Its `run_test_NN` dispatch table binds every parameter with
+/// a leading underscore because qpdf's `test_driver.cc` gives every test the
+/// same signature; that uniformity is the qtest driver's contract, not a dead
+/// bridge, and it needs no marker because the walk never reaches it.
+///
+/// Whether a reported binding should be dropped or kept is a judgment about
+/// qpdf, not something this guard can decide: if qpdf's counterpart takes a
+/// document, the parameter stays and the divergence is the thing to
+/// investigate; if it does not, the parameter goes. A binding that must stay
+/// carries a [`ALLOW_MARKER`] comment on the line above it, stating why.
 #[test]
-fn handle_only_helpers_do_not_carry_dead_pdf_parameters() {
-    for path in [
-        "filespec_helper/embedded_file_stream.rs",
-        "nntree.rs",
-        "page_annotation_flatten.rs",
-        "page_object_helper.rs",
-        "page_form_xobject.rs",
-        "pages/repair.rs",
-        "pages/tree_rebuild.rs",
-        "resources.rs",
-        "job/rotate.rs",
-        // The CLI reaches the same handle-only routes, and the dirty bridge
-        // left a dead parameter here too.
-        "../../flpdf-cli/src/main.rs",
-    ] {
-        let source = read_source(path);
-        assert!(
-            !source.contains("_pdf: &mut Pdf"),
-            "handle-only helper in {path} still carries a dead Pdf parameter"
-        );
+fn no_underscore_bound_pdf_carriers_remain_outside_marked_exceptions() {
+    let mut reported: Vec<String> = Vec::new();
+    for file in scanned_source_files() {
+        let source = fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("read {}: {error}", file.display()))
+            .replace("\r\n", "\n");
+        let display = file.display().to_string();
+        for carrier in unmarked_dead_pdf_carriers(&source, &display) {
+            reported.push(format!(
+                "{display}:{} -- `{}` in {} carries a Pdf it never reads",
+                carrier.line, carrier.binding, carrier.owner
+            ));
+        }
     }
+
+    assert!(
+        reported.is_empty(),
+        "dead Pdf carriers found:\n  {}\n\nDrop the binding if qpdf's \
+         counterpart takes no document, or keep it and write \
+         `// {ALLOW_MARKER} <reason>` on the line above it.",
+        reported.join("\n  ")
+    );
 }
 
 /// `QPDF::readToken(input, max_len = 0)` (`libqpdf/QPDF.cc:1535-1539`) is one
@@ -215,5 +254,404 @@ fn canonical_pdf_open_does_not_snapshot_the_complete_source_for_xref() {
     assert!(
         !production.contains("load_xref_state_from_bytes("),
         "canonical Pdf::open must load xref state through the live source boundary"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Dead `Pdf` carrier detection
+// ---------------------------------------------------------------------------
+
+/// Inline exclusion marker for a binding that must keep the document it does
+/// not read.
+///
+/// Written as `// route-hygiene-allow: <reason>` on the line directly above the
+/// binding's own declaration. The grammar mirrors `// qpdf-deviation:`
+/// (`scripts/check-qpdf-deviation-markers.py`): a real `//` line comment with a
+/// mandatory reason, so the exclusion is reviewable where it applies instead of
+/// hiding in a file-level allowlist. The token is deliberately distinct from
+/// `qpdf-deviation`, because that script rejects any occurrence of its own
+/// token that is not one of its three well-formed forms.
+const ALLOW_MARKER: &str = "route-hygiene-allow:";
+
+/// A `_`-prefixed binding whose type mentions `Pdf`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeadPdfCarrier {
+    /// 1-based line of the binding's own declaration.
+    line: usize,
+    /// The bound name, or `_` for a wildcard pattern.
+    binding: String,
+    /// The enclosing item, for the failure message.
+    owner: String,
+}
+
+/// Every `.rs` file under the two scanned crate roots.
+fn scanned_source_files() -> Vec<PathBuf> {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    for root in ["src", "../flpdf-cli/src"] {
+        let root = manifest.join(root);
+        let before = files.len();
+        collect_rust_files(&root, &mut files);
+        assert!(
+            files.len() > before,
+            "no .rs files under {} -- the walk that replaced the hand-written \
+             file list must not silently scan nothing",
+            root.display()
+        );
+    }
+    files.sort();
+    files
+}
+
+fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries =
+        fs::read_dir(dir).unwrap_or_else(|error| panic!("read {}: {error}", dir.display()));
+    for entry in entries {
+        let path = entry.expect("directory entry").path();
+        if path.is_dir() {
+            collect_rust_files(&path, out);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Parse `source` and return every `_`-prefixed binding whose type mentions
+/// `Pdf`, in source order.
+fn dead_pdf_carriers(source: &str) -> Vec<DeadPdfCarrier> {
+    let file = syn::parse_file(source).expect("scanned source must parse as Rust");
+    let mut scan = CarrierScan::default();
+    Visit::visit_file(&mut scan, &file);
+    scan.found
+}
+
+/// The carriers of `source` that no exclusion marker covers.
+///
+/// Panics on a malformed marker, and on a marker that no longer precedes a
+/// carrier, so an exclusion cannot outlive the binding it excuses.
+fn unmarked_dead_pdf_carriers(source: &str, display: &str) -> Vec<DeadPdfCarrier> {
+    let carriers = dead_pdf_carriers(source);
+    let marked = marked_lines(source, display);
+    for line in &marked {
+        assert!(
+            carriers.iter().any(|carrier| carrier.line == *line),
+            "{display}:{line}: a `{ALLOW_MARKER}` marker precedes no dead Pdf \
+             carrier; drop the stale marker"
+        );
+    }
+    carriers
+        .into_iter()
+        .filter(|carrier| !marked.contains(&carrier.line))
+        .collect()
+}
+
+/// The 1-based lines an exclusion marker covers.
+fn marked_lines(source: &str, display: &str) -> BTreeSet<usize> {
+    let comment = format!("// {ALLOW_MARKER}");
+    let lines: Vec<&str> = source.lines().collect();
+    let mut marked = BTreeSet::new();
+    for (index, line) in lines.iter().enumerate() {
+        if !line.contains(ALLOW_MARKER) {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        assert!(
+            trimmed.starts_with(&comment),
+            "{display}:{}: `{ALLOW_MARKER}` must be written as \
+             `// {ALLOW_MARKER} <reason>` on its own line comment",
+            index + 1
+        );
+        assert!(
+            !trimmed[comment.len()..].trim().is_empty(),
+            "{display}:{}: `{ALLOW_MARKER}` needs a reason",
+            index + 1
+        );
+        let target = lines.iter().enumerate().skip(index + 1).find(|(_, next)| {
+            let next = next.trim_start();
+            !next.is_empty() && !next.starts_with("//") && !next.starts_with("#[")
+        });
+        let (target, _) = target.unwrap_or_else(|| {
+            panic!(
+                "{display}:{}: `{ALLOW_MARKER}` precedes no declaration",
+                index + 1
+            )
+        });
+        marked.insert(target + 1);
+    }
+    marked
+}
+
+/// Whether `ty` names `Pdf` anywhere, so `&Pdf<R>`, `&'a mut Pdf<R>`,
+/// `crate::Pdf<R>` and `Option<&mut Pdf<R>>` are one case rather than four.
+fn type_mentions_pdf(ty: &syn::Type) -> bool {
+    struct PdfIdent(bool);
+    impl Visit<'_> for PdfIdent {
+        fn visit_ident(&mut self, node: &proc_macro2::Ident) {
+            self.0 |= node == "Pdf";
+        }
+    }
+    let mut finder = PdfIdent(false);
+    Visit::visit_type(&mut finder, ty);
+    finder.0
+}
+
+#[derive(Default)]
+struct CarrierScan {
+    owners: Vec<String>,
+    found: Vec<DeadPdfCarrier>,
+}
+
+impl CarrierScan {
+    fn owner(&self) -> String {
+        self.owners
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "file scope".to_owned())
+    }
+
+    /// Record a parameter list; the `Receiver` (`self`) arm carries no pattern.
+    fn record_inputs<'a>(&mut self, inputs: impl Iterator<Item = &'a syn::FnArg>) {
+        for input in inputs {
+            if let syn::FnArg::Typed(typed) = input {
+                self.record(&typed.pat, &typed.ty);
+            }
+        }
+    }
+
+    fn record(&mut self, pat: &syn::Pat, ty: &syn::Type) {
+        let binding = match pat {
+            syn::Pat::Ident(ident) if ident.ident.to_string().starts_with('_') => {
+                ident.ident.to_string()
+            }
+            // A bare `_` is the same papering-over as an underscore rename.
+            syn::Pat::Wild(_) => "_".to_owned(),
+            _ => return,
+        };
+        if !type_mentions_pdf(ty) {
+            return;
+        }
+        self.found.push(DeadPdfCarrier {
+            line: pat.span().start().line,
+            binding,
+            owner: self.owner(),
+        });
+    }
+
+    fn scoped(&mut self, owner: String, body: impl FnOnce(&mut Self)) {
+        self.owners.push(owner);
+        body(self);
+        self.owners.pop();
+    }
+}
+
+impl<'ast> Visit<'ast> for CarrierScan {
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        self.scoped(format!("fn {}", node.sig.ident), |scan| {
+            scan.record_inputs(node.sig.inputs.iter());
+            syn::visit::visit_block(scan, &node.block);
+        });
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        self.scoped(format!("fn {}", node.sig.ident), |scan| {
+            scan.record_inputs(node.sig.inputs.iter());
+            syn::visit::visit_block(scan, &node.block);
+        });
+    }
+
+    fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
+        self.scoped(format!("fn {}", node.sig.ident), |scan| {
+            scan.record_inputs(node.sig.inputs.iter());
+            if let Some(block) = node.default.as_ref() {
+                syn::visit::visit_block(scan, block);
+            }
+        });
+    }
+
+    fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
+        for input in &node.inputs {
+            if let syn::Pat::Type(typed) = input {
+                self.record(&typed.pat, &typed.ty);
+            }
+        }
+        syn::visit::visit_expr(self, &node.body);
+    }
+
+    fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
+        self.scoped(format!("struct {}", node.ident), |scan| {
+            syn::visit::visit_fields(scan, &node.fields);
+        });
+    }
+
+    fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
+        self.scoped(format!("enum {}", node.ident), |scan| {
+            for variant in &node.variants {
+                syn::visit::visit_fields(scan, &variant.fields);
+            }
+        });
+    }
+
+    fn visit_field(&mut self, node: &'ast syn::Field) {
+        let Some(ident) = node.ident.as_ref() else {
+            return;
+        };
+        if ident.to_string().starts_with('_') && type_mentions_pdf(&node.ty) {
+            self.found.push(DeadPdfCarrier {
+                line: ident.span().start().line,
+                binding: ident.to_string(),
+                owner: self.owner(),
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The detector's own contract
+// ---------------------------------------------------------------------------
+
+/// The spellings the superseded literal `_pdf: &mut Pdf` could not see.
+///
+/// Each line below is a dead `Pdf` carrier; none of them contains that literal,
+/// which is asserted here rather than argued, so the gap the structural search
+/// closes stays demonstrable after this guard changes.
+#[test]
+fn the_structural_search_sees_spellings_the_literal_missed() {
+    let source = "\
+struct Holder<'a, R> {
+    _pdf: &'a mut Pdf<R>,
+}
+fn shared<R>(_pdf: &Pdf<R>) {}
+fn renamed<R>(_document: &mut Pdf<R>) {}
+fn wildcard<R>(_: &mut Pdf<R>) {}
+fn qualified<R>(_owner: &mut crate::Pdf<R>) {}
+fn wrapped<R>(_maybe: Option<&mut Pdf<R>>) {}
+fn owned<R>(_taken: Pdf<R>) {}
+";
+    assert!(
+        !source.contains("_pdf: &mut Pdf"),
+        "the superseded literal must match none of these carriers"
+    );
+
+    let found: Vec<(usize, String)> = dead_pdf_carriers(source)
+        .into_iter()
+        .map(|carrier| (carrier.line, carrier.binding))
+        .collect();
+    assert_eq!(
+        found,
+        vec![
+            (2, "_pdf".to_owned()),
+            (4, "_pdf".to_owned()),
+            (5, "_document".to_owned()),
+            (6, "_".to_owned()),
+            (7, "_owner".to_owned()),
+            (8, "_maybe".to_owned()),
+            (9, "_taken".to_owned()),
+        ]
+    );
+}
+
+/// Live parameters, and underscore parameters that carry something else, are
+/// not the dead-bridge shape and must not be reported.
+#[test]
+fn the_structural_search_leaves_live_and_unrelated_bindings_alone() {
+    let source = "\
+fn live<R>(pdf: &mut Pdf<R>) {}
+fn unrelated(_depth: usize, _key: &[u8]) {}
+struct Live<'a, R> {
+    pdf: &'a mut Pdf<R>,
+    _depth: usize,
+}
+";
+    assert_eq!(dead_pdf_carriers(source), Vec::new());
+}
+
+/// Carriers are found in every binding position, and named by their owner.
+#[test]
+fn the_structural_search_reaches_every_binding_position() {
+    let source = "\
+impl<'a, R> Helper<'a, R> {
+    fn method<S>(&self, _pdf: &mut Pdf<S>) {}
+}
+trait Route<R> {
+    fn required(&self, _pdf: &mut Pdf<R>);
+    fn provided(&self, _pdf: &mut Pdf<R>) {}
+}
+enum Carrier<'a, R> {
+    Named { _pdf: &'a mut Pdf<R> },
+}
+fn outer<R>() {
+    fn inner<S>(_pdf: &mut Pdf<S>) {}
+    let closure = |_pdf: &mut Pdf<R>| ();
+}
+";
+    let found: Vec<(usize, String)> = dead_pdf_carriers(source)
+        .into_iter()
+        .map(|carrier| (carrier.line, carrier.owner))
+        .collect();
+    assert_eq!(
+        found,
+        vec![
+            (2, "fn method".to_owned()),
+            (5, "fn required".to_owned()),
+            (6, "fn provided".to_owned()),
+            (9, "enum Carrier".to_owned()),
+            (12, "fn inner".to_owned()),
+            (13, "fn outer".to_owned()),
+        ]
+    );
+}
+
+/// A marker covers the declaration on the line below it, skipping the
+/// attributes and further comments between the two.
+#[test]
+fn an_exclusion_marker_covers_the_declaration_it_precedes() {
+    let source = "\
+// route-hygiene-allow: qpdf's counterpart takes the document.
+fn kept<R>(_pdf: &mut Pdf<R>) {}
+fn reported<R>(_pdf: &mut Pdf<R>) {}
+struct Held<'a, R> {
+    // route-hygiene-allow: holds the exclusive borrow, not a value.
+    #[allow(dead_code)]
+    _pdf: &'a mut Pdf<R>,
+}
+";
+    assert_eq!(marked_lines(source, "synthetic"), BTreeSet::from([2, 7]));
+    let found: Vec<usize> = unmarked_dead_pdf_carriers(source, "synthetic")
+        .into_iter()
+        .map(|carrier| carrier.line)
+        .collect();
+    assert_eq!(found, vec![3]);
+}
+
+#[test]
+#[should_panic(expected = "needs a reason")]
+fn an_exclusion_marker_without_a_reason_is_rejected() {
+    marked_lines(
+        "// route-hygiene-allow:\nfn f<R>(_pdf: &mut Pdf<R>) {}\n",
+        "synthetic",
+    );
+}
+
+#[test]
+#[should_panic(expected = "on its own line comment")]
+fn the_marker_token_outside_a_line_comment_is_rejected() {
+    marked_lines(
+        "let note = \"route-hygiene-allow: smuggled\";\n",
+        "synthetic",
+    );
+}
+
+#[test]
+#[should_panic(expected = "precedes no declaration")]
+fn an_exclusion_marker_with_nothing_after_it_is_rejected() {
+    marked_lines("// route-hygiene-allow: trailing\n\n", "synthetic");
+}
+
+#[test]
+#[should_panic(expected = "drop the stale marker")]
+fn an_exclusion_marker_that_no_longer_covers_a_carrier_is_rejected() {
+    unmarked_dead_pdf_carriers(
+        "// route-hygiene-allow: the parameter it excused is gone.\nfn f(depth: usize) {}\n",
+        "synthetic",
     );
 }
