@@ -298,6 +298,18 @@ def excluded_lines(relpath):
 #     ineligible, falling back to the safe default of still flagging it.
 #     `pub(...)` accepts any restricted-visibility path (`pub(crate)`,
 #     `pub(super)`, `pub(in crate::foo)`), not just a single identifier.
+# flpdf-bhs7: audited 2026-09-22 — `crates/flpdf/src` and `crates/flpdf-cli/src`
+# contain no file whose only top-level items are `type` aliases and/or
+# `const`/`static` declarations with zero `fn`/`impl` blocks (checked via
+# `rg --files-without-match '\bfn\s+\w|\bimpl\b'`, then confirmed each hit is
+# a mod-declaration-only or enum-only file already covered by
+# `_DECL_MOD_RE`/`_DECL_USE_RE`/`_DECL_TYPE_RE` above). `_DECL_TYPE_RE` does
+# not match `type`/`const`/`static`, so such a file would currently fall
+# through to the "real code" case below and be flagged as a false
+# missing-coverage positive if one is ever added. Before assuming this
+# classifier handles that shape, re-run this audit and, if a real
+# `missing_cov` failure appears, extend `_DECL_TYPE_RE`'s pattern rather than
+# building a general Rust parser (see flpdf-bhs7's non-goals).
 _DECL_MOD_RE = re.compile(r"^(pub(\([^)]+\))?\s+)?mod\s+\w+\s*;\s*$")
 _DECL_USE_RE = re.compile(r"^(pub(\([^)]+\))?\s+)?use\s+")
 _DECL_TYPE_RE = re.compile(r"^(pub(\([^)]+\))?\s+)?(?:enum|struct|union)\s+\w+\b")
