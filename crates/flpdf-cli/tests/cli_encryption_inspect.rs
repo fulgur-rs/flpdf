@@ -43,30 +43,9 @@ use std::process::{Command as ShellCommand, Stdio};
 #[path = "support/eol.rs"]
 mod eol;
 use eol::EOL;
-
-/// Collapse a live qpdf subprocess's CRLF-terminated text lines to bare `\n`.
-/// On Windows, `qpdf.exe`'s own C-runtime stdout is opened in text mode and
-/// translates every `\n` write to `\r\n`; flpdf's shared CLI logger applies
-/// the same platform conversion for text output. Comparing raw bytes remains
-/// safe for the qpdf differential checks, while the helper also documents the
-/// platform boundary (same pattern as `cli_logger_routing.rs`/
-/// `cli_attachment_lifecycle.rs`/`encrypt_cli_tests.rs`).
-fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(bytes.len());
-    let mut remaining = bytes;
-
-    while let Some((&byte, rest)) = remaining.split_first() {
-        if byte == b'\r' && rest.first() == Some(&b'\n') {
-            normalized.push(b'\n');
-            remaining = &rest[1..];
-        } else {
-            normalized.push(byte);
-            remaining = rest;
-        }
-    }
-
-    normalized
-}
+#[path = "support/text_newlines.rs"]
+mod text_newlines;
+use text_newlines::normalize_text_newlines;
 
 const R4_EMPTY_PW: &str = "../../tests/fixtures/compat/encrypted-r4-three-page.pdf";
 const V4_AES: &str = "../../tests/fixtures/encrypted/v4-aes-128-r4.pdf";

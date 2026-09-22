@@ -3,6 +3,10 @@
 use assert_cmd::Command;
 use std::process::{Command as ProcessCommand, Output};
 
+#[path = "support/text_newlines.rs"]
+mod text_newlines;
+use text_newlines::normalize_text_newlines;
+
 const EXPECTED_QPDF_VERSION: &str = "qpdf version 11.9.0";
 const INPUT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -38,22 +42,6 @@ fn run_flpdf(args: &[&str]) -> Output {
         .output()
         .expect("flpdf should spawn")
 }
-
-fn normalize_newlines(bytes: &[u8]) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(bytes.len());
-    let mut remaining = bytes;
-    while let Some((&byte, rest)) = remaining.split_first() {
-        if byte == b'\r' && rest.first() == Some(&b'\n') {
-            normalized.push(b'\n');
-            remaining = &rest[1..];
-        } else {
-            normalized.push(byte);
-            remaining = rest;
-        }
-    }
-    normalized
-}
-
 fn assert_matches_qpdf(args: &[&str]) {
     let expected = run_qpdf(args);
     let actual = run_flpdf(args);
@@ -63,13 +51,13 @@ fn assert_matches_qpdf(args: &[&str]) {
         "exit mismatch for {args:?}: qpdf={expected:?} flpdf={actual:?}"
     );
     assert_eq!(
-        normalize_newlines(&actual.stdout),
-        normalize_newlines(&expected.stdout),
+        normalize_text_newlines(&actual.stdout),
+        normalize_text_newlines(&expected.stdout),
         "stdout mismatch for {args:?}"
     );
     assert_eq!(
-        normalize_newlines(&actual.stderr),
-        normalize_newlines(&expected.stderr),
+        normalize_text_newlines(&actual.stderr),
+        normalize_text_newlines(&expected.stderr),
         "stderr mismatch for {args:?}"
     );
 }

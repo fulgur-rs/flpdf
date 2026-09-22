@@ -5,6 +5,10 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
+#[path = "../../flpdf-cli/tests/support/text_newlines.rs"]
+mod text_newlines;
+use text_newlines::normalize_text_newlines;
+
 fn minimal_pdf() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -126,38 +130,10 @@ fn run_qpdf_ctest(directory: &Path, args: &[String]) -> std::process::Output {
     command.output().expect("qpdf-ctest should spawn")
 }
 
-/// qpdf's CLI writes JSON files through a text-mode path on Windows, while
-/// qpdf-ctest test46/47 explicitly use a binary `FILE*` and Rust writes LF.
-/// Compare the textual JSON independent of that platform-only translation.
-fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(bytes.len());
-    let mut remaining = bytes;
-
-    while let Some((&byte, rest)) = remaining.split_first() {
-        if byte == b'\r' && rest.first() == Some(&b'\n') {
-            normalized.push(b'\n');
-            remaining = &rest[1..];
-        } else {
-            normalized.push(byte);
-            remaining = rest;
-        }
-    }
-
-    normalized
-}
-
 fn assert_json_files_equal(adapter: &Path, oracle: &Path) {
     assert_eq!(
         normalize_text_newlines(&fs::read(adapter).unwrap()),
         normalize_text_newlines(&fs::read(oracle).unwrap())
-    );
-}
-
-#[test]
-fn text_newline_normalization_only_collapses_crlf_pairs() {
-    assert_eq!(
-        normalize_text_newlines(b"first\r\nsecond\nthird\rfourth"),
-        b"first\nsecond\nthird\rfourth"
     );
 }
 

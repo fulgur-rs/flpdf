@@ -886,6 +886,12 @@ fn add_raw_argv_output_if_required(args: &mut Vec<Vec<u8>>) {
 /// qpdf's Windows C-runtime text stdout is CRLF-terminated while a recording
 /// pipeline receives the logger's logical LF bytes. Compare the text payload
 /// independently of that host transport convention.
+///
+/// Deliberately kept local instead of sharing `flpdf-cli`'s
+/// `tests/support/text_newlines.rs`: `flpdf-cli` depends on `flpdf`, so a
+/// `#[path]` include reaching up into a dependent crate's test tree would
+/// invert that direction. (`flpdf-qtest-tools` may reach into `flpdf-cli`
+/// because nothing depends on it.)
 fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
     let mut normalized = Vec::with_capacity(bytes.len());
     let mut remaining = bytes;

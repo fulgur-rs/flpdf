@@ -8,6 +8,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ShellCommand, Output};
 
+#[path = "support/text_newlines.rs"]
+mod text_newlines;
+use text_newlines::normalize_text_newlines;
+
 const EXPECTED_QPDF_VERSION: &str = "qpdf version 11.9.0";
 
 fn fixture(name: &str) -> PathBuf {
@@ -40,22 +44,6 @@ fn skip_without_qpdf() -> bool {
     eprintln!("skipping qpdf conflict matrix: {EXPECTED_QPDF_VERSION} is unavailable");
     true
 }
-
-fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(bytes.len());
-    let mut remaining = bytes;
-    while let Some((&byte, rest)) = remaining.split_first() {
-        if byte == b'\r' && rest.first() == Some(&b'\n') {
-            normalized.push(b'\n');
-            remaining = &rest[1..];
-        } else {
-            normalized.push(byte);
-            remaining = rest;
-        }
-    }
-    normalized
-}
-
 fn run_qpdf_and_flpdf(args: &[OsString]) -> (Output, Output) {
     let qpdf = ShellCommand::new("qpdf")
         .args(args)

@@ -4,6 +4,10 @@ use assert_cmd::Command;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ShellCommand, Output};
 
+#[path = "support/text_newlines.rs"]
+mod text_newlines;
+use text_newlines::normalize_text_newlines;
+
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
@@ -48,25 +52,6 @@ fn run_flpdf(args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("flpdf should spawn")
-}
-
-/// qpdf's Windows C-runtime output uses CRLF while Rust's output is LF.
-/// Compare the diagnostic content after collapsing only CRLF pairs.
-fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(bytes.len());
-    let mut remaining = bytes;
-
-    while let Some((&byte, rest)) = remaining.split_first() {
-        if byte == b'\r' && rest.first() == Some(&b'\n') {
-            normalized.push(b'\n');
-            remaining = &rest[1..];
-        } else {
-            normalized.push(byte);
-            remaining = rest;
-        }
-    }
-
-    normalized
 }
 
 fn assert_success(output: &Output, label: &str) {

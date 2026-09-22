@@ -5,6 +5,10 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command as ProcessCommand, Output};
 
+#[path = "support/text_newlines.rs"]
+mod text_newlines;
+use text_newlines::normalize_text_newlines;
+
 fn qpdf_available() -> bool {
     ProcessCommand::new("qpdf")
         .arg("--version")
@@ -27,22 +31,6 @@ fn run_flpdf(args: &[&str]) -> Output {
         .output()
         .expect("flpdf process")
 }
-
-fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(bytes.len());
-    let mut remaining = bytes;
-    while let Some((&byte, rest)) = remaining.split_first() {
-        if byte == b'\r' && rest.first() == Some(&b'\n') {
-            normalized.push(b'\n');
-            remaining = &rest[1..];
-        } else {
-            normalized.push(byte);
-            remaining = rest;
-        }
-    }
-    normalized
-}
-
 fn assert_same_process_result(args: &[&str]) {
     let qpdf = run_qpdf(args);
     let flpdf = run_flpdf(args);
