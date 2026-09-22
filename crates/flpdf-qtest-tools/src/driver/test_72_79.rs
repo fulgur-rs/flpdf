@@ -231,6 +231,28 @@ pub(crate) fn run_test_73<R: Read + Seek>(
     // qpdf's unparseResolved owns the receiver dereference after getKey
     // (`libqpdf/QPDFObjectHandle.cc:1586-1593`); do not add the qpdf-less
     // Pdf::resolve hop that this consumer used to perform.
+    //
+    // The `?` below is live, but not because /Pages can fail to resolve.
+    // qpdf throws out of unparseResolved only for an uninitialized receiver
+    // (`if (!dereference())`, `libqpdf/QPDFObjectHandle.cc:1586-1593`), and
+    // getKey never yields one -- a missing key produces an initialized null.
+    // Resolving an *uncached* indirect /Pages against the closed input
+    // source does not fail either: qpdf's `QPDF::resolve` catches the read
+    // failure, warns, and caches `QPDF_Null` (`libqpdf/QPDF.cc:1737-1742`,
+    // `1745-1749`), and flpdf mirrors that -- probing this exact call shape
+    // (root cached, /Pages uncached, input closed) yields `Ok(b"null")`
+    // beside a `closed input source: object 2/0: error reading object: ...`
+    // warning, not an error.
+    //
+    // What does escape is the *diagnostic emission*. qpdf calls `warn(e)`
+    // from inside that catch handler rather than inside the `try`, so a
+    // throw out of the warning pipeline `*m->log->getWarn()`
+    // (`libqpdf/QPDF.cc:488-494`) unwinds through `resolve()` ->
+    // `dereference()` -> `unparseResolved()`. flpdf's resolver propagates
+    // the same failure through `push_caught_resolution_warning(..)?`. That
+    // is the arm
+    // `test_73_propagates_a_warn_pipeline_failure_from_pages_resolution`
+    // exercises.
     let _ = pages_seed.try_unparse_resolved()?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     Ok(())
@@ -775,7 +797,8 @@ pub(crate) fn run_test_79<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::{run_test_73, run_test_78, run_test_79};
-    use flpdf::{ObjectHandle, Pdf, PdfOpenOptions};
+    use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
+    use flpdf::{Error, ObjectHandle, Pdf, PdfOpenOptions, QPDFLogger};
 
     fn minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
         let options = PdfOpenOptions {
@@ -875,6 +898,89 @@ WARNING: closed input source: object 1/0: error reading object: QPDF operation a
             stderr,
             b"getRoot: attempted to dereference an uninitialized QPDFObjectHandle\n"
         );
+    }
+
+    // Resolving an uncached indirect /Pages against the closed input source
+    // does not itself fail -- qpdf's `QPDF::resolve` catches the read error,
+    // warns, and caches `QPDF_Null` (`libqpdf/QPDF.cc:1737-1742,1745-1749`),
+    // so the handle unparses to `null`. What the `?` in `run_test_73` guards
+    // is the *warning emission* inside that catch handler: qpdf calls
+    // `warn(e)` outside the `try`, so a throw from the warning pipeline
+    // `*m->log->getWarn()` (`libqpdf/QPDF.cc:488-494`) unwinds through
+    // `resolve()` -> `dereference()` -> `unparseResolved()`. flpdf routes the
+    // same failure out of `push_caught_resolution_warning`.
+    struct FailingWarnSink;
+
+    impl Pipeline for FailingWarnSink {
+        fn identifier(&self) -> &str {
+            "test 73 failing warning sink"
+        }
+
+        fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
+            Err(PipelineError::runtime("warn sink write failure"))
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_73_propagates_a_warn_pipeline_failure_from_pages_resolution() {
+        // Warnings must reach the logger, so this fixture cannot use the
+        // `suppress_warnings` helper -- `Pdf` returns early without touching
+        // the warning pipeline when warnings are suppressed.
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            include_bytes!("../../../../tests/fixtures/minimal.pdf").to_vec(),
+            PdfOpenOptions::default(),
+        )
+        .expect("open minimal fixture");
+
+        // Cache the root without caching /Pages: with both uncached the
+        // driver's own `root_handle` lookup fails first and the
+        // `try_unparse_resolved` call is never reached.
+        let root = pdf
+            .root_handle()
+            .expect("resolve root before closing input");
+        let pages = root
+            .try_get_key(b"/Pages")
+            .expect("get /Pages before closing input");
+        assert!(
+            pages.is_indirect() && !pages.is_resolved(),
+            "/Pages must still be an unresolved indirect handle for this probe"
+        );
+        drop(pages);
+        drop(root);
+
+        let logger = QPDFLogger::create();
+        logger.set_warn(Some(PipelineHandle::new(FailingWarnSink)));
+        pdf.set_logger(logger);
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+        let error = run_test_73(
+            &mut pdf,
+            b"minimal-warn-failure.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect_err("a failing warning pipeline must not be swallowed");
+
+        assert!(
+            matches!(&error, Error::System(message) if message == "warn sink write failure"),
+            "unexpected error: {error:?}"
+        );
+        assert!(stdout.is_empty());
+        // The failure unwinds before the driver's own diagnostic drain runs,
+        // so only the uninitialized-handle line from `pdf2` is on stderr.
+        assert_eq!(
+            stderr,
+            b"getRoot: attempted to dereference an uninitialized QPDFObjectHandle\n"
+        );
+        assert_eq!(diagnostics_written, 0);
     }
 
     #[test]
