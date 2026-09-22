@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -183,7 +183,8 @@ fn ownerless_xref_api_is_removed_in_favor_of_the_canonical_pdf_route() {
 /// qpdf, not something this guard can decide: if qpdf's counterpart takes a
 /// document, the parameter stays and the divergence is the thing to
 /// investigate; if it does not, the parameter goes. A binding that must stay
-/// carries a [`ALLOW_MARKER`] comment on the line above it, stating why.
+/// carries a [`ALLOW_MARKER`] comment on the line above it, naming the binding
+/// and stating why.
 #[test]
 fn no_underscore_bound_pdf_carriers_remain_outside_marked_exceptions() {
     let mut reported: Vec<String> = Vec::new();
@@ -264,11 +265,13 @@ fn canonical_pdf_open_does_not_snapshot_the_complete_source_for_xref() {
 /// Inline exclusion marker for a binding that must keep the document it does
 /// not read.
 ///
-/// Written as `// route-hygiene-allow: <reason>` on the line directly above the
-/// binding's own declaration. The grammar mirrors `// qpdf-deviation:`
-/// (`scripts/check-qpdf-deviation-markers.py`): a real `//` line comment with a
-/// mandatory reason, so the exclusion is reviewable where it applies instead of
-/// hiding in a file-level allowlist. The token is deliberately distinct from
+/// Written as `// route-hygiene-allow: <binding> <reason>` on the line directly
+/// above the binding's own declaration. The grammar mirrors
+/// `// qpdf-deviation:` (`scripts/check-qpdf-deviation-markers.py`): a real
+/// `//` line comment with a mandatory reason, so the exclusion is reviewable
+/// where it applies instead of hiding in a file-level allowlist. Naming the
+/// binding is what keeps it from drifting onto whatever declaration later
+/// happens to sit below it. The token is deliberately distinct from
 /// `qpdf-deviation`, because that script rejects any occurrence of its own
 /// token that is not one of its three well-formed forms.
 const ALLOW_MARKER: &str = "route-hygiene-allow:";
@@ -327,29 +330,35 @@ fn dead_pdf_carriers(source: &str) -> Vec<DeadPdfCarrier> {
 
 /// The carriers of `source` that no exclusion marker covers.
 ///
-/// Panics on a malformed marker, and on a marker that no longer precedes a
-/// carrier, so an exclusion cannot outlive the binding it excuses.
+/// Panics on a malformed marker, and on a marker whose named binding is not
+/// the carrier below it. A marker keyed to position alone would drift: replace
+/// the binding under it with a different dead carrier and the old reason would
+/// silently excuse the new one, which is the file-level allowlist this guard
+/// replaced, reintroduced one line at a time.
 fn unmarked_dead_pdf_carriers(source: &str, display: &str) -> Vec<DeadPdfCarrier> {
     let carriers = dead_pdf_carriers(source);
-    let marked = marked_lines(source, display);
-    for line in &marked {
+    let marked = marked_bindings(source, display);
+    for (line, binding) in &marked {
         assert!(
-            carriers.iter().any(|carrier| carrier.line == *line),
-            "{display}:{line}: a `{ALLOW_MARKER}` marker precedes no dead Pdf \
-             carrier; drop the stale marker"
+            carriers
+                .iter()
+                .any(|carrier| carrier.line == *line && carrier.binding == *binding),
+            "{display}:{line}: a `{ALLOW_MARKER}` marker names `{binding}`, but \
+             that is not the dead Pdf carrier below it; retarget the marker or \
+             drop it"
         );
     }
     carriers
         .into_iter()
-        .filter(|carrier| !marked.contains(&carrier.line))
+        .filter(|carrier| marked.get(&carrier.line) != Some(&carrier.binding))
         .collect()
 }
 
-/// The 1-based lines an exclusion marker covers.
-fn marked_lines(source: &str, display: &str) -> BTreeSet<usize> {
+/// The binding each exclusion marker excuses, by 1-based declaration line.
+fn marked_bindings(source: &str, display: &str) -> BTreeMap<usize, String> {
     let comment = format!("// {ALLOW_MARKER}");
     let lines: Vec<&str> = source.lines().collect();
-    let mut marked = BTreeSet::new();
+    let mut marked = BTreeMap::new();
     for (index, line) in lines.iter().enumerate() {
         if !line.contains(ALLOW_MARKER) {
             continue;
@@ -358,12 +367,22 @@ fn marked_lines(source: &str, display: &str) -> BTreeSet<usize> {
         assert!(
             trimmed.starts_with(&comment),
             "{display}:{}: `{ALLOW_MARKER}` must be written as \
-             `// {ALLOW_MARKER} <reason>` on its own line comment",
+             `// {ALLOW_MARKER} <binding> <reason>` on its own line comment",
+            index + 1
+        );
+        let mut text = trimmed[comment.len()..]
+            .trim()
+            .splitn(2, char::is_whitespace);
+        let binding = text.next().unwrap_or_default();
+        assert!(
+            binding.starts_with('_'),
+            "{display}:{}: `{ALLOW_MARKER}` must name the binding it excuses \
+             first, as in `{ALLOW_MARKER} _pdf -- <reason>`",
             index + 1
         );
         assert!(
-            !trimmed[comment.len()..].trim().is_empty(),
-            "{display}:{}: `{ALLOW_MARKER}` needs a reason",
+            !text.next().unwrap_or_default().trim().is_empty(),
+            "{display}:{}: `{ALLOW_MARKER}` needs a reason after `{binding}`",
             index + 1
         );
         let target = lines.iter().enumerate().skip(index + 1).find(|(_, next)| {
@@ -376,7 +395,7 @@ fn marked_lines(source: &str, display: &str) -> BTreeSet<usize> {
                 index + 1
             )
         });
-        marked.insert(target + 1);
+        marked.insert(target + 1, binding.to_owned());
     }
     marked
 }
@@ -614,16 +633,19 @@ union Untracked<'a, R> {
 #[test]
 fn an_exclusion_marker_covers_the_declaration_it_precedes() {
     let source = "\
-// route-hygiene-allow: qpdf's counterpart takes the document.
+// route-hygiene-allow: _pdf -- qpdf's counterpart takes the document.
 fn kept<R>(_pdf: &mut Pdf<R>) {}
 fn reported<R>(_pdf: &mut Pdf<R>) {}
 struct Held<'a, R> {
-    // route-hygiene-allow: holds the exclusive borrow, not a value.
+    // route-hygiene-allow: _pdf -- holds the exclusive borrow, not a value.
     #[allow(dead_code)]
     _pdf: &'a mut Pdf<R>,
 }
 ";
-    assert_eq!(marked_lines(source, "synthetic"), BTreeSet::from([2, 7]));
+    assert_eq!(
+        marked_bindings(source, "synthetic"),
+        BTreeMap::from([(2, "_pdf".to_owned()), (7, "_pdf".to_owned())])
+    );
     let found: Vec<usize> = unmarked_dead_pdf_carriers(source, "synthetic")
         .into_iter()
         .map(|carrier| carrier.line)
@@ -632,10 +654,19 @@ struct Held<'a, R> {
 }
 
 #[test]
-#[should_panic(expected = "needs a reason")]
+#[should_panic(expected = "must name the binding it excuses")]
+fn an_exclusion_marker_that_names_no_binding_is_rejected() {
+    marked_bindings(
+        "// route-hygiene-allow: qpdf takes the document.\nfn f<R>(_pdf: &mut Pdf<R>) {}\n",
+        "synthetic",
+    );
+}
+
+#[test]
+#[should_panic(expected = "needs a reason after `_pdf`")]
 fn an_exclusion_marker_without_a_reason_is_rejected() {
-    marked_lines(
-        "// route-hygiene-allow:\nfn f<R>(_pdf: &mut Pdf<R>) {}\n",
+    marked_bindings(
+        "// route-hygiene-allow: _pdf\nfn f<R>(_pdf: &mut Pdf<R>) {}\n",
         "synthetic",
     );
 }
@@ -643,7 +674,7 @@ fn an_exclusion_marker_without_a_reason_is_rejected() {
 #[test]
 #[should_panic(expected = "on its own line comment")]
 fn the_marker_token_outside_a_line_comment_is_rejected() {
-    marked_lines(
+    marked_bindings(
         "let note = \"route-hygiene-allow: smuggled\";\n",
         "synthetic",
     );
@@ -652,14 +683,27 @@ fn the_marker_token_outside_a_line_comment_is_rejected() {
 #[test]
 #[should_panic(expected = "precedes no declaration")]
 fn an_exclusion_marker_with_nothing_after_it_is_rejected() {
-    marked_lines("// route-hygiene-allow: trailing\n\n", "synthetic");
+    marked_bindings("// route-hygiene-allow: _pdf -- trailing\n\n", "synthetic");
 }
 
 #[test]
-#[should_panic(expected = "drop the stale marker")]
+#[should_panic(expected = "retarget the marker or drop it")]
 fn an_exclusion_marker_that_no_longer_covers_a_carrier_is_rejected() {
     unmarked_dead_pdf_carriers(
-        "// route-hygiene-allow: the parameter it excused is gone.\nfn f(depth: usize) {}\n",
+        "// route-hygiene-allow: _pdf -- the parameter it excused is gone.\n\
+         fn f(depth: usize) {}\n",
+        "synthetic",
+    );
+}
+
+/// The drift the named-binding grammar exists to stop: replacing the binding
+/// under a marker with a different dead carrier must not inherit its reason.
+#[test]
+#[should_panic(expected = "retarget the marker or drop it")]
+fn an_exclusion_marker_does_not_follow_a_replaced_binding() {
+    unmarked_dead_pdf_carriers(
+        "// route-hygiene-allow: _pdf -- holds the exclusive borrow.\n\
+         fn f<R>(_document: &mut Pdf<R>) {}\n",
         "synthetic",
     );
 }

@@ -72,7 +72,7 @@ use std::io::{Read, Seek};
 /// attributes are not inheritable.
 pub struct AnnotationObjectHelper<'a, R: Read + Seek + 'static> {
     annot: ObjectHandle,
-    // route-hygiene-allow: not a dead document bridge. qpdf's
+    // route-hygiene-allow: _pdf -- not a dead document bridge. qpdf's
     // `QPDFAnnotationObjectHelper` derives from `QPDFObjectHelper`, whose one
     // member is `QPDFObjectHandle oh` (`include/qpdf/QPDFObjectHelper.hh:58`);
     // the document reaches its accessors through the handle's own owner. This
