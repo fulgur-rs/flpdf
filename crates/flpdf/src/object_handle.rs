@@ -2768,12 +2768,18 @@ impl ObjectHandle {
             // the walk collects children, because a direct container that
             // holds itself makes `append_direct_children` re-enter this same
             // shared allocation through `ObjectHandle::is_indirect`.
-            {
+            // Take the provider out under the borrow but drop it after the
+            // borrow ends: a caller's `Drop` may read the very stream it was
+            // installed on, and dropping it here would panic with `RefCell
+            // already mutably borrowed`.
+            let released_provider = {
                 let mut shared = shared.borrow_mut();
-                if let ObjectValue::Stream(stream) = &mut shared.value {
-                    stream.stream_provider = None;
+                match &mut shared.value {
+                    ObjectValue::Stream(stream) => stream.stream_provider.take(),
+                    _ => None,
                 }
-            }
+            };
+            drop(released_provider);
             {
                 let shared = shared.borrow();
                 Self::append_direct_children(&shared.value, &mut pending);
@@ -12366,6 +12372,65 @@ mod parsed_offset_tests {
 
 #[cfg(test)]
 mod resolution_state_tests {
+
+    /// A caller's provider may read the stream it was installed on from its
+    /// own `Drop`. Releasing the provider while the shared slot is still
+    /// mutably borrowed panicked with `RefCell already mutably borrowed`,
+    /// so `disconnect` takes it out under the borrow and drops it after.
+    #[test]
+    fn disconnect_releases_a_provider_whose_drop_reads_its_own_stream() {
+        use std::cell::RefCell;
+
+        struct SelfReadingProvider {
+            stream: RefCell<Option<ObjectHandle>>,
+            dropped: Rc<std::cell::Cell<bool>>,
+        }
+
+        impl Drop for SelfReadingProvider {
+            fn drop(&mut self) {
+                if let Some(stream) = self.stream.borrow().as_ref() {
+                    let _ = stream.type_code();
+                }
+                self.dropped.set(true);
+            }
+        }
+
+        impl StreamDataProvider for SelfReadingProvider {
+            fn provide_stream_data_by_id(
+                &self,
+                _object_number: u32,
+                _generation: u16,
+                _pipeline: &mut dyn Pipeline,
+            ) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let stream = ObjectHandle::stream(ObjectHandle::dictionary(vec![]), Rc::new(Vec::new()));
+        let dropped = Rc::new(std::cell::Cell::new(false));
+        let provider = Rc::new(SelfReadingProvider {
+            stream: RefCell::new(Some(stream.clone())),
+            dropped: Rc::clone(&dropped),
+        });
+        stream.with_value_mut(|value| {
+            if let Some(ObjectValue::Stream(stream)) = value {
+                stream.stream_data = None;
+                stream.stream_provider = Some(provider.clone());
+            }
+        });
+        drop(provider);
+
+        stream.disconnect();
+
+        assert!(
+            dropped.get(),
+            "the provider must actually be released by disconnect"
+        );
+        assert!(stream.with_value(|value| matches!(
+            value,
+            Some(ObjectValue::Stream(stream)) if stream.stream_provider.is_none()
+        )));
+    }
     use super::*;
 
     #[test]
