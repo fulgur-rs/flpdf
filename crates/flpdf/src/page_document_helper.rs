@@ -497,7 +497,7 @@ mod job_flattened_page_tests {
 
     fn three_page_pdf() -> Pdf<Cursor<Vec<u8>>> {
         Pdf::open_mem_owned(
-            include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf").to_vec(),
+            include_bytes!("../../../tests/fixtures/compat/three-page.pdf").to_vec(),
         )
         .expect("open three-page fixture")
     }
