@@ -12394,18 +12394,23 @@ mod resolution_state_tests {
             }
         }
 
+        struct ReaderHoldingProvider {
+            _reader: ReadOnDrop,
+        }
+
+        impl StreamDataProvider for ReaderHoldingProvider {}
+
         let stream = ObjectHandle::stream(ObjectHandle::dictionary(vec![]), Rc::new(Vec::new()));
         let dropped = Rc::new(std::cell::Cell::new(false));
         let reader = ReadOnDrop {
             stream: stream.clone(),
             dropped: Rc::clone(&dropped),
         };
-        let provider: Rc<dyn StreamDataProvider> = Rc::new(CallbackProvider {
-            callback: move |_: &mut dyn Pipeline| {
-                let _ = &reader;
-                Ok(())
-            },
-        });
+        // The destructor is the whole point; the data callback never runs in
+        // this test, so keep it a shared no-op rather than a fresh closure
+        // body of its own.
+        let provider: Rc<dyn StreamDataProvider> =
+            Rc::new(ReaderHoldingProvider { _reader: reader });
         stream.with_value_mut(|value| {
             if let Some(ObjectValue::Stream(stream)) = value {
                 stream.stream_data = None;
