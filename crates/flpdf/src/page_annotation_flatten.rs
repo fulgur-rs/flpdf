@@ -290,34 +290,37 @@ fn flatten_annotations_on_page<R: Read + Seek>(
 
     // ── Step 5: Build content appendix and register XObjects ──────────────
     let mut append_bytes: Vec<u8> = Vec::new();
-    // Counter for unique XObject name generation.
-    let mut xobj_counter: u32 = 1;
+    // Counter for unique XObject name generation (qpdf's `int next_fx = 1`,
+    // QPDFPageDocumentHelper.cc:96).
+    let mut xobj_counter: usize = 1;
 
     let mut flattened_count = 0;
     for data in &candidates {
-        // Choose a name that doesn't collide with existing /XObject keys.
-        // Mirrors qpdf's QPDFObjectHandle::getUniqueResourceName: the
-        // counter advances past a rejected (colliding) candidate, but the
+        // Choose a name that collides with nothing already reachable from
+        // this page's /Resources. qpdf calls
+        // `resources.getUniqueResourceName("/Fxo", next_fx)`
+        // (QPDFPageDocumentHelper.cc:119) with no pre-collected name set, so
+        // each candidate is tested against `getResourceNames()`
+        // (QPDFObjectHandle.cc:1156-1170) -- the union of the keys of *every*
+        // dictionary-valued /Resources category, not just /XObject. A page
+        // whose /Font (or /ColorSpace, /ExtGState, ...) already holds an
+        // /Fxo{n} entry therefore pushes qpdf on to /Fxo{n+1}.
+        //
+        // `None` mirrors qpdf's null `namesp` argument: the names are
+        // recollected for every annotation rather than cached across the
+        // loop. (The two are equivalent in output here, because `xobj_counter`
+        // only ever advances past the name this iteration registers, so a
+        // freshly merged /Fxo entry is never re-proposed. Passing `None` is
+        // the faithful translation, not a behavioural requirement.)
+        //
+        // The counter advances past a rejected (colliding) candidate, but the
         // accepted candidate's number is "the value used, not the next
         // value" -- it only becomes final once this annotation is confirmed
         // to produce content, below.
-        //
-        // /XObject may not exist yet (it is only privatized-or-created
-        // below, once content is known to be non-empty), so peek at it
-        // read-only here without creating it.
-        let existing_xobj = resources.try_get_key(b"/XObject")?;
-        let xobj_name = loop {
-            let candidate = format!("Fxo{xobj_counter}");
-            let candidate_key = format!("/{candidate}");
-            let collides = existing_xobj.try_is_dictionary()?
-                && existing_xobj.try_has_key(candidate_key.as_bytes())?;
-            if !collides {
-                break candidate;
-            }
-            xobj_counter += 1;
-        };
-
-        let resource_name = format!("/{xobj_name}");
+        let xobj_name = resources.get_unique_resource_name(b"/Fxo", &mut xobj_counter, None)?;
+        // The `/Fxo` prefix and the decimal suffix are both ASCII, so this
+        // conversion never substitutes a replacement character.
+        let resource_name = String::from_utf8_lossy(&xobj_name);
         let content_result =
             AnnotationObjectHelper::from_object_handle(data.annotation.clone(), pdf)
                 .get_page_content_for_appearance(
@@ -353,7 +356,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         } else {
             pdf.make_indirect_object_handle(data.appearance.clone())?
         };
-        xobj_dict.replace_key(format!("/{xobj_name}").as_bytes(), xobject)?;
+        xobj_dict.replace_key(&xobj_name, xobject)?;
         append_bytes.extend_from_slice(&content);
         flattened_count += 1;
         if !qpdf_flag_contract {
@@ -3231,6 +3234,116 @@ mod tests {
         assert!(
             content_str.contains("Fxo2"),
             "expected Fxo2 due to name collision, got: {content_str}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: the /Fxo collision scan covers every /Resources category, not just
+    // /XObject. qpdf calls `resources.getUniqueResourceName("/Fxo", next_fx)`
+    // (QPDFPageDocumentHelper.cc:119) without a pre-collected name set, so the
+    // candidate is tested against getResourceNames()
+    // (QPDFObjectHandle.cc:1156-1170) -- the union of the keys of every
+    // dictionary-valued top-level entry. A page whose /Font already holds
+    // /Fxo1 therefore makes qpdf 11.9.0 emit /Fxo2, verified against the
+    // pinned binary on this exact shape.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn xobj_name_collision_scan_spans_every_resource_category() {
+        let xobj_body = make_xobj_stream([0.0, 0.0, 100.0, 20.0], b"");
+        let (n5, obj5_bytes) = obj_wrap(5, xobj_body);
+        let (n4, obj4_bytes) = obj_dict(
+            4,
+            "<< /Type /Annot /Subtype /Widget /Rect [50 50 150 70] /AP << /N 5 0 R >> >>",
+        );
+        let (n6, obj6_bytes) =
+            obj_dict(6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+
+        // /Fxo1 lives in /Font, and /XObject is absent entirely: a scan
+        // restricted to /XObject would see no conflict and pick /Fxo1.
+        let bytes = build_pdf(
+            "/Annots [4 0 R] /Resources << /Font << /Fxo1 6 0 R >> >>",
+            &[(n4, obj4_bytes), (n5, obj5_bytes), (n6, obj6_bytes)],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+
+        let count = flatten_annotations_on_page(&mut pdf, page_ref, FlattenMode::All).unwrap();
+        assert_eq!(count, 1);
+
+        let content = page_content_bytes(&mut pdf, page_ref).unwrap();
+        let content_str = String::from_utf8_lossy(&content);
+        assert!(
+            content_str.contains("/Fxo2 Do"),
+            "a /Font entry named /Fxo1 must push the appearance XObject to /Fxo2, got: {content_str}"
+        );
+
+        // The registered /XObject key must agree with the content stream, and
+        // the colliding /Font entry must be left untouched.
+        let resources = pdf
+            .get_object_handle(page_ref)
+            .try_get_key(b"/Resources")
+            .unwrap();
+        let xobject = resources.try_get_key(b"/XObject").unwrap();
+        assert!(xobject.try_has_key(b"/Fxo2").unwrap());
+        assert!(!xobject.try_has_key(b"/Fxo1").unwrap());
+        let font = resources.try_get_key(b"/Font").unwrap();
+        assert!(font.try_has_key(b"/Fxo1").unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: the cross-category scan composes with the suffix cursor that
+    // persists across annotations. With collisions scattered over /Font
+    // (/Fxo1) and /ExtGState (/Fxo3, /Fxo4), qpdf 11.9.0 emits /Fxo2, /Fxo5
+    // and /Fxo6 for three annotations -- verified against the pinned binary
+    // on this exact shape. A scan restricted to /XObject would instead emit
+    // the unbroken run /Fxo1, /Fxo2, /Fxo3.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn xobj_name_collision_scan_composes_with_the_persistent_suffix_cursor() {
+        let mut objects = Vec::new();
+        let mut annots = String::new();
+        for (annot_num, ap_num) in [(20u32, 21u32), (22, 23), (24, 25)] {
+            let (ap_n, ap_bytes) = obj_wrap(ap_num, make_xobj_stream([0.0, 0.0, 100.0, 20.0], b""));
+            let (an_n, an_bytes) = obj_dict(
+                annot_num,
+                &format!(
+                    "<< /Type /Annot /Subtype /Widget /Rect [50 50 150 70] \
+                     /AP << /N {ap_num} 0 R >> >>"
+                ),
+            );
+            objects.push((an_n, an_bytes));
+            objects.push((ap_n, ap_bytes));
+            annots.push_str(&format!("{annot_num} 0 R "));
+        }
+        let (n6, obj6_bytes) =
+            obj_dict(6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        objects.push((n6, obj6_bytes));
+
+        let bytes = build_pdf(
+            &format!(
+                "/Annots [{}] /Resources << /Font << /Fxo1 6 0 R >> \
+                 /ExtGState << /Fxo3 6 0 R /Fxo4 6 0 R >> >>",
+                annots.trim_end()
+            ),
+            &objects,
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+
+        let count = flatten_annotations_on_page(&mut pdf, page_ref, FlattenMode::All).unwrap();
+        assert_eq!(count, 3);
+
+        let content = page_content_bytes(&mut pdf, page_ref).unwrap();
+        let content_str = String::from_utf8_lossy(&content);
+        for expected in ["/Fxo2 Do", "/Fxo5 Do", "/Fxo6 Do"] {
+            assert!(
+                content_str.contains(expected),
+                "expected {expected} in flattened content, got: {content_str}"
+            );
+        }
+        assert!(
+            !content_str.contains("/Fxo1 Do") && !content_str.contains("/Fxo3 Do"),
+            "no candidate may reuse a name already held by another category, got: {content_str}"
         );
     }
 
