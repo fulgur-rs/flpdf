@@ -12418,6 +12418,27 @@ mod resolution_state_tests {
                 stream.stream_provider = Some(provider.clone());
             }
         });
+
+        // Exercise the provider itself so the registered data path is a real
+        // one rather than a stub the gate never enters.
+        struct CountingSink(usize);
+        impl Pipeline for CountingSink {
+            fn identifier(&self) -> &str {
+                "disconnect provider probe sink"
+            }
+            fn write(&mut self, data: &[u8]) -> crate::pipeline::PipelineResult<()> {
+                self.0 += data.len();
+                Ok(())
+            }
+            fn finish(&mut self) -> crate::pipeline::PipelineResult<()> {
+                Ok(())
+            }
+        }
+        let mut sink = CountingSink(0);
+        provider
+            .provide_stream_data_by_id(3, 0, &mut sink)
+            .expect("the probe provider writes nothing and succeeds");
+        assert_eq!(sink.0, 0);
         drop(provider);
 
         stream.disconnect();
