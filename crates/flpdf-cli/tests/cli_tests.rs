@@ -6633,8 +6633,58 @@ fn rewrite_newline_before_endstream_n_accepted_and_produces_valid_output() {
         .success();
 }
 
+/// Every `--newline-before-endstream` spelling enables the option, because
+/// qpdf registers it with `QPDFArgParser::addBare` (`auto_job_init.hh:58`):
+/// `choices` stays empty, and the dispatch loop only rejects a supplied
+/// parameter when `choices` is non-empty (`QPDFArgParser.cc:99-103,505-534`),
+/// so any `=value` is parsed off and discarded before the handler fires.
+///
+/// `never` is covered here alongside `garbage` on purpose. flpdf-cli used to
+/// accept `=never` as a value meaning "leave the option off", which inverted
+/// what real qpdf does with the very same argv token.
 #[test]
-fn rewrite_newline_before_endstream_garbage_uses_qpdf_bare_flag_behavior() {
+fn rewrite_newline_before_endstream_every_spelling_uses_qpdf_bare_flag_behavior() {
+    for spelling in [
+        "--newline-before-endstream",
+        "--newline-before-endstream=y",
+        "--newline-before-endstream=n",
+        "--newline-before-endstream=never",
+        "--newline-before-endstream=garbage",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("in.pdf");
+        let output = temp.path().join("out.pdf");
+        std::fs::write(&input, one_page_pdf_with_content(b"q Q")).unwrap();
+
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(["rewrite", "--compress-streams=n", spelling])
+            .arg(&input)
+            .arg(&output)
+            .assert()
+            .success();
+
+        let output_bytes = std::fs::read(&output).unwrap();
+        assert!(
+            contains(&output_bytes, b"q Q\nendstream"),
+            "`{spelling}` should enable the newline, as qpdf's bare flag does"
+        );
+
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(["--check", output.to_str().unwrap()])
+            .assert()
+            .success();
+    }
+}
+
+/// Omitting the flag is the only way to get qpdf's default framing, where
+/// exactly `/Length` bytes sit between `stream` and `endstream`. This is the
+/// counterpart of the spelling sweep above: the writer's "no newline" state
+/// stays reachable, just not through an `=never` argv token qpdf cannot parse
+/// the same way.
+#[test]
+fn rewrite_without_newline_before_endstream_keeps_qpdf_default_framing() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("in.pdf");
     let output = temp.path().join("out.pdf");
@@ -6642,24 +6692,15 @@ fn rewrite_newline_before_endstream_garbage_uses_qpdf_bare_flag_behavior() {
 
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args([
-            "rewrite",
-            "--compress-streams=n",
-            "--newline-before-endstream=garbage",
-        ])
+        .args(["rewrite", "--compress-streams=n"])
         .arg(&input)
         .arg(&output)
         .assert()
         .success();
 
     let output_bytes = std::fs::read(&output).unwrap();
-    assert!(contains(&output_bytes, b"q Q\nendstream"));
-
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .args(["--check", output.to_str().unwrap()])
-        .assert()
-        .success();
+    assert!(contains(&output_bytes, b"q Qendstream"));
+    assert!(!contains(&output_bytes, b"q Q\nendstream"));
 }
 
 // ── help text contains qpdf-compatible defaults ───────────────────────────────
@@ -6697,15 +6738,31 @@ fn rewrite_help_shows_remove_unreferenced_resources_default_auto() {
         .stdout(predicate::str::contains("default: auto"));
 }
 
+/// qpdf's own `--help=--newline-before-endstream` opens with "For an extra
+/// newline before endstream", and lists the option with no `=value` grammar
+/// because it is registered bare. flpdf's help mirrors that shape, so it must
+/// not advertise a value list or a `never` default.
 #[test]
-fn rewrite_help_shows_newline_before_endstream_default_never() {
+fn rewrite_help_shows_newline_before_endstream_as_a_bare_flag() {
     Command::cargo_bin("flpdf")
         .unwrap()
         .args(["rewrite", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("newline-before-endstream"))
-        .stdout(predicate::str::contains("default: never"));
+        // No `=<VALUE>` grammar on the option line, unlike the valued options
+        // rendered next to it (`--stream-data=<STREAM_DATA>`).
+        .stdout(predicate::str::contains("--newline-before-endstream\n"))
+        .stdout(predicate::str::contains("--newline-before-endstream=").not())
+        .stdout(predicate::str::contains("default: never").not());
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "-h"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "For an extra newline before endstream",
+        ));
 }
 
 #[test]

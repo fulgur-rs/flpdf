@@ -543,8 +543,10 @@ fn render_markdown(rows: &[MatrixRow]) -> String {
     out.push_str("miniz-drift snapshot rather than a qpdf byte-parity signal, which is the\n");
     out.push_str("one sanctioned deviation the pre-v1.0 mimicry policy tolerates. Byte-parity\n");
     out.push_str("under miniz is deliberately **not** chased (see `tests/golden/README.md`).\n\n");
-    out.push_str("Framing uses the CLI's default `--newline-before-endstream=never`, which\n");
-    out.push_str("also matches qpdf. `crates/flpdf/tests/cmp_diff_zero_tests.rs` provides the\n");
+    out.push_str("Framing uses the CLI's default, with `--newline-before-endstream` omitted,\n");
+    out.push_str(
+        "which also matches qpdf. `crates/flpdf/tests/cmp_diff_zero_tests.rs` provides the\n",
+    );
     out.push_str("stricter per-fixture assertions of `cmp`-diff-0 against the committed\n");
     out.push_str("`static-id.pdf` goldens under the same feature.\n\n");
     out.push_str("## Review cadence\n\n");
