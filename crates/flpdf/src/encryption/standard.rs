@@ -10,10 +10,11 @@
 //! Output is an RC4 file key of 40–128 bits (5–16 bytes).
 //!
 //! # V=4 Crypt Filter support
-//! This module also contains the V=4 key derivation shim (`compute_file_key_v4`) and the
-//! Crypt Filter (CF) dispatch types: `CryptFilterMethod`, `CryptFilter`, `CryptFilterRef`,
-//! and `select_crypt_filter`. The `/StmF`, `/StrF`, `/EFF` use-site selection and the
-//! `cfm_to_object_key_alg` helper are included for completeness.
+//! This module contains the V=4 key derivation shim (`compute_file_key_v4`).
+//! Crypt-filter interpretation itself — the `/CF` table walk and the `/StmF`,
+//! `/StrF`, `/EFF` use-site selection — lives in
+//! [`super::crypt_filters`], mirroring qpdf's split between
+//! `QPDF::interpretCF` and the Standard handler's key algorithms.
 //!
 //! This module provides key derivation only. Parsing of the `/Encrypt`
 //! dictionary and end-to-end round-trip decryption are handled elsewhere.

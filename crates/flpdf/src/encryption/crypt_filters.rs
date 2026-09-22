@@ -2,77 +2,20 @@
 //!
 //! qpdf correspondence: `QPDF_encryption.cc:700-716,860-904` crypt-filter interpretation and `/CF` table construction.
 //!
-#![allow(dead_code)]
+//! qpdf keeps its whole crypt-filter state in one bare
+//! `std::map<std::string, encryption_method_e>` (`QPDF.hh:912`) plus the three
+//! interpreted use-site values `cf_stream`/`cf_string`/`cf_file`; the `/CF`
+//! walk at `QPDF_encryption.cc:860-884` discards each entry's name and
+//! `/Length`, and `/StmF`, `/StrF`, `/EFF` stay function locals. The
+//! equivalent flpdf state therefore lives in
+//! [`EncryptionState`](super::state::EncryptionState) as a
+//! `BTreeMap<Vec<u8>, EncryptionMode>`, and this module holds only the
+//! functions that read it.
 
 use super::state::{EncryptionMode, EncryptionState};
-use crate::error::{EncryptedError, Result};
+use crate::error::Result;
 use crate::ObjectHandle;
-use std::collections::{BTreeMap, HashMap};
-
-/// Crypt-filter method from PDF 1.7 `/CFM`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CryptFilterMethod {
-    V2,
-    AesV2,
-    Identity,
-}
-
-/// One named `/CF` dictionary entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CryptFilter {
-    pub name: String,
-    pub cfm: CryptFilterMethod,
-    pub length_bits: Option<i64>,
-}
-
-/// Result of resolving a use-site selector against `/CF`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CryptFilterRef<'a> {
-    Identity,
-    Named(&'a CryptFilter),
-}
-
-/// `/StmF`, `/StrF`, and `/EFF` selectors with qpdf's `/EFF` fallback.
-#[derive(Debug, Clone)]
-pub(crate) struct V4UseSiteSelectors {
-    pub stm_f: Option<String>,
-    pub str_f: Option<String>,
-    pub eff: Option<String>,
-}
-
-impl V4UseSiteSelectors {
-    pub(crate) fn eff_or_stm(&self) -> Option<&str> {
-        self.eff.as_deref().or(self.stm_f.as_deref())
-    }
-}
-
-/// Resolve a named crypt filter for a use site.
-pub(crate) fn select_crypt_filter<'a>(
-    cf_table: &'a HashMap<String, CryptFilter>,
-    name: Option<&str>,
-) -> Result<CryptFilterRef<'a>> {
-    match name {
-        None | Some("Identity") => Ok(CryptFilterRef::Identity),
-        Some(name) => cf_table
-            .get(name)
-            .map(CryptFilterRef::Named)
-            .ok_or_else(|| {
-                EncryptedError::Malformed {
-                    reason: format!("/CF entry '{name}' not found"),
-                }
-                .into()
-            }),
-    }
-}
-
-/// Map a crypt-filter method to the Standard handler's object-key algorithm.
-pub(crate) fn cfm_to_object_key_alg(cfm: CryptFilterMethod) -> Option<super::keys::ObjectKeyAlg> {
-    match cfm {
-        CryptFilterMethod::V2 => Some(super::keys::ObjectKeyAlg::Rc4),
-        CryptFilterMethod::AesV2 => Some(super::keys::ObjectKeyAlg::Aes),
-        CryptFilterMethod::Identity => None,
-    }
-}
+use std::collections::BTreeMap;
 
 fn interpret_cf_name(
     crypt_filters: &BTreeMap<Vec<u8>, EncryptionMode>,
