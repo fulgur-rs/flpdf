@@ -1884,7 +1884,8 @@ mod tests {
 
     #[test]
     fn page_merge_production_route_has_no_legacy_borrowed_resolution() {
-        let production = include_str!("page_merge.rs")
+        let source = include_str!("page_merge.rs").replace("\r\n", "\n");
+        let production = source
             .split_once("#[cfg(test)]\nmod tests")
             .expect("page_merge test module marker")
             .0;
@@ -1897,7 +1898,8 @@ mod tests {
 
     #[test]
     fn install_primary_object_stream_membership_routes_through_get_object_stream_data() {
-        let production = include_str!("page_merge.rs")
+        let source = include_str!("page_merge.rs").replace("\r\n", "\n");
+        let production = source
             .split_once("#[cfg(test)]\nmod tests")
             .expect("page_merge test module marker")
             .0;
