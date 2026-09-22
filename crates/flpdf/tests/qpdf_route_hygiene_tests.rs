@@ -592,8 +592,7 @@ fn marked_bindings(source: &str, display: &str) -> BTreeMap<usize, (usize, Strin
                 break None;
             };
             let trimmed = next.trim_start();
-            if trimmed.is_empty()
-                || trimmed.starts_with("//")
+            if is_only_comment_trivia(trimmed)
                 || line_holds_only_attributes(next, cursor + 1, &attributes)
             {
                 cursor += 1;
@@ -712,8 +711,50 @@ fn line_holds_only_attributes(line: &str, number: usize, attributes: &[Attribute
             rest.push(character);
         }
     }
-    let rest = rest.trim();
-    rest.is_empty() || rest.starts_with("//")
+    is_only_comment_trivia(&rest)
+}
+
+/// Whether `text` holds nothing but comment trivia.
+///
+/// A line comment runs to the end of the line, so it ends the question. A
+/// block comment has to close on this line: one left open takes the
+/// declaration below it with it, and one that closes before a declaration on
+/// the same line must not hide that declaration. Nesting is counted because
+/// Rust allows it.
+fn is_only_comment_trivia(text: &str) -> bool {
+    let mut rest = text.trim_start();
+    loop {
+        if rest.is_empty() || rest.starts_with("//") {
+            return true;
+        }
+        let Some(inner) = rest.strip_prefix("/*") else {
+            return false;
+        };
+        let bytes = inner.as_bytes();
+        let mut depth = 1usize;
+        let mut cursor = 0;
+        while cursor + 1 < bytes.len() {
+            match (bytes[cursor], bytes[cursor + 1]) {
+                (b'/', b'*') => {
+                    depth += 1;
+                    cursor += 2;
+                }
+                (b'*', b'/') => {
+                    depth -= 1;
+                    cursor += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => cursor += 1,
+            }
+        }
+        if depth != 0 {
+            return false;
+        }
+        // `cursor` sits just past an ASCII `*/`, so it is a char boundary.
+        rest = inner[cursor..].trim_start();
+    }
 }
 
 /// An identifier's text without the raw-identifier prefix. `r#_pdf` is an
@@ -1422,6 +1463,42 @@ fn kept<R>(_pdf: &mut Pdf<R>) {}
     );
     assert!(
         unmarked_dead_pdf_carriers(source, "synthetic").is_empty(),
+        "a correctly marked declaration must not be reported"
+    );
+}
+
+/// A block comment is trivia too. One that closes on the attribute's line is
+/// skipped like a line comment; one that a declaration follows on the same
+/// line must not take the declaration with it, and one left open must not
+/// swallow the line below.
+#[test]
+fn a_block_comment_after_an_attribute_is_skipped_without_hiding_a_declaration() {
+    let closing = "\
+// route-hygiene-allow: _pdf -- holds the exclusive borrow, not a value.
+#[allow(dead_code)] /* rationale /* nested */ */
+fn kept<R>(_pdf: &mut Pdf<R>) {}
+";
+    assert_eq!(
+        marked_bindings(closing, "synthetic"),
+        BTreeMap::from([(3, (1, "_pdf".to_owned()))]),
+        "a block comment that closes on the attribute line is trivia"
+    );
+    assert!(
+        unmarked_dead_pdf_carriers(closing, "synthetic").is_empty(),
+        "a correctly marked declaration must not be reported"
+    );
+
+    let sharing = "\
+// route-hygiene-allow: _pdf -- holds the exclusive borrow, not a value.
+#[inline] /* rationale */ fn kept<R>(_pdf: &mut Pdf<R>) {}
+";
+    assert_eq!(
+        marked_bindings(sharing, "synthetic"),
+        BTreeMap::from([(2, (1, "_pdf".to_owned()))]),
+        "a declaration after the block comment is still on that line"
+    );
+    assert!(
+        unmarked_dead_pdf_carriers(sharing, "synthetic").is_empty(),
         "a correctly marked declaration must not be reported"
     );
 }
