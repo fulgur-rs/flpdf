@@ -134,8 +134,7 @@ pub(crate) fn is_inheritable_page_attribute(key: &[u8]) -> bool {
 /// This is the shared qpdf-shaped parent walk used by both page-tree
 /// consumers and [`crate::PageObjectHelper`]. The caller supplies the starting
 /// node so Form XObjects can keep qpdf's non-inheriting `getAttribute` path.
-pub(crate) fn resolve_inherited_handle_from_node_with_max_depth<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
+pub(crate) fn resolve_inherited_handle_from_node_with_max_depth(
     node: ObjectHandle,
     key: &[u8],
     max_depth: usize,
@@ -194,7 +193,7 @@ pub(crate) fn resolve_inherited_handle_with_max_depth<R: Read + Seek>(
     max_depth: usize,
 ) -> Result<Option<ObjectHandle>> {
     let page = pdf.get_object_handle(page_ref);
-    resolve_inherited_handle_from_node_with_max_depth(pdf, page, key, max_depth)
+    resolve_inherited_handle_from_node_with_max_depth(page, key, max_depth)
 }
 
 /// Return every `Page` object in document order using qpdf's unbounded default walk.
@@ -839,7 +838,6 @@ mod tests {
 
     #[test]
     fn inherited_attribute_walk_propagates_an_unresolved_parent_child_error() {
-        let mut pdf = Pdf::empty().expect("empty PDF supplies a resolver owner");
         let node = ObjectHandle::dictionary(vec![
             (b"/MediaBox".to_vec(), ObjectHandle::null()),
             (
@@ -848,8 +846,7 @@ mod tests {
             ),
         ]);
         let error =
-            resolve_inherited_handle_from_node_with_max_depth(&mut pdf, node, b"/MediaBox", 4)
-                .unwrap_err();
+            resolve_inherited_handle_from_node_with_max_depth(node, b"/MediaBox", 4).unwrap_err();
         assert!(error
             .to_string()
             .contains("object 99 0 belongs to a dropped PDF"));

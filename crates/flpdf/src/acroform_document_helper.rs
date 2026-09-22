@@ -378,9 +378,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             return Ok(Vec::new());
         };
 
-        let default_appearance = deref_leaf_handle(self.pdf, acroform.try_get_key(b"/DA")?)?;
-        let quadding = inherited_integer(self.pdf, &acroform, b"/Q")?;
-        let max_len = inherited_integer(self.pdf, &acroform, b"/MaxLen")?;
+        let default_appearance = deref_leaf_handle(acroform.try_get_key(b"/DA")?)?;
+        let quadding = inherited_integer(&acroform, b"/Q")?;
+        let max_len = inherited_integer(&acroform, b"/MaxLen")?;
         let inherited = FieldInheritance {
             default_appearance,
             quadding,
@@ -958,7 +958,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 .copy_transform_object(&annotation, &mut orig_to_copy)?
                 .expect("stream annotations are filtered before copying");
             copy_and_transform_appearance_streams(self.pdf, &copied, cm)?;
-            let rect = transformed_annotation_rectangle(self.pdf, &copied, cm)?;
+            let rect = transformed_annotation_rectangle(&copied, cm)?;
             copied.replace_key(b"/Rect", rect)?;
             transformed.new_annotations.push(copied);
         }
@@ -1113,7 +1113,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 cm,
                 appearance_renames,
             )?; // cov:ignore: LLVM maps this multiline appearance-transform call to a defensive continuation edge
-            let rect = transformed_annotation_rectangle(self.pdf, &copied, cm)?;
+            let rect = transformed_annotation_rectangle(&copied, cm)?;
             copied.replace_key(b"/Rect", rect)?;
             transformed.new_annotations.push(copied);
         }
@@ -2162,8 +2162,8 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         if is_pure_widget_annotation(&field)? {
             return Ok(());
         }
-        let current = inherited.apply(self.pdf, &field)?;
-        let partial_name = deref_leaf_handle(self.pdf, field.try_get_key(b"/T")?)?
+        let current = inherited.apply(&field)?;
+        let partial_name = deref_leaf_handle(field.try_get_key(b"/T")?)?
             .as_ref()
             .and_then(ObjectHandle::as_string)
             .map(|name| name.to_vec());
@@ -2194,8 +2194,8 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 }
 
 impl FieldInheritance {
-    fn apply<R: Read + Seek>(&self, pdf: &mut Pdf<R>, field: &ObjectHandle) -> Result<Self> {
-        let partial_name = deref_leaf_handle(pdf, field.try_get_key(b"/T")?)?
+    fn apply(&self, field: &ObjectHandle) -> Result<Self> {
+        let partial_name = deref_leaf_handle(field.try_get_key(b"/T")?)?
             .as_ref()
             .and_then(ObjectHandle::as_string)
             .map(|name| decode_field_name(&name));
@@ -2207,15 +2207,14 @@ impl FieldInheritance {
 
         Ok(Self {
             full_name,
-            field_type: inherited_name(pdf, field, b"/FT")?.or_else(|| self.field_type.clone()),
-            value: inherited_object(pdf, field, b"/V")?.or_else(|| self.value.clone()),
-            default_value: inherited_object(pdf, field, b"/DV")?
-                .or_else(|| self.default_value.clone()),
-            field_flags: inherited_integer(pdf, field, b"/Ff")?.or(self.field_flags),
-            default_appearance: inherited_object(pdf, field, b"/DA")?
+            field_type: inherited_name(field, b"/FT")?.or_else(|| self.field_type.clone()),
+            value: inherited_object(field, b"/V")?.or_else(|| self.value.clone()),
+            default_value: inherited_object(field, b"/DV")?.or_else(|| self.default_value.clone()),
+            field_flags: inherited_integer(field, b"/Ff")?.or(self.field_flags),
+            default_appearance: inherited_object(field, b"/DA")?
                 .or_else(|| self.default_appearance.clone()),
-            quadding: inherited_integer(pdf, field, b"/Q")?.or(self.quadding),
-            max_len: inherited_integer(pdf, field, b"/MaxLen")?.or(self.max_len),
+            quadding: inherited_integer(field, b"/Q")?.or(self.quadding),
+            max_len: inherited_integer(field, b"/MaxLen")?.or(self.max_len),
         })
     }
 }
@@ -2360,49 +2359,30 @@ fn ensure_foreign_indirect<R: Read + Seek>(
 /// Resolve one level of indirection for a metadata leaf handle. A resolved
 /// null (freed/unknown ref) is treated as absent to match qpdf's inherited
 /// value lookup. Direct values pass through unchanged.
-fn deref_leaf_handle<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
-    value: ObjectHandle,
-) -> Result<Option<ObjectHandle>> {
+fn deref_leaf_handle(value: ObjectHandle) -> Result<Option<ObjectHandle>> {
     value.try_dereference()?;
     Ok((!value.try_is_null()?).then_some(value))
 }
 
-fn inherited_object<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    field: &ObjectHandle,
-    key: &[u8],
-) -> Result<Option<ObjectHandle>> {
-    deref_leaf_handle(pdf, field.try_get_key(key)?)
+fn inherited_object(field: &ObjectHandle, key: &[u8]) -> Result<Option<ObjectHandle>> {
+    deref_leaf_handle(field.try_get_key(key)?)
 }
 
-fn inherited_name<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    field: &ObjectHandle,
-    key: &[u8],
-) -> Result<Option<Vec<u8>>> {
-    match inherited_object(pdf, field, key)? {
+fn inherited_name(field: &ObjectHandle, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    match inherited_object(field, key)? {
         Some(value) => Ok(value.try_as_name()?),
         None => Ok(None),
     }
 }
 
-fn inherited_integer<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    field: &ObjectHandle,
-    key: &[u8],
-) -> Result<Option<i64>> {
-    match inherited_object(pdf, field, key)? {
+fn inherited_integer(field: &ObjectHandle, key: &[u8]) -> Result<Option<i64>> {
+    match inherited_object(field, key)? {
         Some(value) => Ok(value.try_as_integer()?),
         None => Ok(None),
     }
 }
 
-fn transformed_annotation_rectangle<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
-    annotation: &ObjectHandle,
-    cm: Matrix,
-) -> Result<ObjectHandle> {
+fn transformed_annotation_rectangle(annotation: &ObjectHandle, cm: Matrix) -> Result<ObjectHandle> {
     let rect = annotation.try_get_key(b"/Rect")?;
     let rectangle = match rect.try_as_array()? {
         Some(items) if items.len() == 4 => {
@@ -3004,7 +2984,7 @@ mod final_handle_tests {
             "Parent.Child"
         );
         assert_eq!(
-            super::inherited_name(helper.pdf, &child, b"/FT").expect("missing inherited name"),
+            super::inherited_name(&child, b"/FT").expect("missing inherited name"),
             None
         );
     }

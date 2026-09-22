@@ -491,13 +491,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// Missing and null attributes return a direct null handle.
     pub fn get_attribute(&mut self, key: &[u8], copy_if_shared: bool) -> Result<ObjectHandle> {
         let description = self.target_description();
-        get_attribute_for_target(
-            self.pdf,
-            self.object.clone(),
-            key,
-            copy_if_shared,
-            &description,
-        )
+        get_attribute_for_target(self.object.clone(), key, copy_if_shared, &description)
     }
 
     /// Return the effective `/MediaBox` handle.
@@ -1415,13 +1409,8 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             }
 
             let node_description = object_handle_description(&node);
-            let resources = get_attribute_for_target(
-                self.pdf,
-                node.clone(),
-                b"/Resources",
-                false,
-                &node_description,
-            )?; // cov:ignore: traversal already validates each canonical page/Form target; only a defensive resolver error can reach this edge
+            let resources =
+                get_attribute_for_target(node.clone(), b"/Resources", false, &node_description)?; // cov:ignore: traversal already validates each canonical page/Form target; only a defensive resolver error can reach this edge
             if resources.try_is_null()? {
                 continue;
             }
@@ -1916,8 +1905,7 @@ fn externalize_inline_images_for_target<R: Read + Seek + 'static>(
     min_size: usize,
 ) -> Result<()> {
     let (target, is_form) = resolve_attribute_target(object, description)?;
-    let resources =
-        get_attribute_for_target(pdf, target.clone(), b"/Resources", true, description)?;
+    let resources = get_attribute_for_target(target.clone(), b"/Resources", true, description)?;
 
     // qpdf uses mergeResources to make /XObject direct and private before the
     // filter runs. This is a no-op when /Resources is absent or malformed,
@@ -2174,8 +2162,7 @@ fn resolve_attribute_target(
     }
 }
 
-fn get_attribute_for_target<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+fn get_attribute_for_target(
     object: ObjectHandle,
     key: &[u8],
     copy_if_shared: bool,
@@ -2212,7 +2199,6 @@ fn get_attribute_for_target<R: Read + Seek>(
         let parent_ref = dict.try_get_key(b"/Parent")?;
         if let Some(cursor) = next_page_parent(parent_ref)? {
             if let Some(value) = resolve_inherited_handle_from_node_with_max_depth(
-                pdf,
                 cursor.handle(),
                 key,
                 DEFAULT_MAX_PAGE_TREE_DEPTH,

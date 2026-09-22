@@ -28,7 +28,10 @@ thiserror = "2"
 # Test-only: the page-form-xobject route contract parses the module with a
 # real Rust parser instead of scanning text for `#[cfg(test)]` boundaries.
 syn = { version = "2", features = ["full", "parsing", "visit", "extra-traits"] }
-proc-macro2 = "1"
+# Test-only: `span-locations` is what lets the route-hygiene guard report the
+# source line of a parsed binding, so an inline exclusion marker can be keyed
+# to the declaration it precedes instead of to a name that repeats in a file.
+proc-macro2 = { version = "1", features = ["span-locations"] }
 flate2 = "1"
 zlib-rs = "0.6.7"
 clap = { version = "4", features = ["derive"] }
