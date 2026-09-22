@@ -690,7 +690,7 @@ impl ArgParser {
         }
         if let Some(rest) = arg_str.strip_prefix("--") {
             let name = rest.split('=').next().unwrap_or(rest);
-            if self.bare_long_options.contains(name) && should_discard_bare_value(name, arg_str) {
+            if self.bare_long_options.contains(name) && should_discard_bare_value(arg_str) {
                 return RawArg::from_bytes(format!("--{name}").into_bytes());
             }
             return arg;
@@ -717,7 +717,6 @@ impl ArgParser {
         };
         if self.bare_long_options.contains(&name)
             && should_discard_bare_value(
-                &name,
                 std::str::from_utf8(canonical.as_bytes()).unwrap_or_default(),
             )
         {
@@ -1044,14 +1043,8 @@ fn canonical_top_level_non_utf8_option(
     } else {
         arg
     };
-    if promoted && bare_long_options.contains(&name) {
-        let bytes = canonical.as_bytes();
-        if let Some(equal_pos) = bytes.iter().position(|byte| *byte == b'=') {
-            let value = &bytes[equal_pos + 1..];
-            if name != "newline-before-endstream" || !matches!(value, b"y" | b"n" | b"never") {
-                return RawArg::from_bytes(format!("--{name}").into_bytes());
-            }
-        }
+    if promoted && bare_long_options.contains(&name) && canonical.as_bytes().contains(&b'=') {
+        return RawArg::from_bytes(format!("--{name}").into_bytes());
     }
     canonical
 }
@@ -1081,15 +1074,16 @@ fn canonical_segment_non_utf8_option(kind: SegmentKind, token: RawArg) -> RawArg
     }
 }
 
-fn should_discard_bare_value(name: &str, arg: &str) -> bool {
-    let Some((_, value)) = arg.split_once('=') else {
-        return false;
-    };
-    if name == "newline-before-endstream" {
-        !matches!(value, "y" | "n" | "never")
-    } else {
-        true
-    }
+/// Report whether a bare qpdf option's attached `=value` must be dropped.
+///
+/// `QPDFArgParser::addBare` leaves `parameter_needed` false and `choices`
+/// empty (`libqpdf/QPDFArgParser.cc:99-103`), and the dispatch loop only
+/// rejects a supplied parameter when `choices` is non-empty
+/// (`libqpdf/QPDFArgParser.cc:505-534`). Every bare option therefore parses
+/// any `=value` suffix off and discards it, then fires its handler on flag
+/// presence alone — with no per-option exceptions.
+fn should_discard_bare_value(arg: &str) -> bool {
+    arg.contains('=')
 }
 
 #[cfg(test)]

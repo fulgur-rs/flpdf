@@ -330,7 +330,7 @@ fn top_level_writer_options(
         content_normalization: normalize_content,
         content_normalization_set: args.normalize_content.is_some(),
         qdf: args.qdf,
-        newline_before_endstream: args.newline_before_endstream.into(),
+        newline_before_endstream: newline_before_endstream_setting(args.newline_before_endstream),
         password_mode: args.password.password_mode.into(),
         allow_weak_crypto: args.password.allow_weak_crypto,
         ..WriterOptions::default()
@@ -1117,14 +1117,23 @@ struct Cli {
         overrides_with = "stream_data"
     )]
     stream_data: Option<CliStreamDataMode>,
-    /// Insert a newline before each `endstream` keyword (qpdf
-    /// `--newline-before-endstream`). The `y` and `n` spellings both select
-    /// qpdf's enabled boolean setting; `never` retains the default framing.
-    #[arg(long = "newline-before-endstream", value_enum, num_args = 0..=1,
-          require_equals = true, default_missing_value = "y",
-          default_value_t = CliNewlineBeforeEndstream::Never,
-          overrides_with = "newline_before_endstream")]
-    newline_before_endstream: CliNewlineBeforeEndstream,
+    /// Insert an extra newline before each `endstream` keyword (qpdf
+    /// `--newline-before-endstream`).
+    ///
+    /// qpdf registers this as a bare flag, so an attached `=value` of any
+    /// spelling is discarded and the flag's presence alone enables it.
+    /// Omitting the flag keeps qpdf's default framing, where exactly
+    /// `/Length` bytes sit between `stream` and `endstream`.
+    // `overrides_with` self is clap's idiom for accepting repeated
+    // occurrences. qpdf re-fires the bare handler on every occurrence
+    // (`QPDFArgParser.cc:535-537`), so `--newline-before-endstream` twice is
+    // accepted and means the same as once; without this clap rejects the
+    // second occurrence as "cannot be used multiple times".
+    #[arg(
+        long = "newline-before-endstream",
+        overrides_with = "newline_before_endstream"
+    )]
+    newline_before_endstream: bool,
     /// `qpdf --linearize-pass1=PATH` compatibility flag. Writes the
     /// linearization writer's distinct pass-1 intermediate file.
     #[arg(long = "linearize-pass1", require_equals = true)]
@@ -2018,25 +2027,30 @@ struct RewriteCommand {
           overrides_with = "remove_unreferenced_resources")]
     remove_unreferenced_resources: CliRemoveUnreferencedResources,
 
-    /// Insert a newline before each `endstream` keyword
-    /// (qpdf --newline-before-endstream=y|n|never).
+    /// Insert an extra newline before each `endstream` keyword
+    /// (qpdf `--newline-before-endstream`).
     ///
-    /// `never` (default): never insert a newline, so exactly `/Length` bytes sit
-    /// between `stream` and `endstream`. Reproduces qpdf's default output and is
+    /// qpdf registers this as a bare flag, so every attached `=value`
+    /// spelling — `=y`, `=n`, or anything else — is discarded and the flag's
+    /// presence alone enables it. When enabled, exactly one `\n` is written
+    /// before `endstream`.
+    ///
+    /// Omitting the flag keeps qpdf's default framing, where exactly
+    /// `/Length` bytes sit between `stream` and `endstream`. That default is
     /// required for byte-identical qpdf-equivalent rewrites.
-    /// `y` and `n`: enable qpdf's boolean option and always write exactly one
-    /// `\n` before `endstream`. qpdf 11.9.0 accepts both value spellings as
-    /// the presence of the flag.
-    /// Unrecognized attached values are also treated as flag presence, as in
-    /// qpdf's bare-option parser.
     ///
     /// Only affects the full-rewrite path.
-    #[arg(long = "newline-before-endstream", value_enum, num_args = 0..=1,
-          require_equals = true, default_missing_value = "y",
-          default_value_t = CliNewlineBeforeEndstream::Never,
-          help = "Insert newline before endstream keyword (qpdf default: never)",
-          overrides_with = "newline_before_endstream")]
-    newline_before_endstream: CliNewlineBeforeEndstream,
+    // `overrides_with` self is clap's idiom for accepting repeated
+    // occurrences. qpdf re-fires the bare handler on every occurrence
+    // (`QPDFArgParser.cc:535-537`), so `--newline-before-endstream` twice is
+    // accepted and means the same as once; without this clap rejects the
+    // second occurrence as "cannot be used multiple times".
+    #[arg(
+        long = "newline-before-endstream",
+        help = "For an extra newline before endstream",
+        overrides_with = "newline_before_endstream"
+    )]
+    newline_before_endstream: bool,
 
     /// Stream data mode (qpdf --stream-data={preserve,uncompress,compress}).
     ///
@@ -2339,30 +2353,20 @@ fn normalize_content_enabled(setting: Option<CliYesNo>, qdf: bool) -> bool {
     }
 }
 
-/// `--newline-before-endstream=y|n|never` (qpdf default: never).
+/// Map `--newline-before-endstream` flag presence onto the writer setting.
 ///
-/// `never` requests qpdf's default framing (no newline between the stream
-/// payload and `endstream`); `y` and `n` both enable qpdf's boolean option.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum CliNewlineBeforeEndstream {
-    #[clap(name = "y")]
-    Yes,
-    #[clap(name = "n")]
-    No,
-    #[clap(name = "never")]
-    Never,
-}
-
-impl From<CliNewlineBeforeEndstream> for NewlineBeforeEndstream {
-    fn from(v: CliNewlineBeforeEndstream) -> Self {
-        match v {
-            CliNewlineBeforeEndstream::Yes => NewlineBeforeEndstream::Yes,
-            // qpdf treats `--newline-before-endstream=<value>` as the presence
-            // of its boolean option, so `=n` has the same output as `=y` in
-            // the 11.9.0 CLI.
-            CliNewlineBeforeEndstream::No => NewlineBeforeEndstream::Yes,
-            CliNewlineBeforeEndstream::Never => NewlineBeforeEndstream::Never,
-        }
+/// qpdf registers the option through `QPDFArgParser::addBare`
+/// (`libqpdf/qpdf/auto_job_init.hh:58`), which leaves `parameter_needed`
+/// false and `choices` empty (`libqpdf/QPDFArgParser.cc:99-103`). The
+/// dispatch loop only rejects a supplied parameter when `choices` is
+/// non-empty (`libqpdf/QPDFArgParser.cc:505-534`), so any `=value` suffix is
+/// parsed off and discarded before the bare handler fires. Flag presence is
+/// therefore the only input, and flag absence leaves qpdf's default framing.
+fn newline_before_endstream_setting(flag: bool) -> NewlineBeforeEndstream {
+    if flag {
+        NewlineBeforeEndstream::Yes
+    } else {
+        NewlineBeforeEndstream::Never
     }
 }
 
@@ -3456,7 +3460,9 @@ fn main() {
             qdf: args.qdf,
             // qpdf applies `--newline-before-endstream` to every output
             // writer (`QPDFWriter.cc:1560`), including page-operation output.
-            newline_before_endstream: args.newline_before_endstream.into(),
+            newline_before_endstream: newline_before_endstream_setting(
+                args.newline_before_endstream,
+            ),
             password_mode: args.password.password_mode.into(),
             // Now that this route accepts an explicit --encrypt, it also has to
             // honour the opt-in that lets RC4 through, exactly as
@@ -4759,7 +4765,9 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                     CliYesNo::Yes => CompressStreams::Yes,
                     CliYesNo::No => CompressStreams::No,
                 }),
-                newline_before_endstream: cmd.newline_before_endstream.into(),
+                newline_before_endstream: newline_before_endstream_setting(
+                    cmd.newline_before_endstream,
+                ),
                 // --stream-data overrides --compress-streams when set.
                 stream_data: cmd.stream_data.map(Into::into),
                 // Recompressing an existing lone /FlateDecode stream is a writer
@@ -11055,19 +11063,26 @@ mod tests {
             "--json=2",
             "--object-streams=generate",
             "--normalize-content=y",
-            "--newline-before-endstream=never",
         ]);
         assert_eq!(normalize_qpdf_bare_equals(args.clone()), args);
     }
 
     #[test]
-    fn newline_before_endstream_discards_an_unrecognized_equals_value() {
-        let args = strs(&["flpdf", "--newline-before-endstream=garbage"]);
+    fn newline_before_endstream_discards_every_equals_value_spelling() {
+        // `QPDFArgParser::addBare` leaves `choices` empty, and the dispatch
+        // loop only rejects a supplied parameter when `choices` is non-empty
+        // (`QPDFArgParser.cc:99-103,505-534`), so qpdf discards the suffix for
+        // every spelling alike -- `never` included, which is why flpdf keeps
+        // no `=never` value of its own.
+        for value in ["y", "n", "never", "garbage", ""] {
+            let args = strs(&["flpdf", &format!("--newline-before-endstream={value}")]);
 
-        assert_eq!(
-            normalize_qpdf_bare_equals(args),
-            strs(&["flpdf", "--newline-before-endstream"])
-        );
+            assert_eq!(
+                normalize_qpdf_bare_equals(args),
+                strs(&["flpdf", "--newline-before-endstream"]),
+                "`=({value})` should normalize to the bare flag"
+            );
+        }
     }
 
     #[test]

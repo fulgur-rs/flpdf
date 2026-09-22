@@ -314,10 +314,10 @@ fn cli_linearize_normalize_content_is_byte_identical_to_qpdf() {
 
 // ── Plain full rewrite + static-id (no linearize) ─────────────────────────────
 //
-// These cover the plain full-rewrite path, which uses the CLI's default
-// `--newline-before-endstream=never` framing to match qpdf. The linearize tests
-// above force `Never` internally regardless of the CLI default, so only these
-// rows would regress if the CLI default were flipped back to `y`.
+// These cover the plain full-rewrite path, which matches qpdf's framing by
+// leaving `--newline-before-endstream` off, exactly as qpdf's own default does.
+// The linearize tests above force `Never` internally regardless of the CLI
+// default, so only these rows would regress if the CLI default were flipped on.
 
 fn assert_full_rewrite_static_id_byte_identical(stem: &str) {
     let actual = run_cli_full_rewrite_static_id(stem);

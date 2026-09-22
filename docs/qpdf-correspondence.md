@@ -1921,9 +1921,16 @@ option に限る** — clap の `value_enum` か、`arg_parser.rs` の
 `QPDF_REQUIRED_PARAMETER_OPTIONS` に `{...}` の choice として登録され
 `invalid_required_choice_message` が occurrence ごとに検証するもの（`--stream-data`、
 `--object-streams`、`--decode-level`、`--compress-streams`、`--normalize-content`、
-`--newline-before-endstream`、`--flatten-annotations`、`--keep-files-open`、
+`--flatten-annotations`、`--keep-files-open`、
 `--password-mode`、`--password-file`、`--json-stream-data`、resource policy）。
 `--json-key` は qpdf 自身が repeatable と明記しているため対象外。
+`--newline-before-endstream` はこの「値の last-wins」枠ではない — qpdf は
+`addBare` で登録しており（`auto_job_init.hh:58`）値を取らないため、上書きされる
+値が存在しない。clap 側の `overrides_with` self は別目的で残してある: bool flag が
+繰り返されたときに clap が "cannot be used multiple times" で拒否するのを防ぎ、
+qpdf が occurrence ごとに bare handler を再発火する挙動
+（`QPDFArgParser.cc:535-537`）と同じコマンドラインを受理するため
+（`flpdf-glm2.1`、下記）。
 `--pages`/`--add-attachment`/`--copy-attachments-from` の segment accumulation は
 既存の `ArgParser` 境界に残す。
 
@@ -1944,6 +1951,41 @@ top-level token loop で 2 回目を検出し、qpdf と同じ文言・同じ ex
 qpdf は argv 順で最初に問題のあるトークンで失敗するため、この診断は即座に返さず
 保留し、より前の unknown option があればそちらを優先し、より後ろの prescan 失敗
 （missing parameter・invalid choice）にはこちらを渡す。
+
+### `--newline-before-endstream` は bare flag（`flpdf-glm2.1`, 2026-09-22）
+
+qpdf は `--newline-before-endstream` を `QPDFArgParser::addBare` で登録する
+（`libqpdf/qpdf/auto_job_init.hh:58`）。`addBare` は `parameter_needed` を false に
+し `choices` を空のまま残し（`libqpdf/QPDFArgParser.cc:99-103`）、dispatch loop は
+`choices` が非空のときだけ supplied parameter を拒否する
+（`libqpdf/QPDFArgParser.cc:505-534`）。したがって bare option では `=value` の
+suffix がどう綴られていても黙って切り落とされ、bare handler が flag の存在だけで
+発火する。`--newline-before-endstream=y` / `=n` / `=never` / `=garbage` と bare 形は
+qpdf 11.9.0 で byte-identical な出力になり、flag を渡さない場合だけ異なる
+（`tests/fixtures/qpdf-test98-minimal.pdf` で実測: 前者 5 通りすべて 800 bytes /
+md5 `e28d4ff259442e70988e55c152c6361b`、後者 799 bytes /
+md5 `e2d5e40e55c7eeef8a1cf27ca6e810a0`）。
+
+flpdf-cli は以前 `--newline-before-endstream=never` を「flag 不在と同じ」を意味する
+独自の CLI 値として受理しており、同じ argv token を本物の qpdf に渡したときと
+逆の出力になっていた。`arg_parser.rs` の bare-value discard にも
+`newline-before-endstream` だけ `y`/`n`/`never` の値を残す carve-out があった。
+qpdf 側に対応物の無いこの糖衣は撤去し、clap 側も純粋な bool flag に揃えた
+（`main.rs`）。writer 側の `NewlineBeforeEndstream::Never` は無変更で、
+flag を省略すれば qpdf の既定と同じくそのまま到達する。これで `main.rs` の argv
+文法は `job/argv.rs` の `initialize_from_argv`（元から
+`set_newline_before_endstream(true)` を呼ぶ純粋な bare handler）と一致し、
+受理するすべての綴りが実際の qpdf と同じ出力を出す。逸脱ではなく逸脱の解消なので
+`// qpdf-deviation:` マーカーは付けない。
+
+flag の繰り返し（`--newline-before-endstream --newline-before-endstream`）は
+qpdf が exit 0 で受理し単発と同一バイトを出す（`QPDFArgParser.cc:535-537` の
+bare handler は argv 走査の各 occurrence で再発火する）。clap は bool flag の
+重複を既定で拒否するため、`overrides_with` self を残してこれを受理する。
+なお `--qdf` / `--preserve-unreferenced` など他の bare flag は現状この重複を
+usage error にしており、qpdf と乖離している（`flpdf-glm2.1` のスコープ外、
+`flpdf-djmim` で追跡）。`--empty` / `--replace-input` は例外で、
+`QPDFJob_config.cc:27-39,54-62` に従い重複を usage error にするのが正しい。
 
 `flpdf-1qhb` では `--job-json-file` を clap の self-override 対象にせず
 `ArgAction::Append` で occurrence を保持し、`QPDFJob::initialize_from_json_partial_bytes`

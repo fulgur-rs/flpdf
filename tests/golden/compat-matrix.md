@@ -29,8 +29,8 @@ miniz-drift snapshot rather than a qpdf byte-parity signal, which is the
 one sanctioned deviation the pre-v1.0 mimicry policy tolerates. Byte-parity
 under miniz is deliberately **not** chased (see `tests/golden/README.md`).
 
-Framing uses the CLI's default `--newline-before-endstream=never`, which
-also matches qpdf. `crates/flpdf/tests/cmp_diff_zero_tests.rs` provides the
+Framing uses the CLI's default, with `--newline-before-endstream` omitted,
+which also matches qpdf. `crates/flpdf/tests/cmp_diff_zero_tests.rs` provides the
 stricter per-fixture assertions of `cmp`-diff-0 against the committed
 `static-id.pdf` goldens under the same feature.
 

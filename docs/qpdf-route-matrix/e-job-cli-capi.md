@@ -897,8 +897,15 @@ qpdf option の実に 91%（113/124）を**独自の clap 実装で**既に持�
   の後ろのオプションも認識される）へ揃え、`main.rs` の
   `top_level_double_dash_resets_to_main_options_like_qpdf` と同じ形を
   `argv_top_level_double_dash_resumes_the_main_option_table` で検証した。
-- `flpdf-glm2.1`（`--newline-before-endstream=never` の bare flag 化）: 依然 OPEN、
-  `main.rs` 側の別の未解決 issue。本 issue のスコープ外。
+- `flpdf-glm2.1`（`--newline-before-endstream=never` の bare flag 化）: CLOSED。
+  `main.rs` 側を qpdf の `addBare` と同じ純粋な bare flag へ揃え、
+  `arg_parser.rs` の bare-value discard にあった
+  `newline-before-endstream` 専用の carve-out（`y`/`n`/`never` だけ値を
+  残す分岐）も撤去した。`=y`/`=n`/`=never`/`=garbage` はすべて
+  `QPDFArgParser.cc:505-534` と同じく suffix を捨てて flag present 扱いになり、
+  flag を渡さない場合だけ qpdf の既定 framing になる。
+  これで `main.rs` の argv 文法は `job/argv.rs` 側の
+  `initialize_from_argv`（元から純粋な bare handler）と一致した。
 
 **受け入れ基準の残り**: 2026-09-08（`flpdf-q5ok`）で `@argfile` 展開と qpdf 準拠 `--`
 reset の文法基盤は実装済み。残る「raw argv bytes/nested `--`/parameter dispatch/

@@ -10,8 +10,9 @@
 //!
 //! Both invocations are byte-identical except for the added flag, so the `!=`
 //! assertion can only be explained by re-encoding the *raw encoded* bytes — not
-//! by framing differences. The CLI's default `--newline-before-endstream=never`
-//! matches qpdf: no newline is inserted between the payload and `endstream`, so
+//! by framing differences. Neither invocation passes
+//! `--newline-before-endstream`, so both use qpdf's own default framing:
+//! no newline is inserted between the payload and `endstream`, and
 //! the captured payload IS the raw encoded stream. The comparison stays on the
 //! raw encoded bytes (the only observable difference between preserve and
 //! recompress): decoding both would yield identical content and defeat the test.
