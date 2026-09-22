@@ -293,9 +293,27 @@ impl SegmentKind {
         }
     }
 
-    fn retain_in_residual(self) -> bool {
+    // qpdf-deviation: qpdf's QPDFArgParser is single-pass and single-mode, so
+    // it has no concept of a job-json/non-job-json branch here -- every
+    // Config callback (including jobJsonFile itself, QPDFJob_config.cc:774)
+    // sees the same argv stream. flpdf-cli's own native (non-job-json)
+    // dispatch instead applies a named segment through the value this
+    // function's caller collects in `named_segments`/`SegmentHandler`, not
+    // through the reconstructed residual tokens, so unconditional retention
+    // is unobservable there except where flpdf-cli's own subcommand routing
+    // (not qpdf) restricts which subcommands accept a segment's option at
+    // all -- clap must not see an unrecognized `--overlay`/`--underlay` token
+    // on a subcommand that never declared it. Retention is therefore gated
+    // on job-json mode for `Overlay` specifically, matching the one flpdf-cli
+    // subcommand-restriction check that exists only for that segment kind
+    // (`--overlay/--underlay can only be used with rewrite output`,
+    // crates/flpdf-cli/src/main.rs). The other five segment kinds have no
+    // such restriction and can therefore stay unconditionally retained,
+    // which is what already lets `--job-json-file`'s unified argv parser
+    // (`QPDFJob::initialize_from_expanded_raw_argv`) see them.
+    fn retain_in_residual(self, has_job_json: bool) -> bool {
         match self {
-            Self::Overlay => false,
+            Self::Overlay => has_job_json,
             Self::Encrypt
             | Self::Pages
             | Self::AddAttachment
@@ -360,6 +378,12 @@ impl ArgParser {
     ) -> CliResult<ParsedArgs> {
         let args = expand_arg_files(args.into_iter().map(RawArg::from_os).collect())?;
         let expanded_arg_count = args.len();
+        // Matches `preflight_qpdf_cli_events`'s own has_job_json scan
+        // (crates/flpdf-cli/src/main.rs), which runs on this same
+        // already-expanded token stream one layer up.
+        let has_job_json = args
+            .iter()
+            .any(|argument| argument.as_bytes().starts_with(b"--job-json-file="));
         // qpdf has no subcommands. Since flpdf adds a native clap surface, fix
         // the dispatch mode once from the first expanded token: a bare native
         // subcommand at the command position selects clap's native grammar;
@@ -572,7 +596,7 @@ impl ArgParser {
 
             let segment = RawNamedSegment { option, tokens };
             let option = segment.option.as_str();
-            let retain = kind.retain_in_residual();
+            let retain = kind.retain_in_residual(has_job_json);
             if retain {
                 let marker = RawArg::from_bytes(format!("--{option}").into_bytes());
                 residual_args.push(marker.clone());

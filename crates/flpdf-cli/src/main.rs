@@ -10348,6 +10348,66 @@ mod tests {
     }
 
     #[test]
+    fn preprocess_qpdf_args_retains_overlay_group_in_raw_residual_args_under_job_json() {
+        // Unlike every other segment kind, `--overlay`/`--underlay` are
+        // stripped from `raw_residual_args` outside job-json mode
+        // (flpdf-cli's own native overlay application reads `overlay_specs`
+        // from `SegmentHandler`, not from the reconstructed residual
+        // tokens), because flpdf-cli's own subcommand routing -- not
+        // qpdf -- rejects `--overlay`/`--underlay` on subcommands other than
+        // `rewrite`, and clap must not see the raw token there. Under
+        // `--job-json-file`, though, `preflight_qpdf_cli_events` parses
+        // `raw_residual_args` through the qpdf-compatible unified argv
+        // parser directly, so a group left out here is silently dropped
+        // instead of applied (this was flpdf-g9uy9).
+        let preprocessed = preprocess_qpdf_args(strs(&[
+            "flpdf",
+            "--job-json-file=job.json",
+            "--overlay",
+            "src.pdf",
+            "--",
+            "in.pdf",
+            "out.pdf",
+        ]))
+        .expect("qpdf accepts an overlay group under --job-json-file");
+        let count = preprocessed
+            .raw_residual_args
+            .iter()
+            .filter(|argument| argument.as_bytes() == b"--overlay")
+            .count();
+        assert_eq!(
+            count, 1,
+            "raw_residual_args must retain the --overlay group under --job-json-file"
+        );
+    }
+
+    #[test]
+    fn preprocess_qpdf_args_drops_overlay_group_from_raw_residual_args_without_job_json() {
+        // Outside job-json mode the native route applies overlay via
+        // `overlay_specs`, and retaining the raw tokens here would leak an
+        // `--overlay` token into clap's view of a subcommand that never
+        // declared it (see the job-json variant above).
+        let preprocessed = preprocess_qpdf_args(strs(&[
+            "flpdf",
+            "--overlay",
+            "src.pdf",
+            "--",
+            "in.pdf",
+            "out.pdf",
+        ]))
+        .expect("qpdf accepts a bare overlay group");
+        let count = preprocessed
+            .raw_residual_args
+            .iter()
+            .filter(|argument| argument.as_bytes() == b"--overlay")
+            .count();
+        assert_eq!(
+            count, 0,
+            "raw_residual_args must not retain --overlay outside job-json mode"
+        );
+    }
+
+    #[test]
     fn preprocess_qpdf_args_does_not_promote_segment_password_to_top_level() {
         let directory = tempfile::tempdir().expect("create argument-file directory");
         let path = directory.path().join("pages-args");
