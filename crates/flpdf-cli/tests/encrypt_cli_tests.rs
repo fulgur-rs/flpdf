@@ -2580,6 +2580,57 @@ fn copy_encryption_output_has_encrypt_dict() {
     );
 }
 
+/// Keep the valid V=2/R=3 donor path on the same canonical reader route as
+/// malformed donor rejection. With qpdf-compatible compression and fixed IDs,
+/// copying the donor parameters must produce qpdf-identical output.
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn copy_encryption_v2_r3_donor_is_byte_identical_to_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let donor = fixture("../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf");
+    let input = fixture("../../tests/fixtures/compat/one-page.pdf");
+    let qpdf_output = tmp.path().join("qpdf-v2-r3-copy.pdf");
+    let flpdf_output = tmp.path().join("flpdf-v2-r3-copy.pdf");
+    let copy_option = format!("--copy-encryption={}", donor.display());
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--static-id", "--object-streams=disable"])
+        .arg(&copy_option)
+        .arg("--encryption-file-password=user-v2")
+        .arg("--")
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .expect("run qpdf --copy-encryption with the valid V2/R3 donor");
+    assert!(
+        qpdf.status.success(),
+        "qpdf V2/R3 donor copy failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--static-id", "--object-streams=disable"])
+        .arg(&copy_option)
+        .arg("--encryption-file-password=user-v2")
+        .arg("--")
+        .arg(&input)
+        .arg(&flpdf_output)
+        .output()
+        .expect("run flpdf --copy-encryption with the valid V2/R3 donor");
+    assert_eq!(flpdf.status, qpdf.status, "CLI exit status");
+    assert_eq!(flpdf.stdout, qpdf.stdout, "CLI stdout");
+    assert_eq!(flpdf.stderr, qpdf.stderr, "CLI stderr");
+    assert_eq!(
+        std::fs::read(&flpdf_output).expect("read flpdf copy output"),
+        std::fs::read(&qpdf_output).expect("read qpdf copy output"),
+        "valid V2/R3 donor copy must be byte-identical to qpdf 11.9.0"
+    );
+}
+
 /// The output of `--copy-encryption` decrypts with the donor's user
 /// password through qpdf and reports V=4 / R=4 AESv2 — confirming the
 /// /Encrypt scheme was copied, not re-derived.
