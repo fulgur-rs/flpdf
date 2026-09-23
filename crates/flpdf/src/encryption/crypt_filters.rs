@@ -65,10 +65,8 @@ pub(crate) fn crypt_filter_modes_from_handle(
         return Ok(modes);
     }
     let cf = encrypt.try_get_key(b"/CF")?;
-    let Some(cf) = cf.try_as_dictionary()? else {
-        return Ok(modes);
-    };
-    for (name, value) in cf {
+    for name in cf.try_get_keys()? {
+        let value = cf.try_get_key(&name)?;
         let Some(filter) = value.try_as_dictionary()? else {
             continue;
         };

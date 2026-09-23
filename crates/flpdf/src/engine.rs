@@ -309,30 +309,36 @@ impl<R: Read + Seek> Pdf<R> {
             encryption_inspection: Rc::new(RefCell::new(None)),
         };
         pdf.install_parsed_xref_stream_handles(parsed_xref_streams)?;
-        if let Err(error) = pdf.initialize_encryption_inspection() {
-            // Same diagnostic-wrapping boundary as the authentication
-            // failure below: xref recovery may have already recorded repair
-            // warnings, and a suppressed inspection consumer (such as the
-            // JSON check route, which replays them via
-            // `Error::OpenFailure`/`report_open_failure`) must not lose them
-            // just because a malformed `/Encrypt` entry fails this
-            // password-independent parse before authentication even runs.
-            let diagnostics = pdf.repair_diagnostics();
-            return Err(Error::with_open_diagnostics(error, diagnostics));
-        }
-        if let Err(error) = pdf.authenticate_if_encrypted(&options) {
-            // qpdf reconstructs and records warnings before
-            // `initializeEncryption` (`libqpdf/QPDF.cc:450-471`) and raises
-            // authentication errors afterward (`libqpdf/QPDF_encryption.cc:929`).
-            // Preserve that warning stream alongside the terminal
-            // password/encryption error so file-backed helpers can emit it
-            // before the final diagnostic.
-            if allow_bad_password && matches!(error, Error::Encrypted(EncryptedError::BadPassword))
-            {
-                return Ok(pdf);
+        let encryption_inspection = match pdf.initialize_encryption_inspection() {
+            Ok(inspection) => inspection,
+            Err(error) => {
+                // Same diagnostic-wrapping boundary as the authentication
+                // failure below: xref recovery may have already recorded repair
+                // warnings, and a suppressed inspection consumer (such as the
+                // JSON check route, which replays them via
+                // `Error::OpenFailure`/`report_open_failure`) must not lose them
+                // just because a malformed `/Encrypt` entry fails this
+                // password-independent parse before authentication even runs.
+                let diagnostics = pdf.repair_diagnostics();
+                return Err(Error::with_open_diagnostics(error, diagnostics));
             }
-            let diagnostics = pdf.repair_diagnostics();
-            return Err(Error::with_open_diagnostics(error, diagnostics));
+        };
+        if let Some(inspection) = encryption_inspection.as_ref() {
+            if let Err(error) = pdf.authenticate_if_encrypted(&options, inspection) {
+                // qpdf reconstructs and records warnings before
+                // `initializeEncryption` (`libqpdf/QPDF.cc:450-471`) and raises
+                // authentication errors afterward (`libqpdf/QPDF_encryption.cc:929`).
+                // Preserve that warning stream alongside the terminal
+                // password/encryption error so file-backed helpers can emit it
+                // before the final diagnostic.
+                if allow_bad_password
+                    && matches!(error, Error::Encrypted(EncryptedError::BadPassword))
+                {
+                    return Ok(pdf);
+                }
+                let diagnostics = pdf.repair_diagnostics();
+                return Err(Error::with_open_diagnostics(error, diagnostics));
+            }
         }
         Ok(pdf)
     }

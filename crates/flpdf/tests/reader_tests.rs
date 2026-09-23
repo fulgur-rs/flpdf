@@ -381,6 +381,18 @@ fn assert_qpdf_encryption_error(
     exception.get_file_position()
 }
 
+fn v5_terminal_error_with_missing_cf_warning(error: &Error) -> &Error {
+    let (terminal, diagnostics) = error
+        .open_failure()
+        .expect("qpdf /CF getKeys warning is retained with the open failure");
+    assert_eq!(diagnostics.entries().len(), 1);
+    assert_eq!(
+        diagnostics.entries()[0].get_message_detail(),
+        b"operation for dictionary attempted on object of type null: treating as empty"
+    );
+    terminal
+}
+
 #[test]
 fn resolve_resolves_compressed_entry_from_xref_stream() {
     let mut pdf = Pdf::open(std::io::Cursor::new(compressed_entry_pdf())).unwrap();
@@ -591,7 +603,10 @@ fn scenario8_v5_short_u_entry_is_bad_password() {
     };
 
     assert!(
-        matches!(err, Error::Encrypted(EncryptedError::BadPassword)),
+        matches!(
+            v5_terminal_error_with_missing_cf_warning(&err),
+            Error::Encrypted(EncryptedError::BadPassword)
+        ),
         "expected BadPassword for a wrong-length /U on the auth path, got {err:?}"
     );
 }
@@ -613,7 +628,10 @@ fn fence_v5_short_ue_entry_stays_malformed() {
     };
 
     assert!(
-        matches!(err, Error::Encrypted(EncryptedError::Malformed { .. })),
+        matches!(
+            v5_terminal_error_with_missing_cf_warning(&err),
+            Error::Encrypted(EncryptedError::Malformed { .. })
+        ),
         "/UE length errors must remain Malformed (not reclassified), got {err:?}"
     );
 }
@@ -650,7 +668,10 @@ fn fence_c_v5_wellformed_wrong_password_is_bad_password() {
     };
 
     assert!(
-        matches!(err, Error::Encrypted(EncryptedError::BadPassword)),
+        matches!(
+            v5_terminal_error_with_missing_cf_warning(&err),
+            Error::Encrypted(EncryptedError::BadPassword)
+        ),
         "well-formed V=5 + wrong password must stay BadPassword, got {err:?}"
     );
 }
@@ -671,7 +692,10 @@ fn fence_d_non_weak_aes_wrong_password_is_bad_password() {
     };
 
     assert!(
-        matches!(err, Error::Encrypted(EncryptedError::BadPassword)),
+        matches!(
+            v5_terminal_error_with_missing_cf_warning(&err),
+            Error::Encrypted(EncryptedError::BadPassword)
+        ),
         "non-weak AES + wrong password must stay BadPassword, got {err:?}"
     );
 }

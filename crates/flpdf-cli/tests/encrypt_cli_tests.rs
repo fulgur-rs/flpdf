@@ -681,6 +681,74 @@ fn top_level_show_encryption_matches_qpdf_for_user_password() {
 }
 
 #[test]
+fn top_level_show_encryption_missing_v4_v5_cf_type_warning_matches_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    for (fixture_name, cf_dictionary, password, output_name) in [
+        (
+            "../../tests/fixtures/encrypted/v4-aes-128-r4.pdf",
+            "/CF << /StdCF << /AuthEvent /DocOpen /CFM /AESV2 /Length 16 >> >>",
+            "user-v4-aes",
+            "v4-aes-no-cf.pdf",
+        ),
+        (
+            "../../tests/fixtures/encrypted/v5-aes-256-r5.pdf",
+            "/CF << /StdCF << /AuthEvent /DocOpen /CFM /AESV3 /Length 32 >> >>",
+            "user-v5-r5",
+            "v5-aes-no-cf.pdf",
+        ),
+    ] {
+        let mut bytes = std::fs::read(fixture(fixture_name))
+            .unwrap_or_else(|error| panic!("read encryption fixture {fixture_name}: {error}"));
+        let cf_dictionary = cf_dictionary.as_bytes();
+        let absent_cf = vec![b' '; cf_dictionary.len()];
+        replace_fixture_token(&mut bytes, cf_dictionary, &absent_cf);
+        let input = tmp.path().join(output_name);
+        std::fs::write(&input, bytes).expect("write fixture without /CF");
+
+        let password_arg = format!("--password={password}");
+        let qpdf = ShellCommand::new("qpdf")
+            .args(["--show-encryption", &password_arg])
+            .arg(&input)
+            .output()
+            .expect("run qpdf --show-encryption with missing /CF");
+        assert_eq!(qpdf.status.code(), Some(3), "qpdf warning exit status");
+        assert!(
+            String::from_utf8_lossy(&qpdf.stderr).contains(
+                "dictionary key /CF: operation for dictionary attempted on object of type null: treating as empty"
+            ),
+            "qpdf must report getKeys' null type warning: {:?}",
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .env("FLPDF_PROGNAME", "qpdf")
+            .args(["--show-encryption", &password_arg])
+            .arg(&input)
+            .output()
+            .expect("run flpdf --show-encryption with missing /CF");
+
+        assert_eq!(flpdf.status.code(), qpdf.status.code());
+        if cfg!(windows) {
+            assert_eq!(
+                normalize_text_newlines(&flpdf.stdout),
+                normalize_text_newlines(&qpdf.stdout)
+            );
+            assert_eq!(
+                normalize_text_newlines(&flpdf.stderr),
+                normalize_text_newlines(&qpdf.stderr)
+            );
+        } else {
+            assert_eq!(flpdf.stdout, qpdf.stdout);
+            assert_eq!(flpdf.stderr, qpdf.stderr);
+        }
+    }
+}
+
+#[test]
 fn top_level_show_encryption_recovers_v2_user_password_for_owner_password() {
     if !ensure_qpdf_or_skip() {
         return;

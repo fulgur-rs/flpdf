@@ -422,6 +422,7 @@ pub(crate) struct AuthenticationResult {
 /// parsing and key derivation stays in this module.
 pub(crate) fn authenticate(
     encrypt: &ObjectHandle,
+    inspection: &EncryptionInspectionState,
     id: &ObjectHandle,
     encrypt_ref: Option<ObjectRef>,
     password: &[u8],
@@ -429,7 +430,7 @@ pub(crate) fn authenticate(
     password_is_hex_key: bool,
 ) -> Result<AuthenticationResult> {
     let raw_password = password;
-    let parsed = parse_inspection_state(encrypt)?;
+    let parsed = inspection;
     let revision = parsed.r;
     let version = parsed.v;
     let permissions = parsed.permissions;
@@ -1055,6 +1056,10 @@ mod tests {
     /// derivation is the broken one.
     #[test]
     fn v5_r5_stays_weak_before_authentication() {
+        let aes_filter = ObjectHandle::dictionary(vec![
+            (b"/CFM".to_vec(), ObjectHandle::name(b"AESV3".to_vec())),
+            (b"/Length".to_vec(), ObjectHandle::integer(32)),
+        ]);
         let encrypt = ObjectHandle::dictionary(vec![
             (
                 b"/Filter".to_vec(),
@@ -1063,6 +1068,12 @@ mod tests {
             (b"/V".to_vec(), ObjectHandle::integer(5)),
             (b"/R".to_vec(), ObjectHandle::integer(5)),
             (b"/P".to_vec(), ObjectHandle::integer(-4)),
+            (
+                b"/CF".to_vec(),
+                ObjectHandle::dictionary(vec![(b"/StdCF".to_vec(), aes_filter)]),
+            ),
+            (b"/StmF".to_vec(), ObjectHandle::name(b"StdCF".to_vec())),
+            (b"/StrF".to_vec(), ObjectHandle::name(b"StdCF".to_vec())),
         ]);
 
         let state = parse_inspection_state(&encrypt).expect("parse encryption dictionary");
