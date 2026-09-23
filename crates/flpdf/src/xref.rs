@@ -2732,17 +2732,32 @@ fn recover_xref_entries_from_source(
                 }
             } // cov:ignore: LLVM maps the successful trailer-candidate edge to the inner dictionary branch
             owner.source_seek(next_line_start)?;
-        } else if let Some((object_ref, offset)) =
-            scan_object_header_after_first_token(line, &first_token)?
-        {
-            registration
-                .insert_reconstructed_xref_entry(object_ref, line_start.saturating_add(offset));
-            insert_reconstructed_xref_entry(
-                &mut entries,
-                object_ref,
-                line_start.saturating_add(offset),
-                deleted_objects,
-            );
+        } else {
+            // qpdf reads the generation and `obj` tokens from the file rather
+            // than from the current line (`QPDF.cc:556-559` calls `readToken`
+            // on `m->file`), so a header split across lines -- `1\n0\nobj` --
+            // is still recovered. Retry with the following bytes appended when
+            // the line alone does not complete the header.
+            let mut header = scan_object_header_after_first_token(line, &first_token)?;
+            if header.is_none() && first_token.is_integer() {
+                let mut lookahead = line.to_vec();
+                lookahead.push(b'\n');
+                owner.source_seek(next_line_start)?;
+                let mut following = vec![0u8; OBJECT_HEADER_LOOKAHEAD];
+                let read = owner.source_read(&mut following)?;
+                lookahead.extend_from_slice(&following[..read]);
+                header = scan_object_header_after_first_token(&lookahead, &first_token)?;
+            }
+            if let Some((object_ref, offset)) = header {
+                registration
+                    .insert_reconstructed_xref_entry(object_ref, line_start.saturating_add(offset));
+                insert_reconstructed_xref_entry(
+                    &mut entries,
+                    object_ref,
+                    line_start.saturating_add(offset),
+                    deleted_objects,
+                );
+            }
         }
         Ok(())
     };
@@ -3431,6 +3446,12 @@ fn parse_scan_integer(token: &Token) -> Result<i32> {
 /// token read to `next_line_start`), the second and third tokens may spill onto
 /// following lines, and the object/generation must satisfy qpdf's
 /// `insertReconstructedXrefEntry` guards (`obj > 0`, `0 <= gen < 65535`).
+/// Bytes read past a line's end when an object header's tokens straddle the
+/// line break. qpdf caps each recovery token at 100 bytes (`QPDF.cc:547`), and
+/// a header is three tokens, so this covers the generation and `obj` tokens
+/// with their separators.
+const OBJECT_HEADER_LOOKAHEAD: usize = 320;
+
 fn scan_object_header_after_first_token(
     bytes: &[u8],
     number_token: &Token,

@@ -765,3 +765,51 @@ fn show_xref_suppresses_a_committed_free_row_like_qpdf() {
         "the committed free row must suppress object 4: {shown}"
     );
 }
+
+/// qpdf's recovery scan reads the generation and `obj` tokens from the file,
+/// not from the current line (`libqpdf/QPDF.cc:556-559` calls `readToken` on
+/// `m->file`), so an object header written as `4\n0\nobj` is still recovered.
+/// A line-oriented scan without that lookahead resolves the object to null.
+#[test]
+fn a_recovered_object_header_split_across_lines_resolves_like_qpdf() {
+    let fixture = include_bytes!("fixtures/xref-multiline-object-header.pdf");
+    let directory = tempfile::tempdir().expect("create fixture directory");
+    let input = directory.path().join("multiline-object-header.pdf");
+    std::fs::write(&input, fixture).expect("write fixture");
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        // qpdf prefixes its own name on diagnostics; normalize so the
+        // comparison below is about the warning sequence, not the argv[0].
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--show-object=4"])
+        .arg(&input)
+        .output()
+        .expect("flpdf should spawn");
+    assert_eq!(
+        String::from_utf8_lossy(&flpdf.stdout).trim(),
+        "[ ]",
+        "the split header names the empty array, not null: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+
+    if !qpdf_available() {
+        eprintln!("qpdf 11.9.0 is not available; skipping only the oracle comparison");
+        return;
+    }
+    let qpdf: Output = ProcessCommand::new("qpdf")
+        .args(["--show-object=4"])
+        .arg(&input)
+        .output()
+        .expect("qpdf should spawn");
+    assert_eq!(
+        String::from_utf8_lossy(&flpdf.stdout),
+        String::from_utf8_lossy(&qpdf.stdout),
+        "flpdf must show what qpdf shows for the split-header object"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&flpdf.stderr),
+        String::from_utf8_lossy(&qpdf.stderr),
+        "the recovery warning sequence must match qpdf"
+    );
+}
