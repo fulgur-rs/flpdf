@@ -6,6 +6,8 @@
 //! tokens through the QPDFJob parser when job JSON is present. This is a classification (B)
 //! carrier alternative; `cli_job_json.rs::overlay_underlay_transport_matches_qpdf_with_and_without_job_json`
 //! checks qpdf 11.9.0 output bytes for both routes.
+//! Auxiliary raw-argv scans use [`is_named_segment_option`], derived from
+//! [`SegmentKind::from_option`], so all parser openers including page labels share one list.
 use clap::Command;
 use flpdf::job::QPDFJob;
 use std::collections::HashSet;
@@ -315,6 +317,16 @@ impl SegmentKind {
             | Self::PageLabels => true,
         }
     }
+}
+
+pub(crate) fn is_named_segment_option(bytes: &[u8]) -> bool {
+    let Some(option) = bytes.strip_prefix(b"--") else {
+        return false;
+    };
+    std::str::from_utf8(option)
+        .ok()
+        .and_then(SegmentKind::from_option)
+        .is_some()
 }
 
 pub(crate) struct ArgParser {
