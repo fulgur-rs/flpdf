@@ -399,6 +399,23 @@ fn stale_indirect_size_pdf() -> Vec<u8> {
     bytes
 }
 
+fn reconstructed_size_missing_object_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let object_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{object_offset:010} 00000 n \n").as_bytes());
+    // This stale row sends the indirect /Size lookup to object 1. Recovery
+    // finds no object 2, so qpdf's hasKey resolves the child to null and
+    // reports that the trailer lacks /Size at the post-reconstruction EOF.
+    bytes.extend_from_slice(format!("{object_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 2 0 R /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
 #[test]
 fn show_xref_reports_offsets_repaired_during_trailer_resolution() {
     if !qpdf_available() {
@@ -412,6 +429,24 @@ fn show_xref_reports_offsets_repaired_during_trailer_resolution() {
 
     let qpdf = run_qpdf(&path);
     let flpdf = run_flpdf(&path);
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
+fn check_reports_missing_indirect_size_after_reconstruction_like_qpdf() {
+    if !qpdf_available() {
+        eprintln!("skipping: qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let path = temp.path().join("missing-indirect-size.pdf");
+    std::fs::write(&path, reconstructed_size_missing_object_pdf()).expect("write fixture");
+
+    let qpdf = run_qpdf_check(&path);
+    let flpdf = run_flpdf_check(&path);
     assert_eq!(flpdf.status.code(), qpdf.status.code());
     assert_eq!(flpdf.stdout, qpdf.stdout);
     assert_eq!(flpdf.stderr, qpdf.stderr);

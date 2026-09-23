@@ -483,6 +483,12 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// Prevents infinite reconstruction loops if parsing a reconstructed object
     /// fails again.
     reconstructed_xref: bool,
+    #[cfg(test)]
+    reconstruction_guard_at_first_warning: Option<bool>,
+    /// Loader table writes made inside an open-time reconstruction are live
+    /// qpdf-style mutations. Writes from the stale outer loader snapshot after
+    /// that reconstruction must be ignored.
+    reconstruction_table_update_depth: usize,
     /// qpdf `m->fixed_dangling_refs` (`include/qpdf/QPDF.hh:1483`). Set only
     /// after the effective xref table has been completely prepared; qpdf
     /// clears it when reconstruction changes that table.
@@ -1019,6 +1025,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 // so a second full scan is not performed for an object from an
                 // already-recovered table.
                 reconstructed_xref: already_reconstructed,
+                #[cfg(test)]
+                reconstruction_guard_at_first_warning: None,
+                reconstruction_table_update_depth: 0,
                 fixed_dangling_refs: false,
                 repair_diagnostics,
                 logger,
@@ -1062,6 +1071,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 default_xref_warnings: BTreeSet::new(),
                 attempt_recovery: true,
                 reconstructed_xref: false,
+                #[cfg(test)]
+                reconstruction_guard_at_first_warning: None,
+                reconstruction_table_update_depth: 0,
                 fixed_dangling_refs: false,
                 repair_diagnostics: Diagnostics::default(),
                 logger,
@@ -2105,6 +2117,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
     }
 
     #[cfg(test)]
+    pub(crate) fn reconstruction_guard_at_first_warning(&self) -> Option<bool> {
+        self.core.borrow().reconstruction_guard_at_first_warning
+    }
+
+    #[cfg(test)]
     pub(crate) fn dangling_references_fixed(&self) -> bool {
         self.core.borrow().fixed_dangling_refs
     }
@@ -2153,11 +2170,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
         trigger_error: Error,
         expected: QpdfObjGen,
     ) -> Result<Option<ParsedObjectAtOffset>> {
-        if self.core.borrow().reconstructed_xref {
-            // Avoid xref reconstruction infinite loops (QPDF.cc:518-522).
-            return Err(trigger_error);
-        }
-
         // qpdf `catch (QPDFExc&)` at QPDF.cc:1614 — only parse damage triggers
         // reconstruction.  I/O, system, and other errors are propagated
         // unchanged so that the reconstructed_xref guard is not tripped by an
@@ -2166,11 +2178,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
         if !matches!(trigger_error, Error::QpdfExc(_) | Error::Parse { .. }) {
             return Err(trigger_error);
         }
-
-        {
-            let mut core = self.core.borrow_mut();
-            core.reconstructed_xref = true;
-            core.fixed_dangling_refs = false;
+        if !self.begin_xref_reconstruction() {
+            // Avoid xref reconstruction infinite loops (QPDF.cc:518-522).
+            return Err(trigger_error);
         }
 
         // Push repair warnings (QPDF.cc:528-530). qpdf builds both bracketing
@@ -2215,6 +2225,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
         // (`QPDF.cc:1996-2005`). A prior canonical removal therefore cannot
         // filter this fresh recovery scan.
         let new_entries = crate::xref::recover_xref_entries(logical_bytes)?;
+        // qpdf scans the same live InputSource to EOF during reconstruct_xref
+        // and leaves last_offset there when the requested object is absent.
+        // read_underlying_bytes restores the Rust cursor, so preserve this
+        // observable last-offset state explicitly before the retry.
+        self.set_last_offset(u64::try_from(logical_bytes.len()).unwrap_or(u64::MAX));
         let new_raw_entries = new_entries
             .iter()
             .map(|(object_ref, entry)| Ok((QpdfObjGen::try_from_object_ref(*object_ref)?, *entry)))
@@ -2298,6 +2313,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
     pub(crate) fn push_qpdf_warning(&self, warning: QpdfExc) -> Result<()> {
         let (logger, deliver) = {
             let mut core = self.core.borrow_mut();
+            #[cfg(test)]
+            if core.reconstruction_guard_at_first_warning.is_none() {
+                core.reconstruction_guard_at_first_warning = Some(core.reconstructed_xref);
+            }
             core.repair_diagnostics.push(warning.clone());
             (core.logger.clone(), !core.suppress_warnings)
         };
@@ -3507,13 +3526,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// required at the handoff boundary.
     pub(crate) fn install_source_xref_entries(&self, entries: BTreeMap<ObjectRef, XrefEntry>) {
         let mut core = self.core.borrow_mut();
-        if core.reconstructed_xref {
-            // The document reconstructed its own table while the loader was
-            // still resolving the trailer, so the loader's table is the stale
-            // one. qpdf keeps the repaired offsets in the same place it repairs
-            // them: `reconstruct_xref` rewrites `m->xref_table` in situ
-            // (`QPDF.cc:518-620`) and the caller resumes against that table
-            // rather than reinstating what it had read.
+        if core.reconstructed_xref && core.reconstruction_table_update_depth == 0 {
+            // This outer loader snapshot predates the live reconstruction
+            // table; only candidate-section writes inside the scoped scan may
+            // replace it after the qpdf guard has been armed.
             return;
         }
         core.raw_source_xref_entries = raw_xref_entries_from_object_refs(entries);
@@ -3525,26 +3541,44 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// consumers that have the parser-valid boundary.
     pub(crate) fn install_raw_xref_entries(&self, entries: BTreeMap<QpdfObjGen, XrefEntry>) {
         let mut core = self.core.borrow_mut();
-        if core.reconstructed_xref {
-            // Same handoff as `install_source_xref_entries`: the document
-            // repaired the canonical table in place while the loader was
-            // still resolving the trailer, so the loader's table is stale.
-            // qpdf rewrites `m->xref_table` in situ and resumes against it
-            // (`QPDF.cc:518-620`).
+        if core.reconstructed_xref && core.reconstruction_table_update_depth == 0 {
+            // The final reconstruction path installs its raw table while the
+            // scoped scan is active; a later loader snapshot is stale.
             return;
         }
         core.raw_source_xref_entries = entries;
     }
 
-    /// Carry the open-time reconstruction bit into the resolver that owned
-    /// the document during xref parsing.
-    pub(crate) fn set_reconstructed_xref(&self, value: bool) {
-        // Never clear the flag: qpdf reconstructs at most once per document
-        // (`QPDF.cc:518-522` returns immediately when `reconstructed_xref` is
-        // already set), so a loader that did not observe the reconstruction
-        // must not reopen that door.
+    /// Permit xref loader mutations while `recover_xref_from_linear_scan`
+    /// scans and re-enters candidate xref sections. Once that scope ends, any
+    /// later loader snapshot is stale relative to qpdf's already-mutated live
+    /// `m->xref_table` and is ignored.
+    pub(crate) fn begin_reconstructed_xref_table_updates(&self) {
         let mut core = self.core.borrow_mut();
-        core.reconstructed_xref |= value;
+        core.reconstruction_table_update_depth =
+            core.reconstruction_table_update_depth.saturating_add(1);
+    }
+
+    pub(crate) fn end_reconstructed_xref_table_updates(&self) {
+        let mut core = self.core.borrow_mut();
+        core.reconstruction_table_update_depth =
+            core.reconstruction_table_update_depth.saturating_sub(1);
+    }
+
+    /// Arm qpdf's one-reconstruction-per-document guard and reset the cached
+    /// dangling-reference census, matching `QPDF::reconstruct_xref`
+    /// (`libqpdf/QPDF.cc:518-524`). The open-time loader and resolver-time
+    /// retry share this state because both operate on the same `QPDF` owner.
+    /// Returns `false` on a repeated attempt so the caller can propagate the
+    /// original error without emitting another recovery warning sequence.
+    pub(crate) fn begin_xref_reconstruction(&self) -> bool {
+        let mut core = self.core.borrow_mut();
+        if core.reconstructed_xref {
+            return false;
+        }
+        core.reconstructed_xref = true;
+        core.fixed_dangling_refs = false;
+        true
     }
 
     /// Return the logical source bytes while restoring the resolver's current
