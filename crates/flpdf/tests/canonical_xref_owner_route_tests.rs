@@ -379,6 +379,29 @@ fn xref_stream_with_wrong_payload_size() -> Vec<u8> {
     b"%PDF-1.4\n1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Length 4 >>\nstream\nabcd\nendstream\nendobj\nstartxref\n9\n%%EOF\n".to_vec()
 }
 
+/// A classic xref table that inserts type-1 rows for objects 1 and 2 before
+/// its invalid object-3 row fails. Both rows point to object 1; the only text
+/// resembling object 2 is inside a comment, so qpdf reconstruction must drop
+/// the stale loader row for 2 and recover only the real object 1.
+fn classic_xref_with_stale_type1_loader_row() -> (Vec<u8>, usize, usize) {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let object_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    bytes.extend_from_slice(b"% 2 0 obj\n<< /Type /Pages >>\nendobj\n");
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{object_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{object_offset:010} 00000 n \n").as_bytes());
+    let invalid_row_offset = bytes.len();
+    bytes.extend_from_slice(format!("{object_offset:010} 00000 x \n").as_bytes());
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+
+    (bytes, object_offset, invalid_row_offset)
+}
+
 /// Collect the warnings the canonical `Pdf::open` route accumulates, whether
 /// the open ultimately succeeds or fails, rendered exactly as qpdf renders
 /// the text after its own `WARNING: ` prefix (`QPDFExc::createWhat`,
@@ -481,6 +504,82 @@ fn canonical_route_repair_warnings_match_qpdf() {
             "qpdf 11.9.0 no longer produces the pinned sequence for {name}"
         );
     }
+}
+
+#[test]
+fn open_reconstruction_does_not_restore_stale_partially_parsed_xref_rows() {
+    let (fixture, object_offset, invalid_row_offset) = classic_xref_with_stale_type1_loader_row();
+    let directory = tempfile::tempdir().expect("create qpdf fixture directory");
+    let input = directory.path().join("stale-type1-loader-row.pdf");
+    fs::write(&input, &fixture).expect("write qpdf fixture");
+    let description = input.to_string_lossy().into_owned();
+    let pdf = Pdf::open_with_options(
+        Cursor::new(fixture),
+        PdfOpenOptions {
+            repair: true,
+            suppress_warnings: true,
+            description: description.as_bytes().to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("open-time xref reconstruction should recover the catalog");
+
+    let rendered = render_xref_table(&pdf.get_xref_table());
+    assert_eq!(
+        rendered,
+        vec![format!("1/0: uncompressed; offset = {object_offset}")],
+        "the final owner table must not restore stale 2/0 from the failed loader snapshot"
+    );
+    let flpdf_warnings: Vec<String> = pdf
+        .repair_diagnostics()
+        .entries()
+        .iter()
+        .map(|warning| String::from_utf8_lossy(warning.what_bytes()).into_owned())
+        .collect();
+    let expected_warnings = vec![
+        format!("{description}: file is damaged"),
+        format!(
+            "{description} (xref table, offset {invalid_row_offset}): invalid xref entry (obj=3)"
+        ),
+        format!("{description}: Attempting to reconstruct cross-reference table"),
+    ];
+    assert_eq!(
+        flpdf_warnings, expected_warnings,
+        "the failed partial table must enter qpdf's ordered reconstruction warning path"
+    );
+
+    if !qpdf_available() {
+        eprintln!("qpdf 11.9.0 is not available; skipping only the oracle comparison");
+        return;
+    }
+    let qpdf = Command::new("qpdf")
+        .arg("--show-xref")
+        .arg(&input)
+        .output()
+        .expect("qpdf should spawn");
+    assert_eq!(
+        qpdf.status.code(),
+        Some(3),
+        "qpdf reports recovery warnings as exit 3"
+    );
+    let qpdf_warnings: Vec<String> = String::from_utf8_lossy(&qpdf.stderr)
+        .lines()
+        .filter_map(|line| line.strip_prefix("WARNING: "))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        qpdf_warnings, expected_warnings,
+        "qpdf 11.9.0 must retain the fixture's three ordered warnings"
+    );
+    let qpdf_rows: Vec<String> = String::from_utf8_lossy(&qpdf.stdout)
+        .lines()
+        .filter(|line| line.contains(": uncompressed;") || line.contains(": compressed;"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        rendered, qpdf_rows,
+        "the effective flpdf table must equal qpdf 11.9.0 after reconstruction"
+    );
 }
 
 /// A classic xref table whose `/XRefStm` commits a free row and then fails.
