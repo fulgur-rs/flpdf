@@ -71,24 +71,19 @@ pub(crate) trait CanonicalTrailerOwner {
     fn indirect_handle(&self, object_ref: ObjectRef) -> ObjectHandle;
     fn direct_handle(&self, value: ObjectValue) -> ObjectHandle;
     fn install_xref_entries(&self, entries: BTreeMap<ObjectRef, XrefEntry>);
+    fn install_raw_xref_entries(&self, entries: BTreeMap<QpdfObjGen, XrefEntry>);
+    fn begin_reconstructed_xref_table_updates(&self);
+    fn end_reconstructed_xref_table_updates(&self);
     fn discard_cached_generations(&self, object_gens: &[QpdfObjGen]);
     fn set_header_offset(&self, offset: usize);
-    /// Flips the owner's reconstruction flag on, mirroring qpdf's
-    /// `m->reconstructed_xref = true` inside `reconstruct_xref`
-    /// (`QPDF.cc:518-524`), which runs both at open time (`:464`) and during
-    /// object resolution (`:1617`) against the same `QPDF` instance. Xref
-    /// loading calls this the moment its own reconstruction succeeds, so the
-    /// owner's guard is armed by the loader itself rather than batched into a
-    /// returned struct and applied afterward.
-    ///
-    /// The sequence point is not yet qpdf's. qpdf assigns the flag on entry,
-    /// before it warns and before the scan runs, so a recovery that re-enters
-    /// mid-scan is rejected and a scan that fails partway still leaves the
-    /// flag set; this call happens once the scan has succeeded. Moving it to
-    /// the entry point fails nine tests today, because this crate's
-    /// candidate-xref re-entry does re-enter recovery while the scan is
-    /// running.
-    fn set_reconstructed_xref(&self);
+    fn source_last_offset(&self) -> u64;
+    fn set_source_last_offset(&self, offset: u64);
+    /// Arm qpdf's per-document xref reconstruction guard at reconstruction
+    /// entry (`QPDF.cc:518-524`). Return false when this document has already
+    /// reconstructed, matching qpdf's loop guard; the first successful call
+    /// also resets the fixed-dangling-reference cache before warnings or scan
+    /// work begins.
+    fn begin_xref_reconstruction(&self) -> bool;
     /// qpdf's `m->attempt_recovery` (`QPDF.hh:1461`), consulted at parse
     /// entry (`QPDF.cc:463`) and during the resolve-time retry
     /// (`QPDF.cc:1614-1637`) against the same `QPDF` instance. Xref loading
@@ -122,6 +117,26 @@ pub(crate) trait CanonicalTrailerOwner {
     ) -> Result<(ObjectHandle, Option<u64>)>;
     fn push_warning(&self, warning: QpdfExc) -> Result<()>;
     fn repair_diagnostics(&self) -> Diagnostics;
+}
+
+/// Scope live table installations to the loader's own reconstruction scan and
+/// candidate re-entry. A stale outer loader snapshot is rejected after this
+/// scope drops, while the document-level qpdf guard remains armed.
+struct ReconstructedXrefTableUpdateScope<'owner> {
+    owner: &'owner dyn CanonicalTrailerOwner,
+}
+
+impl<'owner> ReconstructedXrefTableUpdateScope<'owner> {
+    fn new(owner: &'owner dyn CanonicalTrailerOwner) -> Self {
+        owner.begin_reconstructed_xref_table_updates();
+        Self { owner }
+    }
+}
+
+impl Drop for ReconstructedXrefTableUpdateScope<'_> {
+    fn drop(&mut self) {
+        self.owner.end_reconstructed_xref_table_updates();
+    }
 }
 
 impl<R: Read + Seek + 'static> CanonicalTrailerOwner for ResolverHandle<R> {
@@ -163,6 +178,18 @@ impl<R: Read + Seek + 'static> CanonicalTrailerOwner for ResolverHandle<R> {
         self.install_source_xref_entries(entries);
     }
 
+    fn install_raw_xref_entries(&self, entries: BTreeMap<QpdfObjGen, XrefEntry>) {
+        ResolverHandle::install_raw_xref_entries(self, entries);
+    }
+
+    fn begin_reconstructed_xref_table_updates(&self) {
+        ResolverHandle::begin_reconstructed_xref_table_updates(self);
+    }
+
+    fn end_reconstructed_xref_table_updates(&self) {
+        ResolverHandle::end_reconstructed_xref_table_updates(self);
+    }
+
     fn discard_cached_generations(&self, object_gens: &[QpdfObjGen]) {
         ResolverHandle::discard_cached_generations(self, object_gens);
     }
@@ -171,8 +198,16 @@ impl<R: Read + Seek + 'static> CanonicalTrailerOwner for ResolverHandle<R> {
         ResolverHandle::set_header_offset(self, offset);
     }
 
-    fn set_reconstructed_xref(&self) {
-        ResolverHandle::set_reconstructed_xref(self, true);
+    fn source_last_offset(&self) -> u64 {
+        ResolverHandle::last_offset(self)
+    }
+
+    fn set_source_last_offset(&self, offset: u64) {
+        ResolverHandle::set_last_offset(self, offset);
+    }
+
+    fn begin_xref_reconstruction(&self) -> bool {
+        ResolverHandle::begin_xref_reconstruction(self)
     }
 
     fn attempt_recovery(&self) -> bool {
@@ -529,6 +564,7 @@ trait XrefObjectContext {
     ) -> Result<Vec<u8>>;
     fn sync_handle_diagnostics(&mut self);
     fn append_diagnostics_to(&mut self, diagnostics: &mut Diagnostics);
+    fn source_last_offset(&self) -> u64;
     fn take_reconstruction_trigger(&mut self) -> Option<Error>;
     fn push_diagnostic(&mut self, diagnostic: QpdfExc);
     fn description(&self) -> &[u8];
@@ -624,6 +660,10 @@ impl XrefObjectContext for CanonicalXrefContext<'_> {
         for diagnostic in self.diagnostics.entries() {
             diagnostics.push(diagnostic.clone());
         }
+    }
+
+    fn source_last_offset(&self) -> u64 {
+        self.owner.source_last_offset()
     }
 
     fn take_reconstruction_trigger(&mut self) -> Option<Error> {
@@ -1445,6 +1485,9 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
             &mut loaded.loaded.repair_diagnostics,
         )?; // cov:ignore: this only propagates an injected logger failure after classic trailer parsing; the live sink is covered at the Pdf open boundary
         if validate_current_classic_trailer {
+            // qpdf's readTrailer restores InputSource::last_offset to the
+            // position just after the `trailer` keyword before validation.
+            canonical_trailer_owner.set_source_last_offset(trailer_start as u64);
             {
                 let mut context =
                     CanonicalXrefContext::new(canonical_trailer_owner, options.description.clone());
@@ -1499,21 +1542,20 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
 }
 
 /// Validate the first classic trailer exactly where qpdf's
-/// `QPDF::read_xrefTable` does (`QPDF.cc:902-912`). The trailer offset is the
-/// position immediately after the `trailer` keyword, which is the location
-/// `QPDF::readTrailer` restores on its `InputSource` before constructing the
-/// `QPDFExc` (`QPDF.cc:1313-1327`).
+/// `QPDF::read_xrefTable` does (`QPDF.cc:902-912`). `readTrailer` restores
+/// `InputSource::last_offset` to the position immediately after the `trailer`
+/// keyword (`QPDF.cc:1313-1327`); resolving an indirect `/Size` can advance it
+/// before validation throws, so use the live offset after each resolution.
 fn validate_classic_trailer(
     context: &mut dyn XrefObjectContext,
     trailer: &ObjectHandle,
     trailer_offset: usize,
 ) -> Result<()> {
-    // qpdf's QPDF_Dictionary::hasKey checks the dictionary's raw child slot
-    // before the subsequent getKey("/Size").isInteger() call resolves that
-    // child.  Do not use ObjectHandle::try_has_key here: its public
-    // qpdf-compatible visible-key operation resolves a child while deciding
-    // whether it is null, which changes the recovery handoff for an indirect
-    // /Size whose stale xref row points at another object.
+    // qpdf's QPDF_Dictionary::hasKey checks the raw child slot and then calls
+    // `isNull()` on it (`QPDF_Dictionary.cc:98-100`), resolving an indirect
+    // child before the subsequent getKey("/Size").isInteger()
+    // (`QPDF.cc:907-912`). Match that order explicitly so a missing object
+    // discovered during xref reconstruction is reported as a missing /Size.
     let size = trailer
         .as_dictionary()
         .and_then(|entries| entries.get(b"/Size".as_slice()).cloned());
@@ -1523,19 +1565,23 @@ fn validate_classic_trailer(
             "trailer dictionary lacks /Size key",
         ));
     };
-    if size.is_null() {
+    context.ensure_source_for_resolution(&size);
+    let is_null = size.try_is_null();
+    context.sync_handle_diagnostics();
+    if is_null? {
+        let error_offset = usize::try_from(context.source_last_offset()).unwrap_or(usize::MAX);
         return Err(Error::parse(
-            trailer_offset,
+            error_offset,
             "trailer dictionary lacks /Size key",
         ));
     }
 
-    context.ensure_source_for_resolution(&size);
     let is_integer = size.try_is_integer();
     context.sync_handle_diagnostics();
     if !is_integer? {
+        let error_offset = usize::try_from(context.source_last_offset()).unwrap_or(usize::MAX);
         return Err(Error::parse(
-            trailer_offset,
+            error_offset,
             "/Size key in trailer dictionary is not an integer",
         ));
     }
@@ -1986,6 +2032,11 @@ fn recover_xref_from_linear_scan(
     observed_uncompressed_after_compressed: bool,
     canonical_trailer_owner: &dyn CanonicalTrailerOwner,
 ) -> Result<LoadedXrefState> {
+    if !canonical_trailer_owner.begin_xref_reconstruction() {
+        // qpdf's `reconstruct_xref` returns the original trigger if a second
+        // attempt enters the same document (`QPDF.cc:518-522`).
+        return Err(trigger_error);
+    }
     // qpdf mutates `m->first_xref_item_offset` while reading object 0's row,
     // before a later row can throw, and `reconstruct_xref` preserves that
     // member across the exception (`QPDF.cc:846-869, 626-708`). Rust's
@@ -1999,6 +2050,11 @@ fn recover_xref_from_linear_scan(
         &options.description,
     );
     deliver_canonical_diagnostics(canonical_trailer_owner, &mut repair_diagnostics)?;
+
+    // During qpdf's reconstruct_xref, candidate xref reads update the same
+    // live table that the scan built. Permit those scoped loader writes; an
+    // outer snapshot arriving after this operation is stale and stays blocked.
+    let _table_update_scope = ReconstructedXrefTableUpdateScope::new(canonical_trailer_owner);
 
     let recovered = recover_xref_entries_from_source(
         canonical_trailer_owner,
@@ -2153,7 +2209,11 @@ fn recover_xref_from_linear_scan(
         canonical_trailer_owner.discard_cached_generations(&discarded_generations);
         discard_trailer_references(&mut trailer_references, &discarded_generations);
     }
-    canonical_trailer_owner.set_reconstructed_xref();
+    // qpdf repairs the live `m->xref_table` in place during reconstruction.
+    // Keep the canonical owner's raw table in sync before returning the local
+    // snapshot: the outer Pdf-open handoff must not reinstall a stale loader
+    // snapshot after the document guard has been armed.
+    canonical_trailer_owner.install_raw_xref_entries(raw_entries.clone());
     Ok(LoadedXrefState {
         loaded: LoadedXref {
             version,
@@ -4020,6 +4080,7 @@ impl<'a> ByteCursor<'a> {
 mod final_handle_tests {
     use super::*;
     use std::cell::RefCell;
+    use std::rc::Rc;
 
     /// Load xref state the way `Pdf::open` does: through a `ResolverHandle`
     /// that owns the input source before parsing starts, mirroring qpdf's
@@ -4103,6 +4164,70 @@ mod final_handle_tests {
 
         assert!(resolver.reconstructed_xref());
         assert_eq!(state.loaded.trailer.object_ref(), None);
+    }
+
+    #[test]
+    fn open_time_reconstruction_arms_the_guard_before_its_first_warning() {
+        let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Size 2 /Root 1 0 R >>\n".to_vec();
+        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), true, 801);
+
+        recover_xref_from_linear_scan(
+            &bytes,
+            "1.4".to_owned(),
+            999,
+            Error::parse(999, "xref not found"),
+            None,
+            None,
+            None,
+            &BTreeSet::new(),
+            XrefLoadOptions::default(),
+            Diagnostics::default(),
+            None,
+            false,
+            resolver.as_ref(),
+        )
+        .expect("the scanner should recover the direct trailer");
+
+        assert_eq!(
+            resolver.reconstruction_guard_at_first_warning(),
+            Some(true),
+            "qpdf sets reconstructed_xref at reconstruct_xref entry, before warning or scan"
+        );
+    }
+
+    #[test]
+    fn open_time_reconstruction_rejects_a_second_attempt_with_its_trigger() {
+        let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Size 2 /Root 1 0 R >>\n".to_vec();
+        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), true, 802);
+        assert!(resolver.begin_xref_reconstruction());
+        let trigger = Error::parse(999, "second xref reconstruction trigger");
+
+        let result = recover_xref_from_linear_scan(
+            &bytes,
+            "1.4".to_owned(),
+            999,
+            trigger,
+            None,
+            None,
+            None,
+            &BTreeSet::new(),
+            XrefLoadOptions::default(),
+            Diagnostics::default(),
+            None,
+            false,
+            resolver.as_ref(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(Error::Parse { offset: 999, message })
+                if message == "second xref reconstruction trigger"
+        ));
+        assert_eq!(
+            resolver.reconstruction_guard_at_first_warning(),
+            None,
+            "qpdf's already-armed guard throws before emitting reconstruction warnings"
+        );
     }
 
     #[test]
@@ -5432,11 +5557,29 @@ mod final_handle_tests {
 
         fn install_xref_entries(&self, _entries: BTreeMap<ObjectRef, XrefEntry>) {}
 
+        // cov:ignore-start: failure-injection owner has no canonical xref state; these test-only trait stubs have no production behavior
+        fn install_raw_xref_entries(&self, _entries: BTreeMap<QpdfObjGen, XrefEntry>) {}
+
+        fn begin_reconstructed_xref_table_updates(&self) {}
+
+        fn end_reconstructed_xref_table_updates(&self) {}
+
         fn discard_cached_generations(&self, _object_gens: &[QpdfObjGen]) {} // cov:ignore: failure-injection owner has no canonical cache to purge
 
         fn set_header_offset(&self, _offset: usize) {}
 
-        fn set_reconstructed_xref(&self) {} // cov:ignore: failure-injection owner never reaches a successful reconstruction
+        fn source_last_offset(&self) -> u64 {
+            0
+        }
+
+        fn set_source_last_offset(&self, _offset: u64) {}
+        // cov:ignore-end
+
+        // cov:ignore-start: failure-injection owner never performs a reconstruction
+        fn begin_xref_reconstruction(&self) -> bool {
+            true
+        }
+        // cov:ignore-end
 
         fn attempt_recovery(&self) -> bool {
             false
@@ -6285,7 +6428,7 @@ mod final_handle_tests {
     }
 
     #[test]
-    fn reconstructed_size_revalidation_uses_the_recovery_offset_index() {
+    fn reconstructed_size_revalidation_uses_the_recovery_index_before_missing_size_error() {
         let mut bytes = b"%PDF-1.4\n".to_vec();
         let object_offset = bytes.len();
         bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
@@ -6297,6 +6440,7 @@ mod final_handle_tests {
             format!("trailer\n<< /Size 2 0 R /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
                 .as_bytes(),
         );
+        let source_length = bytes.len();
 
         let (recovered_owner, recovered_result) = load_xref_state_through_canonical_owner(
             std::io::Cursor::new(bytes),
@@ -6306,14 +6450,29 @@ mod final_handle_tests {
             true,
             46,
         );
-        let _recovered =
-            recovered_result.expect("repair mode must complete the recovered size revalidation");
+        let error = recovered_result
+            .expect_err("qpdf rejects /Size after reconstruction removes the referenced object");
+        assert!(matches!(
+            error,
+            Error::Parse { offset, message }
+                if offset == source_length && message == "trailer dictionary lacks /Size key"
+        ));
         assert!(recovered_owner.reconstructed_xref());
-        assert!(recovered_owner
+        let messages: Vec<_> = recovered_owner
             .repair_diagnostics()
             .entries()
             .iter()
-            .any(|diagnostic| diagnostic.message_string().contains("expected 2 0 obj")));
+            .map(QpdfExc::message_string)
+            .collect();
+        assert_eq!(
+            messages,
+            vec![
+                "file is damaged",
+                "expected 2 0 obj",
+                "Attempting to reconstruct cross-reference table",
+                "object 2 0 not found in file after regenerating cross reference table",
+            ]
+        );
     }
 
     #[test]

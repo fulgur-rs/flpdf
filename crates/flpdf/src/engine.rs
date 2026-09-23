@@ -248,12 +248,10 @@ impl<R: Read + Seek> Pdf<R> {
             Err(error) => return Err(error),
         };
         // The xref loader was given this resolver as its canonical owner, so
-        // xref-stream handles and all metadata they resolve are already in the
-        // live cache. `header_offset` and `reconstructed_xref` are also
-        // already live on this resolver: the loader writes them through
-        // `CanonicalTrailerOwner` itself (`xref.rs:850`,
-        // `xref.rs::set_reconstructed_xref`) rather than returning them for
-        // this function to transcribe.
+        // xref-stream handles and metadata are already in the live cache. If
+        // resolution reconstructed the table during loading, that live table
+        // is authoritative; the returned loader snapshot may predate the
+        // reconstruction and must not replace it at this handoff.
         let parsed_xref_streams = loaded_state.parsed_xref_streams;
         let trailer_references = loaded_state.trailer_references;
         let first_xref_item_offset = loaded_state.first_xref_item_offset;
@@ -262,8 +260,10 @@ impl<R: Read + Seek> Pdf<R> {
         let raw_xref_entries = loaded_state.raw_entries.clone();
         let loaded = loaded_state.loaded;
         let source_xref_entries = loaded.entries.clone();
-        resolver.install_source_xref_entries(source_xref_entries);
-        resolver.install_raw_xref_entries(raw_xref_entries);
+        if !resolver.reconstructed_xref() {
+            resolver.install_source_xref_entries(source_xref_entries);
+            resolver.install_raw_xref_entries(raw_xref_entries);
+        }
         // QPDF's parser registers indirect references while reading every
         // trailer, including historical /Prev sections (QPDFParser.cc:168-175).
         // Canonical xref loading has already minted those handles in this
