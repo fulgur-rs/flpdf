@@ -47,6 +47,7 @@ use crate::writer::DecodeLevel;
 use crate::{
     Diagnostics, Error, ObjectHandle, ObjectRef, QpdfErrorCode, QpdfExc, Result, XrefEntry,
 };
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Seek};
 use std::rc::Rc;
@@ -70,6 +71,9 @@ pub(crate) struct LoadedXref {
 pub(crate) trait CanonicalTrailerOwner {
     fn indirect_handle(&self, object_ref: ObjectRef) -> ObjectHandle;
     fn direct_handle(&self, value: ObjectValue) -> ObjectHandle;
+    fn xref_registration(&self) -> XrefRegistration;
+    fn current_trailer(&self) -> Option<ObjectHandle>;
+    fn set_trailer_if_uninitialized(&self, trailer: ObjectHandle) -> bool;
     fn install_xref_entries(&self, entries: BTreeMap<ObjectRef, XrefEntry>);
     fn install_raw_xref_entries(&self, entries: BTreeMap<QpdfObjGen, XrefEntry>);
     fn begin_reconstructed_xref_table_updates(&self);
@@ -140,6 +144,18 @@ impl Drop for ReconstructedXrefTableUpdateScope<'_> {
 }
 
 impl<R: Read + Seek + 'static> CanonicalTrailerOwner for ResolverHandle<R> {
+    fn xref_registration(&self) -> XrefRegistration {
+        ResolverHandle::xref_registration(self)
+    }
+
+    fn current_trailer(&self) -> Option<ObjectHandle> {
+        ResolverHandle::current_trailer(self)
+    }
+
+    fn set_trailer_if_uninitialized(&self, trailer: ObjectHandle) -> bool {
+        ResolverHandle::set_trailer_if_uninitialized(self, trailer)
+    }
+
     fn source_seek(&self, offset: u64) -> Result<()> {
         self.seek(offset)
     }
@@ -302,17 +318,19 @@ pub enum XrefForm {
 
 #[derive(Debug, Clone, Copy)]
 enum ParsedXrefEntry {
-    Live {
-        object_ref: QpdfObjGen,
-        entry: XrefEntry,
-    },
-    Free {
-        object_ref: QpdfObjGen,
-    },
+    Live,
+    Free { object_ref: QpdfObjGen },
+}
+
+/// A cloneable handle to the single xref registration stored on `ResolverCore`.
+/// Clones share that owner's state; they are not independent parse snapshots.
+#[derive(Debug, Clone)]
+pub(crate) struct XrefRegistration {
+    state: Rc<RefCell<XrefRegistrationState>>,
 }
 
 #[derive(Debug, Default)]
-struct XrefRegistration {
+struct XrefRegistrationState {
     /// qpdf's raw `m->xref_table`, retained through registration so an invalid
     /// generation still participates in exact-key/free-row precedence before
     /// the valid indirect-reference boundary is applied.
@@ -325,84 +343,222 @@ struct XrefRegistration {
     /// qpdf `read_xref` registration retains it through `/Size` validation,
     /// then clears it (`QPDF.cc:686-708`). `reconstruct_xref` instead clears
     /// its line-scan filter immediately at `QPDF.cc:575`, before the optional
-    /// candidate xref-stream re-read at `:576-607`; that re-read gets a fresh
-    /// registration with its own normal lifetime. It deliberately never
-    /// crosses into `ResolverCore`: canonical cache/xref replacement and
-    /// removal are a separate `Pdf` mutation boundary.
+    /// candidate xref-stream re-read at `:576-607`; that re-read uses the same
+    /// document registration after its scan tombstones have been cleared. The
+    /// set tracks registration suppression only, not canonical cache/xref
+    /// replacement or removal history.
     deleted_objects: BTreeSet<u32>,
 }
 
+impl Default for XrefRegistration {
+    fn default() -> Self {
+        Self {
+            state: Rc::new(RefCell::new(XrefRegistrationState::default())),
+        }
+    }
+}
+
 impl XrefRegistration {
+    pub(crate) fn from_effective_entries(entries: BTreeMap<ObjectRef, XrefEntry>) -> Self {
+        let registration = Self::default();
+        registration.replace_from_object_refs(entries);
+        registration
+    }
+
     /// qpdf `insertXrefEntry`: a deleted object number suppresses every later
     /// live registration, while an exact object-generation collision is
     /// first-wins because sections are read newest to oldest.
-    fn insert_xref_entry(&mut self, key: QpdfObjGen, entry: XrefEntry) {
+    pub(crate) fn insert_xref_entry(&self, key: QpdfObjGen, entry: XrefEntry) {
         let Some(object_number) = u32::try_from(key.get_obj()).ok() else {
             return;
         };
-        if self.deleted_objects.contains(&object_number) {
+        let mut state = self.state.borrow_mut();
+        if state.deleted_objects.contains(&object_number) {
             return;
         }
         // qpdf uses `try_emplace` and returns when the row already exists
         // (`QPDF.cc:1164-1168`), so the first section read wins the value as
         // well as the key.
-        match self.raw_entries.entry(key) {
+        match state.raw_entries.entry(key) {
             std::collections::btree_map::Entry::Occupied(_) => return,
             std::collections::btree_map::Entry::Vacant(slot) => slot.insert(entry),
         };
         if let Some(object_ref) = key.to_object_ref() {
-            self.entries.entry(object_ref).or_insert(entry);
+            state.entries.entry(object_ref).or_insert(entry);
         }
     }
 
     /// qpdf `insertFreeXrefEntry`: free rows are represented only by the
     /// object-number tombstone, and a matching exact live generation wins.
-    fn insert_free_xref_entry(&mut self, key: QpdfObjGen) {
+    pub(crate) fn insert_free_xref_entry(&self, key: QpdfObjGen) {
         let Some(object_number) = u32::try_from(key.get_obj()).ok() else {
             return;
         };
-        if !self.raw_entries.contains_key(&key) {
-            self.deleted_objects.insert(object_number);
+        let mut state = self.state.borrow_mut();
+        if !state.raw_entries.contains_key(&key) {
+            state.deleted_objects.insert(object_number);
+        }
+    }
+
+    pub(crate) fn insert_reconstructed_xref_entry(&self, object_ref: ObjectRef, offset: u64) {
+        let Ok(object_gen) = QpdfObjGen::try_from_object_ref(object_ref) else {
+            return;
+        };
+        let mut state = self.state.borrow_mut();
+        if !state.deleted_objects.contains(&object_ref.number) {
+            let entry = XrefEntry::Uncompressed { offset };
+            state.raw_entries.insert(object_gen, entry);
+            state.entries.insert(object_ref, entry);
         }
     }
 
     /// The highest object number in the raw table, which is what qpdf's
     /// `/Size` check reads (`QPDF.cc:691-693`).
-    fn highest_raw_object_number(&self) -> i64 {
-        self.raw_entries
+    pub(crate) fn highest_raw_object_number(&self) -> i64 {
+        self.state
+            .borrow()
+            .raw_entries
             .keys()
             .map(|key| i64::from(key.get_obj()))
             .max()
             .unwrap_or(0)
     }
 
-    fn contains_raw_key(&self, key: QpdfObjGen) -> bool {
-        self.raw_entries.contains_key(&key)
+    pub(crate) fn contains_raw_key(&self, key: QpdfObjGen) -> bool {
+        self.state.borrow().raw_entries.contains_key(&key)
     }
 
-    fn replace_effective_entries(&mut self, entries: BTreeMap<ObjectRef, XrefEntry>) -> Result<()> {
-        self.raw_entries = entries
+    #[cfg(test)]
+    pub(crate) fn replace_effective_entries(
+        &self,
+        entries: BTreeMap<ObjectRef, XrefEntry>,
+    ) -> Result<()> {
+        let raw_entries = entries
             .iter()
             .map(|(object_ref, entry)| Ok((QpdfObjGen::try_from_object_ref(*object_ref)?, *entry)))
             .collect::<Result<BTreeMap<_, _>>>()?;
-        self.entries = entries;
+        let mut state = self.state.borrow_mut();
+        state.raw_entries = raw_entries;
+        state.entries = entries;
         Ok(())
     }
 
-    fn snapshot(&self) -> BTreeMap<ObjectRef, XrefEntry> {
-        self.entries.clone()
+    pub(crate) fn replace_from_object_refs(&self, entries: BTreeMap<ObjectRef, XrefEntry>) {
+        let mut raw_entries = BTreeMap::new();
+        let mut effective_entries = BTreeMap::new();
+        for (object_ref, entry) in entries {
+            if let Ok(object_gen) = QpdfObjGen::try_from_object_ref(object_ref) {
+                raw_entries.insert(object_gen, entry);
+                effective_entries.insert(object_ref, entry);
+            }
+        }
+        let mut state = self.state.borrow_mut();
+        state.raw_entries = raw_entries;
+        state.entries = effective_entries;
     }
 
-    fn raw_snapshot(&self) -> BTreeMap<QpdfObjGen, XrefEntry> {
-        self.raw_entries.clone()
+    pub(crate) fn replace_raw_entries(&self, raw_entries: BTreeMap<QpdfObjGen, XrefEntry>) {
+        let entries = raw_entries
+            .iter()
+            .filter_map(|(object_gen, entry)| {
+                object_gen
+                    .to_object_ref()
+                    .map(|object_ref| (object_ref, *entry))
+            })
+            .collect();
+        let mut state = self.state.borrow_mut();
+        state.raw_entries = raw_entries;
+        state.entries = entries;
+    }
+
+    pub(crate) fn insert_overwriting(&self, key: QpdfObjGen, entry: XrefEntry) {
+        let mut state = self.state.borrow_mut();
+        state.raw_entries.insert(key, entry);
+        if let Some(object_ref) = key.to_object_ref() {
+            state.entries.insert(object_ref, entry);
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> BTreeMap<ObjectRef, XrefEntry> {
+        self.state.borrow().entries.clone()
+    }
+
+    pub(crate) fn raw_snapshot(&self) -> BTreeMap<QpdfObjGen, XrefEntry> {
+        self.state.borrow().raw_entries.clone()
+    }
+
+    pub(crate) fn with_raw_entries<T>(
+        &self,
+        f: impl FnOnce(&BTreeMap<QpdfObjGen, XrefEntry>) -> T,
+    ) -> T {
+        let state = self.state.borrow();
+        f(&state.raw_entries)
+    }
+
+    pub(crate) fn deleted_objects_snapshot(&self) -> BTreeSet<u32> {
+        self.state.borrow().deleted_objects.clone()
+    }
+
+    pub(crate) fn clear_deleted_objects(&self) {
+        self.state.borrow_mut().deleted_objects.clear();
+    }
+
+    pub(crate) fn deleted_objects_contains(&self, object_number: u32) -> bool {
+        self.state.borrow().deleted_objects.contains(&object_number)
+    }
+
+    pub(crate) fn remove_raw_entry(&self, key: QpdfObjGen) {
+        let mut state = self.state.borrow_mut();
+        state.raw_entries.remove(&key);
+        if let Some(object_ref) = key.to_object_ref() {
+            state.entries.remove(&object_ref);
+        }
+    }
+
+    pub(crate) fn remove_uncompressed_entries(&self) {
+        let mut state = self.state.borrow_mut();
+        let removed: Vec<_> = state
+            .raw_entries
+            .iter()
+            .filter_map(|(key, entry)| {
+                matches!(entry, XrefEntry::Uncompressed { .. }).then_some(*key)
+            })
+            .collect();
+        for key in removed {
+            state.raw_entries.remove(&key);
+            if let Some(object_ref) = key.to_object_ref() {
+                state.entries.remove(&object_ref);
+            }
+        }
+    }
+
+    pub(crate) fn extend_raw_entries(&self, entries: BTreeMap<QpdfObjGen, XrefEntry>) {
+        let mut state = self.state.borrow_mut();
+        for (object_gen, entry) in entries {
+            state.raw_entries.insert(object_gen, entry);
+            if let Some(object_ref) = object_gen.to_object_ref() {
+                state.entries.insert(object_ref, entry);
+            }
+        }
+    }
+
+    pub(crate) fn clear_raw_entries(&self) {
+        let mut state = self.state.borrow_mut();
+        state.raw_entries.clear();
+        state.entries.clear();
+    }
+
+    pub(crate) fn raw_entry(&self, key: QpdfObjGen) -> Option<XrefEntry> {
+        self.state.borrow().raw_entries.get(&key).copied()
     }
 }
 
+#[cfg(test)]
 fn seed_candidate_reentry_registration(
+    registration: XrefRegistration,
     line_scan_entries: &BTreeMap<ObjectRef, XrefEntry>,
     preexisting_raw_entries: Option<&BTreeMap<QpdfObjGen, XrefEntry>>,
 ) -> Result<XrefRegistration> {
-    let mut registration = XrefRegistration::default();
     registration.replace_effective_entries(line_scan_entries.clone())?;
     if let Some(raw_entries) = preexisting_raw_entries {
         // qpdf removes all type-1 rows before reconstruction, then repopulates
@@ -410,7 +566,7 @@ fn seed_candidate_reentry_registration(
         // the previous table may seed the candidate re-entry.
         for (&object_ref, &entry) in raw_entries {
             if !matches!(entry, XrefEntry::Uncompressed { .. }) {
-                registration.raw_entries.entry(object_ref).or_insert(entry);
+                registration.insert_xref_entry(object_ref, entry);
             }
         }
     }
@@ -1030,7 +1186,7 @@ fn load_xref_state_from_window(
     // reconstruction handoff below consults the same registration filter --
     // including the `startxref == 0` one, where no section has been read yet
     // and the filter is therefore still empty.
-    let mut registration = XrefRegistration::default();
+    let mut registration = canonical_trailer_owner.xref_registration();
     // qpdf's `xref_offset == 0` check (`QPDF.cc:450-452`) throws
     // damagedPDF("can't find startxref") immediately and never calls
     // read_xref at all -- whether xref_offset is 0 because startxref itself
@@ -1056,7 +1212,7 @@ fn load_xref_state_from_window(
             None,
             None,
             None,
-            &registration.deleted_objects,
+            &registration.deleted_objects_snapshot(),
             options.clone(),
             initial_diagnostics,
             None,
@@ -1102,9 +1258,9 @@ fn load_xref_state_from_window(
                 startxref,
                 trigger,
                 None,
-                Some(&registration.entries),
-                Some(&registration.raw_entries),
-                &registration.deleted_objects,
+                Some(&registration.snapshot()),
+                Some(&registration.raw_snapshot()),
+                &registration.deleted_objects_snapshot(),
                 options.clone(),
                 initial_diagnostics,
                 observed_first_xref_item_offset,
@@ -1145,7 +1301,7 @@ fn load_xref_state_from_window(
         canonical_trailer_owner,
     ) {
         if allow_repair {
-            let deleted_objects = std::mem::take(&mut registration.deleted_objects);
+            let deleted_objects = registration.deleted_objects_snapshot();
             let trigger = parse_errors.into_iter().next().unwrap_or(error);
             // cov:ignore-start: post-chain /Size reconstruction is superseded by the canonical classic-trailer recovery handoff
             let recovered = recover_xref_from_linear_scan(
@@ -1154,8 +1310,8 @@ fn load_xref_state_from_window(
                 startxref,
                 trigger,
                 Some(&loaded.loaded.trailer),
-                Some(&registration.entries),
-                Some(&registration.raw_entries),
+                Some(&registration.snapshot()),
+                Some(&registration.raw_snapshot()),
                 &deleted_objects,
                 options.clone(),
                 previous_parse_diagnostics,
@@ -1201,7 +1357,7 @@ fn load_xref_state_from_window(
         // The trigger is only recorded by a bounded (repair-mode) read; keep
         // this path as the single qpdf-style reconstruction handoff.
         let diagnostics = std::mem::take(&mut loaded.loaded.repair_diagnostics);
-        let deleted_objects = std::mem::take(&mut registration.deleted_objects);
+        let deleted_objects = registration.deleted_objects_snapshot();
         let recovered = recover_xref_from_linear_scan(
             bytes,
             version.clone(),
@@ -1262,7 +1418,7 @@ fn load_xref_state_from_window(
     append_xref_size_warning_for(
         resolved_size.as_ref(),
         registration.highest_raw_object_number(),
-        &registration.deleted_objects,
+        &registration.deleted_objects_snapshot(),
         &options.description,
         &mut loaded.loaded.repair_diagnostics,
     );
@@ -1274,9 +1430,9 @@ fn load_xref_state_from_window(
         // `m->deleted_objects` through `/Size` validation, then clears it
         // (`QPDF.cc:686-708`). `reconstruct_xref` has a distinct line-scan
         // lifetime and clears before candidate re-read (`:516-575`, `:576-607`).
-        // The set implements only registration suppression (`:1187-1210`), never
-        // resolver or mutation history, and must not cross the xref-loader boundary.
-    registration.deleted_objects.clear(); // cov:ignore: ordinary post-chain cleanup is subsumed by the canonical recovery handoff
+        // This owner-held set tracks registration suppression (`:1187-1210`), not
+        // resolver or mutation history.
+    registration.clear_deleted_objects(); // cov:ignore: ordinary post-chain cleanup is subsumed by the canonical recovery handoff
 
     // cov:ignore-start: parse_errors are drained by the earlier qpdf recovery handoff before ordinary completion
     if let Some(error) = parse_errors.into_iter().next() {
@@ -1397,6 +1553,7 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
         let table = parse_xref_table(
             &mut cursor,
             bytes,
+            registration,
             first_xref_item_offset_sink,
             &options.description,
         );
@@ -1419,9 +1576,7 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
         let mut deferred_free = Vec::new();
         for entry in entries {
             match entry {
-                ParsedXrefEntry::Live { object_ref, entry } => {
-                    registration.insert_xref_entry(object_ref, entry);
-                }
+                ParsedXrefEntry::Live => {}
                 ParsedXrefEntry::Free { object_ref } => deferred_free.push(object_ref),
             }
         }
@@ -1458,6 +1613,7 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
                 b"expected trailer dictionary",
             )));
         }
+        canonical_trailer_owner.set_trailer_if_uninitialized(trailer.clone());
         let trailer_references = collect_trailer_references(&trailer);
         let mut loaded = LoadedXrefState {
             loaded: LoadedXref {
@@ -2037,6 +2193,12 @@ fn recover_xref_from_linear_scan(
         // attempt enters the same document (`QPDF.cc:518-522`).
         return Err(trigger_error);
     }
+    // qpdf gates both trailer recovery paths on the live m->trailer state
+    // (QPDF.cc:564-577). Prefer the document owner; the argument is only the
+    // loader's derived snapshot from the already parsed current section.
+    let fallback_trailer = canonical_trailer_owner
+        .current_trailer()
+        .or_else(|| fallback_trailer.cloned());
     // qpdf mutates `m->first_xref_item_offset` while reading object 0's row,
     // before a later row can throw, and `reconstruct_xref` preserves that
     // member across the exception (`QPDF.cc:846-869, 626-708`). Rust's
@@ -2055,6 +2217,9 @@ fn recover_xref_from_linear_scan(
     // live table that the scan built. Permit those scoped loader writes; an
     // outer snapshot arriving after this operation is stale and stays blocked.
     let _table_update_scope = ReconstructedXrefTableUpdateScope::new(canonical_trailer_owner);
+    canonical_trailer_owner
+        .xref_registration()
+        .remove_uncompressed_entries();
 
     let recovered = recover_xref_entries_from_source(
         canonical_trailer_owner,
@@ -2067,6 +2232,12 @@ fn recover_xref_from_linear_scan(
         with_xref_open_diagnostics(error, canonical_trailer_owner)
     })?;
     // cov:ignore-end
+    // qpdf keeps the owner deletion filter through the complete line scan and
+    // clears it only when that scan succeeds, immediately before candidate
+    // xref-stream reread (QPDF.cc:575-576).
+    canonical_trailer_owner
+        .xref_registration()
+        .clear_deleted_objects();
     // qpdf's third `insertReconstructedXrefEntry` condition
     // (`QPDF.cc:1204-1209`): a scanned row whose object number a free row
     // already registered is never written to `m->xref_table`, and
@@ -2133,7 +2304,6 @@ fn recover_xref_from_linear_scan(
                 &mut parsed_xref_streams,
                 &mut repair_diagnostics,
                 &mut extra_trailer_references,
-                preexisting_raw_entries,
                 canonical_trailer_owner,
             ) {
                 Ok((
@@ -2144,9 +2314,9 @@ fn recover_xref_from_linear_scan(
                     first_xref_item_offset,
                     uncompressed_after_compressed,
                 )) => {
-                    // Candidate re-entry has already consumed its local
-                    // tombstones while filtering `entries`; never retain
-                    // them past this recovery operation.
+                    // Candidate re-entry has completed its own `/Size` check;
+                    // the helper clears its owner-held tombstones before it
+                    // returns, so none outlive this recovery operation.
                     candidate_xref_reentered = true;
                     (
                         trailer,
@@ -2384,6 +2554,7 @@ fn recover_xref_entries_from_source(
     filename: &[u8],
     deleted_objects: &BTreeSet<u32>,
 ) -> Result<RecoveredXref> {
+    let registration = owner.xref_registration();
     let source_length = owner.source_length()?;
     owner.source_seek(0)?;
     let mut entries = BTreeMap::new();
@@ -2420,6 +2591,7 @@ fn recover_xref_entries_from_source(
                 // warning side effects remain on the document.
                 trailer_diagnostics.extend(diagnostics);
                 if candidate.try_is_dictionary().unwrap_or(false) {
+                    owner.set_trailer_if_uninitialized(candidate.clone());
                     trailer = Some(candidate);
                 }
             } // cov:ignore: LLVM maps the successful trailer-candidate edge to the inner dictionary branch
@@ -2427,6 +2599,8 @@ fn recover_xref_entries_from_source(
         } else if let Some((object_ref, offset)) =
             scan_object_header_after_first_token(line, &first_token)?
         {
+            registration
+                .insert_reconstructed_xref_entry(object_ref, line_start.saturating_add(offset));
             insert_reconstructed_xref_entry(
                 &mut entries,
                 object_ref,
@@ -2480,12 +2654,11 @@ fn recover_xref_entries_from_source(
 /// both key priority off the number alone). A candidate that fails to decode
 /// becomes "error decoding candidate xref stream while recovering damaged
 /// file"; no candidate at all becomes "unable to find trailer dictionary while
-/// recovering damaged file". The candidate re-read uses its own fresh
-/// `XrefRegistration`: like normal `read_xref`, it uses its free-row filter
-/// for `/Size` before clear (`QPDF.cc:686-708`), while the reconstruction
-/// line-scan filter was already cleared at `:575`. The returned filter is
-/// consumed only by this immediate candidate merge; it is never resolver or
-/// mutation state.
+/// recovering damaged file". The candidate re-read uses the owner-held
+/// registration after the reconstruction scan's free-row filter was cleared
+/// at `QPDF.cc:575`. Its own `/Prev` read accumulates a new filter through its
+/// `/Size` check (`QPDF.cc:686-708`); this snapshot is consumed by the
+/// immediate candidate merge and the owner filter is then cleared.
 type RecoveredXrefStream = (ObjectHandle, u64, XrefForm, BTreeSet<u32>, u64, bool);
 
 #[allow(clippy::too_many_arguments)]
@@ -2497,7 +2670,6 @@ fn recover_trailer_from_xref_stream_candidate(
     parsed_xref_streams: &mut BTreeMap<ObjectRef, ObjectHandle>,
     repair_diagnostics: &mut Diagnostics,
     trailer_references: &mut BTreeSet<ObjectRef>,
-    preexisting_raw_entries: Option<&BTreeMap<QpdfObjGen, XrefEntry>>,
     canonical_trailer_owner: &dyn CanonicalTrailerOwner,
 ) -> Result<RecoveredXrefStream> {
     let (candidate, discovery_diagnostics) =
@@ -2544,15 +2716,13 @@ fn recover_trailer_from_xref_stream_candidate(
     // after the read already succeeded. The canonical sink has already
     // delivered the read warning, so appending this buffer keeps that order.
     //
-    // The candidate's own re-entry gets a fresh `XrefRegistration`, scoped to
-    // just this call and its `/Prev` chain -- qpdf's `insertXrefEntry`/
-    // `insertFreeXrefEntry` priority is local to `read_xref`'s own walk of
-    // that one revision chain, not shared with the line scan's entries.
-    // qpdf re-enters `read_xref` against the xref table produced by the
-    // reconstruction scan. Seed registration with that table so an entry
-    // already present there is skipped before its type is validated.
-    let mut reentry_registration =
-        seed_candidate_reentry_registration(entries, preexisting_raw_entries)?;
+    // The candidate's re-entry uses the same owner-held `XrefRegistration`
+    // that contains the reconstruction scan's rows. qpdf re-enters
+    // `read_xref` against that live xref table, so an entry already present
+    // from the scan is skipped before its type is validated. The scan's
+    // tombstones were cleared before this re-entry; free rows encountered
+    // here accumulate on the owner through this candidate's `/Size` check.
+    let mut reentry_registration = canonical_trailer_owner.xref_registration();
     // A build failure inside `parse_xref_stream_with_canonical_owner` (e.g.
     // a malformed `/W`) writes its own diagnostic to a scratch buffer. The
     // canonical owner has already delivered any warning raised while reading
@@ -2652,7 +2822,7 @@ fn recover_trailer_from_xref_stream_candidate(
 
     let first_xref_item_offset = reentry.first_xref_item_offset;
     let uncompressed_after_compressed = reentry.uncompressed_after_compressed;
-    let deleted_objects = reentry_registration.deleted_objects.clone();
+    let deleted_objects = reentry_registration.deleted_objects_snapshot();
 
     // `reentry.loaded.entries` is already the live-only snapshot of
     // `reentry_registration` (free rows never get a map entry, matching
@@ -2663,8 +2833,8 @@ fn recover_trailer_from_xref_stream_candidate(
     // populated that *same* (number, generation) pair -- an obsolete
     // generation's own leftover entry from the line scan must not suppress
     // the candidate's entry for a distinct generation of the same object
-    // number. Free rows remain local tombstones in the candidate's own
-    // `XrefRegistration`, matching `insertFreeXrefEntry`.
+    // number. Free rows remain registration tombstones on the owner,
+    // matching `insertFreeXrefEntry`.
     for (object_ref, xref_entry) in reentry.loaded.entries {
         entries.entry(object_ref).or_insert(xref_entry);
     }
@@ -2705,6 +2875,9 @@ fn recover_trailer_from_xref_stream_candidate(
         repair_diagnostics,
     );
     deliver_canonical_diagnostics(canonical_trailer_owner, repair_diagnostics)?;
+    canonical_trailer_owner
+        .xref_registration()
+        .clear_deleted_objects();
 
     Ok((
         candidate.trailer,
@@ -2775,6 +2948,7 @@ fn find_xref_stream_trailer_candidate(
         if offset > max_offset {
             max_offset = offset;
             if trailer.is_none() {
+                owner.set_trailer_if_uninitialized(stream_dict.clone());
                 trailer = Some(stream_dict);
             }
         } // cov:ignore: LLVM maps the covered canonical candidate offset branch to its closing brace
@@ -3154,6 +3328,7 @@ fn scan_object_header_after_first_token(
 fn parse_xref_table(
     cursor: &mut ByteCursor<'_>,
     bytes: &[u8],
+    registration: &XrefRegistration,
     mut first_xref_item_offset_sink: Option<&mut Option<u64>>,
     filename: &[u8],
 ) -> Result<(Vec<ParsedXrefEntry>, usize, Vec<QpdfExc>, u64)> {
@@ -3235,10 +3410,8 @@ fn parse_xref_table(
                     entries.push(ParsedXrefEntry::Free { object_ref });
                 }
                 b'n' => {
-                    entries.push(ParsedXrefEntry::Live {
-                        object_ref,
-                        entry: XrefEntry::Uncompressed { offset },
-                    });
+                    entries.push(ParsedXrefEntry::Live);
+                    registration.insert_xref_entry(object_ref, XrefEntry::Uncompressed { offset });
                 }
                 // cov:ignore-start: parse_xref_entry_line accepts only the
                 // two in-use markers handled above.
@@ -3639,7 +3812,7 @@ fn parse_xref_stream_with_canonical_owner(
     let mut diagnostics = Diagnostics::default();
     context.append_diagnostics_to(&mut diagnostics);
     deliver_canonical_diagnostics(owner, &mut diagnostics)?;
-    let (trailer, entries, trailer_references, has_first_xref_item, uncompressed_after_compressed) =
+    let (trailer, _entries, trailer_references, has_first_xref_item, uncompressed_after_compressed) =
         match build_result {
             Ok(build) => build,
             Err(error) => {
@@ -3647,16 +3820,9 @@ fn parse_xref_stream_with_canonical_owner(
                 return Err(error);
             }
         };
-    for entry in entries {
-        match entry {
-            ParsedXrefEntry::Live { object_ref, entry } => {
-                registration.insert_xref_entry(object_ref, entry);
-            }
-            ParsedXrefEntry::Free { object_ref } => {
-                registration.insert_free_xref_entry(object_ref);
-            }
-        }
-    }
+    // build_xref_stream registers each entry as it is decoded, matching
+    // qpdf's per-row mutation of m->xref_table before a later row can fail.
+    owner.set_trailer_if_uninitialized(trailer.clone());
     owner.install_xref_entries(registration.snapshot());
     let state = LoadedXrefState {
         loaded: LoadedXref {
@@ -3870,7 +4036,7 @@ fn parse_xref_entries(
             // type (`QPDF.cc:1158-1169`). This matters on a failed first
             // pass: try_emplace leaves a default type-0 slot behind, so the
             // reconstruction re-entry skips the same malformed entry.
-            if registration.deleted_objects.contains(&object_number)
+            if registration.deleted_objects_contains(object_number)
                 || registration.contains_raw_key(object_ref)
             {
                 continue;
@@ -3885,7 +4051,7 @@ fn parse_xref_entries(
                 1 => {
                     let entry = XrefEntry::Uncompressed { offset: field1 };
                     registration.insert_xref_entry(object_ref, entry);
-                    entries.push(ParsedXrefEntry::Live { object_ref, entry });
+                    entries.push(ParsedXrefEntry::Live);
                 }
                 2 => {
                     let stream = u32::try_from(field1).map_err(|_| {
@@ -3895,7 +4061,7 @@ fn parse_xref_entries(
                         .map_err(|_| Error::parse(0, "xref stream index does not fit u32"))?;
                     let entry = XrefEntry::Compressed { stream, index };
                     registration.insert_xref_entry(object_ref, entry);
-                    entries.push(ParsedXrefEntry::Live { object_ref, entry });
+                    entries.push(ParsedXrefEntry::Live);
                 }
                 _ => {
                     // qpdf's `try_emplace` has already inserted its default
@@ -4156,6 +4322,114 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn failed_previous_xref_read_keeps_raw_rows_on_the_canonical_owner() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let root_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let invalid_generation_offset = bytes.len();
+        bytes.extend_from_slice(b"2 65536 obj\n<< /Foo 2 >>\nendobj\n");
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 3\n0000000000 65535 f \n{root_offset:010} 00000 n \n{invalid_generation_offset:010} 65536 n \ntrailer\n<< /Size 3 /Root 1 0 R /Prev 999999 >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+
+        let (owner, result) = load_xref_state_through_canonical_owner(
+            std::io::Cursor::new(bytes),
+            false,
+            XrefLoadOptions::default(),
+            crate::QPDFLogger::create(),
+            true,
+            803,
+        );
+        assert!(
+            result.is_err(),
+            "the malformed /Prev target should fail when recovery is disabled"
+        );
+
+        let invalid_generation = QpdfObjGen::new(2, 65_536);
+        assert_eq!(
+            owner.raw_xref_entries().get(&invalid_generation),
+            Some(&XrefEntry::Uncompressed {
+                offset: invalid_generation_offset as u64,
+            }),
+            "qpdf keeps the raw row on QPDF::Members while reading the /Prev chain"
+        );
+    }
+
+    #[test]
+    fn failed_classic_xref_table_keeps_prior_live_rows_on_the_canonical_owner() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let root_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 3\n0000000000 65535 f \n{root_offset:010} 00000 n \ninvalid xref row\ntrailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+
+        let (owner, result) = load_xref_state_through_canonical_owner(
+            std::io::Cursor::new(bytes),
+            false,
+            XrefLoadOptions::default(),
+            crate::QPDFLogger::create(),
+            true,
+            807,
+        );
+        assert!(
+            result.is_err(),
+            "the malformed second row must fail with recovery disabled"
+        );
+
+        assert_eq!(
+            owner.raw_xref_entries().get(&QpdfObjGen::new(1, 0)),
+            Some(&XrefEntry::Uncompressed { offset: 9 }),
+            "qpdf inserts an earlier live xref row before a later row fails"
+        );
+        assert!(
+            owner
+                .xref_registration()
+                .deleted_objects_snapshot()
+                .is_empty(),
+            "classic free rows remain deferred until after the hybrid stream read"
+        );
+    }
+
+    #[test]
+    fn canonical_owner_retains_the_newest_trailer_across_previous_sections() {
+        let (mut bytes, previous_xref) = classic_xref_with_trailer("<< /Size 1 /Info (old) >>");
+        let current_xref = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 /Info (new) /Prev {previous_xref} >>\nstartxref\n{current_xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+
+        let (owner, state) = load_xref_snapshot(std::io::Cursor::new(bytes), false, 806);
+        let loaded = state.expect("the current and previous xref sections are valid");
+        let expected_info = loaded
+            .trailer
+            .try_get_key(b"/Info")
+            .unwrap()
+            .try_get_string_value()
+            .unwrap();
+        assert_eq!(expected_info, b"new");
+
+        let owner_trailer = owner
+            .current_trailer()
+            .expect("the parsed trailer remains on the canonical resolver owner");
+        assert!(
+            owner_trailer.is_same_object_as(&loaded.trailer),
+            "the Pdf handoff snapshot must share the owner's newest trailer handle"
+        );
+    }
+
+    #[test]
     fn canonical_nonzero_startxref_recovery_rebuilds_a_direct_trailer() {
         let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n999\n%%EOF\n".to_vec();
         let resolver = canonical_test_resolver(bytes, BTreeMap::new(), true, 12);
@@ -4192,6 +4466,46 @@ mod final_handle_tests {
             resolver.reconstruction_guard_at_first_warning(),
             Some(true),
             "qpdf sets reconstructed_xref at reconstruct_xref entry, before warning or scan"
+        );
+    }
+
+    #[test]
+    fn recovery_uses_the_canonical_owner_trailer_over_a_stale_loader_snapshot() {
+        let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), true, 808);
+        let canonical_trailer = ObjectHandle::dictionary(vec![(
+            b"/Info".to_vec(),
+            ObjectHandle::string(b"canonical".to_vec()),
+        )]);
+        let stale_snapshot = ObjectHandle::dictionary(vec![(
+            b"/Info".to_vec(),
+            ObjectHandle::string(b"stale".to_vec()),
+        )]);
+        assert!(resolver.set_trailer_if_uninitialized(canonical_trailer.clone()));
+
+        let recovered = recover_xref_from_linear_scan(
+            &bytes,
+            "1.4".to_owned(),
+            0,
+            Error::parse(0, "test reconstruction trigger"),
+            Some(&stale_snapshot),
+            None,
+            None,
+            &BTreeSet::new(),
+            XrefLoadOptions::default(),
+            Diagnostics::default(),
+            None,
+            false,
+            resolver.as_ref(),
+        )
+        .expect("the owner-backed scan should recover the object and retained trailer");
+
+        assert!(
+            recovered
+                .loaded
+                .trailer
+                .is_same_object_as(&canonical_trailer),
+            "qpdf reconstruct_xref reads QPDF::Members::trailer, not a stale loader copy"
         );
     }
 
@@ -4497,7 +4811,8 @@ mod final_handle_tests {
     #[test]
     fn classic_xref_section_header_can_span_physical_lines_like_qpdf() {
         let mut cursor = ByteCursor::new(b"\n6\n2147483647", 0);
-        let error = parse_xref_table(&mut cursor, b"", None, b"issue-335b.pdf")
+        let registration = XrefRegistration::default();
+        let error = parse_xref_table(&mut cursor, b"", &registration, None, b"issue-335b.pdf")
             .expect_err("qpdf reaches the first missing xref row after the split header");
         assert!(matches!(
             error,
@@ -4522,13 +4837,11 @@ mod final_handle_tests {
         .expect("qpdf accepts an /Index row beyond the reported /Size");
 
         assert!(!uncompressed_after_compressed);
-        assert!(matches!(
-            entries.as_slice(),
-            [ParsedXrefEntry::Live {
-                object_ref,
-                entry: XrefEntry::Uncompressed { offset: 0 },
-            }] if *object_ref == QpdfObjGen::new(35, 0)
-        ));
+        assert!(matches!(entries.as_slice(), [ParsedXrefEntry::Live]));
+        assert_eq!(
+            registration.raw_entry(QpdfObjGen::new(35, 0)),
+            Some(XrefEntry::Uncompressed { offset: 0 })
+        );
     }
 
     #[test]
@@ -5178,13 +5491,11 @@ mod final_handle_tests {
         // `/Size` consistency check (`QPDF.cc:689-704`).
         //
         // The live resolver performs the reconstruction during `/Prev`
-        // resolution, so this route never re-enters the loader's own
-        // `recover_xref_from_linear_scan`, and that fifth warning is not
-        // reached. That gap predates the owner-less cutover: `Pdf::open` has
-        // always supplied the canonical owner here, and
-        // `CanonicalXrefContext::take_reconstruction_trigger` has always
-        // returned `None`. Pin the four warnings this route does deliver so
-        // the gap cannot widen unnoticed.
+        // resolution. The authoritative owner table then lets the loader's
+        // ordinary post-chain `/Size` check observe the reconstructed maximum
+        // object number, matching qpdf's fifth warning from `QPDF.cc:689-704`.
+        // Pin the complete warning sequence produced by that owner-backed
+        // route.
         let bytes = classic_xref_with_indirect_previous_in_older_section();
         let (owner, result) = load_xref_state_through_canonical_owner(
             std::io::Cursor::new(bytes),
@@ -5208,6 +5519,8 @@ mod final_handle_tests {
                 "expected 2 0 obj".to_owned(),
                 "Attempting to reconstruct cross-reference table".to_owned(),
                 "object 2 0 not found in file after regenerating cross reference table".to_owned(),
+                "reported number of objects (3) is not one plus the highest object number (1)"
+                    .to_owned(),
             ],
             "{messages:?}"
         );
@@ -5553,6 +5866,18 @@ mod final_handle_tests {
 
         fn direct_handle(&self, value: ObjectValue) -> ObjectHandle {
             ObjectHandle::from_value(value)
+        }
+
+        fn xref_registration(&self) -> XrefRegistration {
+            XrefRegistration::default()
+        }
+
+        fn current_trailer(&self) -> Option<ObjectHandle> {
+            None
+        }
+
+        fn set_trailer_if_uninitialized(&self, _trailer: ObjectHandle) -> bool {
+            false
         }
 
         fn install_xref_entries(&self, _entries: BTreeMap<ObjectRef, XrefEntry>) {}
@@ -6064,8 +6389,11 @@ mod final_handle_tests {
     #[test]
     fn live_recovery_source_suppresses_a_tombstoned_object_number() {
         let bytes = b"1 0 obj\n<< >>\nendobj\n2 0 obj\n<< >>\nendobj\n".to_vec();
+        let object_two_offset = b"1 0 obj\n<< >>\nendobj\n".len() as u64;
         let resolver = canonical_test_resolver(bytes, BTreeMap::new(), true, 79);
-        let deleted_objects = BTreeSet::from([1u32]);
+        let registration = resolver.xref_registration();
+        registration.insert_free_xref_entry(QpdfObjGen::new(1, 0));
+        let deleted_objects = registration.deleted_objects_snapshot();
         let recovered = recover_xref_entries_from_source(
             resolver.as_ref(),
             false,
@@ -6078,6 +6406,13 @@ mod final_handle_tests {
             "a tombstoned object number must not be resurrected by the scan"
         );
         assert!(recovered.entries.contains_key(&ObjectRef::new(2, 0)));
+        assert_eq!(
+            resolver.raw_xref_entries().get(&QpdfObjGen::new(2, 0)),
+            Some(&XrefEntry::Uncompressed {
+                offset: object_two_offset,
+            }),
+            "the live owner receives the reconstructed row as the scan finds it"
+        );
     }
 
     #[test]
@@ -6308,7 +6643,6 @@ mod final_handle_tests {
             &mut parsed_xref_streams,
             &mut repair_diagnostics,
             &mut trailer_references,
-            None,
             resolver.as_ref(),
         )
         .expect("the canonical reconstruction candidate must be recoverable");
@@ -6339,7 +6673,6 @@ mod final_handle_tests {
             &mut parsed_xref_streams,
             &mut repair_diagnostics,
             &mut trailer_references,
-            None,
             resolver.as_ref(),
         )
         .expect("the scanned xref-stream candidate must be recoverable");
@@ -6368,15 +6701,19 @@ mod final_handle_tests {
             ),
         ]);
 
-        let registration = seed_candidate_reentry_registration(&entries, Some(&preexisting_raw))
-            .expect("qpdf-sized object references fit the raw identity");
+        let registration = seed_candidate_reentry_registration(
+            XrefRegistration::default(),
+            &entries,
+            Some(&preexisting_raw),
+        )
+        .expect("qpdf-sized object references fit the raw identity");
 
         assert_eq!(
-            registration.raw_entries.get(&QpdfObjGen::new(5, 0)),
+            registration.raw_snapshot().get(&QpdfObjGen::new(5, 0)),
             Some(&XrefEntry::Uncompressed { offset: 100 })
         );
         assert_eq!(
-            registration.raw_entries.get(&QpdfObjGen::new(6, 0)),
+            registration.raw_snapshot().get(&QpdfObjGen::new(6, 0)),
             Some(&XrefEntry::Compressed {
                 stream: 9,
                 index: 0,
@@ -6647,15 +6984,15 @@ mod final_handle_tests {
 
     #[test]
     fn xref_registration_ignores_negative_raw_object_numbers() {
-        let mut registration = XrefRegistration::default();
+        let registration = XrefRegistration::default();
         let key = QpdfObjGen::new(-1, 0);
 
         registration.insert_xref_entry(key, XrefEntry::Uncompressed { offset: 1 });
         registration.insert_free_xref_entry(key);
 
-        assert!(registration.raw_entries.is_empty());
-        assert!(registration.entries.is_empty());
-        assert!(registration.deleted_objects.is_empty());
+        assert!(registration.raw_snapshot().is_empty());
+        assert!(registration.snapshot().is_empty());
+        assert!(registration.deleted_objects_snapshot().is_empty());
     }
 
     fn xref_stream_entry(object_type: u8, field1: u16, field2: u8) -> [u8; 4] {

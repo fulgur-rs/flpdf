@@ -103,7 +103,9 @@ fn pdf_teardown_has_one_canonical_disconnect_owner() {
         .and_then(|(_, rest)| rest.split_once("    pub(crate) fn "))
         .map_or(resolver.as_str(), |(function, _)| function);
     assert_eq!(
-        teardown.matches("raw_source_xref_entries.clear()").count(),
+        teardown
+            .matches("xref_registration.clear_raw_entries()")
+            .count(),
         1,
         "the raw xref-table clear must stay a single production site"
     );
@@ -113,7 +115,7 @@ fn pdf_teardown_has_one_canonical_disconnect_owner() {
         "the object-cache walk must stay a single production site"
     );
     let clear = teardown
-        .find("raw_source_xref_entries.clear()")
+        .find("xref_registration.clear_raw_entries()")
         .expect("teardown clears the canonical xref table");
     let walk = teardown
         .find("object_cache")
@@ -125,7 +127,7 @@ fn pdf_teardown_has_one_canonical_disconnect_owner() {
 }
 
 #[test]
-fn resolver_has_one_raw_source_xref_owner() {
+fn resolver_has_one_owner_held_xref_registration() {
     let resolver = production_source("reader/resolver.rs");
     assert!(
         !resolver.contains("source_xref_entries: BTreeMap<ObjectRef, XrefEntry>"),
@@ -133,10 +135,10 @@ fn resolver_has_one_raw_source_xref_owner() {
     );
     assert_eq!(
         resolver
-            .matches("raw_source_xref_entries: BTreeMap<QpdfObjGen, XrefEntry>")
+            .matches("\n    xref_registration: XrefRegistration,\n")
             .count(),
         1,
-        "the resolver must have exactly one raw QPDFObjGen source table"
+        "the resolver must own exactly one canonical xref registration"
     );
 }
 
