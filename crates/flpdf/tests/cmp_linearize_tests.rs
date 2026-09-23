@@ -863,10 +863,7 @@ use common::{write_linearized_with_settings, write_with_settings, WriterTestSett
 
 #[test]
 fn encrypted_linearized_v4_aes_state_matches_qpdf() {
-    let Some(oracle) = pinned_qpdf() else {
-        eprintln!("[SKIP cmp_linearize_tests] qpdf 11.9.0 is unavailable");
-        return;
-    };
+    let oracle = pinned_qpdf().expect("qpdf 11.9.0 is required for this byte differential");
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
         .join("one-page.pdf");
@@ -912,17 +909,10 @@ fn encrypted_linearized_v4_aes_state_matches_qpdf() {
         .expect("flpdf writes encrypted linearized output");
     std::fs::write(&flpdf_output, &actual).expect("write flpdf output for qpdf check");
     let expected = std::fs::read(&qpdf_output).expect("read qpdf output");
-    if let Some(offset) = first_diff(&actual, &expected) {
-        let start = offset.saturating_sub(16);
-        panic!(
-            "encrypted linearized output differs from qpdf at byte {offset} \
-             (flpdf={} bytes, qpdf={} bytes)\nflpdf: {:?}\nqpdf: {:?}",
-            actual.len(),
-            expected.len(),
-            &actual[start..(offset + 16).min(actual.len())],
-            &expected[start..(offset + 16).min(expected.len())]
-        );
-    }
+    assert_eq!(
+        actual, expected,
+        "encrypted linearized output must match qpdf"
+    );
 
     let check_status = Command::new(oracle)
         .args(["--password=user", "--check-linearization"])
