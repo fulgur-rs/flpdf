@@ -7,14 +7,18 @@ use std::process::Command;
 
 use flpdf::{ObjectRef, Pdf, PdfOpenOptions, XrefEntry};
 
-fn production_source(path: &str) -> String {
-    let source = fs::read_to_string(
+fn source_file(path: &str) -> String {
+    fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join(path),
     )
-    .unwrap_or_else(|error| panic!("unable to read {path}: {error}"));
-    let source = source.replace("\r\n", "\n");
+    .unwrap_or_else(|error| panic!("unable to read {path}: {error}"))
+    .replace("\r\n", "\n")
+}
+
+fn production_source(path: &str) -> String {
+    let source = source_file(path);
     source
         .split_once("\n#[cfg(test)]")
         .map_or(source.clone(), |(production, _)| production.to_owned())
@@ -174,6 +178,117 @@ fn production_open_always_supplies_the_canonical_xref_owner() {
             "the owner-less standalone xref route is removed; {dead} must not return"
         );
     }
+}
+
+#[test]
+fn open_and_resolve_recovery_share_one_owner_operation() {
+    fn function_region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        source
+            .split_once(start)
+            .and_then(|(_, rest)| rest.split_once(end))
+            .map_or_else(
+                || panic!("production source is missing function boundary {start} .. {end}"),
+                |(function, _)| function,
+            )
+    }
+
+    let xref = source_file("xref.rs");
+    let open = function_region(
+        &xref,
+        "fn load_xref_state_from_window(",
+        "#[allow(clippy::too_many_arguments)]\nfn parse_xref_from_start_with_owner(",
+    );
+    let shared = function_region(
+        &xref,
+        "fn reconstruct_xref_on_owner(",
+        "fn merge_recovered_qpdf_state(",
+    );
+    let resolver = production_source("reader/resolver.rs");
+    let delayed = function_region(
+        &resolver,
+        "fn reconstruct_xref_and_retry(",
+        "    /// Sever every canonical handle's value",
+    );
+
+    assert!(
+        open.contains("reconstruct_xref_on_owner("),
+        "parse recovery must delegate to the shared owner operation"
+    );
+    assert!(
+        delayed.contains("reconstruct_xref_on_owner("),
+        "delayed recovery must delegate to the shared owner operation"
+    );
+    assert!(
+        delayed.contains("XrefReconstructionRequest::DelayedResolution"),
+        "delayed recovery must supply its typed trigger context"
+    );
+    for placeholder in ["&[]", "String::new()"] {
+        assert!(
+            !delayed.contains(placeholder),
+            "delayed recovery must not pass open-only placeholder {placeholder}"
+        );
+    }
+    for shared_step in [
+        "begin_xref_reconstruction()",
+        "push_repair_diagnostics(",
+        "remove_uncompressed_entries()",
+        "recover_xref_entries_from_source(",
+        "clear_deleted_objects()",
+        "recover_trailer_from_xref_stream_candidate(",
+    ] {
+        assert!(
+            shared.contains(shared_step),
+            "the shared owner operation must own {shared_step}"
+        );
+    }
+    assert!(
+        delayed.contains("XrefEntry::Uncompressed { offset: new_offset }"),
+        "the resolver caller must retain qpdf's type-1-only retry decision"
+    );
+    for duplicated_step in [
+        "begin_xref_reconstruction()",
+        "push_warning_at(0, \"file is damaged\")",
+        "recover_xref_entries(",
+        "remove_uncompressed_entries()",
+    ] {
+        assert!(
+            !delayed.contains(duplicated_step),
+            "the resolver caller must not duplicate shared step {duplicated_step}"
+        );
+    }
+}
+
+#[test]
+fn candidate_recovery_reentry_without_a_trailer_matches_qpdf_failure() {
+    let fixture = include_bytes!("fixtures/xref-reconstruction-reentrant-before-trailer.pdf");
+    assert_eq!(
+        fixture,
+        include_bytes!(
+            "../../../fuzz/seeds/roundtrip/xref-reconstruction-reentrant-before-trailer.pdf"
+        ),
+        "the regression fixture is also kept in the short fuzz corpus"
+    );
+    let open = std::panic::catch_unwind(|| {
+        Pdf::open_with_options(
+            Cursor::new(fixture),
+            PdfOpenOptions {
+                repair: true,
+                suppress_warnings: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+    });
+    let result = open.expect("qpdf rejects this recovery candidate without panicking");
+    let error = match result {
+        Ok(_) => panic!("the fixture has no recoverable trailer dictionary"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("unable to find trailer dictionary while recovering damaged file"),
+        "expected qpdf's terminal recovery error, got {error}"
+    );
 }
 
 #[test]

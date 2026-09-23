@@ -532,16 +532,6 @@ impl XrefRegistration {
         }
     }
 
-    pub(crate) fn extend_raw_entries(&self, entries: BTreeMap<QpdfObjGen, XrefEntry>) {
-        let mut state = self.state.borrow_mut();
-        for (object_gen, entry) in entries {
-            state.raw_entries.insert(object_gen, entry);
-            if let Some(object_ref) = object_gen.to_object_ref() {
-                state.entries.insert(object_ref, entry);
-            }
-        }
-    }
-
     pub(crate) fn clear_raw_entries(&self) {
         let mut state = self.state.borrow_mut();
         state.raw_entries.clear();
@@ -1204,23 +1194,29 @@ fn load_xref_state_from_window(
             .into_iter()
             .next()
             .unwrap_or_else(|| Error::parse(0, "can't find startxref"));
-        let mut recovered = recover_xref_from_linear_scan(
-            bytes,
-            version,
-            startxref,
-            trigger,
-            None,
-            None,
-            None,
-            &registration.deleted_objects_snapshot(),
-            options.clone(),
-            initial_diagnostics,
-            None,
-            // No section has been read yet at all, so nothing could have
-            // tripped the flag before this reconstruction attempt.
-            false,
+        let mut recovered = match reconstruct_xref_on_owner(
+            XrefReconstructionRequest::Open {
+                bytes,
+                version,
+                startxref,
+                trigger_error: trigger,
+                trigger_warning: None,
+                fallback_trailer: None,
+                preexisting_entries: None,
+                preexisting_raw_entries: None,
+                deleted_objects: registration.deleted_objects_snapshot(),
+                options: options.clone(),
+                repair_diagnostics: initial_diagnostics,
+                observed_first_xref_item_offset: None,
+                // No section has been read yet at all, so nothing could have
+                // tripped the flag before this reconstruction attempt.
+                observed_uncompressed_after_compressed: false,
+            },
             canonical_trailer_owner,
-        )?;
+        )? {
+            XrefReconstructionResult::Open(recovered) => *recovered,
+            XrefReconstructionResult::DelayedResolution => unreachable!(), // cov:ignore: caller constructs only Open
+        };
         recovered.header_offset = header_offset;
         return Ok(recovered);
     }
@@ -1252,21 +1248,27 @@ fn load_xref_state_from_window(
             // trigger when the startxref stage itself succeeded.
             let trigger = parse_errors.into_iter().next().unwrap_or(error);
             deliver_canonical_diagnostics(canonical_trailer_owner, &mut initial_diagnostics)?; // cov:ignore: this branch only propagates a canonical warning-sink failure from a failed xref parse; the sink boundary is covered by Pdf open failure tests
-            let mut recovered = recover_xref_from_linear_scan(
-                bytes,
-                version,
-                startxref,
-                trigger,
-                None,
-                Some(&registration.snapshot()),
-                Some(&registration.raw_snapshot()),
-                &registration.deleted_objects_snapshot(),
-                options.clone(),
-                initial_diagnostics,
-                observed_first_xref_item_offset,
-                observed_uncompressed_after_compressed,
+            let mut recovered = match reconstruct_xref_on_owner(
+                XrefReconstructionRequest::Open {
+                    bytes,
+                    version,
+                    startxref,
+                    trigger_error: trigger,
+                    trigger_warning: None,
+                    fallback_trailer: None,
+                    preexisting_entries: Some(registration.snapshot()),
+                    preexisting_raw_entries: Some(registration.raw_snapshot()),
+                    deleted_objects: registration.deleted_objects_snapshot(),
+                    options: options.clone(),
+                    repair_diagnostics: initial_diagnostics,
+                    observed_first_xref_item_offset,
+                    observed_uncompressed_after_compressed,
+                },
                 canonical_trailer_owner,
-            )?;
+            )? {
+                XrefReconstructionResult::Open(recovered) => *recovered,
+                XrefReconstructionResult::DelayedResolution => unreachable!(), // cov:ignore: caller constructs only Open
+            };
             recovered.header_offset = header_offset;
             return Ok(recovered);
         }
@@ -1304,21 +1306,27 @@ fn load_xref_state_from_window(
             let deleted_objects = registration.deleted_objects_snapshot();
             let trigger = parse_errors.into_iter().next().unwrap_or(error);
             // cov:ignore-start: post-chain /Size reconstruction is superseded by the canonical classic-trailer recovery handoff
-            let recovered = recover_xref_from_linear_scan(
-                bytes,
-                version,
-                startxref,
-                trigger,
-                Some(&loaded.loaded.trailer),
-                Some(&registration.snapshot()),
-                Some(&registration.raw_snapshot()),
-                &deleted_objects,
-                options.clone(),
-                previous_parse_diagnostics,
-                observed_first_xref_item_offset,
-                observed_uncompressed_after_compressed,
+            let recovered = match reconstruct_xref_on_owner(
+                XrefReconstructionRequest::Open {
+                    bytes,
+                    version,
+                    startxref,
+                    trigger_error: trigger,
+                    trigger_warning: None,
+                    fallback_trailer: Some(loaded.loaded.trailer.clone()),
+                    preexisting_entries: Some(registration.snapshot()),
+                    preexisting_raw_entries: Some(registration.raw_snapshot()),
+                    deleted_objects,
+                    options: options.clone(),
+                    repair_diagnostics: previous_parse_diagnostics,
+                    observed_first_xref_item_offset,
+                    observed_uncompressed_after_compressed,
+                },
                 canonical_trailer_owner,
-            )?;
+            )? {
+                XrefReconstructionResult::Open(recovered) => *recovered,
+                XrefReconstructionResult::DelayedResolution => unreachable!(), // cov:ignore: caller constructs only Open
+            };
             let mut recovered = merge_recovered_qpdf_state(recovered, loaded);
             recovered.header_offset = header_offset;
             return Ok(recovered);
@@ -1358,26 +1366,32 @@ fn load_xref_state_from_window(
         // this path as the single qpdf-style reconstruction handoff.
         let diagnostics = std::mem::take(&mut loaded.loaded.repair_diagnostics);
         let deleted_objects = registration.deleted_objects_snapshot();
-        let recovered = recover_xref_from_linear_scan(
-            bytes,
-            version.clone(),
-            startxref,
-            error,
-            Some(&loaded.loaded.trailer),
-            None, // cov:ignore: an existing fallback trailer suppresses candidate re-entry, so no prior candidate state is consumed here
-            None, // cov:ignore: no prior raw registration is consumed here
-            &deleted_objects,
-            options.clone(),
-            diagnostics,
-            None,
-            // Nothing failed mid-scan on this path (the trigger is a later
-            // /Size resolution issue, not a section-parse error), so there is
-            // no pre-reconstruction flag to carry here; `loaded`'s own
-            // already-successfully-parsed value is folded in below via
-            // `merge_recovered_qpdf_state`.
-            false,
+        let recovered = match reconstruct_xref_on_owner(
+            XrefReconstructionRequest::Open {
+                bytes,
+                version: version.clone(),
+                startxref,
+                trigger_error: error,
+                trigger_warning: None,
+                fallback_trailer: Some(loaded.loaded.trailer.clone()),
+                preexisting_entries: None, // cov:ignore: an existing fallback trailer suppresses candidate re-entry, so no prior candidate state is consumed here
+                preexisting_raw_entries: None, // cov:ignore: no prior raw registration is consumed here
+                deleted_objects,
+                options: options.clone(),
+                repair_diagnostics: diagnostics,
+                observed_first_xref_item_offset: None,
+                // Nothing failed mid-scan on this path (the trigger is a later
+                // /Size resolution issue, not a section-parse error), so there is
+                // no pre-reconstruction flag to carry here; `loaded`'s own
+                // already-successfully-parsed value is folded in below via
+                // `merge_recovered_qpdf_state`.
+                observed_uncompressed_after_compressed: false,
+            },
             canonical_trailer_owner,
-        )?; // cov:ignore: recover_xref_entries has no fallible branch; retain defensive propagation
+        )? {
+            XrefReconstructionResult::Open(recovered) => *recovered,
+            XrefReconstructionResult::DelayedResolution => unreachable!(), // cov:ignore: caller constructs only Open
+        }; // cov:ignore: the shared scan has no fallible token path for this fixture; retain defensive propagation
         let mut recovered = merge_recovered_qpdf_state(recovered, loaded);
         recovered.header_offset = header_offset;
 
@@ -1439,7 +1453,7 @@ fn load_xref_state_from_window(
         push_repair_diagnostics(
             &mut loaded.loaded.repair_diagnostics,
             &error,
-            startxref,
+            Some(startxref),
             &options.description,
         );
         deliver_canonical_diagnostics(
@@ -2165,40 +2179,144 @@ fn append_xref_size_warning_for(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn recover_xref_from_linear_scan(
-    bytes: &[u8],
-    version: String,
-    startxref: u64,
+/// Caller-specific data for qpdf's shared `QPDF::reconstruct_xref` operation.
+/// Open recovery carries the loader metadata needed to continue `/Size`
+/// validation; delayed resolution supplies only its trigger and warning
+/// context because the owner already holds the parsed trailer and live source.
+pub(crate) enum XrefReconstructionRequest<'source> {
+    Open {
+        bytes: &'source [u8],
+        version: String,
+        startxref: u64,
+        /// Original error returned unchanged if the owner guard rejects retry.
+        trigger_error: Error,
+        /// Optional qpdf-shaped warning value for caller-specific parser errors.
+        trigger_warning: Option<Error>,
+        fallback_trailer: Option<ObjectHandle>,
+        preexisting_entries: Option<BTreeMap<ObjectRef, XrefEntry>>,
+        preexisting_raw_entries: Option<BTreeMap<QpdfObjGen, XrefEntry>>,
+        deleted_objects: BTreeSet<u32>,
+        options: XrefLoadOptions,
+        repair_diagnostics: Diagnostics,
+        observed_first_xref_item_offset: Option<u64>,
+        observed_uncompressed_after_compressed: bool,
+    },
+    DelayedResolution {
+        /// Original error returned unchanged if the owner guard rejects retry.
+        trigger_error: Error,
+        /// Retains qpdf's object/offset context for a parser-facing `Error::Parse`.
+        trigger_warning: Option<Error>,
+        options: XrefLoadOptions,
+    },
+}
+
+pub(crate) enum XrefReconstructionResult {
+    Open(Box<LoadedXrefState>),
+    DelayedResolution,
+}
+
+enum XrefReconstructionMode<'source> {
+    Open {
+        bytes: &'source [u8],
+        version: String,
+        startxref: u64,
+    },
+    DelayedResolution,
+}
+
+struct PreparedXrefReconstruction<'source> {
     trigger_error: Error,
-    fallback_trailer: Option<&ObjectHandle>,
-    preexisting_entries: Option<&BTreeMap<ObjectRef, XrefEntry>>,
-    preexisting_raw_entries: Option<&BTreeMap<QpdfObjGen, XrefEntry>>,
-    deleted_objects: &BTreeSet<u32>,
+    trigger_warning: Option<Error>,
+    fallback_trailer: Option<ObjectHandle>,
+    preexisting_entries: Option<BTreeMap<ObjectRef, XrefEntry>>,
+    preexisting_raw_entries: Option<BTreeMap<QpdfObjGen, XrefEntry>>,
+    deleted_objects: BTreeSet<u32>,
     options: XrefLoadOptions,
-    mut repair_diagnostics: Diagnostics,
+    repair_diagnostics: Diagnostics,
     observed_first_xref_item_offset: Option<u64>,
-    // qpdf mutates `m->uncompressed_after_compressed` (a sibling member set
-    // right next to `m->first_xref_item_offset`, `QPDF.cc:1112` vs
-    // `:1117-1119`) while scanning the section whose later row triggered
-    // this reconstruction, so it survives the exception the same way. Unlike
-    // the offset, this flag is sticky and OR-accumulates rather than being
-    // superseded by the reconstruction scan's own result -- there is no
-    // "unset" state to fall back from.
     observed_uncompressed_after_compressed: bool,
+    mode: XrefReconstructionMode<'source>,
+}
+
+pub(crate) fn reconstruct_xref_on_owner(
+    request: XrefReconstructionRequest<'_>,
     canonical_trailer_owner: &dyn CanonicalTrailerOwner,
-) -> Result<LoadedXrefState> {
+) -> Result<XrefReconstructionResult> {
+    let mut input = match request {
+        XrefReconstructionRequest::Open {
+            bytes,
+            version,
+            startxref,
+            trigger_error,
+            trigger_warning,
+            fallback_trailer,
+            preexisting_entries,
+            preexisting_raw_entries,
+            deleted_objects,
+            options,
+            repair_diagnostics,
+            observed_first_xref_item_offset,
+            observed_uncompressed_after_compressed,
+        } => PreparedXrefReconstruction {
+            trigger_error,
+            trigger_warning,
+            fallback_trailer,
+            preexisting_entries,
+            preexisting_raw_entries,
+            deleted_objects,
+            options,
+            repair_diagnostics,
+            observed_first_xref_item_offset,
+            observed_uncompressed_after_compressed,
+            mode: XrefReconstructionMode::Open {
+                bytes,
+                version,
+                startxref,
+            },
+        },
+        XrefReconstructionRequest::DelayedResolution {
+            trigger_error,
+            trigger_warning,
+            options,
+        } => {
+            let registration = canonical_trailer_owner.xref_registration();
+            // Candidate xref-stream discovery can re-enter resolution while
+            // the outer reconstruction has already armed the qpdf guard but
+            // has not recovered a trailer yet. Capture the current owner
+            // state and let the guard return the original trigger first.
+            let fallback_trailer = canonical_trailer_owner.current_trailer();
+            PreparedXrefReconstruction {
+                trigger_error,
+                trigger_warning,
+                fallback_trailer,
+                preexisting_entries: Some(registration.snapshot()),
+                preexisting_raw_entries: Some(registration.raw_snapshot()),
+                deleted_objects: registration.deleted_objects_snapshot(),
+                options,
+                repair_diagnostics: Diagnostics::default(),
+                observed_first_xref_item_offset: None,
+                observed_uncompressed_after_compressed: false,
+                mode: XrefReconstructionMode::DelayedResolution,
+            }
+        }
+    };
+
     if !canonical_trailer_owner.begin_xref_reconstruction() {
         // qpdf's `reconstruct_xref` returns the original trigger if a second
         // attempt enters the same document (`QPDF.cc:518-522`).
-        return Err(trigger_error);
+        return Err(input.trigger_error);
     }
     // qpdf gates both trailer recovery paths on the live m->trailer state
     // (QPDF.cc:564-577). Prefer the document owner; the argument is only the
     // loader's derived snapshot from the already parsed current section.
     let fallback_trailer = canonical_trailer_owner
         .current_trailer()
-        .or_else(|| fallback_trailer.cloned());
+        .or(input.fallback_trailer.take());
+    let startxref_for_warning = match &input.mode {
+        XrefReconstructionMode::Open { startxref, .. } => Some(*startxref),
+        XrefReconstructionMode::DelayedResolution => None,
+    };
+    let mut repair_diagnostics = std::mem::take(&mut input.repair_diagnostics);
     // qpdf mutates `m->first_xref_item_offset` while reading object 0's row,
     // before a later row can throw, and `reconstruct_xref` preserves that
     // member across the exception (`QPDF.cc:846-869, 626-708`). Rust's
@@ -2207,9 +2325,12 @@ fn recover_xref_from_linear_scan(
     // sentinel value.
     push_repair_diagnostics(
         &mut repair_diagnostics,
-        &trigger_error,
-        startxref,
-        &options.description,
+        input
+            .trigger_warning
+            .as_ref()
+            .unwrap_or(&input.trigger_error),
+        startxref_for_warning,
+        &input.options.description,
     );
     deliver_canonical_diagnostics(canonical_trailer_owner, &mut repair_diagnostics)?;
 
@@ -2224,14 +2345,16 @@ fn recover_xref_from_linear_scan(
     let recovered = recover_xref_entries_from_source(
         canonical_trailer_owner,
         fallback_trailer.is_none(),
-        &options.description,
-        deleted_objects,
+        &input.options.description,
+        &input.deleted_objects,
     )
     .map_err(|error| {
-        // cov:ignore-start: defensive open-failure wrapper after a line-scan parser error; the live sink boundary is covered by Pdf open failure tests
-        with_xref_open_diagnostics(error, canonical_trailer_owner)
+        if matches!(&input.mode, XrefReconstructionMode::Open { .. }) {
+            with_xref_open_diagnostics(error, canonical_trailer_owner)
+        } else {
+            error
+        }
     })?;
-    // cov:ignore-end
     // qpdf keeps the owner deletion filter through the complete line scan and
     // clears it only when that scan succeeds, immediately before candidate
     // xref-stream reread (QPDF.cc:575-576).
@@ -2252,7 +2375,7 @@ fn recover_xref_from_linear_scan(
     // type-0 row in the table, and compressed rows survive as well. Carry those
     // non-uncompressed rows into the candidate re-entry while allowing the
     // line scan's reconstructed type-1 rows to take precedence.
-    if let Some(preexisting_entries) = preexisting_entries {
+    if let Some(preexisting_entries) = input.preexisting_entries.as_ref() {
         for (&object_ref, &entry) in preexisting_entries {
             if !matches!(entry, XrefEntry::Uncompressed { .. }) {
                 entries.entry(object_ref).or_insert(entry);
@@ -2284,6 +2407,10 @@ fn recover_xref_from_linear_scan(
     // caller (`load_xref_state_from_window`) always overwrites it via
     // `merge_recovered_qpdf_state` with the already-successfully-parsed
     // revision's own real form once this returns.
+    let original_startxref = match &input.mode {
+        XrefReconstructionMode::Open { startxref, .. } => Some(*startxref),
+        XrefReconstructionMode::DelayedResolution => None,
+    };
     let mut candidate_xref_reentered = false;
     let (
         trailer,
@@ -2292,53 +2419,68 @@ fn recover_xref_from_linear_scan(
         recovered_first_xref_item_offset,
         recovered_uncompressed_after_compressed,
     ) = if let Some(trailer) = fallback_trailer {
-        (trailer.clone(), startxref, XrefForm::Table, 0, false)
+        (
+            trailer.clone(),
+            original_startxref,
+            XrefForm::Table,
+            0,
+            false,
+        )
     } else {
         match recovered.trailer {
-            Some(trailer) => (trailer, startxref, XrefForm::Table, 0, false),
-            None => match recover_trailer_from_xref_stream_candidate(
-                bytes,
-                &version,
-                options.clone(),
-                &mut entries,
-                &mut parsed_xref_streams,
-                &mut repair_diagnostics,
-                &mut extra_trailer_references,
-                canonical_trailer_owner,
-            ) {
-                Ok((
-                    trailer,
-                    max_offset,
-                    form,
-                    _deleted_objects,
-                    first_xref_item_offset,
-                    uncompressed_after_compressed,
-                )) => {
-                    // Candidate re-entry has completed its own `/Size` check;
-                    // the helper clears its owner-held tombstones before it
-                    // returns, so none outlive this recovery operation.
-                    candidate_xref_reentered = true;
-                    (
+            Some(trailer) => (trailer, original_startxref, XrefForm::Table, 0, false),
+            None => {
+                let (bytes, version) = match &input.mode {
+                    XrefReconstructionMode::Open { bytes, version, .. } => {
+                        (*bytes, version.as_str())
+                    }
+                    XrefReconstructionMode::DelayedResolution => unreachable!(), // cov:ignore: qpdf resolves only after the trailer is parsed
+                };
+                match recover_trailer_from_xref_stream_candidate(
+                    bytes,
+                    version,
+                    input.options.clone(),
+                    &mut entries,
+                    &mut parsed_xref_streams,
+                    &mut repair_diagnostics,
+                    &mut extra_trailer_references,
+                    canonical_trailer_owner,
+                ) {
+                    Ok((
                         trailer,
                         max_offset,
                         form,
+                        _deleted_objects,
                         first_xref_item_offset,
                         uncompressed_after_compressed,
-                    )
+                    )) => {
+                        // Candidate re-entry has completed its own `/Size` check;
+                        // the helper clears its owner-held tombstones before it
+                        // returns, so none outlive this recovery operation.
+                        candidate_xref_reentered = true;
+                        (
+                            trailer,
+                            Some(max_offset),
+                            form,
+                            first_xref_item_offset,
+                            uncompressed_after_compressed,
+                        )
+                    }
+                    Err(candidate_error) => {
+                        return Err(with_xref_open_diagnostics(
+                            candidate_error,
+                            canonical_trailer_owner,
+                        ));
+                    }
                 }
-                Err(candidate_error) => {
-                    return Err(with_xref_open_diagnostics(
-                        candidate_error,
-                        canonical_trailer_owner,
-                    ));
-                }
-            },
+            }
         }
     };
-    let recovered_first_xref_item_offset =
-        observed_first_xref_item_offset.unwrap_or(recovered_first_xref_item_offset);
+    let recovered_first_xref_item_offset = input
+        .observed_first_xref_item_offset
+        .unwrap_or(recovered_first_xref_item_offset);
     let recovered_uncompressed_after_compressed =
-        observed_uncompressed_after_compressed || recovered_uncompressed_after_compressed;
+        input.observed_uncompressed_after_compressed || recovered_uncompressed_after_compressed;
 
     let mut trailer_references = collect_trailer_references(&trailer);
     trailer_references.extend(extra_trailer_references);
@@ -2360,7 +2502,7 @@ fn recover_xref_from_linear_scan(
     // reconstruction replaces only the uncompressed rows
     // (`QPDF.cc:516-575`). Retain those exact raw identities for the later
     // resolver census; the effective ObjectRef map must still omit them.
-    if let Some(preexisting_raw_entries) = preexisting_raw_entries {
+    if let Some(preexisting_raw_entries) = input.preexisting_raw_entries.as_ref() {
         for (&object_gen, &entry) in preexisting_raw_entries {
             if !matches!(entry, XrefEntry::Uncompressed { .. }) {
                 raw_entries.entry(object_gen).or_insert(entry);
@@ -2384,23 +2526,31 @@ fn recover_xref_from_linear_scan(
     // snapshot: the outer Pdf-open handoff must not reinstall a stale loader
     // snapshot after the document guard has been armed.
     canonical_trailer_owner.install_raw_xref_entries(raw_entries.clone());
-    Ok(LoadedXrefState {
-        loaded: LoadedXref {
-            version,
-            startxref: recovered_startxref,
-            entries,
-            trailer,
-            last_xref_form: recovered_form,
-            repair_diagnostics,
-        },
-        raw_entries,
-        first_xref_item_offset: recovered_first_xref_item_offset,
-        classic_trailer_offset: None,
-        trailer_references,
-        parsed_xref_streams,
-        header_offset: 0,
-        uncompressed_after_compressed: recovered_uncompressed_after_compressed,
-    })
+    match input.mode {
+        XrefReconstructionMode::Open { version, .. } => {
+            Ok(XrefReconstructionResult::Open(Box::new(LoadedXrefState {
+                loaded: LoadedXref {
+                    version,
+                    startxref: recovered_startxref
+                        .expect("open reconstruction carries its original or recovered startxref"),
+                    entries,
+                    trailer,
+                    last_xref_form: recovered_form,
+                    repair_diagnostics,
+                },
+                raw_entries,
+                first_xref_item_offset: recovered_first_xref_item_offset,
+                classic_trailer_offset: None,
+                trailer_references,
+                parsed_xref_streams,
+                header_offset: 0,
+                uncompressed_after_compressed: recovered_uncompressed_after_compressed,
+            })))
+        }
+        XrefReconstructionMode::DelayedResolution => {
+            Ok(XrefReconstructionResult::DelayedResolution)
+        }
+    }
 }
 
 fn merge_recovered_qpdf_state(
@@ -2412,7 +2562,7 @@ fn merge_recovered_qpdf_state(
         repair_diagnostics.push(diagnostic.clone());
     }
     recovered.loaded.repair_diagnostics = repair_diagnostics;
-    // `recover_xref_from_linear_scan` is only ever called with a
+    // `reconstruct_xref_on_owner` is only ever called with a
     // `fallback_trailer` from this merge's caller, and that always wins the
     // trailer (see its own doc comment) -- so `accumulated`'s xref form,
     // the already-successfully-parsed newest revision's real one, is always
@@ -2426,7 +2576,7 @@ fn merge_recovered_qpdf_state(
         .classic_trailer_offset
         .or(recovered.classic_trailer_offset);
     // The reconstruction scan's own `insertReconstructedXrefEntry` filter was
-    // already applied inside `recover_xref_from_linear_scan`, which is where
+    // already applied inside `reconstruct_xref_on_owner`, which is where
     // qpdf applies it (`QPDF.cc:1197-1210`). Rows that were already in
     // `m->xref_table` when reconstruction started survive regardless of that
     // filter -- qpdf never retroactively erases them -- so this merge only
@@ -2482,10 +2632,9 @@ pub(crate) struct RecoveredXref {
 /// is registered in `deleted_objects` -- is shared verbatim by every caller
 /// of this scan, whether it runs at document-open time (a real,
 /// possibly-nonempty `deleted_objects` inherited from the xref parse that
-/// just failed) or at resolve time ([`recover_xref_entries`] always passes
-/// an empty set here, because qpdf's own `m->deleted_objects` is guaranteed
-/// clear by the time a resolved document can retry `readObjectAtOffset`;
-/// see that function's doc comment).
+/// just failed) or at resolve time. qpdf's `m->deleted_objects` is guaranteed
+/// clear by the time a resolved document can retry `readObjectAtOffset`, so
+/// the same owner operation observes an empty set there.
 fn insert_reconstructed_xref_entry(
     entries: &mut BTreeMap<ObjectRef, XrefEntry>,
     object_ref: ObjectRef,
@@ -2497,27 +2646,11 @@ fn insert_reconstructed_xref_entry(
     }
 }
 
-/// Replay only the object-offset half of qpdf's `reconstruct_xref` line scan
-/// over a byte buffer, for the resolver's own xref rescan.
-///
-/// The trailer half of `reconstruct_xref` (`QPDF.cc:564-575`) needs the
-/// document's parser context to build handles, so it lives on the canonical
-/// live-source scanner [`recover_xref_entries_from_source`] instead. qpdf
-/// reaches both halves from the same function; this buffer entry point is the
-/// one `ResolverHandle` uses when it re-scans a source whose trailer it
-/// already holds.
-///
-/// qpdf's `m->deleted_objects` is populated only while a normal xref
-/// table/stream chain is being registered (`insertFreeXrefEntry`,
-/// `QPDF.cc:1186-1192`) and is cleared once that registration finishes
-/// (`QPDF.cc:686-708`). The resolve-time retry this function serves
-/// (`QPDF::readObjectAtOffset`'s catch at `QPDF.cc:1614-1637`) runs strictly
-/// after the document's own open-time xref registration has already
-/// completed and cleared it, and performs no xref registration of its own
-/// before reaching this scan, so `m->deleted_objects` is always empty here
-/// -- this passes that empty set explicitly via
-/// [`insert_reconstructed_xref_entry`] rather than omitting the check.
-pub(crate) fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, XrefEntry>> {
+/// Byte-backed scan helper for parser unit fixtures. Production recovery uses
+/// [`recover_xref_entries_from_source`] from the shared owner operation so both
+/// entrypoints scan and update the same live source/table.
+#[cfg(test)]
+fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, XrefEntry>> {
     let no_deleted_objects = BTreeSet::new();
     let mut entries = BTreeMap::new();
     let mut line_start = 0usize;
@@ -2563,7 +2696,10 @@ fn recover_xref_entries_from_source(
     let mut line = Vec::new();
     let mut line_start = 0u64;
     let mut position = 0u64;
-    let mut chunk = [0u8; 8192];
+    // qpdf `FileInputSource::findAndSkipNextEOL` reads in 10,240-byte blocks
+    // (`libqpdf/FileInputSource.cc:53-64`). Keep the requested length aligned
+    // so a source-read QPDFExc reports the same `read N bytes` detail.
+    let mut chunk = [0u8; 10_240];
 
     let mut process_line = |line: &[u8], line_start: u64, next_line_start: u64| {
         let Some(first_token) = read_scan_token(line, 0, line.len()) else {
@@ -2596,17 +2732,32 @@ fn recover_xref_entries_from_source(
                 }
             } // cov:ignore: LLVM maps the successful trailer-candidate edge to the inner dictionary branch
             owner.source_seek(next_line_start)?;
-        } else if let Some((object_ref, offset)) =
-            scan_object_header_after_first_token(line, &first_token)?
-        {
-            registration
-                .insert_reconstructed_xref_entry(object_ref, line_start.saturating_add(offset));
-            insert_reconstructed_xref_entry(
-                &mut entries,
-                object_ref,
-                line_start.saturating_add(offset),
-                deleted_objects,
-            );
+        } else {
+            // qpdf reads the generation and `obj` tokens from the file rather
+            // than from the current line (`QPDF.cc:556-559` calls `readToken`
+            // on `m->file`), so a header split across lines -- `1\n0\nobj` --
+            // is still recovered. Retry with the following bytes appended when
+            // the line alone does not complete the header.
+            let mut header = scan_object_header_after_first_token(line, &first_token)?;
+            if header.is_none() && first_token.is_integer() {
+                let mut lookahead = line.to_vec();
+                lookahead.push(b'\n');
+                owner.source_seek(next_line_start)?;
+                let mut following = vec![0u8; OBJECT_HEADER_LOOKAHEAD];
+                let read = owner.source_read(&mut following)?;
+                lookahead.extend_from_slice(&following[..read]);
+                header = scan_object_header_after_first_token(&lookahead, &first_token)?;
+            }
+            if let Some((object_ref, offset)) = header {
+                registration
+                    .insert_reconstructed_xref_entry(object_ref, line_start.saturating_add(offset));
+                insert_reconstructed_xref_entry(
+                    &mut entries,
+                    object_ref,
+                    line_start.saturating_add(offset),
+                    deleted_objects,
+                );
+            }
         }
         Ok(())
     };
@@ -2980,13 +3131,15 @@ fn is_xref_stream_dict(context: &mut dyn XrefObjectContext, dict: &ObjectHandle)
 /// subsequent failures from the retry-at-offset-0 detour are not reported
 /// because qpdf has no such detour and they have no counterpart on its
 /// stderr. The triggering error's warning carries that error's own byte
-/// offset when available (falling back to the `startxref` offset); the
-/// surrounding warnings carry no offset, matching qpdf, which reports them
-/// at offset 0 and suppresses the display.
+/// offset when available (falling back to the `startxref` offset for the open
+/// route); the surrounding warnings carry no offset, matching qpdf, which
+/// reports them at offset 0 and suppresses the display. The delayed-resolution
+/// route supplies a qpdf-shaped `QpdfExc` directly, including its object and
+/// offset context.
 fn push_repair_diagnostics(
     diagnostics: &mut Diagnostics,
     trigger_error: &Error,
-    startxref: u64,
+    startxref: Option<u64>,
     filename: &[u8],
 ) {
     diagnostics.push(QpdfExc::new(
@@ -3060,7 +3213,7 @@ fn push_repair_diagnostics(
         _ => (
             Vec::new(),
             trigger_error.raw_message().unwrap_or_default().to_vec(),
-            startxref as i64,
+            startxref.map_or(0, |offset| offset as i64),
         ),
         // cov:ignore-end
     };
@@ -3239,6 +3392,7 @@ fn trailer_warning(filename: &[u8], message: impl Into<String>, offset: Option<u
 /// `findAndSkipNextEOL`, which collapses `\r\n` and blank lines). When
 /// `from < bytes.len()` the result is always strictly greater than `from`, so
 /// the line scan in [`recover_xref_entries`] always makes progress.
+#[cfg(test)]
 fn next_line_start(bytes: &[u8], from: usize) -> usize {
     let mut pos = from;
     while pos < bytes.len() && !matches!(bytes[pos], b'\n' | b'\r') {
@@ -3292,6 +3446,12 @@ fn parse_scan_integer(token: &Token) -> Result<i32> {
 /// token read to `next_line_start`), the second and third tokens may spill onto
 /// following lines, and the object/generation must satisfy qpdf's
 /// `insertReconstructedXrefEntry` guards (`obj > 0`, `0 <= gen < 65535`).
+/// Bytes read past a line's end when an object header's tokens straddle the
+/// line break. qpdf caps each recovery token at 100 bytes (`QPDF.cc:547`), and
+/// a header is three tokens, so this covers the generation and `obj` tokens
+/// with their separators.
+const OBJECT_HEADER_LOOKAHEAD: usize = 320;
+
 fn scan_object_header_after_first_token(
     bytes: &[u8],
     number_token: &Token,
@@ -4445,19 +4605,22 @@ mod final_handle_tests {
         let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Size 2 /Root 1 0 R >>\n".to_vec();
         let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), true, 801);
 
-        recover_xref_from_linear_scan(
-            &bytes,
-            "1.4".to_owned(),
-            999,
-            Error::parse(999, "xref not found"),
-            None,
-            None,
-            None,
-            &BTreeSet::new(),
-            XrefLoadOptions::default(),
-            Diagnostics::default(),
-            None,
-            false,
+        reconstruct_xref_on_owner(
+            XrefReconstructionRequest::Open {
+                bytes: &bytes,
+                version: "1.4".to_owned(),
+                startxref: 999,
+                trigger_error: Error::parse(999, "xref not found"),
+                trigger_warning: None,
+                fallback_trailer: None,
+                preexisting_entries: None,
+                preexisting_raw_entries: None,
+                deleted_objects: BTreeSet::new(),
+                options: XrefLoadOptions::default(),
+                repair_diagnostics: Diagnostics::default(),
+                observed_first_xref_item_offset: None,
+                observed_uncompressed_after_compressed: false,
+            },
             resolver.as_ref(),
         )
         .expect("the scanner should recover the direct trailer");
@@ -4483,22 +4646,29 @@ mod final_handle_tests {
         )]);
         assert!(resolver.set_trailer_if_uninitialized(canonical_trailer.clone()));
 
-        let recovered = recover_xref_from_linear_scan(
-            &bytes,
-            "1.4".to_owned(),
-            0,
-            Error::parse(0, "test reconstruction trigger"),
-            Some(&stale_snapshot),
-            None,
-            None,
-            &BTreeSet::new(),
-            XrefLoadOptions::default(),
-            Diagnostics::default(),
-            None,
-            false,
+        let recovered = match reconstruct_xref_on_owner(
+            XrefReconstructionRequest::Open {
+                bytes: &bytes,
+                version: "1.4".to_owned(),
+                startxref: 0,
+                trigger_error: Error::parse(0, "test reconstruction trigger"),
+                trigger_warning: None,
+                fallback_trailer: Some(stale_snapshot),
+                preexisting_entries: None,
+                preexisting_raw_entries: None,
+                deleted_objects: BTreeSet::new(),
+                options: XrefLoadOptions::default(),
+                repair_diagnostics: Diagnostics::default(),
+                observed_first_xref_item_offset: None,
+                observed_uncompressed_after_compressed: false,
+            },
             resolver.as_ref(),
         )
-        .expect("the owner-backed scan should recover the object and retained trailer");
+        .expect("the owner-backed scan should recover the object and retained trailer")
+        {
+            XrefReconstructionResult::Open(recovered) => *recovered,
+            XrefReconstructionResult::DelayedResolution => unreachable!(), // cov:ignore: test constructs only Open
+        };
 
         assert!(
             recovered
@@ -4516,19 +4686,22 @@ mod final_handle_tests {
         assert!(resolver.begin_xref_reconstruction());
         let trigger = Error::parse(999, "second xref reconstruction trigger");
 
-        let result = recover_xref_from_linear_scan(
-            &bytes,
-            "1.4".to_owned(),
-            999,
-            trigger,
-            None,
-            None,
-            None,
-            &BTreeSet::new(),
-            XrefLoadOptions::default(),
-            Diagnostics::default(),
-            None,
-            false,
+        let result = reconstruct_xref_on_owner(
+            XrefReconstructionRequest::Open {
+                bytes: &bytes,
+                version: "1.4".to_owned(),
+                startxref: 999,
+                trigger_error: trigger,
+                trigger_warning: None,
+                fallback_trailer: None,
+                preexisting_entries: None,
+                preexisting_raw_entries: None,
+                deleted_objects: BTreeSet::new(),
+                options: XrefLoadOptions::default(),
+                repair_diagnostics: Diagnostics::default(),
+                observed_first_xref_item_offset: None,
+                observed_uncompressed_after_compressed: false,
+            },
             resolver.as_ref(),
         );
 
@@ -6831,7 +7004,7 @@ mod final_handle_tests {
 
         for error in errors {
             let mut diagnostics = Diagnostics::default();
-            push_repair_diagnostics(&mut diagnostics, &error, 99, b"input.pdf");
+            push_repair_diagnostics(&mut diagnostics, &error, Some(99), b"input.pdf");
             assert_eq!(diagnostics.len(), 3);
             assert_eq!(
                 diagnostics.entries()[0].get_message_detail(),
@@ -6849,7 +7022,7 @@ mod final_handle_tests {
             &Error::System(
                 "overflow/underflow converting 9900000000000000000 to 64-bit integer".to_owned(),
             ),
-            99,
+            Some(99),
             b"input.pdf",
         );
         assert_eq!(

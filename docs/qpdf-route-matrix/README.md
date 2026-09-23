@@ -50,7 +50,7 @@ markdown だけを読むので `--no-qpdf`（CI の形）でも完全に動く�
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 140 | 0 | 21 | 0 | 161 |
+| 142 | 0 | 19 | 0 | 161 |
 
 ### checker logical aggregate（260 rows）
 
@@ -63,7 +63,7 @@ rowsを検証する。2026-09-20（`flpdf-ycb6l`、`QPDF::isLinearized` のB35�
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 231 | 0 | 29 | 0 | 260 |
+| 233 | 0 | 27 | 0 | 260 |
 
 したがって、161行の領域別表と260 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
@@ -141,7 +141,7 @@ C44は public facade と deferred blob の責務分離を追跡する mixed owne
 | ファイル | 行数 | canonical | bridge | mixed | unknown |
 |---|---|---|---|---|---|
 | [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 20 | 0 | 4 | 0 |
-| [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 35 | 30 | 0 | 5 | 0 |
+| [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 35 | 32 | 0 | 3 | 0 |
 | [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 42 | 0 | 0 | 0 |
 | [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 26 | 0 | 5 | 0 |
 | [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 22 | 0 | 7 | 0 |
@@ -170,12 +170,12 @@ C44は public facade と deferred blob の責務分離を追跡する mixed owne
 |---|---|---|---|
 | **warning sink は `m->warnings` 1 本で、順序は `warn` 呼び出し順そのもの**（`push_back` 以外に並べ替え・重複除去・分類は無い） | `libqpdf/QPDF.cc:487-494` / `include/qpdf/QPDF.hh:1475` | B28 canonical。B27 canonical `Pdf::open` は`.48.73`で xref/recoveryのfile/trailer/candidate diagnosticsを`ResolverHandle::push_qpdf_warning`へ呼出順に合流し、replay/install/deferred bridgeを撤去済み。owner-less public loader/exportとproduction callerは`.48.72`で撤去し、残るBootstrap stagingはtest-only bounded reconstruction scaffolding | canonicalとpublic reader routeのwarning orderはqpdf call orderで一度だけ配送される。test-only bootstrap diagnosticsはproduction contractとして扱わない。probe B-P4 |
 | **`suppress_warnings` は表示だけを止め、sink への push は常に起きる** | `libqpdf/QPDF.cc:487-494` | B28 canonical。`route_warning` が logger 行を組むのは push の後（`crates/flpdf/src/reader/resolver.rs:1911-1928`） | `--no-warn` 指定時に `hasWarnings()` が false になり exit code が 0 と 3 の間で変わる |
-| **resolve 境界で例外は必ず warning に降格し、未解決なら null になる**（`QPDF::resolve` から例外は出ない） | `libqpdf/QPDF.cc:1737-1742` / `libqpdf/QPDF.cc:1745-1749` | A4 canonical。B22 mixed — resolve 側の再構築経路は `flpdf-3yn9.48.19` で qpdf の retry 条件（`getType() == 1` 限定、それ以外は `not found in file after regenerating cross reference table` をwarn して null、`libqpdf/QPDF.cc:1618-1633`）に揃えた。ただし本番経路では再構築後に compressed entry が残らない（`install_source_xref_entries` がテーブルを丸ごと置換し `recover_xref_entries` は `Uncompressed` しか挿入しない）ため、compressed 側は qpdf 同様に防御的な分岐で、end-to-end 実証はP3 の probe として継続中（`libqpdf/QPDF.cc:1618-1633`） | qpdf が warn + null で続行する入力で flpdf が `Err` を返し、その object 以降の処理が止まる。probe B-P3 |
-| **回復予算は `bool` 1 個**（2 回目の `reconstruct_xref` は引数の例外をそのまま re-throw する。残り回数カウンタは存在しない） | `libqpdf/QPDF.cc:518-522` / `include/qpdf/QPDF.hh:1480` | B25 canonical — open / resolve 両経路が `ResolverHandle::begin_xref_reconstruction` を共有し、qpdf と同じ入口で guard を arm する。open / resolve の再構築本体の2実装分割は B22 mixed に残る。B34 bridge — qpdf に対応物のない 64 回の read-to-end fallback 予算（`crates/flpdf/src/pdf.rs:148-154`） | guard が scan 開始後まで未設定だと、2回目の reconstruct が許され、回復 warning と table 更新が qpdf と異なる |
+| **resolve 境界で例外は必ず warning に降格し、未解決なら null になる**（`QPDF::resolve` から例外は出ない） | `libqpdf/QPDF.cc:1737-1742` / `libqpdf/QPDF.cc:1745-1749` | A4 canonical。B22 canonical — `reconstruct_xref_on_owner` が open / resolve 共通で再構築し、resolver caller は qpdf の retry 条件（`getType() == 1` 限定、それ以外は `not found in file after regenerating cross reference table` を warn して null、`libqpdf/QPDF.cc:1618-1633`）を維持する。本番経路で再構築後の compressed entry は作られないため、その branch の direct fixture は P3 probe として残す | qpdf が warn + null で続行する入力で flpdf が `Err` を返し、その object 以降の処理が止まる。probe B-P3 |
+| **回復予算は `bool` 1 個**（2 回目の `reconstruct_xref` は引数の例外をそのまま re-throw する。残り回数カウンタは存在しない） | `libqpdf/QPDF.cc:518-522` / `include/qpdf/QPDF.hh:1480` | B25 canonical — open / resolve 両経路が `xref::reconstruct_xref_on_owner` を通じて owner guard を arm する。B22 の共有操作はこの guard から始まり、再試行では warning を出さず元の trigger を返す。B34 bridge — qpdf に対応物のない 64 回の read-to-end fallback 予算（`crates/flpdf/src/pdf.rs:148-154`） | guard が scan 開始後まで未設定だと、2回目の reconstruct が許され、回復 warning と table 更新が qpdf と異なる |
 | **reconstruct が xref から消すのは type 1 entry のみ。ObjStm の内部は意図的に走査しない** | `libqpdf/QPDF.cc:532-541` / `libqpdf/QPDF.cc:618-622` | B24 canonical（**両側 absent が 1:1 対応**）。B23 canonical で scan 本体は 2 経路が共有 | 回復後に compressed entry を復元すると、qpdf が到達しない object を出力に含める。コミット `6ddb9661` で 1 度是正済みの退行そのもの |
-| **xref entry の上書き規則は 3 primitive で違う**（`insertXrefEntry` = first-seen wins、`insertFreeXrefEntry` = 未登録時のみ、`insertReconstructedXrefEntry` = 後勝ち + `deleted_objects` 抑止） | `libqpdf/QPDF.cc:1149-1184` / `libqpdf/QPDF.cc:1187-1192` / `libqpdf/QPDF.cc:1197-1210` | B19 canonical。B20 canonical（2026-09-19、`flpdf-3yn9.48.176`） — 後勝ち上書きと `deleted_objects` 抑止を `crates/flpdf/src/xref.rs::insert_reconstructed_xref_entry` 1 関数へ統合し、resolve 側 `recover_xref_entries` と開 側 `recover_xref_entries_from_source` の両方がこれを呼ぶ構成にした。**guard（`obj > 0`、`0 <= gen < 65535`）はこの関数には入っていない**——flpdf の `ObjectRef` は範囲外の値を表現できないので、guard は `ObjectRef` を構築する前の `scan_object_header_after_first_token`（`xref.rs:3046-3049`）に残る。canonical と判定したのは**両段とも単一実装を両経路が共有する**（guard は `:3025` の 1 本を `:2269` と `:2339` が、上書き/抑止は 1 本を `:2271` と `:2341` が呼ぶ）からで、qpdf の 1 関数が flpdf で 2 段に分かれる点は経路数ではなく段の配置の差として B20 行に残置記録している（B20 行参照） | 増分更新 PDF でどの世代の object が読まれるかが変わる。`/XRefStm` が free 行の直後で壊れる入力で `qpdf --show-xref` と食い違っていた（probe B-P2 で実測・解消） |
+| **xref entry の上書き規則は 3 primitive で違う**（`insertXrefEntry` = first-seen wins、`insertFreeXrefEntry` = 未登録時のみ、`insertReconstructedXrefEntry` = 後勝ち + `deleted_objects` 抑止） | `libqpdf/QPDF.cc:1149-1184` / `libqpdf/QPDF.cc:1187-1192` / `libqpdf/QPDF.cc:1197-1210` | B19 canonical。B20 canonical（2026-09-19、`flpdf-3yn9.48.176`） — 後勝ち上書きと `deleted_objects` 抑止を `crates/flpdf/src/xref.rs::insert_reconstructed_xref_entry` 1 関数へ統合し、両経路が同じ `reconstruct_xref_on_owner` → `recover_xref_entries_from_source` scan を使う。**guard（`obj > 0`、`0 <= gen < 65535`）はこの関数には入っていない**——flpdf の `ObjectRef` は範囲外の値を表現できないので、guard は `ObjectRef` を構築する前の `scan_object_header_after_first_token` に残る。B22 の共有化で resolver 用 byte-buffer scanner は `#[cfg(test)]` helper になった。B20 の qpdf scan 時点への配置差は、deleted set がscan中に変わらないことと P2 fixture の qpdf byte parity により canonical と確認済み |
 | **`QPDF::readToken` は `allow_bad = true` を保証するが、全token consumerがこの責務ではない** | `libqpdf/QPDF.cc:1535-1539,1801-1814,846-946` | B7 canonical（`.48.175`）。5経路（classic xref subsection lookahead / `startxref` 値読み / trailerの`stream` lookahead / ObjStm header integers / reconstruct_xrefの行scan / `endstream`・`endobj` framing check）が `Tokenizer::read_qpdf_token` の1entrypointを共有する | `read_qpdf_token` が `allow_bad = true` を固定するので、falseを一律trueへ変える経路は無い。classic xrefのreadLine/parse_xrefEntry責務はByteCursorのまま維持される（B-P7） |
-| **`QPDFParser` は context があれば warn、無ければ同じ診断を例外に昇格する** | `libqpdf/QPDFParser.cc:487-498`（`libqpdf/QPDFParser.cc:496` が throw）/ `libqpdf/QPDFParser.cc:161-165` | B3 canonical（`has_context` 分岐 1 本）。B32 mixed — qpdf の 2 軸（例外クラス × `qpdf_error_code_e`）を `crates/flpdf/src/error.rs::Error` の 1 軸に畳んでいる | document なしの parse で構文エラーが黙って null になる。`Error::Parse` だけが reconstruct の trigger（`crates/flpdf/src/reader/resolver.rs:1615`）なので、振り分けを誤ると回復分岐自体が起きなくなる |
+| **`QPDFParser` は context があれば warn、無ければ同じ診断を例外に昇格する** | `libqpdf/QPDFParser.cc:487-498`（`libqpdf/QPDFParser.cc:496` が throw）/ `libqpdf/QPDFParser.cc:161-165` | B3 canonical（`has_context` 分岐 1 本）。B32 mixed — qpdf の 2 軸（例外クラス × `qpdf_error_code_e`）を `crates/flpdf/src/error.rs::Error` の variant に分ける | document なしの parse で構文エラーが黙って null になる。xref reconstruction は `Error::Parse` と `Error::QpdfExc` を受け、後者に相当する trigger だけを recovery に通す。非 PDF の I/O/system error は qpdf の `catch (QPDFExc&)` と同じく回復を起こさない |
 
 ### 5.C stream data provider / decode / retry / filter / encryption / `/Length`
 
@@ -328,8 +328,8 @@ crates/flpdf/src/xref.rs::resolve_objects_in_stream: prod 1 (1 files) / test 0
     crates/flpdf/src/xref.rs 1
 crates/flpdf/src/xref.rs::parse_xref_from_start: prod 3 (1 files) / test 6
     crates/flpdf/src/xref.rs 3
-crates/flpdf/src/reader/resolver.rs::reconstruct_xref_and_retry: prod 1 (1 files) / test 2
-    crates/flpdf/src/reader/resolver.rs 1
+crates/flpdf/src/reader/resolver.rs::reconstruct_xref_and_retry: prod 2 (1 files) / test 3
+    crates/flpdf/src/reader/resolver.rs 2
 crates/flpdf/src/xref.rs::XrefLoadOptions: prod 16 (2 files) / test 52
     crates/flpdf/src/xref.rs 15, crates/flpdf/src/engine.rs 1
 crates/flpdf/src/xref.rs::LoadedXref: prod 7 (1 files) / test 2
@@ -370,8 +370,10 @@ crates/flpdf/src/xref.rs::scan_object_header_after_first_token: prod 1 (1 files)
     crates/flpdf/src/xref.rs 1
 crates/flpdf/src/xref.rs::merge_recovered_qpdf_state: prod 3 (1 files) / test 0
     crates/flpdf/src/xref.rs 3
-crates/flpdf/src/xref.rs::recover_xref_from_linear_scan: prod 4 (1 files) / test 0
-    crates/flpdf/src/xref.rs 4
+crates/flpdf/src/xref.rs::reconstruct_xref_on_owner: prod 5 (2 files) / test 3
+    crates/flpdf/src/xref.rs 4, crates/flpdf/src/reader/resolver.rs 1
+crates/flpdf/src/xref.rs::recover_xref_entries_from_source: prod 1 (1 files) / test 2
+    crates/flpdf/src/xref.rs 1
 crates/flpdf/src/reader/resolver.rs::reconstructed_xref: prod 11 (2 files) / test 23
     crates/flpdf/src/reader/resolver.rs 7, crates/flpdf/src/reader.rs 4
 crates/flpdf/src/reader/resolver.rs::attempt_recovery: prod 13 (3 files) / test 1
@@ -382,7 +384,7 @@ crates/flpdf/src/object_handle.rs::format_qpdf_exception_what: prod 3 (3 files) 
     crates/flpdf/src/content_stream.rs 1, crates/flpdf/src/object_handle.rs 1, crates/flpdf/src/page_document_helper.rs 1
 crates/flpdf/src/error.rs::Error: prod 1273 (114 files) / test 592
     crates/flpdf/src/job/lifecycle.rs 110, crates/flpdf/src/xref.rs 103, crates/flpdf/src/writer.rs 80, crates/flpdf/src/reader/resolver.rs 71, crates/flpdf/src/object_handle.rs 68, crates/flpdf-cli/src/main.rs 47, crates/flpdf/src/linearization/writer.rs 46, crates/flpdf/src/page_splice.rs 30, crates/flpdf-qtest-tools/src/metadata.rs 27, crates/flpdf/src/page_object_helper.rs 26, crates/flpdf/src/writer/plain/plan.rs 24, crates/flpdf/src/object_copy.rs 22, crates/flpdf/src/nntree.rs 21, crates/flpdf/src/json/input.rs 20, crates/flpdf-qtest-tools/src/driver/test_10_17.rs 18, crates/flpdf/src/qdf_fix.rs 18, crates/flpdf/src/job/check.rs 16, crates/flpdf-qtest-tools/src/driver/test_80_87.rs 15, crates/flpdf/src/parser.rs 15, crates/flpdf/src/job/page_specs.rs 14, crates/flpdf/src/linearization/check.rs 14, crates/flpdf/src/stream_filter.rs 14, crates/flpdf/src/writer/plain/xref.rs 13, crates/flpdf-qtest-tools/src/bin/qpdf_ctest.rs 12, crates/flpdf-qtest-tools/src/driver/test_26_33.rs 12, crates/flpdf/src/error.rs 12, crates/flpdf/src/job/page_split.rs 12, crates/flpdf/src/writer/rewrite_renumber.rs 12, crates/flpdf-qtest-tools/src/driver/test_56_63.rs 11, crates/flpdf/src/job/page_combine.rs 11, crates/flpdf/src/writer/plain/body.rs 11, crates/flpdf/src/page_label_document_helper.rs 10, crates/flpdf/src/reader.rs 10, crates/flpdf-qtest-tools/src/driver/mod.rs 9, crates/flpdf-qtest-tools/src/driver/test_0_1.rs 9, crates/flpdf-qtest-tools/src/renumber.rs 9, crates/flpdf/src/engine.rs 9, crates/flpdf/src/filters.rs 9, crates/flpdf/src/job/attachments.rs 9, crates/flpdf/src/page_document_helper.rs 9, crates/flpdf/src/qutil.rs 9, crates/flpdf-qtest-tools/src/bin/qpdfjob_ctest.rs 8, crates/flpdf-qtest-tools/src/driver/test_72_79.rs 8, crates/flpdf/src/job/page_range.rs 8, crates/flpdf/src/job/rotate_spec.rs 8, crates/flpdf/src/json_inspect.rs 8, crates/flpdf/src/page_extract.rs 8, crates/flpdf/src/pages.rs 8, crates/flpdf-qtest-tools/src/driver/test_02_09.rs 7, crates/flpdf-qtest-tools/src/large_file.rs 7, crates/flpdf/src/filespec_helper/embedded_file_stream.rs 7, crates/flpdf/src/job/overlay.rs 7, crates/flpdf/src/job/page_merge.rs 7, crates/flpdf/src/tokenizer.rs 7, crates/flpdf-qtest-tools/src/driver/test_50_55.rs 6, crates/flpdf/src/acroform_document_helper.rs 6, crates/flpdf/src/writer/object.rs 6, crates/flpdf/src/job/inspection.rs 5, crates/flpdf/src/job/page_plan.rs 5, crates/flpdf/src/linearization/back_patch.rs 5, crates/flpdf/src/linearization/plan.rs 5, crates/flpdf/src/linearization/show.rs 5, crates/flpdf/src/logger.rs 5, crates/flpdf/src/page_annotation_flatten.rs 5, crates/flpdf/src/pages/tree_rebuild.rs 5, crates/flpdf/src/reader/file_object.rs 5, crates/flpdf/src/writer/encrypted_strings.rs 5, crates/flpdf/src/content_stream.rs 4, crates/flpdf/src/filespec_helper/shared.rs 4, crates/flpdf/src/json/document.rs 4, crates/flpdf/src/pipeline/stdio_file.rs 4, crates/flpdf-libjpeg-compat/src/ffi.rs 3, crates/flpdf/src/diagnostics.rs 3, crates/flpdf/src/encryption/password.rs 3, crates/flpdf/src/encryption/state.rs 3, crates/flpdf/src/form_field_object_helper.rs 3, crates/flpdf/src/form_field_object_helper/rendering.rs 3, crates/flpdf/src/optimization/inherited_attrs.rs 3, crates/flpdf/src/pages/repair.rs 3, crates/flpdf-qtest-tools/src/character_encoding.rs 2, crates/flpdf-qtest-tools/src/compare.rs 2, crates/flpdf-qtest-tools/src/driver/test_42_49.rs 2, crates/flpdf-qtest-tools/src/driver/test_88_98.rs 2, crates/flpdf/src/embedded_files.rs 2, crates/flpdf/src/filespec_helper/filespec.rs 2, crates/flpdf/src/job/acroform_field_prune.rs 2, crates/flpdf/src/job/json.rs 2, crates/flpdf/src/job/outline_dest_remap.rs 2, crates/flpdf/src/job/rotate.rs 2, crates/flpdf/src/linearization/hint_stream.rs 2, crates/flpdf/src/pdf.rs 2, crates/flpdf/src/signatures.rs 2, crates/flpdf/src/writer/object_streams/emission.rs 2, crates/flpdf/src/writer/pclm.rs 2, crates/flpdf-qtest-tools/src/bin/test_parsedoffset.rs 1, crates/flpdf-qtest-tools/src/bin/test_xref.rs 1, crates/flpdf-qtest-tools/src/document_construction.rs 1, crates/flpdf-qtest-tools/src/driver/handle.rs 1, crates/flpdf-qtest-tools/src/driver/test_34_41.rs 1, crates/flpdf-qtest-tools/src/driver/test_64_71.rs 1, crates/flpdf-qtest-tools/src/tokenizer_runner.rs 1, crates/flpdf/src/bit_stream.rs 1, crates/flpdf/src/encryption/primitives.rs 1, crates/flpdf/src/encryption/standard.rs 1, crates/flpdf/src/job/image_optimization.rs 1, crates/flpdf/src/json/handler.rs 1, crates/flpdf/src/json/value.rs 1, crates/flpdf/src/optimization.rs 1, crates/flpdf/src/outline_document_helper.rs 1, crates/flpdf/src/page_form_xobject.rs 1, crates/flpdf/src/pipeline.rs 1, crates/flpdf/src/resources.rs 1, crates/flpdf/src/struct_tree_pg.rs 1, crates/flpdf/src/writer/serialize.rs 1
-crates/flpdf/src/xref.rs::push_repair_diagnostics: prod 2 (1 files) / test 0
+crates/flpdf/src/xref.rs::push_repair_diagnostics: prod 2 (1 files) / test 2
     crates/flpdf/src/xref.rs 2
 crates/flpdf/src/object_handle.rs::pipe_stream_data_for_object_stream: prod 1 (1 files) / test 0
     crates/flpdf/src/reader/resolver.rs 1
@@ -675,11 +677,11 @@ A11 を A10 の後に置いた理由で、当時の facade `Pdf::next_available_
 3. **B8〜B13 / B34** — canonical file-object/header/stream/trailer責務へbootstrap consumerを移す。
    B10のEOL warning、B11のrecovery、B13のreadTrailer、B34のfallback撤去をbounded sliceに分ける。
 4. **B22 / B25** — canonical reconstructと3種のxref登録primitiveへconsumerを順次移行する。
-   B20（guard/後勝ち/抑止を1つのprimitiveへ束ねる作業）は2026-09-19（`flpdf-3yn9.48.176`）に完了しcanonicalへ移った。
-   残るB22/B25はopen時/resolve時で`Pdf`/`ResolverHandle`構築タイミングが異なるdocument-lifecycle由来の分裂で、
-   B20と同じ関数統合では解消しない。
-5. **B27 / B28 / B30 / B32 / B33** — bootstrap handoff・warning配送・例外分類を同じownerへ寄せる。
-   warning順序とresolve境界のwarn/null降格を各sliceで検証する。
+   B20（guard/後勝ち/抑止を1つのprimitiveへ束ねる作業）は2026-09-19（`flpdf-3yn9.48.176`）に完了し、
+   B22（open / resolve の共有 owner reconstruction operation）と B33（3連 warning sequence）は2026-09-23 に canonical 化した。
+   B25 の guard は共有 operation の入口で owner から読む。B34 の read-to-end fallback bridge は独立に残る。
+5. **B27 / B28 / B30 / B32** — bootstrap handoff・warning配送・例外分類を同じownerへ寄せる。
+   warning collection と resolve 境界の warn/null 降格を各sliceで検証する。
 6. **B14** — 自己参照Prevの既存probeでは二重warningは再現しない。visited初期化の変更を先に決めず、
    他のchain条件と読取順を確認する。
 
