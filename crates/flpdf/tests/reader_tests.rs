@@ -6,7 +6,7 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::{
     DecodeLevel, EncryptMethod, EncryptParams, EncryptedError, Error, ObjectHandle, ObjectRef, Pdf,
-    PdfOpenOptions, PdfWriter, XrefEntry,
+    PdfOpenOptions, PdfWriter, QpdfErrorCode, XrefEntry,
 };
 use md5::{Digest, Md5};
 use std::fs::File;
@@ -230,6 +230,122 @@ fn committed_encrypted_fixture(name: &str) -> Vec<u8> {
         .join(name);
     std::fs::read(&path)
         .unwrap_or_else(|err| panic!("read encrypted fixture {}: {err}", path.display()))
+}
+
+fn replace_pdf_token_once(mut bytes: Vec<u8>, from: &[u8], to: &[u8]) -> Vec<u8> {
+    assert_eq!(
+        from.len(),
+        to.len(),
+        "fixture edit must preserve byte offsets"
+    );
+    let matches = bytes
+        .windows(from.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == from).then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(matches.len(), 1, "expected one occurrence of {from:?}");
+    let start = matches[0];
+    bytes[start..start + to.len()].copy_from_slice(to);
+    bytes
+}
+
+fn replace_pdf_hex_string_with_null(mut bytes: Vec<u8>, key: &[u8]) -> Vec<u8> {
+    let mut marker = key.to_vec();
+    marker.extend_from_slice(b" <");
+    assert_eq!(
+        bytes.windows(marker.len()).filter(|w| *w == marker).count(),
+        1
+    );
+    let start = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("dictionary has one hex string for key");
+    let value_start = start + key.len() + 1;
+    let end = value_start
+        + bytes[value_start..]
+            .iter()
+            .position(|byte| *byte == b'>')
+            .expect("hex string has a closing delimiter")
+        + 1;
+    let span_len = end - value_start;
+    assert!(span_len >= b"null".len());
+    bytes[value_start..end].fill(b' ');
+    bytes[value_start..value_start + b"null".len()].copy_from_slice(b"null");
+    bytes
+}
+
+fn replace_pdf_hex_string_with_literal(mut bytes: Vec<u8>, key: &[u8], literal: &[u8]) -> Vec<u8> {
+    let mut marker = key.to_vec();
+    marker.extend_from_slice(b" <");
+    assert_eq!(
+        bytes.windows(marker.len()).filter(|w| *w == marker).count(),
+        1
+    );
+    let start = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("dictionary has one hex string for key");
+    let value_start = start + key.len() + 1;
+    let end = value_start
+        + bytes[value_start..]
+            .iter()
+            .position(|byte| *byte == b'>')
+            .expect("hex string has a closing delimiter")
+        + 1;
+    let span_len = end - value_start;
+    let literal_len = literal.len() + 2;
+    assert!(literal_len <= span_len);
+    bytes[value_start..end].fill(b' ');
+    bytes[value_start] = b'(';
+    bytes[value_start + 1..value_start + 1 + literal.len()].copy_from_slice(literal);
+    bytes[value_start + 1 + literal.len()] = b')';
+    bytes
+}
+
+fn replace_pdf_encrypt_reference_with_integer(mut bytes: Vec<u8>) -> Vec<u8> {
+    let marker = b"/Encrypt ";
+    assert_eq!(
+        bytes.windows(marker.len()).filter(|w| *w == marker).count(),
+        1
+    );
+    let start = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("trailer has one /Encrypt key");
+    let value_start = start + marker.len();
+    let relative_end = bytes[value_start..]
+        .windows(2)
+        .position(|window| window == b" R")
+        .expect("/Encrypt value is an indirect reference");
+    let end = value_start + relative_end + 2;
+    let value_len = end - value_start;
+    assert!(value_len >= b"1234".len());
+    bytes[value_start..end].fill(b' ');
+    bytes[value_start..value_start + b"1234".len()].copy_from_slice(b"1234");
+    bytes
+}
+
+fn assert_qpdf_encryption_error(
+    error: &Error,
+    code: QpdfErrorCode,
+    filename: &[u8],
+    object: &[u8],
+    message: &[u8],
+) -> i64 {
+    let terminal = error.open_failure().map_or(error, |(source, _)| source);
+    let Error::QpdfExc(exception) = terminal else {
+        panic!("expected qpdf-shaped exception, got {error:?}");
+    };
+    assert_eq!(exception.get_error_code(), code);
+    assert_eq!(exception.get_filename(), filename);
+    assert_eq!(exception.get_object(), object);
+    assert_eq!(exception.get_message_detail(), message);
+    assert!(exception.get_file_position() > 0);
+    assert_eq!(
+        error.raw_message().expect("qpdf-shaped open error"),
+        exception.what_bytes()
+    );
+    exception.get_file_position()
 }
 
 #[test]
@@ -1265,9 +1381,9 @@ fn explicit_identity_after_flate_consumes_recovered_eol_in_source_representation
 }
 
 #[test]
-fn r5_and_r6_reject_malformed_encrypt_metadata() {
+fn r5_and_r6_default_non_boolean_encrypt_metadata_to_true() {
     for revision in [5, 6] {
-        let err = match Pdf::open_with_options(
+        let pdf = Pdf::open_with_options(
             std::io::Cursor::new(encrypted_r5_or_r6_pdf(
                 revision,
                 " /EncryptMetadata /false",
@@ -1277,14 +1393,21 @@ fn r5_and_r6_reject_malformed_encrypt_metadata() {
                 password: b"userpass".to_vec(),
                 ..PdfOpenOptions::default()
             },
-        ) {
-            Ok(_) => panic!("malformed /EncryptMetadata should be rejected"),
-            Err(err) => err,
-        };
+        )
+        .unwrap_or_else(|error| {
+            panic!("qpdf defaults non-boolean /EncryptMetadata to true for R={revision}: {error:?}")
+        });
 
+        assert_eq!(
+            pdf.permissions().expect("encrypted fixture has /P").raw(),
+            -3904,
+            "qpdf retains the encryption dictionary for R={revision}"
+        );
         assert!(
-            matches!(err, Error::Encrypted(EncryptedError::Malformed { .. })),
-            "expected Malformed for R={revision}, got {err:?}"
+            !pdf.repair_diagnostics().entries().iter().any(|entry| {
+                String::from_utf8_lossy(entry.get_message_detail()).contains("/Perms")
+            }),
+            "the matching /Perms value is valid when non-boolean /EncryptMetadata defaults to true for R={revision}"
         );
     }
 }
@@ -1589,6 +1712,15 @@ fn encrypted_r5_or_r6_pdf(revision: i64, encrypt_suffix: &str, extra_objects: &[
         ),
         _ => panic!("unsupported revision"),
     };
+    // qpdf requires a string-valued `/Perms` for V=5 during
+    // initializeEncryption. Keep normal synthetic fixtures valid while
+    // preserving cases that explicitly provide malformed or mismatched data.
+    let default_perms_suffix = if encrypt_suffix.contains("/Perms") {
+        String::new()
+    } else {
+        let perms = r6_perms_entry(-3904, true);
+        format!(" /Perms <{}>", hex_string(&perms))
+    };
 
     let mut bytes = b"%PDF-2.0\n".to_vec();
     let obj1_offset = bytes.len();
@@ -1608,7 +1740,7 @@ fn encrypted_r5_or_r6_pdf(revision: i64, encrypt_suffix: &str, extra_objects: &[
     }
     bytes.extend_from_slice(
         format!(
-            "trailer\n<< /Size {size} /Root 1 0 R /Encrypt << /Filter /Standard /V 5 /R {revision} /Length 256 /P -3904 /O <{o}> /U <{u}> /OE <{oe}> /UE <{ue}>{encrypt_suffix} >> /ID [<000102030405060708090a0b0c0d0e0f><000102030405060708090a0b0c0d0e0f>] >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            "trailer\n<< /Size {size} /Root 1 0 R /Encrypt << /Filter /Standard /V 5 /R {revision} /Length 256 /P -3904 /O <{o}> /U <{u}> /OE <{oe}> /UE <{ue}>{encrypt_suffix}{default_perms_suffix} >> /ID [<000102030405060708090a0b0c0d0e0f><000102030405060708090a0b0c0d0e0f>] >>\nstartxref\n{xref_offset}\n%%EOF\n"
         )
         .as_bytes(),
     );
@@ -1669,8 +1801,9 @@ fn encrypted_v4_mixed_cf_reader_fixture() -> Vec<u8> {
     bytes
 }
 
-/// qpdf requires `/V` and `/R` together, before any password work, and throws
-/// `damagedPDF` when either is missing (`libqpdf/QPDF_encryption.cc:770-777`).
+/// qpdf checks the required encryption dictionary value types before the
+/// supported V/R set and before password work, then throws `damagedPDF`
+/// (`libqpdf/QPDF_encryption.cc:770-777`).
 /// Observed by blanking `/V 5` in place in a `qpdf --encrypt --bits=256`
 /// output:
 ///
@@ -1696,11 +1829,13 @@ fn an_encrypt_dictionary_without_v_is_rejected_on_every_path() {
     let paths = [
         PdfOpenOptions {
             password: b"userpass".to_vec(),
+            description: b"no-v.pdf".to_vec(),
             ..PdfOpenOptions::default()
         },
         PdfOpenOptions {
             password: b"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_vec(),
             password_is_hex_key: true,
+            description: b"no-v.pdf".to_vec(),
             ..PdfOpenOptions::default()
         },
     ];
@@ -1709,15 +1844,302 @@ fn an_encrypt_dictionary_without_v_is_rejected_on_every_path() {
         let err = Pdf::open_with_options(std::io::Cursor::new(fixture.clone()), options)
             .err()
             .unwrap_or_else(|| panic!("qpdf rejects this document (hex key path: {hex_key})"));
-        assert!(
-            matches!(
-                err,
-                Error::Encrypted(EncryptedError::Malformed { ref reason })
-                    if reason == "missing /V entry"
-            ),
-            "hex key path: {hex_key}, got {err:?}"
+        let terminal = err.open_failure().map_or(&err, |(source, _)| source);
+        let Error::QpdfExc(exception) = terminal else {
+            panic!("expected qpdf damaged-PDF exception, got {err:?}");
+        };
+        assert_eq!(exception.get_error_code(), QpdfErrorCode::DamagedPdf);
+        assert_eq!(exception.get_filename(), b"no-v.pdf");
+        assert_eq!(exception.get_object(), b"encryption dictionary");
+        assert!(exception.get_file_position() > 0);
+        assert_eq!(
+            exception.get_message_detail(),
+            b"some encryption dictionary parameters are missing or the wrong type"
+        );
+        assert_eq!(
+            err.raw_message().expect("qpdf-shaped open error"),
+            exception.what_bytes()
         );
     }
+}
+
+#[test]
+fn unsupported_v3_r3_is_a_qpdf_exception_before_password_authentication() {
+    let donor = replace_pdf_token_once(
+        committed_encrypted_fixture("v2-rc4-128-r3.pdf"),
+        b"/V 2",
+        b"/V 3",
+    );
+    let options = PdfOpenOptions {
+        password: b"wrong-password".to_vec(),
+        description: b"v3-r3.pdf".to_vec(),
+        ..PdfOpenOptions::default()
+    };
+    let error = match Pdf::open_with_options(std::io::Cursor::new(donor), options) {
+        Ok(_) => panic!("qpdf rejects V=3/R=3 before password authentication"),
+        Err(error) => error,
+    };
+
+    assert_qpdf_encryption_error(
+        &error,
+        QpdfErrorCode::Unsupported,
+        b"v3-r3.pdf",
+        b"encryption dictionary",
+        b"Unsupported /R or /V in encryption dictionary; R = 3 (max 6), V = 3 (max 5)",
+    );
+}
+
+#[test]
+fn unsupported_filter_precedes_missing_version_and_uses_qpdf_exception() {
+    let donor = replace_pdf_token_once(
+        replace_pdf_token_once(
+            committed_encrypted_fixture("v2-rc4-128-r3.pdf"),
+            b"/Standard",
+            b"/BadValue",
+        ),
+        b"/V 2",
+        b"    ",
+    );
+    let error = match Pdf::open_with_options(
+        std::io::Cursor::new(donor),
+        PdfOpenOptions {
+            description: b"bad-filter.pdf".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("qpdf rejects a non-Standard encryption filter"),
+        Err(error) => error,
+    };
+
+    assert_qpdf_encryption_error(
+        &error,
+        QpdfErrorCode::Unsupported,
+        b"bad-filter.pdf",
+        b"encryption dictionary",
+        b"unsupported encryption filter",
+    );
+}
+
+#[test]
+fn missing_filter_precedes_missing_version_and_uses_qpdf_exception() {
+    let donor = replace_pdf_token_once(
+        replace_pdf_token_once(
+            committed_encrypted_fixture("v2-rc4-128-r3.pdf"),
+            b"/Filter",
+            b"/BadKey",
+        ),
+        b"/V 2",
+        b"    ",
+    );
+    let error = match Pdf::open_with_options(
+        std::io::Cursor::new(donor),
+        PdfOpenOptions {
+            description: b"missing-filter.pdf".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("qpdf rejects an encryption dictionary without /Filter"),
+        Err(error) => error,
+    };
+
+    assert_qpdf_encryption_error(
+        &error,
+        QpdfErrorCode::Unsupported,
+        b"missing-filter.pdf",
+        b"encryption dictionary",
+        b"unsupported encryption filter",
+    );
+}
+
+#[test]
+fn required_parameter_type_error_precedes_unsupported_v_r() {
+    let donor = replace_pdf_hex_string_with_null(
+        replace_pdf_token_once(
+            committed_encrypted_fixture("v2-rc4-128-r3.pdf"),
+            b"/V 2",
+            b"/V 3",
+        ),
+        b"/O",
+    );
+    let error = match Pdf::open_with_options(
+        std::io::Cursor::new(donor),
+        PdfOpenOptions {
+            description: b"bad-owner-entry.pdf".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("qpdf rejects an /Encrypt entry with a non-string /O"),
+        Err(error) => error,
+    };
+
+    assert_qpdf_encryption_error(
+        &error,
+        QpdfErrorCode::DamagedPdf,
+        b"bad-owner-entry.pdf",
+        b"encryption dictionary",
+        b"some encryption dictionary parameters are missing or the wrong type",
+    );
+}
+
+#[test]
+fn required_r_u_and_p_types_are_checked_before_authentication() {
+    let base = committed_encrypted_fixture("v2-rc4-128-r3.pdf");
+    let cases = [
+        (
+            "bad-revision-entry.pdf",
+            replace_pdf_token_once(base.clone(), b"/R 3", b"/R /"),
+        ),
+        (
+            "bad-user-entry.pdf",
+            replace_pdf_hex_string_with_null(base.clone(), b"/U"),
+        ),
+        (
+            "bad-permissions-entry.pdf",
+            replace_pdf_token_once(base, b"/P -4", b"/P /N"),
+        ),
+    ];
+
+    for (filename, donor) in cases {
+        let error = match Pdf::open_with_options(
+            std::io::Cursor::new(donor),
+            PdfOpenOptions {
+                password: b"wrong-password".to_vec(),
+                description: filename.as_bytes().to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        ) {
+            Ok(_) => panic!("qpdf rejects the wrong type for /R, /U, or /P"),
+            Err(error) => error,
+        };
+
+        assert_qpdf_encryption_error(
+            &error,
+            QpdfErrorCode::DamagedPdf,
+            filename.as_bytes(),
+            b"encryption dictionary",
+            b"some encryption dictionary parameters are missing or the wrong type",
+        );
+    }
+}
+
+#[test]
+fn overlength_v_lt_5_owner_and_user_entries_use_qpdf_damaged_pdf_error() {
+    let base = committed_encrypted_fixture("v2-rc4-128-r3.pdf");
+    for (key, filename) in [
+        (b"/O".as_slice(), b"overlong-owner.pdf".as_slice()),
+        (b"/U".as_slice(), b"overlong-user.pdf".as_slice()),
+    ] {
+        let donor = replace_pdf_hex_string_with_literal(base.clone(), key, &[b'a'; 33]);
+        let error = match Pdf::open_with_options(
+            std::io::Cursor::new(donor),
+            PdfOpenOptions {
+                description: filename.to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        ) {
+            Ok(_) => panic!("qpdf rejects V<5 /O and /U values longer than 32 bytes"),
+            Err(error) => error,
+        };
+
+        assert_qpdf_encryption_error(
+            &error,
+            QpdfErrorCode::DamagedPdf,
+            filename,
+            b"encryption dictionary",
+            b"incorrect length for /O and/or /U in encryption dictionary",
+        );
+    }
+}
+
+#[test]
+fn v5_perms_wrong_type_is_rejected_during_initialization() {
+    let donor = replace_pdf_hex_string_with_null(encrypted_r5_or_r6_pdf(6, "", &[]), b"/Perms");
+    let error = match Pdf::open_with_options(
+        std::io::Cursor::new(donor),
+        PdfOpenOptions {
+            description: b"bad-perms-type.pdf".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("qpdf rejects a non-string V=5 /Perms before authentication"),
+        Err(error) => error,
+    };
+
+    assert_qpdf_encryption_error(
+        &error,
+        QpdfErrorCode::DamagedPdf,
+        b"bad-perms-type.pdf",
+        b"encryption dictionary",
+        b"some V=5 encryption dictionary parameters are missing or the wrong type",
+    );
+}
+
+#[test]
+fn non_dictionary_encrypt_value_uses_qpdf_damaged_pdf_exception() {
+    let donor = replace_pdf_encrypt_reference_with_integer(committed_encrypted_fixture(
+        "v2-rc4-128-r3.pdf",
+    ));
+    let error = match Pdf::open_with_options(
+        std::io::Cursor::new(donor),
+        PdfOpenOptions {
+            description: b"non-dictionary-encrypt.pdf".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("qpdf rejects a non-dictionary /Encrypt value"),
+        Err(error) => error,
+    };
+
+    assert_qpdf_encryption_error(
+        &error,
+        QpdfErrorCode::DamagedPdf,
+        b"non-dictionary-encrypt.pdf",
+        b"",
+        b"/Encrypt in trailer dictionary is not a dictionary",
+    );
+}
+
+#[test]
+fn subfilter_warning_precedes_qpdf_unsupported_v_r_exception() {
+    let donor = replace_pdf_token_once(
+        replace_pdf_token_once(
+            encrypted_r5_or_r6_pdf(6, " /SubFilter /Foo", &[]),
+            b"/V 5",
+            b"/V 3",
+        ),
+        b"/R 6",
+        b"/R 3",
+    );
+    let error = match Pdf::open_with_options(
+        std::io::Cursor::new(donor),
+        PdfOpenOptions {
+            description: b"subfilter-v3.pdf".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("qpdf rejects V=3 after warning about /SubFilter"),
+        Err(error) => error,
+    };
+    let (terminal, diagnostics) = error
+        .open_failure()
+        .expect("the earlier /SubFilter warning is preserved with the failure");
+    assert_eq!(diagnostics.entries().len(), 1);
+    assert_eq!(
+        diagnostics.entries()[0].get_error_code(),
+        QpdfErrorCode::Unsupported
+    );
+    assert_eq!(
+        diagnostics.entries()[0].get_message_detail(),
+        b"file uses encryption SubFilters, which qpdf does not support"
+    );
+    assert_qpdf_encryption_error(
+        &error,
+        QpdfErrorCode::Unsupported,
+        b"subfilter-v3.pdf",
+        b"encryption dictionary",
+        b"Unsupported /R or /V in encryption dictionary; R = 3 (max 6), V = 3 (max 5)",
+    );
+    assert!(matches!(terminal, Error::QpdfExc(_)));
 }
 
 /// A `/V 4` document whose one crypt filter names a `/CFM` qpdf does not

@@ -29,10 +29,7 @@
 //! `docs/qpdf-correspondence.md` for the corresponding row.
 //!
 
-use super::crypt_filters::{
-    crypt_filter_method_from_handle, crypt_filter_modes_from_handle,
-    interpret_cf_selector_from_handle,
-};
+use super::crypt_filters::{crypt_filter_modes_from_handle, interpret_cf_selector_from_handle};
 use super::password::{decode_hex, password_bytes_for_read, PasswordMode};
 use super::permissions::Permissions;
 use super::standard::{
@@ -630,18 +627,8 @@ fn standard_handler_inputs_from_handle(
     encrypt: &ObjectHandle,
     id0: &[u8],
 ) -> Result<StandardHandlerInputsOwned> {
-    let filter = required_name_from_handle(encrypt, "Filter")?;
     let v = required_integer_from_handle(encrypt, "V")?;
     let r = required_integer_from_handle(encrypt, "R")?;
-    if filter != "Standard" || !matches!(v, 1 | 2 | 4) || !(2..=6).contains(&r) {
-        return Err(crate::error::EncryptedError::UnsupportedHandler {
-            filter,
-            v,
-            r,
-            cfm: crypt_filter_method_from_handle(encrypt)?,
-        }
-        .into());
-    }
     let length = encrypt.try_get_key(b"/Length")?;
     let length_bits = effective_length_bits(v, &length)?;
     let p = required_permissions_from_handle(encrypt)?;
@@ -683,18 +670,6 @@ pub(crate) fn effective_length_bits(v: i64, length: &ObjectHandle) -> Result<i64
 fn standard_handler_r5_inputs_from_handle(
     encrypt: &ObjectHandle,
 ) -> Result<StandardHandlerR5InputsOwned> {
-    let filter = required_name_from_handle(encrypt, "Filter")?;
-    let v = required_integer_from_handle(encrypt, "V")?;
-    let r = required_integer_from_handle(encrypt, "R")?;
-    if filter != "Standard" || v != 5 || !(2..=6).contains(&r) {
-        return Err(crate::error::EncryptedError::UnsupportedHandler {
-            filter,
-            v,
-            r,
-            cfm: crypt_filter_method_from_handle(encrypt)?,
-        }
-        .into());
-    }
     Ok(StandardHandlerR5InputsOwned {
         u: required_48_byte_string_from_handle(encrypt, "U")?,
         o: required_48_byte_string_from_handle(encrypt, "O")?,
@@ -885,15 +860,10 @@ fn required_48_byte_string_from_handle(dict: &ObjectHandle, key: &'static str) -
 
 fn encrypt_metadata_flag_from_handle(encrypt: &ObjectHandle) -> Result<bool> {
     let value = encrypt.try_get_key(b"/EncryptMetadata")?;
-    value.try_dereference()?;
-    match value.as_boolean() {
-        Some(value) => Ok(value),
-        None if value.is_null() => Ok(true),
-        None => Err(crate::error::EncryptedError::Malformed {
-            reason: "/EncryptMetadata entry is not a boolean".into(),
-        }
-        .into()),
-    }
+    // qpdf only honors `/EncryptMetadata` when it is a boolean. Missing,
+    // null, and other types all keep the initializer's default `true`
+    // (`QPDF_encryption.cc:854-857`).
+    Ok(value.try_get_value_as_bool()?.unwrap_or(true))
 }
 
 fn required_permissions_from_handle(encrypt: &ObjectHandle) -> Result<i32> {

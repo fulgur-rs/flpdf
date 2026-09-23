@@ -2915,6 +2915,114 @@ fn copy_encryption_failure_stderr(donor: &Path, password: Option<&str>, out: &Pa
     stderr
 }
 
+fn replace_fixture_token(bytes: &mut [u8], from: &[u8], to: &[u8]) {
+    assert_eq!(from.len(), to.len(), "fixture edit preserves xref offsets");
+    let matches = bytes
+        .windows(from.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == from).then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(matches.len(), 1, "expected one occurrence of {from:?}");
+    let start = matches[0];
+    bytes[start..start + to.len()].copy_from_slice(to);
+}
+
+/// `QPDF::initializeEncryption` rejects unsupported `/Filter` and V/R values
+/// while opening every input, including a `--copy-encryption` donor. Keep the
+/// donor consumer on that same error path instead of adding writer-side text.
+#[test]
+fn invalid_encryption_dictionary_errors_match_qpdf_across_cli_routes() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let base = std::fs::read(fixture("../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf"))
+        .expect("read qpdf V2/R3 donor fixture");
+    struct Mutation {
+        name: &'static str,
+        from: &'static [u8],
+        to: &'static [u8],
+    }
+    let cases = [
+        Mutation {
+            name: "v3-r3",
+            from: b"/V 2",
+            to: b"/V 3",
+        },
+        Mutation {
+            name: "bad-filter",
+            from: b"/Standard",
+            to: b"/BadValue",
+        },
+    ];
+
+    for Mutation {
+        name: case,
+        from,
+        to,
+    } in cases
+    {
+        let mut bytes = base.clone();
+        replace_fixture_token(&mut bytes, from, to);
+        let donor = tmp.path().join(format!("{case}.pdf"));
+        std::fs::write(&donor, bytes).expect("write mutated donor fixture");
+
+        for route in ["show", "check", "copy"] {
+            let qpdf = match route {
+                "show" => ShellCommand::new("qpdf")
+                    .arg("--show-encryption")
+                    .arg(&donor)
+                    .output()
+                    .expect("run qpdf --show-encryption"),
+                "check" => ShellCommand::new("qpdf")
+                    .arg("--check")
+                    .arg(&donor)
+                    .output()
+                    .expect("run qpdf --check"),
+                _ => ShellCommand::new("qpdf")
+                    .arg("--empty")
+                    .arg(format!("--copy-encryption={}", donor.display()))
+                    .arg(tmp.path().join(format!("qpdf-{case}.pdf")))
+                    .output()
+                    .expect("run qpdf --copy-encryption"),
+            };
+            let flpdf = match route {
+                "show" => Command::cargo_bin("flpdf")
+                    .unwrap()
+                    .env("FLPDF_PROGNAME", "qpdf")
+                    .arg("--show-encryption")
+                    .arg(&donor)
+                    .output()
+                    .expect("run flpdf --show-encryption"),
+                "check" => Command::cargo_bin("flpdf")
+                    .unwrap()
+                    .env("FLPDF_PROGNAME", "qpdf")
+                    .arg("--check")
+                    .arg(&donor)
+                    .output()
+                    .expect("run flpdf --check"),
+                _ => Command::cargo_bin("flpdf")
+                    .unwrap()
+                    .env("FLPDF_PROGNAME", "qpdf")
+                    .arg("--empty")
+                    .arg(format!("--copy-encryption={}", donor.display()))
+                    .arg(tmp.path().join(format!("flpdf-{case}.pdf")))
+                    .output()
+                    .expect("run flpdf --copy-encryption"),
+            };
+
+            assert_eq!(qpdf.status.code(), Some(2), "qpdf {case}/{route}");
+            assert_eq!(
+                flpdf.status.code(),
+                qpdf.status.code(),
+                "flpdf {case}/{route}"
+            );
+            assert_eq!(flpdf.stdout, qpdf.stdout, "stdout for {case}/{route}");
+            assert_eq!(flpdf.stderr, qpdf.stderr, "stderr for {case}/{route}");
+        }
+    }
+}
+
 /// `--copy-encryption` with a wrong password is rejected with an error
 /// (the donor cannot be opened with the supplied password).
 ///
