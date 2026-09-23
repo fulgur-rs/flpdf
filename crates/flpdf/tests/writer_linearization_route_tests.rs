@@ -109,9 +109,13 @@ fn linearization_final_route_does_not_clone_complete_xref_maps() {
     );
     let pass = source
         .split_once("fn do_write_pass")
-        .and_then(|(_, rest)| rest.split_once("/// Compute per-object byte lengths"))
+        .and_then(|(_, rest)| rest.split_once("// ---------------------------------------------------------------------------\n// Public API"))
         .map(|(function, _)| function)
         .expect("linearized pass writer exists");
+    assert!(
+        pass.contains("layout.xref_offsets") && pass.contains("layout.lengths"),
+        "the final pass must borrow both writer-owned layout maps"
+    );
     assert!(
         !pass.contains("layout.xref_offsets.clone()"),
         "the final pass must borrow the writer-owned xref map"

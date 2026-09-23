@@ -1010,12 +1010,16 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> crate::writer::write_object
         // cov:ignore-end
     }
 
-    fn xref(&mut self) -> &mut BTreeMap<u32, (u16, usize)> {
-        &mut self.layout.uncompressed
+    fn record_object_offset(&mut self, object: u32, offset: usize) {
+        self.layout.uncompressed.insert(object, (0, offset));
     }
 
-    fn lengths(&mut self) -> &mut BTreeMap<u32, usize> {
-        &mut self.lengths
+    fn object_offset(&self, object: u32) -> usize {
+        self.layout.uncompressed[&object].1
+    }
+
+    fn record_object_length(&mut self, object: u32, length: usize) {
+        self.lengths.insert(object, length);
     }
 
     fn encryption_state(&mut self) -> &mut crate::writer::encryption_state::WriterEncryptionState {

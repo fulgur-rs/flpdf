@@ -4,7 +4,7 @@
 //! the measuring thread only, so libtest's concurrent tests cannot sample each
 //! other's windows.
 
-use flpdf::{ObjectHandle, ObjectStreamMode, Pdf, PdfWriter};
+use flpdf::{EncryptParams, ObjectHandle, ObjectStreamMode, Pdf, PdfWriter};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::io::{self, Cursor, Write};
@@ -13,6 +13,8 @@ std::thread_local! {
     static ALLOCATION_TRACKING: Cell<bool> = const { Cell::new(false) };
     static LIVE_BYTES: Cell<usize> = const { Cell::new(0) };
     static PEAK_LIVE_BYTES: Cell<usize> = const { Cell::new(0) };
+    static TOTAL_ALLOCATED_BYTES: Cell<usize> = const { Cell::new(0) };
+    static TOTAL_ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
 struct LiveAllocationTracker;
@@ -20,6 +22,12 @@ struct LiveAllocationTracker;
 fn record_allocation(size: usize) {
     let _ = ALLOCATION_TRACKING.try_with(|tracking| {
         if tracking.get() {
+            TOTAL_ALLOCATED_BYTES.with(|total| {
+                total.set(total.get().saturating_add(size));
+            });
+            TOTAL_ALLOCATION_COUNT.with(|total| {
+                total.set(total.get().saturating_add(1));
+            });
             LIVE_BYTES.with(|live| {
                 let live_bytes = live.get().saturating_add(size);
                 live.set(live_bytes);
@@ -79,12 +87,25 @@ static ALLOCATOR: LiveAllocationTracker = LiveAllocationTracker;
 fn start_allocation_measurement_after_fixture_baseline() {
     LIVE_BYTES.with(|live| live.set(0));
     PEAK_LIVE_BYTES.with(|peak| peak.set(0));
+    TOTAL_ALLOCATED_BYTES.with(|total| total.set(0));
+    TOTAL_ALLOCATION_COUNT.with(|total| total.set(0));
     ALLOCATION_TRACKING.with(|tracking| tracking.set(true));
 }
 
-fn finish_allocation_measurement() -> usize {
+#[derive(Clone, Copy, Debug)]
+struct AllocationStats {
+    peak_live_bytes: usize,
+    total_allocated_bytes: usize,
+    total_allocation_count: usize,
+}
+
+fn finish_allocation_measurement() -> AllocationStats {
     ALLOCATION_TRACKING.with(|tracking| tracking.set(false));
-    PEAK_LIVE_BYTES.with(Cell::get)
+    AllocationStats {
+        peak_live_bytes: PEAK_LIVE_BYTES.with(Cell::get),
+        total_allocated_bytes: TOTAL_ALLOCATED_BYTES.with(Cell::get),
+        total_allocation_count: TOTAL_ALLOCATION_COUNT.with(Cell::get),
+    }
 }
 
 /// Swallows the linearized output so the measurement reads what the route
@@ -108,12 +129,15 @@ fn one_page_fixture() -> Pdf<Cursor<Vec<u8>>> {
     .expect("open the one-page linearization fixture")
 }
 
-fn write_linearized(pdf: &mut Pdf<Cursor<Vec<u8>>>) {
+fn write_linearized(pdf: &mut Pdf<Cursor<Vec<u8>>>, encrypted: bool) {
     let mut writer = PdfWriter::new(pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_compress_streams(false);
     writer.set_static_id(true);
     writer.set_linearization(true);
+    if encrypted {
+        writer.set_encryption_parameters(EncryptParams::v4_aes128(b"user", b"owner"));
+    }
     writer
         .set_output_writer(DiscardWriter)
         .expect("install the discard output");
@@ -129,7 +153,21 @@ fn write_linearized(pdf: &mut Pdf<Cursor<Vec<u8>>>) {
 fn linearized_peak_for_object_count(object_count: usize) -> usize {
     let mut pdf = attach_small_objects(object_count);
     start_allocation_measurement_after_fixture_baseline();
-    write_linearized(&mut pdf);
+    write_linearized(&mut pdf, false);
+    finish_allocation_measurement().peak_live_bytes
+}
+
+fn linearized_allocation_stats_for_object_count(object_count: usize) -> AllocationStats {
+    let mut pdf = attach_small_objects(object_count);
+    start_allocation_measurement_after_fixture_baseline();
+    write_linearized(&mut pdf, false);
+    finish_allocation_measurement()
+}
+
+fn encrypted_linearized_allocation_stats_for_object_count(object_count: usize) -> AllocationStats {
+    let mut pdf = attach_small_objects(object_count);
+    start_allocation_measurement_after_fixture_baseline();
+    write_linearized(&mut pdf, true);
     finish_allocation_measurement()
 }
 
@@ -162,8 +200,8 @@ fn linearized_peak_for_padding(padding: usize) -> usize {
         .expect("attach the padded object");
 
     start_allocation_measurement_after_fixture_baseline();
-    write_linearized(&mut pdf);
-    finish_allocation_measurement()
+    write_linearized(&mut pdf, false);
+    finish_allocation_measurement().peak_live_bytes
 }
 
 const SMALL_OBJECT_COUNT: usize = 256;
@@ -177,7 +215,7 @@ const LARGE_OBJECT_COUNT: usize = 4096;
 /// [`SMALL_OBJECT_COUNT`] and [`LARGE_OBJECT_COUNT`], and each regression was
 /// applied to the production route and measured, not estimated:
 ///
-/// - canonical route: **666.6** bytes per object.
+/// - qpdf-shaped writer-owned state: **697.3** bytes per object.
 /// - the complete renumber map cloned once before pass 1 (`let mut
 ///   local_renumber = renumber.to_owned()` in place of the move):
 ///   **750.9** bytes per object.
@@ -186,11 +224,11 @@ const LARGE_OBJECT_COUNT: usize = 4096;
 ///   object — one extra allocation per object, which this bound rejects with
 ///   28% to spare.
 ///
-/// The bound sits between the canonical slope and the cheaper of the two
-/// regressions — 6.5% of headroom above what the route costs today, 5.4%
-/// below the first regression it has to reject. It discriminates rather than
-/// accommodates: any second complete per-object map costs more than the 43
-/// bytes per object of slack.
+/// The bound sits between the current slope and the cheaper of the two
+/// regressions — 1.8% of headroom above the shared-state route, 5.4% below
+/// the first regression it has to reject. It discriminates rather than
+/// accommodates: a second complete per-object map costs more than the
+/// 12 bytes per object of slack.
 ///
 /// The counter sums `Layout` sizes, so the slope is independent of the system
 /// allocator and of the optimization level; the debug and release figures were
@@ -199,13 +237,13 @@ const PEAK_BYTES_PER_OBJECT_BOUND: usize = 710;
 
 /// The two-pass route keeps one copy of the per-object bookkeeping, not two.
 ///
-/// qpdf's renumber table is a writer member assigned once while objects are
-/// enqueued (`QPDFWriter.cc:1067,1107`); both linearization passes then read
-/// it (`QPDFWriter.cc:2664`). Growing the object count here grows every
-/// per-object structure the route owns at once, so a second complete copy of
-/// any of them shows up as a steeper slope — which is what this measures,
-/// instead of reading the production source for the spelling of a particular
-/// clone.
+/// qpdf's renumber, xref, and length tables are writer members assigned while
+/// objects are emitted (`QPDFWriter.cc:1041-1053,1067,1107`); both
+/// linearization passes use that state (`QPDFWriter.cc:2664`). Growing the
+/// object count here grows every per-object structure the route owns at once,
+/// so a second complete copy of any of them shows up as a steeper slope —
+/// which is what this measures, instead of reading production source for the
+/// spelling of a particular clone.
 #[test]
 fn linearized_route_keeps_no_second_complete_per_object_map() {
     let small = linearized_peak_for_object_count(SMALL_OBJECT_COUNT);
@@ -254,6 +292,71 @@ fn linearized_passes_retain_no_document_sized_body() {
         "a layout pass retained the document body: unpadded={unpadded}, \
          padded={padded} for a {LINEARIZED_PADDING_BYTES}-byte payload, \
          allowance={PASS_BODY_RESIDENCY_ALLOWANCE}"
+    );
+}
+
+const TOTAL_ALLOCATED_BYTES_PER_OBJECT_BOUND: usize = 3760;
+const TOTAL_ALLOCATIONS_PER_OBJECT_BOUND: f64 = 36.0;
+const ENCRYPTED_TOTAL_ALLOCATED_BYTES_PER_OBJECT_BOUND: usize = 3600;
+const ENCRYPTED_TOTAL_ALLOCATIONS_PER_OBJECT_BOUND: f64 = 50.0;
+
+/// Before writer-state reuse, the same 256-to-4096 object workload measured
+/// 3,921.2 allocated bytes and 37.39 allocation calls per object. The gates
+/// below require a material reduction after the per-object maps are removed.
+#[test]
+fn linearized_body_emission_reuses_writer_owned_allocation_state() {
+    let small = linearized_allocation_stats_for_object_count(SMALL_OBJECT_COUNT);
+    let large = linearized_allocation_stats_for_object_count(LARGE_OBJECT_COUNT);
+    let extra_objects = LARGE_OBJECT_COUNT - SMALL_OBJECT_COUNT;
+    let allocated_bytes_per_object = large
+        .total_allocated_bytes
+        .saturating_sub(small.total_allocated_bytes)
+        / extra_objects;
+    let allocations_per_object = large
+        .total_allocation_count
+        .saturating_sub(small.total_allocation_count) as f64
+        / extra_objects as f64;
+    assert!(
+        allocated_bytes_per_object <= TOTAL_ALLOCATED_BYTES_PER_OBJECT_BOUND,
+        "linearized body emission retained transient per-object writer state: \
+         small={small:?}, large={large:?}, allocated_bytes_per_object={allocated_bytes_per_object}, \
+         bound={TOTAL_ALLOCATED_BYTES_PER_OBJECT_BOUND}"
+    );
+    assert!(
+        allocations_per_object <= TOTAL_ALLOCATIONS_PER_OBJECT_BOUND,
+        "linearized body emission still allocates per-object adapter maps: \
+         small={small:?}, large={large:?}, allocations_per_object={allocations_per_object:.2}, \
+         bound={TOTAL_ALLOCATIONS_PER_OBJECT_BOUND:.2}"
+    );
+}
+
+/// The shared-state encrypted route measures 3,581 bytes and 49.39 allocation
+/// calls per object. A diagnostic mutation that cloned the file key in each
+/// object emitter measured 3,613 bytes per object and fails this bound.
+#[test]
+fn encrypted_linearized_body_emission_reuses_writer_file_key_state() {
+    let small = encrypted_linearized_allocation_stats_for_object_count(SMALL_OBJECT_COUNT);
+    let large = encrypted_linearized_allocation_stats_for_object_count(LARGE_OBJECT_COUNT);
+    let extra_objects = LARGE_OBJECT_COUNT - SMALL_OBJECT_COUNT;
+    let allocated_bytes_per_object = large
+        .total_allocated_bytes
+        .saturating_sub(small.total_allocated_bytes)
+        / extra_objects;
+    let allocations_per_object = large
+        .total_allocation_count
+        .saturating_sub(small.total_allocation_count) as f64
+        / extra_objects as f64;
+    assert!(
+        allocated_bytes_per_object <= ENCRYPTED_TOTAL_ALLOCATED_BYTES_PER_OBJECT_BOUND,
+        "encrypted linearized emission allocated a per-object file-key clone: \
+         small={small:?}, large={large:?}, allocated_bytes_per_object={allocated_bytes_per_object}, \
+         bound={ENCRYPTED_TOTAL_ALLOCATED_BYTES_PER_OBJECT_BOUND}"
+    );
+    assert!(
+        allocations_per_object <= ENCRYPTED_TOTAL_ALLOCATIONS_PER_OBJECT_BOUND,
+        "encrypted linearized emission allocated per-object writer state: \
+         small={small:?}, large={large:?}, allocations_per_object={allocations_per_object:.2}, \
+         bound={ENCRYPTED_TOTAL_ALLOCATIONS_PER_OBJECT_BOUND:.2}"
     );
 }
 

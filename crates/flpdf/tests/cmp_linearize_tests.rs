@@ -20,7 +20,7 @@
 
 #![cfg(feature = "qpdf-zlib-compat")]
 
-use flpdf::{NewlineBeforeEndstream, Pdf};
+use flpdf::{CompressStreams, EncryptParams, NewlineBeforeEndstream, ObjectStreamMode, Pdf};
 use std::path::Path;
 use std::process::Command;
 
@@ -860,6 +860,81 @@ fn plain_rewrite_one_page() -> Vec<u8> {
 mod common;
 #[allow(unused_imports)]
 use common::{write_linearized_with_settings, write_with_settings, WriterTestSettings};
+
+#[test]
+fn encrypted_linearized_v4_aes_state_matches_qpdf() {
+    let Some(oracle) = pinned_qpdf() else {
+        eprintln!("[SKIP cmp_linearize_tests] qpdf 11.9.0 is unavailable");
+        return;
+    };
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join("one-page.pdf");
+    let directory = tempfile::tempdir().expect("tempdir");
+    let qpdf_output = directory.path().join("qpdf-encrypted-linearized.pdf");
+    let flpdf_output = directory.path().join("flpdf-encrypted-linearized.pdf");
+
+    let status = Command::new(oracle)
+        .args([
+            "--linearize",
+            "--static-id",
+            "--static-aes-iv",
+            "--object-streams=disable",
+            "--stream-data=uncompress",
+            "--encrypt",
+            "user",
+            "owner",
+            "128",
+            "--use-aes=y",
+            "--",
+        ])
+        .arg(&fixture)
+        .arg(&qpdf_output)
+        .status()
+        .expect("qpdf writes encrypted linearized output");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "qpdf encryption and linearization succeed"
+    );
+
+    let file = std::fs::File::open(&fixture).expect("open one-page fixture");
+    let mut pdf = Pdf::open(std::io::BufReader::new(file)).expect("open fixture as PDF");
+    let settings = WriterTestSettings {
+        static_id: true,
+        static_aes_iv: true,
+        object_streams: ObjectStreamMode::Disable,
+        compress_streams: CompressStreams::No,
+        encrypt: Some(EncryptParams::v4_aes128(b"user", b"owner")),
+        ..WriterTestSettings::default()
+    };
+    let actual = write_linearized_with_settings(&mut pdf, &settings)
+        .expect("flpdf writes encrypted linearized output");
+    std::fs::write(&flpdf_output, &actual).expect("write flpdf output for qpdf check");
+    let expected = std::fs::read(&qpdf_output).expect("read qpdf output");
+    if let Some(offset) = first_diff(&actual, &expected) {
+        let start = offset.saturating_sub(16);
+        panic!(
+            "encrypted linearized output differs from qpdf at byte {offset} \
+             (flpdf={} bytes, qpdf={} bytes)\nflpdf: {:?}\nqpdf: {:?}",
+            actual.len(),
+            expected.len(),
+            &actual[start..(offset + 16).min(actual.len())],
+            &expected[start..(offset + 16).min(expected.len())]
+        );
+    }
+
+    let check_status = Command::new(oracle)
+        .args(["--password=user", "--check-linearization"])
+        .arg(&flpdf_output)
+        .status()
+        .expect("qpdf checks the encrypted flpdf output");
+    assert_eq!(
+        check_status.code(),
+        Some(0),
+        "qpdf must accept the encrypted flpdf linearization layout"
+    );
+}
 
 #[test]
 fn linearized_extra_header_starts_after_qpdf_separator_newline() {
