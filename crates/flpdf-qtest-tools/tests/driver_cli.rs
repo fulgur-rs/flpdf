@@ -2147,6 +2147,133 @@ fn obfuscated_open_failure_reports_the_real_obfuscated_path_not_the_fabricated_p
     );
 }
 
+/// Build a valid one-page PDF whose xref table points object 4 one byte into
+/// its header. Reading the xref table alone is clean; resolving the Catalog's
+/// reachable /QTest value during writing triggers qpdf's delayed repair warning.
+fn test_45_lazy_writer_warning_pdf() -> (Vec<u8>, usize) {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = [0usize; 5];
+    for (number, body) in [
+        (
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /QTest 4 0 R >>".as_slice(),
+        ),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice()),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".as_slice(),
+        ),
+        (4, b"42".as_slice()),
+    ] {
+        offsets[number] = bytes.len();
+        bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+
+    let wrong_offset = offsets[4] + 1;
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+    for (number, object_offset) in offsets.iter().enumerate().skip(1) {
+        let offset = if number == 4 {
+            wrong_offset
+        } else {
+            *object_offset
+        };
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    (bytes, wrong_offset)
+}
+
+fn qpdf_11_9_available() -> bool {
+    std::process::Command::new("qpdf")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.trim() == "qpdf version 11.9.0")
+        })
+}
+
+#[test]
+fn test_45_reports_lazy_writer_warning_after_successful_write() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let base = directory.path().join("lazy-writer-warning");
+    let pdf_path = base.with_extension("pdf");
+    let mut obfuscated_path = base.clone().into_os_string();
+    obfuscated_path.push(".obfuscated");
+    let (pdf, wrong_offset) = test_45_lazy_writer_warning_pdf();
+    fs::write(&pdf_path, &pdf).expect("write decoded qpdf input");
+    fs::write(
+        &obfuscated_path,
+        pdf.iter().map(|byte| byte ^ 0xcc).collect::<Vec<_>>(),
+    )
+    .expect("write qpdf test 45 obfuscated input");
+
+    let description = pdf_path.to_string_lossy().into_owned();
+    let base = base.to_str().expect("utf-8 temporary path");
+    let output = driver()
+        .args(["45", base])
+        .current_dir(directory.path())
+        .output()
+        .expect("run qtest driver test 45");
+
+    let expected_warnings = vec![
+        format!("WARNING: {description}: file is damaged"),
+        format!("WARNING: {description} (object 4 0, offset {wrong_offset}): expected n n obj"),
+        format!("WARNING: {description}: Attempting to reconstruct cross-reference table"),
+    ];
+    let driver_warnings: Vec<String> = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(output.status.code(), Some(3));
+    assert!(
+        output.stdout.is_empty(),
+        "qpdf test 45 exits before its normal completion footer"
+    );
+    assert!(
+        directory.path().join("a.pdf").is_file(),
+        "the warning status is evaluated after the writer completes"
+    );
+    assert_eq!(driver_warnings, expected_warnings);
+
+    if !qpdf_11_9_available() {
+        eprintln!("qpdf 11.9.0 is not available; skipping only the oracle comparison");
+        return;
+    }
+    let xref = std::process::Command::new("qpdf")
+        .args(["--show-xref"])
+        .arg(&pdf_path)
+        .output()
+        .expect("qpdf should spawn");
+    assert!(xref.status.success());
+    assert!(
+        xref.stderr.is_empty(),
+        "xref inspection must not trigger the deferred object-header warning"
+    );
+
+    let qpdf = std::process::Command::new("qpdf")
+        .arg("--static-id")
+        .arg(&pdf_path)
+        .arg(directory.path().join("qpdf-output.pdf"))
+        .output()
+        .expect("qpdf should spawn");
+    assert_eq!(qpdf.status.code(), Some(3));
+    let qpdf_warnings: Vec<String> = String::from_utf8_lossy(&qpdf.stderr)
+        .lines()
+        .filter_map(|line| line.strip_prefix("WARNING: "))
+        .map(|warning| format!("WARNING: {warning}"))
+        .collect();
+    assert_eq!(qpdf_warnings, expected_warnings);
+}
+
 /// Secondary input failures in tests 26/27/29/30 must report
 /// `arg2` open (`crates/flpdf-qtest-tools/src/driver/test_26_33.rs`): qpdf's
 /// `QPDF::processFile` opens `arg2` through `FileInputSource`, which uses
