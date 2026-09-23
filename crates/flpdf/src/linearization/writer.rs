@@ -436,8 +436,11 @@ fn preserved_objstm_extends<R: Read + Seek>(
 /// Build the ObjStm container stream object for one scheduled container from
 /// the live member handles and apply qpdf's global structural-stream
 /// compression policy.
+#[allow(clippy::too_many_arguments)]
 fn append_objstm_container_object<R: Read + Seek>(
     out: &mut OutputSink<'_>,
+    xref_offsets: &mut BTreeMap<u32, usize>,
+    lengths: &mut BTreeMap<u32, usize>,
     container: &ObjStmContainer,
     renumber: &RenumberMap,
     pdf: &mut Pdf<R>,
@@ -548,6 +551,10 @@ fn append_objstm_container_object<R: Read + Seek>(
         )?; // cov:ignore: plain ObjStm payload failure is a defensive pipeline continuation
     }
     out.write_bytes(b"\nendobj\n")?;
+    let end = out.position_usize()?;
+    let length = end - offset;
+    xref_offsets.insert(container.container_new_num, offset);
+    lengths.insert(container.container_new_num, length);
     Ok(offset)
 }
 
@@ -653,15 +660,12 @@ pub(crate) const PREV_PLACEHOLDER_WIDTH: usize = 22;
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Build the [`WriterEncryptionState`] a [`LinearizedObjectEmitter`] carries
-/// for trait conformance. qpdf's `setDataKey`/`cur_data_key` lifecycle
-/// (`QPDFWriter.cc:842-847`) runs unconditionally around every object, so
-/// this is constructed the same way regardless of whether `encrypt_ctx` is
-/// `Some` — matching the canonical live writer's own inert copy of this state
-/// (`LiveObjectEmitter`'s `encryption` field,
-/// `crates/flpdf/src/writer/plain/body.rs:578-587`). String encryption itself
-/// goes through `encrypted_string_emitter`'s own per-call key derivation
-/// instead of this state (see [`LinearizedObjectEmitter::encryption`]'s doc).
+/// Build the writer-owned [`WriterEncryptionState`] shared by all linearized
+/// body-object adapters and both passes. qpdf keeps the corresponding
+/// `cur_data_key` on `QPDFWriter::Members` and `writeObject` updates it around
+/// each object (`QPDFWriter.cc:842-847,1761-1796`). String encryption itself
+/// goes through `encrypted_string_emitter`'s per-object key derivation; this
+/// state is retained for the shared `WriteObject` boundary.
 fn writer_encryption_state_for(
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
 ) -> WriterEncryptionState {
@@ -716,17 +720,12 @@ struct LinearizedObjectEmitter<'a, 'sink> {
     root_source: Option<QpdfObjGen>,
     final_pdf_version: &'a str,
     final_extension_level: i64,
-    /// Faithful port of qpdf's unconditional `setDataKey`/`cur_data_key`
-    /// state (`QPDFWriter.cc:842-847`, built by
-    /// [`writer_encryption_state_for`]). Never read here: string encryption
-    /// goes through `encrypted_string_emitter`'s own per-call key derivation
-    /// keyed by the emitted object number, the same split the canonical
-    /// `LiveObjectEmitter` already uses for the plain live route
-    /// (`crates/flpdf/src/writer/plain/body.rs:1021-1023`,
-    /// `crates/flpdf/src/writer/encrypted_strings.rs:96`).
-    encryption: WriterEncryptionState,
-    xref: BTreeMap<u32, (u16, usize)>,
-    lengths: BTreeMap<u32, usize>,
+    /// Borrowed qpdf writer state. These maps and the encryption key live for
+    /// the complete linearized write, rather than being allocated per object.
+    /// The xref offsets are also the pass result consumed by hint generation.
+    encryption: &'a mut WriterEncryptionState,
+    xref_offsets: &'a mut BTreeMap<u32, usize>,
+    lengths: &'a mut BTreeMap<u32, usize>,
 }
 
 impl WriteObject for LinearizedObjectEmitter<'_, '_> {
@@ -776,16 +775,20 @@ impl WriteObject for LinearizedObjectEmitter<'_, '_> {
         self.out.position_usize()
     }
 
-    fn xref(&mut self) -> &mut BTreeMap<u32, (u16, usize)> {
-        &mut self.xref
+    fn record_object_offset(&mut self, object: u32, offset: usize) {
+        self.xref_offsets.insert(object, offset);
     }
 
-    fn lengths(&mut self) -> &mut BTreeMap<u32, usize> {
-        &mut self.lengths
+    fn object_offset(&self, object: u32) -> usize {
+        self.xref_offsets[&object]
+    }
+
+    fn record_object_length(&mut self, object: u32, length: usize) {
+        self.lengths.insert(object, length);
     }
 
     fn encryption_state(&mut self) -> &mut WriterEncryptionState {
-        &mut self.encryption
+        self.encryption
     }
 
     fn unparse_object(&mut self, object: &ObjectHandle, _in_object_stream: bool) -> Result<()> {
@@ -918,8 +921,8 @@ impl WriteObject for LinearizedObjectEmitter<'_, '_> {
 
 /// Write one live-handle body object addressed by a checked `ObjectRef`,
 /// through [`LinearizedObjectEmitter`]. `new_ref` is the caller's own
-/// renumber-map lookup for `original_ref`; this returns the same offset
-/// [`LinearizedObjectEmitter::xref`] records for it during the call.
+/// renumber-map lookup for `original_ref`; the emitter records its offset in
+/// the pass-owned xref map consumed by the later hint and xref writers.
 #[allow(clippy::too_many_arguments)]
 fn append_body_object_for_ref<R: Read + Seek>(
     out: &mut OutputSink<'_>,
@@ -929,6 +932,9 @@ fn append_body_object_for_ref<R: Read + Seek>(
     options: &WriterOptions,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
     encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
+    xref_offsets: &mut BTreeMap<u32, usize>,
+    lengths: &mut BTreeMap<u32, usize>,
+    encryption: &mut WriterEncryptionState,
     renumber: &RenumberMap,
     removed_refs: &BTreeSet<QpdfObjGen>,
     content_normalize_refs: &BTreeSet<QpdfObjGen>,
@@ -945,12 +951,12 @@ fn append_body_object_for_ref<R: Read + Seek>(
         root_source: None,
         final_pdf_version: "",
         final_extension_level: 0,
-        encryption: writer_encryption_state_for(encrypt_ctx),
-        xref: BTreeMap::new(),
-        lengths: BTreeMap::new(),
+        encryption,
+        xref_offsets,
+        lengths,
     };
     emitter.write_object(&object, None)?;
-    Ok(emitter.xref[&new_ref.number].1)
+    Ok(emitter.xref_offsets[&new_ref.number])
 }
 
 /// Write one live-handle body object addressed by qpdf's raw
@@ -966,6 +972,9 @@ fn append_body_object_for_raw<R: Read + Seek>(
     options: &WriterOptions,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
     encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
+    xref_offsets: &mut BTreeMap<u32, usize>,
+    lengths: &mut BTreeMap<u32, usize>,
+    encryption: &mut WriterEncryptionState,
     renumber: &RenumberMap,
     removed_refs: &BTreeSet<QpdfObjGen>,
     content_normalize_refs: &BTreeSet<QpdfObjGen>,
@@ -983,12 +992,12 @@ fn append_body_object_for_raw<R: Read + Seek>(
         root_source: None,
         final_pdf_version: "",
         final_extension_level: 0,
-        encryption: writer_encryption_state_for(encrypt_ctx),
-        xref: BTreeMap::new(),
-        lengths: BTreeMap::new(),
+        encryption,
+        xref_offsets,
+        lengths,
     };
     emitter.write_object(&object, None)?;
-    Ok(emitter.xref[&new_ref.number].1)
+    Ok(emitter.xref_offsets[&new_ref.number])
 }
 
 /// Write the document root (qpdf `lc_root`) through
@@ -1005,6 +1014,9 @@ fn append_root_object<R: Read + Seek>(
     options: &WriterOptions,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
     encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
+    xref_offsets: &mut BTreeMap<u32, usize>,
+    lengths: &mut BTreeMap<u32, usize>,
+    encryption: &mut WriterEncryptionState,
     renumber: &RenumberMap,
     removed_refs: &BTreeSet<QpdfObjGen>,
     content_normalize_refs: &BTreeSet<QpdfObjGen>,
@@ -1024,12 +1036,12 @@ fn append_root_object<R: Read + Seek>(
         root_source: Some(root_source),
         final_pdf_version,
         final_extension_level,
-        encryption: writer_encryption_state_for(encrypt_ctx),
-        xref: BTreeMap::new(),
-        lengths: BTreeMap::new(),
+        encryption,
+        xref_offsets,
+        lengths,
     };
     emitter.write_object(&object, None)?;
-    Ok(emitter.xref[&new_ref.number].1)
+    Ok(emitter.xref_offsets[&new_ref.number])
 }
 
 /// Write repeated padding through the counted output boundary without creating
@@ -2405,10 +2417,12 @@ fn build_pass1_part1(part1: &Part1Bytes) -> Part1Bytes {
 /// Result of one complete linearized layout pass.
 ///
 /// Pass 1 omits the reserved hint object, so its offsets are qpdf's virtual
-/// coordinates. The final pass contains the exact hint-object buffer generated
-/// from this result.
+/// coordinates. Its writer-owned xref and length maps feed hint generation and
+/// are reused by the final pass, which contains the exact hint-object buffer
+/// generated from this result.
 struct LinearizedPassOutput {
     xref_offsets: BTreeMap<u32, usize>,
+    lengths: BTreeMap<u32, usize>,
     first_page_xref_offset: Option<usize>,
     hint_stream_offset: usize,
     hint_stream_obj_total_len: usize,
@@ -2422,13 +2436,14 @@ struct LinearizedPassOutput {
 
 /// Final-pass coordinates derived from qpdf's pass-1 measurements.
 ///
-/// qpdf keeps the xref map from the first pass and applies the framed hint
-/// object's length when it writes the second pass. Keeping that same map here
-/// lets the final pass write its first-page xref and parameter dictionary
-/// forward, without reserving a region that must be repaired after the body
-/// has already reached a non-seekable sink.
+/// qpdf keeps the xref and length maps from the first pass and applies the
+/// framed hint object's length when it writes the second pass. Keeping those
+/// same maps here lets the final pass write its first-page xref and parameter
+/// dictionary forward, without reserving a region that must be repaired after
+/// the body has already reached a non-seekable sink.
 struct FinalLinearizedLayout<'a> {
     xref_offsets: &'a mut BTreeMap<u32, usize>,
+    lengths: &'a mut BTreeMap<u32, usize>,
     main_xref_offset: usize,
 }
 
@@ -2481,17 +2496,22 @@ fn do_write_pass<R: Read + Seek>(
     pass1_digest: bool,
     id_writer: Option<crate::pdf_syntax::ReborrowableIdWriter>,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
+    encryption_state: &mut WriterEncryptionState,
     mut encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
     final_pdf_version: &str,
     final_extension_level: i64,
     final_layout: Option<FinalLinearizedLayout<'_>>,
 ) -> Result<LinearizedPassOutput> {
     let is_final = final_layout.is_some();
-    let final_main_xref_offset = final_layout.as_ref().map(|layout| layout.main_xref_offset);
     let mut local_xref_offsets = BTreeMap::new();
-    let xref_offsets: &mut BTreeMap<u32, usize> = match final_layout {
-        Some(layout) => layout.xref_offsets,
-        None => &mut local_xref_offsets,
+    let mut local_lengths = BTreeMap::new();
+    let (xref_offsets, lengths, final_main_xref_offset) = match final_layout {
+        Some(layout) => (
+            layout.xref_offsets,
+            layout.lengths,
+            Some(layout.main_xref_offset),
+        ),
+        None => (&mut local_xref_offsets, &mut local_lengths, None),
     };
 
     // The classic path emits `/ID` at two sites (Part-1 and main trailers).
@@ -2678,7 +2698,7 @@ fn do_write_pass<R: Read + Seek>(
         // WriteObject::write_object reports progress before unparse_object
         // mutates shared Extensions, matching qpdf's writeObject
         // (QPDFWriter.cc:1771,1791-1794).
-        let offset = append_root_object(
+        append_root_object(
             output,
             pdf,
             catalog_new_ref,
@@ -2686,13 +2706,15 @@ fn do_write_pass<R: Read + Seek>(
             options,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
+            xref_offsets,
+            lengths,
+            encryption_state,
             renumber,
             raw_removed_refs,
             raw_content_normalize_refs,
             final_pdf_version,
             final_extension_level,
         )?; // cov:ignore: planner-produced Catalog references are valid by construction.
-        xref_offsets.insert(catalog_new_ref.number, offset);
         catalog_emitted_early = true;
     }
 
@@ -2783,7 +2805,7 @@ fn do_write_pass<R: Read + Seek>(
     for (_, emit) in open_document_emits {
         match emit {
             OpenDocumentEmit::Plain { original, new_ref } => {
-                let offset = append_body_object_for_ref(
+                append_body_object_for_ref(
                     output,
                     pdf,
                     new_ref,
@@ -2791,14 +2813,16 @@ fn do_write_pass<R: Read + Seek>(
                     options,
                     encrypt_ctx,
                     encrypted_string_emitter.as_deref_mut(),
+                    xref_offsets,
+                    lengths,
+                    encryption_state,
                     renumber,
                     raw_removed_refs,
                     raw_content_normalize_refs,
                 )?; // cov:ignore: planner-produced open-document references are valid by construction.
-                xref_offsets.insert(new_ref.number, offset);
             }
             OpenDocumentEmit::Raw { original, new_ref } => {
-                let offset = append_body_object_for_raw(
+                append_body_object_for_raw(
                     output,
                     pdf,
                     new_ref,
@@ -2806,15 +2830,19 @@ fn do_write_pass<R: Read + Seek>(
                     options,
                     encrypt_ctx,
                     encrypted_string_emitter.as_deref_mut(),
+                    xref_offsets,
+                    lengths,
+                    encryption_state,
                     renumber,
                     raw_removed_refs,
                     raw_content_normalize_refs,
                 )?; // cov:ignore: planner-produced raw open-document identities are valid by construction.
-                xref_offsets.insert(new_ref.number, offset);
             }
             OpenDocumentEmit::Container(container) => {
-                let offset = append_objstm_container_object(
+                append_objstm_container_object(
                     output,
+                    xref_offsets,
+                    lengths,
                     container,
                     renumber,
                     pdf,
@@ -2822,7 +2850,6 @@ fn do_write_pass<R: Read + Seek>(
                     options,
                     encrypt_ctx,
                 )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
-                xref_offsets.insert(container.container_new_num, offset);
                 for _ in &container.members {
                     if pass1_digest {
                         decrement_progress_event(options)?;
@@ -2961,7 +2988,7 @@ fn do_write_pass<R: Read + Seek>(
                 let new_ref = renumber
                     .new_for_original(original_ref)
                     .expect("first-page plain object renumber entry checked above");
-                let offset = append_body_object_for_ref(
+                append_body_object_for_ref(
                     output,
                     pdf,
                     new_ref,
@@ -2969,17 +2996,19 @@ fn do_write_pass<R: Read + Seek>(
                     options,
                     encrypt_ctx,
                     encrypted_string_emitter.as_deref_mut(),
+                    xref_offsets,
+                    lengths,
+                    encryption_state,
                     renumber,
                     raw_removed_refs,
                     raw_content_normalize_refs,
                 )?; // cov:ignore: planner-produced first-page references are valid by construction.
-                xref_offsets.insert(new_ref.number, offset);
             }
             FirstPageEmit::Raw(original_gen) => {
                 let new_ref = renumber
                     .new_for_raw(original_gen)
                     .expect("raw first-page object renumber entry checked above");
-                let offset = append_body_object_for_raw(
+                append_body_object_for_raw(
                     output,
                     pdf,
                     new_ref,
@@ -2987,15 +3016,19 @@ fn do_write_pass<R: Read + Seek>(
                     options,
                     encrypt_ctx,
                     encrypted_string_emitter.as_deref_mut(),
+                    xref_offsets,
+                    lengths,
+                    encryption_state,
                     renumber,
                     raw_removed_refs,
                     raw_content_normalize_refs,
                 )?; // cov:ignore: planner-produced raw first-page identities are valid by construction.
-                xref_offsets.insert(new_ref.number, offset);
             }
             FirstPageEmit::Container(container) => {
-                let offset = append_objstm_container_object(
+                append_objstm_container_object(
                     output,
+                    xref_offsets,
+                    lengths,
                     container,
                     renumber,
                     pdf,
@@ -3003,7 +3036,6 @@ fn do_write_pass<R: Read + Seek>(
                     options,
                     encrypt_ctx,
                 )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
-                xref_offsets.insert(container.container_new_num, offset);
                 for _ in &container.members {
                     if pass1_digest {
                         decrement_progress_event(options)?;
@@ -3100,7 +3132,7 @@ fn do_write_pass<R: Read + Seek>(
                 let new_ref = renumber
                     .new_for_original(*original_ref)
                     .expect("part4 plain object renumber entry checked above");
-                let offset = append_body_object_for_ref(
+                append_body_object_for_ref(
                     output,
                     pdf,
                     new_ref,
@@ -3108,17 +3140,19 @@ fn do_write_pass<R: Read + Seek>(
                     options,
                     encrypt_ctx,
                     encrypted_string_emitter.as_deref_mut(),
+                    xref_offsets,
+                    lengths,
+                    encryption_state,
                     renumber,
                     raw_removed_refs,
                     raw_content_normalize_refs,
                 )?; // cov:ignore: planner-produced Part-4 references are valid by construction.
-                xref_offsets.insert(new_ref.number, offset);
             }
             Part4Emit::Raw(original_gen) => {
                 let new_ref = renumber
                     .new_for_raw(*original_gen)
                     .expect("raw Part-4 object renumber entry checked above");
-                let offset = append_body_object_for_raw(
+                append_body_object_for_raw(
                     output,
                     pdf,
                     new_ref,
@@ -3126,15 +3160,19 @@ fn do_write_pass<R: Read + Seek>(
                     options,
                     encrypt_ctx,
                     encrypted_string_emitter.as_deref_mut(),
+                    xref_offsets,
+                    lengths,
+                    encryption_state,
                     renumber,
                     raw_removed_refs,
                     raw_content_normalize_refs,
                 )?; // cov:ignore: planner-produced raw Part-4 identities are valid by construction.
-                xref_offsets.insert(new_ref.number, offset);
             }
             Part4Emit::Container(container) => {
-                let offset = append_objstm_container_object(
+                append_objstm_container_object(
                     output,
+                    xref_offsets,
+                    lengths,
                     container,
                     renumber,
                     pdf,
@@ -3142,7 +3180,6 @@ fn do_write_pass<R: Read + Seek>(
                     options,
                     encrypt_ctx,
                 )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
-                xref_offsets.insert(container.container_new_num, offset);
                 for _ in &container.members {
                     if pass1_digest {
                         decrement_progress_event(options)?;
@@ -3300,8 +3337,14 @@ fn do_write_pass<R: Read + Seek>(
     } else {
         std::mem::take(xref_offsets)
     };
+    let pass_lengths = if is_final {
+        BTreeMap::new()
+    } else {
+        std::mem::take(lengths)
+    };
     Ok(LinearizedPassOutput {
         xref_offsets: pass_xref_offsets,
+        lengths: pass_lengths,
         first_page_xref_offset: first_page_xref_patch
             .as_ref()
             .map(|patch| patch.region.start),
@@ -3314,47 +3357,6 @@ fn do_write_pass<R: Read + Seek>(
         first_trailer_prev_range,
         id_ranges,
     })
-}
-
-/// Compute per-object byte lengths from a written-out `xref_offsets` map.
-///
-/// Each object's byte length = offset of the next object (or end-of-xref-section)
-/// minus this object's offset.
-///
-/// Returns `new_number → byte_length` map.
-fn compute_byte_lengths(
-    xref_offsets: &BTreeMap<u32, usize>,
-    last_xref_offset: usize,
-    hint_stream_new_num: u32,
-    param_dict_new_num: u32,
-) -> BTreeMap<u32, usize> {
-    // Build a sorted list of (offset, new_number) pairs, plus a sentinel for
-    // the last_xref_offset (= start of main xref, which terminates the body).
-    let mut sorted: Vec<(usize, u32)> = xref_offsets
-        .iter()
-        // Exclude the param dict (Part 1, written before the hint stream).
-        // The slot is dynamic because the renumber map may promote /Pages,
-        // /Info, /Catalog ahead of it — hard-coding `1` here would skip the
-        // wrong object whenever the param dict moves.
-        .filter(|(&num, _)| num != param_dict_new_num)
-        .map(|(&num, &off)| (off, num))
-        .collect();
-    sorted.sort_unstable();
-
-    let mut lengths: BTreeMap<u32, usize> = BTreeMap::new();
-    for (idx, &(off, num)) in sorted.iter().enumerate() {
-        // Skip the hint stream — its "length" is used separately.
-        if num == hint_stream_new_num {
-            continue;
-        }
-        let next_off = if idx + 1 < sorted.len() {
-            sorted[idx + 1].0
-        } else {
-            last_xref_offset
-        };
-        lengths.insert(num, next_off.saturating_sub(off));
-    }
-    lengths
 }
 
 // ---------------------------------------------------------------------------
@@ -4689,6 +4691,7 @@ fn write_linearized_impl<R: Read + Seek>(
     // `id_writer = None`), exactly as qpdf's pass 1 does, so the digest depends
     // only on the input and is stable.
     let pass1_part1 = build_pass1_part1(&part1);
+    let mut writer_encryption_state = writer_encryption_state_for(encrypt_ctx.as_ref());
     let mut pass1_target = Pass1OutputTarget::new(pass1_path)?;
     let mut pass1_sink = OutputSink::new(&mut pass1_target);
     if deterministic_id {
@@ -4716,6 +4719,7 @@ fn write_linearized_impl<R: Read + Seek>(
         true,
         None,
         encrypt_ctx.as_ref(),
+        &mut writer_encryption_state,
         encrypted_string_emitter.as_mut(),
         eff_version,
         eff_ext,
@@ -4865,6 +4869,7 @@ fn write_linearized_impl<R: Read + Seek>(
     )?; // cov:ignore: final values are bounded by the fixed Part-1 reserve
     let final_layout = FinalLinearizedLayout {
         xref_offsets: &mut pass1_output.xref_offsets,
+        lengths: &mut pass1_output.lengths,
         main_xref_offset: final_main_xref_offset,
     };
 
@@ -4921,6 +4926,7 @@ fn write_linearized_impl<R: Read + Seek>(
         false,
         None,
         encrypt_ctx.as_ref(),
+        &mut writer_encryption_state,
         encrypted_string_emitter.as_mut(),
         eff_version,
         eff_ext,
@@ -4933,6 +4939,7 @@ fn write_linearized_impl<R: Read + Seek>(
     final_finish?;
     let LinearizedPassOutput {
         xref_offsets: _final_xref_offsets,
+        lengths: _final_lengths,
         first_page_xref_offset: final_first_page_xref_offset,
         hint_stream_offset: final_hint_stream_offset,
         hint_stream_obj_total_len: final_hint_stream_obj_total_len,
@@ -5111,17 +5118,11 @@ fn build_hint_stream_from_pass1(input: &HintStreamBuildInput<'_>) -> Result<Vec<
     // ------------------------------------------------------------------
     let xref_offsets = &pass1_output.xref_offsets;
     let hint_stream_offset = pass1_output.hint_stream_offset;
-    let last_xref_offset = pass1_output.last_xref_offset;
     // ------------------------------------------------------------------
-    // Compute per-object byte lengths from pass 1.
-    // Use the xref keyword offset (not first_entry_offset) for length computation.
+    // Reuse qpdf's pass-1 writer-owned object lengths for hint construction.
+    // The final pass updates this same map after the hint object is written.
     // ------------------------------------------------------------------
-    let byte_lengths = compute_byte_lengths(
-        xref_offsets,
-        last_xref_offset,
-        hint_stream_new_num,
-        renumber.param_dict_ref().number,
-    );
+    let byte_lengths = &pass1_output.lengths;
 
     // ------------------------------------------------------------------
     // Per-page byte lengths.
@@ -5483,7 +5484,7 @@ fn build_hint_stream_from_pass1(input: &HintStreamBuildInput<'_>) -> Result<Vec<
     // `build_outline_hint_table`).
     let outline_table = outline_info
         .as_ref()
-        .map(|info| build_outline_hint_table(info, xref_offsets, &byte_lengths))
+        .map(|info| build_outline_hint_table(info, xref_offsets, byte_lengths))
         .transpose()?;
 
     // Re-encode hint stream with patched tables.
@@ -5803,6 +5804,7 @@ mod tests {
         let container_shared_sort_key = BTreeMap::new();
         let pass1_output = LinearizedPassOutput {
             xref_offsets: BTreeMap::new(),
+            lengths: BTreeMap::new(),
             first_page_xref_offset: None,
             hint_stream_offset: 0,
             hint_stream_obj_total_len: 0,
@@ -5896,7 +5898,10 @@ mod tests {
             .expect("stream ref is in the renumber map");
         let mut plain_bytes = Vec::new();
         let mut plain_sink = OutputSink::new(&mut plain_bytes);
-        append_body_object_for_ref(
+        let mut xref_offsets = BTreeMap::new();
+        let mut lengths = BTreeMap::new();
+        let mut encryption_state = writer_encryption_state_for(None);
+        let body_offset = append_body_object_for_ref(
             &mut plain_sink,
             &mut pdf,
             new_ref,
@@ -5904,12 +5909,17 @@ mod tests {
             &WriterOptions::default(),
             None,
             None,
+            &mut xref_offsets,
+            &mut lengths,
+            &mut encryption_state,
             &renumber,
             &BTreeSet::new(),
             &BTreeSet::new(),
         )
         .expect("plain stream body writes");
         drop(plain_sink);
+        assert_eq!(xref_offsets[&new_ref.number], body_offset);
+        assert_eq!(lengths[&new_ref.number], plain_bytes.len() - body_offset);
         assert!(plain_bytes
             .windows(b"endstream".len())
             .any(|window| window == b"endstream"));
@@ -5921,8 +5931,12 @@ mod tests {
         };
         let mut plain_objstm_bytes = Vec::new();
         let mut plain_objstm_sink = OutputSink::new(&mut plain_objstm_bytes);
-        append_objstm_container_object(
+        let mut plain_xref_offsets = BTreeMap::new();
+        let mut plain_lengths = BTreeMap::new();
+        let plain_objstm_offset = append_objstm_container_object(
             &mut plain_objstm_sink,
+            &mut plain_xref_offsets,
+            &mut plain_lengths,
             &container,
             &renumber,
             &mut pdf,
@@ -5932,13 +5946,25 @@ mod tests {
         )
         .expect("plain ObjStm body writes");
         drop(plain_objstm_sink);
+        assert_eq!(
+            plain_xref_offsets[&container.container_new_num],
+            plain_objstm_offset
+        );
+        assert_eq!(
+            plain_lengths[&container.container_new_num],
+            plain_objstm_bytes.len() - plain_objstm_offset
+        );
 
         let mut encrypted_pdf = Pdf::empty().expect("empty PDF for encrypted ObjStm output");
         let encryption = test_encryption_context();
         let mut encrypted_bytes = Vec::new();
         let mut encrypted_sink = OutputSink::new(&mut encrypted_bytes);
-        append_objstm_container_object(
+        let mut encrypted_xref_offsets = BTreeMap::new();
+        let mut encrypted_lengths = BTreeMap::new();
+        let encrypted_objstm_offset = append_objstm_container_object(
             &mut encrypted_sink,
+            &mut encrypted_xref_offsets,
+            &mut encrypted_lengths,
             &container,
             &renumber,
             &mut encrypted_pdf,
@@ -5948,6 +5974,14 @@ mod tests {
         )
         .expect("encrypted ObjStm body writes");
         drop(encrypted_sink);
+        assert_eq!(
+            encrypted_xref_offsets[&container.container_new_num],
+            encrypted_objstm_offset
+        );
+        assert_eq!(
+            encrypted_lengths[&container.container_new_num],
+            encrypted_bytes.len() - encrypted_objstm_offset
+        );
         assert!(plain_objstm_bytes.starts_with(b"2 0 obj\n"));
         assert!(encrypted_bytes.starts_with(b"2 0 obj\n"));
     }
@@ -6189,6 +6223,9 @@ mod tests {
         let options = WriterOptions::default();
         let removed_refs = BTreeSet::new();
         let content_normalize_refs = BTreeSet::new();
+        let mut xref_offsets = BTreeMap::new();
+        let mut lengths = BTreeMap::new();
+        let mut encryption = writer_encryption_state_for(None);
         let mut emitter = LinearizedObjectEmitter {
             out: &mut sink,
             options: &options,
@@ -6200,9 +6237,9 @@ mod tests {
             root_source: None,
             final_pdf_version: "",
             final_extension_level: 0,
-            encryption: writer_encryption_state_for(None),
-            xref: BTreeMap::new(),
-            lengths: BTreeMap::new(),
+            encryption: &mut encryption,
+            xref_offsets: &mut xref_offsets,
+            lengths: &mut lengths,
         };
         let error = emitter
             .write_object(&unresolved, None)

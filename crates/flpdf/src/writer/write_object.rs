@@ -8,8 +8,6 @@
 //! the shared method retains qpdf's control flow. This replaces C++ member
 //! access with borrowed Rust state without changing the emission sequence.
 
-use std::collections::BTreeMap;
-
 use super::encryption_state::WriterEncryptionState;
 use crate::qpdf_obj_gen::QpdfObjGen;
 #[cfg(test)]
@@ -86,6 +84,12 @@ pub(crate) trait WriteObject {
     fn indicate_progress(&mut self) -> Result<()>;
     fn output_number(&self, object: QpdfObjGen) -> Result<u32>;
     fn write_bytes(&mut self, bytes: &[u8]) -> Result<()>;
+    /// Store the qpdf xref entry created by openObject in the consumer owner.
+    fn record_object_offset(&mut self, object: u32, offset: usize);
+    /// Read the xref offset used by closeObject to calculate object length.
+    fn object_offset(&self, object: u32) -> usize;
+    /// Store closeObject's measured object length in the consumer owner.
+    fn record_object_length(&mut self, object: u32, length: usize);
 
     fn write_decimal_i64(&mut self, value: i64) -> Result<()> {
         let (encoded, start) = decimal_i64_bytes(value);
@@ -97,8 +101,6 @@ pub(crate) trait WriteObject {
         self.write_bytes(&encoded[start..])
     }
     fn output_count(&self) -> Result<usize>;
-    fn xref(&mut self) -> &mut BTreeMap<u32, (u16, usize)>;
-    fn lengths(&mut self) -> &mut BTreeMap<u32, usize>;
     fn encryption_state(&mut self) -> &mut WriterEncryptionState;
     fn unparse_object(&mut self, object: &ObjectHandle, in_object_stream: bool) -> Result<()>;
 
@@ -117,7 +119,7 @@ pub(crate) trait WriteObject {
     /// The already-allocated-id case of qpdf's `openObject`.
     fn open_object(&mut self, object: u32) -> Result<()> {
         let offset = self.output_count()?;
-        self.xref().insert(object, (0, offset));
+        self.record_object_offset(object, offset);
         self.write_decimal_u64(u64::from(object))?;
         self.write_bytes(b" 0 obj\n")
     }
@@ -129,9 +131,9 @@ pub(crate) trait WriteObject {
         }
         let length = self
             .output_count()?
-            .checked_sub(self.xref()[&object].1)
+            .checked_sub(self.object_offset(object))
             .ok_or_else(|| crate::Error::Internal("writer object length underflow".to_string()))?;
-        self.lengths().insert(object, length);
+        self.record_object_length(object, length);
         Ok(())
     }
 
@@ -208,7 +210,7 @@ mod tests {
     use super::*;
     use crate::writer::{serialize, ObjectWriterEmission};
     use crate::{NewlineBeforeEndstream, Pdf};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::io::Cursor;
     use std::rc::Rc;
 
@@ -285,11 +287,14 @@ mod tests {
         fn output_count(&self) -> Result<usize> {
             Ok(self.bytes.len())
         }
-        fn xref(&mut self) -> &mut BTreeMap<u32, (u16, usize)> {
-            &mut self.xref
+        fn record_object_offset(&mut self, object: u32, offset: usize) {
+            self.xref.insert(object, (0, offset));
         }
-        fn lengths(&mut self) -> &mut BTreeMap<u32, usize> {
-            &mut self.lengths
+        fn object_offset(&self, object: u32) -> usize {
+            self.xref[&object].1
+        }
+        fn record_object_length(&mut self, object: u32, length: usize) {
+            self.lengths.insert(object, length);
         }
         fn encryption_state(&mut self) -> &mut WriterEncryptionState {
             &mut self.encryption
