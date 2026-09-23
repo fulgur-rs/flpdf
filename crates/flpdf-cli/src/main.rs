@@ -2706,15 +2706,7 @@ fn last_encryption_mode(args: &[arg_parser::RawArg]) -> Option<EncryptionMode> {
 }
 
 fn is_named_segment_option(bytes: &[u8]) -> bool {
-    matches!(
-        bytes,
-        b"--encrypt"
-            | b"--pages"
-            | b"--add-attachment"
-            | b"--copy-attachments-from"
-            | b"--overlay"
-            | b"--underlay"
-    )
+    arg_parser::is_named_segment_option(bytes)
 }
 
 fn raw_os_args(args: &[OsString]) -> Vec<Vec<u8>> {
@@ -11241,6 +11233,27 @@ mod tests {
         assert_eq!(parsed.named_segments[1].tokens, ["--range=1"]);
         assert_eq!(parsed.named_segments[2].tokens, ["--replace"]);
         assert_eq!(parsed.named_segments[3].tokens, ["--prefix=copy-"]);
+    }
+
+    #[test]
+    fn auxiliary_named_segment_classifier_covers_every_segment_kind() {
+        let openers: &[&[u8]] = &[
+            b"--encrypt",
+            b"--pages",
+            b"--add-attachment",
+            b"--copy-attachments-from",
+            b"--overlay",
+            b"--underlay",
+            b"--set-page-labels",
+        ];
+        for opener in openers {
+            assert!(
+                is_named_segment_option(opener),
+                "every SegmentKind opener must be recognized by auxiliary scans"
+            );
+        }
+        assert!(!is_named_segment_option(b"--ordinary-option"));
+        assert!(!is_named_segment_option(b"--pages=value"));
     }
 
     #[test]
