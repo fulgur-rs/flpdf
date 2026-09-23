@@ -86,6 +86,101 @@ fn job_json_file_runs_through_the_production_qpdf_job() {
 }
 
 #[test]
+fn overlay_underlay_transport_matches_qpdf_with_and_without_job_json() {
+    if !qpdf_available() {
+        return;
+    }
+    let version = ProcessCommand::new("/usr/bin/qpdf")
+        .arg("--version")
+        .output()
+        .expect("qpdf version probe should spawn");
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout)
+            .lines()
+            .next()
+            .map(str::trim),
+        Some("qpdf version 11.9.0")
+    );
+
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/three-page.pdf");
+    fs::copy(&fixture, directory.path().join("input.pdf")).unwrap();
+    fs::copy(&fixture, directory.path().join("overlay.pdf")).unwrap();
+    fs::write(directory.path().join("empty-job.json"), b"{}").unwrap();
+
+    for (segment_name, segment_option) in [("overlay", "--overlay"), ("underlay", "--underlay")] {
+        let mut flat_qpdf_output = None;
+        for (route_name, use_job_json) in [("flat", false), ("job-json", true)] {
+            let qpdf_output = format!("qpdf-{segment_name}-{route_name}.pdf");
+            let flpdf_output = format!("flpdf-{segment_name}-{route_name}.pdf");
+            let mut qpdf_args = vec!["--static-id".to_owned(), "--compress-streams=n".to_owned()];
+            let mut flpdf_args = qpdf_args.clone();
+            if use_job_json {
+                qpdf_args.push("--job-json-file=empty-job.json".to_owned());
+                flpdf_args.push("--job-json-file=empty-job.json".to_owned());
+            }
+            for args in [&mut qpdf_args, &mut flpdf_args] {
+                args.extend([
+                    segment_option.to_owned(),
+                    "overlay.pdf".to_owned(),
+                    "--".to_owned(),
+                    "input.pdf".to_owned(),
+                ]);
+            }
+            qpdf_args.push(qpdf_output.clone());
+            flpdf_args.push(flpdf_output.clone());
+
+            let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+                .current_dir(directory.path())
+                .args(&qpdf_args)
+                .output()
+                .unwrap();
+            let flpdf = Command::cargo_bin("flpdf")
+                .unwrap()
+                .current_dir(directory.path())
+                .env("FLPDF_PROGNAME", "qpdf")
+                .args(&flpdf_args)
+                .output()
+                .unwrap();
+
+            assert_eq!(
+                qpdf.status.code(),
+                Some(0),
+                "qpdf {segment_name}/{route_name}: {qpdf:?}"
+            );
+            assert_eq!(
+                flpdf.status.code(),
+                qpdf.status.code(),
+                "flpdf {segment_name}/{route_name}: {flpdf:?}"
+            );
+            assert_eq!(
+                flpdf.stdout, qpdf.stdout,
+                "stdout differs for {segment_name}/{route_name}"
+            );
+            assert_eq!(
+                flpdf.stderr, qpdf.stderr,
+                "stderr differs for {segment_name}/{route_name}"
+            );
+            let qpdf_bytes = fs::read(directory.path().join(&qpdf_output)).unwrap();
+            let flpdf_bytes = fs::read(directory.path().join(&flpdf_output)).unwrap();
+            assert_eq!(
+                flpdf_bytes, qpdf_bytes,
+                "PDF bytes differ for {segment_name}/{route_name}"
+            );
+            if let Some(flat_qpdf_output) = &flat_qpdf_output {
+                assert_eq!(
+                    qpdf_bytes, *flat_qpdf_output,
+                    "job JSON must not change the {segment_name} output"
+                );
+            } else {
+                flat_qpdf_output = Some(qpdf_bytes);
+            }
+        }
+    }
+}
+
+#[test]
 fn job_json_file_password_and_password_file_follow_argv_order() {
     if !qpdf_available() {
         return;

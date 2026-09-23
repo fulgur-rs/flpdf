@@ -1,3 +1,11 @@
+//! Preprocess qpdf-style argv while retaining named-segment boundaries for flpdf-cli.
+//!
+//! qpdf correspondence: `QPDFArgParser::parseArgs` (`libqpdf/QPDFArgParser.cc:433-569`)
+//! scans argv once and invokes `jobJsonFile` and segment configuration callbacks in order.
+//! flpdf uses typed `SegmentHandler` values on the ordinary route and replays raw segment
+//! tokens through the QPDFJob parser when job JSON is present. This is a classification (B)
+//! carrier alternative; `cli_job_json.rs::overlay_underlay_transport_matches_qpdf_with_and_without_job_json`
+//! checks qpdf 11.9.0 output bytes for both routes.
 use clap::Command;
 use flpdf::job::QPDFJob;
 use std::collections::HashSet;
@@ -293,24 +301,10 @@ impl SegmentKind {
         }
     }
 
-    // qpdf-deviation: qpdf's QPDFArgParser is single-pass and single-mode, so
-    // it has no concept of a job-json/non-job-json branch here -- every
-    // Config callback (including jobJsonFile itself, QPDFJob_config.cc:774)
-    // sees the same argv stream. flpdf-cli's own native (non-job-json)
-    // dispatch instead applies a named segment through the value this
-    // function's caller collects in `named_segments`/`SegmentHandler`, not
-    // through the reconstructed residual tokens, so unconditional retention
-    // is unobservable there except where flpdf-cli's own subcommand routing
-    // (not qpdf) restricts which subcommands accept a segment's option at
-    // all -- clap must not see an unrecognized `--overlay`/`--underlay` token
-    // on a subcommand that never declared it. Retention is therefore gated
-    // on job-json mode for `Overlay` specifically, matching the one flpdf-cli
-    // subcommand-restriction check that exists only for that segment kind
-    // (`--overlay/--underlay can only be used with rewrite output`,
-    // crates/flpdf-cli/src/main.rs). The other five segment kinds have no
-    // such restriction and can therefore stay unconditionally retained,
-    // which is what already lets `--job-json-file`'s unified argv parser
-    // (`QPDFJob::initialize_from_expanded_raw_argv`) see them.
+    // qpdf's QPDFArgParser invokes all Config callbacks in one pass. The
+    // ordinary qpdf-style route applies overlay specs from SegmentHandler;
+    // job-json replays the same raw group through QPDFJob so it updates the
+    // partially initialized job in argv order. Keep both carriers aligned.
     fn retain_in_residual(self, has_job_json: bool) -> bool {
         match self {
             Self::Overlay => has_job_json,
