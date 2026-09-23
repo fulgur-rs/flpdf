@@ -5868,6 +5868,7 @@ mod final_handle_tests {
             ObjectHandle::from_value(value)
         }
 
+        // cov:ignore-start: failure-injection owner has no canonical xref state; these test-only trait stubs have no production behavior
         fn xref_registration(&self) -> XrefRegistration {
             XrefRegistration::default()
         }
@@ -5882,7 +5883,6 @@ mod final_handle_tests {
 
         fn install_xref_entries(&self, _entries: BTreeMap<ObjectRef, XrefEntry>) {}
 
-        // cov:ignore-start: failure-injection owner has no canonical xref state; these test-only trait stubs have no production behavior
         fn install_raw_xref_entries(&self, _entries: BTreeMap<QpdfObjGen, XrefEntry>) {}
 
         fn begin_reconstructed_xref_table_updates(&self) {}
@@ -6993,6 +6993,16 @@ mod final_handle_tests {
         assert!(registration.raw_snapshot().is_empty());
         assert!(registration.snapshot().is_empty());
         assert!(registration.deleted_objects_snapshot().is_empty());
+    }
+
+    #[test]
+    fn reconstructed_registration_ignores_object_numbers_outside_qpdf_int_range() {
+        let registration = XrefRegistration::default();
+
+        registration.insert_reconstructed_xref_entry(ObjectRef::new(u32::MAX, 0), 1);
+
+        assert!(registration.raw_snapshot().is_empty());
+        assert!(registration.snapshot().is_empty());
     }
 
     fn xref_stream_entry(object_type: u8, field1: u16, field2: u8) -> [u8; 4] {
