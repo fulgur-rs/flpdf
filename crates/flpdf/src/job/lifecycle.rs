@@ -4884,13 +4884,14 @@ impl QPDFJob {
         // failed encrypted one.
         let authentication_failed = pdf.is_encrypted() && pdf.encryption_file_key().is_none();
         // qpdf's createQPDF returns from its password-error catch before the
-        // ordinary post-open root walk. Do not resolve an encrypted root in
-        // the same partial state; successful/plaintext opens keep the normal
-        // QPDFJob root initialization and warning boundary.
+        // ordinary post-open root walk and before writeQPDF transfers document
+        // warnings to the job. Do not resolve an encrypted root or promote its
+        // already-emitted diagnostics from the same partial state; successful
+        // and plaintext opens keep the normal job boundaries.
         if !authentication_failed {
             pdf.root_handle()?;
+            self.record_document_warnings(&pdf);
         }
-        self.record_document_warnings(&pdf);
         Ok(pdf)
     }
 

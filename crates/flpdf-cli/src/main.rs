@@ -8969,14 +8969,20 @@ fn run_show_encryption(
 /// Emit the qpdf-verbatim encryption report through the job-owned renderer,
 /// then complete the same warning/exit-status boundary as other inspections.
 /// The document may have come from either a file-backed input or a JSON update,
-/// so the already-open document must be passed through unchanged.
+/// so the already-open document must be passed through unchanged. qpdf's
+/// wrong-password `createQPDF` path returns before `writeQPDF` transfers the
+/// partially opened document's warnings to the job, so this path retains their
+/// live output without using them to select the exit code.
 fn finish_show_encryption<R: Read + Seek>(
     job: &mut QPDFJob,
     pdf: &mut Pdf<R>,
     password_is_hex_key: bool,
 ) -> CliResult<()> {
+    let authentication_failed = pdf.is_encrypted() && pdf.encryption_file_key().is_none();
     job.show_encryption(pdf, password_is_hex_key)?;
-    job.record_document_warnings(pdf);
+    if !authentication_failed {
+        job.record_document_warnings(pdf);
+    }
     finish_job_exit_status(job.complete_report()?)
 }
 

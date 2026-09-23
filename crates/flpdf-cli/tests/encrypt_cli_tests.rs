@@ -763,6 +763,66 @@ fn top_level_show_encryption_reports_wrong_password_without_failing() {
 }
 
 #[test]
+fn top_level_show_encryption_subfilter_warning_exit_matches_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut bytes = std::fs::read(fixture("../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf"))
+        .expect("read V2/R3 encryption fixture");
+    insert_subfilter_warning_into_encryption_dictionary(&mut bytes);
+    let input = tmp.path().join("subfilter-encryption.pdf");
+    std::fs::write(&input, bytes).expect("write SubFilter encryption fixture");
+
+    for (password, expected_exit) in [("wrong", 0), ("user-v2", 3)] {
+        let password_arg = format!("--password={password}");
+        let qpdf = ShellCommand::new("qpdf")
+            .args(["--show-encryption", &password_arg])
+            .arg(&input)
+            .output()
+            .expect("run qpdf --show-encryption with SubFilter");
+        assert_eq!(
+            qpdf.status.code(),
+            Some(expected_exit),
+            "qpdf password={password}"
+        );
+        assert!(
+            String::from_utf8_lossy(&qpdf.stderr).contains("file uses encryption SubFilters"),
+            "qpdf must preserve the SubFilter warning for password={password}: {:?}",
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .env("FLPDF_PROGNAME", "qpdf")
+            .args(["--show-encryption", &password_arg])
+            .arg(&input)
+            .output()
+            .expect("run flpdf --show-encryption with SubFilter");
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "flpdf password={password}"
+        );
+        if cfg!(windows) {
+            assert_eq!(
+                normalize_text_newlines(&flpdf.stdout),
+                normalize_text_newlines(&qpdf.stdout),
+                "stdout for password={password}"
+            );
+            assert_eq!(
+                normalize_text_newlines(&flpdf.stderr),
+                normalize_text_newlines(&qpdf.stderr),
+                "stderr for password={password}"
+            );
+        } else {
+            assert_eq!(flpdf.stdout, qpdf.stdout, "stdout for password={password}");
+            assert_eq!(flpdf.stderr, qpdf.stderr, "stderr for password={password}");
+        }
+    }
+}
+
+#[test]
 fn json_encrypt_section_recovers_v2_user_password_from_owner_password() {
     if !ensure_qpdf_or_skip() {
         return;
@@ -2976,6 +3036,57 @@ fn replace_fixture_token(bytes: &mut [u8], from: &[u8], to: &[u8]) {
     assert_eq!(matches.len(), 1, "expected one occurrence of {from:?}");
     let start = matches[0];
     bytes[start..start + to.len()].copy_from_slice(to);
+}
+
+fn insert_subfilter_warning_into_encryption_dictionary(bytes: &mut Vec<u8>) {
+    let filter = b"/Filter /Standard";
+    let matches = bytes
+        .windows(filter.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == filter).then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matches.len(),
+        1,
+        "fixture has one Standard encryption dictionary"
+    );
+    let insert_at = matches[0] + filter.len();
+    let first_xref = bytes
+        .windows(b"xref\n".len())
+        .position(|window| window == b"xref\n")
+        .expect("classic fixture has an xref table");
+    let encryption_object = bytes
+        .windows(b"3 0 obj\n".len())
+        .position(|window| window == b"3 0 obj\n")
+        .expect("fixture has the indirect encryption dictionary object");
+    assert!(encryption_object < insert_at && insert_at < first_xref);
+    assert!(
+        !bytes[insert_at..first_xref]
+            .windows(b" obj\n".len())
+            .any(|window| window == b" obj\n"),
+        "encryption dictionary object is final before the xref table"
+    );
+    bytes.splice(insert_at..insert_at, b" /SubFilter /Bogus".iter().copied());
+
+    // The encrypted fixture stores its final object immediately before the
+    // classic xref table, so inserting a dictionary key leaves every object
+    // offset intact; only startxref moves.
+    let xref_offset = bytes
+        .windows(b"xref\n".len())
+        .position(|window| window == b"xref\n")
+        .expect("classic fixture still has an xref table");
+    let startxref_marker = b"startxref\n";
+    let startxref = bytes
+        .windows(startxref_marker.len())
+        .rposition(|window| window == startxref_marker)
+        .expect("classic fixture has startxref");
+    let value_start = startxref + startxref_marker.len();
+    let value_end = value_start
+        + bytes[value_start..]
+            .iter()
+            .position(|byte| !byte.is_ascii_digit())
+            .expect("startxref has a numeric offset");
+    bytes.splice(value_start..value_end, xref_offset.to_string().bytes());
 }
 
 fn replace_fixture_encrypt_dictionary_with_integer(bytes: &mut [u8]) {
