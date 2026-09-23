@@ -119,6 +119,7 @@ use crate::pipeline::rc4::PlRc4;
 use crate::pipeline::Pipeline;
 use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::tokenizer::{Token, TokenType, Tokenizer};
+use crate::xref::XrefRegistration;
 use crate::{
     Diagnostics, Error, ObjectHandle, ObjectRef, QpdfErrorCode, QpdfExc, Result, XrefEntry,
 };
@@ -321,32 +322,6 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
     }
 }
 
-fn raw_xref_entries_from_object_refs(
-    entries: BTreeMap<ObjectRef, XrefEntry>,
-) -> BTreeMap<QpdfObjGen, XrefEntry> {
-    entries
-        .into_iter()
-        .filter_map(|(object_ref, entry)| {
-            QpdfObjGen::try_from_object_ref(object_ref)
-                .ok()
-                .map(|object_gen| (object_gen, entry))
-        })
-        .collect()
-}
-
-fn object_ref_xref_entries(
-    entries: &BTreeMap<QpdfObjGen, XrefEntry>,
-) -> BTreeMap<ObjectRef, XrefEntry> {
-    entries
-        .iter()
-        .filter_map(|(object_gen, entry)| {
-            object_gen
-                .to_object_ref()
-                .map(|object_ref| (object_ref, *entry))
-        })
-        .collect()
-}
-
 /// qpdf's private `QPDF::ObjCache` entry (`include/qpdf/QPDF.hh:868-889`):
 /// canonical handle identity and source-layout metadata share one cache node.
 #[derive(Clone, Debug)]
@@ -388,9 +363,15 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// the shift unskippable, so raw-input snapshots reach the bytes before it
     /// through the wrapper's `proxied` member rather than through `m->file`.
     header_offset: usize,
-    /// qpdf `m->xref_table` (`QPDF.hh:1465`). The raw identity is canonical;
-    /// valid `ObjectRef` views are projected at consumer boundaries.
-    raw_source_xref_entries: BTreeMap<QpdfObjGen, XrefEntry>,
+    /// qpdf `m->xref_table` and `m->deleted_objects`
+    /// (`QPDF.hh:1465-1466`). The raw identity and registration tombstones
+    /// stay live on the document owner from the first xref row through parse
+    /// and reconstruction; valid `ObjectRef` views are projections.
+    xref_registration: XrefRegistration,
+    /// qpdf `m->trailer` (`QPDF.hh:1469`). Set only once by readTrailer or
+    /// xref-stream parsing; both open-time and delayed recovery read this same
+    /// handle from the document owner.
+    trailer: Option<ObjectHandle>,
     /// qpdf `m->obj_cache` (`QPDF.hh:1467`), and the document's *only*
     /// canonical [`QpdfObjGen`] → [`ObjectHandle`] map.
     ///
@@ -1007,7 +988,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 input: RefCell::new(Rc::new(StreamInput::new(reader, header_offset))),
                 input_generation: Cell::new(0),
                 header_offset,
-                raw_source_xref_entries: raw_xref_entries_from_object_refs(initial_entries),
+                xref_registration: XrefRegistration::from_effective_entries(initial_entries),
+                trailer: None,
                 object_cache: BTreeMap::new(),
                 last_object_description: String::new(),
                 last_object_description_bytes: Vec::new(),
@@ -1058,7 +1040,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 input: RefCell::new(Rc::new(StreamInput::invalid())),
                 input_generation: Cell::new(0),
                 header_offset: 0,
-                raw_source_xref_entries: BTreeMap::new(),
+                xref_registration: XrefRegistration::default(),
+                trailer: None,
                 object_cache: BTreeMap::new(),
                 last_object_description: String::new(),
                 last_object_description_bytes: Vec::new(),
@@ -1684,7 +1667,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         for &object_gen in object_gens {
             let cached = {
                 let mut core = self.core.borrow_mut();
-                core.raw_source_xref_entries.remove(&object_gen);
+                core.xref_registration.remove_raw_entry(object_gen);
                 core.default_xref_entries.remove(&object_gen);
                 core.default_xref_warnings.remove(&object_gen);
                 core.allocated_object_refs.remove(&object_gen);
@@ -2060,7 +2043,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// translation of `m->xref_table.erase(og)`, not a second, extra map:
     /// flpdf represents that one qpdf map as two disjoint collections, since
     /// a given `og` is in at most one of them at a time —
-    /// [`ResolverCore::raw_source_xref_entries`] for the live type-1/type-2
+    /// [`ResolverCore::xref_registration`] for the live type-1/type-2
     /// rows, and [`ResolverCore::default_xref_entries`] for the transient
     /// type-0 rows `m->xref_table[og]` default-constructs as a side effect of
     /// `operator[]` while inspecting an ObjStm header (`QPDF.cc:1823`) — so
@@ -2073,7 +2056,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let cached = {
             let mut core = self.core.borrow_mut();
             // `QPDF::removeObject` erases the one raw-keyed row every consumer reads.
-            core.raw_source_xref_entries.remove(&object_gen);
+            core.xref_registration.remove_raw_entry(object_gen);
             core.default_xref_entries.remove(&object_gen);
             // qpdf-deviation: qpdf carries no "was this default row's warning
             // already delivered" field to erase here -- `warn_default_xref_entries`
@@ -2236,22 +2219,16 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .collect::<Result<BTreeMap<_, _>>>()?;
 
         {
-            let mut core = self.core.borrow_mut();
-            core.raw_source_xref_entries
-                .retain(|_, entry| !matches!(entry, XrefEntry::Uncompressed { .. }));
-            core.raw_source_xref_entries.extend(new_raw_entries);
+            let core = self.core.borrow_mut();
+            core.xref_registration.remove_uncompressed_entries();
+            core.xref_registration.extend_raw_entries(new_raw_entries);
         }
 
         // Lookup the same raw object/generation in the reconstructed xref
         // table. qpdf's one table keeps invalid generations visible here;
         // the valid ObjectRef projection is only a fallback for tests that
         // inject effective entries directly.
-        let retry_entry = self
-            .core
-            .borrow()
-            .raw_source_xref_entries
-            .get(&expected)
-            .copied();
+        let retry_entry = self.core.borrow().xref_registration.raw_entry(expected);
         match retry_entry {
             Some(XrefEntry::Uncompressed { offset: new_offset }) => {
                 // qpdf QPDF.cc:1622-1628: the retry call has try_recovery=false, so
@@ -2281,8 +2258,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// required when opening fails before a `Pdf` exists.
     pub(crate) fn disconnect_all(&self) {
         let handles: Vec<_> = {
-            let mut core = self.core.borrow_mut();
-            core.raw_source_xref_entries.clear();
+            let core = self.core.borrow_mut();
+            core.xref_registration.clear_raw_entries();
             core.object_cache
                 .values()
                 .map(|entry| entry.handle.clone())
@@ -2602,11 +2579,24 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// declared one.
     pub(crate) fn xref_entry(&self, object_ref: ObjectRef) -> Option<XrefEntry> {
         let object_gen = QpdfObjGen::try_from_object_ref(object_ref).ok()?;
-        self.core
-            .borrow()
-            .raw_source_xref_entries
-            .get(&object_gen)
-            .copied()
+        self.core.borrow().xref_registration.raw_entry(object_gen)
+    }
+
+    pub(crate) fn xref_registration(&self) -> XrefRegistration {
+        self.core.borrow().xref_registration.clone()
+    }
+
+    pub(crate) fn current_trailer(&self) -> Option<ObjectHandle> {
+        self.core.borrow().trailer.clone()
+    }
+
+    pub(crate) fn set_trailer_if_uninitialized(&self, trailer: ObjectHandle) -> bool {
+        let mut core = self.core.borrow_mut();
+        if core.trailer.is_some() {
+            return false;
+        }
+        core.trailer = Some(trailer);
+        true
     }
 
     fn insert_default_xref_entry(&self, object_ref: ObjectRef) {
@@ -2674,7 +2664,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// because those rows are lookup side effects rather than source objects.
     pub(crate) fn source_xref_entries(&self) -> BTreeMap<ObjectRef, XrefEntry> {
         let core = self.core.borrow();
-        object_ref_xref_entries(&core.raw_source_xref_entries)
+        core.xref_registration.snapshot()
     }
 
     /// Append qpdf's type-2 source object-to-container mapping.
@@ -2684,11 +2674,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// map. Default lookup-created rows are all type 0, so only the physical
     /// source table can contribute type-2 entries.
     pub(crate) fn get_object_stream_data(&self, mapping: &mut BTreeMap<u32, u32>) {
-        for (object_gen, entry) in &self.core.borrow().raw_source_xref_entries {
+        for (object_gen, entry) in self.core.borrow().xref_registration.raw_snapshot() {
             if let (Some(object), XrefEntry::Compressed { stream, .. }) =
                 (object_gen.to_object_ref(), entry)
             {
-                mapping.insert(object.number, *stream);
+                mapping.insert(object.number, stream);
             }
         }
     }
@@ -2699,7 +2689,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// public snapshot while preserving any source row for the same identity.
     pub(crate) fn xref_entries(&self) -> BTreeMap<ObjectRef, XrefEntry> {
         let core = self.core.borrow();
-        let mut entries = object_ref_xref_entries(&core.raw_source_xref_entries);
+        let mut entries = core.xref_registration.snapshot();
         for object_gen in &core.default_xref_entries {
             let object_ref = object_gen.to_object_ref().or_else(|| {
                 (object_gen.is_indirect()
@@ -2722,7 +2712,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// so a signed generation such as 65536 remains visible.
     pub(crate) fn raw_xref_entries(&self) -> BTreeMap<QpdfObjGen, XrefEntry> {
         let core = self.core.borrow();
-        let mut entries = core.raw_source_xref_entries.clone();
+        let mut entries = core.xref_registration.raw_snapshot();
         for object_gen in &core.default_xref_entries {
             entries
                 .entry(*object_gen)
@@ -2738,54 +2728,55 @@ impl<R: Read + Seek> ResolverHandle<R> {
         });
 
         let core = self.core.borrow();
-        let mut entries = Vec::with_capacity(
-            core.raw_source_xref_entries.len() + core.default_xref_entries.len(),
-        );
-        let mut raw = core.raw_source_xref_entries.iter().peekable();
-        let mut defaults = core.default_xref_entries.iter().peekable();
-        loop {
-            match (raw.peek().copied(), defaults.peek().copied()) {
-                (Some((raw_object_gen, _)), Some(default_object_gen)) => {
-                    match raw_object_gen.cmp(default_object_gen) {
-                        std::cmp::Ordering::Less => {
-                            let Some((object_gen, entry)) = raw.next() else {
-                                break; // cov:ignore: peeked raw iterator cannot be empty before next
-                            };
-                            entries.push((*object_gen, *entry));
-                        }
-                        std::cmp::Ordering::Equal => {
-                            let Some((object_gen, entry)) = raw.next() else {
-                                break; // cov:ignore: peeked raw iterator cannot be empty before next
-                            };
-                            let Some(_) = defaults.next() else {
-                                break; // cov:ignore: peeked default iterator cannot be empty before next
-                            };
-                            entries.push((*object_gen, *entry));
-                        }
-                        std::cmp::Ordering::Greater => {
-                            let Some(object_gen) = defaults.next() else {
-                                break; // cov:ignore: peeked default iterator cannot be empty before next
-                            };
-                            entries.push((*object_gen, XrefEntry::Free { next: 0 }));
+        core.xref_registration.with_raw_entries(|raw_entries| {
+            let mut entries =
+                Vec::with_capacity(raw_entries.len() + core.default_xref_entries.len());
+            let mut raw = raw_entries.iter().peekable();
+            let mut defaults = core.default_xref_entries.iter().peekable();
+            loop {
+                match (raw.peek().copied(), defaults.peek().copied()) {
+                    (Some((raw_object_gen, _)), Some(default_object_gen)) => {
+                        match raw_object_gen.cmp(default_object_gen) {
+                            std::cmp::Ordering::Less => {
+                                let Some((object_gen, entry)) = raw.next() else {
+                                    break; // cov:ignore: peeked raw iterator cannot be empty before next
+                                };
+                                entries.push((*object_gen, *entry));
+                            }
+                            std::cmp::Ordering::Equal => {
+                                let Some((object_gen, entry)) = raw.next() else {
+                                    break; // cov:ignore: peeked raw iterator cannot be empty before next
+                                };
+                                let Some(_) = defaults.next() else {
+                                    break; // cov:ignore: peeked default iterator cannot be empty before next
+                                };
+                                entries.push((*object_gen, *entry));
+                            }
+                            std::cmp::Ordering::Greater => {
+                                let Some(object_gen) = defaults.next() else {
+                                    break; // cov:ignore: peeked default iterator cannot be empty before next
+                                };
+                                entries.push((*object_gen, XrefEntry::Free { next: 0 }));
+                            }
                         }
                     }
+                    (Some(_), None) => {
+                        let Some((object_gen, entry)) = raw.next() else {
+                            break; // cov:ignore: peeked raw iterator cannot be empty before next
+                        };
+                        entries.push((*object_gen, *entry));
+                    }
+                    (None, Some(_)) => {
+                        let Some(object_gen) = defaults.next() else {
+                            break; // cov:ignore: peeked default iterator cannot be empty before next
+                        };
+                        entries.push((*object_gen, XrefEntry::Free { next: 0 }));
+                    }
+                    (None, None) => break,
                 }
-                (Some(_), None) => {
-                    let Some((object_gen, entry)) = raw.next() else {
-                        break; // cov:ignore: peeked raw iterator cannot be empty before next
-                    };
-                    entries.push((*object_gen, *entry));
-                }
-                (None, Some(_)) => {
-                    let Some(object_gen) = defaults.next() else {
-                        break; // cov:ignore: peeked default iterator cannot be empty before next
-                    };
-                    entries.push((*object_gen, XrefEntry::Free { next: 0 }));
-                }
-                (None, None) => break,
             }
-        }
-        entries
+            entries
+        })
     }
 
     fn object_stream_description_template(
@@ -3210,10 +3201,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// collected under a single short borrow.
     pub(crate) fn xref_refs(&self) -> Vec<ObjectRef> {
         let core = self.core.borrow();
-        core.raw_source_xref_entries
-            .keys()
-            .filter_map(|object_gen| object_gen.to_object_ref())
-            .collect()
+        core.xref_registration.with_raw_entries(|raw_entries| {
+            raw_entries
+                .keys()
+                .filter_map(|object_gen| object_gen.to_object_ref())
+                .collect()
+        })
     }
 
     /// qpdf `QPDF::pipeStreamData` (`libqpdf/QPDF.cc:2477-2538`), the only
@@ -3323,10 +3316,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let Ok(object_gen) = QpdfObjGen::try_from_object_ref(object_ref) else {
             return;
         };
-        let mut core = self.core.borrow_mut();
+        let core = self.core.borrow_mut();
         // qpdf keeps one table, so a row added after open is the same row
         // `showXRefTable` walks (`QPDF.cc:1149-1184,1213-1236`).
-        core.raw_source_xref_entries.insert(object_gen, entry);
+        core.xref_registration.insert_overwriting(object_gen, entry);
     }
 
     /// Test-only: install a cross-reference entry the source did not declare,
@@ -3518,35 +3511,44 @@ impl<R: Read + Seek> ResolverHandle<R> {
         core.input.borrow().header_offset.set(offset);
     }
 
-    /// Replace the source xref table after the initial section has been read.
+    /// Merge a valid `ObjectRef` projection into the owner-held source table.
     ///
-    /// The document exists before xref parsing, so a classic trailer can mint
-    /// its indirect children in this same resolver cache.  Later xref sections
-    /// update that one table as they are discovered; no trailer rebind is
-    /// required at the handoff boundary.
+    /// Parsing has already inserted each raw row into this same registration;
+    /// this boundary resets dangling-reference preparation and registers any
+    /// valid projected row that is not present yet.
     pub(crate) fn install_source_xref_entries(&self, entries: BTreeMap<ObjectRef, XrefEntry>) {
-        let mut core = self.core.borrow_mut();
-        if core.reconstructed_xref && core.reconstruction_table_update_depth == 0 {
-            // This outer loader snapshot predates the live reconstruction
-            // table; only candidate-section writes inside the scoped scan may
-            // replace it after the qpdf guard has been armed.
-            return;
+        let registration = {
+            let mut core = self.core.borrow_mut();
+            if core.reconstructed_xref && core.reconstruction_table_update_depth == 0 {
+                // This outer loader snapshot predates the live reconstruction
+                // table; merging it could re-add stale rows after the qpdf guard
+                // has been armed.
+                return;
+            }
+            core.fixed_dangling_refs = false;
+            core.xref_registration.clone()
+        };
+        // This is a valid-ObjectRef projection of rows already registered by
+        // the loader. Register missing valid rows without replacing raw
+        // QpdfObjGen entries (notably invalid generations) held by the owner.
+        for (object_ref, entry) in entries {
+            if let Ok(object_gen) = QpdfObjGen::try_from_object_ref(object_ref) {
+                registration.insert_xref_entry(object_gen, entry);
+            }
         }
-        core.raw_source_xref_entries = raw_xref_entries_from_object_refs(entries);
-        core.fixed_dangling_refs = false;
     }
 
     /// Install qpdf's raw xref identity retained by the loader. This is the
     /// canonical table; valid `ObjectRef` views are projected from it for
     /// consumers that have the parser-valid boundary.
     pub(crate) fn install_raw_xref_entries(&self, entries: BTreeMap<QpdfObjGen, XrefEntry>) {
-        let mut core = self.core.borrow_mut();
+        let core = self.core.borrow_mut();
         if core.reconstructed_xref && core.reconstruction_table_update_depth == 0 {
             // The final reconstruction path installs its raw table while the
             // scoped scan is active; a later loader snapshot is stale.
             return;
         }
-        core.raw_source_xref_entries = entries;
+        core.xref_registration.replace_raw_entries(entries);
     }
 
     /// Permit xref loader mutations while `recover_xref_from_linear_scan`
@@ -5751,13 +5753,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let entry = object_gen
             .to_object_ref()
             .and_then(|object_ref| self.xref_entry(object_ref))
-            .or_else(|| {
-                self.core
-                    .borrow()
-                    .raw_source_xref_entries
-                    .get(&object_gen)
-                    .copied()
-            });
+            .or_else(|| self.core.borrow().xref_registration.raw_entry(object_gen));
 
         if entry.is_none()
             && object_gen
