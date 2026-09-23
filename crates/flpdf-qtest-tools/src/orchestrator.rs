@@ -57,8 +57,8 @@ pub fn compare_files(
     // the same identity graph rather than cloning a legacy Dictionary.
     let act_trailer = actual.trailer();
     let exp_trailer = expected.trailer();
-    clean_trailer_handle(&mut actual, &act_trailer)?;
-    clean_trailer_handle(&mut expected, &exp_trailer)?;
+    clean_trailer_handle(&act_trailer)?;
+    clean_trailer_handle(&exp_trailer)?;
     let trailer_diff = compare_objects(
         "trailer",
         &act_trailer,
@@ -70,8 +70,8 @@ pub fn compare_files(
         return Ok(Some(trailer_diff));
     }
 
-    clean_encryption_handle(&mut actual, &act_trailer)?;
-    clean_encryption_handle(&mut expected, &exp_trailer)?;
+    clean_encryption_handle(&act_trailer)?;
+    clean_encryption_handle(&exp_trailer)?;
 
     let a_refs: Vec<_> = actual
         .get_all_objects()?
