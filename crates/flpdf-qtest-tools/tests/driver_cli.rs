@@ -1411,13 +1411,83 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         env!("CARGO_MANIFEST_DIR"),
         "/src/driver/test_88_98.rs"
     ))
-    .expect("read mutation-driver source");
+    .expect("read mutation-driver source")
+    .replace("\r\n", "\n");
     let form_source = fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/src/driver/test_50_55.rs"
     ))
     .expect("read form-driver source")
     .replace("\r\n", "\n");
+
+    assert!(
+        !resolve_source.contains("fn resolve_once")
+            && !resolve_source.contains("fn resolved_terminal")
+            && !resolve_source.contains("fn resolved_key")
+            && !resolve_source.contains("pdf.resolve("),
+        "test 34-41 must not retain hidden explicit-resolution helpers"
+    );
+    assert!(
+        !mutation_source.contains("fn resolved_key") && !mutation_source.contains("pdf.resolve("),
+        "test 88-98 must not retain the hidden resolved_key bridge"
+    );
+    let qpdf_get_key = section(
+        resolve_source.as_str(),
+        "fn qpdf_get_key",
+        "/// `QUtil::hex_encode`",
+    );
+    assert!(
+        qpdf_get_key.contains("handle.try_get_key(key)") && !qpdf_get_key.contains("pdf.resolve("),
+        "test 34-41 must map qpdf getKey through ObjectHandle::try_get_key"
+    );
+    let test_35 = section(
+        resolve_source.as_str(),
+        "pub(crate) fn run_test_35",
+        "pub(crate) fn run_test_36",
+    );
+    assert!(
+        test_35.contains("pdf.root_handle()")
+            && test_35.contains("qpdf_get_key(")
+            && test_35.contains("try_get_array_n_items()")
+            && test_35.contains("matching_filespec_ef_f_stream(")
+            && !test_35.contains("resolved_key("),
+        "test 35 must use qpdf-shaped root, key, array, and type accessors"
+    );
+    let test_36 = section(
+        resolve_source.as_str(),
+        "pub(crate) fn run_test_36",
+        "// ---------------------------------------------------------------------------\n// test_37",
+    );
+    assert!(
+        test_36.contains("pdf.root_handle()")
+            && test_36.contains("qpdf_get_key(")
+            && test_36.contains("try_get_array_n_items()")
+            && test_36.contains("matching_filespec_ef_f_stream(")
+            && !test_36.contains("resolved_key("),
+        "test 36 must use qpdf-shaped stream and accessor calls"
+    );
+    let test_90 = section(
+        mutation_source.as_str(),
+        "pub(crate) fn run_test_90",
+        "// ---------------------------------------------------------------------------\n// test_91",
+    );
+    assert!(
+        test_90.contains("trailer.try_get_key(")
+            && test_90.contains("qtest.try_get_key(")
+            && !test_90.contains("resolved_key("),
+        "test 90 must use the canonical qpdf getKey accessor"
+    );
+    let test_94 = section(
+        mutation_source.as_str(),
+        "pub(crate) fn run_test_94",
+        "pub(crate) fn run_test_95",
+    );
+    assert!(
+        test_94.contains("root.try_get_key(")
+            && test_94.contains("pages_root.try_get_key(")
+            && !test_94.contains("resolved_key("),
+        "test 94 must use qpdf-shaped chained dictionary accessors"
+    );
 
     assert!(tree_source.contains("value.try_get_string_value()"));
 
@@ -1661,8 +1731,8 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "test 79 must use the canonical key accessor while retaining stream-copy writer behavior"
     );
     assert!(
-        test_79.contains("try_get_key(") && resolve_source.contains("fn resolve_once"),
-        "test 79 must retain canonical accessor usage while unrelated resolver scope remains"
+        test_79.contains("try_get_key(") && resolve_source.contains("fn qpdf_get_key"),
+        "test 79 must retain canonical accessor usage while the test-driver helper owns only its qpdf-shaped key boundary"
     );
     let test_19 = section(
         page_source.as_str(),

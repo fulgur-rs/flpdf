@@ -13,8 +13,8 @@ use std::rc::Rc;
 
 use flpdf::pipeline::{FlateAction, PlFlate};
 use flpdf::{
-    DecodeLevel, Error, ObjectHandle, PageDocumentHelper, PageObjectHelper, Pdf, PdfWriter,
-    Pipeline, PipelineResult, TokenFilter, TokenFilterOutput,
+    DecodeLevel, ObjectHandle, PageDocumentHelper, PageObjectHelper, Pdf, PdfWriter, Pipeline,
+    PipelineResult, TokenFilter, TokenFilterOutput,
 };
 
 use super::emit_new_diagnostics;
@@ -23,52 +23,32 @@ use crate::output::write_bytes;
 // ---------------------------------------------------------------------------
 // Shared helpers
 //
-// qpdf's own C++ accessors (`getKey`, `getArrayItem`, `unparseResolved`, ...)
-// transparently dereference an unresolved indirect handle on every call
-// (`QPDFObjectHandle::dereference`, `libqpdf/QPDFObjectHandle.cc:2376-2383`).
-// This crate's `ObjectHandle` accessors deliberately do not (see e.g.
-// `ObjectHandle::get_key`'s own doc: "Never performs resolution itself"), so
-// every qpdf `getKey(...)`/array-item step that is followed by a further
-// accessor call needs an explicit one-hop resolution here to observe the same
-// value qpdf would. Parsed qpdf objects never store an indirect object as a
-// bare reference value: `QPDF::replaceObject` rejects that shape
-// (`libqpdf/QPDF.cc:1980-1991`). The canonical `Pdf::resolve` operation is
-// therefore sufficient here; the separate legacy redirect chase is not part
-// of this qpdf test-driver translation.
+// qpdf's object accessors dereference their receiver (`QPDFObjectHandle::dereference`,
+// `libqpdf/QPDFObjectHandle.cc:2376-2383`). Translate each operation through the
+// corresponding fallible `ObjectHandle::try_*` accessor and drain diagnostics at
+// that operation boundary; do not route resolution through the qpdf-less
+// `Pdf::resolve` compatibility facade.
 // ---------------------------------------------------------------------------
 
-/// Resolve one canonical handle hop and drain any repair diagnostics that
-/// resolution produced, mirroring qpdf's synchronous per-dereference warning
-/// emission to stderr.
-fn resolved_terminal<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    handle: &ObjectHandle,
-    filename: &[u8],
-    diagnostics_written: &mut usize,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> flpdf::Result<ObjectHandle> {
-    let resolved = resolve_once(pdf, handle)?;
-    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    Ok(resolved)
+/// Drain warnings produced by one qpdf-shaped accessor before the next
+/// operation, matching qpdf's synchronous `QPDF::warn` logger.
+fn after_qpdf_call<'a, T, R: Read + Seek>(
+    pdf: &'a Pdf<R>,
+    filename: &'a [u8],
+    diagnostics_written: &'a mut usize,
+    stdout: &'a mut dyn Write,
+    stderr: &'a mut dyn Write,
+) -> impl FnOnce(flpdf::Result<T>) -> flpdf::Result<T> + 'a {
+    move |result| {
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        result
+    }
 }
 
-/// Resolve one canonical handle hop without changing the caller's diagnostic
-/// policy. This is used by test paths whose qpdf source does not drain the
-/// document-wide repair channel at that point.
-fn resolve_once<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    handle: &ObjectHandle,
-) -> flpdf::Result<ObjectHandle> {
-    pdf.resolve(handle)?;
-    Ok(handle.clone())
-}
-
-/// `handle.getKey(key)` plus the implicit dereference of the *returned*
-/// child that qpdf's next accessor call on it would perform
-/// (`QPDFObjectHandle::getKey`, `libqpdf/QPDFObjectHandle.cc:979-988`).
+/// `QPDFObjectHandle::getKey` (`libqpdf/QPDFObjectHandle.cc:979-988`): resolve
+/// the receiver and return the child without resolving it yet.
 #[allow(clippy::too_many_arguments)]
-fn resolved_key<R: Read + Seek>(
+fn qpdf_get_key<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: &ObjectHandle,
     key: &[u8],
@@ -77,35 +57,8 @@ fn resolved_key<R: Read + Seek>(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> flpdf::Result<ObjectHandle> {
-    let child = handle.get_key(key);
-    resolved_terminal(pdf, &child, filename, diagnostics_written, stdout, stderr)
-}
-
-/// `QPDF::getRoot()`'s minimal path (`libqpdf/QPDF.cc:2354-2368`): fetch
-/// `/Root` from the trailer and error if it is not a dictionary. The
-/// `check_mode` `/Type /Catalog` repair branch there is qpdf's `--check`-only
-/// behavior and this driver never runs in that mode, so it has no
-/// counterpart here.
-fn root_handle<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    filename: &[u8],
-    diagnostics_written: &mut usize,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> flpdf::Result<ObjectHandle> {
-    let candidate = pdf.trailer_key_handle(b"Root");
-    let resolved = resolved_terminal(
-        pdf,
-        &candidate,
-        filename,
-        diagnostics_written,
-        stdout,
-        stderr,
-    )?;
-    if resolved.as_dictionary().is_none() {
-        return Err(Error::System("unable to find /Root dictionary".to_string()));
-    }
-    Ok(resolved)
+    let result = handle.try_get_key(key);
+    after_qpdf_call(pdf, filename, diagnostics_written, stdout, stderr)(result)
 }
 
 /// `QUtil::hex_encode` (`libqpdf/QUtil.cc:720-731`): lowercase hex, two
@@ -230,11 +183,8 @@ fn inflate_with_pipeline(raw: &[u8]) -> flpdf::Result<Vec<u8>> {
 /// (item.getKey("/Type").getName() == "/Filespec") &&
 /// item.getKey("/EF").isDictionary() && item.getKey("/EF").getKey("/F").isStream()`
 /// (`test_driver.cc:1277-1279`, `1323-1325`), returning the resolved `/EF /F`
-/// stream handle on a match. Name *values* (as opposed to dictionary key
-/// strings) are decoded without a leading `/` in this crate
-/// (`ObjectHandle::as_name`'s own doc; contrast `ObjectHandle::get_key`,
-/// which requires the leading `/` for the *key* string), so the comparison
-/// below is against `b"Filespec"`, not `b"/Filespec"`.
+/// stream handle on a match. `try_get_name` returns qpdf's slash-prefixed
+/// name spelling, so compare with `b"/Filespec"`.
 #[allow(clippy::too_many_arguments)]
 fn matching_filespec_ef_f_stream<R: Read + Seek>(
     pdf: &mut Pdf<R>,
@@ -244,10 +194,13 @@ fn matching_filespec_ef_f_stream<R: Read + Seek>(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> flpdf::Result<Option<ObjectHandle>> {
-    if item.as_dictionary().is_none() {
+    let item_is_dictionary = after_qpdf_call(pdf, filename, diagnostics_written, stdout, stderr)(
+        item.try_is_dictionary(),
+    )?;
+    if !item_is_dictionary {
         return Ok(None);
     }
-    let type_name = resolved_key(
+    let type_value = qpdf_get_key(
         pdf,
         item,
         b"/Type",
@@ -256,10 +209,19 @@ fn matching_filespec_ef_f_stream<R: Read + Seek>(
         stdout,
         stderr,
     )?;
-    if type_name.as_name().as_deref() != Some(b"Filespec".as_slice()) {
+    let type_is_name = after_qpdf_call(pdf, filename, diagnostics_written, stdout, stderr)(
+        type_value.try_is_name(),
+    )?;
+    if !type_is_name {
         return Ok(None);
     }
-    let ef = resolved_key(
+    let type_name = after_qpdf_call(pdf, filename, diagnostics_written, stdout, stderr)(
+        type_value.try_get_name(),
+    )?;
+    if type_name.as_slice() != b"/Filespec" {
+        return Ok(None);
+    }
+    let ef = qpdf_get_key(
         pdf,
         item,
         b"/EF",
@@ -268,10 +230,13 @@ fn matching_filespec_ef_f_stream<R: Read + Seek>(
         stdout,
         stderr,
     )?;
-    if ef.as_dictionary().is_none() {
+    let ef_is_dictionary = after_qpdf_call(pdf, filename, diagnostics_written, stdout, stderr)(
+        ef.try_is_dictionary(),
+    )?;
+    if !ef_is_dictionary {
         return Ok(None);
     }
-    let ef_f = resolved_key(
+    let ef_f = qpdf_get_key(
         pdf,
         &ef,
         b"/F",
@@ -280,7 +245,10 @@ fn matching_filespec_ef_f_stream<R: Read + Seek>(
         stdout,
         stderr,
     )?;
-    if ef_f.as_stream_dict().is_none() {
+    let ef_f_is_stream = after_qpdf_call(pdf, filename, diagnostics_written, stdout, stderr)(
+        ef_f.try_is_stream_of_type(b"", b""),
+    )?;
+    if !ef_f_is_stream {
         return Ok(None);
     }
     Ok(Some(ef_f))
@@ -294,8 +262,9 @@ pub(crate) fn run_test_35<R: Read + Seek>(
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let root = root_handle(pdf, filename, diagnostics_written, stdout, stderr)?;
-    let names = resolved_key(
+    let root_result = pdf.root_handle();
+    let root = after_qpdf_call(pdf, filename, diagnostics_written, stdout, stderr)(root_result)?;
+    let names = qpdf_get_key(
         pdf,
         &root,
         b"/Names",
@@ -304,7 +273,7 @@ pub(crate) fn run_test_35<R: Read + Seek>(
         stdout,
         stderr,
     )?;
-    let embedded_files = resolved_key(
+    let embedded_files = qpdf_get_key(
         pdf,
         &names,
         b"/EmbeddedFiles",
@@ -313,7 +282,7 @@ pub(crate) fn run_test_35<R: Read + Seek>(
         stdout,
         stderr,
     )?;
-    let names = resolved_key(
+    let names = qpdf_get_key(
         pdf,
         &embedded_files,
         b"/Names",
@@ -330,8 +299,13 @@ pub(crate) fn run_test_35<R: Read + Seek>(
     // `operator[]` assignment, `test_driver.cc:1282`) -- both of which
     // `BTreeMap::insert` reproduces directly.
     let mut attachments: BTreeMap<Vec<u8>, Rc<Vec<u8>>> = BTreeMap::new();
-    for item in names.as_array().unwrap_or_default() {
-        let item = resolved_terminal(pdf, &item, filename, diagnostics_written, stdout, stderr)?;
+    let array_count = after_qpdf_call(pdf, filename, diagnostics_written, stdout, stderr)(
+        names.try_get_array_n_items(),
+    )?;
+    for index in 0..array_count {
+        let item = after_qpdf_call(pdf, filename, diagnostics_written, stdout, stderr)(
+            names.try_get_array_item(i64::try_from(index).unwrap_or(i64::MAX)),
+        )?;
         let Some(ef_f) = matching_filespec_ef_f_stream(
             pdf,
             &item,
@@ -343,7 +317,7 @@ pub(crate) fn run_test_35<R: Read + Seek>(
         else {
             continue;
         };
-        let filename_value = resolved_key(
+        let filename_handle = qpdf_get_key(
             pdf,
             &item,
             b"/F",
@@ -351,10 +325,13 @@ pub(crate) fn run_test_35<R: Read + Seek>(
             diagnostics_written,
             stdout,
             stderr,
-        )?
-        .as_string()
-        .unwrap_or_default();
-        let data = ef_f.get_stream_data(DecodeLevel::Generalized)?;
+        )?;
+        let filename_value = after_qpdf_call(pdf, filename, diagnostics_written, stdout, stderr)(
+            filename_handle.try_get_string_value(),
+        )?;
+        let data = after_qpdf_call(pdf, filename, diagnostics_written, stdout, stderr)(
+            ef_f.get_stream_data(DecodeLevel::Generalized),
+        )?;
         attachments.insert(filename_value, data);
     }
 
@@ -393,8 +370,9 @@ pub(crate) fn run_test_36<R: Read + Seek>(
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let root = root_handle(pdf, filename, diagnostics_written, stdout, stderr)?;
-    let names = resolved_key(
+    let root_result = pdf.root_handle();
+    let root = after_qpdf_call(pdf, filename, diagnostics_written, stdout, stderr)(root_result)?;
+    let names = qpdf_get_key(
         pdf,
         &root,
         b"/Names",
@@ -403,7 +381,7 @@ pub(crate) fn run_test_36<R: Read + Seek>(
         stdout,
         stderr,
     )?;
-    let embedded_files = resolved_key(
+    let embedded_files = qpdf_get_key(
         pdf,
         &names,
         b"/EmbeddedFiles",
@@ -412,7 +390,7 @@ pub(crate) fn run_test_36<R: Read + Seek>(
         stdout,
         stderr,
     )?;
-    let names = resolved_key(
+    let names = qpdf_get_key(
         pdf,
         &embedded_files,
         b"/Names",
@@ -422,8 +400,13 @@ pub(crate) fn run_test_36<R: Read + Seek>(
         stderr,
     )?;
 
-    for item in names.as_array().unwrap_or_default() {
-        let item = resolved_terminal(pdf, &item, filename, diagnostics_written, stdout, stderr)?;
+    let array_count = after_qpdf_call(pdf, filename, diagnostics_written, stdout, stderr)(
+        names.try_get_array_n_items(),
+    )?;
+    for index in 0..array_count {
+        let item = after_qpdf_call(pdf, filename, diagnostics_written, stdout, stderr)(
+            names.try_get_array_item(i64::try_from(index).unwrap_or(i64::MAX)),
+        )?;
         let Some(ef_f) = matching_filespec_ef_f_stream(
             pdf,
             &item,
@@ -435,7 +418,7 @@ pub(crate) fn run_test_36<R: Read + Seek>(
         else {
             continue;
         };
-        let filename_handle = resolved_key(
+        let filename_handle = qpdf_get_key(
             pdf,
             &item,
             b"/F",
@@ -444,10 +427,13 @@ pub(crate) fn run_test_36<R: Read + Seek>(
             stdout,
             stderr,
         )?;
-        if filename_handle.as_string().as_deref() != Some(b"attachment1.txt".as_slice()) {
+        let filename_value = after_qpdf_call(pdf, filename, diagnostics_written, stdout, stderr)(
+            filename_handle.try_get_string_value(),
+        )?;
+        if filename_value.as_slice() != b"attachment1.txt" {
             continue;
         }
-        let attachment_name = filename_handle.as_string().unwrap_or_default();
+        let attachment_name = filename_value;
 
         // `stream.pipeStreamData(&p2, 0, qpdf_dl_none)` pipes the raw,
         // undecoded stream bytes through a bare `Pl_Flate` inflate stage
@@ -456,12 +442,14 @@ pub(crate) fn run_test_36<R: Read + Seek>(
         // `get_raw_stream_data` is `QPDF_Stream::getRawStreamData`, the same
         // undecoded source `pipeStreamData(dl_none)` reads
         // (`ObjectHandle::get_raw_stream_data`'s own doc).
-        let raw = ef_f.get_raw_stream_data()?;
+        let raw = after_qpdf_call(pdf, filename, diagnostics_written, stdout, stderr)(
+            ef_f.get_raw_stream_data(),
+        )?;
         let data = inflate_with_pipeline(raw.as_ref())?;
 
-        let dict_handle = ef_f
-            .as_stream_dict()
-            .expect("matching_filespec_ef_f_stream already confirmed a stream value");
+        let dict_handle = after_qpdf_call(pdf, filename, diagnostics_written, stdout, stderr)(
+            ef_f.try_get_stream_dict(),
+        )?;
         write_bytes(stdout, &dict_handle.unparse())?;
         write_bytes(stdout, &attachment_name)?;
         stdout.write_all(b":\n")?;
@@ -722,8 +710,7 @@ pub(crate) fn run_test_41<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::{
-        inflate_with_pipeline, resolved_terminal, run_test_34, run_test_37, run_test_38,
-        run_test_39,
+        inflate_with_pipeline, qpdf_get_key, run_test_34, run_test_37, run_test_38, run_test_39,
     };
     use flpdf::{Pdf, PdfOpenOptions};
 
@@ -884,28 +871,34 @@ mod tests {
     }
 
     #[test]
-    fn resolved_terminal_uses_the_canonical_one_hop_resolver() {
+    fn qpdf_get_key_uses_the_canonical_accessor_and_keeps_child_lazy() {
         let mut pdf = Pdf::open_mem_owned_with_options(
             include_bytes!("../../../../tests/fixtures/minimal.pdf").to_vec(),
             PdfOpenOptions::default(),
         )
         .expect("open minimal fixture");
-        let root = pdf.trailer_key_handle(b"Root");
+        let root = pdf.root_handle().expect("resolve catalog root");
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
 
-        let resolved = resolved_terminal(
+        let child = qpdf_get_key(
             &mut pdf,
             &root,
+            b"/Pages",
             b"minimal.pdf",
             &mut diagnostics_written,
             &mut stdout,
             &mut stderr,
         )
-        .expect("resolve root");
+        .expect("read qpdf getKey child");
 
-        assert!(resolved.as_dictionary().is_some());
+        assert!(root.is_resolved());
+        assert!(child.is_indirect());
+        assert!(
+            !child.is_resolved(),
+            "qpdf getKey resolves its receiver but leaves its returned child lazy"
+        );
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
     }
