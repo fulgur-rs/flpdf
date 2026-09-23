@@ -259,6 +259,39 @@ fn open_and_resolve_recovery_share_one_owner_operation() {
 }
 
 #[test]
+fn candidate_recovery_reentry_without_a_trailer_matches_qpdf_failure() {
+    let fixture = include_bytes!("fixtures/xref-reconstruction-reentrant-before-trailer.pdf");
+    assert_eq!(
+        fixture,
+        include_bytes!(
+            "../../../fuzz/seeds/roundtrip/xref-reconstruction-reentrant-before-trailer.pdf"
+        ),
+        "the regression fixture is also kept in the short fuzz corpus"
+    );
+    let open = std::panic::catch_unwind(|| {
+        Pdf::open_with_options(
+            Cursor::new(fixture),
+            PdfOpenOptions {
+                repair: true,
+                suppress_warnings: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+    });
+    let result = open.expect("qpdf rejects this recovery candidate without panicking");
+    let error = match result {
+        Ok(_) => panic!("the fixture has no recoverable trailer dictionary"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("unable to find trailer dictionary while recovering damaged file"),
+        "expected qpdf's terminal recovery error, got {error}"
+    );
+}
+
+#[test]
 fn canonical_open_reads_a_candidate_past_64_false_headers_like_qpdf() {
     let (fixture, candidate_offset, payload_len) = candidate_with_more_than_64_false_headers();
     let pdf = Pdf::open_with_options(

@@ -2280,11 +2280,11 @@ pub(crate) fn reconstruct_xref_on_owner(
             options,
         } => {
             let registration = canonical_trailer_owner.xref_registration();
+            // Candidate xref-stream discovery can re-enter resolution while
+            // the outer reconstruction has already armed the qpdf guard but
+            // has not recovered a trailer yet. Capture the current owner
+            // state and let the guard return the original trigger first.
             let fallback_trailer = canonical_trailer_owner.current_trailer();
-            debug_assert!(
-                fallback_trailer.is_some(),
-                "delayed object resolution runs only after qpdf parse has established the trailer"
-            );
             PreparedXrefReconstruction {
                 trigger_error,
                 trigger_warning,
