@@ -552,9 +552,7 @@ fn append_objstm_container_object<R: Read + Seek>(
     }
     out.write_bytes(b"\nendobj\n")?;
     let end = out.position_usize()?;
-    let length = end.checked_sub(offset).ok_or_else(|| {
-        crate::Error::Internal("linearization ObjStm object length underflow".into())
-    })?;
+    let length = end - offset;
     xref_offsets.insert(container.container_new_num, offset);
     lengths.insert(container.container_new_num, length);
     Ok(offset)
@@ -5903,7 +5901,7 @@ mod tests {
         let mut xref_offsets = BTreeMap::new();
         let mut lengths = BTreeMap::new();
         let mut encryption_state = writer_encryption_state_for(None);
-        append_body_object_for_ref(
+        let body_offset = append_body_object_for_ref(
             &mut plain_sink,
             &mut pdf,
             new_ref,
@@ -5920,6 +5918,8 @@ mod tests {
         )
         .expect("plain stream body writes");
         drop(plain_sink);
+        assert_eq!(xref_offsets[&new_ref.number], body_offset);
+        assert_eq!(lengths[&new_ref.number], plain_bytes.len() - body_offset);
         assert!(plain_bytes
             .windows(b"endstream".len())
             .any(|window| window == b"endstream"));
@@ -5933,7 +5933,7 @@ mod tests {
         let mut plain_objstm_sink = OutputSink::new(&mut plain_objstm_bytes);
         let mut plain_xref_offsets = BTreeMap::new();
         let mut plain_lengths = BTreeMap::new();
-        append_objstm_container_object(
+        let plain_objstm_offset = append_objstm_container_object(
             &mut plain_objstm_sink,
             &mut plain_xref_offsets,
             &mut plain_lengths,
@@ -5946,6 +5946,14 @@ mod tests {
         )
         .expect("plain ObjStm body writes");
         drop(plain_objstm_sink);
+        assert_eq!(
+            plain_xref_offsets[&container.container_new_num],
+            plain_objstm_offset
+        );
+        assert_eq!(
+            plain_lengths[&container.container_new_num],
+            plain_objstm_bytes.len() - plain_objstm_offset
+        );
 
         let mut encrypted_pdf = Pdf::empty().expect("empty PDF for encrypted ObjStm output");
         let encryption = test_encryption_context();
@@ -5953,7 +5961,7 @@ mod tests {
         let mut encrypted_sink = OutputSink::new(&mut encrypted_bytes);
         let mut encrypted_xref_offsets = BTreeMap::new();
         let mut encrypted_lengths = BTreeMap::new();
-        append_objstm_container_object(
+        let encrypted_objstm_offset = append_objstm_container_object(
             &mut encrypted_sink,
             &mut encrypted_xref_offsets,
             &mut encrypted_lengths,
@@ -5966,6 +5974,14 @@ mod tests {
         )
         .expect("encrypted ObjStm body writes");
         drop(encrypted_sink);
+        assert_eq!(
+            encrypted_xref_offsets[&container.container_new_num],
+            encrypted_objstm_offset
+        );
+        assert_eq!(
+            encrypted_lengths[&container.container_new_num],
+            encrypted_bytes.len() - encrypted_objstm_offset
+        );
         assert!(plain_objstm_bytes.starts_with(b"2 0 obj\n"));
         assert!(encrypted_bytes.starts_with(b"2 0 obj\n"));
     }
