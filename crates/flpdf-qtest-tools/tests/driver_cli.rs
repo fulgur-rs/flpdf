@@ -1411,7 +1411,8 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         env!("CARGO_MANIFEST_DIR"),
         "/src/driver/test_88_98.rs"
     ))
-    .expect("read mutation-driver source");
+    .expect("read mutation-driver source")
+    .replace("\r\n", "\n");
     let form_source = fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/src/driver/test_50_55.rs"
