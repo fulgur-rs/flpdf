@@ -50,7 +50,7 @@ markdown だけを読むので `--no-qpdf`（CI の形）でも完全に動く�
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 139 | 0 | 22 | 0 | 161 |
+| 140 | 0 | 21 | 0 | 161 |
 
 ### checker logical aggregate（260 rows）
 
@@ -63,7 +63,7 @@ rowsを検証する。2026-09-20（`flpdf-ycb6l`、`QPDF::isLinearized` のB35�
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 230 | 0 | 30 | 0 | 260 |
+| 231 | 0 | 29 | 0 | 260 |
 
 したがって、161行の領域別表と260 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
@@ -141,7 +141,7 @@ C44は public facade と deferred blob の責務分離を追跡する mixed owne
 | ファイル | 行数 | canonical | bridge | mixed | unknown |
 |---|---|---|---|---|---|
 | [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 20 | 0 | 4 | 0 |
-| [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 35 | 29 | 0 | 6 | 0 |
+| [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 35 | 30 | 0 | 5 | 0 |
 | [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 42 | 0 | 0 | 0 |
 | [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 26 | 0 | 5 | 0 |
 | [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 22 | 0 | 7 | 0 |
@@ -171,7 +171,7 @@ C44は public facade と deferred blob の責務分離を追跡する mixed owne
 | **warning sink は `m->warnings` 1 本で、順序は `warn` 呼び出し順そのもの**（`push_back` 以外に並べ替え・重複除去・分類は無い） | `libqpdf/QPDF.cc:487-494` / `include/qpdf/QPDF.hh:1475` | B28 canonical。B27 canonical `Pdf::open` は`.48.73`で xref/recoveryのfile/trailer/candidate diagnosticsを`ResolverHandle::push_qpdf_warning`へ呼出順に合流し、replay/install/deferred bridgeを撤去済み。owner-less public loader/exportとproduction callerは`.48.72`で撤去し、残るBootstrap stagingはtest-only bounded reconstruction scaffolding | canonicalとpublic reader routeのwarning orderはqpdf call orderで一度だけ配送される。test-only bootstrap diagnosticsはproduction contractとして扱わない。probe B-P4 |
 | **`suppress_warnings` は表示だけを止め、sink への push は常に起きる** | `libqpdf/QPDF.cc:487-494` | B28 canonical。`route_warning` が logger 行を組むのは push の後（`crates/flpdf/src/reader/resolver.rs:1911-1928`） | `--no-warn` 指定時に `hasWarnings()` が false になり exit code が 0 と 3 の間で変わる |
 | **resolve 境界で例外は必ず warning に降格し、未解決なら null になる**（`QPDF::resolve` から例外は出ない） | `libqpdf/QPDF.cc:1737-1742` / `libqpdf/QPDF.cc:1745-1749` | A4 canonical。B22 mixed — resolve 側の再構築経路は `flpdf-3yn9.48.19` で qpdf の retry 条件（`getType() == 1` 限定、それ以外は `not found in file after regenerating cross reference table` をwarn して null、`libqpdf/QPDF.cc:1618-1633`）に揃えた。ただし本番経路では再構築後に compressed entry が残らない（`install_source_xref_entries` がテーブルを丸ごと置換し `recover_xref_entries` は `Uncompressed` しか挿入しない）ため、compressed 側は qpdf 同様に防御的な分岐で、end-to-end 実証はP3 の probe として継続中（`libqpdf/QPDF.cc:1618-1633`） | qpdf が warn + null で続行する入力で flpdf が `Err` を返し、その object 以降の処理が止まる。probe B-P3 |
-| **回復予算は `bool` 1 個**（2 回目の `reconstruct_xref` は引数の例外をそのまま re-throw する。残り回数カウンタは存在しない） | `libqpdf/QPDF.cc:518-522` / `include/qpdf/QPDF.hh:1480` | B25 mixed（open 時は `already_reconstructed` を経由して `ResolverCore` に転記）。B34 bridge — qpdf に対応物のない 64 回の read-to-end fallback 予算（`crates/flpdf/src/pdf.rs:148-154`） | 破損 PDF で回復の起きる回数が変わり、reconstruct の 3 連 warn（B33）が余分に出る／出ない |
+| **回復予算は `bool` 1 個**（2 回目の `reconstruct_xref` は引数の例外をそのまま re-throw する。残り回数カウンタは存在しない） | `libqpdf/QPDF.cc:518-522` / `include/qpdf/QPDF.hh:1480` | B25 canonical — open / resolve 両経路が `ResolverHandle::begin_xref_reconstruction` を共有し、qpdf と同じ入口で guard を arm する。open / resolve の再構築本体の2実装分割は B22 mixed に残る。B34 bridge — qpdf に対応物のない 64 回の read-to-end fallback 予算（`crates/flpdf/src/pdf.rs:148-154`） | guard が scan 開始後まで未設定だと、2回目の reconstruct が許され、回復 warning と table 更新が qpdf と異なる |
 | **reconstruct が xref から消すのは type 1 entry のみ。ObjStm の内部は意図的に走査しない** | `libqpdf/QPDF.cc:532-541` / `libqpdf/QPDF.cc:618-622` | B24 canonical（**両側 absent が 1:1 対応**）。B23 canonical で scan 本体は 2 経路が共有 | 回復後に compressed entry を復元すると、qpdf が到達しない object を出力に含める。コミット `6ddb9661` で 1 度是正済みの退行そのもの |
 | **xref entry の上書き規則は 3 primitive で違う**（`insertXrefEntry` = first-seen wins、`insertFreeXrefEntry` = 未登録時のみ、`insertReconstructedXrefEntry` = 後勝ち + `deleted_objects` 抑止） | `libqpdf/QPDF.cc:1149-1184` / `libqpdf/QPDF.cc:1187-1192` / `libqpdf/QPDF.cc:1197-1210` | B19 canonical。B20 canonical（2026-09-19、`flpdf-3yn9.48.176`） — 後勝ち上書きと `deleted_objects` 抑止を `crates/flpdf/src/xref.rs::insert_reconstructed_xref_entry` 1 関数へ統合し、resolve 側 `recover_xref_entries` と開 側 `recover_xref_entries_from_source` の両方がこれを呼ぶ構成にした。**guard（`obj > 0`、`0 <= gen < 65535`）はこの関数には入っていない**——flpdf の `ObjectRef` は範囲外の値を表現できないので、guard は `ObjectRef` を構築する前の `scan_object_header_after_first_token`（`xref.rs:3046-3049`）に残る。canonical と判定したのは**両段とも単一実装を両経路が共有する**（guard は `:3025` の 1 本を `:2269` と `:2339` が、上書き/抑止は 1 本を `:2271` と `:2341` が呼ぶ）からで、qpdf の 1 関数が flpdf で 2 段に分かれる点は経路数ではなく段の配置の差として B20 行に残置記録している（B20 行参照） | 増分更新 PDF でどの世代の object が読まれるかが変わる。`/XRefStm` が free 行の直後で壊れる入力で `qpdf --show-xref` と食い違っていた（probe B-P2 で実測・解消） |
 | **`QPDF::readToken` は `allow_bad = true` を保証するが、全token consumerがこの責務ではない** | `libqpdf/QPDF.cc:1535-1539,1801-1814,846-946` | B7 canonical（`.48.175`）。5経路（classic xref subsection lookahead / `startxref` 値読み / trailerの`stream` lookahead / ObjStm header integers / reconstruct_xrefの行scan / `endstream`・`endobj` framing check）が `Tokenizer::read_qpdf_token` の1entrypointを共有する | `read_qpdf_token` が `allow_bad = true` を固定するので、falseを一律trueへ変える経路は無い。classic xrefのreadLine/parse_xrefEntry責務はByteCursorのまま維持される（B-P7） |
