@@ -325,6 +325,39 @@ fn replace_pdf_encrypt_reference_with_integer(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
+fn replace_pdf_encrypt_object_dictionary_with_integer(mut bytes: Vec<u8>) -> Vec<u8> {
+    let object_marker = b"3 0 obj\n";
+    assert_eq!(
+        bytes
+            .windows(object_marker.len())
+            .filter(|window| *window == object_marker)
+            .count(),
+        1
+    );
+    let object_start = bytes
+        .windows(object_marker.len())
+        .position(|window| window == object_marker)
+        .expect("fixture has one indirect encryption dictionary object");
+    let dictionary_start = object_start + object_marker.len();
+    assert!(bytes[dictionary_start..].starts_with(b"<<"));
+    let object_end = dictionary_start
+        + bytes[dictionary_start..]
+            .windows(b"endobj".len())
+            .position(|window| window == b"endobj")
+            .expect("encryption dictionary object has endobj");
+    let relative_end = bytes[dictionary_start..object_end]
+        .windows(2)
+        .rposition(|window| window == b">>")
+        .expect("encryption dictionary has a closing delimiter")
+        + 2;
+    let dictionary_end = dictionary_start + relative_end;
+    let span_len = dictionary_end - dictionary_start;
+    assert!(span_len >= b"123".len());
+    bytes[dictionary_start..dictionary_end].fill(b' ');
+    bytes[dictionary_start..dictionary_start + b"123".len()].copy_from_slice(b"123");
+    bytes
+}
+
 fn assert_qpdf_encryption_error(
     error: &Error,
     code: QpdfErrorCode,
@@ -2095,6 +2128,31 @@ fn non_dictionary_encrypt_value_uses_qpdf_damaged_pdf_exception() {
         QpdfErrorCode::DamagedPdf,
         b"non-dictionary-encrypt.pdf",
         b"",
+        b"/Encrypt in trailer dictionary is not a dictionary",
+    );
+}
+
+#[test]
+fn indirect_non_dictionary_encrypt_uses_last_object_description() {
+    let donor = replace_pdf_encrypt_object_dictionary_with_integer(committed_encrypted_fixture(
+        "v2-rc4-128-r3.pdf",
+    ));
+    let error = match Pdf::open_with_options(
+        std::io::Cursor::new(donor),
+        PdfOpenOptions {
+            description: b"indirect-encrypt.pdf".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("qpdf rejects an indirect /Encrypt reference to a non-dictionary"),
+        Err(error) => error,
+    };
+
+    assert_qpdf_encryption_error(
+        &error,
+        QpdfErrorCode::DamagedPdf,
+        b"indirect-encrypt.pdf",
+        b"object 3 0",
         b"/Encrypt in trailer dictionary is not a dictionary",
     );
 }
