@@ -2149,7 +2149,7 @@ fn normalize_content_container(
     options: &WriterOptions,
 ) -> crate::Result<ObjectHandle> {
     container.try_dereference()?;
-    if let Some(entries) = container.as_dictionary() {
+    if let Some(entries) = container.try_as_dictionary()? {
         let entries = entries
             .into_iter()
             .map(|(key, value)| {
@@ -2162,7 +2162,7 @@ fn normalize_content_container(
             .collect::<crate::Result<Vec<_>>>()?;
         return Ok(ObjectHandle::dictionary(entries));
     }
-    if let Some(items) = container.as_array() {
+    if let Some(items) = container.try_as_array()? {
         let items = items
             .into_iter()
             .map(|item| normalize_content_value(&item, options))
@@ -2192,7 +2192,7 @@ fn normalize_content_value(
             let (dict, data, _) = canonical_stream_output_for_rewrite(value, options, true)?; // cov:ignore: LLVM maps the covered direct-stream normalization continuation to this line
             return Ok(ObjectHandle::stream(dict, Rc::new(data)));
         }
-        if let Some(items) = value.as_array() {
+        if let Some(items) = value.try_as_array()? {
             let items = items
                 .into_iter()
                 .map(|item| normalize_content_value(&item, options))
@@ -2259,14 +2259,14 @@ where
 
             if root {
                 if value.try_is_array()? && has_direct_stream_in_value(value)? {
-                    let items = value.as_array().ok_or_else(|| {
+                    let items = value.try_as_array()?.ok_or_else(|| {
                         // cov:ignore-start: the handle cannot change between the shape probe and this read
                         crate::Error::Internal("content array disappeared during emission".into())
                         // cov:ignore-end
                     })?; // cov:ignore: the preceding shape probe makes this defensive error unreachable
                     return self.emit_array(&items, indent);
                 }
-                if let Some(entries) = value.as_dictionary() {
+                if let Some(entries) = value.try_as_dictionary()? {
                     let has_contents_stream = entries
                         .get(b"/Contents".as_slice())
                         .map(has_direct_stream_in_value)
@@ -2277,10 +2277,10 @@ where
                     }
                 }
             } else if has_direct_stream_in_value(value)? {
-                if let Some(items) = value.as_array() {
+                if let Some(items) = value.try_as_array()? {
                     return self.emit_array(&items, indent);
                 }
-                if let Some(entries) = value.as_dictionary() {
+                if let Some(entries) = value.try_as_dictionary()? {
                     return self.emit_dictionary(&entries, indent);
                 } // cov:ignore: LLVM does not attribute this successful nested dictionary continuation
             }
@@ -2427,13 +2427,13 @@ fn has_direct_stream_in_value_body(value: &ObjectHandle) -> crate::Result<bool> 
         if value.as_stream_dict().is_some() {
             return Ok(true);
         }
-        if let Some(items) = value.as_array() {
+        if let Some(items) = value.try_as_array()? {
             for item in items {
                 if has_direct_stream_in_value_charged(&item)? {
                     return Ok(true);
                 }
             }
-        } else if let Some(entries) = value.as_dictionary() {
+        } else if let Some(entries) = value.try_as_dictionary()? {
             for (_, child) in entries {
                 if has_direct_stream_in_value_charged(&child)? {
                     return Ok(true);
