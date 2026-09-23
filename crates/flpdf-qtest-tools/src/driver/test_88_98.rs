@@ -25,26 +25,6 @@ use super::{
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// qpdf's `getKey` resolves its receiver before inspecting the dictionary and
-/// returns the child handle without resolving that child -- every
-/// `QPDFObjectHandle.cc` dictionary accessor reaches `asDictionary()` /
-/// `dereference()` on its receiver before inspecting a child's type -- while
-/// `ObjectHandle::get_key` explicitly does not ("never performs resolution
-/// itself", `get_key`'s own doc). The remaining qtest exception paths in this
-/// file resolve each required hop through this helper instead of a bare
-/// `get_key`; bounded canonical cutovers may remove it from individual
-/// consumers without changing those distinct paths.
-fn resolved_key<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    parent: &ObjectHandle,
-    key: &[u8],
-) -> flpdf::Result<ObjectHandle> {
-    pdf.resolve(parent)?;
-    let child = parent.get_key(key);
-    pdf.resolve(&child)?;
-    Ok(child)
-}
-
 /// `QPDFObjectHandle::isScalar` (`libqpdf/QPDFObjectHandle.cc:450-453`):
 /// `isBool() || isInteger() || isName() || isNull() || isReal() ||
 /// isString()`, i.e. ordinals `2..=7` in [`ObjectHandle::type_code`]'s own
@@ -253,17 +233,24 @@ pub(crate) fn run_test_90<R: Read + Seek>(
     trailer.append_array_item(null.clone())?;
     emit_new_diagnostics(pdf, diagnostics_written, &arg2_diagnostic, stdout, stderr)?;
 
-    let qtest = resolved_key(pdf, &trailer, b"/QTest")?;
-    qtest.append_array_item(null.clone())?;
+    let qtest_result = trailer.try_get_key(b"/QTest");
     emit_new_diagnostics(pdf, diagnostics_written, &arg2_diagnostic, stdout, stderr)?;
+    let qtest = qtest_result?;
+    let append_result = qtest.append_array_item(null.clone());
+    emit_new_diagnostics(pdf, diagnostics_written, &arg2_diagnostic, stdout, stderr)?;
+    append_result?;
 
-    let strings = resolved_key(pdf, &qtest, b"/strings")?;
-    strings.try_get_int_value()?;
+    let strings_result = qtest.try_get_key(b"/strings");
     emit_new_diagnostics(pdf, diagnostics_written, &arg2_diagnostic, stdout, stderr)?;
+    let strings = strings_result?;
+    let integer_result = strings.try_get_int_value();
+    emit_new_diagnostics(pdf, diagnostics_written, &arg2_diagnostic, stdout, stderr)?;
+    integer_result?;
 
     let root = pdf.root_handle()?;
-    root.append_array_item(null)?;
+    let append_result = root.append_array_item(null);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    append_result?;
     Ok(())
 }
 
@@ -491,8 +478,12 @@ pub(crate) fn run_test_94<R: Read + Seek>(
     let root_result = pdf.root_handle();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let root = root_result?;
-    let pages_root = resolved_key(pdf, &root, b"/Pages")?;
-    let root_media = resolved_key(pdf, &pages_root, b"/MediaBox")?;
+    let pages_root_result = root.try_get_key(b"/Pages");
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let pages_root = pages_root_result?;
+    let root_media_result = pages_root.try_get_key(b"/MediaBox");
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let root_media = root_media_result?;
     let root_media_unparse = root_media.unparse();
 
     let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
