@@ -743,9 +743,10 @@ impl<R: Read + Seek> Pdf<R> {
                 .push_trailer_warning_at(offset, "invalid /ID in trailer dictionary")?;
         }
         if !encrypt_handle.try_is_dictionary()? {
+            let object = self.resolver.last_object_description();
             return Err(Error::QpdfExc(self.encryption_qpdf_exception(
                 QpdfErrorCode::DamagedPdf,
-                b"",
+                &object,
                 b"/Encrypt in trailer dictionary is not a dictionary",
             )));
         };

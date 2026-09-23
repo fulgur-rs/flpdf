@@ -2978,6 +2978,38 @@ fn replace_fixture_token(bytes: &mut [u8], from: &[u8], to: &[u8]) {
     bytes[start..start + to.len()].copy_from_slice(to);
 }
 
+fn replace_fixture_encrypt_dictionary_with_integer(bytes: &mut [u8]) {
+    let object_marker = b"3 0 obj\n";
+    assert_eq!(
+        bytes
+            .windows(object_marker.len())
+            .filter(|window| *window == object_marker)
+            .count(),
+        1
+    );
+    let object_start = bytes
+        .windows(object_marker.len())
+        .position(|window| window == object_marker)
+        .expect("fixture has one indirect encryption dictionary object");
+    let dictionary_start = object_start + object_marker.len();
+    assert!(bytes[dictionary_start..].starts_with(b"<<"));
+    let object_end = dictionary_start
+        + bytes[dictionary_start..]
+            .windows(b"endobj".len())
+            .position(|window| window == b"endobj")
+            .expect("encryption dictionary object has endobj");
+    let relative_end = bytes[dictionary_start..object_end]
+        .windows(2)
+        .rposition(|window| window == b">>")
+        .expect("encryption dictionary has a closing delimiter")
+        + 2;
+    let dictionary_end = dictionary_start + relative_end;
+    let span_len = dictionary_end - dictionary_start;
+    assert!(span_len >= b"123".len());
+    bytes[dictionary_start..dictionary_end].fill(b' ');
+    bytes[dictionary_start..dictionary_start + b"123".len()].copy_from_slice(b"123");
+}
+
 /// `QPDF::initializeEncryption` rejects unsupported `/Filter` and V/R values
 /// while opening every input, including a `--copy-encryption` donor. Keep the
 /// donor consumer on that same error path instead of adding writer-side text.
@@ -3071,6 +3103,79 @@ fn invalid_encryption_dictionary_errors_match_qpdf_across_cli_routes() {
             assert_eq!(flpdf.stdout, qpdf.stdout, "stdout for {case}/{route}");
             assert_eq!(flpdf.stderr, qpdf.stderr, "stderr for {case}/{route}");
         }
+    }
+}
+
+/// A non-dictionary reached through an indirect `/Encrypt` value retains
+/// qpdf's `last_object_description` on primary, inspection, and donor routes.
+#[test]
+fn indirect_non_dictionary_encrypt_context_matches_qpdf_across_cli_routes() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut bytes = std::fs::read(fixture("../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf"))
+        .expect("read qpdf V2/R3 fixture");
+    replace_fixture_encrypt_dictionary_with_integer(&mut bytes);
+    let donor = tmp.path().join("indirect-encrypt.pdf");
+    std::fs::write(&donor, bytes).expect("write mutated indirect /Encrypt fixture");
+
+    for route in ["show", "check", "copy"] {
+        let qpdf = match route {
+            "show" => ShellCommand::new("qpdf")
+                .arg("--show-encryption")
+                .arg(&donor)
+                .output()
+                .expect("run qpdf --show-encryption"),
+            "check" => ShellCommand::new("qpdf")
+                .arg("--check")
+                .arg(&donor)
+                .output()
+                .expect("run qpdf --check"),
+            _ => ShellCommand::new("qpdf")
+                .arg("--empty")
+                .arg(format!("--copy-encryption={}", donor.display()))
+                .arg(tmp.path().join("qpdf-output.pdf"))
+                .output()
+                .expect("run qpdf --copy-encryption"),
+        };
+        let flpdf = match route {
+            "show" => Command::cargo_bin("flpdf")
+                .unwrap()
+                .env("FLPDF_PROGNAME", "qpdf")
+                .arg("--show-encryption")
+                .arg(&donor)
+                .output()
+                .expect("run flpdf --show-encryption"),
+            "check" => Command::cargo_bin("flpdf")
+                .unwrap()
+                .env("FLPDF_PROGNAME", "qpdf")
+                .arg("--check")
+                .arg(&donor)
+                .output()
+                .expect("run flpdf --check"),
+            _ => Command::cargo_bin("flpdf")
+                .unwrap()
+                .env("FLPDF_PROGNAME", "qpdf")
+                .arg("--empty")
+                .arg(format!("--copy-encryption={}", donor.display()))
+                .arg(tmp.path().join("flpdf-output.pdf"))
+                .output()
+                .expect("run flpdf --copy-encryption"),
+        };
+
+        assert_eq!(
+            qpdf.status.code(),
+            Some(2),
+            "qpdf indirect /Encrypt/{route}"
+        );
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "flpdf indirect /Encrypt/{route}"
+        );
+        assert_eq!(flpdf.stdout, qpdf.stdout, "stdout for {route}");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "stderr for {route}");
     }
 }
 
