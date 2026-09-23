@@ -2955,8 +2955,9 @@ mod final_handle_tests {
         canonical_stream_filter_probe_for_linearization, canonical_stream_output_for_rewrite,
         emit_content_container_from_handle_with_qpdf_obj_gen_map,
         emit_content_container_from_handle_with_ref_map,
-        emit_content_container_from_handle_with_ref_map_and_string_writer, normalize_content_value,
-        object_streams, PlainWritePlan, PlannedIndirectObject, CONTENT_EMIT_WALK_DEPTH,
+        emit_content_container_from_handle_with_ref_map_and_string_writer,
+        normalize_content_container, normalize_content_value, object_streams, PlainWritePlan,
+        PlannedIndirectObject, CONTENT_EMIT_WALK_DEPTH,
     };
     use crate::token_filter::{TokenFilter, TokenFilterOutput};
     use crate::tokenizer::Token;
@@ -3047,6 +3048,37 @@ mod final_handle_tests {
         assert!(output
             .windows(b"stream\ndata\nendstream".len())
             .any(|window| { window == b"stream\ndata\nendstream" }));
+    }
+
+    #[test]
+    fn content_normalization_resolves_an_indirect_contents_array_receiver() -> crate::Result<()> {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/qdf-contents-ref-array.pdf");
+        let bytes = std::fs::read(fixture).expect("indirect Contents array fixture");
+        let mut pdf = crate::Pdf::open(std::io::Cursor::new(bytes))?;
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        let contents = page.try_get_key(b"/Contents")?;
+        assert!(
+            !contents.is_resolved(),
+            "getKey resolves the page but leaves its indirect child lazy"
+        );
+
+        let options = WriterOptions {
+            content_normalization: true,
+            ..WriterOptions::default()
+        };
+        let normalized = normalize_content_container(&contents, &options)?;
+        assert!(
+            contents.is_resolved(),
+            "writer-body type inspection resolves the indirect array receiver"
+        );
+        let items = normalized
+            .try_as_array()?
+            .expect("normalized Contents remains an array");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].object_ref(), Some(ObjectRef::new(6, 0)));
+        assert_eq!(items[1].object_ref(), Some(ObjectRef::new(7, 0)));
+        Ok(())
     }
 
     #[test]

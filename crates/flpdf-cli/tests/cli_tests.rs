@@ -6003,6 +6003,58 @@ fn rewrite_normalize_content_follows_indirect_contents_array() {
 }
 
 #[test]
+fn rewrite_normalize_content_indirect_contents_array_matches_qpdf() {
+    if !qpdf_available() {
+        eprintln!("qpdf 11.9.0 is unavailable; skipping indirect Contents array differential");
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("indirect-array-content.pdf");
+    let qpdf_output = temp.path().join("qpdf-output.pdf");
+    let flpdf_output = temp.path().join("flpdf-output.pdf");
+    std::fs::write(&input, one_page_pdf_with_indirect_contents_array(b"q\rQ")).unwrap();
+
+    let qpdf = ProcessCommand::new("qpdf")
+        .args([
+            "--static-id",
+            "--compress-streams=n",
+            "--normalize-content=y",
+        ])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args([
+            "rewrite",
+            "--static-id",
+            "--compress-streams=n",
+            "--normalize-content=y",
+        ])
+        .arg(&input)
+        .arg(&flpdf_output)
+        .output()
+        .unwrap();
+
+    assert_eq!(qpdf.status.code(), Some(0), "qpdf failed: {qpdf:?}");
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "flpdf failed: {flpdf:?}"
+    );
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "normalized output with an indirect /Contents array must match qpdf 11.9.0"
+    );
+}
+
+#[test]
 fn rewrite_normalize_content_skips_null_array_entries_like_qpdf() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("mixed-content-array.pdf");
