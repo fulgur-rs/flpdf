@@ -119,7 +119,9 @@ use crate::pipeline::rc4::PlRc4;
 use crate::pipeline::Pipeline;
 use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::tokenizer::{Token, TokenType, Tokenizer};
-use crate::xref::XrefRegistration;
+use crate::xref::{
+    XrefLoadOptions, XrefReconstructionRequest, XrefReconstructionResult, XrefRegistration,
+};
 use crate::{
     Diagnostics, Error, ObjectHandle, ObjectRef, QpdfErrorCode, QpdfExc, Result, XrefEntry,
 };
@@ -677,19 +679,6 @@ impl<R: Read + Seek> ResolverCore<R> {
             }
             Err(StreamReadError::UnderlyingRead(error))
             | Err(StreamReadError::Operation(error)) => Err(error),
-        }
-    }
-
-    /// Read all physical bytes of the input source from position 0, restoring the
-    /// logical position afterwards.
-    fn read_underlying_bytes(&mut self) -> Result<Vec<u8>> {
-        match self.input.borrow().read_underlying_bytes() {
-            Ok(bytes) => Ok(bytes),
-            Err(Error::Io(_error)) if !self.description.is_empty() => {
-                Err(Error::SystemBytes(b"read 1024 bytes".to_vec()))
-            }
-            // cov:ignore: an InputSource-backed bootstrap read can only return qpdf damage or parse errors; non-UTF8 I/O is normalized above
-            Err(error) => Err(error), // cov:ignore: source read failures are normalized to SystemBytes for the canonical bootstrap source
         }
     }
 }
@@ -2134,19 +2123,17 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// qpdf `QPDF::reconstruct_xref` (`libqpdf/QPDF.cc:516-530`) & `QPDF::readObjectAtOffset`
     /// recovery retry (`:1614-1637`).
     ///
-    /// Only `Error::Parse` triggers reconstruction, matching qpdf's
-    /// `catch (QPDFExc&)` guard at `QPDF.cc:1614` (qpdf's `QPDFExc` covers only
-    /// parse-level damage, not I/O or system errors).
+    /// Only qpdf damage (`Error::QpdfExc` or its parser-facing
+    /// `Error::Parse` form) triggers reconstruction, matching qpdf's
+    /// `catch (QPDFExc&)` guard at `QPDF.cc:1614` rather than catching I/O or
+    /// system errors.
     ///
-    /// Reconstructs the cross-reference table via line-scan of the logical byte
-    /// slice (`bytes[header_offset..]`), matching qpdf's use of
-    /// `OffsetInputSource` which presents logical offset 0 to `reconstruct_xref`
-    /// (`libqpdf/OffsetInputSource.cc:seek`).  Flips `m->reconstructed_xref` to
-    /// `true`, emits repair warnings, and retries reading `object_ref` at the
-    /// rebuilt offset. Returns `Ok(Some(parsed))`
+    /// Delegates the shared guard, warning, and owner-table reconstruction to
+    /// `xref::reconstruct_xref_on_owner`, then retries reading `object_ref` at
+    /// the rebuilt offset. Returns `Ok(Some(parsed))`
     /// on successful retry, `Ok(None)` if the object is absent post-rebuild (to
     /// be warned and resolved to null), or `Err(err)` if recovery fails, if the
-    /// trigger is not a parse error, or if a second reconstruction attempt is
+    /// trigger is not qpdf damage, or if a second reconstruction attempt is
     /// made (infinite-loop guard).
     fn reconstruct_xref_and_retry(
         &self,
@@ -2161,67 +2148,35 @@ impl<R: Read + Seek> ResolverHandle<R> {
         if !matches!(trigger_error, Error::QpdfExc(_) | Error::Parse { .. }) {
             return Err(trigger_error);
         }
-        if !self.begin_xref_reconstruction() {
-            // Avoid xref reconstruction infinite loops (QPDF.cc:518-522).
-            return Err(trigger_error);
-        }
-
-        // Push repair warnings (QPDF.cc:528-530). qpdf builds both bracketing
-        // warnings with `damagedPDF("", 0, ...)`, i.e. an explicit offset of 0,
-        // so neither carries a file position; only the triggering exception in
-        // between reports one. Using the input's last offset here would attach a
-        // position qpdf never prints.
-        self.push_warning_at(0, "file is damaged")?;
-
-        match trigger_error {
-            Error::QpdfExc(warning) => self.push_qpdf_warning(warning)?,
-            Error::Parse { offset, message } => {
-                let filename = self.core.borrow().description.clone();
-                self.push_qpdf_warning(QpdfExc::new(
-                    QpdfErrorCode::DamagedPdf,
-                    filename,
-                    format!("object {} {}", expected.get_obj(), expected.get_gen()),
-                    i64::try_from(offset).unwrap_or(i64::MAX),
-                    message.into_bytes(),
-                ))?; // cov:ignore: parser recovery always supplies a qpdf exception or parse error in this route
-            }
+        let description = self.core.borrow().description.clone();
+        let trigger_warning = match &trigger_error {
+            Error::QpdfExc(_) => None,
+            Error::Parse { offset, message } => Some(Error::QpdfExc(QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                description.clone(),
+                format!("object {} {}", expected.get_obj(), expected.get_gen()),
+                i64::try_from(*offset).unwrap_or(i64::MAX),
+                message.as_bytes(),
+            ))),
             _ => unreachable!("guard above ensures a qpdf damage variant"), // cov:ignore: unreachable after guard
-        }
-        self.push_warning_at(0, "Attempting to reconstruct cross-reference table")?;
-
-        // Read logical bytes (header_offset already consumed), matching qpdf's
-        // OffsetInputSource which seeks to logical-0 at QPDF.cc:543.
-        let header_offset = self.core.borrow().header_offset;
-        let raw_bytes = self.core.borrow_mut().read_underlying_bytes()?;
-        self.bump_input_generation();
-        let logical_bytes = raw_bytes.get(header_offset..).ok_or_else(|| {
-            Error::parse(
-                header_offset,
-                "input ended before the detected PDF header offset",
-            )
-        })?;
-        // `reconstruct_xref` rescans every recoverable body after removing
-        // only type-1 xref rows (`QPDF.cc:516-575`). Its local
-        // `deleted_objects` suppression belongs to xref registration and is
-        // cleared after that operation (`QPDF.cc:686-708`, `:1187-1210`);
-        // `removeObject` is instead an exact cache/xref mutation
-        // (`QPDF.cc:1996-2005`). A prior canonical removal therefore cannot
-        // filter this fresh recovery scan.
-        let new_entries = crate::xref::recover_xref_entries(logical_bytes)?;
-        // qpdf scans the same live InputSource to EOF during reconstruct_xref
-        // and leaves last_offset there when the requested object is absent.
-        // read_underlying_bytes restores the Rust cursor, so preserve this
-        // observable last-offset state explicitly before the retry.
-        self.set_last_offset(u64::try_from(logical_bytes.len()).unwrap_or(u64::MAX));
-        let new_raw_entries = new_entries
-            .iter()
-            .map(|(object_ref, entry)| Ok((QpdfObjGen::try_from_object_ref(*object_ref)?, *entry)))
-            .collect::<Result<BTreeMap<_, _>>>()?;
-
-        {
-            let core = self.core.borrow_mut();
-            core.xref_registration.remove_uncompressed_entries();
-            core.xref_registration.extend_raw_entries(new_raw_entries);
+        };
+        // The parsed document already has its canonical trailer, so qpdf's
+        // candidate-trailer fallback is gated off here. The shared operation
+        // scans the owner's logical source directly and mutates this same raw
+        // registration; no byte snapshot or replacement table is needed.
+        match crate::xref::reconstruct_xref_on_owner(
+            XrefReconstructionRequest::DelayedResolution {
+                trigger_error,
+                trigger_warning,
+                options: XrefLoadOptions {
+                    description,
+                    ..XrefLoadOptions::default()
+                },
+            },
+            self,
+        )? {
+            XrefReconstructionResult::DelayedResolution => {}
+            XrefReconstructionResult::Open(_) => unreachable!(), // cov:ignore: request is DelayedResolution
         }
 
         // Lookup the same raw object/generation in the reconstructed xref
@@ -3551,7 +3506,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         core.xref_registration.replace_raw_entries(entries);
     }
 
-    /// Permit xref loader mutations while `recover_xref_from_linear_scan`
+    /// Permit xref loader mutations while `reconstruct_xref_on_owner`
     /// scans and re-enters candidate xref sections. Once that scope ends, any
     /// later loader snapshot is stale relative to qpdf's already-mutated live
     /// `m->xref_table` and is ignored.
@@ -14652,9 +14607,10 @@ mod tests {
         );
     }
 
-    /// A named file source uses qpdf's `FileInputSource::read` exception shape
-    /// for a lazy read failure, including the source name and requested length;
-    /// the platform I/O message is intentionally omitted.
+    /// qpdf's `FileInputSource::read` raises a `QPDFExc(qpdf_e_system)` on a
+    /// named-source read failure. `readObjectAtOffset` attempts reconstruction;
+    /// if the live-source scan also fails, `resolve` warns with that exception
+    /// unchanged. Both requested lengths and offsets remain observable.
     #[test]
     fn a_described_input_source_formats_mid_resolution_read_failures_like_qpdf() {
         struct Breakable {
@@ -14694,20 +14650,32 @@ mod tests {
 
         handle
             .try_is_scalar()
-            .expect("qpdf catches std::exception, warns, and resolves to null");
+            .expect("qpdf propagates the reconstruction read failure to resolve");
         assert!(handle.is_null());
         let diagnostics = pdf.repair_diagnostics();
-        let warning = diagnostics
+        let warning_messages: Vec<_> = diagnostics
             .entries()
             .iter()
-            .find(|warning| {
-                warning
-                    .get_message_detail()
-                    .starts_with(b"object 1/0: error reading object: ")
-            })
-            .expect("the caught source failure must become a typed warning");
-        assert_eq!(warning.get_filename(), b"input.pdf");
-        assert_eq!(warning.get_file_position(), 0);
+            .map(QpdfExc::message_string)
+            .collect();
+        assert_eq!(
+            warning_messages,
+            [
+                "file is damaged",
+                "read 128 bytes",
+                "Attempting to reconstruct cross-reference table",
+                "read 10240 bytes",
+            ],
+            "qpdf warns the trigger, then propagates the live scan read failure"
+        );
+        assert_eq!(diagnostics.entries()[1].get_filename(), b"input.pdf");
+        assert_eq!(diagnostics.entries()[1].get_file_position(), 9);
+        assert_eq!(diagnostics.entries()[3].get_filename(), b"input.pdf");
+        assert_eq!(diagnostics.entries()[3].get_file_position(), 0);
+        assert_eq!(
+            diagnostics.entries()[3].get_error_code(),
+            QpdfErrorCode::System
+        );
     }
 
     /// A described source that reaches EOF but cannot perform qpdf's
@@ -16045,6 +16013,7 @@ mod tests {
             ResolverWarningOptions::new(logger, false, Vec::new()),
             0,
         );
+        assert!(resolver.set_trailer_if_uninitialized(ObjectHandle::dictionary(Vec::new())));
         resolver.install_raw_xref_entries(BTreeMap::from([(
             QpdfObjGen::new(1, 0),
             XrefEntry::Uncompressed { offset: 9 },
@@ -16270,6 +16239,25 @@ mod tests {
         let _ = recovery_trigger.try_is_scalar();
         assert!(pdf.reconstructed_xref());
 
+        let warnings = pdf.resolver.repair_diagnostics();
+        let warning_messages: Vec<_> = warnings
+            .entries()
+            .iter()
+            .take(3)
+            .map(QpdfExc::message_string)
+            .collect();
+        assert_eq!(
+            warning_messages,
+            [
+                "file is damaged",
+                "expected 1 0 obj",
+                "Attempting to reconstruct cross-reference table",
+            ],
+            "delayed resolution must use qpdf's shared ordered warning sequence"
+        );
+        assert_eq!(warnings.entries()[1].get_object(), b"object 1 0");
+        assert_eq!(warnings.entries()[1].get_file_position(), 9);
+
         // Simulate a second recovery trigger by invoking reconstruct_xref_and_retry directly
         let err = Error::parse(10, "expected 2 0 obj");
         let result = pdf.resolver.reconstruct_xref_and_retry(
@@ -16313,9 +16301,9 @@ mod tests {
     fn reconstruct_xref_and_retry_treats_a_post_reconstruction_compressed_entry_as_not_found() {
         // Reachability note: the production path cannot currently produce this
         // state. `resolve_indirect` reaches `reconstruct_xref_and_retry` only
-        // from its `Uncompressed` arm, `install_source_xref_entries` (:2890)
-        // replaces the table wholesale, and `recover_xref_entries`
-        // (`crates/flpdf/src/xref.rs:3111`) inserts only `Uncompressed` rows.
+        // from its `Uncompressed` arm, and the shared owner reconstruction
+        // removes type-1 rows before the live-source scan inserts only
+        // `Uncompressed` rows.
         // qpdf's own compressed side is defensive for the same reason: an
         // objgen holds one entry, so deleting the type-1 row cannot leave a
         // type-2 row behind (`libqpdf/QPDF.cc:531-540`). This test therefore
@@ -16470,11 +16458,24 @@ mod tests {
             .try_is_scalar()
             .expect("qpdf catches the reconstruction parse error");
         assert!(handle.is_null());
-        assert!(pdf
-            .repair_diagnostics()
+        let warnings = pdf.repair_diagnostics();
+        let warning_messages: Vec<_> = warnings
             .entries()
             .iter()
-            .any(|entry| entry.message_string().contains("input ended before")));
+            .map(QpdfExc::message_string)
+            .collect();
+        assert_eq!(
+            warning_messages,
+            [
+                "file is damaged",
+                "expected n n obj",
+                "Attempting to reconstruct cross-reference table",
+                "object 1 0 not found in file after regenerating cross reference table",
+            ],
+            "reconstruction reads the same truncated live source instead of a pre-open snapshot"
+        );
+        assert_eq!(warnings.entries()[1].get_object(), b"object 1 0");
+        assert_eq!(warnings.entries()[1].get_file_position(), 9);
     }
 
     #[test]
