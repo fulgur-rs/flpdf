@@ -402,6 +402,11 @@ jobs:
           # (QPDF_encryption.cc:1180-1198), matches everywhere qpdf is
           # reproducible (flpdf-cqd44).
           cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_encrypt_split_pages_qpdf
+          # Pins the valid V=2/R=3 --copy-encryption donor route: the copied
+          # /Encrypt parameters must reproduce qpdf's output bytes exactly.
+          # The byte comparison is behind qpdf-zlib-compat, so it only runs
+          # when listed here (flpdf-8xp72).
+          cargo test -p flpdf-cli --features qpdf-zlib-compat --test encrypt_cli_tests
           # Pins top-level no-pages rotate/split transformation handoff
           # (generate-appearances and flatten-annotations) against qpdf's
           # createQPDF -> writeQPDF boundary (flpdf-m6kt).
