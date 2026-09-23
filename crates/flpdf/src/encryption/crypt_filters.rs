@@ -91,24 +91,3 @@ pub(crate) fn crypt_filter_modes_from_handle(
     }
     Ok(modes)
 }
-
-/// Report `/CF/StdCF/CFM` without materializing the encryption dictionary.
-pub(crate) fn crypt_filter_method_from_handle(encrypt: &ObjectHandle) -> Result<Option<String>> {
-    let cf = encrypt.try_get_key(b"/CF")?;
-    let Some(cf) = cf.try_as_dictionary()? else {
-        return Ok(None);
-    };
-    let Some(std_cf) = cf.get(b"/StdCF".as_slice()).cloned() else {
-        return Ok(None);
-    };
-    let Some(std_cf) = std_cf.try_as_dictionary()? else {
-        return Ok(None);
-    };
-    let Some(cfm) = std_cf.get(b"/CFM".as_slice()).cloned() else {
-        return Ok(None);
-    };
-    cfm.try_dereference()?;
-    Ok(cfm
-        .try_as_name()?
-        .map(|name| String::from_utf8_lossy(&name).into_owned()))
-}

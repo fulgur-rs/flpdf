@@ -11,7 +11,9 @@ use crate::encryption::CopyEncryptionSource;
 use crate::error::EncryptedError;
 use crate::object_handle::DocumentResolver;
 use crate::qpdf_obj_gen::QpdfObjGen;
-use crate::{Diagnostics, Error, ObjectHandle, ObjectRef, QpdfExc, Result, XrefEntry};
+use crate::{
+    Diagnostics, Error, ObjectHandle, ObjectRef, QpdfErrorCode, QpdfExc, Result, XrefEntry,
+};
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -740,12 +742,124 @@ impl<R: Read + Seek> Pdf<R> {
             self.resolver
                 .push_trailer_warning_at(offset, "invalid /ID in trailer dictionary")?;
         }
-        let Some(encrypt) = self.encrypt_dictionary_handle()? else {
-            return Ok(());
+        if !encrypt_handle.try_is_dictionary()? {
+            return Err(Error::QpdfExc(self.encryption_qpdf_exception(
+                QpdfErrorCode::DamagedPdf,
+                b"",
+                b"/Encrypt in trailer dictionary is not a dictionary",
+            )));
         };
+        self.validate_qpdf_encryption_initialization(&encrypt_handle)?;
+        let encrypt = encrypt_handle;
         let inspection = crate::encryption::state::parse_inspection_state(&encrypt)?;
         *self.encryption_inspection.borrow_mut() = Some(inspection);
         Ok(())
+    }
+
+    fn encryption_qpdf_exception(
+        &self,
+        code: QpdfErrorCode,
+        object: &[u8],
+        message: &[u8],
+    ) -> QpdfExc {
+        QpdfExc::new(
+            code,
+            self.input_description(),
+            object,
+            i64::try_from(self.resolver.last_offset()).unwrap_or(i64::MAX),
+            message,
+        )
+    }
+
+    fn validate_qpdf_encryption_initialization(&self, encrypt: &ObjectHandle) -> Result<()> {
+        let filter = encrypt.try_get_key(b"/Filter")?;
+        if filter.try_as_name()?.as_deref() != Some(b"Standard") {
+            return Err(Error::QpdfExc(self.encryption_qpdf_exception(
+                QpdfErrorCode::Unsupported,
+                b"encryption dictionary",
+                b"unsupported encryption filter",
+            )));
+        }
+
+        let subfilter = encrypt.try_get_key(b"/SubFilter")?;
+        if !subfilter.try_is_null()? {
+            let warning = self.encryption_qpdf_exception(
+                QpdfErrorCode::Unsupported,
+                b"encryption dictionary",
+                b"file uses encryption SubFilters, which qpdf does not support",
+            );
+            self.resolver.push_qpdf_warning(warning)?;
+        }
+
+        let version = encrypt.try_get_key(b"/V")?;
+        if !version.try_is_integer()? {
+            return Err(self.damaged_encryption_dictionary());
+        }
+        let revision = encrypt.try_get_key(b"/R")?;
+        if !revision.try_is_integer()? {
+            return Err(self.damaged_encryption_dictionary());
+        }
+        let owner = encrypt.try_get_key(b"/O")?;
+        if !owner.try_is_string()? {
+            return Err(self.damaged_encryption_dictionary());
+        }
+        let user = encrypt.try_get_key(b"/U")?;
+        if !user.try_is_string()? {
+            return Err(self.damaged_encryption_dictionary());
+        }
+        let permissions = encrypt.try_get_key(b"/P")?;
+        if !permissions.try_is_integer()? {
+            return Err(self.damaged_encryption_dictionary());
+        }
+
+        let version = version.try_get_int_value_as_int()?;
+        let revision = revision.try_get_int_value_as_int()?;
+        let owner = owner.try_as_string()?.unwrap_or_default();
+        let user = user.try_as_string()?.unwrap_or_default();
+
+        if !(2..=6).contains(&revision) || !matches!(version, 1 | 2 | 4 | 5) {
+            let message = format!(
+                "Unsupported /R or /V in encryption dictionary; R = {revision} (max 6), V = {version} (max 5)"
+            );
+            return Err(Error::QpdfExc(self.encryption_qpdf_exception(
+                QpdfErrorCode::Unsupported,
+                b"encryption dictionary",
+                message.as_bytes(),
+            )));
+        }
+
+        // qpdf pads short V<5 /O and /U entries before checking their exact
+        // 32-byte lengths, so only longer values fail this initializer gate.
+        if version < 5 && (owner.len() > 32 || user.len() > 32) {
+            return Err(Error::QpdfExc(self.encryption_qpdf_exception(
+                QpdfErrorCode::DamagedPdf,
+                b"encryption dictionary",
+                b"incorrect length for /O and/or /U in encryption dictionary",
+            )));
+        }
+
+        if version == 5 {
+            for key in [b"/OE".as_ref(), b"/UE", b"/Perms"] {
+                let value = encrypt.try_get_key(key)?;
+                if !value.try_is_string()? {
+                    return Err(Error::QpdfExc(self.encryption_qpdf_exception(
+                        QpdfErrorCode::DamagedPdf,
+                        b"encryption dictionary",
+                        b"some V=5 encryption dictionary parameters are missing or the wrong type",
+                    )));
+                }
+                let _value = value.try_as_string()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn damaged_encryption_dictionary(&self) -> Error {
+        Error::QpdfExc(self.encryption_qpdf_exception(
+            QpdfErrorCode::DamagedPdf,
+            b"encryption dictionary",
+            b"some encryption dictionary parameters are missing or the wrong type",
+        ))
     }
 
     fn authenticate_if_encrypted_once(&mut self, options: &PdfOpenOptions) -> Result<()> {

@@ -52,13 +52,16 @@ fn dead_qpdf_routes_are_removed_and_canonical_owners_remain() {
         "fn interpret_cf_from_handle(",
         "fn interpret_cf_selector_from_handle(",
         "fn crypt_filter_modes_from_handle(",
-        "fn crypt_filter_method_from_handle(",
     ] {
         assert!(
             crypt_filters.contains(owner),
             "canonical crypt-filter owner missing: {owner}"
         );
     }
+    assert!(
+        !crypt_filters.contains("fn crypt_filter_method_from_handle("),
+        "obsolete authentication-side unsupported-handler formatter remains"
+    );
     let primitives = read_source("encryption/primitives.rs");
     assert!(primitives.contains("fn compute_data_key("));
     assert!(!read_source("encryption/state.rs").contains("fn compute_data_key("));
