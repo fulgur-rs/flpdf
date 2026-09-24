@@ -862,15 +862,13 @@ mod tests {
         let error = encode_hint_stream(&page_offset, &shared_object, None)
             .err()
             .expect("qpdf rejects signature-present shared-object entries");
-        let crate::Error::QpdfExc(error) = error else {
-            panic!("expected qpdf damaged-PDF error, got {error}");
-        };
-
-        assert_eq!(error.get_error_code(), crate::QpdfErrorCode::DamagedPdf);
-        assert_eq!(
-            error.get_message_detail(),
-            b"found unexpected signature present while writing linearization data"
-        );
+        assert!(matches!(
+            error,
+            crate::Error::QpdfExc(ref error)
+                if error.get_error_code() == crate::QpdfErrorCode::DamagedPdf
+                    && error.get_message_detail()
+                        == b"found unexpected signature present while writing linearization data"
+        ));
     }
 
     #[test]
