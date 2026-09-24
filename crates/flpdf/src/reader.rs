@@ -674,17 +674,21 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(())
     }
 
-    pub(crate) fn authenticate_if_encrypted(&mut self, options: &PdfOpenOptions) -> Result<()> {
+    pub(crate) fn authenticate_if_encrypted(
+        &mut self,
+        options: &PdfOpenOptions,
+        inspection: &crate::encryption::state::EncryptionInspectionState,
+    ) -> Result<()> {
         if self.encrypt_dictionary_handle()?.is_none() {
             return Ok(());
         }
         if options.password_is_hex_key || options.suppress_password_recovery {
-            return self.authenticate_if_encrypted_once(options);
+            return self.authenticate_if_encrypted_once(options, inspection);
         }
 
         let candidates = password_candidates_for_read(&options.password, options.password_mode)?;
         if candidates.len() == 1 {
-            return self.authenticate_if_encrypted_once(options);
+            return self.authenticate_if_encrypted_once(options, inspection);
         }
 
         // qpdf tries the original candidate first, then each repaired encoding,
@@ -704,7 +708,7 @@ impl<R: Read + Seek> Pdf<R> {
             attempt.password = candidate;
             attempt.password_mode = PasswordMode::Bytes;
             attempt.suppress_password_recovery = true;
-            match self.authenticate_if_encrypted_once(&attempt) {
+            match self.authenticate_if_encrypted_once(&attempt, inspection) {
                 Ok(()) => return Ok(()),
                 Err(error) if matches!(error, Error::Encrypted(EncryptedError::BadPassword)) => {
                     final_bad_password = Some(error);
@@ -726,10 +730,12 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// Parse qpdf's encryption parameters before authentication so the
     /// read-only `--show-encryption` path can report them after BadPassword.
-    pub(crate) fn initialize_encryption_inspection(&mut self) -> Result<()> {
+    pub(crate) fn initialize_encryption_inspection(
+        &mut self,
+    ) -> Result<Option<crate::encryption::state::EncryptionInspectionState>> {
         let encrypt_handle = self.trailer_key_handle(b"Encrypt");
         if encrypt_handle.try_is_null()? {
-            return Ok(());
+            return Ok(None);
         }
         let id_handle = self.trailer_key_handle(b"ID");
         if !crate::encryption::state::first_file_id_handle_with_status(&id_handle)?.valid {
@@ -753,8 +759,8 @@ impl<R: Read + Seek> Pdf<R> {
         self.validate_qpdf_encryption_initialization(&encrypt_handle)?;
         let encrypt = encrypt_handle;
         let inspection = crate::encryption::state::parse_inspection_state(&encrypt)?;
-        *self.encryption_inspection.borrow_mut() = Some(inspection);
-        Ok(())
+        *self.encryption_inspection.borrow_mut() = Some(inspection.clone());
+        Ok(Some(inspection))
     }
 
     fn encryption_qpdf_exception(
@@ -863,7 +869,11 @@ impl<R: Read + Seek> Pdf<R> {
         ))
     }
 
-    fn authenticate_if_encrypted_once(&mut self, options: &PdfOpenOptions) -> Result<()> {
+    fn authenticate_if_encrypted_once(
+        &mut self,
+        options: &PdfOpenOptions,
+        inspection: &crate::encryption::state::EncryptionInspectionState,
+    ) -> Result<()> {
         let encrypt_handle = self.trailer_key_handle(b"Encrypt");
         let encrypt_ref = encrypt_handle.object_ref();
         let id_handle = self.trailer_key_handle(b"ID");
@@ -872,6 +882,7 @@ impl<R: Read + Seek> Pdf<R> {
         };
         let authenticated = crate::encryption::state::authenticate(
             &encrypt,
+            inspection,
             &id_handle,
             encrypt_ref,
             &options.password,
@@ -1773,8 +1784,14 @@ mod encryption_state_commit_tests {
         )));
         pdf.set_logger(logger);
 
+        let inspection = pdf
+            .encryption_inspection
+            .borrow()
+            .as_ref()
+            .cloned()
+            .expect("encrypted document has parsed inspection state");
         let error = pdf
-            .authenticate_if_encrypted_once(&options)
+            .authenticate_if_encrypted_once(&options, &inspection)
             .expect_err("warning sink failure must propagate");
         assert!(matches!(
             error,
