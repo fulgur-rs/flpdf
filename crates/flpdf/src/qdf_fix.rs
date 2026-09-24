@@ -327,19 +327,22 @@ fn ignore_newline_marker_count(separator: &[u8]) -> usize {
 }
 
 /// Return the input range of a top-level object's first body line when it is
-/// bare decimal digits plus LF (`fix-qdf.cc:90,256-259`). Its header was
-/// already recognized by `parse_obj_header` using qpdf's `re_n_0_obj`.
-fn qpdf_bare_integer_line_range(input: &[u8], object: &ObjectSpan) -> Option<(usize, usize)> {
-    let integer_start = object.body_start;
+/// bare decimal digits plus LF (`fix-qdf.cc:90,256-259`).
+fn qpdf_bare_integer_line_range_at(input: &[u8], integer_start: usize) -> Option<(usize, usize)> {
     let integer_end = memchr_nl(input, integer_start)?;
-    if integer_end + 1 > object.end {
-        return None;
-    }
     let integer = &input[integer_start..integer_end];
     if integer.is_empty() || !integer.iter().all(u8::is_ascii_digit) {
         return None;
     }
     Some((integer_start, integer_end + 1))
+}
+
+/// Return the input range of a top-level object's first body line when it is
+/// bare decimal digits plus LF, bounded by the parsed object span. The header
+/// was already recognized by `parse_obj_header` using qpdf's `re_n_0_obj`.
+fn qpdf_bare_integer_line_range(input: &[u8], object: &ObjectSpan) -> Option<(usize, usize)> {
+    let range = qpdf_bare_integer_line_range_at(input, object.body_start)?;
+    (range.1 <= object.end).then_some(range)
 }
 
 /// Whether a dict's lines contain qpdf's exact, oracle-literal type marker
@@ -652,8 +655,29 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     // alongside the `break` below, and reused as-is after the loop instead
     // of re-matching `objects.last()` to answer the same question twice.
     let mut is_xref_stream_form = false;
+    // qpdf's checkObjId counter advances as each top-level header and each
+    // ObjStm member is encountered, before the next object body is processed.
+    let mut last_obj: u32 = 0;
     let mut cursor = 0usize;
     while let Some((num, gen, line_start, kw_end)) = find_next_obj(input, cursor) {
+        last_obj = check_sequential(num, last_obj, line_start)?;
+        let body_start = kw_end + 1;
+        let previous_stream_enters_after_stream = objects.last().is_some_and(|previous| {
+            matches!(
+                &previous.body,
+                ObjectBody::Plain {
+                    stream_len: Some(_),
+                    marker_scan_start: Some(_),
+                    ..
+                }
+            )
+        });
+        if previous_stream_enters_after_stream
+            && qpdf_bare_integer_line_range_at(input, body_start).is_none()
+        {
+            return Err(Error::parse(body_start, "fix_qdf: expected integer"));
+        }
+
         // Determine whether this object contains a stream BEFORE searching for
         // `endobj`. A decompressed QDF stream body may itself contain a line
         // that starts with `endobj`, which would truncate the object span if we
@@ -803,12 +827,18 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
             (body, end)
         };
 
+        if let ObjectBody::ObjStm { members, .. } = &body {
+            for member in members {
+                last_obj = check_sequential(member.num, last_obj, line_start)?;
+            }
+        }
+
         is_xref_stream_form = matches!(body, ObjectBody::XRefStream { .. });
         objects.push(ObjectSpan {
             num,
             gen,
             obj_line_start: line_start,
-            body_start: kw_end + 1,
+            body_start,
             end,
             body,
         });
@@ -853,26 +883,8 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     }
     // qpdf-deviation-end
 
-    // qpdf's fix-qdf requires objects numbered exactly `1..N` in file order
-    // (QdfFixer::checkObjId fatals on `stoi(id) != ++last_obj`) — and this ONE
-    // counter spans both top-level objects and (when present) each object
-    // stream's members, in encounter order: a member is `checkObjId`'d exactly
-    // like a top-level object is. Enforce the same numbering; this also
-    // bounds `/Size`/the xref length to the true object count (never a dense
-    // table sized by the maximum object number), so a sparse or huge object
-    // number can no longer drive an overflow — AND restores full byte-for-byte
-    // fix-qdf parity: flpdf's own QDF writer emits objects in ascending file
-    // order with each `/Length` holder inline after its stream. This rejects
-    // nothing produced by the writer or qpdf `--qdf`.
-    let mut last_obj: u32 = 0;
-    for obj in &objects {
-        last_obj = check_sequential(obj.num, last_obj, obj.obj_line_start)?;
-        if let ObjectBody::ObjStm { members, .. } = &obj.body {
-            for m in members {
-                last_obj = check_sequential(m.num, last_obj, obj.obj_line_start)?;
-            }
-        }
-    }
+    // `last_obj` was checked in the same scan order as qpdf's `checkObjId`
+    // for top-level headers and each encountered object-stream member.
     let size = last_obj as usize + 1;
 
     // qpdf enters st_after_stream immediately after reading endstream and

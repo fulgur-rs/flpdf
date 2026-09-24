@@ -1171,6 +1171,18 @@ fn unrecognized_positional_header_does_not_advance_object_numbering() {
 }
 
 #[test]
+fn positional_holder_expected_integer_precedes_successor_body_validation() {
+    let pdf = read("error-order-holder-before-objstm.qdf");
+    let error =
+        flpdf::fix_qdf(&pdf).expect_err("qpdf checks the holder line before the ObjStm body");
+
+    assert!(matches!(
+        error,
+        flpdf::Error::Parse { message, .. } if message == "fix_qdf: expected integer"
+    ));
+}
+
+#[test]
 fn positional_holder_requires_an_exact_bare_integer_line() {
     let invalid_bodies: [&[u8]; 4] = [b" 0\n", b"0 \n", b"0\r\n", b""];
     for body in invalid_bodies {
