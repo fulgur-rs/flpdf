@@ -2807,7 +2807,7 @@ fn cli_command() -> clap::Command {
     stacker::maybe_grow(
         CLI_COMMAND_STACK_RED_ZONE,
         CLI_COMMAND_STACK_GROWTH_SIZE,
-        Cli::command,
+        || arg_parser::configure_qpdf_repeatable_bare_options(Cli::command()),
     )
 }
 
@@ -2821,30 +2821,30 @@ fn cli_parse_from_mode(args: Vec<OsString>, native_subcommand_mode: bool) -> Cli
         CLI_COMMAND_STACK_RED_ZONE,
         CLI_COMMAND_STACK_GROWTH_SIZE,
         || {
-            if native_subcommand_mode {
-                return Cli::parse_from(args);
-            }
-
-            // clap has no public operation that removes generated
-            // subcommands from a Command. Rename and hide them for the
-            // qpdf-compat parse only, retaining the same generated argument
-            // schema while making every positional obey qpdf's flat grammar.
-            let mut disabled_index = 0;
-            let command = cli_command().mut_subcommands(|subcommand| {
-                let disabled_name: &'static str = Box::leak(
-                    format!("__flpdf_qpdf_compat_native_subcommand_{disabled_index}")
-                        .into_boxed_str(),
-                );
-                disabled_index += 1;
-                subcommand
-                    .name(disabled_name)
-                    .hide(true)
-                    .alias(None)
-                    .visible_alias(None)
-                    .short_flag(None)
-                    .short_flag_alias(None)
-                    .visible_short_flag_alias(None)
-            });
+            let command = if native_subcommand_mode {
+                cli_command()
+            } else {
+                // clap has no public operation that removes generated
+                // subcommands from a Command. Rename and hide them for the
+                // qpdf-compat parse only, retaining the same generated argument
+                // schema while making every positional obey qpdf's flat grammar.
+                let mut disabled_index = 0;
+                cli_command().mut_subcommands(|subcommand| {
+                    let disabled_name: &'static str = Box::leak(
+                        format!("__flpdf_qpdf_compat_native_subcommand_{disabled_index}")
+                            .into_boxed_str(),
+                    );
+                    disabled_index += 1;
+                    subcommand
+                        .name(disabled_name)
+                        .hide(true)
+                        .alias(None)
+                        .visible_alias(None)
+                        .short_flag(None)
+                        .short_flag_alias(None)
+                        .visible_short_flag_alias(None)
+                })
+            };
             let matches = command.get_matches_from(args);
             Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
         },

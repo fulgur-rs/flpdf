@@ -16,6 +16,45 @@ fn qpdf_available() -> bool {
 }
 
 #[test]
+fn repeated_replace_input_remains_a_qpdf_usage_error() {
+    if !qpdf_available() {
+        eprintln!("qpdf 11.9.0 is unavailable; skipping repeated replace-input differential");
+        return;
+    }
+
+    let directory = tempfile::tempdir().expect("temporary replace-input directory");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/one-page.pdf");
+    let qpdf_input = directory.path().join("qpdf-input.pdf");
+    let flpdf_input = directory.path().join("flpdf-input.pdf");
+    fs::copy(&fixture, &qpdf_input).expect("copy qpdf input");
+    fs::copy(&fixture, &flpdf_input).expect("copy flpdf input");
+    let original = fs::read(&fixture).expect("read original fixture");
+
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(["--replace-input", "--replace-input"])
+        .arg(&qpdf_input)
+        .output()
+        .expect("run qpdf 11.9.0 duplicate selector oracle");
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--replace-input", "--replace-input"])
+        .arg(&flpdf_input)
+        .output()
+        .expect("run flpdf duplicate selector");
+
+    assert_eq!(qpdf.status.code(), Some(2));
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(
+        String::from_utf8_lossy(&flpdf.stderr),
+        String::from_utf8_lossy(&qpdf.stderr).replace("qpdf", "flpdf")
+    );
+    assert_eq!(fs::read(&qpdf_input).unwrap(), original);
+    assert_eq!(fs::read(&flpdf_input).unwrap(), original);
+}
+
+#[test]
 fn top_level_replace_input_rewrites_unicode_input() {
     let directory = tempfile::tempdir().expect("temporary replace-input directory");
     let input = directory.path().join("auto-ü.pdf");
