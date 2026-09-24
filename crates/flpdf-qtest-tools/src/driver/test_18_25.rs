@@ -115,12 +115,14 @@ pub(crate) fn run_test_19<R: Read + Seek + 'static>(
     // qpdf's `last.getKey("/Contents").getObjGen() ==
     // newpage.getKey("/Contents").getObjGen()`. qpdf's public getKey resolves
     // the receiver first, so use the canonical resolving key accessor here.
-    assert_eq!(
-        last_handle.try_get_key(b"/Contents")?.object_ref(),
-        newpage_handle.try_get_key(b"/Contents")?.object_ref()
-    );
-
+    let last_contents_result = last_handle.try_get_key(b"/Contents");
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let last_contents = last_contents_result?.object_ref();
+    let newpage_contents_result = newpage_handle.try_get_key(b"/Contents");
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let newpage_contents = newpage_contents_result?.object_ref();
+    assert_eq!(last_contents, newpage_contents);
+
     Ok(())
 }
 

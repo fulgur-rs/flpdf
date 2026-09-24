@@ -84,12 +84,15 @@ pub(crate) fn run_test_42<R: Read + Seek>(
     let qpdf_flush_result_20 = qtest.try_get_string_value();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     qpdf_flush_result_20?;
-    assert!(array.try_get_array_item(-1)?.is_null());
+    let negative_array_item = array.try_get_array_item(-1);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    assert!(array.try_get_array_item(16_059)?.is_null());
+    assert!(negative_array_item?.is_null());
+    let out_of_bounds_array_item = array.try_get_array_item(16_059);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    assert!(integer.try_get_array_item(0)?.is_null());
+    assert!(out_of_bounds_array_item?.is_null());
+    let non_array_item = integer.try_get_array_item(0);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert!(non_array_item?.is_null());
     let qpdf_flush_result_21 = integer.try_append_array_item(ObjectHandle::null());
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     qpdf_flush_result_21?;
@@ -119,18 +122,24 @@ pub(crate) fn run_test_42<R: Read + Seek>(
     let qpdf_flush_result_29 = integer.try_set_array_item_at(0, ObjectHandle::null());
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     qpdf_flush_result_29?;
-    assert_eq!(integer.try_get_array_n_items()?, 0);
+    let integer_array_count = integer.try_get_array_n_items();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    assert!(integer.try_get_array_as_vector()?.is_empty());
+    assert_eq!(integer_array_count?, 0);
+    let integer_array_items = integer.try_get_array_as_vector();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    assert!(!integer.try_get_bool_value()?);
+    assert!(integer_array_items?.is_empty());
+    let integer_bool = integer.try_get_bool_value();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    assert!(integer.try_get_dict_as_map()?.is_empty());
+    assert!(!integer_bool?);
+    let integer_dictionary_items = integer.try_get_dict_as_map();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    assert!(integer.try_get_keys()?.is_empty());
+    assert!(integer_dictionary_items?.is_empty());
+    let integer_keys = integer.try_get_keys();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    assert!(!integer.try_get_has_key(b"/Potato")?);
+    assert!(integer_keys?.is_empty());
+    let integer_has_potato = integer.try_get_has_key(b"/Potato");
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert!(!integer_has_potato?);
     let qpdf_flush_result_30 = integer.remove_key_and_get_old(b"/Potato");
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     qpdf_flush_result_30?;
@@ -152,39 +161,51 @@ pub(crate) fn run_test_42<R: Read + Seek>(
     let qpdf_flush_result_34 = integer_from_qtest.try_get_key(b"/Potato");
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     qpdf_flush_result_34?;
-    assert!(integer.try_get_inline_image_value()?.is_empty());
+    let integer_inline_image = integer.try_get_inline_image_value();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    assert_eq!(dictionary.try_get_int_value()?, 0);
+    assert!(integer_inline_image?.is_empty());
+    let dictionary_integer = dictionary.try_get_int_value();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    assert_eq!(integer.try_get_name()?, b"/QPDFFakeName");
+    assert_eq!(dictionary_integer?, 0);
+    let integer_name = integer.try_get_name();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    assert_eq!(integer.try_get_operator_value()?, b"QPDFFAKE");
+    assert_eq!(integer_name?, b"/QPDFFakeName");
+    let integer_operator = integer.try_get_operator_value();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    assert_eq!(dictionary.try_get_real_value()?, b"0.0");
+    assert_eq!(integer_operator?, b"QPDFFAKE");
+    let dictionary_real = dictionary.try_get_real_value();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    assert!(integer.try_get_string_value()?.is_empty());
+    assert_eq!(dictionary_real?, b"0.0");
+    let integer_string = integer.try_get_string_value();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    assert!(integer.try_get_utf8_value()?.is_empty());
+    assert!(integer_string?.is_empty());
+    let integer_utf8 = integer.try_get_utf8_value();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    assert_eq!(dictionary.try_get_numeric_value()?, 0.0);
+    assert!(integer_utf8?.is_empty());
+    let dictionary_numeric = dictionary.try_get_numeric_value();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert_eq!(dictionary_numeric?, 0.0);
 
     writeln!(stderr, "One error")?;
-    assert!(array
-        .try_get_array_item(0)?
-        .try_get_string_value()?
-        .is_empty());
+    let first_array_item = array.try_get_array_item(0);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let first_array_item = first_array_item?;
+    let first_string_value = first_array_item.try_get_string_value();
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert!(first_string_value?.is_empty());
     writeln!(stderr, "One error")?;
-    assert!(dictionary
-        .try_get_key(b"/Quack")?
-        .try_get_string_value()?
-        .is_empty());
-    assert!(dictionary
-        .try_get_key_if_dict(b"/Quack")?
-        .try_get_string_value()?
-        .is_empty());
+    let quack_value = dictionary.try_get_key(b"/Quack");
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let quack_value = quack_value?;
+    let quack_string = quack_value.try_get_string_value();
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert!(quack_string?.is_empty());
+    let quack_dictionary_value = dictionary.try_get_key_if_dict(b"/Quack");
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let quack_dictionary_value = quack_dictionary_value?;
+    let quack_dictionary_string = quack_dictionary_value.try_get_string_value();
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert!(quack_dictionary_string?.is_empty());
     let nested_dictionary = array.try_get_array_item(1)?;
     assert!(nested_dictionary.try_is_dictionary()?);
     let nested_array = nested_dictionary.try_get_key(b"/K")?;
@@ -195,8 +216,9 @@ pub(crate) fn run_test_42<R: Read + Seek>(
 
     writeln!(stderr, "Two errors")?;
     let invalid_item = array.try_get_array_item(16_059)?;
-    assert!(invalid_item.try_get_string_value()?.is_empty());
+    let invalid_item_string = invalid_item.try_get_string_value();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert!(invalid_item_string?.is_empty());
     writeln!(stderr, "One error")?;
     let invalid_nested_string = (|| {
         array
@@ -216,11 +238,12 @@ pub(crate) fn run_test_42<R: Read + Seek>(
     let page = pdf.get_object_handle(page_ref);
     let contents = page.try_get_key(b"/Contents")?;
     let stream_dictionary = contents.try_get_stream_dict()?;
-    assert_eq!(
-        stream_dictionary.try_get_key(b"/Potato")?.try_get_name()?,
-        b"/QPDFFakeName"
-    );
+    let potato_value = stream_dictionary.try_get_key(b"/Potato");
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let potato_value = potato_value?;
+    let potato_name = potato_value.try_get_name();
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert_eq!(potato_name?, b"/QPDFFakeName");
 
     assert_eq!(integer.try_get_array_as_rectangle()?, Rectangle::default());
     let rectangle = ObjectHandle::new_from_rectangle(Rectangle::new(1.2, 3.4, 5.6, 7.8));

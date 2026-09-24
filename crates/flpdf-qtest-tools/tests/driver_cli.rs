@@ -1,6 +1,9 @@
 use assert_cmd::Command;
 use flpdf::{PageDocumentHelper, Pdf, PdfOpenOptions};
+use proc_macro2::TokenTree;
 use std::{ffi::CStr, fs};
+use syn::spanned::Spanned;
+use syn::visit::{self, Visit};
 
 #[path = "../../flpdf-cli/tests/support/eol.rs"]
 mod eol;
@@ -2102,6 +2105,156 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
     }
 }
 
+fn token_stream_contains_try_operator(tokens: &proc_macro2::TokenStream) -> bool {
+    tokens.clone().into_iter().any(|token| match token {
+        TokenTree::Punct(punct) => punct.as_char() == '?',
+        TokenTree::Group(group) => token_stream_contains_try_operator(&group.stream()),
+        TokenTree::Ident(_) | TokenTree::Literal(_) => false,
+    })
+}
+
+fn expression_is_diagnostic_flush(expression: &syn::Expr) -> bool {
+    match expression {
+        syn::Expr::Call(call) => match call.func.as_ref() {
+            syn::Expr::Path(function) => function
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "emit_new_diagnostics"),
+            _ => false,
+        },
+        syn::Expr::MethodCall(call) if call.method == "map_err" => {
+            expression_is_diagnostic_flush(&call.receiver)
+        }
+        syn::Expr::Try(expression) => expression_is_diagnostic_flush(&expression.expr),
+        syn::Expr::Paren(paren) => expression_is_diagnostic_flush(&paren.expr),
+        syn::Expr::Group(group) => expression_is_diagnostic_flush(&group.expr),
+        _ => false,
+    }
+}
+
+fn statement_is_diagnostic_flush(statement: &syn::Stmt) -> bool {
+    match statement {
+        syn::Stmt::Expr(expression, _) => expression_is_diagnostic_flush(expression),
+        syn::Stmt::Item(_) | syn::Stmt::Macro(_) | syn::Stmt::Local(_) => false,
+    }
+}
+
+#[derive(Default)]
+struct AssertionMacroTryFinder {
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for AssertionMacroTryFinder {
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        let is_assertion = mac
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident.to_string().starts_with("assert"));
+        if is_assertion && token_stream_contains_try_operator(&mac.tokens) {
+            self.found = true;
+        }
+        visit::visit_macro(self, mac);
+    }
+}
+
+fn statement_contains_assertion_try_operator(statement: &syn::Stmt) -> bool {
+    let mut finder = AssertionMacroTryFinder::default();
+    finder.visit_stmt(statement);
+    finder.found
+}
+
+fn qtest_flush_guard_violations(source: &str, file_name: &str) -> Vec<String> {
+    struct BlockGuard<'a> {
+        file_name: &'a str,
+        violations: Vec<String>,
+    }
+
+    impl<'ast> Visit<'ast> for BlockGuard<'_> {
+        fn visit_block(&mut self, block: &'ast syn::Block) {
+            for pair in block.stmts.windows(2) {
+                let previous = &pair[0];
+                let next = &pair[1];
+                if statement_is_diagnostic_flush(next)
+                    && statement_contains_assertion_try_operator(previous)
+                {
+                    self.violations.push(format!(
+                        "{}:{}",
+                        self.file_name,
+                        previous.span().start().line
+                    ));
+                }
+            }
+            visit::visit_block(self, block);
+        }
+    }
+
+    let syntax = syn::parse_file(source).expect("parse qtest driver module");
+    let mut guard = BlockGuard {
+        file_name,
+        violations: Vec::new(),
+    };
+    guard.visit_file(&syntax);
+    let mut violations = guard.violations;
+
+    // Preserve the original check for a direct `?;` on the physical line
+    // immediately before the flush. The syntax walk above adds assertion
+    // macro token streams, which rustc does not expose as ordinary Expr nodes.
+    let lines: Vec<_> = source.lines().collect();
+    for (line_index, line) in lines.iter().enumerate() {
+        if !line.trim_start().starts_with("emit_new_diagnostics(") {
+            continue;
+        }
+        let previous = lines[..line_index]
+            .iter()
+            .rev()
+            .find(|line| !line.trim().is_empty());
+        if previous.is_some_and(|line| line.trim_end().ends_with("?;")) {
+            violations.push(format!("{}:{}", file_name, line_index + 1));
+        }
+    }
+    violations
+}
+
+#[test]
+fn qtest_flush_guard_detects_try_operators_inside_macro_statements() {
+    let source = r#"
+fn example() {
+    assert_eq!(
+        array.try_get_array_item(0)?.try_get_name()?,
+        other.try_get_name()?
+    );
+    emit_new_diagnostics(pdf, written, filename, stdout, stderr)?;
+}
+"#;
+    assert_eq!(qtest_flush_guard_violations(source, "example.rs").len(), 1);
+}
+
+#[test]
+fn qtest_flush_guard_detects_try_operators_in_result_statements() {
+    let source = "fn example() {\n    let value = fallible()?;\n    emit_new_diagnostics(pdf, written, filename, stdout, stderr)?;\n}\n";
+    assert_eq!(qtest_flush_guard_violations(source, "example.rs").len(), 1);
+}
+
+#[test]
+fn qtest_flush_guard_ignores_question_marks_in_strings_and_comments() {
+    let source = r##"
+fn example() {
+    assert!(b"question ?".len() > 0); // comment with try? punctuation
+    let text = "the literal ? stays ordinary"; // and this ? is a comment
+    emit_new_diagnostics(pdf, written, filename, stdout, stderr)?;
+}
+"##;
+    assert!(qtest_flush_guard_violations(source, "example.rs").is_empty());
+}
+
+#[test]
+fn qtest_flush_guard_does_not_follow_flushes_nested_in_later_statements() {
+    let source = "fn example() {\n    let value = fallible()?;\n    for _ in 0..1 { emit_new_diagnostics(pdf, written, filename, stdout, stderr)?; }\n}\n";
+    assert!(qtest_flush_guard_violations(source, "example.rs").is_empty());
+}
+
 #[test]
 fn qtest_driver_flushes_diagnostics_before_result_propagation() {
     let driver_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/driver");
@@ -2120,30 +2273,16 @@ fn qtest_driver_flushes_diagnostics_before_result_propagation() {
     let mut violations = Vec::new();
     for path in source_paths {
         let source = fs::read_to_string(&path).expect("read qtest driver source");
-        let lines: Vec<_> = source.lines().collect();
-        for (line_index, line) in lines.iter().enumerate() {
-            if !line.trim_start().starts_with("emit_new_diagnostics(") {
-                continue;
-            }
-            let previous = lines[..line_index]
-                .iter()
-                .rev()
-                .find(|line| !line.trim().is_empty());
-            if previous.is_some_and(|line| line.trim_end().ends_with("?;")) {
-                violations.push(format!(
-                    "{}:{}",
-                    path.file_name().unwrap().to_string_lossy(),
-                    line_index + 1
-                ));
-            }
-        }
+        violations.extend(qtest_flush_guard_violations(
+            &source,
+            &path.file_name().unwrap().to_string_lossy(),
+        ));
     }
-
     assert!(
         violations.is_empty(),
         "qtest callsites must flush pending qpdf warnings before propagating errors; {} sites remain: {:?}",
         violations.len(),
-        violations.iter().take(12).collect::<Vec<_>>()
+        violations
     );
 }
 

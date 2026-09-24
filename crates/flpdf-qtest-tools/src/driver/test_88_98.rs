@@ -126,10 +126,12 @@ pub(crate) fn run_test_88<R: Read + Seek>(
     let root = root_result?;
     let arr2 = root.replace_key_and_get_new(b"/QTest", ObjectHandle::parse(b"[1 2]")?)?;
     arr2.set_object_description(pdf, "test array")?;
-    assert!(arr2.erase_array_item_and_get_old(50)?.is_null());
+    let arr2_removed_item = arr2.erase_array_item_and_get_old(50);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    assert!(root.erase_array_item_and_get_old(0)?.is_null());
+    assert!(arr2_removed_item?.is_null());
+    let root_removed_item = root.erase_array_item_and_get_old(0);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert!(root_removed_item?.is_null());
     Ok(())
 }
 
