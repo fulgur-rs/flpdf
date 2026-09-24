@@ -1921,6 +1921,37 @@ mod tests {
     }
 
     #[test]
+    fn job_check_indirect_default_xref_warning_uses_zero_offset() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        let mut pdf = job
+            .open(
+                Cursor::new(include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/compat/indirect-default-xref-row.pdf"
+                ))),
+                "indirect-default-xref-row.pdf",
+                PdfOpenOptions::default(),
+            )
+            .expect("the synthetic ObjStm default-row fixture should open");
+
+        assert_eq!(
+            job.check(&mut pdf)
+                .expect("an indirect default xref row is a warning"),
+            JobExitCode::Warning
+        );
+        let output = String::from_utf8(output.lock().expect("capture output").clone())
+            .expect("check output should be UTF-8");
+
+        assert!(output.contains(
+            "WARNING: indirect-default-xref-row.pdf: object 5/0 has unexpected xref entry type\n"
+        ));
+        assert!(!output.contains("object 5/0, offset "));
+    }
+
+    #[test]
     fn document_check_reports_extension_level_and_linearization_warning() {
         let output = Arc::new(Mutex::new(Vec::new()));
         let logger = logger_with_capture(Arc::clone(&output));

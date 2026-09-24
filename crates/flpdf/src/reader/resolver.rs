@@ -2564,14 +2564,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .insert(object_gen);
     }
 
-    /// Deliver one warning for the non-indirect default xref row currently
-    /// being resolved. qpdf's ObjStm reader only inserts/looks up member rows;
-    /// `QPDF::resolveXRefTable` later reaches object 0 and `QPDF::resolve`
-    /// warns for that row (`QPDF.cc:1239-1254,1700-1753`).
+    /// Deliver one warning for the default xref row currently being resolved.
+    /// qpdf reaches each unresolved row through `QPDF::resolveXRefTable` and
+    /// reports unexpected types with empty object context and offset 0
+    /// (`QPDF.cc:1239-1254,1700-1753`).
     fn warn_default_xref_entry(&self, object_gen: QpdfObjGen) -> Result<()> {
-        if object_gen.is_indirect() {
-            return Ok(());
-        }
         let should_warn = {
             let core = self.core.borrow();
             core.default_xref_entries.contains(&object_gen)
@@ -5706,11 +5703,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 .to_object_ref()
                 .is_some_and(|object_ref| self.has_default_xref_entry(object_ref))
         {
-            self.push_warning(format!(
-                "object {}/{} has unexpected xref entry type",
-                object_gen.get_obj(),
-                object_gen.get_gen()
-            ))?;
+            self.warn_default_xref_entry(object_gen)?;
             handle.set_resolved(ObjectValue::Null);
             return Ok(());
         }
@@ -11591,19 +11584,6 @@ mod tests {
             "a default row recreated after removal must be warned about again, \
              not suppressed by warning-delivery bookkeeping the removal left stale"
         );
-    }
-
-    #[test]
-    fn default_object_zero_warning_helper_ignores_indirect_rows() {
-        let resolver = bare_resolver();
-        let object_ref = ObjectRef::new(5, 0);
-        resolver.insert_default_xref_entry_for_test(object_ref);
-
-        resolver
-            .warn_default_xref_entry(QpdfObjGen::new(5, 0))
-            .expect("the object-zero warning owner ignores indirect rows");
-
-        assert!(resolver.repair_diagnostics().entries().is_empty());
     }
 
     #[test]
