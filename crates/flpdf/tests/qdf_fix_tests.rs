@@ -54,8 +54,12 @@ const OBJSTM_CASES: &[&str] = &[
 ///   syntactically valid `N G obj ... endobj` block appended *after* the
 ///   original `%%EOF`. The oracle's `st_top`/`st_at_xref`/.../`st_done`
 ///   state machine can never re-enter object recognition once the tail
-///   `xref` line is seen, so this trailing block is discarded entirely
-///   (not copied through, not treated as an object).
+///   `xref` line is seen on this fixture (the preceding object is not a
+///   stream awaiting a positional holder), so this trailing block is discarded
+///   entirely (not copied through, not treated as an object). A holder after a
+///   stream keeps qpdf in `st_after_stream` across the earlier tail; after that
+///   holder is rewritten, `st_top` can recognize later objects and another
+///   xref (covered by the post-tail continuation fixtures).
 /// * `corrupt-nested-type-xref` — a regular stream whose dictionary has a
 ///   nested sub-dictionary containing `/Type /XRef`. The oracle's
 ///   `line.find("/Type /XRef") != line.npos` check is a plain per-line
@@ -102,6 +106,9 @@ const POSITIONAL_LENGTH_CASES: &[&str] = &[
     "corrupt-length-marker-before-endobj",
     "corrupt-length-holder-after-xref",
     "corrupt-length-holder-after-xref-marker",
+    "corrupt-length-holder-after-xref-next-object",
+    "corrupt-length-holder-after-xref-second-xref",
+    "corrupt-length-holder-after-xref-next-stream",
 ];
 
 /// A QDF with an empty indirect-object table and a direct trailer root.
@@ -188,6 +195,68 @@ fn empty_object_table_without_a_recognized_xref_is_rejected() {
         "an empty object table without qpdf's exact xref line is malformed: {message}"
     );
     assert!(message.contains("no objects found before xref"));
+}
+
+#[test]
+fn resumed_post_tail_scan_rejects_a_nonsequential_object_number() {
+    let mut input = read("corrupt-length-holder-after-xref.qdf");
+    input.extend_from_slice(b"9 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let err = flpdf::fix_qdf(&input)
+        .expect_err("qpdf resumes st_top after rewriting the post-tail holder");
+    let message = err.to_string();
+    assert!(
+        matches!(err, flpdf::Error::Parse { .. }),
+        "the resumed object-number check must be a parse error: {message}"
+    );
+    assert!(
+        message.contains("non-sequential object numbering"),
+        "unexpected resumed object-number error: {message}"
+    );
+}
+
+#[test]
+fn post_tail_holder_truncated_before_endobj_is_still_rewritten() {
+    // qpdf's `st_in_length` consumes only the holder's integer line and
+    // returns to `st_top` (`fix-qdf.cc:255-263`), so it never looks for the
+    // holder's `endobj`. Live `fix-qdf` exits 0 on this input.
+    let complete = read("corrupt-length-holder-after-xref.qdf");
+    let terminator = b"endobj\n";
+    let cut = complete
+        .windows(terminator.len())
+        .rposition(|window| window == terminator)
+        .expect("the fixture ends with the holder's endobj");
+    let truncated = complete[..cut].to_vec();
+
+    let fixed = flpdf::fix_qdf(&truncated)
+        .expect("a post-tail holder without endobj is still a length holder");
+    let expected = flpdf::fix_qdf(&complete).expect("the complete fixture repairs");
+    let expected_prefix = &expected[..expected.len() - terminator.len()];
+    assert_eq!(
+        fixed, expected_prefix,
+        "the truncated holder must be rewritten exactly like the complete one"
+    );
+}
+
+#[test]
+fn post_tail_holder_without_endobj_does_not_swallow_a_later_object() {
+    // qpdf returns to `st_top` right after the holder's integer line, so the
+    // two objects that follow are validated as 4 then 5. Bounding the holder
+    // only when no later `endobj` exists merges the holder with object 4, so
+    // the sequential check then sees 5 where it expects 4 and fails. Live
+    // fix-qdf exits 0 on this input.
+    let complete = read("corrupt-length-holder-after-xref.qdf");
+    let terminator = b"endobj\n";
+    let cut = complete
+        .windows(terminator.len())
+        .rposition(|window| window == terminator)
+        .expect("the fixture ends with the holder's endobj");
+    let mut input = complete[..cut].to_vec();
+    input.extend_from_slice(b"4 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    input.extend_from_slice(b"5 0 obj\n<< >>\nendobj\n");
+
+    flpdf::fix_qdf(&input)
+        .expect("the holder ends at its integer line, so objects 4 and 5 stay sequential");
 }
 
 /// `fix_qdf(fix_qdf(x)) == fix_qdf(x)` for every corrupted input.
