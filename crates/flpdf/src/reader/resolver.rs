@@ -2580,14 +2580,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
         if !should_warn {
             return Ok(());
         }
-        self.push_warning_at(
-            0,
-            format!(
-                "object {}/{} has unexpected xref entry type",
-                object_gen.get_obj(),
-                object_gen.get_gen()
-            ),
-        )?;
+        let object_number = object_gen.get_obj();
+        let generation = object_gen.get_gen();
+        let warning = format!("object {object_number}/{generation} has unexpected xref entry type");
+        self.push_warning_at(0, warning)?;
         self.core
             .borrow_mut()
             .default_xref_warnings
