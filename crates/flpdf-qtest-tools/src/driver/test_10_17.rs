@@ -366,7 +366,7 @@ pub(crate) fn run_test_14<R: Read + Seek>(
             writer.set_static_id(static_id);
             writer.set_stream_data_mode(StreamDataMode::Preserve);
             writer.write()?;
-            Ok(writer.get_buffer()?.to_vec())
+            writer.get_buffer()
         })();
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         let buffer = buffer_result?;
