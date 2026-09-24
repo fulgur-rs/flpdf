@@ -1,0 +1,41 @@
+%PDF-1.7
+%¿÷¢þ
+%QDF-1.0
+
+1 0 obj
+<<
+  /Length 99 0 R
+>>
+stream
+abc
+endstream
+endobj
+
+2 0 obj
+<<
+/Type /ObjStm
+>>
+stream
+not-an-object-stream
+endstream
+endobj
+
+3 0 obj
+<<
+/Type /Catalog
+>>
+endobj
+
+xref
+0 4
+0000000000 65535 f 
+0000000000 00000 n 
+0000000000 00000 n 
+0000000000 00000 n 
+trailer <<
+  /Root 3 0 R
+  /Size 4
+>>
+startxref
+0
+%%EOF
