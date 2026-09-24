@@ -91,8 +91,11 @@ const SCANNER_EDGE_CASES: &[&str] = &[
 ];
 
 /// Ordinary-stream holder cases for qpdf's positional state transition.
-const POSITIONAL_LENGTH_CASES: &[&str] =
-    &["corrupt-length-position", "corrupt-length-position-markers"];
+const POSITIONAL_LENGTH_CASES: &[&str] = &[
+    "corrupt-length-position",
+    "corrupt-length-position-markers",
+    "corrupt-length-position-no-successor",
+];
 
 /// Each corrupted fixture, fixed by `flpdf::fix_qdf`, must equal the committed
 /// oracle golden byte-for-byte.
@@ -1059,7 +1062,7 @@ fn positional_length_qdf(
     }
     pdf.extend_from_slice(b"2 0 obj\n");
     pdf.extend_from_slice(next_body);
-    if !next_body.ends_with(b"\n") {
+    if !next_body.is_empty() && !next_body.ends_with(b"\n") {
         pdf.push(b'\n');
     }
     pdf.extend_from_slice(b"endobj\n\n3 0 obj\n<<\n/Type /Catalog\n>>\nendobj\n\n");
@@ -1122,20 +1125,54 @@ fn each_ignore_newline_marker_line_subtracts_once() {
 }
 
 #[test]
-fn positional_holder_requires_an_exact_bare_integer_line() {
-    let input = positional_length_qdf(Some(b"  /Length 2 0 R"), 0, b" 0\n");
-    let err = match flpdf::fix_qdf(&input) {
-        Err(err) => err,
-        Ok(output) => panic!(
-            "qpdf rejects an indented holder line, but fix_qdf returned:\n{}",
-            String::from_utf8_lossy(&output)
-        ),
-    };
+fn no_positional_successor_leaves_qpdf_tail_processing_in_st_after_stream() {
+    let input = read("corrupt-length-position-no-successor.qdf");
+    let golden = read("corrupt-length-position-no-successor.golden.qdf");
+    let fixed = flpdf::fix_qdf(&input).expect("qpdf returns success without a successor");
 
-    assert!(
-        matches!(err, flpdf::Error::Parse { .. }),
-        "expected parse error: {err:?}"
+    assert_eq!(
+        fixed, golden,
+        "partial st_after_stream output must match qpdf"
     );
+    assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
+}
+
+#[test]
+fn unrecognized_positional_header_does_not_advance_object_numbering() {
+    let header = b"5 0 obj\n";
+    for replacement in [b"5  0 obj\n".as_slice(), b" 0 obj\n", b"x 0 obj\n"] {
+        let mut input = read("corrupt-length-position.qdf");
+        let position = find(&input, header).expect("holder 5 header");
+        input.splice(
+            position..position + header.len(),
+            replacement.iter().copied(),
+        );
+        let err = flpdf::fix_qdf(&input).unwrap_err();
+
+        assert!(
+            format!("{err}").contains("non-sequential object numbering"),
+            "qpdf ignores header {replacement:?}, so the next recognized object must fail its ID check: {err}"
+        );
+    }
+}
+
+#[test]
+fn positional_holder_requires_an_exact_bare_integer_line() {
+    let invalid_bodies: [&[u8]; 4] = [b" 0\n", b"0 \n", b"0\r\n", b""];
+    for body in invalid_bodies {
+        let input = positional_length_qdf(Some(b"  /Length 2 0 R"), 0, body);
+        let err = match flpdf::fix_qdf(&input) {
+            Err(err) => err,
+            Ok(output) => panic!(
+                "qpdf rejects holder body {body:?}, but fix_qdf returned:\n{}",
+                String::from_utf8_lossy(&output)
+            ),
+        };
+        assert!(
+            matches!(err, flpdf::Error::Parse { .. }),
+            "expected parse error: {err:?}"
+        );
+    }
 }
 
 // ── Positional successor validation ────────────────────────────────────────

@@ -88,6 +88,8 @@ fn positional_holder_is_ignored_by_length_reference_shape() {
 - [ ] Add `each_ignore_newline_marker_subtracts_one`: call `positional_length_qdf(Some(b"  /Length 99 0 R"), 2, b"0\n")`; assert object 2 becomes `2` and the result is idempotent.
 - [ ] Add `holder_integer_line_must_match_qpdf_exactly`: call `positional_length_qdf(Some(b"  /Length 2 0 R"), 0, b" 0\n")`; require `Error::Parse`. The pinned qpdf probe exits 2 with `expected integer` for this input shape.
 - [ ] Commit input/golden pairs from the pinned qpdf qtest `fix1.qdf`: change its first `/Length 5 0 R` to `/Length 99 0 R`, and separately insert two exact marker lines before object 5. Generate each golden with `/usr/bin/fix-qdf` 11.9.0, register both fixtures in the qdf tests, and compare flpdf output byte-for-byte.
+- [ ] Add a no-successor input/golden pair by removing the final integer holder from qpdf `fix1.qdf`. The live oracle rewrites the earlier holder but leaves the xref/trailer tail byte-for-byte unchanged because it remains in `st_after_stream`.
+- [ ] Add a malformed-holder-header regression by changing `5 0 obj\n` to `5  0 obj\n` in the wrong-target fixture. qpdf ignores that header and exits 2 with `expected object 5` at the next recognized object.
 - [ ] Run `cargo test -p flpdf --test qdf_fix_tests positional_holder_is_ignored_by_length_reference_shape -- --exact`; it must fail because flpdf currently follows object M or skips a holder when `/Length` is absent/direct.
 - [ ] Run the marker and integer-line tests individually and confirm each fails for its intended reason.
 
@@ -96,16 +98,18 @@ fn positional_holder_is_ignored_by_length_reference_shape() {
 **Files:** `crates/flpdf/src/qdf_fix.rs`.
 
 - [ ] Remove `length_holder` from `ObjectBody::Plain` and stop calling `classify_length` when parsing an ordinary stream; preserve dictionary bytes unchanged.
+- [ ] Make `parse_obj_header` recognize only qpdf's LF-terminated single-space `N 0 obj` form, and call it only for lines ending in LF.
 - [ ] Replace `has_ignore_newline_marker` with a count of exact LF-terminated marker lines in the separator between the stream span and the next top-level span.
 - [ ] Build rewrite lengths from adjacent `objects.windows(2)` entries. For each ordinary `Plain` stream, subtract the separator marker count with saturation and associate the result with the immediately following top-level object, regardless of its parsed body variant. qpdf enters `st_in_length` before it would classify that successor body.
 - [ ] Require the successor header to be `N 0 obj\n`, then require the line immediately after that header to be nonempty ASCII digits followed by LF. Return `Error::Parse` otherwise, matching qpdf's `st_in_length` rule; do not skip an ObjStm/XRef object to find a later integer.
 - [ ] Replace only the validated integer line with the measured value. Remove declared-M missing-object, generation, conflict, and reuse checks because qpdf does not consult M/G at all.
-- [ ] Run the three RED tests and `cargo test -p flpdf --test qdf_fix_tests`; verify the new cases pass and inspect any legacy M-keyed assertion that remains.
+- [ ] If the last parsed object is an ordinary stream with no recognized successor, finish earlier holder rewrites and copy the remaining input tail verbatim; do not regenerate xref/trailer because qpdf never leaves `st_after_stream`.
+- [ ] Run every new qpdf-derived RED regression and `cargo test -p flpdf --test qdf_fix_tests`; verify all positional, no-successor, header-recognition and integer-line cases pass and inspect any legacy M-keyed assertion that remains.
 
-The per-stream assignment is one optional length per object. Validate the successor line before the output pass; rederive its small byte range when emitting so the vector does not retain two offsets per object:
+The positional assignment stores the length and validated integer-line range at the successor object's index:
 
 ```rust
-let mut new_len_body = vec![None; objects.len()];
+let mut new_len_body: Vec<Option<(usize, usize, usize)>> = vec![None; objects.len()];
 for (i, object) in objects.iter().enumerate() {
     let ObjectBody::Plain {
         stream_len: Some(measured_len),
@@ -117,8 +121,43 @@ for (i, object) in objects.iter().enumerate() {
     let Some(successor) = objects.get(i + 1) else {
         continue;
     };
-    qpdf_bare_integer_line_range(input, successor)?;
-    new_len_body[i + 1] = Some(measured_len.saturating_sub(*ignore_newline_count));
+    let Some((integer_start, integer_end)) = qpdf_bare_integer_line_range(input, successor) else {
+        return Err(Error::parse(successor.body_start, "fix_qdf: expected integer"));
+    };
+    new_len_body[i + 1] = Some((
+        measured_len.saturating_sub(*ignore_newline_count),
+        integer_start,
+        integer_end,
+    ));
+}
+```
+
+The object-header recognizer is applied only to LF-terminated lines and matches qpdf's generation-zero single-space expression:
+
+```rust
+fn parse_obj_header(line: &[u8]) -> Option<(u32, u32, usize)> {
+    let number = line.strip_suffix(b" 0 obj")?;
+    if number.is_empty() || !number.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let number = std::str::from_utf8(number).ok()?.parse::<u32>().ok()?;
+    Some((number, 0, line.len()))
+}
+```
+
+After the object-emission loop, preserve the unprocessed tail if qpdf would still be in `st_after_stream`:
+
+```rust
+if matches!(
+    objects.last().map(|object| &object.body),
+    Some(ObjectBody::Plain {
+        stream_len: Some(_),
+        ..
+    })
+) {
+    let last_end = objects.last().expect("nonempty object list").end;
+    out.extend_from_slice(&input[last_end..]);
+    return Ok(out);
 }
 ```
 
@@ -128,6 +167,7 @@ for (i, object) in objects.iter().enumerate() {
 
 - [ ] Replace `direct_length_with_length1_left_verbatim` and the indirect-holder-generation tests with positional assertions; `/Length1`, comments and strings remain verbatim but do not select a holder.
 - [ ] Change the missing-M and ObjStm-successor tests to assert `expected integer`; consolidate the old conflicting/same-length M-reuse tests into `following_stream_is_not_a_bare_integer_holder`; remove the redundant declared-generation rejection test because the new nonzero-reference test covers qpdf's ignored `/Length` generation.
+- [ ] Keep the no-successor partial-tail fixture and malformed-header sequencing test in both focused and live-oracle coverage.
 - [ ] Keep the writer QDF closed-loop, clean-QDF no-op, ObjStm/XRef tests, oracle goldens, sequential-number checks and xref-regeneration tests passing.
 - [ ] Regenerate `three-page-clean.qdf` with `flpdf rewrite --qdf --static-id`, then regenerate its stale-length, edited-payload and shifted-offset variants from that output. Confirm live qpdf `fix-qdf` is a byte no-op on clean output, returns nonzero for each corrupted input, and accepts each repaired output.
 - [ ] Update module docs and local comments to state that qpdf never reads `/Length` for holder selection and that each exact marker line subtracts once.
