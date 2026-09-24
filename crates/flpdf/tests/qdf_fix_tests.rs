@@ -95,6 +95,7 @@ const POSITIONAL_LENGTH_CASES: &[&str] = &[
     "corrupt-length-position",
     "corrupt-length-position-markers",
     "corrupt-length-position-no-successor",
+    "corrupt-length-marker-before-endobj",
 ];
 
 /// Each corrupted fixture, fixed by `flpdf::fix_qdf`, must equal the committed
@@ -1121,6 +1122,19 @@ fn each_ignore_newline_marker_line_subtracts_once() {
     let fixed = flpdf::fix_qdf(&input).expect("qpdf consumes both marker lines");
 
     assert_positional_length(&fixed, 2);
+    assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
+}
+
+#[test]
+fn ignore_newline_between_endstream_and_endobj_matches_qpdf_golden() {
+    let input = read("corrupt-length-marker-before-endobj.qdf");
+    let golden = read("corrupt-length-marker-before-endobj.golden.qdf");
+    let fixed = flpdf::fix_qdf(&input).expect("qpdf counts the marker before endobj");
+
+    assert_eq!(
+        fixed, golden,
+        "marker before endobj must match qpdf fix-qdf"
+    );
     assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
 }
 

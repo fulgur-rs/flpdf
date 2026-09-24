@@ -110,7 +110,11 @@ enum ObjectBody {
         /// recomputed `/Length` value (byte count between the `stream` EOL
         /// and `endstream`).
         stream_len: Option<usize>,
-        /// Number of exact marker lines between this stream's endobj and the
+        /// Byte offset immediately after qpdf's exact `endstream\n` line,
+        /// where it enters `st_after_stream`; `None` if that transition did
+        /// not occur.
+        marker_scan_start: Option<usize>,
+        /// Number of exact marker lines from `marker_scan_start` through the
         /// next top-level object. qpdf subtracts once per line.
         ignore_newline_count: usize,
     },
@@ -779,14 +783,20 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
                         // qpdf's st_after_stream state does not inspect the
                         // dictionary's /Length entry. Holder selection is
                         // derived from the next top-level object after parsing.
+                        let marker_scan_start = input
+                            .get(endstream_kw_abs..)
+                            .and_then(|tail| tail.strip_prefix(b"endstream\n"))
+                            .map(|_| endstream_kw_abs + b"endstream\n".len());
                         ObjectBody::Plain {
                             stream_len: Some(endstream_kw_abs - content_start_abs),
+                            marker_scan_start,
                             ignore_newline_count: 0,
                         }
                     }
                 } else {
                     ObjectBody::Plain {
                         stream_len: None,
+                        marker_scan_start: None,
                         ignore_newline_count: 0,
                     }
                 };
@@ -865,21 +875,19 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     }
     let size = last_obj as usize + 1;
 
-    // qpdf remains in st_after_stream after the stream's endobj and consumes
-    // every exact marker line until it reaches the next object header. Count
-    // only bytes in that separator; marker-like bytes in the dictionary,
-    // payload, or a different inter-object region cannot affect the length.
+    // qpdf enters st_after_stream immediately after reading endstream and
+    // remains there through endobj until the next recognized object header.
+    // Start at that transition boundary so markers before endobj count too.
     for i in 0..objects.len().saturating_sub(1) {
-        let end = objects[i].end;
         let next_start = objects[i + 1].obj_line_start;
         if let ObjectBody::Plain {
             stream_len: Some(_),
+            marker_scan_start: Some(marker_scan_start),
             ignore_newline_count,
-            ..
         } = &mut objects[i].body
         {
-            let separator = &input[end..next_start];
-            *ignore_newline_count = ignore_newline_marker_count(separator);
+            *ignore_newline_count =
+                ignore_newline_marker_count(&input[*marker_scan_start..next_start]);
         }
     }
 
@@ -893,6 +901,7 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
         let ObjectBody::Plain {
             stream_len: Some(measured_len),
             ignore_newline_count,
+            ..
         } = &obj.body
         else {
             continue;
