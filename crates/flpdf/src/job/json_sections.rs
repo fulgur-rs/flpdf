@@ -113,10 +113,10 @@ fn stream_decode_level(level: DecodeLevel) -> crate::writer::DecodeLevel {
     }
 }
 
-/// Build the qpdf JSON v2 `"pages"` section.
+/// Build qpdf JSON v2 page entries in page order.
 ///
-/// Returns a [`Json`] array where each element is a JSON object with
-/// keys in alphabetical order:
+/// Each returned [`Json`] value is one page object with keys in alphabetical
+/// order:
 /// `contents`, `images`, `label`, `object`, `outlines`, `pageposfrom1`.
 ///
 /// - `label` is always `null` (placeholder; not yet populated).
@@ -130,7 +130,7 @@ pub(crate) fn build_pages_section_with_options<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     version: i32,
     decode_level: DecodeLevel,
-) -> Result<Json, ConvertError> {
+) -> Result<Vec<Json>, ConvertError> {
     let page_refs = {
         let mut page_document = crate::PageDocumentHelper::new(pdf);
         page_document.get_all_pages()?
@@ -245,7 +245,7 @@ pub(crate) fn build_pages_section_with_options<R: Read + Seek>(
         entries.push(entry?);
     }
 
-    json_array(entries)
+    Ok(entries)
 }
 
 // ── build_acroform_section ────────────────────────────────────────────────────
@@ -1376,6 +1376,7 @@ mod tests {
 
         let pages = build_pages_section_with_options(&mut pdf, 2, DecodeLevel::Generalized)
             .expect("pages with outline");
-        assert!(pages.is_array());
+        assert_eq!(pages.len(), 1);
+        assert!(pages[0].is_dictionary());
     }
 }

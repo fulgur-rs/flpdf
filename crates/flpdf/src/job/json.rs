@@ -52,6 +52,30 @@ fn emit_section(
     Ok(())
 }
 
+fn emit_pages_section<R: Read + Seek>(
+    out: &mut dyn Pipeline,
+    first: &mut bool,
+    pdf: &mut Pdf<R>,
+    version: i32,
+    decode_level: DecodeLevel,
+    keys: &[JsonKey],
+) -> Result<(), JsonOutputError> {
+    if !json_section_selected(keys, JsonKey::Pages) {
+        return Ok(());
+    }
+    // qpdf writes the key and opens the array before getAllPages, so a page
+    // traversal error leaves this prefix on stdout (`QPDFJob.cc:1030-1035`).
+    Json::write_dictionary_key(out, first, b"pages", 1)?;
+    let mut first_page = true;
+    Json::write_array_open(out, &mut first_page, 1)?;
+    for page in super::json_sections::build_pages_section_with_options(pdf, version, decode_level)?
+    {
+        Json::write_array_item(out, &mut first_page, &page, 2)?;
+    }
+    Json::write_array_close(out, first_page, 1)?;
+    Ok(())
+}
+
 /// Incrementally write a selected qpdf JSON document from the QPDFJob command
 /// boundary. Version 1 and version 2 share the section builders but differ in
 /// their object-map container (`objects`/`objectinfo` versus `qpdf`).
@@ -85,9 +109,7 @@ pub fn write_qpdf_json_selected_objects_with_options<R: Read + Seek>(
             1,
         )?;
     }
-    emit_section(out, &mut first, b"pages", keys, JsonKey::Pages, || {
-        super::json_sections::build_pages_section_with_options(pdf, version, decode_level)
-    })?;
+    emit_pages_section(out, &mut first, pdf, version, decode_level, keys)?;
     emit_section(
         out,
         &mut first,
@@ -770,6 +792,10 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "operation for dictionary attempted on object of type null: returning false for a key containment request"
+        );
+        assert_eq!(
+            stdout,
+            b"{\n  \"version\": 2,\n  \"parameters\": {\n    \"decodelevel\": \"generalized\"\n  },\n  \"pages\": ["
         );
     }
 
