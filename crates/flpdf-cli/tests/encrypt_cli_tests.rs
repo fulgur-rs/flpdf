@@ -831,6 +831,103 @@ fn top_level_show_encryption_reports_wrong_password_without_failing() {
 }
 
 #[test]
+fn top_level_show_encryption_accepts_short_v2_o_and_u_like_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    for (parameter, output_name) in [
+        (b"/O <".as_slice(), "short-owner-entry.pdf"),
+        (b"/U <".as_slice(), "short-user-entry.pdf"),
+    ] {
+        let mut bytes = std::fs::read(fixture("../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf"))
+            .expect("read V2/R3 encryption fixture");
+        blank_hex_suffix(&mut bytes, parameter, 1);
+        let input = tmp.path().join(output_name);
+        std::fs::write(&input, bytes).expect("write short V2/R3 encryption fixture");
+
+        let qpdf = ShellCommand::new("qpdf")
+            .args(["--show-encryption", "--password=user-v2"])
+            .arg(&input)
+            .output()
+            .expect("run qpdf with short V2/R3 encryption entry");
+        assert!(qpdf.status.success(), "qpdf must pad a short {parameter:?}");
+
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .env("FLPDF_PROGNAME", "qpdf")
+            .args(["--show-encryption", "--password=user-v2"])
+            .arg(&input)
+            .output()
+            .expect("run flpdf with short V2/R3 encryption entry");
+        assert_eq!(flpdf.status.code(), qpdf.status.code());
+        if cfg!(windows) {
+            assert_eq!(
+                normalize_text_newlines(&flpdf.stdout),
+                normalize_text_newlines(&qpdf.stdout)
+            );
+            assert_eq!(
+                normalize_text_newlines(&flpdf.stderr),
+                normalize_text_newlines(&qpdf.stderr)
+            );
+        } else {
+            assert_eq!(flpdf.stdout, qpdf.stdout);
+            assert_eq!(flpdf.stderr, qpdf.stderr);
+        }
+    }
+}
+
+#[test]
+fn subfilter_warning_precedes_encryption_parameter_type_error_matches_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut bytes = std::fs::read(fixture("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf"))
+        .expect("read V=4 AES encryption fixture");
+    insert_subfilter_and_corrupt_v4_type(&mut bytes);
+    let input = tmp.path().join("subfilter-bad-v.pdf");
+    std::fs::write(&input, bytes).expect("write bad V/SubFilter encryption fixture");
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-encryption", "--password=user-v4-aes"])
+        .arg(&input)
+        .output()
+        .expect("run qpdf with bad V and SubFilter");
+    assert_eq!(qpdf.status.code(), Some(2));
+    let qpdf_stderr = String::from_utf8_lossy(&qpdf.stderr);
+    let warning = qpdf_stderr
+        .find("file uses encryption SubFilters, which qpdf does not support")
+        .expect("qpdf emits the SubFilter warning");
+    let error = qpdf_stderr
+        .find("some encryption dictionary parameters are missing or the wrong type")
+        .expect("qpdf emits the required-parameter type error");
+    assert!(warning < error, "qpdf warning must precede the type error");
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--show-encryption", "--password=user-v4-aes"])
+        .arg(&input)
+        .output()
+        .expect("run flpdf with bad V and SubFilter");
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    if cfg!(windows) {
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stdout),
+            normalize_text_newlines(&qpdf.stdout)
+        );
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stderr),
+            normalize_text_newlines(&qpdf.stderr)
+        );
+    } else {
+        assert_eq!(flpdf.stdout, qpdf.stdout);
+        assert_eq!(flpdf.stderr, qpdf.stderr);
+    }
+}
+
+#[test]
 fn top_level_show_encryption_subfilter_warning_exit_matches_qpdf() {
     if !ensure_qpdf_or_skip() {
         return;
@@ -3106,6 +3203,24 @@ fn replace_fixture_token(bytes: &mut [u8], from: &[u8], to: &[u8]) {
     bytes[start..start + to.len()].copy_from_slice(to);
 }
 
+fn blank_hex_suffix(bytes: &mut [u8], parameter: &[u8], suffix_bytes: usize) {
+    let matches = bytes
+        .windows(parameter.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == parameter).then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(matches.len(), 1, "fixture has one {parameter:?} entry");
+    let value_start = matches[0] + parameter.len();
+    let value_end = value_start
+        + bytes[value_start..]
+            .iter()
+            .position(|byte| *byte == b'>')
+            .expect("PDF hex string has a closing delimiter");
+    let suffix_hex_bytes = suffix_bytes.checked_mul(2).expect("hex byte count fits");
+    assert!(value_end - value_start > suffix_hex_bytes);
+    bytes[value_end - suffix_hex_bytes..value_end].fill(b' ');
+}
+
 fn insert_subfilter_warning_into_encryption_dictionary(bytes: &mut Vec<u8>) {
     let filter = b"/Filter /Standard";
     let matches = bytes
@@ -3155,6 +3270,80 @@ fn insert_subfilter_warning_into_encryption_dictionary(bytes: &mut Vec<u8>) {
             .position(|byte| !byte.is_ascii_digit())
             .expect("startxref has a numeric offset");
     bytes.splice(value_start..value_end, xref_offset.to_string().bytes());
+}
+
+fn insert_subfilter_and_corrupt_v4_type(bytes: &mut Vec<u8>) {
+    let object_marker = b"3 0 obj\n";
+    assert_eq!(
+        bytes
+            .windows(object_marker.len())
+            .filter(|window| *window == object_marker)
+            .count(),
+        1
+    );
+    let object_start = bytes
+        .windows(object_marker.len())
+        .position(|window| window == object_marker)
+        .expect("fixture has one encryption dictionary object");
+    let filter = b"/Filter /Standard";
+    assert_eq!(
+        bytes
+            .windows(filter.len())
+            .filter(|window| *window == filter)
+            .count(),
+        1
+    );
+    let insert_at = bytes
+        .windows(filter.len())
+        .position(|window| window == filter)
+        .expect("fixture has a Standard encryption dictionary")
+        + filter.len();
+    let first_xref = bytes
+        .windows(b"xref\n".len())
+        .position(|window| window == b"xref\n")
+        .expect("fixture has a classic xref table");
+    assert!(object_start < insert_at && insert_at < first_xref);
+    assert!(
+        !bytes[insert_at..first_xref]
+            .windows(b" obj\n".len())
+            .any(|window| window == b" obj\n"),
+        "encryption dictionary is the final object before xref"
+    );
+    bytes.splice(insert_at..insert_at, b" /SubFilter /Bogus".iter().copied());
+
+    let version = b"/V 4";
+    assert_eq!(
+        bytes
+            .windows(version.len())
+            .filter(|window| *window == version)
+            .count(),
+        1
+    );
+    let version_start = bytes
+        .windows(version.len())
+        .position(|window| window == version)
+        .expect("fixture has a V=4 encryption entry");
+    bytes.splice(
+        version_start..version_start + version.len(),
+        b"/V /NotAnInt".iter().copied(),
+    );
+
+    let xref_offset = bytes
+        .windows(b"xref\n".len())
+        .position(|window| window == b"xref\n")
+        .expect("mutated fixture has an xref table");
+    let startxref_marker = b"startxref\n";
+    let startxref = bytes
+        .windows(startxref_marker.len())
+        .rposition(|window| window == startxref_marker)
+        .expect("fixture has startxref");
+    let offset_start = startxref + startxref_marker.len();
+    let offset_end = offset_start
+        + bytes[offset_start..]
+            .iter()
+            .position(|byte| !byte.is_ascii_digit())
+            .expect("startxref has a numeric xref offset");
+    bytes.splice(offset_start..offset_end, xref_offset.to_string().bytes());
 }
 
 fn replace_fixture_encrypt_dictionary_with_integer(bytes: &mut [u8]) {
