@@ -392,17 +392,17 @@ fn encode_shared_object_header(
 fn encode_shared_object_entries(
     writer: &mut BitWriter<'_>,
     t: &SharedObjectHintTable,
-) -> PipelineResult<()> {
+) -> crate::Result<()> {
     let h = &t.header;
 
-    // qpdf reads shared-object entries column-wise (per `Lin::readHSharedObject`):
+    // qpdf writes shared-object entries in columns. Its writer rejects any
+    // set signature_present flag after writing the complete second column;
+    // it never writes signature bytes. The reader accepts signature bytes
+    // after the flag column and skips 128 bits for each set flag.
     //   col 1: delta_group_length    (bits_length_delta bits × N entries)
     //   col 2: signature_present     (1 bit × N entries)
     //   col 3: nobjects_minus_one    (bits_group_object_count bits × N entries)
     //   …with a byte alignment after each column.
-    //
-    // (Signatures, when present, are inline with the signature_present
-    // column per qpdf; we never emit signatures, so this is a no-op.)
     //
     // col 1: delta_group_length
     for entry in &t.objects {
@@ -413,18 +413,25 @@ fn encode_shared_object_entries(
     }
     writer.flush()?;
 
-    // col 2: signature_present (1 bit per entry, plus 128-bit signature if set)
+    // col 2: signature_present (1 bit per entry)
     for entry in &t.objects {
         writer.write_bits(if entry.signature_present { 1 } else { 0 }, 1)?;
-        if entry.signature_present {
-            if let Some(sig) = &entry.signature {
-                for &byte in sig {
-                    writer.write_bits(byte as u64, 8)?;
-                }
-            }
-        }
     }
     writer.flush()?;
+
+    // qpdf's writer does not support signatures. It writes the complete flag
+    // column, then rejects any set flag before writing nobjects_minus_one
+    // (`QPDF_linearization.cc:1715-1745`). The reader still supports skipping
+    // signature bytes from existing input (`:374-405`).
+    if t.objects.iter().any(|entry| entry.signature_present) {
+        return Err(crate::Error::QpdfExc(crate::QpdfExc::new(
+            crate::QpdfErrorCode::DamagedPdf,
+            b"",
+            b"",
+            0,
+            b"found unexpected signature present while writing linearization data",
+        )));
+    }
 
     // col 3: nobjects_minus_one
     for entry in &t.objects {
@@ -813,8 +820,8 @@ mod tests {
         shared_object.header.bits_length_delta = 8;
         shared_object.objects = vec![SharedObjectEntry {
             length_minus_least: 1,
-            signature_present: true,
-            signature: Some([0xA5; 16]),
+            signature_present: false,
+            signature: None,
             nobjects_minus_one: 1,
         }];
         (page_offset, shared_object)
@@ -844,6 +851,26 @@ mod tests {
         assert_eq!(entry.delta_group_length, 0x2a);
         assert!(!entry.signature_present);
         assert_eq!(entry.nobjects_minus_one, 0x3c);
+    }
+
+    #[test]
+    fn shared_signature_is_rejected_like_qpdf_write_h_shared_object() {
+        let (page_offset, mut shared_object) = nonzero_tables();
+        shared_object.objects[0].signature_present = true;
+        shared_object.objects[0].signature = Some([0xA5; 16]);
+
+        let error = encode_hint_stream(&page_offset, &shared_object, None)
+            .err()
+            .expect("qpdf rejects signature-present shared-object entries");
+        let crate::Error::QpdfExc(error) = error else {
+            panic!("expected qpdf damaged-PDF error, got {error}");
+        };
+
+        assert_eq!(error.get_error_code(), crate::QpdfErrorCode::DamagedPdf);
+        assert_eq!(
+            error.get_message_detail(),
+            b"found unexpected signature present while writing linearization data"
+        );
     }
 
     #[test]
