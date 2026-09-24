@@ -36,12 +36,15 @@
 //!   its `st_after_stream` state takes the next positional `N 0 obj` as the
 //!   holder and rewrites that object's next line, regardless of the `/Length`
 //!   value, generation, or presence;
-//! * a tail that is EITHER a single classic `xref` table with one `0 N`
+//! * canonical QDF uses either a classic `xref` table with one `0 N`
 //!   subsection, followed by a `trailer` dictionary, `startxref`, and
 //!   `%%EOF`, OR a cross-reference stream (`/Type /XRef`) object folding the
 //!   trailer keys into its own dictionary — `qpdf --qdf
 //!   --object-streams=generate` emits the latter form, complete with
-//!   `/Type /ObjStm` container objects, so both are canonical QDF.
+//!   `/Type /ObjStm` container objects. In a hand-edited file, `st_after_stream`
+//!   can pass through a classic tail to find a positional holder; after
+//!   rewriting that holder, qpdf resumes `st_top` and may process more objects
+//!   and a later classic xref/trailer before it enters `st_done`.
 //!
 //! An object whose dictionary has `/Type /ObjStm` is a QDF-expanded object
 //! stream: its `stream`...`endstream` payload is a stale offset table
@@ -645,15 +648,12 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     // ---- 1. Parse all `N G obj` spans, from the start of the file. ------
     // Unlike the classic-only version, we do NOT pre-locate a tail `xref`
     // keyword to bound this scan: a cross-reference-stream-form file has no
-    // such keyword at all, and qpdf itself never looks for one up front
-    // either — it discovers the file's tail shape (classic `xref` line vs.
-    // an object whose dict is `/Type /XRef`) while walking objects in file
-    // order. We do the same: scan until `find_next_obj` finds no more
-    // `N G obj` lines (the classic tail — `xref`/`trailer` text never
-    // matches that pattern), or until an object classifies as a
-    // cross-reference stream, which is always the last real content in a
-    // valid file (everything after its `stream` keyword is ignored) so we
-    // stop there immediately.
+    // such keyword, and qpdf discovers the tail while walking objects. Match
+    // its state here: st_top stops at an exact classic `xref` line, while
+    // st_after_stream passes through xref/trailer/EOF text until it finds the
+    // positional holder. Parsing that holder returns to st_top, which can
+    // continue through later objects and a second classic tail. A recognized
+    // `/Type /XRef` object remains terminal.
     let mut objects: Vec<ObjectSpan> = Vec::new();
     // Whether the last-scanned object is a cross-reference stream — set
     // alongside the `break` below, and reused as-is after the loop instead
@@ -663,7 +663,21 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     // ObjStm member is encountered, before the next object body is processed.
     let mut last_obj: u32 = 0;
     let mut cursor = 0usize;
-    while let Some((num, gen, line_start, kw_end)) = find_next_obj(input, cursor, true) {
+    let mut scan_after_stream = false;
+    let mut resumed_after_tail = false;
+    while let Some((num, gen, line_start, kw_end)) =
+        find_next_obj(input, cursor, !scan_after_stream)
+    {
+        // qpdf st_top recognizes the exact classic-xref line. st_after_stream
+        // does not: it keeps copying tail text until the next object header,
+        // whose body is the positional length holder. Once that holder has
+        // been parsed, st_top resumes and may encounter another xref/trailer.
+        if scan_after_stream
+            && !resumed_after_tail
+            && find_qpdf_xref_line_from(&input[..line_start], cursor).is_some()
+        {
+            resumed_after_tail = true;
+        }
         last_obj = check_sequential(num, last_obj, line_start)?;
         let body_start = kw_end + 1;
         let previous_stream_enters_after_stream = objects.last().is_some_and(|previous| {
@@ -837,6 +851,14 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
             }
         }
 
+        scan_after_stream = matches!(
+            &body,
+            ObjectBody::Plain {
+                stream_len: Some(_),
+                marker_scan_start: Some(_),
+                ..
+            }
+        );
         is_xref_stream_form = matches!(body, ObjectBody::XRefStream { .. });
         objects.push(ObjectSpan {
             num,
@@ -930,42 +952,9 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
             integer_end,
         ));
     }
-
-    // If the final ordinary stream had no positional successor before the
-    // classic xref, qpdf is still in `st_after_stream`: it ignores the xref,
-    // trailer, and EOF lines and keeps scanning for the next exact object
-    // header. A header found there is checked against the same object-number
-    // counter and its immediate body line is the positional holder.
-    let post_tail_length_body = match objects.last() {
-        Some(last) => match &last.body {
-            ObjectBody::Plain {
-                stream_len: Some(measured_len),
-                marker_scan_start: Some(marker_scan_start),
-                ..
-            } => match find_next_obj(input, last.end, false) {
-                Some((num, _, header_start, kw_end)) => {
-                    last_obj = check_sequential(num, last_obj, header_start)?;
-                    let body_start = kw_end + 1;
-                    let (integer_start, integer_end) =
-                        qpdf_bare_integer_line_range_at(input, body_start)
-                            .ok_or_else(|| Error::parse(body_start, "fix_qdf: expected integer"))?;
-                    let ignored_newlines =
-                        ignore_newline_marker_count(&input[*marker_scan_start..header_start]);
-                    Some((
-                        measured_len.saturating_sub(ignored_newlines),
-                        integer_start,
-                        integer_end,
-                    ))
-                }
-                None => None,
-            },
-            _ => None,
-        },
-        None => None,
-    };
-
     // `last_obj` was checked in the same scan order as qpdf's `checkObjId`
-    // for top-level headers, object-stream members, and any post-tail holder.
+    // for top-level headers and object-stream members, including objects found
+    // after a post-tail positional holder.
     let size = last_obj as usize + 1;
 
     // ---- 3. Emit the rewritten body, substituting length-holder bodies,
@@ -1075,8 +1064,8 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
 
     // If the final recognized object is an ordinary stream, qpdf remains in
     // st_after_stream until a positional holder is found, even when the
-    // holder occurs after the xref/trailer/EOF text. The tail itself is never
-    // regenerated on this path.
+    // holder occurs after xref/trailer/EOF text. With no holder, qpdf just
+    // copies the remaining bytes and never regenerates a tail.
     if matches!(
         objects.last().map(|object| &object.body),
         Some(ObjectBody::Plain {
@@ -1085,14 +1074,7 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
         })
     ) {
         let last_end = objects.last().unwrap().end;
-        if let Some((new_len, integer_start, integer_end)) = post_tail_length_body {
-            out.extend_from_slice(&input[last_end..integer_start]);
-            out.extend_from_slice(new_len.to_string().as_bytes());
-            out.push(b'\n');
-            out.extend_from_slice(&input[integer_end..]);
-        } else {
-            out.extend_from_slice(&input[last_end..]);
-        }
+        out.extend_from_slice(&input[last_end..]);
         return Ok(out);
     }
 
@@ -1108,7 +1090,16 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     // stream body containing a stray line-anchored `xref` earlier in the
     // file can never be mistaken for the real table.
     let last_end = objects.last().map_or(first_obj_start, |object| object.end);
-    let xref_pos = find_qpdf_xref_line_from(input, last_end)
+    let recognized_xref = find_qpdf_xref_line_from(input, last_end);
+    // After a post-tail holder, st_top may reach EOF without seeing another
+    // xref. In that case qpdf preserves the original tail and all resumed
+    // objects verbatim; it only regenerates a tail when a later exact xref
+    // line is encountered.
+    if resumed_after_tail && recognized_xref.is_none() {
+        out.extend_from_slice(&input[last_end..]);
+        return Ok(out);
+    }
+    let xref_pos = recognized_xref
         // Preserve the existing diagnostic path for malformed tails that do
         // not contain qpdf's exact transition line; a real `xref\n` always
         // wins over any earlier xref-prefixed text line.
@@ -1161,16 +1152,13 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
 
     // Finally, the literal `%%EOF` marker — validated present in the input
     // (fail loud on a malformed tail), but emitted as qpdf's own literal
-    // `"%%EOF\n"` rather than copied from input. qpdf's `st_in_trailer`
-    // writes this same fixed string the moment the trailer's closing `>>\n`
-    // is seen and immediately enters `st_done` (`qpdf/fix-qdf.cc:284-287`),
-    // which then ignores every remaining input line rather than echoing it
-    // (`qpdf/fix-qdf.cc:288-290`) — so nothing after the ORIGINAL `%%EOF`,
-    // including a syntactically valid trailing `N G obj ... endobj` block,
-    // is ever copied through. Confirmed against the live oracle: feeding it
-    // a classic-tail QDF with such a block appended after `%%EOF` reproduces
-    // this file's own regenerated tail byte-for-byte and drops the block
-    // entirely (see `corrupt-trailing-garbage` fixture).
+    // `"%%EOF\n"` rather than copied from input. On this st_top tail path,
+    // qpdf's `st_in_trailer` writes the fixed marker when the trailer closes
+    // and enters `st_done` (`qpdf/fix-qdf.cc:284-290`), so later bytes are
+    // dropped. If an earlier xref was passed in st_after_stream, this is the
+    // later tail reached after holder resumption; the earlier tail remains
+    // verbatim. A classic-tail QDF with no preceding stream holder still drops
+    // an object appended after its EOF (see `corrupt-trailing-garbage`).
     find_subslice(&input[startxref_kw..], b"%%EOF")
         .ok_or_else(|| Error::parse(startxref_kw, "fix_qdf: no `%%EOF` marker"))?;
     out.extend_from_slice(b"%%EOF\n");

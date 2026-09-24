@@ -723,6 +723,9 @@ fn cell_d_qdf_fix_matches_empty_and_post_xref_holder_goldens() {
         "corrupt-decoy-xref-after-last-object",
         "corrupt-length-holder-after-xref",
         "corrupt-length-holder-after-xref-marker",
+        "corrupt-length-holder-after-xref-next-object",
+        "corrupt-length-holder-after-xref-second-xref",
+        "corrupt-length-holder-after-xref-next-stream",
     ] {
         let input = fixture("qdf-fix").join(format!("{case}.qdf"));
         let expected = fixture("qdf-fix").join(format!("{case}.golden.qdf"));
@@ -755,4 +758,39 @@ fn cell_d_qdf_fix_matches_empty_and_post_xref_holder_goldens() {
             "qdf-fix CLI must be idempotent for {case}"
         );
     }
+}
+
+#[test]
+fn qdf_fix_rejects_a_nonsequential_object_after_a_post_tail_holder() {
+    let mut input =
+        std::fs::read(fixture("qdf-fix").join("corrupt-length-holder-after-xref.qdf")).unwrap();
+    input.extend_from_slice(b"9 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let input_path = tmp.path().join("wrong-object.qdf");
+    let output_path = tmp.path().join("fixed.qdf");
+    std::fs::write(&input_path, input).unwrap();
+
+    let result = flpdf()
+        .args([
+            "qdf-fix",
+            input_path.to_str().unwrap(),
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run qdf-fix on a nonsequential post-tail object");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(
+        result.status.code(),
+        Some(2),
+        "qdf-fix must reject object 9 after holder object 3; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("non-sequential object numbering"),
+        "unexpected qdf-fix error: {stderr}"
+    );
+    assert!(
+        !output_path.exists(),
+        "qdf-fix must not create output after the resumed scan fails"
+    );
 }

@@ -54,8 +54,12 @@ const OBJSTM_CASES: &[&str] = &[
 ///   syntactically valid `N G obj ... endobj` block appended *after* the
 ///   original `%%EOF`. The oracle's `st_top`/`st_at_xref`/.../`st_done`
 ///   state machine can never re-enter object recognition once the tail
-///   `xref` line is seen, so this trailing block is discarded entirely
-///   (not copied through, not treated as an object).
+///   `xref` line is seen on this fixture (the preceding object is not a
+///   stream awaiting a positional holder), so this trailing block is discarded
+///   entirely (not copied through, not treated as an object). A holder after a
+///   stream keeps qpdf in `st_after_stream` across the earlier tail; after that
+///   holder is rewritten, `st_top` can recognize later objects and another
+///   xref (covered by the post-tail continuation fixtures).
 /// * `corrupt-nested-type-xref` — a regular stream whose dictionary has a
 ///   nested sub-dictionary containing `/Type /XRef`. The oracle's
 ///   `line.find("/Type /XRef") != line.npos` check is a plain per-line
@@ -102,6 +106,9 @@ const POSITIONAL_LENGTH_CASES: &[&str] = &[
     "corrupt-length-marker-before-endobj",
     "corrupt-length-holder-after-xref",
     "corrupt-length-holder-after-xref-marker",
+    "corrupt-length-holder-after-xref-next-object",
+    "corrupt-length-holder-after-xref-second-xref",
+    "corrupt-length-holder-after-xref-next-stream",
 ];
 
 /// A QDF with an empty indirect-object table and a direct trailer root.
@@ -188,6 +195,24 @@ fn empty_object_table_without_a_recognized_xref_is_rejected() {
         "an empty object table without qpdf's exact xref line is malformed: {message}"
     );
     assert!(message.contains("no objects found before xref"));
+}
+
+#[test]
+fn resumed_post_tail_scan_rejects_a_nonsequential_object_number() {
+    let mut input = read("corrupt-length-holder-after-xref.qdf");
+    input.extend_from_slice(b"9 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let err = flpdf::fix_qdf(&input)
+        .expect_err("qpdf resumes st_top after rewriting the post-tail holder");
+    let message = err.to_string();
+    assert!(
+        matches!(err, flpdf::Error::Parse { .. }),
+        "the resumed object-number check must be a parse error: {message}"
+    );
+    assert!(
+        message.contains("non-sequential object numbering"),
+        "unexpected resumed object-number error: {message}"
+    );
 }
 
 /// `fix_qdf(fix_qdf(x)) == fix_qdf(x)` for every corrupted input.
