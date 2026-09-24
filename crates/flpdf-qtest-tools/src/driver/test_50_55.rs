@@ -72,8 +72,9 @@ pub(crate) fn run_test_50<R: Read + Seek>(
     // owns the same receiver/value resolution boundary and returns the raw
     // dictionary keys, so the driver only performs the qpdf consumer's byte
     // output step here.
-    let resource_names = d1.get_resource_names()?;
+    let qpdf_flush_result_61 = d1.get_resource_names();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let resource_names = qpdf_flush_result_61?;
     for name in resource_names {
         stdout.write_all(&name)?;
         stdout.write_all(b"\n")?;
@@ -131,8 +132,9 @@ pub(crate) fn run_test_51<R: Read + Seek>(
         if utf8 == b"r1" {
             writeln!(stdout, "setting r1 via parent")?;
             let mut foh = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
-            foh.set_value(ObjectHandle::name(b"2".to_vec()), true)?;
+            let qpdf_flush_result_62 = foh.set_value(ObjectHandle::name(b"2".to_vec()), true);
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+            qpdf_flush_result_62?;
         } else if utf8 == b"r2" {
             writeln!(stdout, "setting r2 via child")?;
             let kids = field.try_get_key(b"/Kids");
@@ -142,21 +144,24 @@ pub(crate) fn run_test_51<R: Read + Seek>(
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             let kid = kid?;
             let mut foh = FormFieldObjectHelper::from_object_handle(kid, pdf);
-            foh.set_value(ObjectHandle::name(b"3".to_vec()), true)?;
+            let qpdf_flush_result_63 = foh.set_value(ObjectHandle::name(b"3".to_vec()), true);
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+            qpdf_flush_result_63?;
         } else if utf8 == b"checkbox1" {
             writeln!(stdout, "turning checkbox1 on")?;
             // The value that eventually gets set is based on what's allowed
             // in /N and may not match this value (matches qpdf's own comment:
             // setV maps any non-/Off name to "checked").
             let mut foh = FormFieldObjectHelper::from_object_handle(field, pdf);
-            foh.set_value(ObjectHandle::name(b"Sure".to_vec()), true)?;
+            let qpdf_flush_result_64 = foh.set_value(ObjectHandle::name(b"Sure".to_vec()), true);
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+            qpdf_flush_result_64?;
         } else if utf8 == b"checkbox2" {
             writeln!(stdout, "turning checkbox2 off")?;
             let mut foh = FormFieldObjectHelper::from_object_handle(field, pdf);
-            foh.set_value(ObjectHandle::name(b"Off".to_vec()), true)?;
+            let qpdf_flush_result_65 = foh.set_value(ObjectHandle::name(b"Off".to_vec()), true);
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+            qpdf_flush_result_65?;
         }
     }
 
@@ -235,8 +240,9 @@ pub(crate) fn run_test_52<R: Read + Seek>(
             // `value.isString()` branch.)
             let value = ObjectHandle::string(os_str_diagnostic_bytes(arg2).into_owned());
             let mut foh = FormFieldObjectHelper::from_object_handle(field, pdf);
-            foh.set_value(value, true)?;
+            let qpdf_flush_result_66 = foh.set_value(value, true);
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+            qpdf_flush_result_66?;
         }
     }
 
@@ -262,8 +268,10 @@ pub(crate) fn run_test_53<R: Read + Seek>(
     // an indirect object identity.
     let root = pdf.root_handle()?;
 
-    let new_object = pdf.make_indirect_object_handle(ObjectHandle::string(b"potato".to_vec()))?;
+    let qpdf_flush_result_67 =
+        pdf.make_indirect_object_handle(ObjectHandle::string(b"potato".to_vec()));
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let new_object = qpdf_flush_result_67?;
     stdout.write_all(b"new object: ")?;
     stdout.write_all(&new_object.unparse())?;
     stdout.write_all(b"\n")?;
@@ -328,8 +336,9 @@ pub(crate) fn run_test_55<R: Read + Seek>(
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let mut helper = PageDocumentHelper::new(pdf);
-    let pages = helper.get_all_pages()?;
+    let qpdf_flush_result_68 = helper.get_all_pages();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let pages = qpdf_flush_result_68?;
     // qpdf constructs the array before the loop and appends both
     // `getFormXObjectForPage()` and `getFormXObjectForPage(false)` for each
     // page (`qpdf/test_driver.cc:2056-2064`). The canonical page helper owns

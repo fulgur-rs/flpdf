@@ -1708,7 +1708,7 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "pub(crate) fn run_test_74",
     );
     assert!(
-        test_73.contains("pages_seed.try_unparse_resolved()?")
+        test_73.contains("pages_seed.try_unparse_resolved()")
             && !test_73.contains("resolve_once(")
             && !test_73.contains(".unparse_resolved()"),
         "test 73 must let unparseResolved own /Pages resolution without a Pdf::resolve bridge"
@@ -1787,11 +1787,11 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "pub(crate) fn run_test_39",
     );
     assert!(
-        test_38.contains("pdf.root_handle()?")
-            && test_38.contains("try_get_key(b\"/QTest\")?")
-            && test_38.contains("try_get_array_n_items()?")
+        test_38.contains("pdf.root_handle()")
+            && test_38.contains("try_get_key(b\"/QTest\")")
+            && test_38.contains("try_get_array_n_items()")
             && test_38.contains("try_get_array_item(")
-            && test_38.contains("try_unparse_resolved()?")
+            && test_38.contains("try_unparse_resolved()")
             && test_38.matches("emit_new_diagnostics(").count() >= 5
             && !test_38.contains("root_handle(pdf")
             && !test_38.contains("resolved_key(")
@@ -2100,6 +2100,51 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             "test 85 retains the qpdf-less local route {old_route}"
         );
     }
+}
+
+#[test]
+fn qtest_driver_flushes_diagnostics_before_result_propagation() {
+    let driver_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/driver");
+    let mut source_paths: Vec<_> = fs::read_dir(&driver_dir)
+        .expect("read qtest driver sources")
+        .map(|entry| entry.expect("read qtest driver directory entry").path())
+        .filter(|path| {
+            path.extension().and_then(|extension| extension.to_str()) == Some("rs")
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("test_"))
+        })
+        .collect();
+    source_paths.sort();
+
+    let mut violations = Vec::new();
+    for path in source_paths {
+        let source = fs::read_to_string(&path).expect("read qtest driver source");
+        let lines: Vec<_> = source.lines().collect();
+        for (line_index, line) in lines.iter().enumerate() {
+            if !line.trim_start().starts_with("emit_new_diagnostics(") {
+                continue;
+            }
+            let previous = lines[..line_index]
+                .iter()
+                .rev()
+                .find(|line| !line.trim().is_empty());
+            if previous.is_some_and(|line| line.trim_end().ends_with("?;")) {
+                violations.push(format!(
+                    "{}:{}",
+                    path.file_name().unwrap().to_string_lossy(),
+                    line_index + 1
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "qtest callsites must flush pending qpdf warnings before propagating errors; {} sites remain: {:?}",
+        violations.len(),
+        violations.iter().take(12).collect::<Vec<_>>()
+    );
 }
 
 fn test_driver_fixture_dir() -> std::path::PathBuf {

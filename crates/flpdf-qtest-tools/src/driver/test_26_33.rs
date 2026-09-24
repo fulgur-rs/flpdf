@@ -137,8 +137,10 @@ pub(crate) fn run_test_26<R: Read + Seek>(
         let o3_ref = o3
             .object_ref()
             .expect("/O3 is a page, always an indirect object");
-        PageDocumentHelper::new(pdf).add_page(PageInput::foreign(&mut oldpdf, o3_ref), false)?;
+        let qpdf_flush_result_13 =
+            PageDocumentHelper::new(pdf).add_page(PageInput::foreign(&mut oldpdf, o3_ref), false);
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        qpdf_flush_result_13?;
 
         // qpdf replaces the live trailer key with the result of its canonical
         // foreign graph copy (`test_driver.cc:993`). `Pdf::trailer()` is the
@@ -417,8 +419,9 @@ pub(crate) fn run_test_30<R: Read + Seek>(
         .into_iter()
         .next()
         .ok_or_else(|| flpdf::Error::System("pdf has no pages".to_string()))?;
-    let orig_contents = page_contents(pdf, orig_page)?;
+    let qpdf_flush_result_14 = page_contents(pdf, orig_page);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let orig_contents = qpdf_flush_result_14?;
     let new_page = PageDocumentHelper::new(&mut final_pdf)
         .get_all_pages()?
         .into_iter()
