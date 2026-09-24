@@ -71,9 +71,10 @@
 //!    (until the count reaches zero). If the next recognized line is `N 0 obj`,
 //!    its following line must consist only of decimal digits plus LF; qpdf
 //!    replaces that line with the measured length and does not look up
-//!    `/Length M G R`. If no such header occurs before the tail, qpdf remains
-//!    in `st_after_stream` and copies the remaining xref/trailer bytes without
-//!    regenerating them. No EOL normalization is performed.
+//!    `/Length M G R`. The state does not change on `xref`, `trailer`,
+//!    `startxref`, or `%%EOF`; a positional holder after those lines is still
+//!    recognized. If no holder appears before the input ends, qpdf copies the
+//!    remaining tail without regenerating it. No EOL normalization is performed.
 //! 2. **xref offsets** — each in-use object's 10-digit offset is the byte
 //!    offset of the start of its `N G obj` line in the *rewritten* output.
 //! 3. **trailer `/Size`** — object count + 1 (equivalently the highest object
@@ -180,17 +181,16 @@ struct ObjectSpan {
 /// Find the next qpdf `N 0 obj\n` line at `from`, scanning line by line.
 /// Returns `(num, gen, line_start, content_after_obj_kw)`.
 ///
-/// Stops (returns `None`) upon the first top-level `xref` keyword line,
-/// without considering any further lines. This mirrors qpdf's own `st_top`
-/// dispatch (`qpdf/fix-qdf.cc:126-134`): `N G obj` object recognition and
-/// the classic tail's `xref` keyword compete on the SAME per-line scan, and
-/// once `xref\n` is seen the state machine (`st_at_xref` → ... → `st_done`)
-/// can never re-enter object recognition — `st_done` ignores every
-/// remaining line rather than echoing it. So nothing past the real tail
-/// `xref` line — including a syntactically valid `N G obj ... endobj` block
-/// appended after the original `%%EOF` — is ever reinterpreted as an
-/// object, and this scan must not continue past it either.
-fn find_next_obj(input: &[u8], from: usize) -> Option<(u32, u32, usize, usize)> {
+/// `stop_at_xref` selects qpdf's current state. In `st_top`, the exact
+/// `xref\n` line wins over further object recognition and enters the tail
+/// states (`qpdf/fix-qdf.cc:126-134`). In `st_after_stream`, xref/trailer/EOF
+/// lines do not change state, so the scanner must continue looking for the
+/// positional holder (`qpdf/fix-qdf.cc:246-255`).
+fn find_next_obj(
+    input: &[u8],
+    from: usize,
+    stop_at_xref: bool,
+) -> Option<(u32, u32, usize, usize)> {
     let mut line_start = from;
     while line_start < input.len() {
         let line_end = memchr_nl(input, line_start).unwrap_or(input.len());
@@ -200,7 +200,7 @@ fn find_next_obj(input: &[u8], from: usize) -> Option<(u32, u32, usize, usize)> 
                 return Some((num, gen, line_start, line_start + kw_end));
             }
         }
-        if is_xref_keyword_line(input, line_start) {
+        if stop_at_xref && is_xref_keyword_line(input, line_start) {
             return None;
         }
         line_start = line_end + 1;
@@ -663,7 +663,7 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     // ObjStm member is encountered, before the next object body is processed.
     let mut last_obj: u32 = 0;
     let mut cursor = 0usize;
-    while let Some((num, gen, line_start, kw_end)) = find_next_obj(input, cursor) {
+    while let Some((num, gen, line_start, kw_end)) = find_next_obj(input, cursor, true) {
         last_obj = check_sequential(num, last_obj, line_start)?;
         let body_start = kw_end + 1;
         let previous_stream_enters_after_stream = objects.last().is_some_and(|previous| {
@@ -883,10 +883,6 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     }
     // qpdf-deviation-end
 
-    // `last_obj` was checked in the same scan order as qpdf's `checkObjId`
-    // for top-level headers and each encountered object-stream member.
-    let size = last_obj as usize + 1;
-
     // qpdf enters st_after_stream immediately after reading endstream and
     // remains there through endobj until the next recognized object header.
     // Start at that transition boundary so markers before endobj count too.
@@ -934,6 +930,43 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
             integer_end,
         ));
     }
+
+    // If the final ordinary stream had no positional successor before the
+    // classic xref, qpdf is still in `st_after_stream`: it ignores the xref,
+    // trailer, and EOF lines and keeps scanning for the next exact object
+    // header. A header found there is checked against the same object-number
+    // counter and its immediate body line is the positional holder.
+    let post_tail_length_body = match objects.last() {
+        Some(last) => match &last.body {
+            ObjectBody::Plain {
+                stream_len: Some(measured_len),
+                marker_scan_start: Some(marker_scan_start),
+                ..
+            } => match find_next_obj(input, last.end, false) {
+                Some((num, _, header_start, kw_end)) => {
+                    last_obj = check_sequential(num, last_obj, header_start)?;
+                    let body_start = kw_end + 1;
+                    let (integer_start, integer_end) =
+                        qpdf_bare_integer_line_range_at(input, body_start)
+                            .ok_or_else(|| Error::parse(body_start, "fix_qdf: expected integer"))?;
+                    let ignored_newlines =
+                        ignore_newline_marker_count(&input[*marker_scan_start..header_start]);
+                    Some((
+                        measured_len.saturating_sub(ignored_newlines),
+                        integer_start,
+                        integer_end,
+                    ))
+                }
+                None => None,
+            },
+            _ => None,
+        },
+        None => None,
+    };
+
+    // `last_obj` was checked in the same scan order as qpdf's `checkObjId`
+    // for top-level headers, object-stream members, and any post-tail holder.
+    let size = last_obj as usize + 1;
 
     // ---- 3. Emit the rewritten body, substituting length-holder bodies,
     //         object-stream/xref-stream bodies, and recording each
@@ -1040,10 +1073,10 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
         }
     }
 
-    // If the final recognized object is an ordinary stream, qpdf never saw a
-    // positional N 0 obj after it and therefore never returned from
-    // st_after_stream to st_top. Earlier holders have already been rewritten;
-    // the rest of the input, including the xref/trailer tail, is copied raw.
+    // If the final recognized object is an ordinary stream, qpdf remains in
+    // st_after_stream until a positional holder is found, even when the
+    // holder occurs after the xref/trailer/EOF text. The tail itself is never
+    // regenerated on this path.
     if matches!(
         objects.last().map(|object| &object.body),
         Some(ObjectBody::Plain {
@@ -1052,7 +1085,14 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
         })
     ) {
         let last_end = objects.last().unwrap().end;
-        out.extend_from_slice(&input[last_end..]);
+        if let Some((new_len, integer_start, integer_end)) = post_tail_length_body {
+            out.extend_from_slice(&input[last_end..integer_start]);
+            out.extend_from_slice(new_len.to_string().as_bytes());
+            out.push(b'\n');
+            out.extend_from_slice(&input[integer_end..]);
+        } else {
+            out.extend_from_slice(&input[last_end..]);
+        }
         return Ok(out);
     }
 

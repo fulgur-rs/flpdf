@@ -716,11 +716,13 @@ fn cell_d_fix_qdf_is_noop_and_idempotent_on_clean() {
 }
 
 #[test]
-fn cell_d_qdf_fix_rebuilds_empty_and_decoy_xref_tables() {
+fn cell_d_qdf_fix_matches_empty_and_post_xref_holder_goldens() {
     for case in [
         "empty-qdf-direct-root",
         "empty-qdf-decoy-xref-line",
         "corrupt-decoy-xref-after-last-object",
+        "corrupt-length-holder-after-xref",
+        "corrupt-length-holder-after-xref-marker",
     ] {
         let input = fixture("qdf-fix").join(format!("{case}.qdf"));
         let expected = fixture("qdf-fix").join(format!("{case}.golden.qdf"));

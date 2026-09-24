@@ -100,6 +100,8 @@ const POSITIONAL_LENGTH_CASES: &[&str] = &[
     "corrupt-length-position-markers",
     "corrupt-length-position-no-successor",
     "corrupt-length-marker-before-endobj",
+    "corrupt-length-holder-after-xref",
+    "corrupt-length-holder-after-xref-marker",
 ];
 
 /// A QDF with an empty indirect-object table and a direct trailer root.
@@ -1196,6 +1198,52 @@ fn no_positional_successor_leaves_qpdf_tail_processing_in_st_after_stream() {
         "partial st_after_stream output must match qpdf"
     );
     assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
+}
+
+#[test]
+fn post_xref_noninteger_holder_is_still_checked_while_in_st_after_stream() {
+    let mut input = read("corrupt-length-holder-after-xref.qdf");
+    let original = b"3 0 obj\n999\n";
+    let replacement = b"3 0 obj\nnot-integer\n";
+    let position = find(&input, original).expect("post-xref positional holder");
+    input.splice(
+        position..position + original.len(),
+        replacement.iter().copied(),
+    );
+
+    let err = match flpdf::fix_qdf(&input) {
+        Ok(_) => panic!("qdf-fix must reject a non-integer post-xref positional holder"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, flpdf::Error::Parse { .. }),
+        "a post-xref holder must remain subject to qpdf's integer-line check: {err}"
+    );
+    assert!(err.to_string().contains("expected integer"));
+}
+
+#[test]
+fn post_xref_object_number_is_checked_before_its_holder_body() {
+    let mut input = read("corrupt-length-holder-after-xref.qdf");
+    let original = b"3 0 obj\n999\n";
+    let replacement = b"4 0 obj\nnot-integer\n";
+    let position = find(&input, original).expect("post-xref positional holder");
+    input.splice(
+        position..position + original.len(),
+        replacement.iter().copied(),
+    );
+
+    let err = match flpdf::fix_qdf(&input) {
+        Ok(_) => panic!("qdf-fix must reject an out-of-sequence post-xref object"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, flpdf::Error::Parse { .. }),
+        "an out-of-sequence post-xref header must be rejected: {err}"
+    );
+    let message = err.to_string();
+    assert!(message.contains("non-sequential object numbering"));
+    assert!(!message.contains("expected integer"));
 }
 
 #[test]
