@@ -826,6 +826,32 @@ mod tests {
     }
 
     #[test]
+    fn json_v1_object_maps_use_unparse_keys_for_object_zero() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/xref-default-object-zero-in-objstm.pdf");
+        let mut pdf = Pdf::open(BufReader::new(File::open(fixture).unwrap())).unwrap();
+        let mut output = Vec::new();
+
+        write_json_with_version_with_logger(
+            &mut pdf,
+            1,
+            false,
+            false,
+            false,
+            stream_options(JsonStreamData::None, None),
+            JsonJobOutput::Stdout(&mut output),
+            &QPDFLogger::create(),
+        )
+        .expect("json v1 object maps should be written with warnings");
+
+        let output = String::from_utf8(output).expect("JSON output should be UTF-8");
+        assert_eq!(output.matches("\"null\": null,").count(), 1);
+        assert_eq!(output.matches("\"null\": {").count(), 1);
+        assert!(!output.contains("\"0 0 R\": null,"));
+        assert!(!output.contains("\"0 0 R\": {"));
+    }
+
+    #[test]
     fn job_json_v1_selectors_skip_unselected_objects_but_keep_the_trailer() {
         let mut pdf = Pdf::open(BufReader::new(File::open(fixture()).unwrap())).unwrap();
         let mut bytes = Vec::new();

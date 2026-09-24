@@ -58,9 +58,11 @@ pub(crate) fn parse_object_selectors(
 /// Write qpdf JSON v1's top-level `objects` map into an already-open document.
 ///
 /// qpdf writes object references in object-number order and appends the
-/// trailer after the indirect objects (`QPDFJob.cc:958-980`). Object values
-/// are delegated to `QPDFObjectHandle::writeJSON(1, ..., true)` so names,
-/// strings, and stream dictionaries retain the v1 encoding.
+/// trailer after the indirect objects (`QPDFJob.cc:958-980`). It uses each
+/// handle's `unparse()` for the map key, so the direct null object zero is
+/// keyed by `null` instead of a projected `0 0 R`. Object values are delegated
+/// to `QPDFObjectHandle::writeJSON(1, ..., true)` so names, strings, and stream
+/// dictionaries retain the v1 encoding.
 pub(crate) fn write_json_v1_objects_key<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     out: &mut dyn Pipeline,
@@ -76,8 +78,8 @@ pub(crate) fn write_json_v1_objects_key<R: Read + Seek>(
         if !object_selected(&wanted_objects, object_gen, false) {
             continue;
         }
-        let key = format!("{} {} R", object_gen.get_obj(), object_gen.get_gen());
-        Json::write_dictionary_key(out, &mut object_first, key.as_bytes(), 2)?;
+        let key = handle.unparse();
+        Json::write_dictionary_key(out, &mut object_first, &key, 2)?;
         handle.write_json(1, out, true, 2)?;
     }
     if trailer_selected(&wanted_objects, false) {
@@ -127,8 +129,8 @@ pub(crate) fn write_json_v1_objectinfo_key<R: Read + Seek>(
             (false, ObjectHandle::null(), ObjectHandle::null())
         };
 
-        let key = format!("{} {} R", object_gen.get_obj(), object_gen.get_gen());
-        Json::write_dictionary_key(out, &mut object_first, key.as_bytes(), 2)?;
+        let key = handle.unparse();
+        Json::write_dictionary_key(out, &mut object_first, &key, 2)?;
         let mut details_first = true;
         Json::write_dictionary_open(out, &mut details_first, 2)?;
         Json::write_dictionary_key(out, &mut details_first, b"stream", 3)?;
