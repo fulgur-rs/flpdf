@@ -292,11 +292,14 @@ pub(crate) const QPDF_JSON_VERSION: i32 = 2;
 
 // ── ConvertError ──────────────────────────────────────────────────────────────
 
-/// Errors that can occur when converting PDF objects to JSON values.
+/// Errors that can occur while constructing or serializing qpdf JSON output.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConvertError {
     /// A non-finite float (NaN or infinity) was encountered.
     NonFiniteFloat,
+    /// A qpdf exception that the command boundary renders without a JSON or
+    /// PDF conversion prefix.
+    QpdfExc(crate::QpdfExc),
     /// An underlying PDF read/parse error.
     PdfError(String),
     /// A shared JSON value could not be mutated as the requested container.
@@ -309,6 +312,7 @@ impl std::fmt::Display for ConvertError {
             ConvertError::NonFiniteFloat => {
                 write!(f, "non-finite float cannot be serialized as JSON")
             }
+            ConvertError::QpdfExc(error) => std::fmt::Display::fmt(error, f),
             ConvertError::PdfError(msg) => write!(f, "PDF error: {msg}"),
             ConvertError::JsonError(msg) => write!(f, "JSON error: {msg}"),
         }
@@ -319,7 +323,10 @@ impl std::error::Error for ConvertError {}
 
 impl From<crate::Error> for ConvertError {
     fn from(err: crate::Error) -> Self {
-        ConvertError::PdfError(err.to_string())
+        match err {
+            crate::Error::QpdfExc(error) => ConvertError::QpdfExc(error),
+            error => ConvertError::PdfError(error.to_string()),
+        }
     }
 }
 
@@ -394,6 +401,7 @@ pub(crate) fn side_file_io_error(
 impl From<JsonOutputError> for crate::Error {
     fn from(error: JsonOutputError) -> Self {
         match error {
+            JsonOutputError::Convert(ConvertError::QpdfExc(error)) => crate::Error::QpdfExc(error),
             JsonOutputError::Convert(error) => crate::Error::System(error.to_string()),
             JsonOutputError::Pipeline(error) => crate::Error::from(error),
             JsonOutputError::ObjectSelector(message) => crate::Error::System(message),
@@ -524,6 +532,21 @@ mod tests {
             JsonOutputError::Convert(ConvertError::PdfError(message))
                 if message.contains("only version 1 or 2")
         ));
+    }
+
+    #[test]
+    fn qpdf_exception_json_error_round_trip_retains_raw_what_bytes() {
+        let original = crate::QpdfExc::new(
+            crate::QpdfErrorCode::Object,
+            b"",
+            b"",
+            0,
+            b"raw qpdf error \xff",
+        );
+        let convert_error = ConvertError::from(crate::Error::QpdfExc(original.clone()));
+        let output_error: crate::Error = JsonOutputError::Convert(convert_error).into();
+
+        assert_eq!(output_error.raw_message(), Some(original.what_bytes()));
     }
 
     #[test]
