@@ -624,11 +624,12 @@ fn check_sequential(num: u32, last: u32, err_offset: usize) -> Result<u32> {
 ///   compressed-object entry), so this combination cannot arise from
 ///   genuine QDF input.
 /// * [`Error::Parse`] if the input does not look like a QDF file (no `xref`
-///   table or cross-reference stream, malformed trailer, an indirect
-///   `/Length` whose holder object is missing, an object stream with no
-///   `%% Object stream: object N` marker lines, or object numbers — spanning
-///   both top-level objects and object stream members — that are not
-///   contiguous `1..N` in file order).
+///   table or cross-reference stream, malformed trailer, a positional length
+///   holder whose first body line is not a bare integer, an object stream
+///   with no `%% Object stream: object N` marker lines, or object numbers —
+///   spanning both top-level objects and object stream members — that are not
+///   contiguous `1..N` in file order). A declared indirect `/Length M G R`
+///   is never inspected, so a missing holder object is not an error.
 pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     // ---- 1. Parse all `N G obj` spans, from the start of the file. ------
     // Unlike the classic-only version, we do NOT pre-locate a tail `xref`
