@@ -175,6 +175,19 @@ fn empty_qdf_uses_the_recognized_xref_after_a_decoy_line() {
     );
 }
 
+#[test]
+fn empty_object_table_without_a_recognized_xref_is_rejected() {
+    let input = b"%PDF-1.7\n%QDF-1.0\n\nxref decoy, not the classic table\n";
+    let err = flpdf::fix_qdf(input).unwrap_err();
+    let message = err.to_string();
+
+    assert!(
+        matches!(&err, flpdf::Error::Parse { .. }),
+        "an empty object table without qpdf's exact xref line is malformed: {message}"
+    );
+    assert!(message.contains("no objects found before xref"));
+}
+
 /// `fix_qdf(fix_qdf(x)) == fix_qdf(x)` for every corrupted input.
 #[test]
 fn idempotent() {
