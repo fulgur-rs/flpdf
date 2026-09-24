@@ -19,6 +19,8 @@ const MINI_NONDICT_KID_INPUT: &[u8] =
     include_bytes!("../../../tests/fixtures/pclm/mini-pclm-nondict-kid-in.pdf");
 const MINI_NONDICT_PAGE_INPUT: &[u8] =
     include_bytes!("../../../tests/fixtures/pclm/mini-pclm-nondict-page-in.pdf");
+const MINI_TYPE_PAGE_KIDS_INPUT: &[u8] =
+    include_bytes!("../../../tests/fixtures/pclm/mini-pclm-type-page-kids-in.pdf");
 
 fn write_pclm(
     input: &[u8],
@@ -178,5 +180,17 @@ fn pclm_non_dictionary_page_leaf_matches_qpdf_11_9() {
         &actual,
         include_bytes!("../../../tests/fixtures/pclm/mini-pclm-nondict-page-out.pdf"),
         "PCLm non-dictionary page leaf",
+    );
+}
+
+/// `/Kids` determines subtree membership even when the dictionary says
+/// `/Type /Page`; qpdf repairs it to `/Pages` and seeds PCLm from its children.
+#[test]
+fn pclm_page_typed_kid_with_kids_matches_qpdf_11_9() {
+    let actual = write_pclm(MINI_TYPE_PAGE_KIDS_INPUT, |_| {});
+    assert_matches_golden(
+        &actual,
+        include_bytes!("../../../tests/fixtures/pclm/mini-pclm-type-page-kids-out.pdf"),
+        "PCLm /Type /Page subtree",
     );
 }

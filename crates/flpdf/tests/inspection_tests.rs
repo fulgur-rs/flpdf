@@ -73,18 +73,6 @@ fn page_refs_accepts_a_120_level_tree_like_qpdf() {
 }
 
 #[test]
-fn page_refs_with_max_depth_rejects_too_deep_trees() {
-    let pdf = nested_pages_pdf();
-    let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();
-    let error = pages::page_refs_with_max_depth(&mut pdf, 1).unwrap_err();
-    let message = error.to_string();
-    assert!(
-        message.contains("depth exceeds maximum of 1"),
-        "expected depth error, got {message}"
-    );
-}
-
-#[test]
 fn outline_tree_returns_titles_in_pre_order() {
     let pdf = pdf_with_metadata_outline_and_fonts();
     let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();

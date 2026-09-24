@@ -86,3 +86,7 @@ done
 
 "$workdir/oracle" "$here/mini-pclm-nondict-page-in.pdf" \
     "$here/mini-pclm-nondict-page-out.pdf" pclm
+
+# A dictionary labeled /Page that also has /Kids is a /Pages subtree to qpdf.
+"$workdir/oracle" "$here/mini-pclm-type-page-kids-in.pdf" \
+    "$here/mini-pclm-type-page-kids-out.pdf" pclm

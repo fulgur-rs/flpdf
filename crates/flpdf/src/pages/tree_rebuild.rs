@@ -76,7 +76,10 @@
 
 use crate::object_handle::ObjectHandleIdentity;
 use crate::pages::{
-    repair::{prepare_for_optimization, prepare_for_optimization_with_max_depth, PageTreeRoot},
+    repair::{
+        prepare_for_optimization, prepare_for_optimization_with_max_depth, PageTreeRoot,
+        PreparedPages,
+    },
     resolve_inherited_handle_with_max_depth,
 };
 use crate::qpdf_obj_gen::QpdfObjGen;
@@ -659,6 +662,20 @@ fn rebuild_page_tree_canonical<R: Read + Seek>(
         leaf.replace_key(b"/Parent", root.clone())?;
     }
 
+    // qpdf's insertPage/removePage mutate `m->all_pages` in step with `/Kids`
+    // (`QPDF_pages.cc:225-250,260-276`). A duplicate hook can reenter the
+    // page-list route after the early invalidation above and cache the old
+    // tree; replace that snapshot with the completed selection in qpdf order.
+    pdf.invalidate_page_list_cache();
+    let final_pages = PreparedPages {
+        root: page_root,
+        pages: new_kids
+            .iter()
+            .map(|object_ref| pdf.get_object_handle(*object_ref))
+            .collect(),
+    };
+    pdf.cache_page_list(&final_pages);
+
     // A removed page is an original leaf that no selection kept (absent from
     // `ref_map`). New refs minted for duplicate selections are fresh object
     // numbers, never original leaves, so they are correctly excluded.
@@ -942,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_invalidates_the_cached_page_list() {
+    fn rebuild_updates_the_cached_page_list_to_the_final_tree() {
         let mut pdf = open(build_nested_pdf());
         let before = crate::PageDocumentHelper::new(&mut pdf)
             .get_all_pages()
@@ -962,6 +979,27 @@ mod tests {
             .get_all_pages()
             .expect("page list after rebuild");
         assert_eq!(after, vec![ObjectRef::new(5, 0)]);
+    }
+
+    #[test]
+    fn rebuild_replaces_a_page_cache_repopulated_during_duplicate_callback() {
+        let mut pdf = open(build_nested_pdf());
+        let page = ObjectRef::new(4, 0);
+        let mut reenter_page_list = |pdf: &mut Pdf<Cursor<Vec<u8>>>, _, _| {
+            let _ = crate::PageDocumentHelper::new(pdf).get_all_pages()?;
+            Ok(())
+        };
+
+        let rebuilt =
+            rebuild_page_tree_with_duplicate_hook(&mut pdf, &[page, page], &mut reenter_page_list)
+                .expect("rebuild duplicate page occurrences");
+
+        let cached = pdf
+            .cached_page_list()
+            .expect("qpdf retains its current non-empty page cache")
+            .page_refs()
+            .expect("cached page identities");
+        assert_eq!(cached, rebuilt.new_kids);
     }
 
     #[allow(

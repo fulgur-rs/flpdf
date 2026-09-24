@@ -734,9 +734,11 @@ walk, `PageDocumentHelper` consumers reuse it across JSON sections, and
 (`QPDF_pages.cc:141-150`; `QPDF.hh:671-704`).
 
 `flpdf-ymuj.6.38` extends that existing cache to the linearization and ObjStm
-planning consumers. `pages::page_refs` returns the prepared non-empty sequence
-when the cache is valid; an unprepared document and qpdf's empty
-`m->all_pages` sentinel retain the bounded `PageWalk` fallback. When the
+planning consumers. `pages::page_refs` returns the prepared sequence when the
+cache is valid; on a cache miss it delegates to
+`PageDocumentHelper::get_all_pages` and the same `pages::repair` route. qpdf's
+empty `m->all_pages` sentinel therefore triggers another canonical preparation,
+with no separate page-tree walker. When the
 linearization content-normalization probe is active, it first obtains the page
 sequence through the same `initializeSpecialStreams`-ordered preparation;
 writer-side QDF/decode triggers already seed the cache in
@@ -748,9 +750,10 @@ optimization, linearization, and tree-rebuild consumers now retain the prepared
 `ObjectHandle` sequence rather than re-projecting and re-looking up each page;
 the public `pages::page_refs` / `PageDocumentHelper::get_all_pages` surfaces
 still expose their owned `Vec<ObjectRef>` contract. No second page-tree
-traversal is performed, and
-`update_all_pages_cache`/tree-rebuild/page-splice invalidation remains authoritative
-(`QPDF_pages.cc:39-75,141-150`).
+traversal is performed. `update_all_pages_cache` forces regeneration as qpdf's
+`updateAllPagesCache` does; `rebuild_page_tree` publishes the final prepared list
+after rewriting `/Kids`; page-splice invalidates the list and the next read
+prepares it again (`QPDF_pages.cc:39-75,141-150,225-250`).
 
 `QPDF::removePage` first delegates membership lookup to `findPage`, which
 flattens the page tree and throws a `qpdf_e_pages` `QPDFExc` for a non-member
@@ -1658,9 +1661,9 @@ warning-producing accessor chainを実行する。classic trailer handleにも
 linearization の空ページツリーでは、qpdf の `getAllPages`（`QPDF_pages.cc:39-150`）と
 `QPDF_optimization` の inherited-attribute walk（`QPDF_optimization.cc:57-245`）が、
 null `/Pages` に対する `hasKey`、`getKeys`、`getKey("/Kids")`、配列長取得を行う。
-flpdf は `PageWalk` と `optimization/inherited_attrs.rs` の canonical
-`try_*` accessorsで同じ連鎖を発生させ、linearization planの事前 page-cache境界も
-`initializeSpecialStreams` 相当の順序に揃えた。
+flpdf は `PageDocumentHelper::get_all_pages` / `pages::repair` と
+`optimization/inherited_attrs.rs` の canonical `try_*` accessorsで同じ連鎖を発生させ、
+linearization planの事前 page-cache境界も `initializeSpecialStreams` 相当の順序に揃えた。
 
 Pinned qpdf 11.9.0（`3b97c9bd266b7c32ea36d3536e22dab77412886d`）の live probeでは、
 `invalid-id-xref.pdf` の `--static-id` が qpdf/flpdf とも exit 3、1012 bytes、stderr
@@ -4965,72 +4968,63 @@ closed by `flpdf-3yn9.48.160` (see the next section): `pages::page_refs`
 dropped a `/Kids` leaf that is not a dictionary, while `QPDF::getAllPages`
 keeps it, so qpdf wrote such a leaf as the first PCLm object and flpdf did not.
 
-### `page_refs` classifies a `/Kids` leaf the way qpdf does (`flpdf-3yn9.48.160`, 2026-09-18)
+### `page_refs` uses qpdf's repaired page list (`flpdf-wg1na`, 2026-09-24)
 
-`QPDF::getAllPagesInternal` decides whether a kid is an interior node or a
-leaf page with `kid.hasKey("/Kids")` (`libqpdf/QPDF_pages.cc:100-103`), and
-`QPDF::getAllPages` enters that recursion only for a `/Pages` root that
-reports `/Kids` (`libqpdf/QPDF_pages.cc:69-71`). `pages::PageWalk` — the
-non-repairing walk `pages::page_refs` uses when the prepared page cache is
-empty — dispatched on `/Type` instead, so it dropped a non-dictionary leaf and
-classified a `/Pages` root labelled `/Type /Page` as a page of its own. Both
-now follow qpdf's `/Kids` dispatch. A non-dictionary leaf is returned
-unchanged, which is byte-exact because every repair the leaf arm attempts (the
-`/MediaBox` default and the `/Type` override) is an "ignoring key replacement
-request" no-op on a non-dictionary receiver
-(`libqpdf/QPDFObjectHandle.cc:1199-1208`).
+`QPDF::getAllPages` owns the page cache and root correction, then enters
+`getAllPagesInternal` only when the effective `/Pages` root has `/Kids`
+(`QPDF_pages.cc:39-75`). The recursive walk classifies each child by
+`kid.hasKey("/Kids")`, descends immediately in child order, and repairs each
+leaf in qpdf's order: inherited/default `/MediaBox`, direct promotion, duplicate
+shallow copy, `/Type /Page`, then append (`QPDF_pages.cc:77-138`).
+`QPDFPageDocumentHelper::getAllPages` is a thin wrapper over that public list
+(`QPDFPageDocumentHelper.cc:13-18`).
 
-Observed against qpdf 11.9.0: `tests/fixtures/pclm/mini-pclm-nondict-page-*`
-pins the complete PCLm output (`1 0 obj\n42\nendobj` first, 1117 bytes) and a
-second scenario — `tests/fixtures/compat/three-page.pdf` with its first page
-replaced by an integer — is byte-identical through the same route. A
-CLI sweep over the same input (plain write, `--qdf`, `--linearize`,
-`--object-streams=generate|disable`, `--decode-level=all`,
-`--normalize-content`, `--flatten-annotations`,
-`--remove-unreferenced-resources`, `--pages`, `--split-pages`,
-`--overlay`, `--underlay`, `--json-output`, `rewrite`, `--check`,
-`--show-npages`, `--json-key=pages`) produces identical output bytes, stdout,
-stderr and exit codes before and after: those consumers reach the page list
-through `PageDocumentHelper::get_all_pages` / `pages::repair`, which already
-implemented qpdf's leaf dispatch and its repairs.
+`pages::page_refs` now returns its valid prepared cache or delegates a cache miss
+to `PageDocumentHelper::get_all_pages` and the existing live-handle
+`pages::repair` route. The partial public `PageWalk` and
+`page_refs_with_max_depth` APIs were removed; qpdf has no corresponding iterator
+or caller-selected page-list depth bound, and no production caller depended on
+them.
 
-The one CLI-observable change is a diagnostic, on the multi-source `--pages`
-merge (`--empty --pages in.pdf 1-z --` and `--collate`), which reads its
-source page list through `page_refs` directly. qpdf writes both outputs with
-warnings (exit 3); flpdf rejected them before this change and still does
-(exit 2, no output), but the message moved from `--pages: merge produced 1
-pages for 2 selected pages` — the count mismatch left by dropping the leaf —
-to `object 3 0 R is not a page dictionary or Form XObject`, raised by the
-page-copy step now that the list is qpdf-correct. Closing that one belongs to
-the page-copy path, which has to tolerate a non-dictionary page the way
-`QPDFPageDocumentHelper::addPage` does.
+`rebuild_page_tree` also publishes its final prepared cache after rewriting the
+root. Its duplicate callback can re-enter AcroForm analysis, which may enumerate
+and cache the old tree after the rebuild's initial invalidation; qpdf's
+`insertPage` instead updates `m->all_pages` in step with each `/Kids` insertion
+(`QPDF_pages.cc:225-250`). The regression
+`rebuild_replaces_a_page_cache_repopulated_during_duplicate_callback` pins the
+final cache, and `qpdf_job_in_place_page_job_copies_repeated_page_annotations`
+checks the caller result.
 
-Three page-tree classification divergences remain open, all of them cases
-where qpdf's leaf arm performs a repair that actually lands on a dictionary
-and that `PageWalk` does not perform at all (`pages::repair` does). Measured
-against qpdf 11.9.0 on purpose-built fixtures. Two of the originally listed
-gaps are closed: an indirect kid without `/Kids` is now pushed as a
-`PageNode::Leaf` (`crates/flpdf/src/pages.rs`) and a direct kid is promoted
-with `make_indirect_object_handle` before it is yielded, both byte-gated
-against qpdf-generated PCLm goldens (`mini-pclm-nondict-kid-*` for a direct
-kid, `mini-pclm-nondict-page-*` for an indirect one).
+The four malformed page-tree fixtures were probed with qpdf 11.9.0
+`--show-pages` and a temporary Rust probe of both `pages::page_refs` and
+`PageDocumentHelper::get_all_pages`:
 
-What remains is the **dictionary** dispatch, which still keys on `/Type`:
-a dictionary kid with neither `/Type` nor `/Kids` is a page for qpdf (which
-also writes `/Type /Page` into it) and is dropped here; a dictionary kid
-carrying both `/Type /Page` and `/Kids` is an interior node for qpdf (which
-rewrites its `/Type` to `/Pages`) and is returned as a page here. A repeated
-non-dictionary leaf is also lost, because `PageWalk`'s `seen` set is shared
-between interior nodes and leaves while qpdf shallow-copies a duplicate page.
-Closing these means giving `page_refs` qpdf's repairing walk, which is the
-`pages::repair` / `PageWalk` consolidation, not a change to the dispatch.
+| Input | qpdf 11.9.0 | Before this cutover | Current `page_refs` |
+|---|---|---|---|
+| `/Type /Page` dictionary with `/Kids [4 0 R]` | page `4 0 R`; repairs parent `/Type` to `/Pages` | returned parent `3 0 R` | page `4 0 R`, with repair warning |
+| Dictionary leaf without `/Type` or `/Kids` | page `3 0 R`; repairs `/Type /Page` and default `/MediaBox` when needed | returned `3 0 R` without leaf repair | page `3 0 R`, with qpdf repairs and warnings |
+| Duplicate indirect integer leaf `[3 0 R 3 0 R]` | pages `3 0 R`, `4 0 R`; shallow-copies second occurrence | returned only `3 0 R` | pages `3 0 R`, `4 0 R` |
+| Direct subtree with scalar `42`, followed by direct scalar `43` | promotes in DFS order: pages `3 0 R`, `4 0 R` | promoted sibling first: pages `4 0 R`, `3 0 R` | pages `3 0 R`, `4 0 R` |
 
-The writer and `--check` routes already reach the full leaf arm through
-`pages::repair`: measured on a non-dictionary kid fixture, qpdf 11.9.0 and
-flpdf both emit the same six warnings in the same order (key-containment,
-key-retrieval, `MediaBox is undefined`, `ignoring key replacement request`,
-`/Type key should be /Page but is not`, `ignoring key replacement request`).
-The diagnostic gap is specific to the non-repair `PageWalk` route.
+The Catalog boundary was also probed. When `/Pages` is absent, qpdf exits 3
+with one containment warning and an empty page list; `page_refs` now does the
+same. A direct `/Pages null` produces qpdf's type error and exit 2; `page_refs`
+now propagates the same `QpdfExc` from the canonical route. The existing
+`PageDocumentHelper` route matched qpdf for both cases before the cutover.
+
+The writer and `--check` routes already used `pages::repair`; this change brings
+the cache-miss `page_refs` consumers onto that same owner route. A non-dictionary
+leaf remains in the qpdf page list and is repaired with qpdf's warning sequence.
+The later multi-source page-copy rejection for a scalar leaf remains a separate
+page-copy responsibility (`object 3 0 R is not a page dictionary or Form
+XObject`); this enumeration change does not resolve that caller behavior.
+
+The old `PageWalk` also suppressed type errors from contextless programmatic
+handles. qpdf's `QPDFObjectHandle::warn` throws when there is no owning `QPDF`
+(`QPDFObjectHandle.cc:2170-2197,2386-2394`), so that suppression had no qpdf
+counterpart and was removed with the walker. The nested direct-child ordering
+from `flpdf-f59bf` is covered by the same resumable `pages::repair` frame; its
+PageWalk-specific depth guard no longer has a public entry point.
 
 ### PCLm Generate setup membership (`flpdf-xom94`, 2026-09-18)
 
