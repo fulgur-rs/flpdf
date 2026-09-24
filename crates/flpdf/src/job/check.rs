@@ -1868,6 +1868,59 @@ mod tests {
     }
 
     #[test]
+    fn job_check_defers_default_object_zero_warning_until_xref_resolution() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        let mut pdf = job
+            .open(
+                Cursor::new(include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/compat/xref-default-object-zero-in-objstm.pdf"
+                ))),
+                "xref-default-object-zero-in-objstm.pdf",
+                PdfOpenOptions::default(),
+            )
+            .expect("the synthetic xref/ObjStm fixture should open");
+
+        assert_eq!(
+            job.check(&mut pdf)
+                .expect("malformed Catalog and /Pages are warnings"),
+            JobExitCode::Warning
+        );
+        let output = String::from_utf8(output.lock().expect("capture output").clone())
+            .expect("check output should be UTF-8");
+        let catalog_warning = output
+            .find("catalog /Type entry missing or invalid")
+            .expect("Catalog warning is present");
+        let pages_warning = output
+            .find("object 2 0: operation for dictionary attempted on object of type null")
+            .expect("/Pages warning is present");
+        let object_zero_warning = output
+            .find("object 0/0 has unexpected xref entry type")
+            .expect("default object-zero xref warning is present");
+
+        assert!(catalog_warning < pages_warning);
+        assert!(
+            pages_warning < object_zero_warning,
+            "object 0 must be warned when the xref walk reaches its default row:\n{output}"
+        );
+        assert_eq!(
+            output
+                .matches("catalog /Type entry missing or invalid")
+                .count(),
+            1
+        );
+        assert_eq!(
+            output
+                .matches("object 0/0 has unexpected xref entry type")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn document_check_reports_extension_level_and_linearization_warning() {
         let output = Arc::new(Mutex::new(Vec::new()));
         let logger = logger_with_capture(Arc::clone(&output));
