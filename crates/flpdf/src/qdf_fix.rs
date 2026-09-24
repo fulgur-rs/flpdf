@@ -26,6 +26,10 @@
 //! * object numbers are contiguous, numbered `1..N` in file order — qpdf's
 //!   `fix-qdf` requires this (it aborts on the first out-of-sequence object)
 //!   and [`fix_qdf`] rejects non-sequential numbering the same way;
+//! * a classic `xref\n` line may be reached before any indirect object when
+//!   the trailer `/Root` is direct; qpdf still emits subsection `0 1` with
+//!   only the free object-0 row and rewrites trailer `/Size` to `1`, while
+//!   preserving the direct root (`fix-qdf.cc:130,265-287`);
 //! * qpdf's QDF writer emits a real stream's `/Length` as an indirect
 //!   `/Length M 0 R` and puts a synthetic integer object immediately after the
 //!   stream. qpdf's `fix-qdf` tool does not read that dictionary key, though:
@@ -851,10 +855,6 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
         cursor = end;
     }
 
-    if objects.is_empty() {
-        return Err(Error::parse(0, "fix_qdf: no objects found before xref"));
-    }
-
     // qpdf-deviation-start: qpdf's fix-qdf st_at_xref state has no check for
     // this combination -- it unconditionally calls QPDFXRefEntry::getOffset()
     // on every xref entry, which throws std::logic_error for the type-2
@@ -941,8 +941,13 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     //         object stream member's compressed-entry position). ---------
     let mut out: Vec<u8> = Vec::with_capacity(input.len() + 16);
     // Everything before the first object is the header (%PDF / binary marker /
-    // %QDF / blank lines) — copied verbatim.
-    let first_obj_start = objects[0].obj_line_start;
+    // %QDF / blank lines) — copied verbatim. If there are no objects, qpdf
+    // echoes this prefix through the xref line before entering st_at_xref.
+    let first_obj_start = match objects.first() {
+        Some(first) => first.obj_line_start,
+        None => find_qpdf_xref_line_from(input, 0)
+            .ok_or_else(|| Error::parse(0, "fix_qdf: no objects found before xref"))?,
+    };
     out.extend_from_slice(&input[..first_obj_start]);
 
     // New byte offset of each object number (by index in `objects`) — used
@@ -1057,12 +1062,17 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     // vector in order. Object numbering was validated as `1..N` in file order, so
     // `new_offsets` is already in ascending object-number order.
     // Locate the real tail `xref` keyword — the FIRST line-anchored match
-    // strictly after the last object's end. Restricting the search to this
+    // at or after the last object's end (or the empty-file prefix boundary).
+    // Restricting the search to this
     // region (rather than scanning the whole input) means a decompressed
     // stream body containing a stray line-anchored `xref` earlier in the
     // file can never be mistaken for the real table.
-    let last_end = objects.last().unwrap().end;
-    let xref_pos = find_line_keyword_from(input, b"xref", last_end)
+    let last_end = objects.last().map_or(first_obj_start, |object| object.end);
+    let xref_pos = find_qpdf_xref_line_from(input, last_end)
+        // Preserve the existing diagnostic path for malformed tails that do
+        // not contain qpdf's exact transition line; a real `xref\n` always
+        // wins over any earlier xref-prefixed text line.
+        .or_else(|| find_line_keyword_from(input, b"xref", last_end))
         .ok_or_else(|| Error::parse(last_end, "fix_qdf: no classic `xref` table found"))?;
 
     // Copy bytes between the last object's end and the `xref` keyword
@@ -1146,6 +1156,20 @@ fn find_line_keyword_from(input: &[u8], kw: &[u8], from: usize) -> Option<usize>
             }
         }
         i += 1;
+    }
+    None
+}
+
+/// Find the next exact `xref\n` line, using qpdf's `st_top` recognition rule.
+/// `from` is either the input start or the byte immediately after an object
+/// terminator, so it is always a line boundary.
+fn find_qpdf_xref_line_from(input: &[u8], from: usize) -> Option<usize> {
+    let mut line_start = from;
+    while line_start < input.len() {
+        if is_xref_keyword_line(input, line_start) {
+            return Some(line_start);
+        }
+        line_start = memchr_nl(input, line_start)?.checked_add(1)?;
     }
     None
 }

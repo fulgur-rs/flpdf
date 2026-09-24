@@ -81,6 +81,9 @@ const OBJSTM_CASES: &[&str] = &[
 ///   text and object recognition continues past it (confirmed against the
 ///   live oracle: the second object is still found and included in the
 ///   regenerated table).
+/// * `corrupt-decoy-xref-after-last-object` — the same unrecognized line
+///   after the last object; qpdf preserves it and locates only the exact
+///   `xref\n` line that enters `st_at_xref`.
 const SCANNER_EDGE_CASES: &[&str] = &[
     "corrupt-xref-truncated",
     "corrupt-trailing-garbage",
@@ -88,6 +91,7 @@ const SCANNER_EDGE_CASES: &[&str] = &[
     "corrupt-comment-type-xref",
     "corrupt-string-type-xref",
     "corrupt-decoy-xref-line",
+    "corrupt-decoy-xref-after-last-object",
 ];
 
 /// Ordinary-stream holder cases for qpdf's positional state transition.
@@ -97,6 +101,9 @@ const POSITIONAL_LENGTH_CASES: &[&str] = &[
     "corrupt-length-position-no-successor",
     "corrupt-length-marker-before-endobj",
 ];
+
+/// A QDF with an empty indirect-object table and a direct trailer root.
+const EMPTY_QDF_CASES: &[&str] = &["empty-qdf-direct-root", "empty-qdf-decoy-xref-line"];
 
 /// Each corrupted fixture, fixed by `flpdf::fix_qdf`, must equal the committed
 /// oracle golden byte-for-byte.
@@ -113,6 +120,7 @@ fn matches_oracle_golden_byte_for_byte() {
     .chain(OBJSTM_CASES.iter().copied())
     .chain(SCANNER_EDGE_CASES.iter().copied())
     .chain(POSITIONAL_LENGTH_CASES.iter().copied())
+    .chain(EMPTY_QDF_CASES.iter().copied())
     {
         let input = read(&format!("{case}.qdf"));
         let golden = read(&format!("{case}.golden.qdf"));
@@ -137,11 +145,34 @@ fn no_op_on_clean_qdf() {
         "one-page-clean.qdf",
         "minimal-clean.qdf",
         "objstm-clean.qdf",
+        "empty-qdf-direct-root.qdf",
     ] {
         let data = read(clean);
         let got = flpdf::fix_qdf(&data).unwrap();
         assert_eq!(got, data, "{clean}: fix_qdf should be a no-op on clean QDF");
     }
+}
+
+#[test]
+fn empty_qdf_direct_root_matches_qpdf_golden_and_is_a_no_op() {
+    let input = read("empty-qdf-direct-root.qdf");
+    let golden = read("empty-qdf-direct-root.golden.qdf");
+    let fixed = flpdf::fix_qdf(&input).expect("qpdf accepts a QDF with no indirect objects");
+
+    assert_eq!(fixed, golden, "empty QDF output must match qpdf fix-qdf");
+    assert_eq!(fixed, input, "qpdf fix-qdf is a no-op on this empty QDF");
+}
+
+#[test]
+fn empty_qdf_uses_the_recognized_xref_after_a_decoy_line() {
+    let input = read("empty-qdf-decoy-xref-line.qdf");
+    let golden = read("empty-qdf-decoy-xref-line.golden.qdf");
+    let fixed = flpdf::fix_qdf(&input).expect("qpdf accepts the xref decoy as top-level text");
+
+    assert_eq!(
+        fixed, golden,
+        "the empty-table prefix must end at qpdf's exact xref line"
+    );
 }
 
 /// `fix_qdf(fix_qdf(x)) == fix_qdf(x)` for every corrupted input.
@@ -158,6 +189,7 @@ fn idempotent() {
     .chain(OBJSTM_CASES.iter().copied())
     .chain(SCANNER_EDGE_CASES.iter().copied())
     .chain(POSITIONAL_LENGTH_CASES.iter().copied())
+    .chain(EMPTY_QDF_CASES.iter().copied())
     {
         let input = read(&format!("{case}.qdf"));
         let once = flpdf::fix_qdf(&input).unwrap();
@@ -223,10 +255,12 @@ fn committed_goldens_still_match_live_oracle() {
         "corrupt-size",
         "corrupt-startxref",
         "corrupt-combo",
+        "corrupt-decoy-xref-after-last-object",
     ]
     .into_iter()
     .chain(OBJSTM_CASES.iter().copied())
     .chain(POSITIONAL_LENGTH_CASES.iter().copied())
+    .chain(EMPTY_QDF_CASES.iter().copied())
     {
         use std::io::Write;
         let input = read(&format!("{case}.qdf"));
