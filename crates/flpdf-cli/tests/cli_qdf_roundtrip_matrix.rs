@@ -549,7 +549,7 @@ fn run_fix_cell(corrupt_name: &str, surviving_bytes: &[u8]) {
 
 #[test]
 fn cell_b_fix_stale_length_holder() {
-    // Holder object 12's body was hand-edited 90 -> 7. qdf-fix must
+    // Holder object 8's body was hand-edited 89 -> 7. qdf-fix must
     // recompute it. The page-3 stream text is a stable surviving marker.
     run_fix_cell("three-page-stale-length.qdf", b"(Fixture page 3) Tj");
 }
