@@ -632,11 +632,10 @@ fn check_sequential(num: u32, last: u32, err_offset: usize) -> Result<u32> {
 /// # Errors
 ///
 /// * [`Error::Unsupported`] if an object stream (`/Type /ObjStm`) is present
-///   in a file whose tail is a classic `xref` table rather than a
-///   cross-reference stream — real `qpdf --qdf` always pairs object streams
-///   with a cross-reference stream (a classic table cannot represent a
-///   compressed-object entry), so this combination cannot arise from
-///   genuine QDF input.
+///   in classic-xref form. After a positional holder resumes `st_top`, a scan
+///   that reaches EOF without another exact `xref\n` preserves the previous
+///   tail and does not report this error: qpdf never enters `st_at_xref` in
+///   that path.
 /// * [`Error::Parse`] if the input does not look like a QDF file (no `xref`
 ///   table or cross-reference stream, malformed trailer, a positional length
 ///   holder whose first body line is not a bare integer, an object stream
@@ -918,13 +917,27 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
         cursor = end;
     }
 
+    // Find the xref that follows the last scanned object before applying the
+    // classic-xref ObjStm refusal. A resumed st_top scan that reaches EOF
+    // without another exact xref never enters qpdf's st_at_xref state.
+    let first_obj_start = match objects.first() {
+        Some(first) => first.obj_line_start,
+        None => find_qpdf_xref_line_from(input, 0)
+            .ok_or_else(|| Error::parse(0, "fix_qdf: no objects found before xref"))?,
+    };
+    let last_end = objects.last().map_or(first_obj_start, |object| object.end);
+    let recognized_xref = find_qpdf_xref_line_from(input, last_end);
+    let resumed_scan_ends_without_xref = resumed_after_tail && recognized_xref.is_none();
+
     // qpdf-deviation-start: qpdf's fix-qdf st_at_xref state has no check for
     // this combination -- it unconditionally calls QPDFXRefEntry::getOffset()
     // on every xref entry, which throws std::logic_error for the type-2
     // entries an object stream's members produce, so real qpdf crashes via
     // an uncaught exception here instead of detecting and rejecting the
-    // input; flpdf instead proactively rejects it.
-    if !is_xref_stream_form
+    // input; flpdf instead proactively rejects it. Do not take this branch
+    // for the resumed EOF path above, where qpdf never reaches st_at_xref.
+    if !resumed_scan_ends_without_xref
+        && !is_xref_stream_form
         && objects
             .iter()
             .any(|o| matches!(o.body, ObjectBody::ObjStm { .. }))
@@ -1006,11 +1019,6 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     // Everything before the first object is the header (%PDF / binary marker /
     // %QDF / blank lines) — copied verbatim. If there are no objects, qpdf
     // echoes this prefix through the xref line before entering st_at_xref.
-    let first_obj_start = match objects.first() {
-        Some(first) => first.obj_line_start,
-        None => find_qpdf_xref_line_from(input, 0)
-            .ok_or_else(|| Error::parse(0, "fix_qdf: no objects found before xref"))?,
-    };
     out.extend_from_slice(&input[..first_obj_start]);
 
     // New byte offset of each object number (by index in `objects`) — used
@@ -1124,19 +1132,11 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     // the free-list head, then one in-use entry per object by iterating its xref
     // vector in order. Object numbering was validated as `1..N` in file order, so
     // `new_offsets` is already in ascending object-number order.
-    // Locate the real tail `xref` keyword — the FIRST line-anchored match
-    // at or after the last object's end (or the empty-file prefix boundary).
-    // Restricting the search to this
-    // region (rather than scanning the whole input) means a decompressed
-    // stream body containing a stray line-anchored `xref` earlier in the
-    // file can never be mistaken for the real table.
-    let last_end = objects.last().map_or(first_obj_start, |object| object.end);
-    let recognized_xref = find_qpdf_xref_line_from(input, last_end);
     // After a post-tail holder, st_top may reach EOF without seeing another
     // xref. In that case qpdf preserves the original tail and all resumed
     // objects verbatim; it only regenerates a tail when a later exact xref
     // line is encountered.
-    if resumed_after_tail && recognized_xref.is_none() {
+    if resumed_scan_ends_without_xref {
         out.extend_from_slice(&input[last_end..]);
         return Ok(out);
     }
