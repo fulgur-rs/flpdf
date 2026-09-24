@@ -215,6 +215,29 @@ fn resumed_post_tail_scan_rejects_a_nonsequential_object_number() {
     );
 }
 
+#[test]
+fn post_tail_holder_truncated_before_endobj_is_still_rewritten() {
+    // qpdf's `st_in_length` consumes only the holder's integer line and
+    // returns to `st_top` (`fix-qdf.cc:255-263`), so it never looks for the
+    // holder's `endobj`. Live `fix-qdf` exits 0 on this input.
+    let complete = read("corrupt-length-holder-after-xref.qdf");
+    let terminator = b"endobj\n";
+    let cut = complete
+        .windows(terminator.len())
+        .rposition(|window| window == terminator)
+        .expect("the fixture ends with the holder's endobj");
+    let truncated = complete[..cut].to_vec();
+
+    let fixed = flpdf::fix_qdf(&truncated)
+        .expect("a post-tail holder without endobj is still a length holder");
+    let expected = flpdf::fix_qdf(&complete).expect("the complete fixture repairs");
+    let expected_prefix = &expected[..expected.len() - terminator.len()];
+    assert_eq!(
+        fixed, expected_prefix,
+        "the truncated holder must be rewritten exactly like the complete one"
+    );
+}
+
 /// `fix_qdf(fix_qdf(x)) == fix_qdf(x)` for every corrupted input.
 #[test]
 fn idempotent() {

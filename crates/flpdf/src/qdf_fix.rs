@@ -690,10 +690,38 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
                 }
             )
         });
-        if previous_stream_enters_after_stream
-            && qpdf_bare_integer_line_range_at(input, body_start).is_none()
-        {
-            return Err(Error::parse(body_start, "fix_qdf: expected integer"));
+        let holder_line = if previous_stream_enters_after_stream {
+            match qpdf_bare_integer_line_range_at(input, body_start) {
+                Some(range) => Some(range),
+                None => return Err(Error::parse(body_start, "fix_qdf: expected integer")),
+            }
+        } else {
+            None
+        };
+
+        // qpdf's `st_in_length` consumes only the holder's integer line and
+        // returns to `st_top` (`fix-qdf.cc:255-263`); it never looks for the
+        // holder's `endobj`. A post-tail holder truncated before `endobj` is
+        // therefore still repaired, so record the span at the integer line and
+        // resume scanning after it rather than demanding a complete object.
+        if let Some((_, integer_end)) = holder_line {
+            if resumed_after_tail && find_line_keyword_from(input, b"endobj", kw_end).is_none() {
+                objects.push(ObjectSpan {
+                    num,
+                    gen,
+                    obj_line_start: line_start,
+                    body_start,
+                    end: integer_end,
+                    body: ObjectBody::Plain {
+                        stream_len: None,
+                        marker_scan_start: None,
+                        ignore_newline_count: 0,
+                    },
+                });
+                cursor = integer_end;
+                scan_after_stream = false;
+                continue;
+            }
         }
 
         // Determine whether this object contains a stream BEFORE searching for
