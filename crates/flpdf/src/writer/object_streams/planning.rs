@@ -243,8 +243,8 @@ pub(crate) fn filter_objstm_batches_for_output<R: std::io::Read + std::io::Seek>
     let page_refs: BTreeSet<ObjectRef> = if output_linearized {
         // QPDFWriter filters page dictionaries after Preserve/Generate setup
         // and obtains them through getAllPages
-        // (QPDFWriter.cc:2125-2149). Seed or reuse the same repaired cache so
-        // this output filter does not start a second PageWalk.
+        // (QPDFWriter.cc:2125-2149). Seed or reuse the same repaired page cache
+        // before filtering the output batches.
         crate::pages::repair::prepare_for_optimization(pdf)?
             .map(|prepared| {
                 prepared
@@ -555,8 +555,6 @@ mod tests {
         .expect("open one-page fixture");
         let mut batches = vec![vec![ObjectRef::new(3, 0)]];
         let mut source_containers = vec![None];
-        let before = crate::pages::page_walk_visits_for_test();
-
         filter_objstm_batches_for_output(
             &mut pdf,
             &mut batches,
@@ -568,7 +566,6 @@ mod tests {
 
         assert!(batches.is_empty());
         assert!(source_containers.is_empty());
-        assert_eq!(crate::pages::page_walk_visits_for_test(), before);
         assert!(pdf.cached_page_list().is_some());
     }
 }

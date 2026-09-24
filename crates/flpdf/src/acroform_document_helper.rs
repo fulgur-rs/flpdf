@@ -598,9 +598,8 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         };
         // qpdf's orphan-widget fallback walks the canonical page annotation
         // route and associates an otherwise-unreachable widget with itself.
-        // QPDF::getAllPages returns an empty vector when the catalog has no
-        // `/Pages` entry, so do not route that malformed-but-readable shape
-        // through flpdf's stricter public `page_refs` missing-key error.
+        // `pages::page_refs` uses the same repaired page-list route and returns
+        // qpdf's empty result when the catalog has no `/Pages` entry.
         // qpdf's `analyze()` obtains the Catalog through `QPDF::getRoot`
         // before scanning all pages (`QPDFAcroFormDocumentHelper.cc:235-286`);
         // use the same direct-or-indirect root gate here. Invalid root shapes
@@ -614,20 +613,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             // has `/Kids`; `try_has_key` also preserves qpdf's type warning
             // and empty-result behavior for a non-dictionary `/Pages` value.
             if pages.try_has_key(b"/Kids")? {
-                // `crate::pages::page_refs` requires `/Pages` to be an
-                // indirect reference (`PageWalk::with_max_depth`); qpdf's own
-                // `getAllPages` has no such requirement. A malformed-but-
-                // readable catalog that embeds `/Pages` directly must not
-                // fail this eager `analyze()` (and so take down unrelated
-                // AcroForm operations like `fields`/`has_acro_form`) just
-                // because the stricter public helper can't walk it -- treat
-                // it the same as the "no `/Pages`" case above and skip the
-                // orphan-widget fallback.
-                let page_refs = match crate::pages::page_refs(self.pdf) {
-                    Ok(page_refs) => page_refs,
-                    Err(Error::Missing("/Pages")) => Vec::new(),
-                    Err(err) => return Err(err),
-                };
+                let page_refs = crate::pages::page_refs(self.pdf)?;
                 for page_ref in page_refs {
                     let widgets = {
                         let mut page = PageObjectHelper::new(page_ref, self.pdf);

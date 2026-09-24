@@ -3,9 +3,10 @@
 //! qpdf reads the catalog through `QPDF::getRoot`, which throws
 //! `unable to find /Root dictionary` for **any** non-dictionary `/Root`,
 //! including an indirect reference to a free or missing object
-//! (`libqpdf/QPDF.cc:2354-2360`). `QPDF::getAllPages` then reads `/Pages`
-//! with no null check at all and enumerates nothing when the value carries no
-//! `/Kids` (`libqpdf/QPDF_pages.cc:46,68-72`).
+//! (`libqpdf/QPDF.cc:2354-2360`). `QPDF::getAllPages` then reads `/Pages` and
+//! probes `/Kids` (`libqpdf/QPDF_pages.cc:46,68-72`). An absent key and an
+//! indirect null enumerate no pages; an explicit direct null yields qpdf's
+//! type error.
 //!
 //! So a presence pre-check at this boundary may only reject a *directly*
 //! absent entry; resolving an indirect one here would preempt qpdf's own
@@ -88,12 +89,12 @@ fn indirect_pages_resolving_to_null_enumerates_no_pages() {
     assert_eq!(page_refs_result(bytes), Ok(0));
 }
 
-/// A directly null `/Pages` is still rejected as an absent entry.
+/// An explicit direct null `/Pages` reaches qpdf's `/Kids` type-error boundary.
 #[test]
-fn direct_null_pages_reports_a_missing_entry() {
+fn direct_null_pages_reports_the_qpdf_type_error() {
     let bytes = build("/Root 1 0 R", &[(1, "<< /Type /Catalog /Pages null >>")]);
     assert_eq!(
         page_refs_result(bytes),
-        Err("missing required PDF entry: /Pages".to_owned())
+        Err("operation for dictionary attempted on object of type null: returning false for a key containment request".to_owned())
     );
 }

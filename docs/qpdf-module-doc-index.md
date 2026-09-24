@@ -97,7 +97,7 @@
 | `crates/flpdf/src/page_label_document_helper.rs` | correspondence | \`QPDFPageLabelDocumentHelper.cc\` canonical page-label access and reconstruction |
 | `crates/flpdf/src/page_object_helper.rs` | correspondence | QPDFPageObjectHelper.cc responsibilities shared with page form, resource, flatten, and overlay modules |
 | `crates/flpdf/src/page_splice.rs` | correspondence | \`QPDFPageDocumentHelper.cc:37-52\` delegates page insertion/removal to the page-tree owner |
-| `crates/flpdf/src/pages.rs` | correspondence | QPDF_pages.cc traversal responsibilities shared with page-tree rebuild and linearization repair |
+| `crates/flpdf/src/pages.rs` | correspondence | \`QPDF::getAllPages\` / \`getAllPagesInternal\` page-list repair and cache responsibilities |
 | `crates/flpdf/src/pages/repair.rs` | correspondence | QPDF_pages.cc page-tree preparation responsibilities |
 | `crates/flpdf/src/pages/tree_rebuild.rs` | correspondence | QPDF_pages.cc page-tree repair plus QPDFJob.cc page-selection rebuilding |
 | `crates/flpdf/src/parser.rs` | correspondence | QPDFParser.cc live file-object parsing plus slice object/content consumer boundaries |

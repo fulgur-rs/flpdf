@@ -1,12 +1,9 @@
 //! Page-tree traversal helpers.
 //!
-//! qpdf correspondence: QPDF_pages.cc traversal responsibilities shared with page-tree rebuild and linearization repair.
+//! qpdf correspondence: `QPDF::getAllPages` / `getAllPagesInternal` page-list repair and cache responsibilities.
 //!
-//! Iterates the document's `/Pages` tree in the order described by ISO 32000-1 §7.7.3.2
-//! and yields the `ObjectRef` of every leaf `Page` node. The walker tolerates broken
-//! cycles (each node is visited at most once). An explicit depth limit remains
-//! available for callers that request a bounded walk; the default qpdf-shaped
-//! walk has no arbitrary depth cap.
+//! Returns the document's qpdf-ordered page list through
+//! [`crate::PageDocumentHelper::get_all_pages`], including qpdf's page-tree repairs.
 
 #[cfg(not(feature = "qtest-driver"))]
 pub(crate) mod repair;
@@ -15,31 +12,15 @@ pub(crate) mod repair;
 pub mod repair;
 pub mod tree_rebuild;
 
-use crate::object_handle::ObjectHandleIdentity;
 use crate::pipeline::buffer::Buffer;
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
-use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::io::{Read, Seek};
 
-#[cfg(test)]
-use std::cell::Cell;
-
-#[cfg(test)]
-thread_local! {
-    static PAGE_WALK_VISITS: Cell<usize> = const { Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn page_walk_visits_for_test() -> usize {
-    PAGE_WALK_VISITS.with(Cell::get)
-}
-
-/// Default recursion limit for [`page_refs`].
+/// Default depth bound used by flpdf page-tree ancestor and mutation helpers.
 ///
-/// Real-world PDFs almost always fit within a couple of dozen levels; the limit is
-/// generous enough for legitimate documents while still preventing pathological inputs
-/// from causing unbounded recursion.
+/// qpdf's `getAllPages` walk is unbounded and uses visited-object detection instead.
+/// This constant remains for flpdf APIs that expose their own depth-limited operations.
 pub const DEFAULT_MAX_PAGE_TREE_DEPTH: usize = 100;
 
 /// A qpdf-style page-tree dictionary handle while following `/Parent`.
@@ -200,9 +181,11 @@ pub(crate) fn resolve_inherited_handle_with_max_depth<R: Read + Seek>(
 ///
 /// # Errors
 ///
-/// - [`Error::Missing`] when the catalog (`/Root`) or its `/Pages` entry is absent.
-/// - [`Error::Unsupported`] when the catalog is not a dictionary.
-/// - Any [`Error`] propagated from canonical ObjectHandle resolution while walking the tree.
+/// - [`Error::Missing`] when the trailer has no `/Root` entry.
+/// - [`Error::Unsupported`] when `/Root` is not a dictionary.
+/// - A missing `/Pages` entry yields an empty list after qpdf's containment warning.
+/// - An explicit null or other invalid `/Pages` value propagates its qpdf type error.
+/// - Any [`Error`] propagated from canonical ObjectHandle resolution while repairing the tree.
 ///
 /// # Examples
 ///
@@ -221,24 +204,7 @@ pub fn page_refs<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<ObjectRef>> {
         pdf.mark_get_all_pages_called();
         return prepared.page_refs();
     }
-    pdf.mark_get_all_pages_called();
-    PageWalk::new(pdf)?.collect()
-}
-
-/// Like [`page_refs`] but with a caller-supplied recursion limit.
-///
-/// # Errors
-///
-/// - [`Error::Missing`] when the catalog (`/Root`) or its `/Pages` entry is absent.
-/// - [`Error::Unsupported`] when the catalog is not a dictionary, or when the page
-///   tree exceeds `max_depth`.
-/// - Any [`Error`] propagated from canonical ObjectHandle resolution while walking the tree.
-pub fn page_refs_with_max_depth<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    max_depth: usize,
-) -> Result<Vec<ObjectRef>> {
-    pdf.mark_get_all_pages_called();
-    PageWalk::with_max_depth(pdf, max_depth)?.collect()
+    crate::PageDocumentHelper::new(pdf).get_all_pages()
 }
 
 /// Return the decoded content-stream bytes for a single `Page` object.
@@ -324,394 +290,72 @@ pub fn page_content_bytes<R: Read + Seek>(
     Ok(buffer.take_buffer()?)
 }
 
-/// An iterator over every leaf `Page` object-reference in the document's `/Pages`
-/// tree, yielding refs in document order (ISO 32000-1 §7.7.3.2).
-///
-/// Leaf classification for `/Kids` entries follows qpdf's
-/// `getAllPagesInternal` (`libqpdf/QPDF_pages.cc:91-131`): an entry with
-/// `/Kids` is a subtree and anything else is a page, dictionary or not. A
-/// direct entry is promoted to an indirect page object (the `/Kids` entry is
-/// rewritten) before it is yielded, which is what keeps a scalar leaf in the
-/// page list. Subtree expansion here still keys on `/Type /Pages`, and the
-/// remaining page-dictionary repair (`/Type` override, media-box default,
-/// duplicate copying, repair warnings) stays with the canonical
-/// `pages::repair` walk that [`crate::pages::page_refs`] uses when a prepared
-/// page list exists.
-///
-/// Each node is visited at most once (tracked via a `BTreeSet`) so cycles in
-/// malformed documents are silently skipped. On the first resolve failure or
-/// depth-limit breach the iterator emits `Some(Err(...))` and is then fused
-/// — all subsequent calls return `None`.
-///
-/// # Construction
-///
-/// Use [`PageWalk::new`] or [`PageWalk::with_max_depth`].
-///
-/// # Example
-///
-/// ```no_run
-/// use std::fs::File;
-/// use std::io::BufReader;
-/// use flpdf::{pages::PageWalk, Pdf};
-///
-/// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-/// for page_ref in PageWalk::new(&mut pdf)? {
-///     let page_ref = page_ref?;
-///     println!("page: {page_ref}");
-/// }
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-#[derive(Clone)]
-enum PageNode {
-    Indirect(ObjectRef),
-    Direct(ObjectHandle),
-    /// A `/Kids` entry without `/Kids` of its own: qpdf's
-    /// `getAllPagesInternal` treats every such entry as a page leaf,
-    /// dictionary or not (`libqpdf/QPDF_pages.cc:91-131`).
-    Leaf(ObjectRef),
-}
-
-impl PageNode {
-    fn from_handle(handle: ObjectHandle) -> Self {
-        match handle.object_ref() {
-            Some(object_ref) => Self::Indirect(object_ref),
-            None => Self::Direct(handle),
-        }
-    }
-
-    fn handle<R: Read + Seek>(&self, pdf: &mut Pdf<R>) -> ObjectHandle {
-        match self {
-            Self::Indirect(object_ref) | Self::Leaf(object_ref) => {
-                pdf.get_object_handle(*object_ref)
-            }
-            Self::Direct(handle) => handle.clone(),
-        }
-    }
-
-    fn object_ref(&self) -> Option<ObjectRef> {
-        match self {
-            Self::Indirect(object_ref) | Self::Leaf(object_ref) => Some(*object_ref),
-            Self::Direct(_) => None,
-        }
-    }
-
-    fn label(&self) -> String {
-        self.object_ref().map_or_else(
-            || "direct page-tree object".to_owned(),
-            |reference| reference.to_string(),
-        )
-    }
-}
-
-pub struct PageWalk<'a, R: Read + Seek + 'static> {
-    pdf: &'a mut Pdf<R>,
-    /// Stack of page-tree handles and depths yet to be visited. Direct
-    /// `/Pages` dictionaries are valid qpdf children and therefore cannot be
-    /// represented by `ObjectRef` alone.
-    stack: Vec<(PageNode, usize)>,
-    seen: BTreeSet<ObjectRef>,
-    #[allow(
-        clippy::mutable_key_type,
-        reason = "direct page-tree cycle detection keys on canonical handle identity"
-    )]
-    seen_direct: HashSet<ObjectHandleIdentity>,
-    max_depth: Option<usize>,
-    /// Set to `true` after yielding `Err`; causes all subsequent calls to return `None`.
-    done: bool,
-}
-
-/// Probe qpdf's `/Kids` containment boundary without turning a contextless
-/// programmatic null into a hard error. Parsed document handles have a warning
-/// sink and propagate sink failures; direct nulls created without a document
-/// retain the pre-existing page-classification behavior.
-fn probe_page_kids(handle: &ObjectHandle) -> Result<()> {
-    let contextless = handle.context().is_none();
-    match handle.try_has_key(b"/Kids") {
-        Ok(_) => Ok(()),
-        Err(Error::QpdfExc(_)) if contextless => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-/// qpdf's `kid.hasKey("/Kids")` page-tree classification
-/// (`libqpdf/QPDF_pages.cc:91-131`). A contextless programmatic handle has no
-/// warning sink, so the type warning `try_has_key` raises there is mapped to
-/// `false` the same way [`probe_page_kids`] maps it for the sibling probes.
-fn page_kid_has_kids(handle: &ObjectHandle) -> Result<bool> {
-    let contextless = handle.context().is_none();
-    match handle.try_has_key(b"/Kids") {
-        Ok(has_kids) => Ok(has_kids),
-        Err(Error::QpdfExc(_)) if contextless => Ok(false),
-        Err(error) => Err(error),
-    }
-}
-
-impl<'a, R: Read + Seek> PageWalk<'a, R> {
-    /// Create an unbounded qpdf-shaped `PageWalk`.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Missing`] when the catalog (`/Root`) or its `/Pages` entry is absent.
-    /// - [`Error::Unsupported`] when the catalog is not a dictionary.
-    /// - Any [`Error`] propagated from canonical ObjectHandle resolution while resolving the catalog.
-    pub fn new(pdf: &'a mut Pdf<R>) -> Result<Self> {
-        // Only a *directly* absent `/Root` is `Missing` here. A present
-        // `/Root` that resolves to a non-dictionary — including an indirect
-        // reference to a free or missing object — is `QPDF::getRoot`'s
-        // responsibility, which throws `unable to find /Root dictionary`
-        // (`libqpdf/QPDF.cc:2354-2360`); resolving it here would preempt that
-        // qpdf-shaped error with a `Missing`. `root_handle` implements
-        // `getRoot`.
-        let root = pdf.trailer_key_handle(b"Root");
-        if !root.is_indirect() && root.try_is_null()? {
-            return Err(Error::Missing("/Root"));
-        }
-        let catalog = pdf.root_handle()?;
-        // Likewise for `/Pages`: qpdf's `getAllPages` reads it without a null
-        // check and simply enumerates nothing when it carries no `/Kids`
-        // (`libqpdf/QPDF_pages.cc:46,68-72`), so an indirect `/Pages`
-        // resolving to null yields zero pages rather than an error.
-        let pages = catalog.try_get_key(b"/Pages")?;
-        if !pages.is_indirect() && pages.try_is_null()? {
-            probe_page_kids(&pages)?;
-            return Err(Error::Missing("/Pages"));
-        }
-        let pages = PageNode::from_handle(pages);
-        Ok(PageWalk {
-            pdf,
-            stack: vec![(pages, 0)],
-            seen: BTreeSet::new(),
-            seen_direct: HashSet::new(),
-            max_depth: None,
-            done: false,
-        })
-    }
-
-    /// Create a `PageWalk` with a caller-supplied recursion limit.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Missing`] when the catalog (`/Root`) or its `/Pages` entry is absent.
-    /// - [`Error::Unsupported`] when the catalog is not a dictionary.
-    /// - Any [`Error`] propagated from canonical ObjectHandle resolution while resolving the catalog.
-    pub fn with_max_depth(pdf: &'a mut Pdf<R>, max_depth: usize) -> Result<Self> {
-        // Only a *directly* absent `/Root` is `Missing` here. A present
-        // `/Root` that resolves to a non-dictionary — including an indirect
-        // reference to a free or missing object — is `QPDF::getRoot`'s
-        // responsibility, which throws `unable to find /Root dictionary`
-        // (`libqpdf/QPDF.cc:2354-2360`); resolving it here would preempt that
-        // qpdf-shaped error with a `Missing`. `root_handle` implements
-        // `getRoot`.
-        let root = pdf.trailer_key_handle(b"Root");
-        if !root.is_indirect() && root.try_is_null()? {
-            return Err(Error::Missing("/Root"));
-        }
-        let catalog = pdf.root_handle()?;
-        // Likewise for `/Pages`: qpdf's `getAllPages` reads it without a null
-        // check and simply enumerates nothing when it carries no `/Kids`
-        // (`libqpdf/QPDF_pages.cc:46,68-72`), so an indirect `/Pages`
-        // resolving to null yields zero pages rather than an error.
-        let pages = catalog.try_get_key(b"/Pages")?;
-        if !pages.is_indirect() && pages.try_is_null()? {
-            probe_page_kids(&pages)?;
-            return Err(Error::Missing("/Pages"));
-        }
-        let pages = PageNode::from_handle(pages);
-        Ok(PageWalk {
-            pdf,
-            stack: vec![(pages, 0)],
-            seen: BTreeSet::new(),
-            seen_direct: HashSet::new(),
-            max_depth: Some(max_depth),
-            done: false,
-        })
-    }
-
-    fn visit_node(&mut self, node: &PageNode, depth: usize) -> Result<Option<ObjectRef>> {
-        let node_obj = node.handle(self.pdf);
-        node_obj.try_dereference()?;
-
-        if !node_obj.try_is_dictionary()? {
-            probe_page_kids(&node_obj)?;
-            return Ok(None); // non-dictionary: skip silently
-        }
-
-        let node_type = node_obj.try_get_key(b"/Type")?;
-
-        if node_type.try_as_name()?.as_deref() == Some(b"Pages") {
-            let kids = node_obj.try_get_key(b"/Kids")?;
-            if let Some(kids_items) = kids.try_as_array()? {
-                // qpdf classifies an entry by `/Kids` containment, not
-                // `/Type`: an entry with `/Kids` is a subtree and everything
-                // else is a page leaf even when it is not a dictionary
-                // (`libqpdf/QPDF_pages.cc:91-131`). Subtree expansion itself
-                // still keys on `/Type /Pages` in `visit_node`.
-                //
-                // Classify -- and in particular promote -- in forward order.
-                // qpdf allocates each promoted leaf during its forward
-                // depth-first walk (`libqpdf/QPDF_pages.cc:95-101`), so
-                // `/Kids [42 43]` must mint the object for `42` before the one
-                // for `43`; `pages/repair.rs` does the same. Only the stack
-                // insertion is reversed afterwards, so the first kid is still
-                // popped first.
-                let mut classified = Vec::with_capacity(kids_items.len());
-                for (index, kid) in kids_items.iter().enumerate() {
-                    if page_kid_has_kids(kid)? {
-                        if let Some(r) = kid.object_ref() {
-                            classified.push(PageNode::Indirect(r));
-                        } else {
-                            classified.push(PageNode::Direct(kid.clone()));
-                        }
-                    } else if let Some(r) = kid.object_ref() {
-                        classified.push(PageNode::Leaf(r));
-                    } else {
-                        // qpdf promotes every direct kid to an indirect page
-                        // object before pushing it (`libqpdf/QPDF_pages.cc:95-101`),
-                        // which is also what keeps a non-dictionary leaf in
-                        // the page list.
-                        let promoted = self.pdf.make_indirect_object_handle(kid.clone())?;
-                        kids.set_array_item(index, promoted.clone())?;
-                        let promoted_ref = promoted
-                            .object_ref()
-                            .expect("make_indirect_object_handle returns an indirect handle");
-                        classified.push(PageNode::Leaf(promoted_ref));
-                    }
-                }
-                for node in classified.into_iter().rev() {
-                    self.stack.push((node, depth + 1));
-                }
-            }
-            return Ok(None);
-        }
-
-        if node_type.try_as_name()?.as_deref() == Some(b"Page") {
-            return Ok(node.object_ref());
-        }
-
-        Ok(None)
-    }
-}
-
-impl<'a, R: Read + Seek> Iterator for PageWalk<'a, R> {
-    type Item = Result<ObjectRef>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-
-        loop {
-            let (node, depth) = self.stack.pop()?;
-
-            #[cfg(test)]
-            PAGE_WALK_VISITS.with(|visits| visits.set(visits.get() + 1));
-
-            if self.max_depth.is_some_and(|max_depth| depth >= max_depth) {
-                self.done = true;
-                return Some(Err(Error::Unsupported(format!(
-                    "page tree depth exceeds maximum of {} at {}",
-                    self.max_depth.expect("checked above"),
-                    node.label()
-                ))));
-            }
-
-            let first_visit = match &node {
-                PageNode::Indirect(reference) | PageNode::Leaf(reference) => {
-                    self.seen.insert(*reference)
-                }
-                PageNode::Direct(handle) => self.seen_direct.insert(handle.identity_key()),
-            };
-            if !first_visit {
-                continue; // cycle guard: already visited
-            }
-
-            let visited = match &node {
-                PageNode::Leaf(reference) => Ok(Some(*reference)),
-                PageNode::Indirect(_) | PageNode::Direct(_) => self.visit_node(&node, depth),
-            };
-            match visited {
-                Ok(Some(page)) => return Some(Ok(page)),
-                Ok(None) => continue,
-                Err(error) => {
-                    self.done = true;
-                    return Some(Err(error));
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn unbounded_page_walk_reports_a_missing_root() {
-        let mut pdf = Pdf::<std::io::Cursor<Vec<u8>>>::uninitialized();
-        assert!(matches!(
-            PageWalk::new(&mut pdf),
-            Err(Error::Missing("/Root"))
-        ));
+    fn pdf_with_objects(objects: &[&str]) -> Vec<u8> {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+        );
+        for offset in offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    fn pdf_with_catalog(catalog: &str) -> Vec<u8> {
+        pdf_with_objects(&[catalog])
     }
 
     #[test]
-    fn unbounded_page_walk_reports_a_missing_pages_entry() {
-        let mut pdf = Pdf::empty().expect("empty PDF");
-        let catalog = pdf.root_handle().expect("empty catalog");
-        catalog.remove_key(b"/Pages");
-        assert!(matches!(
-            PageWalk::new(&mut pdf),
-            Err(Error::Missing("/Pages"))
-        ));
-        let messages: Vec<_> = pdf
-            .repair_diagnostics()
-            .entries()
-            .iter()
-            .map(|entry| entry.message_string())
-            .collect();
-        assert_eq!(messages.len(), 1);
-        assert!(messages[0].contains(
-            "operation for dictionary attempted on object of type null: returning false for a key containment request"
-        ));
+    fn page_refs_returns_an_empty_list_when_catalog_has_no_pages_entry() {
+        let mut pdf = Pdf::open_mem_owned(pdf_with_catalog("<< /Type /Catalog >>"))
+            .expect("open Catalog without /Pages");
+
+        let actual = page_refs(&mut pdf).expect("qpdf returns an empty page list");
+
+        assert!(actual.is_empty());
+        let warnings = pdf.repair_diagnostics();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings.entries()[0].get_message_detail(),
+            b"operation for dictionary attempted on object of type null: returning false for a key containment request"
+        );
     }
 
     #[test]
-    fn bounded_page_walk_reports_a_missing_pages_entry() {
-        let mut pdf = Pdf::empty().expect("empty PDF");
-        pdf.root_handle()
-            .expect("empty catalog")
-            .remove_key(b"/Pages");
-        assert!(matches!(
-            PageWalk::with_max_depth(&mut pdf, 4),
-            Err(Error::Missing("/Pages"))
-        ));
+    fn page_refs_preserves_qpdf_type_error_for_a_direct_null_pages_entry() {
+        let mut pdf = Pdf::open_mem_owned(pdf_with_catalog("<< /Type /Catalog /Pages null >>"))
+            .expect("open Catalog with direct null /Pages");
+
+        let error = page_refs(&mut pdf).expect_err("qpdf rejects direct null /Pages");
+
+        match error {
+            Error::QpdfExc(error) => assert_eq!(
+                error.get_message_detail(),
+                b"operation for dictionary attempted on object of type null: returning false for a key containment request"
+            ),
+            other => panic!("expected qpdf type error, got {other:?}"), // cov:ignore: this is the failing arm of the qpdf error-type regression assertion
+        }
     }
 
     #[test]
-    fn page_kids_probe_propagates_uninitialized_handle_errors() {
-        let error = probe_page_kids(&ObjectHandle::uninitialized()).unwrap_err();
-        assert!(matches!(error, Error::Internal(_)));
-    }
-
-    #[test]
-    fn page_kid_classification_propagates_uninitialized_handle_errors() {
-        let error = page_kid_has_kids(&ObjectHandle::uninitialized()).unwrap_err();
-        assert!(matches!(error, Error::Internal(_)));
-    }
-
-    #[test]
-    fn explicit_page_walk_limit_remains_available() {
-        let mut pdf = Pdf::empty().expect("empty PDF");
-        let mut walk = PageWalk::with_max_depth(&mut pdf, 0).expect("empty pages root");
-        let error = walk
-            .next()
-            .expect("bounded walk must report an error")
-            .unwrap_err();
-        assert!(error.to_string().contains("depth exceeds maximum of 0"));
-    }
-
-    #[test]
-    fn page_refs_reuses_the_nonempty_prepared_page_cache() {
+    fn page_refs_keeps_qpdfs_nonempty_cache_until_explicit_refresh() {
         let mut pdf = Pdf::open_mem_owned(
             include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
         )
@@ -719,23 +363,206 @@ mod tests {
         let prepared = crate::pages::repair::prepare_for_optimization(&mut pdf)
             .expect("prepare pages")
             .expect("prepared page list");
-        let before = page_walk_visits_for_test();
+        let original = prepared
+            .pages
+            .iter()
+            .map(|page| page.object_ref().expect("page identity"))
+            .collect::<Vec<_>>();
+        let pages = pdf
+            .root_handle()
+            .expect("Catalog")
+            .try_get_key(b"/Pages")
+            .expect("page-tree root");
+        pages
+            .replace_key(b"/Kids", ObjectHandle::array(Vec::new()))
+            .expect("mutate the live page tree without refreshing its cache");
 
         let actual = page_refs(&mut pdf).expect("cached page refs");
 
-        assert_eq!(
-            actual,
-            prepared
-                .pages
-                .iter()
-                .map(|page| page.object_ref().expect("page identity"))
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(page_walk_visits_for_test(), before);
+        assert_eq!(actual, original);
     }
 
     #[test]
-    fn page_walk_expands_a_direct_pages_kid() {
+    fn page_refs_expands_a_page_typed_node_with_kids_and_repairs_its_type() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let pages = pdf
+            .root_handle()
+            .expect("empty catalog")
+            .try_get_key(b"/Pages")
+            .expect("empty /Pages");
+        let leaf = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Type".to_vec(),
+                ObjectHandle::name(b"Page".to_vec()),
+            )]))
+            .expect("indirect page leaf");
+        let page_typed_subtree = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![
+                (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+                (b"/Kids".to_vec(), ObjectHandle::array(vec![leaf.clone()])),
+                (b"/Count".to_vec(), ObjectHandle::integer(1)),
+            ]))
+            .expect("indirect subtree mislabeled as a page");
+        let leaf_ref = leaf.object_ref().expect("page leaf identity");
+        let subtree_ref = page_typed_subtree.object_ref().expect("subtree identity");
+        pages
+            .replace_key(
+                b"/Kids",
+                ObjectHandle::array(vec![page_typed_subtree.clone()]),
+            )
+            .expect("install subtree");
+        pages
+            .replace_key(b"/Count", ObjectHandle::integer(1))
+            .expect("install page count");
+
+        let actual = page_refs(&mut pdf).expect("enumerate repaired page tree");
+
+        assert_eq!(actual, vec![leaf_ref]);
+        assert!(!actual.contains(&subtree_ref));
+        assert_eq!(
+            page_typed_subtree
+                .try_get_key(b"/Type")
+                .expect("repaired subtree type")
+                .try_as_name()
+                .expect("name type"),
+            Some(b"Pages".to_vec())
+        );
+        assert!(pdf.repair_diagnostics().entries().iter().any(|warning| {
+            warning.get_message_detail() == b"/Type key should be /Pages but is not; overriding"
+        }));
+    }
+
+    #[test]
+    fn page_refs_repairs_a_type_less_dictionary_leaf_before_returning_it() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let pages = pdf
+            .root_handle()
+            .expect("empty catalog")
+            .try_get_key(b"/Pages")
+            .expect("empty /Pages");
+        pages.remove_key(b"/MediaBox");
+        let leaf = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("indirect dictionary leaf");
+        let leaf_ref = leaf.object_ref().expect("page leaf identity");
+        pages
+            .replace_key(b"/Kids", ObjectHandle::array(vec![leaf.clone()]))
+            .expect("install leaf");
+        pages
+            .replace_key(b"/Count", ObjectHandle::integer(1))
+            .expect("install page count");
+
+        let actual = page_refs(&mut pdf).expect("enumerate and repair page tree");
+
+        assert_eq!(actual, vec![leaf_ref]);
+        assert_eq!(
+            leaf.try_get_key(b"/Type")
+                .expect("repaired leaf type")
+                .try_as_name()
+                .expect("name type"),
+            Some(b"Page".to_vec())
+        );
+        let media_box = leaf
+            .try_get_key(b"/MediaBox")
+            .expect("default leaf MediaBox")
+            .try_as_array()
+            .expect("array MediaBox")
+            .expect("default rectangle");
+        let rectangle = media_box
+            .iter()
+            .map(|coordinate| coordinate.try_as_integer().expect("integer coordinate"))
+            .collect::<Vec<_>>();
+        assert_eq!(rectangle, vec![Some(0), Some(0), Some(612), Some(792)]);
+        let warnings = pdf.repair_diagnostics();
+        let details = warnings
+            .entries()
+            .iter()
+            .map(|warning| warning.get_message_detail())
+            .collect::<Vec<_>>();
+        let media_warning = details
+            .iter()
+            .position(|detail| detail.starts_with(b"kid 0 (from 0) MediaBox is undefined"))
+            .expect("qpdf MediaBox warning");
+        let type_warning = details
+            .iter()
+            .position(|detail| *detail == b"/Type key should be /Page but is not; overriding")
+            .expect("qpdf leaf type warning");
+        assert!(
+            media_warning < type_warning,
+            "qpdf repairs MediaBox before /Type"
+        );
+    }
+
+    #[test]
+    fn page_refs_clones_each_occurrence_of_a_duplicate_scalar_leaf() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let pages = pdf
+            .root_handle()
+            .expect("empty catalog")
+            .try_get_key(b"/Pages")
+            .expect("empty /Pages");
+        let scalar = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(42))
+            .expect("indirect scalar leaf");
+        let first_ref = scalar.object_ref().expect("original leaf identity");
+        let kids = ObjectHandle::array(vec![scalar.clone(), scalar.clone()]);
+        pages
+            .replace_key(b"/Kids", kids.clone())
+            .expect("install duplicate leaves");
+        pages
+            .replace_key(b"/Count", ObjectHandle::integer(2))
+            .expect("install page count");
+
+        let actual = page_refs(&mut pdf).expect("enumerate duplicate leaves");
+
+        assert_eq!(actual.len(), 2, "each /Kids slot is a page occurrence");
+        assert_eq!(actual[0], first_ref);
+        assert_eq!(actual, vec![first_ref, ObjectRef::new(4, 0)]);
+        assert_ne!(actual[0], actual[1], "qpdf shallow-copies duplicate leaves");
+        for reference in &actual {
+            assert_eq!(
+                pdf.get_object_handle(*reference)
+                    .try_as_integer()
+                    .expect("resolve page leaf"),
+                Some(42)
+            );
+        }
+        assert_eq!(
+            kids.try_get_array_item(1)
+                .expect("updated duplicate slot")
+                .object_ref(),
+            Some(actual[1])
+        );
+        assert!(pdf.repair_diagnostics().entries().iter().any(|warning| {
+            warning.get_message_detail()
+                == b"kid 1 (from 0) appears more than once in the pages tree; creating a new page object as a copy"
+        }));
+    }
+
+    #[test]
+    fn page_refs_promotes_nested_direct_kids_in_depth_first_order() {
+        let mut pdf = Pdf::open_mem_owned(pdf_with_objects(&[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [<< /Type /Pages /Kids [42] /Count 1 >> 43] /Count 2 /MediaBox [0 0 10 10] >>",
+        ]))
+        .expect("open nested direct subtree fixture");
+
+        let actual = page_refs(&mut pdf).expect("enumerate nested direct leaves");
+
+        assert_eq!(actual, vec![ObjectRef::new(3, 0), ObjectRef::new(4, 0)]);
+        let values = actual
+            .iter()
+            .map(|reference| {
+                pdf.get_object_handle(*reference)
+                    .try_as_integer()
+                    .expect("resolve promoted scalar leaf")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![Some(42), Some(43)]);
+    }
+
+    #[test]
+    fn page_refs_expands_a_direct_pages_kid() {
         let mut pdf = Pdf::empty().expect("empty PDF");
         let root_pages = pdf
             .root_handle()
@@ -772,27 +599,15 @@ mod tests {
     /// object numbering a caller observes.
     #[test]
     fn direct_scalar_kids_are_promoted_in_forward_order() {
-        let mut pdf = Pdf::empty().expect("empty PDF");
-        let pages = pdf
-            .root_handle()
-            .expect("empty catalog")
-            .try_get_key(b"/Pages")
-            .expect("empty /Pages");
-        let kids = ObjectHandle::array(vec![ObjectHandle::integer(42), ObjectHandle::integer(43)]);
-        pages
-            .replace_key(b"/Kids", kids.clone())
-            .expect("install scalar kids");
-        pages
-            .replace_key(b"/Count", ObjectHandle::integer(2))
-            .expect("install count");
+        let mut pdf = Pdf::open_mem_owned(pdf_with_objects(&[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [42 43] /Count 2 /MediaBox [0 0 10 10] >>",
+        ]))
+        .expect("open direct scalar leaf fixture");
 
         let refs = page_refs(&mut pdf).expect("two scalar leaves are two pages");
 
-        assert_eq!(refs.len(), 2);
-        assert!(
-            refs[0].number < refs[1].number,
-            "the first kid must mint the lower object number, got {refs:?}"
-        );
+        assert_eq!(refs, vec![ObjectRef::new(3, 0), ObjectRef::new(4, 0)]);
         let values: Vec<_> = refs
             .iter()
             .map(|r| {
@@ -802,38 +617,6 @@ mod tests {
             })
             .collect();
         assert_eq!(values, vec![Some(42), Some(43)]);
-    }
-
-    #[test]
-    fn page_walk_promotes_a_direct_scalar_kid_like_qpdf() {
-        let mut pdf = Pdf::empty().expect("empty PDF");
-        let pages = pdf
-            .root_handle()
-            .expect("empty catalog")
-            .try_get_key(b"/Pages")
-            .expect("empty /Pages");
-        let kids = ObjectHandle::array(vec![ObjectHandle::integer(42)]);
-        pages
-            .replace_key(b"/Kids", kids.clone())
-            .expect("install scalar kid");
-        pages
-            .replace_key(b"/Count", ObjectHandle::integer(1))
-            .expect("install count");
-
-        let refs = page_refs(&mut pdf).expect("a scalar leaf is a page");
-        assert_eq!(refs.len(), 1, "qpdf counts the scalar leaf as one page");
-        assert_eq!(
-            pdf.get_object_handle(refs[0])
-                .try_as_integer()
-                .expect("resolve promoted leaf"),
-            Some(42)
-        );
-        assert!(
-            kids.try_get_array_item(0)
-                .expect("rewritten kid")
-                .is_indirect(),
-            "qpdf promotes a direct kid to an indirect page object"
-        );
     }
 
     #[test]
