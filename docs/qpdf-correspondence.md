@@ -2250,12 +2250,16 @@ parser、bridge、qpdf-deviation markerは追加しない。
 
 `QPDFArgParser` の help-table 境界は、`flpdf-cli/src/arg_parser.rs` の raw/canonical 二重 argv と
 `flpdf-cli/src/main.rs` の `qpdf_sole_help_topic` / `qpdf_compat_help_usage_error` に接続した。
-`QPDFArgParser.cc:433-555` と `qpdf/qpdf.cc:10-39` に対応し、qpdf 互換の top-level では
-`--help=usage` / `--help=exit-status` の source-derived body、expanded argv の sole-option
-判定、first unknown の argv 順、single-dash の原文診断を保持する。`flpdf help <subcommand>` と
-`flpdf rewrite --help` は native clap surface として別の dispatch 境界に残す。help topic の
-related-option と footer は `libqpdf/qpdf/auto_job_help.hh`（qpdf 11.9.0 pin）に対応し、未移植の
-topic body は後続の parity slice として扱う。
+`QPDFArgParser.cc:33-34,433-555,671-785` と `qpdf/qpdf.cc:10-39` に対応し、qpdf-compatible
+top-level の bare `--help`、`--help=all`、各 topic、各 `--option` は table-backed renderer を通る。
+private な `qpdf_help.rs` table は pinned qpdf 11.9.0 の `libqpdf/qpdf/auto_job_help.hh:10-1023`
+にある19 topic / 127 option recordsを写し、topic・option・related-option の順序、本文と footer を
+`QPDFArgParser::getTopHelp` / `getAllHelp` / `getTopicHelp` / `getHelp` および
+`addHelpFooter` に合わせる。`--help=usage` の本文中 `Usage: qpdf` と `OR qpdf` も source literal
+のまま保持する。5つの standalone option の help text も table に含むが、各 command の動作実装は
+別 scope である。expanded argv の sole-option 判定、first unknown の argv 順、single-dash の原文診断は
+引き続き保持する。`flpdf help <subcommand>` と `flpdf rewrite --help` は native clap surface として
+別の dispatch 境界に残す。
 
 2026-09-17（`flpdf-3yn9.48.147`）: `QPDFJob::initialize_from_raw_argv` を追加し、
 `initialize_from_argv` は同じbyte-preserving parserへ委譲するようにした。main/pages/
