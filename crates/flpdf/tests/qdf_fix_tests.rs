@@ -109,6 +109,7 @@ const POSITIONAL_LENGTH_CASES: &[&str] = &[
     "corrupt-length-holder-after-xref-next-object",
     "corrupt-length-holder-after-xref-second-xref",
     "corrupt-length-holder-after-xref-next-stream",
+    "corrupt-xref-between-endstream-and-endobj",
 ];
 
 /// A QDF with an empty indirect-object table and a direct trailer root.

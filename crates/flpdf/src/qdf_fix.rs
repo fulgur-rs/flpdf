@@ -672,9 +672,22 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
         // does not: it keeps copying tail text until the next object header,
         // whose body is the positional length holder. Once that holder has
         // been parsed, st_top resumes and may encounter another xref/trailer.
+        // The qpdf state transition begins at `endstream`, not at the end of
+        // its containing object. Include the rest of that stream object's
+        // bytes when checking whether st_after_stream crossed an xref line.
+        let resumed_xref_search_start = objects
+            .last()
+            .and_then(|previous| match &previous.body {
+                ObjectBody::Plain {
+                    marker_scan_start: Some(start),
+                    ..
+                } => Some(*start),
+                _ => None,
+            })
+            .unwrap_or(cursor);
         if scan_after_stream
             && !resumed_after_tail
-            && find_qpdf_xref_line_from(&input[..line_start], cursor).is_some()
+            && find_qpdf_xref_line_from(&input[..line_start], resumed_xref_search_start).is_some()
         {
             resumed_after_tail = true;
         }
