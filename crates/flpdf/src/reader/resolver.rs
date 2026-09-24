@@ -1696,7 +1696,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                             .default_xref_entries
                             .contains(&object_gen);
                         if is_default {
-                            self.warn_default_xref_entries()?;
+                            self.warn_default_xref_entry(object_gen)?;
                         } else {
                             self.push_warning_at(0, "object 0/0 has unexpected xref entry type")?;
                         }
@@ -2048,7 +2048,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             core.xref_registration.remove_raw_entry(object_gen);
             core.default_xref_entries.remove(&object_gen);
             // qpdf-deviation: qpdf carries no "was this default row's warning
-            // already delivered" field to erase here -- `warn_default_xref_entries`
+            // already delivered" field to erase here -- `warn_default_xref_entry`
             // derives that fact from `default_xref_warnings`, a bookkeeping set
             // that exists only because flpdf caches the delivery instead of
             // qpdf's per-call recomputation. Leaving a stale entry here would
@@ -2564,40 +2564,36 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .insert(object_gen);
     }
 
-    /// Deliver warnings for qpdf's non-indirect default xref rows at the
-    /// boundary where ObjStm header inspection has made them visible. This is
-    /// the ordering seam that puts object 0 after the containing ObjStm's
-    /// member diagnostics but before the next xref object is resolved
-    /// (`QPDF.cc:1823`, followed by `resolveXRefTable`).
-    // cov:ignore-start: qtest specific-bugs issue-143 exercises the malformed canonical default-row ordering
-    fn warn_default_xref_entries(&self) -> Result<()> {
-        let candidates: Vec<QpdfObjGen> = {
-            let core = self.core.borrow();
-            core.default_xref_entries
-                .iter()
-                .copied()
-                .filter(|object_gen| {
-                    !object_gen.is_indirect() && !core.default_xref_warnings.contains(object_gen)
-                })
-                .collect()
-        };
-        for object_gen in candidates {
-            self.push_warning_at(
-                0,
-                format!(
-                    "object {}/{} has unexpected xref entry type",
-                    object_gen.get_obj(),
-                    object_gen.get_gen()
-                ),
-            )?;
-            self.core
-                .borrow_mut()
-                .default_xref_warnings
-                .insert(object_gen);
+    /// Deliver one warning for the non-indirect default xref row currently
+    /// being resolved. qpdf's ObjStm reader only inserts/looks up member rows;
+    /// `QPDF::resolveXRefTable` later reaches object 0 and `QPDF::resolve`
+    /// warns for that row (`QPDF.cc:1239-1254,1700-1753`).
+    fn warn_default_xref_entry(&self, object_gen: QpdfObjGen) -> Result<()> {
+        if object_gen.is_indirect() {
+            return Ok(());
         }
+        let should_warn = {
+            let core = self.core.borrow();
+            core.default_xref_entries.contains(&object_gen)
+                && !core.default_xref_warnings.contains(&object_gen)
+        };
+        if !should_warn {
+            return Ok(());
+        }
+        self.push_warning_at(
+            0,
+            format!(
+                "object {}/{} has unexpected xref entry type",
+                object_gen.get_obj(),
+                object_gen.get_gen()
+            ),
+        )?;
+        self.core
+            .borrow_mut()
+            .default_xref_warnings
+            .insert(object_gen);
         Ok(())
     }
-    // cov:ignore-end
 
     #[cfg(test)]
     pub(crate) fn insert_default_xref_entry_for_test(&self, object_ref: ObjectRef) {
@@ -2920,7 +2916,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 }
             }
         }
-        self.warn_default_xref_entries()?;
         Ok(())
     }
 
@@ -11564,7 +11559,12 @@ mod tests {
         let resolver = bare_resolver();
         let object_ref = ObjectRef::new(0, 0);
         resolver.insert_default_xref_entry_for_test(object_ref);
-        resolver.warn_default_xref_entries().unwrap();
+        resolver
+            .warn_default_xref_entry(QpdfObjGen::new(0, 0))
+            .unwrap();
+        resolver
+            .warn_default_xref_entry(QpdfObjGen::new(0, 0))
+            .unwrap();
         assert_eq!(
             resolver
                 .repair_diagnostics()
@@ -11577,7 +11577,9 @@ mod tests {
 
         resolver.remove_object(object_ref).unwrap();
         resolver.insert_default_xref_entry_for_test(object_ref);
-        resolver.warn_default_xref_entries().unwrap();
+        resolver
+            .warn_default_xref_entry(QpdfObjGen::new(0, 0))
+            .unwrap();
 
         assert_eq!(
             resolver
@@ -11593,6 +11595,19 @@ mod tests {
             "a default row recreated after removal must be warned about again, \
              not suppressed by warning-delivery bookkeeping the removal left stale"
         );
+    }
+
+    #[test]
+    fn default_object_zero_warning_helper_ignores_indirect_rows() {
+        let resolver = bare_resolver();
+        let object_ref = ObjectRef::new(5, 0);
+        resolver.insert_default_xref_entry_for_test(object_ref);
+
+        resolver
+            .warn_default_xref_entry(QpdfObjGen::new(5, 0))
+            .expect("the object-zero warning owner ignores indirect rows");
+
+        assert!(resolver.repair_diagnostics().entries().is_empty());
     }
 
     #[test]
