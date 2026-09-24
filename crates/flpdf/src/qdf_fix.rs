@@ -19,17 +19,19 @@
 //! QDF structure that `qpdf --qdf` produces and that qpdf's own `fix-qdf`
 //! accepts:
 //!
-//! * objects are written as `N G obj` at the start of a line, optionally
-//!   preceded by a `%% Original object ID: N G` comment line (the offset always
-//!   points at the `N G obj` line, **not** the comment — verified against the
-//!   `fix-qdf` oracle);
+//! * objects are written as the exact LF-terminated `N 0 obj` line recognized
+//!   by qpdf's `re_n_0_obj`, optionally preceded by a
+//!   `%% Original object ID: N G` comment line (the offset always points at
+//!   the `N 0 obj` line, **not** the comment — verified against the oracle);
 //! * object numbers are contiguous, numbered `1..N` in file order — qpdf's
 //!   `fix-qdf` requires this (it aborts on the first out-of-sequence object)
 //!   and [`fix_qdf`] rejects non-sequential numbering the same way;
-//! * stream lengths are stored as an *indirect* reference `/Length M G R`, with
-//!   the length itself living in a standalone `M G obj` whose body is a single
-//!   integer (qpdf canonical QDF never inlines a direct `/Length <n>` for an
-//!   actual stream — the oracle does not fix a direct length either);
+//! * qpdf's QDF writer emits a real stream's `/Length` as an indirect
+//!   `/Length M 0 R` and puts a synthetic integer object immediately after the
+//!   stream. qpdf's `fix-qdf` tool does not read that dictionary key, though:
+//!   its `st_after_stream` state takes the next positional `N 0 obj` as the
+//!   holder and rewrites that object's next line, regardless of the `/Length`
+//!   value, generation, or presence;
 //! * a tail that is EITHER a single classic `xref` table with one `0 N`
 //!   subsection, followed by a `trailer` dictionary, `startxref`, and
 //!   `%%EOF`, OR a cross-reference stream (`/Type /XRef`) object folding the
@@ -58,16 +60,16 @@
 //!
 //! ## The four regenerated regions
 //!
-//! 1. **Stream `/Length`** — for every stream object the length is the exact
-//!    number of bytes between the end of the line containing the `stream`
-//!    keyword and the `endstream` keyword: counting starts at the first byte
-//!    after the `stream` keyword's end-of-line marker (`\r\n`, `\n`, or `\r`)
-//!    and ends at (but excludes) the `endstream` keyword. No EOL normalization
-//!    is performed. If the exact standalone line `%QDF: ignore_newline` occurs
-//!    between the stream object and its immediately following length holder,
-//!    one framing byte is excluded. The recomputed value is written into the
-//!    indirect length object's body as a plain decimal integer (no zero
-//!    padding).
+//! 1. **Stream length holder** — for an ordinary stream, qpdf counts bytes
+//!    between the end of the `stream` line and the `endstream` keyword. It
+//!    then remains in `st_after_stream`: every exact LF-terminated
+//!    `%QDF: ignore_newline` line before the next object subtracts one byte
+//!    (until the count reaches zero). If the next recognized line is `N 0 obj`,
+//!    its following line must consist only of decimal digits plus LF; qpdf
+//!    replaces that line with the measured length and does not look up
+//!    `/Length M G R`. If no such header occurs before the tail, qpdf remains
+//!    in `st_after_stream` and copies the remaining xref/trailer bytes without
+//!    regenerating them. No EOL normalization is performed.
 //! 2. **xref offsets** — each in-use object's 10-digit offset is the byte
 //!    offset of the start of its `N G obj` line in the *rewritten* output.
 //! 3. **trailer `/Size`** — object count + 1 (equivalently the highest object
@@ -102,19 +104,15 @@ struct ObjStmMember {
 /// (`qpdf/fix-qdf.cc`'s `st_in_obj` dispatch on the object's dictionary).
 #[derive(Debug, Clone)]
 enum ObjectBody {
-    /// A regular object: a non-stream object, or a stream with a (possibly
-    /// indirect) `/Length`.
+    /// A regular object: a non-stream object or an ordinary stream.
     Plain {
         /// If this object directly contains a stream, the verbatim
         /// recomputed `/Length` value (byte count between the `stream` EOL
         /// and `endstream`).
         stream_len: Option<usize>,
-        /// If this object's stream dict uses an indirect `/Length M G R`,
-        /// the object number `M` that holds the length integer.
-        length_holder: Option<u32>,
-        /// qpdf emitted one framing LF that fix-qdf must exclude from
-        /// `stream_len`.
-        ignore_newline: bool,
+        /// Number of exact marker lines between this stream's endobj and the
+        /// next top-level object. qpdf subtracts once per line.
+        ignore_newline_count: usize,
     },
     /// An object stream (`/Type /ObjStm`).
     ObjStm {
@@ -155,21 +153,24 @@ enum ObjectBody {
     },
 }
 
-/// One parsed `N G obj ... endobj` body in the input.
+/// One parsed qpdf-recognized `N 0 obj ... endobj` body in the input.
 #[derive(Debug, Clone)]
 struct ObjectSpan {
     num: u32,
     gen: u32,
-    /// Byte offset (in the *input*) of the start of the `N G obj` line.
+    /// Byte offset (in the *input*) of the start of the `N 0 obj` line.
     obj_line_start: usize,
+    /// Byte offset (in the *input*) of the first body line after the exact
+    /// qpdf `N 0 obj\n` header.
+    body_start: usize,
     /// Byte offset (in the *input*) one past the `endobj` keyword's line
     /// (start of the next byte region, used as this object's end bound).
     end: usize,
     body: ObjectBody,
 }
 
-/// Find the next line that begins exactly with `N G obj` at `from`, scanning
-/// line by line. Returns `(num, gen, line_start, content_after_obj_kw)`.
+/// Find the next qpdf `N 0 obj\n` line at `from`, scanning line by line.
+/// Returns `(num, gen, line_start, content_after_obj_kw)`.
 ///
 /// Stops (returns `None`) upon the first top-level `xref` keyword line,
 /// without considering any further lines. This mirrors qpdf's own `st_top`
@@ -186,8 +187,10 @@ fn find_next_obj(input: &[u8], from: usize) -> Option<(u32, u32, usize, usize)> 
     while line_start < input.len() {
         let line_end = memchr_nl(input, line_start).unwrap_or(input.len());
         let line = &input[line_start..line_end];
-        if let Some((num, gen, kw_end)) = parse_obj_header(line) {
-            return Some((num, gen, line_start, line_start + kw_end));
+        if line_end < input.len() {
+            if let Some((num, gen, kw_end)) = parse_obj_header(line) {
+                return Some((num, gen, line_start, line_start + kw_end));
+            }
         }
         if is_xref_keyword_line(input, line_start) {
             return None;
@@ -223,47 +226,16 @@ fn memchr_nl(buf: &[u8], from: usize) -> Option<usize> {
         .map(|i| from + i)
 }
 
-/// Parse a line that should be `N G obj` (with optional trailing content after
-/// the `obj` keyword, e.g. nothing in canonical QDF). Returns
-/// `(num, gen, byte index just past "obj")` on success.
-///
-/// Requires `gen == 0`, exactly mirroring qpdf's own object-header regex
-/// `re_n_0_obj = "^(\d+) 0 obj\n$"` (`qpdf/fix-qdf.cc:87`), which hard-codes
-/// generation `0` into the pattern itself. A line like `1 1 obj` simply does
-/// not match that regex, so qpdf's `st_top` never recognizes it as an
-/// object header at all — it falls through to the state's default
-/// `std::cout << line;` and is echoed as plain text, `checkObjId` is never
-/// called for it, and `last_obj` is not incremented (`qpdf/fix-qdf.cc:126-134`).
-/// Returning `None` here for a non-zero generation reproduces that: the
-/// caller (`find_next_obj`) will keep scanning past this line for the next
-/// real object header, so the following genuine object then fails the
-/// sequential `1..N` check (matching the oracle's fatal `expected object N`
-/// at that same later point — confirmed against the live `fix-qdf` binary,
-/// which exits 2 with exactly that message on `1 1 obj` followed by
-/// `2 0 obj`).
+/// Parse the bytes before LF when they should be qpdf's exact `N 0 obj\n`
+/// object header. `find_next_obj` only calls this for LF-terminated lines.
+/// The literal spaces and generation match `re_n_0_obj` (`fix-qdf.cc:87`).
 fn parse_obj_header(line: &[u8]) -> Option<(u32, u32, usize)> {
-    // Trim a trailing '\r' (CRLF inputs).
-    let line = if line.last() == Some(&b'\r') {
-        &line[..line.len() - 1]
-    } else {
-        line
-    };
-    let s = std::str::from_utf8(line).ok()?;
-    let mut it = s.split_ascii_whitespace();
-    let num: u32 = it.next()?.parse().ok()?;
-    let gen: u32 = it.next()?.parse().ok()?;
-    if gen != 0 {
+    let number = line.strip_suffix(b" 0 obj")?;
+    if number.is_empty() || !number.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    if it.next()? != "obj" {
-        return None;
-    }
-    // canonical QDF puts nothing else on the line; reject if there is.
-    if it.next().is_some() {
-        return None;
-    }
-    let kw_end = s.rfind("obj")? + 3;
-    Some((num, gen, kw_end))
+    let num = std::str::from_utf8(number).ok()?.parse().ok()?;
+    Some((num, 0, line.len()))
 }
 
 /// Find the PDF name token `name` (e.g. `b"/Length"`, `b"/Size"`,
@@ -333,55 +305,6 @@ fn find_name_token_from(hay: &[u8], name: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-/// Scan a stream dictionary slice for `/Length M G R` (indirect) or
-/// `/Length <int>` (direct). Returns `Indirect(M)` or `Direct`.
-enum LengthKind {
-    /// Indirect `/Length M 0 R` — canonical QDF only ever uses generation 0.
-    Indirect(u32),
-    /// Indirect `/Length M G R` with `G != 0` — not canonical QDF; qdf_fix
-    /// keys holders by object number only, so a non-zero generation cannot be
-    /// validated/rewritten safely. Treated as an explicit error rather than
-    /// silently rewriting the wrong-generation object.
-    IndirectUnsupportedGeneration,
-    Direct,
-    None,
-}
-
-fn classify_length(dict: &[u8]) -> LengthKind {
-    // Find the PDF *name token* `/Length` in object syntax (skipping strings,
-    // hex strings, and comments; requiring a trailing token boundary so
-    // `/Length1` etc. do not match).
-    let needle = b"/Length";
-    let Some(p) = find_name_token(dict, needle) else {
-        return LengthKind::None;
-    };
-    let rest = &dict[p + needle.len()..];
-    let s = match std::str::from_utf8(rest) {
-        Ok(s) => s,
-        Err(_) => return LengthKind::None,
-    };
-    let mut it = s.split_ascii_whitespace();
-    let Some(first) = it.next() else {
-        return LengthKind::None;
-    };
-    if first.parse::<u32>().is_err() {
-        return LengthKind::None;
-    }
-    // Indirect form: `<int> <int> R`
-    let second = it.next();
-    let third = it.next();
-    if let (Some(g), Some(r)) = (second, third) {
-        if let (Ok(gen), "R") = (g.parse::<u32>(), r) {
-            return if gen == 0 {
-                LengthKind::Indirect(first.parse().unwrap())
-            } else {
-                LengthKind::IndirectUnsupportedGeneration
-            };
-        }
-    }
-    LengthKind::Direct
-}
-
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || hay.len() < needle.len() {
         return None;
@@ -389,13 +312,30 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Whether an inter-object separator contains qpdf's exact standalone marker.
-/// qpdf's fix-qdf recognizes only the LF-terminated line with no surrounding
-/// whitespace, so CRLF and lookalike comments intentionally do not match.
-fn has_ignore_newline_marker(separator: &[u8]) -> bool {
+/// Count qpdf's exact standalone marker lines in one inter-object separator.
+/// Only the LF-terminated line with no surrounding whitespace matches; CRLF
+/// and lookalike comments intentionally do not.
+fn ignore_newline_marker_count(separator: &[u8]) -> usize {
     separator
         .split_inclusive(|&b| b == b'\n')
-        .any(|line| line == b"%QDF: ignore_newline\n")
+        .filter(|line| *line == b"%QDF: ignore_newline\n")
+        .count()
+}
+
+/// Return the input range of a top-level object's first body line when it is
+/// bare decimal digits plus LF (`fix-qdf.cc:90,256-259`). Its header was
+/// already recognized by `parse_obj_header` using qpdf's `re_n_0_obj`.
+fn qpdf_bare_integer_line_range(input: &[u8], object: &ObjectSpan) -> Option<(usize, usize)> {
+    let integer_start = object.body_start;
+    let integer_end = memchr_nl(input, integer_start)?;
+    if integer_end + 1 > object.end {
+        return None;
+    }
+    let integer = &input[integer_start..integer_end];
+    if integer.is_empty() || !integer.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some((integer_start, integer_end + 1))
 }
 
 /// Whether a dict's lines contain qpdf's exact, oracle-literal type marker
@@ -684,11 +624,12 @@ fn check_sequential(num: u32, last: u32, err_offset: usize) -> Result<u32> {
 ///   compressed-object entry), so this combination cannot arise from
 ///   genuine QDF input.
 /// * [`Error::Parse`] if the input does not look like a QDF file (no `xref`
-///   table or cross-reference stream, malformed trailer, an indirect
-///   `/Length` whose holder object is missing, an object stream with no
-///   `%% Object stream: object N` marker lines, or object numbers — spanning
-///   both top-level objects and object stream members — that are not
-///   contiguous `1..N` in file order).
+///   table or cross-reference stream, malformed trailer, a positional length
+///   holder whose first body line is not a bare integer, an object stream
+///   with no `%% Object stream: object N` marker lines, or object numbers —
+///   spanning both top-level objects and object stream members — that are not
+///   contiguous `1..N` in file order). A declared indirect `/Length M G R`
+///   is never inspected, so a missing holder object is not an error.
 pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     // ---- 1. Parse all `N G obj` spans, from the start of the file. ------
     // Unlike the classic-only version, we do NOT pre-locate a tail `xref`
@@ -835,33 +776,18 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
                             extends,
                         }
                     } else {
-                        let mut length_holder = None;
-                        match classify_length(dict) {
-                            LengthKind::Indirect(m) => length_holder = Some(m),
-                            LengthKind::IndirectUnsupportedGeneration => {
-                                return Err(Error::parse(
-                                    line_start,
-                                    "fix_qdf: stream /Length holder with non-zero generation \
-                                 is not supported (canonical QDF uses generation 0)",
-                                ));
-                            }
-                            LengthKind::Direct | LengthKind::None => {
-                                // Canonical qpdf QDF always uses an indirect length for
-                                // real streams; the oracle does not rewrite a direct
-                                // one. Leave it untouched (verbatim preservation).
-                            }
-                        }
+                        // qpdf's st_after_stream state does not inspect the
+                        // dictionary's /Length entry. Holder selection is
+                        // derived from the next top-level object after parsing.
                         ObjectBody::Plain {
                             stream_len: Some(endstream_kw_abs - content_start_abs),
-                            length_holder,
-                            ignore_newline: false,
+                            ignore_newline_count: 0,
                         }
                     }
                 } else {
                     ObjectBody::Plain {
                         stream_len: None,
-                        length_holder: None,
-                        ignore_newline: false,
+                        ignore_newline_count: 0,
                     }
                 };
             (body, end)
@@ -872,6 +798,7 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
             num,
             gen,
             obj_line_start: line_start,
+            body_start: kw_end + 1,
             end,
             body,
         });
@@ -938,124 +865,53 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     }
     let size = last_obj as usize + 1;
 
-    // qpdf writes the marker after the stream object's `endobj` and directly
-    // before its synthetic length holder. Associate only that exact separator
-    // with the stream; marker-like bytes in the dictionary, payload, or a
-    // different inter-object region cannot affect its length.
+    // qpdf remains in st_after_stream after the stream's endobj and consumes
+    // every exact marker line until it reaches the next object header. Count
+    // only bytes in that separator; marker-like bytes in the dictionary,
+    // payload, or a different inter-object region cannot affect the length.
     for i in 0..objects.len().saturating_sub(1) {
-        let next_num = objects[i + 1].num;
         let end = objects[i].end;
         let next_start = objects[i + 1].obj_line_start;
         if let ObjectBody::Plain {
-            length_holder: Some(h),
-            ignore_newline,
+            stream_len: Some(_),
+            ignore_newline_count,
             ..
         } = &mut objects[i].body
         {
-            if *h == next_num {
-                let separator = &input[end..next_start];
-                *ignore_newline = has_ignore_newline_marker(separator);
-            }
+            let separator = &input[end..next_start];
+            *ignore_newline_count = ignore_newline_marker_count(separator);
         }
     }
 
-    // ---- 2. Compute the new length-holder integer bodies. ---------------
-    // Validate every indirect `/Length M G R` holder:
-    //   * the holder object `M` must actually exist in the parsed set —
-    //     otherwise the "repaired" file still carries a dangling indirect
-    //     length and is invalid for downstream readers; and
-    //   * a holder reused by two streams with *conflicting* lengths is an
-    //     explicit error rather than silent last-writer-wins (which would
-    //     leave the earlier stream's /Length wrong).
-    // A canonical QDF indirect /Length is always `M 0 R` (generation 0;
-    // non-zero generations are rejected above). The holder must therefore be
-    // an object whose number is M AND whose generation is 0 — matching on the
-    // number alone would wrongly accept/rewrite an `M G` object with G != 0.
-    // Only TOP-LEVEL objects are eligible holders — provably so, not just by
-    // convention: in `fix-qdf.cc`, `st_in_length` (where an indirect
-    // /Length's holder value is written) is reachable only from
-    // `st_after_stream` matching `re_n_0_obj`, and `st_after_stream` is only
-    // reachable from `st_top`/`st_in_obj` (top-level object states). The
-    // `st_in_ostream_*` states used while inside an object stream have no
-    // transition into `st_after_stream`/`st_in_length` at all, so qpdf's own
-    // state machine can never treat a compressed member as a length holder.
-    // A holder number that resolves to one therefore correctly fails loud as
-    // "missing" below.
-    //
-    // The holder's classified BODY must also be `Plain` (not `ObjStm`/
-    // `XRefStream`) — this is a real qpdf behavior, not an
-    // implementation-specific restriction, though the underlying oracle
-    // mechanism is different from
-    // what this M-keyed lookup implements. qpdf's own `st_in_length` never
-    // reads the declared `/Length M G R` value at all: it is purely
-    // positional — whatever top-level object immediately follows a stream's
-    // `endobj` (skipping an optional `%QDF: ignore_newline` marker line) is
-    // unconditionally treated as ITS length holder via `checkObjId`, and
-    // `st_in_length` then requires that object's OWN second line to match
-    // `re_num` ("^\d+\n$", a bare integer) or fatals "expected integer"
-    // (`fix-qdf.cc:256-259`). An `/Type /ObjStm` or `/Type /XRef` object's
-    // second line is always a dict token (`<<`/a key), never a bare
-    // integer, so REAL qpdf fatals whenever the positionally-next object
-    // after a stream is one of these types — confirmed against the live
-    // `fix-qdf` binary: a stream immediately followed by an `/Type /ObjStm`
-    // object it declares as its `/Length` holder exits 2 with "expected
-    // integer" rather than producing a repaired file. This flpdf function
-    // is declared-M-keyed rather than positional, so it does not reproduce
-    // qpdf's mechanism when the declared M and "positionally next" diverge
-    // (confirmed separately: a declared `/Length 99 0 R` where object 99
-    // does not exist is silently ignored by the live oracle, which
-    // overwrites whatever plain-integer object actually sits next instead
-    // of erroring) — that gap is a pre-existing declared-M-vs-positional
-    // architecture difference outside this check's scope. Rejecting an
-    // ObjStm/XRefStream-typed holder here
-    // fails loud instead of silently emitting `Ok` with an unresolved
-    // `/Length` reference, matching the oracle for the reported common
-    // shape and erring toward failure (like the `Error::Unsupported` block
-    // above) rather than toward silent corruption for the rest.
-    let gen0_bodies: std::collections::HashMap<u32, &ObjectBody> = objects
-        .iter()
-        .filter(|o| o.gen == 0)
-        .map(|o| (o.num, &o.body))
-        .collect();
-    let mut new_len_body: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
-    for obj in &objects {
-        if let ObjectBody::Plain {
+    // ---- 2. Compute qpdf's positional length-holder replacements. --------
+    // qpdf's st_after_stream transition is immediate: it does not resolve a
+    // dictionary reference or skip an object whose body is not an integer.
+    // The next N 0 obj line enters st_in_length, whose next line must contain
+    // only decimal digits followed by LF (`fix-qdf.cc:246-264`).
+    let mut new_len_body: Vec<Option<(usize, usize, usize)>> = vec![None; objects.len()];
+    for (i, obj) in objects.iter().enumerate() {
+        let ObjectBody::Plain {
             stream_len: Some(measured_len),
-            length_holder: Some(holder),
-            ignore_newline,
+            ignore_newline_count,
         } = &obj.body
-        {
-            let len = if *ignore_newline {
-                measured_len.saturating_sub(1)
-            } else {
-                *measured_len
-            };
-            match gen0_bodies.get(holder) {
-                None => {
-                    return Err(Error::parse(
-                        obj.obj_line_start,
-                        "fix_qdf: stream's indirect /Length holder object (M 0) is missing",
-                    ));
-                }
-                Some(ObjectBody::ObjStm { .. } | ObjectBody::XRefStream { .. }) => {
-                    return Err(Error::parse(
-                        obj.obj_line_start,
-                        "fix_qdf: stream's indirect /Length holder object (M 0) is an \
-                         object stream or cross-reference stream, not a plain integer",
-                    ));
-                }
-                Some(ObjectBody::Plain { .. }) => {}
-            }
-            if let Some(&prev) = new_len_body.get(holder) {
-                if prev != len {
-                    return Err(Error::parse(
-                        obj.obj_line_start,
-                        "fix_qdf: indirect /Length holder reused with conflicting lengths",
-                    ));
-                }
-            }
-            new_len_body.insert(*holder, len);
-        }
+        else {
+            continue;
+        };
+        let Some(successor) = objects.get(i + 1) else {
+            continue;
+        };
+        let Some((integer_start, integer_end)) = qpdf_bare_integer_line_range(input, successor)
+        else {
+            return Err(Error::parse(
+                successor.body_start,
+                "fix_qdf: expected integer",
+            ));
+        };
+        new_len_body[i + 1] = Some((
+            measured_len.saturating_sub(*ignore_newline_count),
+            integer_start,
+            integer_end,
+        ));
     }
 
     // ---- 3. Emit the rewritten body, substituting length-holder bodies,
@@ -1088,7 +944,7 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
             out.extend_from_slice(&input[prev_end..obj.obj_line_start]);
         }
 
-        // This object's offset = current output length (start of `N G obj`).
+        // This object's offset = current output length (start of `N 0 obj`).
         let this_offset = out.len();
         new_offsets.push((obj.num, obj.gen, this_offset));
         entries.push(crate::XrefEntry::Uncompressed {
@@ -1097,14 +953,13 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
 
         match &obj.body {
             ObjectBody::Plain { .. } => {
-                // Only a generation-0 object can be the holder a canonical
-                // `M 0 R` /Length points at — never rewrite an `M G` object
-                // with G != 0.
-                if let Some(&new_len) = new_len_body.get(&obj.num).filter(|_| obj.gen == 0) {
-                    // Rewrite this length-holder object: keep the `N G obj`
-                    // line and `endobj`, replace the integer body with the
-                    // recomputed value.
-                    rewrite_length_holder(&mut out, &input[obj.obj_line_start..obj.end], new_len)?;
+                if let Some((new_len, integer_start, integer_end)) = new_len_body[i] {
+                    // Rewrite the integer body of the positionally selected
+                    // object, preserving its header, framing, and endobj.
+                    out.extend_from_slice(&input[obj.obj_line_start..integer_start]);
+                    out.extend_from_slice(new_len.to_string().as_bytes());
+                    out.push(b'\n');
+                    out.extend_from_slice(&input[integer_end..obj.end]);
                 } else {
                     // Copy the object verbatim.
                     out.extend_from_slice(&input[obj.obj_line_start..obj.end]);
@@ -1157,6 +1012,22 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
                 return Ok(out);
             }
         }
+    }
+
+    // If the final recognized object is an ordinary stream, qpdf never saw a
+    // positional N 0 obj after it and therefore never returned from
+    // st_after_stream to st_top. Earlier holders have already been rewritten;
+    // the rest of the input, including the xref/trailer tail, is copied raw.
+    if matches!(
+        objects.last().map(|object| &object.body),
+        Some(ObjectBody::Plain {
+            stream_len: Some(_),
+            ..
+        })
+    ) {
+        let last_end = objects.last().unwrap().end;
+        out.extend_from_slice(&input[last_end..]);
+        return Ok(out);
     }
 
     // ---- 4. Emit the regenerated classic xref table (this form only). ---
@@ -1256,50 +1127,6 @@ fn find_line_keyword_from(input: &[u8], kw: &[u8], from: usize) -> Option<usize>
         i += 1;
     }
     None
-}
-
-/// Given the verbatim bytes of a length-holder object (`N G obj\n<int>\nendobj`
-/// possibly with different whitespace), emit it with the integer replaced by
-/// `new_len`, preserving the `obj`/`endobj` lines and surrounding whitespace.
-fn rewrite_length_holder(out: &mut Vec<u8>, obj_bytes: &[u8], new_len: usize) -> Result<()> {
-    // Find end of the `N G obj` header line.
-    let nl = obj_bytes
-        .iter()
-        .position(|&b| b == b'\n')
-        .ok_or_else(|| Error::parse(0, "fix_qdf: malformed length object header"))?;
-    // Header (including its newline) copied verbatim.
-    out.extend_from_slice(&obj_bytes[..=nl]);
-
-    // The body is everything up to the `endobj` keyword. Preserve leading and
-    // trailing whitespace around the integer so the file shape is kept.
-    let endobj_rel = find_line_keyword_from(obj_bytes, b"endobj", nl + 1)
-        .ok_or_else(|| Error::parse(0, "fix_qdf: length object missing endobj"))?;
-    let body = &obj_bytes[nl + 1..endobj_rel];
-
-    // Split body into leading whitespace, the integer token, trailing bytes.
-    let lead = body
-        .iter()
-        .take_while(|&&b| b.is_ascii_whitespace())
-        .count();
-    let after_int = body[lead..]
-        .iter()
-        .position(|&b| !b.is_ascii_digit())
-        .map(|p| lead + p)
-        .unwrap_or(body.len());
-    // Sanity: the token between lead..after_int must be all digits.
-    if after_int == lead || !body[lead..after_int].iter().all(|b| b.is_ascii_digit()) {
-        return Err(Error::parse(
-            0,
-            "fix_qdf: length-holder body is not a plain integer",
-        ));
-    }
-    out.extend_from_slice(&body[..lead]);
-    out.extend_from_slice(new_len.to_string().as_bytes());
-    out.extend_from_slice(&body[after_int..]);
-
-    // Emit `endobj` and the rest of the object verbatim.
-    out.extend_from_slice(&obj_bytes[endobj_rel..]);
-    Ok(())
 }
 
 /// Find the `>>` that closes the dictionary opened by `<<` at `open`,

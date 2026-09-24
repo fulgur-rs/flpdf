@@ -90,6 +90,13 @@ const SCANNER_EDGE_CASES: &[&str] = &[
     "corrupt-decoy-xref-line",
 ];
 
+/// Ordinary-stream holder cases for qpdf's positional state transition.
+const POSITIONAL_LENGTH_CASES: &[&str] = &[
+    "corrupt-length-position",
+    "corrupt-length-position-markers",
+    "corrupt-length-position-no-successor",
+];
+
 /// Each corrupted fixture, fixed by `flpdf::fix_qdf`, must equal the committed
 /// oracle golden byte-for-byte.
 #[test]
@@ -104,6 +111,7 @@ fn matches_oracle_golden_byte_for_byte() {
     .into_iter()
     .chain(OBJSTM_CASES.iter().copied())
     .chain(SCANNER_EDGE_CASES.iter().copied())
+    .chain(POSITIONAL_LENGTH_CASES.iter().copied())
     {
         let input = read(&format!("{case}.qdf"));
         let golden = read(&format!("{case}.golden.qdf"));
@@ -148,6 +156,7 @@ fn idempotent() {
     .into_iter()
     .chain(OBJSTM_CASES.iter().copied())
     .chain(SCANNER_EDGE_CASES.iter().copied())
+    .chain(POSITIONAL_LENGTH_CASES.iter().copied())
     {
         let input = read(&format!("{case}.qdf"));
         let once = flpdf::fix_qdf(&input).unwrap();
@@ -216,6 +225,7 @@ fn committed_goldens_still_match_live_oracle() {
     ]
     .into_iter()
     .chain(OBJSTM_CASES.iter().copied())
+    .chain(POSITIONAL_LENGTH_CASES.iter().copied())
     {
         use std::io::Write;
         let input = read(&format!("{case}.qdf"));
@@ -492,8 +502,8 @@ fn objstm_in_classic_xref_form_is_unsupported() {
 #[test]
 fn ignores_xref_and_stream_inside_object_body() {
     // obj 1: stream whose dict has a string containing the word "stream" and
-    // whose decompressed content contains a line `xref`. /Length is indirect
-    // (held by obj 3). Initial xref offsets are intentionally bogus zeros —
+    // whose decompressed content contains a line `xref`. /Length points to
+    // obj 3, but qpdf's positional integer holder is obj 2. Initial xref offsets are intentionally bogus zeros —
     // fix_qdf must regenerate them and still pick the real table at the tail.
     // Object numbering is contiguous 1..3 (qpdf's fix-qdf rejects gaps).
     let mut pdf = Vec::new();
@@ -501,17 +511,17 @@ fn ignores_xref_and_stream_inside_object_body() {
     pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n");
     pdf.extend_from_slice(b"<<\n  /Length 3 0 R\n  /Note (the word stream appears here)\n>>\n");
     pdf.extend_from_slice(b"stream\nline one\nxref\nendstream\nendobj\n\n");
+    pdf.extend_from_slice(b"2 0 obj\n0\nendobj\n\n");
     pdf.extend_from_slice(
-        b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
+        b"%% Original object ID: 2 0\n3 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
     );
-    pdf.extend_from_slice(b"%% Original object ID: 3 0\n3 0 obj\n0\nendobj\n\n");
     // Real (tail) xref table with deliberately wrong offsets.
     pdf.extend_from_slice(b"xref\n0 4\n");
     pdf.extend_from_slice(b"0000000000 65535 f \n");
     pdf.extend_from_slice(b"0000000000 00000 n \n");
     pdf.extend_from_slice(b"0000000000 00000 n \n");
     pdf.extend_from_slice(b"0000000000 00000 n \n");
-    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 4\n>>\nstartxref\n0\n%%EOF\n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 3 0 R\n  /Size 4\n>>\nstartxref\n0\n%%EOF\n");
 
     let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must succeed");
     let s = &fixed;
@@ -529,11 +539,11 @@ fn ignores_xref_and_stream_inside_object_body() {
         "real xref table must be regenerated at the tail"
     );
 
-    // /Length holder (obj 3) recomputed to the verbatim content byte count:
+    // Positional holder (obj 2) recomputed to the verbatim content byte count:
     // "line one\nxref\n" == 14 bytes (after `stream`+EOL, up to line `endstream`).
     assert!(
-        find(s, b"3 0 obj\n14\nendobj").is_some(),
-        "indirect /Length holder must be recomputed to 14, got:\n{}",
+        find(s, b"2 0 obj\n14\nendobj").is_some(),
+        "positional integer holder must be recomputed to 14, got:\n{}",
         String::from_utf8_lossy(s)
     );
 
@@ -557,7 +567,8 @@ fn stream_body_endobj_and_xref_not_mistaken_for_object_terminator() {
     // obj 1: stream whose decompressed body contains BOTH a line `endobj` and
     // a line `xref`; the object terminator must still be found after
     // `endstream`.
-    // /Length is indirect (held by obj 3). xref offsets are bogus zeros.
+    // /Length points at obj 3, but qpdf's positional integer holder is obj 2.
+    // Xref offsets are bogus zeros.
     // Object numbering is contiguous 1..3 (qpdf's fix-qdf rejects gaps).
     let mut pdf = Vec::new();
     pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
@@ -567,17 +578,17 @@ fn stream_body_endobj_and_xref_not_mistaken_for_object_terminator() {
     pdf.extend_from_slice(
         b"stream\nsome content\nendobj\nmore content\nxref\nfinal line\nendstream\nendobj\n\n",
     );
+    pdf.extend_from_slice(b"2 0 obj\n0\nendobj\n\n");
     pdf.extend_from_slice(
-        b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
+        b"%% Original object ID: 2 0\n3 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
     );
-    pdf.extend_from_slice(b"%% Original object ID: 3 0\n3 0 obj\n0\nendobj\n\n");
     // Real (tail) xref table with deliberately wrong offsets.
     pdf.extend_from_slice(b"xref\n0 4\n");
     pdf.extend_from_slice(b"0000000000 65535 f \n");
     pdf.extend_from_slice(b"0000000000 00000 n \n");
     pdf.extend_from_slice(b"0000000000 00000 n \n");
     pdf.extend_from_slice(b"0000000000 00000 n \n");
-    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 4\n>>\nstartxref\n0\n%%EOF\n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 3 0 R\n  /Size 4\n>>\nstartxref\n0\n%%EOF\n");
 
     let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must succeed on stream-body-endobj input");
 
@@ -599,13 +610,13 @@ fn stream_body_endobj_and_xref_not_mistaken_for_object_terminator() {
         "real xref table must be regenerated at the tail"
     );
 
-    // /Length holder (obj 3) recomputed to the verbatim content byte count:
+    // Positional holder (obj 2) recomputed to the verbatim content byte count:
     // "some content\nendobj\nmore content\nxref\nfinal line\n" = 50 bytes.
     let expected_len = b"some content\nendobj\nmore content\nxref\nfinal line\n".len();
-    let expected_holder = format!("3 0 obj\n{expected_len}\nendobj");
+    let expected_holder = format!("2 0 obj\n{expected_len}\nendobj");
     assert!(
         find(&fixed, expected_holder.as_bytes()).is_some(),
-        "indirect /Length holder must be recomputed to {expected_len};\ngot:\n{}",
+        "positional integer holder must be recomputed to {expected_len};\ngot:\n{}",
         String::from_utf8_lossy(&fixed)
     );
 
@@ -617,98 +628,63 @@ fn stream_body_endobj_and_xref_not_mistaken_for_object_terminator() {
     );
 }
 
-/// A `/Length1` key must not be mistaken for the real indirect `/Length` key:
-///   A stream dict containing `/Length1 999` before the real `/Length H 0 R`
-///   must not fool classify_length into treating `/Length1` as `/Length`.
-///   fix_qdf must locate and recompute the REAL indirect length holder H.
+/// `/Length1` and `/Length` dictionary values do not select qpdf's holder.
 #[test]
-fn length1_not_mistaken_for_indirect_length() {
-    // obj 1: stream with `/Length1 999` before the real `/Length 3 0 R`.
-    // obj 3 is the length holder. Bogus xref offsets.
-    // Object numbering is contiguous 1..3 (qpdf's fix-qdf rejects gaps).
+fn length1_and_wrong_length_target_do_not_control_positional_holder() {
+    // Object 2 is the positional holder even though /Length points to object 3.
     let mut pdf = Vec::new();
     pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
     pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n");
-    // /Length1 appears BEFORE /Length — the false-match scenario.
     pdf.extend_from_slice(b"<<\n  /Length1 999\n  /Length 3 0 R\n>>\n");
     pdf.extend_from_slice(b"stream\nhello world\nendstream\nendobj\n\n");
+    pdf.extend_from_slice(b"2 0 obj\n0\nendobj\n\n");
     pdf.extend_from_slice(
-        b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
+        b"%% Original object ID: 2 0\n3 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
     );
-    pdf.extend_from_slice(b"%% Original object ID: 3 0\n3 0 obj\n0\nendobj\n\n");
     pdf.extend_from_slice(b"xref\n0 4\n");
     pdf.extend_from_slice(b"0000000000 65535 f \n");
     pdf.extend_from_slice(b"0000000000 00000 n \n");
     pdf.extend_from_slice(b"0000000000 00000 n \n");
     pdf.extend_from_slice(b"0000000000 00000 n \n");
-    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 4\n>>\nstartxref\n0\n%%EOF\n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 3 0 R\n  /Size 4\n>>\nstartxref\n0\n%%EOF\n");
 
-    let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must succeed with /Length1 in dict");
+    let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf uses the positional object");
 
-    // /Length holder obj 3 must be recomputed to the stream body byte count:
-    // "hello world\n" = 12 bytes.
     let expected_len = b"hello world\n".len();
-    let expected_holder = format!("3 0 obj\n{expected_len}\nendobj");
+    let expected_holder = format!("2 0 obj\n{expected_len}\nendobj");
     assert!(
         find(&fixed, expected_holder.as_bytes()).is_some(),
-        "indirect /Length holder must be recomputed to {expected_len} (not fooled by /Length1);\ngot:\n{}",
+        "positional holder must be recomputed to {expected_len};\ngot:\n{}",
         String::from_utf8_lossy(&fixed)
     );
-
-    // /Length1 must NOT have been misread as the holder reference — obj 999
-    // does not exist, so if classify_length had parsed 999 as the holder num
-    // the function would return an error above. The fact that we got Ok(fixed)
-    // already proves we didn't pick /Length1. Assert the stale holder (0) is
-    // gone and the correct value is present.
     assert!(
-        find(&fixed, b"3 0 obj\n0\nendobj").is_none(),
-        "stale holder value 0 must have been replaced"
+        find(&fixed, b"/Length1 999\n  /Length 3 0 R").is_some(),
+        "length-like dictionary bytes must remain verbatim"
     );
-
-    // Idempotent.
-    let again = flpdf::fix_qdf(&fixed).expect("fix_qdf must be idempotent");
-    assert_eq!(
-        again, fixed,
-        "fix_qdf must be idempotent on /Length1 output"
-    );
+    assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
 }
 
-/// A dictionary with ONLY `/Length1` and a
-/// direct `/Length` integer has no indirect holder; fix_qdf must leave the
-/// direct length verbatim, matching qpdf.
+/// A direct `/Length` value is preserved while the positional successor is updated.
 #[test]
-fn direct_length_with_length1_left_verbatim() {
-    // obj 1: stream with `/Length1 999` and a DIRECT `/Length 11`.
-    // No length-holder object exists.
+fn direct_length_with_length1_preserves_dict_and_rewrites_successor() {
     let mut pdf = Vec::new();
     pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
     pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n");
     pdf.extend_from_slice(b"<<\n  /Length1 999\n  /Length 11\n>>\n");
     pdf.extend_from_slice(b"stream\nhello world\nendstream\nendobj\n\n");
-    pdf.extend_from_slice(
-        b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
-    );
-    pdf.extend_from_slice(b"xref\n0 3\n");
+    pdf.extend_from_slice(b"2 0 obj\n0\nendobj\n\n");
+    pdf.extend_from_slice(b"3 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n");
+    pdf.extend_from_slice(b"xref\n0 4\n");
     pdf.extend_from_slice(b"0000000000 65535 f \n");
     pdf.extend_from_slice(b"0000000000 00000 n \n");
     pdf.extend_from_slice(b"0000000000 00000 n \n");
-    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 3\n>>\nstartxref\n0\n%%EOF\n");
+    pdf.extend_from_slice(b"0000000000 00000 n \n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 3 0 R\n  /Size 4\n>>\nstartxref\n0\n%%EOF\n");
 
-    let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must succeed on direct-length input");
+    let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must repair the positional integer");
 
-    // The direct /Length 11 must be preserved verbatim (fix_qdf does not
-    // rewrite direct lengths — that is intentionally out of scope).
-    assert!(
-        find(&fixed, b"/Length 11\n").is_some(),
-        "direct /Length must be preserved verbatim;\ngot:\n{}",
-        String::from_utf8_lossy(&fixed)
-    );
-
-    // No spurious holder rewrite: /Length1 must not be touched.
-    assert!(
-        find(&fixed, b"/Length1 999\n").is_some(),
-        "/Length1 must be preserved verbatim"
-    );
+    assert!(find(&fixed, b"/Length1 999\n  /Length 11\n").is_some());
+    assert_positional_length(&fixed, b"hello world\n".len());
 }
 
 /// Closed loop for the flpdf QDF writer and flpdf::fix_qdf
@@ -850,39 +826,29 @@ fn ignore_newline_marker_repairs_raw_length_and_is_idempotent() {
     );
 }
 
-/// A `/Length` appearing inside a string value
-/// or a comment in the stream dict must NOT be mistaken for the real key.
-/// fix_qdf must still locate the genuine indirect `/Length H 0 R` and
-/// recompute holder H after the stream content is edited.
+/// Length-like text in strings, comments, and keys stays byte-preserved;
+/// none of it selects qpdf's positional holder.
 #[test]
-fn length_inside_string_or_comment_not_mistaken_for_key() {
+fn length_like_string_and_comment_do_not_control_positional_holder() {
     let mut pdf = Vec::new();
     pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
     pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n");
-    // Decoy `/Length` inside a literal string AND a comment, before the real
-    // indirect /Length key.
+    // Decoy `/Length` inside a literal string and a comment, before a wrong
+    // declared target. qpdf never examines any of these dictionary tokens.
     pdf.extend_from_slice(b"<<\n  /Note (a /Length 999 decoy)\n");
     pdf.extend_from_slice(b"  %% /Length 888 in a comment\n");
     pdf.extend_from_slice(b"  /Length 3 0 R\n>>\n");
     pdf.extend_from_slice(b"stream\nABCDEFGHIJ\nendstream\nendobj\n\n");
-    pdf.extend_from_slice(
-        b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
-    );
-    pdf.extend_from_slice(b"3 0 obj\n0\nendobj\n\n");
+    pdf.extend_from_slice(b"2 0 obj\n0\nendobj\n\n");
+    pdf.extend_from_slice(b"3 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n");
     pdf.extend_from_slice(b"xref\n0 4\n");
     pdf.extend_from_slice(b"0000000000 65535 f \n0000000000 00000 n \n");
     pdf.extend_from_slice(b"0000000000 00000 n \n0000000000 00000 n \n");
-    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 4\n>>\nstartxref\n0\n%%EOF\n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 3 0 R\n  /Size 4\n>>\nstartxref\n0\n%%EOF\n");
 
-    let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must succeed");
+    let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must use positional object 2");
 
-    // Holder object 3 must be recomputed to the on-disk content length of the
-    // stream payload ("ABCDEFGHIJ\n" = 11 bytes, payload + framing EOL).
-    assert!(
-        find(&fixed, b"\n3 0 obj\n11\nendobj").is_some(),
-        "indirect /Length holder 3 must be recomputed (decoy /Length in string/comment ignored):\n{}",
-        String::from_utf8_lossy(&fixed)
-    );
+    assert_positional_length(&fixed, b"ABCDEFGHIJ\n".len());
     // The decoy string and comment are preserved verbatim.
     assert!(find(&fixed, b"/Note (a /Length 999 decoy)").is_some());
     assert!(find(&fixed, b"%% /Length 888 in a comment").is_some());
@@ -1078,12 +1044,143 @@ fn stream_keywords_inside_dict_string_not_mistaken_for_stream() {
     assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
 }
 
-// ── Indirect /Length holder validation ─────────────────────────────────────
+// ── qpdf's positional stream-length holder state ────────────────────────────
 
-/// A stream whose indirect `/Length M G R` points at a NON-existent object
-/// `M` must be rejected, not silently "repaired" with a dangling /Length.
+fn positional_length_qdf(
+    length_entry: Option<&[u8]>,
+    marker_count: usize,
+    next_body: &[u8],
+) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n1 0 obj\n<<\n".to_vec();
+    if let Some(entry) = length_entry {
+        pdf.extend_from_slice(entry);
+        pdf.push(b'\n');
+    }
+    pdf.extend_from_slice(b">>\nstream\nabc\nendstream\nendobj\n");
+    for _ in 0..marker_count {
+        pdf.extend_from_slice(b"%QDF: ignore_newline\n");
+    }
+    pdf.extend_from_slice(b"2 0 obj\n");
+    pdf.extend_from_slice(next_body);
+    if !next_body.is_empty() && !next_body.ends_with(b"\n") {
+        pdf.push(b'\n');
+    }
+    pdf.extend_from_slice(b"endobj\n\n3 0 obj\n<<\n/Type /Catalog\n>>\nendobj\n\n");
+    pdf.extend_from_slice(
+        b"xref\n0 4\n0000000000 65535 f \n0000000000 00000 n \n\
+          0000000000 00000 n \n0000000000 00000 n \n",
+    );
+    pdf.extend_from_slice(b"trailer <<\n  /Root 3 0 R\n  /Size 4\n>>\nstartxref\n0\n%%EOF\n");
+    pdf
+}
+
+fn assert_positional_length(fixed: &[u8], length: usize) {
+    let expected = format!("\n2 0 obj\n{length}\nendobj");
+    assert!(
+        find(fixed, expected.as_bytes()).is_some(),
+        "positional object 2 must contain length {length}:\n{}",
+        String::from_utf8_lossy(fixed)
+    );
+}
+
 #[test]
-fn missing_indirect_length_holder_is_rejected() {
+fn wrong_length_target_still_rewrites_positionally_next_object() {
+    let input = positional_length_qdf(Some(b"  /Length 99 0 R"), 0, b"0\n");
+    let fixed = flpdf::fix_qdf(&input).expect("qpdf ignores the declared holder number");
+
+    assert_positional_length(&fixed, 4);
+    assert!(find(&fixed, b"/Length 99 0 R").is_some());
+}
+
+#[test]
+fn direct_or_absent_length_still_rewrites_positional_object() {
+    for entry in [Some(&b"  /Length 44"[..]), None] {
+        let input = positional_length_qdf(entry, 0, b"0\n");
+        let fixed = flpdf::fix_qdf(&input).expect("qpdf does not inspect /Length");
+        assert_positional_length(&fixed, 4);
+        if let Some(entry) = entry {
+            assert!(fixed.windows(entry.len()).any(|window| window == entry));
+        } else {
+            assert!(find(&fixed, b"/Length ").is_none());
+        }
+    }
+}
+
+#[test]
+fn nonzero_length_generation_does_not_change_positional_holder() {
+    let input = positional_length_qdf(Some(b"  /Length 2 1 R"), 0, b"0\n");
+    let fixed = flpdf::fix_qdf(&input).expect("qpdf ignores the declared generation");
+
+    assert_positional_length(&fixed, 4);
+    assert!(find(&fixed, b"/Length 2 1 R").is_some());
+}
+
+#[test]
+fn each_ignore_newline_marker_line_subtracts_once() {
+    let input = positional_length_qdf(Some(b"  /Length 99 0 R"), 2, b"0\n");
+    let fixed = flpdf::fix_qdf(&input).expect("qpdf consumes both marker lines");
+
+    assert_positional_length(&fixed, 2);
+    assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
+}
+
+#[test]
+fn no_positional_successor_leaves_qpdf_tail_processing_in_st_after_stream() {
+    let input = read("corrupt-length-position-no-successor.qdf");
+    let golden = read("corrupt-length-position-no-successor.golden.qdf");
+    let fixed = flpdf::fix_qdf(&input).expect("qpdf returns success without a successor");
+
+    assert_eq!(
+        fixed, golden,
+        "partial st_after_stream output must match qpdf"
+    );
+    assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
+}
+
+#[test]
+fn unrecognized_positional_header_does_not_advance_object_numbering() {
+    let header = b"5 0 obj\n";
+    for replacement in [b"5  0 obj\n".as_slice(), b" 0 obj\n", b"x 0 obj\n"] {
+        let mut input = read("corrupt-length-position.qdf");
+        let position = find(&input, header).expect("holder 5 header");
+        input.splice(
+            position..position + header.len(),
+            replacement.iter().copied(),
+        );
+        let err = flpdf::fix_qdf(&input).unwrap_err();
+
+        assert!(
+            format!("{err}").contains("non-sequential object numbering"),
+            "qpdf ignores header {replacement:?}, so the next recognized object must fail its ID check: {err}"
+        );
+    }
+}
+
+#[test]
+fn positional_holder_requires_an_exact_bare_integer_line() {
+    let invalid_bodies: [&[u8]; 4] = [b" 0\n", b"0 \n", b"0\r\n", b""];
+    for body in invalid_bodies {
+        let input = positional_length_qdf(Some(b"  /Length 2 0 R"), 0, body);
+        let err = match flpdf::fix_qdf(&input) {
+            Err(err) => err,
+            Ok(output) => panic!(
+                "qpdf rejects holder body {body:?}, but fix_qdf returned:\n{}",
+                String::from_utf8_lossy(&output)
+            ),
+        };
+        assert!(
+            matches!(err, flpdf::Error::Parse { .. }),
+            "expected parse error: {err:?}"
+        );
+    }
+}
+
+// ── Positional successor validation ────────────────────────────────────────
+
+/// qpdf rejects a non-integer positional successor even when `/Length` points
+/// to an unrelated missing object.
+#[test]
+fn noninteger_positional_successor_is_rejected_with_missing_length_target() {
     let mut pdf = Vec::new();
     pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
     pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n");
@@ -1091,36 +1188,22 @@ fn missing_indirect_length_holder_is_rejected() {
     pdf.extend_from_slice(
         b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
     );
-    // No object 9 (the declared /Length holder) anywhere.
+    // Object 2 follows the stream but begins with a dictionary, not an integer.
     pdf.extend_from_slice(
         b"xref\n0 3\n0000000000 65535 f \n0000000000 00000 n \n0000000000 00000 n \n",
     );
     pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 3\n>>\nstartxref\n0\n%%EOF\n");
     let err = flpdf::fix_qdf(&pdf).unwrap_err();
     assert!(
-        format!("{err}").contains("holder object (M 0) is missing"),
-        "dangling indirect /Length holder must be an error, got: {err}"
+        format!("{err}").contains("integer"),
+        "expected integer error: {err}"
     );
 }
 
-/// A stream whose indirect `/Length M 0 R` points at an object classified
-/// as an object stream (`/Type /ObjStm`) must be rejected — not silently
-/// emitted with `/Length` left pointing at a dict/stream object instead of
-/// a resolved integer. Confirmed against the live `fix-qdf` binary: qpdf's
-/// `st_in_length` never actually reads the declared `M` value at all — it
-/// is purely positional, treating whatever top-level object immediately
-/// follows a stream's `endobj` as its length holder unconditionally
-/// (`qpdf/fix-qdf.cc:246-264`) — but when that object's own second line
-/// isn't a bare integer (`re_num`, `"^\d+\n$"`), which is always the case
-/// for an ObjStm's `<<` dict-open line, the oracle fatals with "expected
-/// integer" instead of producing a repaired file. This fixture's declared
-/// `M` genuinely is the positionally-next object (the shape this raw probe
-/// covers), so both the oracle and flpdf reject it. (flpdf's own holder
-/// resolution is declared-`M`-keyed rather than positional and does not
-/// reproduce the oracle's mechanism when the two diverge — a separate,
-/// pre-existing gap outside this fixture's scope.)
+/// The successor's body line must be an integer even when the successor is
+/// an ObjStm dictionary; qpdf fails before it reaches ObjStm processing.
 #[test]
-fn objstm_typed_length_holder_is_rejected() {
+fn objstm_successor_is_rejected_by_integer_line_rule() {
     let mut pdf = Vec::new();
     pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
     pdf.extend_from_slice(
@@ -1138,18 +1221,18 @@ fn objstm_typed_length_holder_is_rejected() {
     let err = flpdf::fix_qdf(&pdf).unwrap_err();
     assert!(
         matches!(err, flpdf::Error::Parse { .. }),
-        "an ObjStm-typed /Length holder must be an error, got: {err:?}"
+        "an ObjStm successor must fail qpdf's integer-line check, got: {err:?}"
     );
     assert!(
-        format!("{err}").contains("object stream or cross-reference stream"),
-        "unexpected error: {err}"
+        format!("{err}").contains("integer"),
+        "expected integer error: {err}"
     );
 }
 
-/// Two streams sharing one indirect /Length holder with DIFFERENT lengths is
-/// an explicit error (not silent last-writer-wins).
+/// A second stream immediately after the first cannot act as a bare integer
+/// holder, regardless of whether both `/Length` keys declare object 4.
 #[test]
-fn conflicting_indirect_length_holder_reuse_is_rejected() {
+fn following_stream_is_not_a_bare_integer_holder() {
     let mut pdf = Vec::new();
     pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
     pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n<<\n  /Length 4 0 R\n>>\nstream\nABC\nendstream\nendobj\n\n");
@@ -1162,78 +1245,8 @@ fn conflicting_indirect_length_holder_reuse_is_rejected() {
     pdf.extend_from_slice(b"trailer <<\n  /Root 3 0 R\n  /Size 5\n>>\nstartxref\n0\n%%EOF\n");
     let err = flpdf::fix_qdf(&pdf).unwrap_err();
     assert!(
-        format!("{err}").contains("conflicting lengths"),
-        "conflicting holder reuse must be an error, got: {err}"
-    );
-}
-
-/// Two streams sharing one holder with the SAME length is legitimate and
-/// must still succeed (no false conflict).
-#[test]
-fn same_length_indirect_holder_reuse_is_ok() {
-    let mut pdf = Vec::new();
-    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
-    pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n<<\n  /Length 4 0 R\n>>\nstream\nABC\nendstream\nendobj\n\n");
-    pdf.extend_from_slice(b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Length 4 0 R\n>>\nstream\nXYZ\nendstream\nendobj\n\n");
-    pdf.extend_from_slice(
-        b"%% Original object ID: 3 0\n3 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
-    );
-    pdf.extend_from_slice(b"4 0 obj\n0\nendobj\n\n");
-    pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n0000000000 00000 n \n0000000000 00000 n \n0000000000 00000 n \n0000000000 00000 n \n");
-    pdf.extend_from_slice(b"trailer <<\n  /Root 3 0 R\n  /Size 5\n>>\nstartxref\n0\n%%EOF\n");
-    let fixed = flpdf::fix_qdf(&pdf).expect("same-length holder reuse must succeed");
-    // Holder 4 recomputed to the (shared) on-disk length of "ABC\n" / "XYZ\n".
-    assert!(
-        find(&fixed, b"\n4 0 obj\n4\nendobj").is_some(),
-        "holder 4 must be recomputed to the shared length 4:\n{}",
-        String::from_utf8_lossy(&fixed)
-    );
-    assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
-}
-
-/// An indirect `/Length M G R` with a non-zero
-/// generation is not canonical QDF and cannot be validated/rewritten by
-/// object-number-keyed holder tracking — it must be an explicit error, not a
-/// silent wrong-generation rewrite.
-#[test]
-fn nonzero_generation_indirect_length_holder_is_rejected() {
-    let mut pdf = Vec::new();
-    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
-    pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n<<\n  /Length 4 1 R\n>>\nstream\nhello\nendstream\nendobj\n\n");
-    pdf.extend_from_slice(
-        b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
-    );
-    pdf.extend_from_slice(b"4 0 obj\n0\nendobj\n\n");
-    pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n0000000000 00000 n \n0000000000 00000 n \n0000000000 00000 n \n0000000000 00000 n \n");
-    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 5\n>>\nstartxref\n0\n%%EOF\n");
-    let err = flpdf::fix_qdf(&pdf).unwrap_err();
-    assert!(
-        format!("{err}").contains("non-zero generation"),
-        "non-zero-generation indirect /Length holder must be rejected, got: {err}"
-    );
-}
-
-/// An indirect `/Length 3 0 R` whose
-/// only object numbered 3 is `3 1 obj` (generation 1, NOT the gen-0 holder
-/// the reference points at) must be rejected — number-only matching would
-/// wrongly accept it and rewrite the wrong-generation object. (Numbering stays
-/// contiguous 1..3 so the gen mismatch — not a number gap — is what trips it.)
-#[test]
-fn indirect_length_holder_generation_must_match() {
-    let mut pdf = Vec::new();
-    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
-    pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n<<\n  /Length 3 0 R\n>>\nstream\nhello\nendstream\nendobj\n\n");
-    pdf.extend_from_slice(
-        b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
-    );
-    // Only `3 1 obj` exists — the `3 0` holder the /Length points at is absent.
-    pdf.extend_from_slice(b"3 1 obj\n0\nendobj\n\n");
-    pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n0000000000 00000 n \n0000000000 00000 n \n0000000000 00001 n \n");
-    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 4\n>>\nstartxref\n0\n%%EOF\n");
-    let err = flpdf::fix_qdf(&pdf).unwrap_err();
-    assert!(
-        format!("{err}").contains("holder object (M 0) is missing"),
-        "a /Length 3 0 R with only 3 1 obj must be rejected, got: {err}"
+        format!("{err}").contains("integer"),
+        "expected integer error: {err}"
     );
 }
 
