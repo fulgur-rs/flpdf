@@ -714,3 +714,43 @@ fn cell_d_fix_qdf_is_noop_and_idempotent_on_clean() {
         }
     }
 }
+
+#[test]
+fn cell_d_qdf_fix_rebuilds_empty_and_decoy_xref_tables() {
+    for case in [
+        "empty-qdf-direct-root",
+        "empty-qdf-decoy-xref-line",
+        "corrupt-decoy-xref-after-last-object",
+    ] {
+        let input = fixture("qdf-fix").join(format!("{case}.qdf"));
+        let expected = fixture("qdf-fix").join(format!("{case}.golden.qdf"));
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("fixed.qdf");
+        let output2 = tmp.path().join("fixed-again.qdf");
+
+        flpdf()
+            .args(["qdf-fix", input.to_str().unwrap(), output.to_str().unwrap()])
+            .assert()
+            .success();
+        let fixed = std::fs::read(&output).unwrap();
+        assert_eq!(
+            fixed,
+            std::fs::read(expected).unwrap(),
+            "qdf-fix CLI must match the qpdf golden for {case}"
+        );
+
+        flpdf()
+            .args([
+                "qdf-fix",
+                output.to_str().unwrap(),
+                output2.to_str().unwrap(),
+            ])
+            .assert()
+            .success();
+        assert_eq!(
+            fixed,
+            std::fs::read(output2).unwrap(),
+            "qdf-fix CLI must be idempotent for {case}"
+        );
+    }
+}
