@@ -1982,11 +1982,24 @@ flag を省略すれば qpdf の既定と同じくそのまま到達する。こ
 flag の繰り返し（`--newline-before-endstream --newline-before-endstream`）は
 qpdf が exit 0 で受理し単発と同一バイトを出す（`QPDFArgParser.cc:535-537` の
 bare handler は argv 走査の各 occurrence で再発火する）。clap は bool flag の
-重複を既定で拒否するため、`overrides_with` self を残してこれを受理する。
-なお `--qdf` / `--preserve-unreferenced` など他の bare flag は現状この重複を
-usage error にしており、qpdf と乖離している（`flpdf-glm2.1` のスコープ外、
-`flpdf-djmim` で追跡）。`--empty` / `--replace-input` は例外で、
-`QPDFJob_config.cc:27-39,54-62` に従い重複を usage error にするのが正しい。
+重複を既定で拒否するため、この flag には `overrides_with` self を設定する。
+
+同じ契約を他の qpdf main-table bare 設定 flag にも適用する
+（`flpdf-djmim`; `QPDFArgParser.cc:535-537`, registrations in
+`libqpdf/qpdf/auto_job_init.hh:39-91`）。flpdf は `arg_parser.rs` に明示した
+`QPDF_REPEATABLE_BARE_CONFIG_OPTIONS` の名前に一致する `SetTrue` 引数だけへ
+self-override を付け、root と subcommand の両 command tree で重複を受理する。
+qpdf setter は同じ boolean / enum 状態を再設定するため、各 occurrence の最終状態は
+単発と同じになる。`QPDF_BARE_LONG_OPTIONS` は argv suffix の正規化用で、
+`--empty` / `--replace-input` や option-table opener も含むため、repeatability の
+判定には使わない。`Command::args_override_self(true)` も command-wide に適用しない。
+
+`--empty` / `--replace-input` は例外で、`QPDFJob_config.cc:27-39,54-62` に従い
+重複を usage error にする。`--encrypt`、`--pages`、overlay / attachment / page-label
+segment opener は option table を切り替えるため、重複は現在の table grammar に従う
+（`QPDFJob_argv.cc:165-168,233-237,283-305,375-378`）。value option の occurrence
+validation と順序、特に `--job-json-file` は変更しない。qpdf differential と全名の
+scoped allowlist regression は `cli_tests.rs` および `arg_parser.rs` の tests で確認する。
 
 `flpdf-1qhb` では `--job-json-file` を clap の self-override 対象にせず
 `ArgAction::Append` で occurrence を保持し、`QPDFJob::initialize_from_json_partial_bytes`

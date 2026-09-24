@@ -1789,6 +1789,86 @@ fn preserve_unreferenced_retains_orphan_across_writer_cli_surfaces() {
 }
 
 #[test]
+fn repeated_idempotent_qpdf_bare_flags_match_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+
+    let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/qpdf-test98-minimal.pdf");
+    let temp = tempfile::tempdir().unwrap();
+    let qpdf_single_output = temp.path().join("qpdf-single.pdf");
+    let qpdf_repeated_output = temp.path().join("qpdf-repeated.pdf");
+
+    let qpdf_single = ProcessCommand::new("qpdf")
+        .args(["--static-id", "--qdf", "--preserve-unreferenced"])
+        .arg(&input)
+        .arg(&qpdf_single_output)
+        .output()
+        .expect("qpdf 11.9.0 should run");
+    let qpdf_repeated = ProcessCommand::new("qpdf")
+        .args([
+            "--static-id",
+            "--static-id",
+            "--qdf",
+            "--qdf",
+            "--preserve-unreferenced",
+            "--preserve-unreferenced",
+        ])
+        .arg(&input)
+        .arg(&qpdf_repeated_output)
+        .output()
+        .expect("qpdf 11.9.0 should run");
+    assert!(qpdf_single.status.success(), "qpdf single flags failed");
+    assert!(qpdf_repeated.status.success(), "qpdf repeated flags failed");
+    assert_eq!(qpdf_repeated.stdout, qpdf_single.stdout);
+    assert_eq!(qpdf_repeated.stderr, qpdf_single.stderr);
+    assert_eq!(
+        std::fs::read(&qpdf_repeated_output).unwrap(),
+        std::fs::read(&qpdf_single_output).unwrap(),
+        "repeating qpdf configuration flags must preserve the output bytes"
+    );
+
+    for (surface, prefix) in [("rewrite", vec!["rewrite"]), ("flat", Vec::<&str>::new())] {
+        let output = temp.path().join(format!("flpdf-{surface}.pdf"));
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .env("FLPDF_STATIC_ID_QUIET", "1")
+            .args(prefix)
+            .args([
+                "--static-id",
+                "--static-id",
+                "--qdf",
+                "--qdf",
+                "--preserve-unreferenced",
+                "--preserve-unreferenced",
+            ])
+            .arg(&input)
+            .arg(&output)
+            .output()
+            .expect("flpdf should run");
+
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf_repeated.status.code(),
+            "{surface} repeated flags should match qpdf status: {}",
+            String::from_utf8_lossy(&flpdf.stderr)
+        );
+        assert_eq!(flpdf.stdout, qpdf_repeated.stdout, "{surface} stdout");
+        assert_eq!(flpdf.stderr, qpdf_repeated.stderr, "{surface} stderr");
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            std::fs::read(&qpdf_repeated_output).unwrap(),
+            "{surface} repeated bare flags should match qpdf output bytes"
+        );
+    }
+}
+
+#[test]
 fn preserve_pages_retains_qpdf_promoted_deselected_inheritable_object() {
     let fixture = fixture_with_nested_pages();
     let temp = tempfile::tempdir().unwrap();

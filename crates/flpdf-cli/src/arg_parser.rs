@@ -8,7 +8,7 @@
 //! checks qpdf 11.9.0 output bytes for both routes.
 //! Auxiliary raw-argv scans use [`is_named_segment_option`], derived from
 //! [`SegmentKind::from_option`], so all parser openers including page labels share one list.
-use clap::Command;
+use clap::{ArgAction, Command};
 use flpdf::job::QPDFJob;
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
@@ -74,6 +74,77 @@ const QPDF_BARE_LONG_OPTIONS: &[&str] = &[
     "empty",
     "with-images",
 ];
+
+/// Main-table qpdf bare handlers whose `QPDFJob::Config` callbacks set
+/// repeatable configuration state (`libqpdf/qpdf/auto_job_init.hh:39-91`).
+/// This is deliberately separate from `QPDF_BARE_LONG_OPTIONS`, which also
+/// contains stateful input selectors and option-table openers.
+const QPDF_REPEATABLE_BARE_CONFIG_OPTIONS: &[&str] = &[
+    "allow-weak-crypto",
+    "check",
+    "check-linearization",
+    "coalesce-contents",
+    "decrypt",
+    "deterministic-id",
+    "externalize-inline-images",
+    "filtered-stream-data",
+    "flatten-rotation",
+    "generate-appearances",
+    "ignore-xref-streams",
+    "is-encrypted",
+    "json-input",
+    "keep-inline-images",
+    "linearize",
+    "list-attachments",
+    "newline-before-endstream",
+    "no-original-object-ids",
+    "no-warn",
+    "optimize-images",
+    "password-is-hex-key",
+    "preserve-unreferenced",
+    "progress",
+    "qdf",
+    "raw-stream-data",
+    "recompress-flate",
+    "remove-page-labels",
+    "remove-restrictions",
+    "report-memory-usage",
+    "requires-password",
+    "show-encryption",
+    "show-encryption-key",
+    "show-linearization",
+    "show-npages",
+    "show-pages",
+    "show-xref",
+    "static-aes-iv",
+    "static-id",
+    "suppress-password-recovery",
+    "suppress-recovery",
+    "test-json-schema",
+    "verbose",
+    "warning-exit-0",
+    "with-images",
+];
+
+/// Add clap self-overrides only to boolean arguments backed by qpdf main-table
+/// configuration callbacks. qpdf invokes those setters once per argv token;
+/// input selectors and option-table openers retain their own parsing rules.
+pub(crate) fn configure_qpdf_repeatable_bare_options(command: Command) -> Command {
+    command
+        .mut_args(|arg| {
+            let is_repeatable_bare_config = matches!(arg.get_action(), ArgAction::SetTrue)
+                && arg
+                    .get_long()
+                    .is_some_and(|name| QPDF_REPEATABLE_BARE_CONFIG_OPTIONS.contains(&name));
+            if is_repeatable_bare_config {
+                let id = arg.get_id().clone();
+                arg.overrides_with(id)
+            } else {
+                arg
+            }
+        })
+        .mut_subcommands(configure_qpdf_repeatable_bare_options)
+}
 
 /// qpdf's main option table marks these options as requiring a parameter
 /// (`libqpdf/qpdf/auto_job_init.hh:92-126`). `QPDFArgParser::parseArgs`
@@ -1603,5 +1674,96 @@ mod tests {
             .expect("unrecognized single-dash option should pass through unchanged");
 
         assert_eq!(parsed.residual_args, [OsString::from("flpdf"), input]);
+    }
+
+    #[test]
+    fn qpdf_repeatable_bare_config_overrides_are_scoped_and_recursive() {
+        let mut root = Command::new("flpdf");
+        let mut rewrite = Command::new("rewrite");
+        for (index, name) in QPDF_REPEATABLE_BARE_CONFIG_OPTIONS.iter().enumerate() {
+            let arg = clap::Arg::new(*name).long(*name).action(ArgAction::SetTrue);
+            if index % 2 == 0 {
+                root = root.arg(arg);
+            } else {
+                rewrite = rewrite.arg(arg);
+            }
+        }
+        for name in [
+            "empty",
+            "replace-input",
+            "encrypt",
+            "pages",
+            "overlay",
+            "underlay",
+            "add-attachment",
+            "copy-attachments-from",
+            "set-page-labels",
+        ] {
+            root = root.arg(clap::Arg::new(name).long(name).action(ArgAction::SetTrue));
+        }
+        root = root.subcommand(rewrite);
+
+        let command = configure_qpdf_repeatable_bare_options(root);
+        for (index, name) in QPDF_REPEATABLE_BARE_CONFIG_OPTIONS.iter().enumerate() {
+            let flag = format!("--{name}");
+            let args = if index % 2 == 0 {
+                vec!["flpdf".to_owned(), flag.clone(), flag]
+            } else {
+                vec!["flpdf".to_owned(), "rewrite".to_owned(), flag.clone(), flag]
+            };
+            assert!(
+                command.clone().try_get_matches_from(args).is_ok(),
+                "qpdf configuration flag --{name} should accept repeated occurrences"
+            );
+        }
+
+        for flag in [
+            "--empty",
+            "--replace-input",
+            "--encrypt",
+            "--pages",
+            "--overlay",
+            "--underlay",
+            "--add-attachment",
+            "--copy-attachments-from",
+            "--set-page-labels",
+        ] {
+            assert!(
+                command
+                    .clone()
+                    .try_get_matches_from(["flpdf", flag, flag])
+                    .is_err(),
+                "stateful selector or option-table opener {flag} must not get self-overridden"
+            );
+        }
+    }
+
+    #[test]
+    fn qpdf_repeatable_bare_config_allowlist_maps_to_cli_set_true_arguments() {
+        fn collect_set_true_arguments(
+            command: &Command,
+            found: &mut std::collections::HashSet<String>,
+        ) {
+            for arg in command.get_arguments() {
+                if matches!(arg.get_action(), ArgAction::SetTrue) {
+                    if let Some(long) = arg.get_long() {
+                        found.insert(long.to_owned());
+                    }
+                }
+            }
+            for subcommand in command.get_subcommands() {
+                collect_set_true_arguments(subcommand, found);
+            }
+        }
+
+        let mut set_true_arguments = std::collections::HashSet::new();
+        collect_set_true_arguments(&crate::cli_command(), &mut set_true_arguments);
+
+        for name in QPDF_REPEATABLE_BARE_CONFIG_OPTIONS {
+            assert!(
+                set_true_arguments.contains(*name),
+                "qpdf bare configuration flag --{name} must map to a clap SetTrue argument"
+            );
+        }
     }
 }
