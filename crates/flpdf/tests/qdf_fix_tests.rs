@@ -37,6 +37,7 @@ const OBJSTM_CASES: &[&str] = &[
     "corrupt-objstm",
     "corrupt-objstm-multi",
     "corrupt-objstm-big",
+    "corrupt-length-holder-after-xref-next-objstm",
 ];
 
 /// Edge cases in the object-stream/cross-reference-stream scanner, each
