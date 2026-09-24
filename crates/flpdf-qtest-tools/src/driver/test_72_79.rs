@@ -253,8 +253,9 @@ pub(crate) fn run_test_73<R: Read + Seek>(
     // is the arm
     // `test_73_propagates_a_warn_pipeline_failure_from_pages_resolution`
     // exercises.
-    let _ = pages_seed.try_unparse_resolved()?;
+    let qpdf_flush_result_75 = pages_seed.try_unparse_resolved();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let _ = qpdf_flush_result_75?;
     Ok(())
 }
 
@@ -284,8 +285,9 @@ pub(crate) fn run_test_74<R: Read + Seek>(
             key
         );
     }
-    let mut cursor = split1.begin(pdf)?;
+    let qpdf_flush_result_76 = split1.begin(pdf);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let mut cursor = qpdf_flush_result_76?;
     while let Some((key, _value)) = cursor.current() {
         writeln!(stdout, "{key}")?;
         cursor.next(&mut split1, pdf)?;
@@ -304,8 +306,9 @@ pub(crate) fn run_test_74<R: Read + Seek>(
             .as_slice(),
         b"C"
     );
-    let mut cursor = split2.begin(pdf)?;
+    let qpdf_flush_result_77 = split2.begin(pdf);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let mut cursor = qpdf_flush_result_77?;
     while let Some((key, _value)) = cursor.current() {
         write_bytes(stdout, &key)?;
         writeln!(stdout)?;
@@ -332,8 +335,9 @@ pub(crate) fn run_test_74<R: Read + Seek>(
             key
         );
     }
-    let mut cursor = split3.begin(pdf)?;
+    let qpdf_flush_result_78 = split3.begin(pdf);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let mut cursor = qpdf_flush_result_78?;
     while let Some((key, value)) = cursor.current() {
         write_bytes(stdout, &key)?;
         write!(stdout, " ")?;
@@ -391,8 +395,9 @@ pub(crate) fn run_test_75<R: Read + Seek>(
 
     let erase2_handle = pdf.trailer_key_handle(b"Erase2");
     let mut erase2 = NumberTree::new(erase2_handle.clone(), true);
-    let mut iter2 = erase2.find(pdf, 250, false)?;
+    let qpdf_flush_result_79 = erase2.find(pdf, 250, false);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let mut iter2 = qpdf_flush_result_79?;
     iter2.remove(&mut erase2, pdf)?;
     assert!(iter2 == erase2.end());
     iter2.previous(&mut erase2, pdf)?;
@@ -431,16 +436,18 @@ pub(crate) fn run_test_75<R: Read + Seek>(
     assert_eq!(kid0_kids.try_get_array_n_items()?, 1);
 
     let mut erase3 = NumberTree::new(pdf.trailer_key_handle(b"Erase3"), true);
-    let mut iter3 = erase3.find(pdf, 320, false)?;
+    let qpdf_flush_result_80 = erase3.find(pdf, 320, false);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let mut iter3 = qpdf_flush_result_80?;
     iter3.remove(&mut erase3, pdf)?;
     assert!(iter3 == erase3.end());
     erase3.remove(pdf, 310)?;
     assert!(erase3.begin(pdf)? == erase3.end());
 
     let mut erase4 = NumberTree::new(pdf.trailer_key_handle(b"Erase4"), true);
-    let mut iter4 = erase4.find(pdf, 420, false)?;
+    let qpdf_flush_result_81 = erase4.find(pdf, 420, false);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let mut iter4 = qpdf_flush_result_81?;
     iter4.remove(&mut erase4, pdf)?;
     assert_eq!(
         iter4.current().expect("cursor at 430 after removing 420").0,
@@ -974,13 +981,21 @@ WARNING: closed input source: object 1/0: error reading object: QPDF operation a
             "unexpected error: {error:?}"
         );
         assert!(stdout.is_empty());
-        // The failure unwinds before the driver's own diagnostic drain runs,
-        // so only the uninitialized-handle line from `pdf2` is on stderr.
+        // The resolver queues the caught read warning before the warning
+        // pipeline fails. The driver drains that queued warning before it
+        // propagates the accessor error.
         assert_eq!(
             stderr,
-            b"getRoot: attempted to dereference an uninitialized QPDFObjectHandle\n"
+            concat!(
+                "getRoot: attempted to dereference an uninitialized QPDFObjectHandle\n",
+                "WARNING: closed input source: object 2/0: error reading object: ",
+                "QPDF operation attempted on a QPDF object with no input source. ",
+                "QPDF operations are invalid before processFile (or another process method) ",
+                "or after closeInputSource\n",
+            )
+            .as_bytes()
         );
-        assert_eq!(diagnostics_written, 0);
+        assert_eq!(diagnostics_written, 1);
     }
 
     #[test]

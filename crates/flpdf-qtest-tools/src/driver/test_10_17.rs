@@ -360,13 +360,19 @@ pub(crate) fn run_test_14<R: Read + Seek>(
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
     for (static_id, output_name) in [(true, "a.pdf"), (false, "b.pdf")] {
-        let mut writer = PdfWriter::new(pdf);
-        writer.set_output_memory()?;
-        writer.set_static_id(static_id);
-        writer.set_stream_data_mode(StreamDataMode::Preserve);
-        writer.write()?;
-        std::fs::write(output_name, writer.get_buffer()?)?;
+        let buffer_result = (|| -> flpdf::Result<Vec<u8>> {
+            let mut writer = PdfWriter::new(pdf);
+            writer.set_output_memory()?;
+            writer.set_static_id(static_id);
+            writer.set_stream_data_mode(StreamDataMode::Preserve);
+            writer.write()?;
+            Ok(writer.get_buffer()?.to_vec())
+        })();
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        let buffer = buffer_result?;
+        let output_result = std::fs::write(output_name, buffer);
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        output_result?;
     }
     Ok(())
 }
@@ -673,8 +679,9 @@ pub(crate) fn run_test_17<R: Read + Seek>(
     let kid1 = page_kids.try_get_array_item(1)?;
     assert_eq!(kid0.object_ref(), kid1.object_ref());
 
-    let mut pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    let qpdf_flush_result_9 = PageDocumentHelper::new(pdf).get_all_pages();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let mut pages = qpdf_flush_result_9?;
     assert_eq!(pages.len(), 3);
     assert_ne!(pages[0], pages[1]);
 

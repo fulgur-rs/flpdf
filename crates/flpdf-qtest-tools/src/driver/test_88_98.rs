@@ -160,25 +160,30 @@ pub(crate) fn run_test_89<R: Read + Seek>(
     // `ObjectHandle::append_array_item`'s own `prepare_array_mutation`
     // reproduces through this crate's warning pipeline.
     let trailer = pdf.trailer();
-    trailer.append_array_item(null.clone())?;
+    let qpdf_flush_result_82 = trailer.append_array_item(null.clone());
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    qpdf_flush_result_82?;
 
-    let root = pdf.root_handle()?;
+    let qpdf_flush_result_83 = pdf.root_handle();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    root.append_array_item(null.clone())?;
+    let root = qpdf_flush_result_83?;
+    let qpdf_flush_result_84 = root.append_array_item(null.clone());
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    qpdf_flush_result_84?;
 
     let object5 = pdf.get_object_handle(ObjectRef::new(5, 0));
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    object5.replace_key(b"/X", null.clone())?;
+    let qpdf_flush_result_85 = object5.replace_key(b"/X", null.clone());
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    qpdf_flush_result_85?;
 
     // qpdf's getArrayItem(0) dereferences the receiver and uses its warning
     // boundary on a non-array or invalid index. The canonical signed-index
     // accessor has the same contract and returns the live child handle.
     let item0 = object5.try_get_array_item(0)?;
-    item0.replace_key(b"/X", null)?;
+    let qpdf_flush_result_86 = item0.replace_key(b"/X", null);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    qpdf_flush_result_86?;
     Ok(())
 }
 
@@ -230,8 +235,9 @@ pub(crate) fn run_test_90<R: Read + Seek>(
     // the original PDF and uses filename instead.
     let null = ObjectHandle::null();
     let trailer = pdf.trailer();
-    trailer.append_array_item(null.clone())?;
+    let qpdf_flush_result_87 = trailer.append_array_item(null.clone());
     emit_new_diagnostics(pdf, diagnostics_written, &arg2_diagnostic, stdout, stderr)?;
+    qpdf_flush_result_87?;
 
     let qtest_result = trailer.try_get_key(b"/QTest");
     emit_new_diagnostics(pdf, diagnostics_written, &arg2_diagnostic, stdout, stderr)?;

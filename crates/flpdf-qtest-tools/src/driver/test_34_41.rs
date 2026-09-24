@@ -566,17 +566,22 @@ pub(crate) fn run_test_38<R: Read + Seek>(
     // (`qpdf/test_driver.cc:1351-1358`). Keep the same order with the
     // canonical ObjectHandle accessors instead of the driver-local resolution
     // helpers.
-    let root = pdf.root_handle()?;
+    let qpdf_flush_result_15 = pdf.root_handle();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    let qtest = root.try_get_key(b"/QTest")?;
+    let root = qpdf_flush_result_15?;
+    let qpdf_flush_result_16 = root.try_get_key(b"/QTest");
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    let count = qtest.try_get_array_n_items()?;
+    let qtest = qpdf_flush_result_16?;
+    let qpdf_flush_result_17 = qtest.try_get_array_n_items();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let count = qpdf_flush_result_17?;
     for index in 0..count {
-        let item = qtest.try_get_array_item(index as i64)?;
+        let qpdf_flush_result_18 = qtest.try_get_array_item(index as i64);
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-        let rendered = item.try_unparse_resolved()?;
+        let item = qpdf_flush_result_18?;
+        let qpdf_flush_result_19 = item.try_unparse_resolved();
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        let rendered = qpdf_flush_result_19?;
         write_bytes(stdout, &rendered)?;
         writeln!(stdout)?;
     }

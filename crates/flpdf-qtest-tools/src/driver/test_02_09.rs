@@ -63,16 +63,18 @@ pub(crate) fn run_test_2<R: Read + Seek>(
 
     let info = trailer.try_get_key(b"/Info")?;
     let creation_date = info.try_get_key(b"/CreationDate")?;
-    let creation_date_value = creation_date.try_get_string_value()?;
+    let qpdf_flush_result_0 = creation_date.try_get_string_value();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
         .map_err(Error::from)?;
+    let creation_date_value = qpdf_flush_result_0?;
     write_bytes(stdout, &creation_date_value)?;
     writeln!(stdout)?;
 
     let producer = info.try_get_key(b"/Producer")?;
-    let producer_value = producer.try_get_string_value()?;
+    let qpdf_flush_result_1 = producer.try_get_string_value();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
         .map_err(Error::from)?;
+    let producer_value = qpdf_flush_result_1?;
     write_bytes(stdout, &producer_value)?;
     writeln!(stdout)?;
 
@@ -89,18 +91,20 @@ pub(crate) fn run_test_2<R: Read + Seek>(
         .map_err(Error::from)?;
     write_bytes(stdout, &o.unparse())?;
     writeln!(stdout)?;
-    let u = encrypt.try_get_key(b"/U")?;
+    let qpdf_flush_result_2 = encrypt.try_get_key(b"/U");
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
         .map_err(Error::from)?;
+    let u = qpdf_flush_result_2?;
     write_bytes(stdout, &u.unparse())?;
     writeln!(stdout)?;
 
     let root = trailer.try_get_key(b"/Root")?;
     let pages = root.try_get_key(b"/Pages")?;
     let kids = pages.try_get_key(b"/Kids")?;
-    let page = kids.try_get_array_item(1)?;
+    let qpdf_flush_result_3 = kids.try_get_array_item(1);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
         .map_err(Error::from)?;
+    let page = qpdf_flush_result_3?;
     let contents = page.try_get_key(b"/Contents")?;
     // qpdf's pipeStreamData resolves its receiver through the public stream
     // accessor (`libqpdf/QPDFObjectHandle.cc:1300-1341`); the canonical
@@ -210,9 +214,14 @@ pub(crate) fn run_test_4<R: Read + Seek>(
     )?;
 
     let array = qtest.try_get_key(b"/A")?;
-    let first_item = array.try_get_array_item(0)?.try_get_int_value()?;
+    let first_item = array.try_get_array_item(0);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
         .map_err(Error::from)?;
+    let first_item = first_item?;
+    let first_item = first_item.try_get_int_value();
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
+        .map_err(Error::from)?;
+    let first_item = first_item?;
     if first_item == 1 {
         array.set_array_item(1, ObjectHandle::integer(5))?;
         array.insert_array_item(2, ObjectHandle::integer(10))?;
@@ -308,9 +317,14 @@ pub(crate) fn run_test_5<R: Read + Seek>(
                 .as_stream_dict()
                 .expect("get_images only returns image stream handles");
             let width = image_dict.try_get_key(b"/Width")?.try_get_int_value()?;
-            let height = image_dict.try_get_key(b"/Height")?.try_get_int_value()?;
+            let height = image_dict.try_get_key(b"/Height");
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
                 .map_err(Error::from)?;
+            let height = height?;
+            let height = height.try_get_int_value();
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
+                .map_err(Error::from)?;
+            let height = height?;
             write!(stdout, "    ")?;
             write_bytes(stdout, &name)?;
             writeln!(stdout, ": {width} x {height}")?;
@@ -345,26 +359,29 @@ pub(crate) fn run_test_5<R: Read + Seek>(
         let item_count = qstrings.try_get_array_n_items()?;
         for index in 0..item_count {
             let item = qstrings.try_get_array_item(index as i64)?;
-            let utf8 = item.try_get_utf8_value()?;
+            let qpdf_flush_result_4 = item.try_get_utf8_value();
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
                 .map_err(Error::from)?;
+            let utf8 = qpdf_flush_result_4?;
             write_bytes(stdout, &utf8)?;
             writeln!(stdout)?;
         }
     }
 
     let qnumbers = root.try_get_key(b"/QNumbers")?;
-    let qnumbers_is_array = qnumbers.try_is_array()?;
+    let qpdf_flush_result_5 = qnumbers.try_is_array();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
         .map_err(Error::from)?;
+    let qnumbers_is_array = qpdf_flush_result_5?;
     if qnumbers_is_array {
         writeln!(stdout, "QNumbers:")?;
         let item_count = qnumbers.try_get_array_n_items()?;
         for index in 0..item_count {
             let item = qnumbers.try_get_array_item(index as i64)?;
-            let value = item.try_get_numeric_value()?;
+            let qpdf_flush_result_6 = item.try_get_numeric_value();
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
                 .map_err(Error::from)?;
+            let value = qpdf_flush_result_6?;
             writeln!(stdout, "{}", double_to_string_3(value))?;
         }
     }

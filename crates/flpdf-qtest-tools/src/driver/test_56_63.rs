@@ -80,9 +80,10 @@ fn test_56_59_body<R: Read + Seek>(
 
     // `QPDFPageDocumentHelper(pdf).getAllPages()` / `QPDFPageDocumentHelper(pdf2).getAllPages()`
     // (test_driver.cc:2089-2091).
-    let pages1 = PageDocumentHelper::new(pdf).get_all_pages()?;
+    let qpdf_flush_result_69 = PageDocumentHelper::new(pdf).get_all_pages();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    let pages2 = PageDocumentHelper::new(&mut pdf2).get_all_pages()?;
+    let pages1 = qpdf_flush_result_69?;
+    let qpdf_flush_result_70 = PageDocumentHelper::new(&mut pdf2).get_all_pages();
     emit_new_diagnostics(
         &pdf2,
         &mut secondary_diagnostics_written,
@@ -90,6 +91,7 @@ fn test_56_59_body<R: Read + Seek>(
         stdout,
         stderr,
     )?; // cov:ignore: diagnostic sink failures are covered by the shared driver flush tests; this terminator has no separate qpdf behavior
+    let pages2 = qpdf_flush_result_70?;
     let npages = pages1.len().min(pages2.len());
 
     for index in 0..npages {
@@ -145,9 +147,10 @@ fn test_56_59_body<R: Read + Seek>(
             pdf.new_stream_with_data(Rc::new(format!("\nQ\n{content}").into_bytes()))?;
         let mut destination_page = PageObjectHelper::new(pages1[index], pdf);
         destination_page.add_page_contents(q_stream, true)?;
-        destination_page.add_page_contents(placed_stream, false)?;
+        let qpdf_flush_result_71 = destination_page.add_page_contents(placed_stream, false);
 
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        qpdf_flush_result_71?;
     }
 
     let mut writer = PdfWriter::new(pdf);

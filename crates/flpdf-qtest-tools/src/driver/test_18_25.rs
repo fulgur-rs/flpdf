@@ -177,9 +177,10 @@ pub(crate) fn run_test_21<R: Read + Seek + 'static>(
     let pages = helper.get_all_pages()?;
     let page = pages[0];
     let page_handle = pdf.get_object_handle(page);
-    let contents = page_handle.try_get_key(b"/Contents")?;
+    let qpdf_flush_result_10 = page_handle.try_get_key(b"/Contents");
 
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let contents = qpdf_flush_result_10?;
 
     contents.shallow_copy()?;
     writeln!(stdout, "you can't see this")?;
@@ -203,9 +204,10 @@ pub(crate) fn run_test_22<R: Read + Seek + 'static>(
     let mut helper = PageDocumentHelper::new(pdf);
     let pages = helper.get_all_pages()?;
     let page = pages[0];
-    helper.remove_page(page)?;
+    let qpdf_flush_result_11 = helper.remove_page(page);
 
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    qpdf_flush_result_11?;
 
     // Re-borrow: `helper`'s first mutable borrow of `pdf` must end before
     // `emit_new_diagnostics` above can immutably borrow `pdf`.
@@ -232,9 +234,10 @@ pub(crate) fn run_test_23<R: Read + Seek + 'static>(
     let last = *pages
         .last()
         .expect("a page-manipulation fixture has at least one page");
-    helper.remove_page(last)?;
+    let qpdf_flush_result_12 = helper.remove_page(last);
 
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    qpdf_flush_result_12?;
     Ok(())
 }
 

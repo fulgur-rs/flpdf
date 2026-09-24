@@ -291,8 +291,9 @@ fn write_object_details<R: Read + Seek>(
         }
         9 => {
             writeln!(stdout, "/QTest is a dictionary")?;
-            let items = dictionary_items(pdf, chased)?;
+            let qpdf_flush_result_7 = dictionary_items(pdf, chased);
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+            let items = qpdf_flush_result_7?;
             for (key, is_indirect) in items {
                 write!(stdout, "  /")?;
                 write_bytes(stdout, key.strip_prefix(b"/").unwrap_or(&key))?;
@@ -306,8 +307,9 @@ fn write_object_details<R: Read + Seek>(
                 .expect("type_code confirmed a stream value");
             let data = chased.get_raw_stream_data()?;
             write!(stdout, "/QTest is a stream.  Dictionary: ")?;
-            let dictionary = write_qpdf_object_handle(pdf, &dict_handle)?;
+            let qpdf_flush_result_8 = write_qpdf_object_handle(pdf, &dict_handle);
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+            let dictionary = qpdf_flush_result_8?;
             write_bytes(stdout, &dictionary)?;
             writeln!(stdout)?;
 
