@@ -705,7 +705,7 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
         // therefore still repaired, so record the span at the integer line and
         // resume scanning after it rather than demanding a complete object.
         if let Some((_, integer_end)) = holder_line {
-            if resumed_after_tail && find_line_keyword_from(input, b"endobj", kw_end).is_none() {
+            if resumed_after_tail {
                 objects.push(ObjectSpan {
                     num,
                     gen,

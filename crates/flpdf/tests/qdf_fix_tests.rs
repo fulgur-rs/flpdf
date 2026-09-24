@@ -238,6 +238,27 @@ fn post_tail_holder_truncated_before_endobj_is_still_rewritten() {
     );
 }
 
+#[test]
+fn post_tail_holder_without_endobj_does_not_swallow_a_later_object() {
+    // qpdf returns to `st_top` right after the holder's integer line, so the
+    // two objects that follow are validated as 4 then 5. Bounding the holder
+    // only when no later `endobj` exists merges the holder with object 4, so
+    // the sequential check then sees 5 where it expects 4 and fails. Live
+    // fix-qdf exits 0 on this input.
+    let complete = read("corrupt-length-holder-after-xref.qdf");
+    let terminator = b"endobj\n";
+    let cut = complete
+        .windows(terminator.len())
+        .rposition(|window| window == terminator)
+        .expect("the fixture ends with the holder's endobj");
+    let mut input = complete[..cut].to_vec();
+    input.extend_from_slice(b"4 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    input.extend_from_slice(b"5 0 obj\n<< >>\nendobj\n");
+
+    flpdf::fix_qdf(&input)
+        .expect("the holder ends at its integer line, so objects 4 and 5 stay sequential");
+}
+
 /// `fix_qdf(fix_qdf(x)) == fix_qdf(x)` for every corrupted input.
 #[test]
 fn idempotent() {
