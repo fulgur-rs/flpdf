@@ -754,6 +754,26 @@ mod tests {
     }
 
     #[test]
+    fn direct_null_pages_json_error_uses_raw_qpdf_exception_text() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/direct-null-pages.pdf");
+        let mut pdf = Pdf::open(BufReader::new(File::open(fixture).unwrap())).unwrap();
+        let mut stdout = Vec::new();
+
+        let error = write_json_default(
+            &mut pdf,
+            stream_options(JsonStreamData::None, None),
+            JsonJobOutput::Stdout(&mut stdout),
+        )
+        .expect_err("a direct null /Pages value aborts qpdf JSON page traversal");
+
+        assert_eq!(
+            error.to_string(),
+            "operation for dictionary attempted on object of type null: returning false for a key containment request"
+        );
+    }
+
+    #[test]
     fn job_json_writer_emits_the_v1_object_and_objectinfo_sections() {
         let mut pdf = Pdf::open(BufReader::new(File::open(fixture()).unwrap())).unwrap();
         let mut bytes = Vec::new();
