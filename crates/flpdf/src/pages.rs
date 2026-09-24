@@ -345,13 +345,14 @@ mod tests {
 
         let error = page_refs(&mut pdf).expect_err("qpdf rejects direct null /Pages");
 
-        match error {
-            Error::QpdfExc(error) => assert_eq!(
-                error.get_message_detail(),
-                b"operation for dictionary attempted on object of type null: returning false for a key containment request"
-            ),
-            other => panic!("expected qpdf type error, got {other:?}"), // cov:ignore: this is the failing arm of the qpdf error-type regression assertion
-        }
+        assert!(
+            matches!(&error, Error::QpdfExc(_)),
+            "expected qpdf type error, got {error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "operation for dictionary attempted on object of type null: returning false for a key containment request"
+        );
     }
 
     #[test]
