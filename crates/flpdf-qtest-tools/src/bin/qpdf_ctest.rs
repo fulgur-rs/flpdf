@@ -908,8 +908,16 @@ mod tests {
 
     #[cfg(unix)]
     use super::password_bytes;
+    #[cfg(windows)]
+    use super::password_bytes;
+    #[cfg(windows)]
+    use std::ffi::OsStr;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
+    #[cfg(windows)]
+    use std::os::windows::ffi::OsStrExt;
+    #[cfg(windows)]
+    use windows_sys::Win32::Globalization::{GetACP, WideCharToMultiByte, CP_ACP, CP_UTF8};
 
     #[cfg(unix)]
     #[test]
@@ -921,6 +929,63 @@ mod tests {
         let raw = [b'p', b'w', 0xe9, b'!'];
         let arg = std::ffi::OsStr::from_bytes(&raw);
         assert_eq!(password_bytes(arg), raw.to_vec());
+    }
+
+    #[cfg(windows)]
+    fn windows_c_main_argv_bytes(value: &OsStr) -> Vec<u8> {
+        let wide: Vec<u16> = value.encode_wide().collect();
+        assert!(!wide.is_empty());
+        let wide_len = i32::try_from(wide.len()).unwrap();
+        // SAFETY: the input pointer is valid for wide_len UTF-16 code units;
+        // a null output pointer with a zero size is the documented sizing call.
+        let required = unsafe {
+            WideCharToMultiByte(
+                CP_ACP,
+                0,
+                wide.as_ptr(),
+                wide_len,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(required > 0);
+        let mut output = vec![0_u8; required as usize];
+        // SAFETY: output has required bytes, and the same live input pointer and
+        // length are passed as in the sizing call above.
+        let written = unsafe {
+            WideCharToMultiByte(
+                CP_ACP,
+                0,
+                wide.as_ptr(),
+                wide_len,
+                output.as_mut_ptr(),
+                required,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(written, required);
+        output
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn password_bytes_matches_the_narrow_c_main_argv_encoding_on_windows() {
+        let password = OsStr::new("pw-é!");
+        let expected = windows_c_main_argv_bytes(password);
+        let actual = password_bytes(password);
+        assert_eq!(actual, expected);
+        // SAFETY: GetACP takes no arguments and has no pointer preconditions.
+        let active_code_page = unsafe { GetACP() };
+        if active_code_page != CP_UTF8 {
+            assert_ne!(
+                actual,
+                password.to_string_lossy().into_bytes(),
+                "non-UTF-8 ACP argv bytes must not be replaced with lossy UTF-8"
+            );
+        }
     }
 
     #[test]
