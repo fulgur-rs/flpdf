@@ -58,6 +58,27 @@ fn rewrite_qpdf_equivalent_mode(fixture: &str, mode: ObjectStreamMode) -> Vec<u8
     out
 }
 
+fn catalog_metadata_observation(bytes: &[u8]) -> (Option<ObjectRef>, Vec<u8>, Vec<u8>) {
+    let mut pdf = Pdf::open(std::io::Cursor::new(bytes.to_vec())).expect("open metadata PDF");
+    let metadata = pdf
+        .root_handle()
+        .expect("catalog handle")
+        .try_get_key(b"/Metadata")
+        .expect("catalog Metadata key");
+    let object_ref = metadata.object_ref();
+    let dictionary = metadata
+        .try_get_stream_dict()
+        .expect("metadata stream dictionary");
+    let filter = dictionary
+        .try_get_key(b"/Filter")
+        .expect("metadata Filter lookup")
+        .unparse();
+    let packet = metadata
+        .get_stream_data(flpdf::writer::DecodeLevel::All)
+        .expect("decode XMP metadata packet");
+    (object_ref, filter, packet.as_ref().clone())
+}
+
 fn golden(fixture_stem: &str) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/golden/references")
@@ -212,6 +233,35 @@ fn one_two_three_page_mode_matrix_is_byte_identical_to_qpdf() {
             assert_mode_cmp_diff_zero(fixture, mode);
         }
     }
+}
+
+#[test]
+fn compressed_metadata_xmp_rewrite_matches_qpdf_and_preserves_decoded_packet() {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/compressed-metadata.pdf");
+    let input = std::fs::read(&fixture_path).expect("read compressed metadata fixture");
+    let (input_ref, input_filter, input_packet) = catalog_metadata_observation(&input);
+    assert!(
+        input_ref.is_some(),
+        "input /Metadata reference must be indirect"
+    );
+    assert_eq!(input_filter, b"/FlateDecode");
+
+    let actual = rewrite_qpdf_equivalent("compressed-metadata.pdf");
+    assert_cmp_diff_zero_named(&actual, "compressed-metadata", "static-id.pdf");
+    let (output_ref, output_filter, output_packet) = catalog_metadata_observation(&actual);
+    assert!(
+        output_ref.is_some(),
+        "output /Metadata reference must remain valid"
+    );
+    assert_eq!(
+        output_filter, b"null",
+        "qpdf removes the source filter for clear XMP"
+    );
+    assert_eq!(
+        output_packet, input_packet,
+        "decoded XMP packet bytes must survive"
+    );
 }
 
 /// A direct `/Root` survives when Preserve selects a cross-reference stream.
