@@ -682,9 +682,11 @@ fn qdf_page_context<R: Read + Seek>(
         let page_object_gen = page
             .qpdf_obj_gen()
             .filter(|object_gen| object_gen.is_indirect())
+            // cov:ignore-start: page repair promotes every direct leaf before publishing it (`pages/repair.rs:275-332`; `QPDF_pages.cc:120-130`).
             .ok_or_else(|| {
                 crate::Error::Internal("qpdf page list contains a direct page".into())
             })?;
+        // cov:ignore-end
         page_sequences.insert(page_object_gen, sequence);
         for object_gen in crate::writer::collect_content_stream_qpdf_obj_gens(&page)? {
             contents_sequences.insert(object_gen, sequence);
