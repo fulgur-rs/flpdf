@@ -5,7 +5,7 @@
 //! through the Catalog, and every indirect reference is remapped by the normal
 //! plain-writer traversal.
 
-use flpdf::{ObjectHandle, ObjectRef, ObjectStreamMode, Pdf};
+use flpdf::{CompressStreams, ObjectHandle, ObjectRef, ObjectStreamMode, Pdf};
 use serde_json::{json, Value};
 use std::fs::File;
 use std::io::{BufReader, Cursor};
@@ -40,8 +40,12 @@ fn qpdf_available() -> bool {
 }
 
 fn qpdf_rewrite(input: &Path, output: &Path) {
+    qpdf_rewrite_with_options(input, output, &["--static-id", "--object-streams=preserve"]);
+}
+
+fn qpdf_rewrite_with_options(input: &Path, output: &Path, options: &[&str]) {
     let result = Command::new("qpdf")
-        .args(["--static-id", "--object-streams=preserve"])
+        .args(options)
         .arg(input)
         .arg(output)
         .output()
@@ -82,14 +86,23 @@ fn qpdf_json(path: &Path) -> Value {
 }
 
 fn flpdf_rewrite(input: &Path) -> flpdf::Result<Vec<u8>> {
+    flpdf_rewrite_with_settings(
+        input,
+        &WriterTestSettings {
+            static_id: true,
+            object_streams: ObjectStreamMode::Preserve,
+            ..WriterTestSettings::default()
+        },
+    )
+}
+
+fn flpdf_rewrite_with_settings(
+    input: &Path,
+    settings: &WriterTestSettings,
+) -> flpdf::Result<Vec<u8>> {
     let mut pdf = Pdf::open(BufReader::new(File::open(input)?))?;
-    let settings = WriterTestSettings {
-        static_id: true,
-        object_streams: ObjectStreamMode::Preserve,
-        ..WriterTestSettings::default()
-    };
     let mut output = Vec::new();
-    write_with_settings(&mut pdf, &mut output, &settings)?;
+    write_with_settings(&mut pdf, &mut output, settings)?;
     Ok(output)
 }
 
@@ -143,6 +156,37 @@ fn assert_flpdf_structure(output: &[u8]) -> flpdf::Result<()> {
 
 fn rewritten_objects(json: &Value) -> &Value {
     &json["qpdf"][1]
+}
+
+fn value_for_reference<'a>(objects: &'a Value, value: &'a Value) -> &'a Value {
+    if let Some(reference) = value.as_str().filter(|value| value.ends_with(" R")) {
+        let key = format!("obj:{reference}");
+        let entry = objects
+            .get(&key)
+            .unwrap_or_else(|| panic!("qpdf JSON object map is missing {key}"));
+        entry
+            .get("value")
+            .or_else(|| entry.get("stream").and_then(|stream| stream.get("dict")))
+            .unwrap_or_else(|| panic!("qpdf JSON object {key} has no value or stream dictionary"))
+    } else {
+        value
+    }
+}
+
+fn catalog_ocg_names(json: &Value) -> Vec<String> {
+    let objects = rewritten_objects(json);
+    let trailer = &objects["trailer"]["value"];
+    let catalog = value_for_reference(objects, &trailer["/Root"]);
+    let ocproperties = value_for_reference(objects, &catalog["/OCProperties"]);
+    ocproperties["/OCGs"]
+        .as_array()
+        .expect("Catalog /OCProperties /OCGs array")
+        .iter()
+        .map(|reference| {
+            let ocg = value_for_reference(objects, reference);
+            ocg["/Name"].as_str().expect("OCG /Name string").to_owned()
+        })
+        .collect()
 }
 
 #[test]
@@ -208,6 +252,62 @@ fn plain_rewrite_preserves_multi_config_ocproperties_and_remaps_all_references()
         actual,
         std::fs::read(&qpdf_output)?,
         "plain rewrite must match qpdf --static-id for this stream-free fixture"
+    );
+    Ok(())
+}
+
+#[test]
+fn plain_rewrite_preserves_content_used_and_unused_catalog_ocgs() -> flpdf::Result<()> {
+    let input = fixture("ocproperties-primary-used-unused.pdf");
+    assert!(
+        input.is_file(),
+        "OCProperties fixture must exist: {input:?}"
+    );
+    assert!(
+        qpdf_available(),
+        "qpdf {EXPECTED_QPDF_VERSION} is required for optional-content parity"
+    );
+
+    let temporary = tempfile::tempdir()?;
+    let qpdf_output = temporary.path().join("qpdf-output.pdf");
+    let flpdf_output = temporary.path().join("flpdf-output.pdf");
+    qpdf_rewrite_with_options(
+        &input,
+        &qpdf_output,
+        &[
+            "--static-id",
+            "--object-streams=disable",
+            "--compress-streams=n",
+        ],
+    );
+    let settings = WriterTestSettings {
+        static_id: true,
+        object_streams: ObjectStreamMode::Disable,
+        compress_streams: CompressStreams::No,
+        ..WriterTestSettings::default()
+    };
+    let actual = flpdf_rewrite_with_settings(&input, &settings)?;
+    std::fs::write(&flpdf_output, &actual)?;
+
+    qpdf_check(&input);
+    qpdf_check(&qpdf_output);
+    qpdf_check(&flpdf_output);
+    let qpdf_json_output = qpdf_json(&qpdf_output);
+    let flpdf_json_output = qpdf_json(&flpdf_output);
+    assert_eq!(
+        rewritten_objects(&flpdf_json_output),
+        rewritten_objects(&qpdf_json_output),
+        "plain rewrite must preserve the complete used/unused optional-content graph"
+    );
+    assert_eq!(
+        catalog_ocg_names(&qpdf_json_output),
+        vec!["u:Primary used", "u:Primary unused"],
+        "the primary Catalog keeps the OCG used by content and the OCG used only by /OCProperties"
+    );
+    assert_eq!(
+        actual,
+        std::fs::read(&qpdf_output)?,
+        "plain rewrite with compression disabled must match qpdf bytes"
     );
     Ok(())
 }
