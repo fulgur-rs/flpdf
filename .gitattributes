@@ -21,6 +21,10 @@ docs/qpdf-module-doc-index.md text eol=lf
 # these checked snapshots to CRLF.
 tests/oracle/*.tsv text eol=lf
 
+# qpdf help stdout fixtures are parsed and compared byte-for-byte by the CLI
+# help-table tests. Keep them LF-terminated on Windows as well.
+crates/flpdf-cli/tests/fixtures/qpdf-help-*.txt text eol=lf
+
 # test_driver qpdf merged-output goldens are byte-exact and may contain raw
 # compressed bytes. Treat them as binary so line-ending conversion and text
 # diffing cannot mutate their oracle bytes.

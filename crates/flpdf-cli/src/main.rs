@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod arg_parser;
+mod qpdf_help;
 
 use clap::{Args as ClapArgs, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use flpdf::fix_qdf;
@@ -2880,69 +2881,6 @@ continue to consider qpdf to be licensed under those terms. Please\n\
     ));
 }
 
-/// Render the native top-level help without letting clap decide whether a
-/// qpdf-compatible argv token is a command-position help request. The help
-/// text remains the existing flpdf surface; only the qpdf topic forms below
-/// use qpdf's generated topic bodies.
-fn print_flpdf_help() {
-    let mut command = cli_command();
-    emit_logger_info(command.render_help().to_string());
-}
-
-/// Render the qpdf 11.9.0 generated bodies for the topics that are currently
-/// part of the qpdf-compatible help contract. The related-option lists and
-/// footer are copied from `libqpdf/qpdf/auto_job_help.hh`.
-fn qpdf_help_topic_body(topic: &[u8]) -> Option<Vec<u8>> {
-    let who = progname();
-    match topic {
-        b"usage" => Some(
-            format!(
-                r#"Read a PDF file, apply transformations or modifications, and write
-a new PDF file.
-
-Usage: {who} [infile] [options] [outfile]
-   OR  {who} --help[={{topic|--option}}]
-
-- infile, options, and outfile may be in any order as long as infile
-  precedes outfile.
-- Use --empty in place of an input file for a zero-page, empty input
-- Use --replace-input in place of an output file to overwrite the
-  input file with the output
-- outfile may be - to write to stdout; reading from stdin is not supported
-- @filename is an argument file; each line is treated as a separate
-  command-line argument
-- @- may be used to read arguments from stdin
-- Later options may override earlier options if contradictory
-
-Related options:
-  --empty: use empty file as input
-  --job-json-file: job JSON file
-  --replace-input: overwrite input with output
-
-For detailed help, visit the qpdf manual: https://qpdf.readthedocs.io
-"#
-            )
-            .into_bytes(),
-        ),
-        b"exit-status" => Some(
-            br#"Meaning of exit codes:
-
-- 0: no errors or warnings
-- 1: not used by qpdf but may be used by the shell if unable to invoke qpdf
-- 2: errors detected
-- 3: warnings detected, unless --warning-exit-0 is given
-
-Related options:
-  --warning-exit-0: exit 0 even with warnings
-
-For detailed help, visit the qpdf manual: https://qpdf.readthedocs.io
-"#
-            .to_vec(),
-        ),
-        _ => None,
-    }
-}
-
 /// Return the value of a sole top-level qpdf help option, preserving raw
 /// bytes so an unknown topic can be sent through the qpdf usage boundary.
 /// `None` means plain `--help`/`-help`; `Some(bytes)` means `--help=...`.
@@ -3061,11 +2999,11 @@ fn main() {
     if let Some(topic) = qpdf_sole_help_topic(&preprocessed) {
         match topic {
             None => {
-                print_flpdf_help();
+                emit_logger_info(qpdf_help::render_top(&progname()));
                 return;
             }
             Some(topic) => {
-                if let Some(body) = qpdf_help_topic_body(&topic) {
+                if let Some(body) = qpdf_help::render(&topic, &progname()) {
                     emit_logger_info(body);
                     return;
                 }

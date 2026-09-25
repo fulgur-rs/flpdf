@@ -219,18 +219,29 @@ fn top_level_object_streams_modes_reach_the_writer() {
         .success();
 }
 
+fn flpdf_help_entry(argument: &str) -> String {
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(argument)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "qpdf help entry {argument:?} must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
 #[test]
 fn top_level_writer_mode_help_matches_qpdf_terms() {
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .arg("--help")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("--object-streams"))
-        .stdout(predicate::str::contains("preserve"))
-        .stdout(predicate::str::contains("generate"))
-        .stdout(predicate::str::contains("--stream-data"))
-        .stdout(predicate::str::contains("uncompress"));
+    let object_streams = flpdf_help_entry("--help=--object-streams");
+    assert!(object_streams.contains("preserve:"));
+    assert!(object_streams.contains("generate:"));
+
+    let stream_data = flpdf_help_entry("--help=--stream-data");
+    assert!(stream_data.contains("uncompress:"));
 }
 
 #[test]
@@ -366,12 +377,7 @@ fn qpdf_help_topics_render_their_source_topics() {
             String::from_utf8_lossy(&flpdf.stdout)
         );
 
-        let mut expected = String::from_utf8_lossy(&qpdf.stdout).into_owned();
-        if topic == "usage" {
-            expected = expected
-                .replace("Usage: qpdf [infile]", "Usage: flpdf [infile]")
-                .replace("OR  qpdf --help", "OR  flpdf --help");
-        }
+        let expected = String::from_utf8_lossy(&qpdf.stdout).into_owned();
         assert_eq!(
             String::from_utf8_lossy(&flpdf.stdout),
             expected,
@@ -492,41 +498,7 @@ fn invalid_rotate_usage_preserves_qpdf_raw_bytes_and_help_framing() {
 }
 
 #[test]
-fn required_parameter_help_uses_qpdf_equals_form() {
-    let top_level = [
-        "compression-level",
-        "copy-encryption",
-        "encryption-file-password",
-        "force-version",
-        "ii-min-bytes",
-        "job-json-file",
-        "json-object",
-        "keep-files-open-threshold",
-        "linearize-pass1",
-        "min-version",
-        "oi-min-area",
-        "oi-min-height",
-        "oi-min-width",
-        "password",
-        "password-file",
-        "remove-attachment",
-        "rotate",
-        "show-attachment",
-        "show-object",
-        "json-stream-prefix",
-        "update-from-json",
-        "compress-streams",
-        "decode-level",
-        "flatten-annotations",
-        "json-key",
-        "json-stream-data",
-        "keep-files-open",
-        "normalize-content",
-        "object-streams",
-        "password-mode",
-        "remove-unreferenced-resources",
-        "stream-data",
-    ];
+fn rewrite_required_parameter_help_uses_qpdf_equals_form() {
     let rewrite = [
         "password",
         "password-file",
@@ -570,17 +542,6 @@ fn required_parameter_help_uses_qpdf_equals_form() {
             );
         }
     }
-
-    let top_help = String::from_utf8(
-        Command::cargo_bin("flpdf")
-            .unwrap()
-            .arg("--help")
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
-    assert_equals_form(&top_help, &top_level, "top-level");
 
     let rewrite_help = String::from_utf8(
         Command::cargo_bin("flpdf")
@@ -902,17 +863,11 @@ fn is_encrypted_applies_ignore_xref_streams() {
 
 #[test]
 fn recovery_help_text_matches_qpdf_wording() {
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .arg("--help")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "Ignore any cross-reference streams in the file",
-        ))
-        .stdout(predicate::str::contains(
-            "Avoid attempting to recover when errors are found",
-        ));
+    let ignore_xref_streams = flpdf_help_entry("--help=--ignore-xref-streams");
+    assert!(ignore_xref_streams.contains("Ignore any cross-reference streams in the file"));
+
+    let suppress_recovery = flpdf_help_entry("--help=--suppress-recovery");
+    assert!(suppress_recovery.contains("Avoid attempting to recover when errors are found"));
 }
 
 #[test]
@@ -8052,15 +8007,11 @@ fn rewrite_subcommand_supports_pages() {
 
 #[test]
 fn pages_help_text_mirrors_qpdf_terms() {
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .arg("--help")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("--pages"))
-        .stdout(predicate::str::contains("--rotate"))
-        .stdout(predicate::str::contains("--split-pages"))
-        .stdout(predicate::str::contains("--collate"));
+    let page_selection = flpdf_help_entry("--help=page-selection");
+    assert!(page_selection.contains("--pages"));
+    for option in ["--rotate", "--split-pages", "--collate"] {
+        assert!(flpdf_help_entry(&format!("--help={option}")).contains(option));
+    }
 }
 
 // ── Attachment tests ────────────────────────────────────────
@@ -9305,16 +9256,19 @@ fn attachment_round_trip_add_list_show_remove_copy() {
 
 #[test]
 fn attachment_help_text_contains_expected_flags() {
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .arg("--help")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("--add-attachment"))
-        .stdout(predicate::str::contains("--remove-attachment"))
-        .stdout(predicate::str::contains("--list-attachments"))
-        .stdout(predicate::str::contains("--show-attachment"))
-        .stdout(predicate::str::contains("--copy-attachments-from"));
+    let attachments = flpdf_help_entry("--help=attachments");
+    assert!(attachments.contains("--add-attachment"));
+    assert!(attachments.contains("--remove-attachment"));
+    assert!(attachments.contains("--copy-attachments-from"));
+    for (option, marker) in [
+        ("--list-attachments", "Show the key and stream number"),
+        (
+            "--show-attachment",
+            "Write the contents of the specified attachment",
+        ),
+    ] {
+        assert!(flpdf_help_entry(&format!("--help={option}")).contains(marker));
+    }
 }
 
 /// Multiple attachment operations must run in qpdf's remove/add/copy order,
