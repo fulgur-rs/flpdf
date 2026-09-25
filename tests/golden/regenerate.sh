@@ -49,6 +49,14 @@ else
     echo "Skipping linearized-one-page.pdf (already exists)"
 fi
 
+if [[ ! -f "$FIX/linearized-two-page.pdf" ]]; then
+    echo "Generating linearized-two-page.pdf ..."
+    qpdf --linearize --static-id --warning-exit-0 \
+        "$FIX/two-page.pdf" "$FIX/linearized-two-page.pdf"
+else
+    echo "Skipping linearized-two-page.pdf (already exists)"
+fi
+
 if [[ ! -f "$FIX/encrypted-r4-three-page.pdf" ]]; then
     echo "Generating encrypted-r4-three-page.pdf ..."
     qpdf --encrypt "" "" 128 --use-aes=y -- --warning-exit-0 \
@@ -2265,6 +2273,8 @@ mkdir -p \
     "$REF/two-page" \
     "$REF/three-page" \
     "$REF/linearized-one-page" \
+    "$REF/linearized-two-page" \
+    "$REF/linearized-two-stream-overflow" \
     "$REF/encrypted-r4-three-page" \
     "$REF/encrypted-recovered-eol" \
     "$REF/attachment-two-page" \
@@ -2404,6 +2414,20 @@ echo "one-page/static-id.pdf"
 qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/one-page.pdf" "$REF/one-page/linearize.pdf"
 echo "one-page/linearize.pdf"
+
+# Relinearize a qpdf-produced two-page source to exercise page-closure GC.
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/linearized-two-page.pdf" "$REF/linearized-two-page/linearize.pdf"
+echo "linearized-two-page/linearize.pdf"
+qpdf --check-linearization "$REF/linearized-two-page/linearize.pdf"
+
+# qpdf 11.9.0 reads both primary and overflow streams from this hand-authored
+# four-item /H source, but its writer emits only a primary hint stream.
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/linearized-two-stream-overflow.pdf" \
+    "$REF/linearized-two-stream-overflow/linearize.pdf"
+echo "linearized-two-stream-overflow/linearize.pdf"
+qpdf --check-linearization "$REF/linearized-two-stream-overflow/linearize.pdf"
 
 # --- objstm-lin-part9-head-anchor: the part-9 `lc_other` set is ordered
 # stream (obj 1), preserved object stream (obj 2), page tree (obj 8). qpdf puts

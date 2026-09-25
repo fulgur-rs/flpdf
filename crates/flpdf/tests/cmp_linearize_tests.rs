@@ -531,6 +531,23 @@ fn relinearize_one_page_is_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("linearized-one-page.pdf", "linearized-one-page");
 }
 
+#[test]
+fn relinearize_two_page_is_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical("linearized-two-page.pdf", "linearized-two-page");
+}
+
+#[test]
+fn relinearize_two_stream_overflow_source_is_byte_identical_to_qpdf() {
+    // qpdf 11.9.0 reads both hint streams from a four-item /H array but only
+    // writes a primary stream when re-linearizing. The checked-in source is a
+    // tiny hand-authored input with two distinct streams, not a qpdf-writer
+    // output; relinearization must garbage-collect both source hint objects.
+    assert_linearize_byte_identical(
+        "linearized-two-stream-overflow.pdf",
+        "linearized-two-stream-overflow",
+    );
+}
+
 // a live body object (the Catalog) carrying null-resolving indirect
 // refs. qpdf drops the null-valued dict keys (/Bad 0 0 R, /Junk 99 0 R, the
 // nested /Inner 99 0 R) and inlines `null` for the object-0 array element
