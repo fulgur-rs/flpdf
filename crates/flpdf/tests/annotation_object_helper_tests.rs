@@ -76,13 +76,42 @@ fn build_annotation_pdf(annot_extras: &str) -> Vec<u8> {
     ])
 }
 
+#[test]
+fn annotation_helpers_from_handles_can_coexist_with_pdf_access() {
+    let bytes = build_pdf(vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 100 100] >>".to_vec(),
+        ),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /Annots [4 0 R 5 0 R] >>".to_vec(),
+        ),
+        (4, b"<< /Type /Annot /Subtype /Text >>".to_vec()),
+        (5, b"<< /Type /Annot /Subtype /Link >>".to_vec()),
+    ]);
+    let mut pdf = open(bytes);
+    let mut text = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
+    let mut link = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(5, 0)));
+
+    assert_eq!(text.get_subtype().expect("text subtype"), b"Text".to_vec());
+    assert_eq!(link.get_subtype().expect("link subtype"), b"Link".to_vec());
+    assert_eq!(
+        flpdf::pages::page_refs(&mut pdf)
+            .expect("Pdf remains independently usable")
+            .len(),
+        1
+    );
+}
+
 // ── AnnotationObjectHelper::get_subtype ──────────────────────────────────────
 
 #[test]
 fn annotation_subtype_returns_name_bytes() {
     let bytes = build_annotation_pdf("/Subtype /Highlight /Rect [10 20 200 50]");
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
     let subtype = annot.get_subtype().expect("get_subtype()");
     assert_eq!(subtype, b"Highlight".to_vec());
 }
@@ -95,7 +124,7 @@ fn annotation_subtype_absent_returns_the_qpdf_fake_name_sentinel() {
     // absent (`libqpdf/QPDFObjectHandle.cc:634-643`).
     let bytes = build_annotation_pdf("/Rect [0 0 100 100]");
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
     assert_eq!(
         annot.get_subtype().expect("get_subtype()"),
         b"QPDFFakeName".to_vec()
@@ -115,7 +144,7 @@ fn annotation_subtype_follows_indirect_name() {
         (5, b"/Widget".to_vec()),
     ]);
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
 
     assert_eq!(
         annot.get_subtype().expect("get_subtype()"),
@@ -136,7 +165,7 @@ fn annotation_subtype_indirect_non_name_returns_the_qpdf_fake_name_sentinel() {
         (5, b"42".to_vec()),
     ]);
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
 
     assert_eq!(
         annot.get_subtype().expect("get_subtype()"),
@@ -150,7 +179,7 @@ fn annotation_subtype_indirect_non_name_returns_the_qpdf_fake_name_sentinel() {
 fn annotation_rect_integers() {
     let bytes = build_annotation_pdf("/Subtype /Text /Rect [ 10 20 200 50 ]");
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
     let rect = annot.get_rect().expect("get_rect()");
     assert_eq!(rect.llx, 10.0);
     assert_eq!(rect.lly, 20.0);
@@ -162,7 +191,7 @@ fn annotation_rect_integers() {
 fn annotation_rect_reals() {
     let bytes = build_annotation_pdf("/Subtype /Link /Rect [ 0.5 1.5 100.0 200.5 ]");
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
     let rect = annot.get_rect().expect("get_rect()");
     assert!((rect.llx - 0.5).abs() < 1e-9);
     assert!((rect.lly - 1.5).abs() < 1e-9);
@@ -186,7 +215,7 @@ fn annotation_rect_resolves_indirect_array() {
         (5, b"[ 10 20 200 50 ]".to_vec()),
     ]);
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
 
     let rect = annot.get_rect().expect("get_rect()");
 
@@ -200,7 +229,7 @@ fn annotation_rect_resolves_indirect_array() {
 fn annotation_rect_absent_returns_zero_box() {
     let bytes = build_annotation_pdf("/Subtype /Text");
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
     assert_eq!(
         annot.get_rect().expect("get_rect()"),
         flpdf::PageBox::new(0.0, 0.0, 0.0, 0.0)
@@ -212,7 +241,7 @@ fn annotation_rect_reversed_corners_normalized() {
     // qpdf's getArrayAsRectangle normalizes llx<=urx, lly<=ury via min/max.
     let bytes = build_annotation_pdf("/Subtype /Text /Rect [ 200 50 10 20 ]");
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
     let rect = annot.get_rect().expect("get_rect()");
     assert_eq!(rect.llx, 10.0);
     assert_eq!(rect.lly, 20.0);
@@ -245,7 +274,7 @@ fn annotation_appearance_indirect_dict() {
         (6, b"<< /N 5 0 R >>".to_vec()),
     ]);
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
     let ap = annot
         .get_appearance_dictionary()
         .expect("get_appearance_dictionary()");
@@ -259,7 +288,7 @@ fn annotation_appearance_indirect_dict() {
 fn annotation_appearance_absent_returns_null_handle() {
     let bytes = build_annotation_pdf("/Subtype /Text /Rect [0 0 10 10]");
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
     assert!(annot
         .get_appearance_dictionary()
         .expect("get_appearance_dictionary()")
@@ -272,7 +301,7 @@ fn annotation_appearance_absent_returns_null_handle() {
 fn annotation_handle_reads_qpdf_leaf_attributes() {
     let bytes = build_annotation_pdf("/Subtype /Highlight /Rect [10 20 200 50] /AS /On /F 12");
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
 
     assert_eq!(annot.get_subtype().unwrap(), b"Highlight");
     assert_eq!(annot.get_appearance_state().unwrap(), b"On");
@@ -297,7 +326,7 @@ fn annotation_handle_uses_direct_appearance_stream_even_with_state() {
         (5, b"<< /Length 0 >>\nstream\n\nendstream".to_vec()),
     ]);
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
     let stream = annot
         .get_appearance_stream(b"N", None)
         .expect("get_appearance_stream()");
@@ -323,7 +352,7 @@ fn annotation_handle_appearance_stream_state_dictionary_uses_as() {
         (6, b"<< /Length 0 >>\nstream\n\nendstream".to_vec()),
     ]);
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
     let stream = annot
         .get_appearance_stream(b"N", None)
         .expect("get_appearance_stream()");
@@ -347,7 +376,7 @@ fn annotation_handle_appearance_stream_explicit_state_overrides_as() {
         (6, b"<< /Length 0 >>\nstream\n\nendstream".to_vec()),
     ]);
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
     let stream = annot
         .get_appearance_stream(b"N", Some(b"Off"))
         .expect("get_appearance_stream()");
@@ -370,7 +399,7 @@ fn annotation_handle_appearance_stream_missing_state_returns_null() {
         (5, b"<< /Length 0 >>\nstream\n\nendstream".to_vec()),
     ]);
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
     // No /AS on the annotation and no explicit state: desired_state is empty,
     // so the state-dictionary branch (which requires a non-empty state) is
     // never taken.
@@ -396,7 +425,7 @@ fn annotation_handle_appearance_stream_state_dictionary_key_missing_returns_null
         (5, b"<< /Length 0 >>\nstream\n\nendstream".to_vec()),
     ]);
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
     // /AS selects "Off", a non-empty state, so the state-dictionary branch is
     // taken; but /N's state dictionary only has an "On" entry, so the
     // selected key doesn't resolve to a stream and the result is null.
@@ -422,7 +451,7 @@ fn annotation_handle_builds_qpdf_page_content_for_appearance() {
         ),
     ]);
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
 
     let content = annot
         .get_page_content_for_appearance("/Fxo1", 0, 0, 0x3)
@@ -477,7 +506,7 @@ fn annotation_handle_builds_no_rotate_page_content_for_appearance() {
     };
 
     // The helper owns the same qpdf NoRotate transform used by page flattening.
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
     let content = annot
         .get_page_content_for_appearance("/Fxo1", 90, 0, 0x3)
         .expect("get_page_content_for_appearance()");
@@ -955,7 +984,7 @@ fn annotation_object_helper_on_non_dict_returns_defaults() {
         (4, b"42".to_vec()),
     ]);
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
     assert_eq!(
         annot.get_subtype().expect("get_subtype()"),
         b"QPDFFakeName".to_vec()

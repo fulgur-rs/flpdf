@@ -91,11 +91,8 @@ fn resolve_rect_canonical(widget: &ObjectHandle) -> Result<Option<PageBox>> {
 /// `/Rect [10 10 400 130]` is rewritten with `/BBox` still `[0 0 190 20]`,
 /// and the appearance content's `Td` offsets are computed from that
 /// unchanged 190×20 box.
-fn resolve_appearance_bbox_canonical<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    widget: &ObjectHandle,
-) -> Result<Option<PageBox>> {
-    let normal = resolve_normal_appearance_canonical(pdf, widget)?;
+fn resolve_appearance_bbox_canonical(widget: &ObjectHandle) -> Result<Option<PageBox>> {
+    let normal = resolve_normal_appearance_canonical(widget)?;
     normal.try_dereference()?;
     if let Some(stream_dict) = normal.as_stream_dict() {
         return resolve_rectangle_canonical(&stream_dict, b"/BBox");
@@ -113,11 +110,8 @@ fn resolve_appearance_bbox_canonical<R: Read + Seek>(
 
 /// Select `/AP/N`, including qpdf's `/AS` lookup when `/N` is a state
 /// dictionary. The annotation helper owns this qpdf responsibility.
-fn resolve_normal_appearance_canonical<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    widget: &ObjectHandle,
-) -> Result<ObjectHandle> {
-    let mut annotation = AnnotationObjectHelper::from_object_handle(widget.clone(), pdf);
+fn resolve_normal_appearance_canonical(widget: &ObjectHandle) -> Result<ObjectHandle> {
+    let mut annotation = AnnotationObjectHelper::new(widget.clone());
     annotation.get_appearance_stream(b"N", None)
 }
 
@@ -372,7 +366,7 @@ fn install_normal_appearance_canonical_handles<R: Read + Seek>(
     font_resource: Option<AppearanceFont>,
 ) -> Result<Option<ObjectRef>> {
     widget.try_dereference()?;
-    let normal = resolve_normal_appearance_canonical(pdf, &widget)?;
+    let normal = resolve_normal_appearance_canonical(&widget)?;
     normal.try_dereference()?;
 
     // qpdf keeps an existing normal appearance stream and installs a
@@ -479,7 +473,7 @@ pub(crate) fn render_text_field_canonical_handles<R: Read + Seek>(
 
     let value = FormFieldObjectHelper::from_object_handle(field.clone(), pdf).value_as_string()?;
     widget.try_dereference()?;
-    let Some(rect) = resolve_appearance_bbox_canonical(pdf, &widget)? else {
+    let Some(rect) = resolve_appearance_bbox_canonical(&widget)? else {
         return Ok(None);
     };
     let bbox_w = rect.urx - rect.llx;
@@ -497,7 +491,7 @@ pub(crate) fn render_text_field_canonical_handles<R: Read + Seek>(
     let da = parse_default_appearance(default_appearance.as_bytes());
     drop(helper);
 
-    let normal_appearance = resolve_normal_appearance_canonical(pdf, &widget)?;
+    let normal_appearance = resolve_normal_appearance_canonical(&widget)?;
     let font = lookup_appearance_font(
         pdf,
         field.clone(),
@@ -534,7 +528,7 @@ pub(crate) fn render_choice_field_canonical_handles<R: Read + Seek>(
     }
 
     widget.try_dereference()?;
-    let Some(rect) = resolve_appearance_bbox_canonical(pdf, &widget)? else {
+    let Some(rect) = resolve_appearance_bbox_canonical(&widget)? else {
         return Ok(None);
     };
     let bbox_w = rect.urx - rect.llx;
@@ -572,7 +566,7 @@ pub(crate) fn render_choice_field_canonical_handles<R: Read + Seek>(
     let options = helper.choices()?;
     drop(helper);
 
-    let normal_appearance = resolve_normal_appearance_canonical(pdf, &widget)?;
+    let normal_appearance = resolve_normal_appearance_canonical(&widget)?;
     let font = lookup_appearance_font(
         pdf,
         field.clone(),

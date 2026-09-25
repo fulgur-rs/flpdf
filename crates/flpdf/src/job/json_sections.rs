@@ -363,7 +363,7 @@ pub(crate) fn build_acroform_section_with_version<R: Read + Seek>(
 
         let (mut appearancestate, annotationflags) = {
             let mut annotation_object_helper =
-                crate::AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
+                crate::AnnotationObjectHelper::new(annotation.clone());
             (
                 annotation_object_helper.get_appearance_state()?,
                 annotation_object_helper.get_flags()?,

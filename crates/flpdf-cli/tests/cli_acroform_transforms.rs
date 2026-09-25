@@ -245,7 +245,7 @@ fn nested_tx_widget_with_local_value() -> Vec<u8> {
 fn widget_normal_appearance_data(path: &Path) -> Vec<u8> {
     let mut pdf = Pdf::open(BufReader::new(File::open(path).unwrap())).unwrap();
     let widget_ref = first_widget_ref(&mut pdf);
-    let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
+    let mut helper = AnnotationObjectHelper::new(pdf.get_object_handle(widget_ref));
     helper
         .get_appearance_stream(b"N", None)
         .unwrap()
@@ -419,7 +419,7 @@ fn top_level_generate_appearances_routes_to_canonical_writer() {
     let mut form = flpdf::AcroFormDocumentHelper::new(&mut pdf).unwrap();
     assert!(!form.get_need_appearances().unwrap());
     drop(form);
-    let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
+    let mut helper = AnnotationObjectHelper::new(pdf.get_object_handle(widget_ref));
     let appearance = helper
         .get_appearance_stream(b"N", None)
         .unwrap()
@@ -476,7 +476,7 @@ fn top_level_generate_appearances_compress_streams_n_without_qdf_stays_stale_lik
     let read_appearance = |output: &Path| -> Vec<u8> {
         let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
         let widget_ref = first_widget_ref(&mut pdf);
-        let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
+        let mut helper = AnnotationObjectHelper::new(pdf.get_object_handle(widget_ref));
         helper
             .get_appearance_stream(b"N", None)
             .unwrap()
@@ -693,7 +693,7 @@ fn generate_appearances_without_need_marker_is_a_noop() {
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget_ref = first_widget_ref(&mut pdf);
-    let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
+    let mut helper = AnnotationObjectHelper::new(pdf.get_object_handle(widget_ref));
     assert!(
         helper.get_appearance_dictionary().unwrap().is_null(),
         "qpdf leaves a widget without /AP unchanged when /NeedAppearances is false"
@@ -727,7 +727,7 @@ fn generate_appearances_tx_ap_n_contains_tj() {
 
     // /AP/N must be present after generate-appearances, and resolve to the
     // Form XObject stream.
-    let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
+    let mut helper = AnnotationObjectHelper::new(pdf.get_object_handle(widget_ref));
     let n = helper.get_appearance_stream(b"N", None).unwrap();
     let data = n
         .get_stream_data(DecodeLevel::Generalized)
@@ -765,7 +765,7 @@ fn generate_appearances_tx_reuses_existing_ap() {
     // renderer's existing-stream token-filter path.
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget_ref = first_widget_ref(&mut pdf);
-    let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
+    let mut helper = AnnotationObjectHelper::new(pdf.get_object_handle(widget_ref));
     let n_handle = helper
         .get_appearance_stream(b"N", None)
         .expect("/AP must survive --generate-appearances for widget that already has one");
@@ -848,7 +848,7 @@ fn generate_appearances_checkbox_without_ap_leaves_ap_absent() {
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget_ref = first_widget_ref(&mut pdf);
-    let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
+    let mut helper = AnnotationObjectHelper::new(pdf.get_object_handle(widget_ref));
     assert!(
         helper.get_appearance_dictionary().unwrap().is_null(),
         "qpdf leaves a button without /AP unchanged"
@@ -910,7 +910,7 @@ fn generate_appearances_radio_without_ap_leaves_ap_absent() {
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget_ref = first_widget_ref(&mut pdf);
-    let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
+    let mut helper = AnnotationObjectHelper::new(pdf.get_object_handle(widget_ref));
     assert!(
         helper.get_appearance_dictionary().unwrap().is_null(),
         "qpdf leaves a radio button without /AP unchanged"
@@ -1001,7 +1001,7 @@ fn generate_appearances_combo_ap_n_contains_tj() {
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget_ref = first_widget_ref(&mut pdf);
-    let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
+    let mut helper = AnnotationObjectHelper::new(pdf.get_object_handle(widget_ref));
     let n = helper.get_appearance_stream(b"N", None).unwrap();
     let data = n
         .get_stream_data(DecodeLevel::Generalized)

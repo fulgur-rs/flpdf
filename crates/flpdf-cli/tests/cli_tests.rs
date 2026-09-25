@@ -9805,7 +9805,7 @@ fn rewrite_generate_appearances_replaces_null_ap_n() {
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget = first_widget_ref(&mut pdf);
-    let mut helper = AnnotationObjectHelper::new(widget, &mut pdf);
+    let mut helper = AnnotationObjectHelper::new(pdf.get_object_handle(widget));
     let n = helper.get_appearance_stream(b"N", None).unwrap();
     // /N must now be a real (non-null) appearance, resolving to a Form XObject
     // stream — not the original null.
@@ -9862,7 +9862,7 @@ fn rewrite_generate_appearances_adds_ap_n() {
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget = first_widget_ref(&mut pdf);
-    let mut helper = AnnotationObjectHelper::new(widget, &mut pdf);
+    let mut helper = AnnotationObjectHelper::new(pdf.get_object_handle(widget));
     let ap = helper.get_appearance_dictionary().unwrap();
     assert!(
         !ap.try_get_key(b"/N").unwrap().is_null(),

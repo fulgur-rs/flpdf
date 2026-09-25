@@ -140,11 +140,11 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         // selected /N stream is itself a flattening/removal outcome (for
         // example an unchecked checkbox).
         let appearance_dictionary = {
-            let mut helper = AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
+            let mut helper = AnnotationObjectHelper::new(annotation.clone());
             helper.get_appearance_dictionary()?
         };
         let appearance = {
-            let mut helper = AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
+            let mut helper = AnnotationObjectHelper::new(annotation.clone());
             helper.get_appearance_stream(b"N", None)?
         };
 
@@ -153,16 +153,14 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         // (`QPDFPageDocumentHelper.cc:97-105`). Keep this order so a skipped
         // Widget still observes the canonical appearance-resolution boundary.
         if skip_widgets
-            && AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf).get_subtype()?
-                == b"Widget"
+            && AnnotationObjectHelper::new(annotation.clone()).get_subtype()? == b"Widget"
         {
             continue;
         }
 
         // Read /F through the canonical helper. A zero result is also qpdf's
         // fail-soft value for absent/non-integer /F.
-        let flags =
-            AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf).get_flags()?;
+        let flags = AnnotationObjectHelper::new(annotation.clone()).get_flags()?;
         #[cfg(test)]
         let hidden = (flags & FLAG_HIDDEN) != 0;
         #[cfg(test)]
@@ -213,8 +211,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
             if !has_rect {
                 continue;
             }
-            let rect =
-                AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf).get_rect()?;
+            let rect = AnnotationObjectHelper::new(annotation.clone()).get_rect()?;
             let (llx, urx) = if rect.llx <= rect.urx {
                 (rect.llx, rect.urx)
             } else {
@@ -321,14 +318,13 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         // The `/Fxo` prefix and the decimal suffix are both ASCII, so this
         // conversion never substitutes a replacement character.
         let resource_name = String::from_utf8_lossy(&xobj_name);
-        let content_result =
-            AnnotationObjectHelper::from_object_handle(data.annotation.clone(), pdf)
-                .get_page_content_for_appearance(
-                    &resource_name,
-                    page_rotate,
-                    required_flags,
-                    forbidden_flags,
-                );
+        let content_result = AnnotationObjectHelper::new(data.annotation.clone())
+            .get_page_content_for_appearance(
+                &resource_name,
+                page_rotate,
+                required_flags,
+                forbidden_flags,
+            );
         let content = content_result?;
         if content.is_empty() {
             continue;
@@ -769,8 +765,7 @@ fn merge_widget_default_resources_on_page_with_associations<R: Read + Seek>(
     field_annotation_ids: &HashSet<ObjectHandleIdentity>,
 ) -> Result<()> {
     for annotation in page_annotation_handles(pdf, page_ref)? {
-        let mut annotation_object_helper =
-            AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
+        let mut annotation_object_helper = AnnotationObjectHelper::new(annotation.clone());
         if annotation_object_helper.get_subtype()? != b"Widget" {
             continue;
         }
@@ -2408,34 +2403,42 @@ mod tests {
 
         let mut pdf =
             open_annotation_object_helper_fixture("<< /Type /Annot /Rect [0 0 100 20] >>", None);
-        assert!(AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf)
-            .get_page_content_for_appearance("/Fxo1", 0, 0, 0)
-            .unwrap()
-            .is_empty());
+        assert!(
+            AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)))
+                .get_page_content_for_appearance("/Fxo1", 0, 0, 0)
+                .unwrap()
+                .is_empty()
+        );
 
         let mut pdf = open_annotation_object_helper_fixture(annotation, Some(stream_dictionary));
-        assert!(AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf)
-            .get_page_content_for_appearance("/Fxo1", 0, 0, 4)
-            .unwrap()
-            .is_empty());
+        assert!(
+            AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)))
+                .get_page_content_for_appearance("/Fxo1", 0, 0, 4)
+                .unwrap()
+                .is_empty()
+        );
 
         let mut pdf = open_annotation_object_helper_fixture(
             "<< /Type /Annot /Rect [0 0 100] /AP << /N 5 0 R >> >>",
             Some(stream_dictionary),
         );
-        assert!(AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf)
-            .get_page_content_for_appearance("/Fxo1", 0, 0, 0)
-            .unwrap()
-            .is_empty());
+        assert!(
+            AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)))
+                .get_page_content_for_appearance("/Fxo1", 0, 0, 0)
+                .unwrap()
+                .is_empty()
+        );
 
         let mut pdf = open_annotation_object_helper_fixture(
             "<< /Type /Annot /Rect [0 0 bad 20] /AP << /N 5 0 R >> >>",
             Some(stream_dictionary),
         );
-        assert!(AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf)
-            .get_page_content_for_appearance("/Fxo1", 0, 0, 0)
-            .unwrap()
-            .is_empty());
+        assert!(
+            AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)))
+                .get_page_content_for_appearance("/Fxo1", 0, 0, 0)
+                .unwrap()
+                .is_empty()
+        );
 
         let mut pdf = open_annotation_object_helper_fixture(
             annotation,
@@ -2443,10 +2446,12 @@ mod tests {
                 "<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Matrix [1 0 0] /Length 0 >>",
             ),
         );
-        assert!(!AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf)
-            .get_page_content_for_appearance("/Fxo1", 0, 0, 0)
-            .unwrap()
-            .is_empty());
+        assert!(
+            !AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)))
+                .get_page_content_for_appearance("/Fxo1", 0, 0, 0)
+                .unwrap()
+                .is_empty()
+        );
 
         let mut pdf = open_annotation_object_helper_fixture(
             annotation,
@@ -2454,17 +2459,19 @@ mod tests {
                 "<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Matrix [1 0 bad 1 0 0] /Length 0 >>",
             ),
         );
-        assert!(!AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf)
-            .get_page_content_for_appearance("/Fxo1", 0, 0, 0)
-            .unwrap()
-            .is_empty());
+        assert!(
+            !AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)))
+                .get_page_content_for_appearance("/Fxo1", 0, 0, 0)
+                .unwrap()
+                .is_empty()
+        );
 
         for rotate in [180, 270, 45] {
             let annotation = "<< /Type /Annot /Rect [10 20 110 40] /F 16 /AP << /N 5 0 R >> >>";
             let mut pdf =
                 open_annotation_object_helper_fixture(annotation, Some(stream_dictionary));
             assert!(
-                !AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf)
+                !AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)))
                     .get_page_content_for_appearance("/Fxo1", rotate, 0, 0)
                     .unwrap()
                     .is_empty(),
