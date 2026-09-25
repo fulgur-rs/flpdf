@@ -57,6 +57,39 @@ else
     echo "Skipping linearized-two-page.pdf (already exists)"
 fi
 
+if [[ ! -f "$FIX/compressed-metadata.pdf" ]]; then
+    echo "Generating compressed-metadata.pdf ..."
+    python3 - "$FIX/compressed-metadata.pdf" <<'PY'
+import sys
+import zlib
+
+xmp = (b'<?xpacket begin="\xef\xbb\xbf"?><x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF '
+       b'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description '
+       b'rdf:about=""/></rdf:RDF></x:xmpmeta><?xpacket end="w"?>')
+compressed = zlib.compress(xmp)
+objects = [
+    b'1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 4 0 R >>\nendobj\n',
+    b'2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n',
+    b'3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n',
+    (f'4 0 obj\n<< /Type /Metadata /Subtype /XML /Filter /FlateDecode /Length {len(compressed)} >>\nstream\n'.encode()
+     + compressed + b'\nendstream\nendobj\n'),
+]
+pdf = bytearray(b'%PDF-1.7\n')
+offsets = []
+for obj in objects:
+    offsets.append(len(pdf))
+    pdf.extend(obj)
+xref = len(pdf)
+pdf.extend(b'xref\n0 5\n0000000000 65535 f \n')
+for offset in offsets:
+    pdf.extend(f'{offset:010} 00000 n \n'.encode())
+pdf.extend(f'trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n'.encode())
+open(sys.argv[1], 'wb').write(pdf)
+PY
+else
+    echo "Skipping compressed-metadata.pdf (already exists)"
+fi
+
 if [[ ! -f "$FIX/encrypted-r4-three-page.pdf" ]]; then
     echo "Generating encrypted-r4-three-page.pdf ..."
     qpdf --encrypt "" "" 128 --use-aes=y -- --warning-exit-0 \
@@ -2275,6 +2308,7 @@ mkdir -p \
     "$REF/linearized-one-page" \
     "$REF/linearized-two-page" \
     "$REF/linearized-two-stream-overflow" \
+    "$REF/compressed-metadata" \
     "$REF/encrypted-r4-three-page" \
     "$REF/encrypted-recovered-eol" \
     "$REF/attachment-two-page" \
@@ -2410,6 +2444,13 @@ echo "one-page/plain.pdf"
 qpdf --static-id --warning-exit-0 \
     "$FIX/one-page.pdf" "$REF/one-page/static-id.pdf"
 echo "one-page/static-id.pdf"
+
+# Cleartext /Metadata is fully decoded and emitted without a filter, including
+# when the input XMP packet is Flate-compressed.
+qpdf --static-id --warning-exit-0 \
+    "$FIX/compressed-metadata.pdf" "$REF/compressed-metadata/static-id.pdf"
+echo "compressed-metadata/static-id.pdf"
+qpdf --check "$REF/compressed-metadata/static-id.pdf"
 
 qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/one-page.pdf" "$REF/one-page/linearize.pdf"
