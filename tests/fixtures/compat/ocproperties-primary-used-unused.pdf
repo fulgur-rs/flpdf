@@ -1,0 +1,55 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /OCProperties 3 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /OCGs [7 0 R 8 0 R] /D 5 0 R /Configs [6 0 R] >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Properties << /Used 7 0 R >> >> /Contents 9 0 R >>
+endobj
+5 0 obj
+<< /BaseState /ON /Order [7 0 R [8 0 R]] /ON [7 0 R] /OFF [8 0 R] >>
+endobj
+6 0 obj
+<< /Name (Print) /BaseState /OFF /Order [8 0 R 7 0 R] /ON [] /OFF [7 0 R 8 0 R] >>
+endobj
+7 0 obj
+<< /Type /OCG /Name (Primary used) >>
+endobj
+8 0 obj
+<< /Type /OCG /Name (Primary unused) >>
+endobj
+9 0 obj
+<< /Length 33 >>
+stream
+/OC /Used BDC
+0 0 50 50 re f
+EMC
+endstream
+endobj
+10 0 obj
+<< /Producer (flpdf optional-content fixture generator) >>
+endobj
+xref
+0 11
+0000000000 65535 f 
+0000000015 00000 n 
+0000000084 00000 n 
+0000000141 00000 n 
+0000000208 00000 n 
+0000000342 00000 n 
+0000000426 00000 n 
+0000000524 00000 n 
+0000000577 00000 n 
+0000000632 00000 n 
+0000000714 00000 n 
+trailer
+<< /Size 11 /Root 1 0 R /Info 10 0 R >>
+startxref
+789
+%%EOF
