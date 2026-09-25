@@ -3957,6 +3957,8 @@ raw fallback behavior. The differential regression
 an unknown `/PlateDecode` filter and compares qpdf 11.9.0's exit code, stdout,
 stderr, and object-specific error text.
 
+The post-writer page-content pass follows the same handle boundary in flpdf: `job/check.rs::check_document_with_suppression` obtains prepared page handles through `PageDocumentHelper::get_all_page_handles()` and constructs `PageObjectHelper::from_object_handle`, preserving raw `QpdfObjGen` identity for this qpdf-shaped loop. The public `get_all_pages() -> Vec<ObjectRef>` remains the explicit projection surface for other consumers (`flpdf-ihyup.4`; `QPDFPageDocumentHelper.cc:13-20`, `QPDFJob.cc:745-790`).
+
 ### qtest document-construction helper ports (`flpdf-egzr.5`)
 
 `flpdf-qtest-tools::document_construction` ports the two qpdf test programs
