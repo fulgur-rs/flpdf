@@ -1,6 +1,7 @@
 use flpdf::{
-    AcroFormDocumentHelper, Error, FormFieldObjectHelper, ObjectRef, PageDocumentHelper,
-    PageObjectHelper, Pdf, PdfOpenOptions, Pipeline, PipelineError, PipelineHandle, QPDFLogger,
+    AcroFormDocumentHelper, Error, FormFieldObjectHelper, ObjectHandle, ObjectRef,
+    PageDocumentHelper, PageObjectHelper, Pdf, PdfOpenOptions, Pipeline, PipelineError,
+    PipelineHandle, QPDFLogger,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -71,7 +72,7 @@ fn canonical_helpers_preserve_grouped_widget_field_association() {
         let mut acroform = AcroFormDocumentHelper::new(&mut pdf).unwrap();
         acroform.annotation_to_field_map().unwrap()
     };
-    let top_level_fields: Vec<ObjectRef> = widgets
+    let top_level_fields: Vec<ObjectHandle> = widgets
         .into_iter()
         .map(|widget| {
             let annotation_ref = widget.object_ref().unwrap();
@@ -85,7 +86,7 @@ fn canonical_helpers_preserve_grouped_widget_field_association() {
     assert_eq!(
         top_level_fields
             .iter()
-            .filter(|field_ref| **field_ref == ObjectRef::new(5, 0))
+            .filter(|field| field.object_ref() == Some(ObjectRef::new(5, 0)))
             .count(),
         3,
         "the three grouped widgets must resolve through the canonical qpdf helper composition"
