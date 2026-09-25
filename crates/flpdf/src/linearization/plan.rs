@@ -4550,6 +4550,43 @@ mod tests {
     }
 
     #[test]
+    fn linearized_writer_pipes_provider_once_for_probe_and_each_output_pass() {
+        let mut pdf = Pdf::open(Cursor::new(parameter_probe_fixture())).expect("parse fixture");
+        let stream = pdf.get_object_handle(ObjectRef::new(4, 0));
+        stream.try_is_scalar().expect("resolve page content");
+
+        let provider_calls = Rc::new(Cell::new(0));
+        let provider_calls_for_callback = Rc::clone(&provider_calls);
+        let compressed_content = flate(b"q Q\n");
+        stream
+            .replace_stream_data_with_retry_callback(
+                move |pipeline, _suppress_warnings, _will_retry| {
+                    provider_calls_for_callback.set(provider_calls_for_callback.get() + 1);
+                    pipeline.write(&compressed_content)?;
+                    pipeline.finish()?;
+                    Ok(true)
+                },
+                None,
+                None,
+            )
+            .expect("install successful retry-aware stream provider");
+
+        let mut writer = crate::writer::PdfWriter::new(&mut pdf);
+        writer.set_object_stream_mode(ObjectStreamMode::Disable);
+        writer.set_compress_streams(true);
+        writer.set_linearization(true);
+        writer.set_output_memory().expect("install output memory");
+        writer.write().expect("write linearized output");
+        let output = writer.get_buffer().expect("read linearized output");
+        assert!(!output.is_empty(), "linearized output must be emitted");
+        assert_eq!(
+            provider_calls.get(),
+            3,
+            "qpdf probes once during optimization and pipes once in each of its two output passes"
+        );
+    }
+
+    #[test]
     fn stream_parameter_probe_uses_a_live_dictionary_lookup_with_warning_fallback() {
         let source = include_str!("plan.rs").replace("\r\n", "\n");
         let start = source
