@@ -13,8 +13,10 @@ and follows indirect references and direct arrays and dictionaries
 `libqpdf/QPDFWriter.cc:1072-1157,2907-2925`). Therefore reachable PDF/A-related
 entries such as `/OutputIntents` (including `/DestOutputProfile`), `/MarkInfo`,
 `/StructTreeRoot`, `/Lang`, and `/AF` remain part of the output object graph.
-This does not preserve unreachable objects, and it does not guarantee that an
-input file was conforming or that a rewrite leaves it conforming.
+By default this does not preserve unreachable objects (`--preserve-unreferenced`
+enqueues every cached object before `/Root` and does keep them), and it does not
+guarantee that an input file was conforming or that a rewrite leaves it
+conforming.
 
 Preservation is about the reachable PDF values and stream payloads, not stable
 object numbers or identical serialization. The writer may renumber objects and
@@ -23,10 +25,13 @@ apply its stream-filter, length, and framing policies.
 ## Metadata streams and stream framing
 
 For cleartext `/Metadata` streams, qpdf 11.9.0 decodes the stream data and
-writes it without a filter (`QPDFWriter::willFilterStream` in
-`libqpdf/QPDFWriter.cc:1238-1299`). The decoded XMP packet is the content to
-preserve; the original `/Filter`, `/Length`, and encoded bytes are not a
-byte-for-byte preservation contract. The decoded payload of an ICC profile
+writes it without a filter when the decode succeeds
+(`QPDFWriter::willFilterStream` in `libqpdf/QPDFWriter.cc:1238-1299`). A filter
+that cannot be decoded falls back to a raw second attempt that keeps the
+original filter (`:1304-1313`), and disabling filter-on-write vetoes decoding
+altogether. The decoded XMP packet is the content to preserve; the original
+`/Filter`, `/Length`, and encoded bytes are not a byte-for-byte preservation
+contract. The decoded payload of an ICC profile
 referenced by `/DestOutputProfile` is likewise preserved when it can be
 decoded; its encoded representation follows the selected writer options.
 
