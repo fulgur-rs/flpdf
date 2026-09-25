@@ -2239,13 +2239,12 @@ fn static_aes_iv_matches_the_vector_qpdf_writes() {
 /// `qpdf --static-id --static-aes-iv --encrypt "" "" 256 --` runs on the same
 /// input diverge partway into the first encrypted string. A byte-identical
 /// comparison is therefore not meaningful for the 256-bit case, independent
-/// of flpdf's implementation.
+/// of flpdf's implementation. The committed 11.9.0 golden is checked even
+/// when the qpdf executable is unavailable; a live qpdf comparison is added
+/// when it is present.
 #[cfg(feature = "qpdf-zlib-compat")]
 #[test]
 fn encrypted_document_is_byte_identical_to_qpdf() {
-    if !ensure_qpdf_or_skip() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let ours = tmp.path().join("flpdf.pdf");
     let theirs = tmp.path().join("qpdf.pdf");
@@ -2270,6 +2269,20 @@ fn encrypted_document_is_byte_identical_to_qpdf() {
         .assert()
         .success();
 
+    let mine = std::fs::read(&ours).unwrap();
+    let golden =
+        fixture("../../tests/golden/references/encrypted-document-is-byte-identical-to-qpdf.pdf");
+    let expected = std::fs::read(&golden)
+        .unwrap_or_else(|e| panic!("read qpdf 11.9.0 golden {golden:?}: {e}"));
+    assert_eq!(
+        mine, expected,
+        "AES-128 (V=4/AESV2): flpdf output must match the committed qpdf 11.9.0 golden"
+    );
+
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+
     let qpdf = std::process::Command::new("qpdf")
         .args(args)
         .arg(&input)
@@ -2282,7 +2295,6 @@ fn encrypted_document_is_byte_identical_to_qpdf() {
         String::from_utf8_lossy(&qpdf.stderr)
     );
 
-    let mine = std::fs::read(&ours).unwrap();
     let reference = std::fs::read(&theirs).unwrap();
     assert_eq!(
         mine, reference,
