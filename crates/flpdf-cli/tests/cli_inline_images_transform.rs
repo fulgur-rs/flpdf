@@ -40,8 +40,7 @@ fn stream_object(dictionary: &[u8], data: &[u8]) -> Vec<u8> {
     object
 }
 
-fn inline_image_pdf() -> Vec<u8> {
-    let content = inline_image_content(b"/G", &[0, 64, 128, 255], true);
+fn single_page_pdf_with_content(content: &[u8]) -> Vec<u8> {
     assemble_pdf(&[
         (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
         (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
@@ -53,14 +52,29 @@ fn inline_image_pdf() -> Vec<u8> {
             4,
             stream_object(
                 format!("<< /Length {} >>", content.len()).as_bytes(),
-                &content,
+                content,
             ),
         ),
     ])
 }
 
+fn inline_image_pdf() -> Vec<u8> {
+    let content = inline_image_content(b"/G", &[0, 64, 128, 255], true);
+    single_page_pdf_with_content(&content)
+}
+
 fn inline_image_content(colorspace: &[u8], payload: &[u8], with_ei: bool) -> Vec<u8> {
-    let mut content = b"q 200 0 0 200 0 0 cm BI /W 2 /H 2 /CS ".to_vec();
+    inline_image_content_with_dimensions(2, 2, colorspace, payload, with_ei)
+}
+
+fn inline_image_content_with_dimensions(
+    width: u8,
+    height: u8,
+    colorspace: &[u8],
+    payload: &[u8],
+    with_ei: bool,
+) -> Vec<u8> {
+    let mut content = format!("q 200 0 0 200 0 0 cm BI /W {width} /H {height} /CS ").into_bytes();
     content.extend_from_slice(colorspace);
     content.extend_from_slice(b" /BPC 8 ID\n");
     content.extend_from_slice(payload);
@@ -70,6 +84,18 @@ fn inline_image_content(colorspace: &[u8], payload: &[u8], with_ei: bool) -> Vec
         content.extend_from_slice(b"\nQ\n");
     }
     content
+}
+
+fn mixed_threshold_inline_image_pdf() -> Vec<u8> {
+    let mut content = inline_image_content_with_dimensions(2, 2, b"/G", &[0, 64, 128, 255], true);
+    content.extend_from_slice(&inline_image_content_with_dimensions(
+        4,
+        4,
+        b"/G",
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        true,
+    ));
+    single_page_pdf_with_content(&content)
 }
 
 fn two_page_inline_image_pdf() -> Vec<u8> {
@@ -191,6 +217,12 @@ fn damaged_inline_image_pdf() -> Vec<u8> {
             stream_object(format!("<< /Length {} >>", content.len()).as_bytes(), &content),
         ),
     ])
+}
+
+fn eof_inline_image_pdf() -> Vec<u8> {
+    let mut content = b"q 200 0 0 200 0 0 cm BI /W 2 /H 2 /CS /G /BPC 8 ID\n".to_vec();
+    content.extend_from_slice(&[0, 64, 128, 255]);
+    single_page_pdf_with_content(&content)
 }
 
 fn qpdf_or_skip() -> bool {
@@ -611,6 +643,145 @@ fn top_level_externalize_inline_images_honors_inclusive_payload_threshold() {
         &["--externalize-inline-images", "--ii-min-bytes=5"],
         "at the inclusive threshold",
     );
+}
+
+#[test]
+fn mixed_inline_image_sizes_match_qpdf_at_thresholds() {
+    if !qpdf_or_skip() {
+        return;
+    }
+    let directory = tempfile::tempdir().expect("tempdir");
+    let input = directory.path().join("mixed-input.pdf");
+    std::fs::write(&input, mixed_threshold_inline_image_pdf()).expect("write input");
+
+    let cases: [(usize, &[&str], usize); 3] = [
+        (0, &["/IIm1", "/IIm2"], 0),
+        (10, &["/IIm1"], 1),
+        (100, &[], 2),
+    ];
+    for (threshold, expected_images, expected_inline_images) in cases {
+        let qpdf_output = directory.path().join(format!("qpdf-{threshold}.pdf"));
+        let flpdf_output = directory.path().join(format!("flpdf-{threshold}.pdf"));
+        let flags = vec![
+            "--qdf".to_owned(),
+            "--static-id".to_owned(),
+            "--externalize-inline-images".to_owned(),
+            format!("--ii-min-bytes={threshold}"),
+        ];
+        let qpdf = run_qpdf_rewrite(&flags, &input, &qpdf_output);
+        assert!(
+            qpdf.status.success(),
+            "qpdf threshold {threshold} failed: {}",
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+        let flpdf = run_flpdf_rewrite(&flags, &input, &flpdf_output);
+        assert!(
+            flpdf.status.success(),
+            "flpdf threshold {threshold} failed: {}",
+            String::from_utf8_lossy(&flpdf.stderr)
+        );
+        assert_streams_and_status_match(&qpdf, &flpdf, &format!("mixed threshold {threshold}"));
+
+        let qpdf_bytes = std::fs::read(&qpdf_output).expect("qpdf output");
+        let flpdf_bytes = std::fs::read(&flpdf_output).expect("flpdf output");
+        assert_eq!(
+            qpdf_bytes, flpdf_bytes,
+            "threshold {threshold}: --qdf output must be byte-identical to qpdf 11.9.0"
+        );
+        assert_eq!(
+            qpdf_bytes
+                .windows(3)
+                .filter(|token| *token == b"BI ")
+                .count(),
+            expected_inline_images,
+            "threshold {threshold}: retained inline-image count"
+        );
+
+        let qpdf_json = qpdf_pages_json(&qpdf_output);
+        let qpdf_names: Vec<&str> = qpdf_json["pages"][0]["images"]
+            .as_array()
+            .expect("qpdf image array")
+            .iter()
+            .map(|image| image["name"].as_str().expect("qpdf image name"))
+            .collect();
+        assert_eq!(qpdf_names, expected_images);
+        let flpdf_json = flpdf_pages_json(&flpdf_output);
+        let flpdf_names: Vec<&str> = flpdf_json["pages"][0]["images"]
+            .as_array()
+            .expect("flpdf image array")
+            .iter()
+            .map(|image| image["name"].as_str().expect("flpdf image name"))
+            .collect();
+        assert_eq!(flpdf_names, expected_images);
+    }
+}
+
+#[test]
+fn large_delimited_ei_payload_matches_qpdf() {
+    if !qpdf_or_skip() {
+        return;
+    }
+    // This is qpdf 11.9.0's qpdf/qtest/qpdf/large-inline-image.pdf fixture:
+    // its ASCII85 data contains several delimiter-surrounded EI candidates.
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/inline-images/large-inline-image.pdf");
+    let directory = tempfile::tempdir().expect("tempdir");
+    let qpdf_output = directory.path().join("qpdf.pdf");
+    let flpdf_output = directory.path().join("flpdf.pdf");
+    let flags = ["--qdf".to_owned(), "--static-id".to_owned()];
+
+    let qpdf = run_qpdf_rewrite(&flags, &input, &qpdf_output);
+    assert!(
+        qpdf.status.success(),
+        "qpdf large inline image failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    let flpdf = run_flpdf_rewrite(&flags, &input, &flpdf_output);
+    assert!(
+        flpdf.status.success(),
+        "flpdf large inline image failed: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert_streams_and_status_match(&qpdf, &flpdf, "large inline image with delimited EI data");
+    assert_eq!(
+        std::fs::read(&qpdf_output).expect("qpdf output"),
+        std::fs::read(&flpdf_output).expect("flpdf output"),
+        "large inline-image --qdf output must be byte-identical to qpdf 11.9.0"
+    );
+}
+
+#[test]
+fn eof_inside_inline_image_matches_qpdf_exit_three() {
+    if !qpdf_or_skip() {
+        return;
+    }
+    let directory = tempfile::tempdir().expect("tempdir");
+    let input = directory.path().join("eof-inline-image.pdf");
+    std::fs::write(&input, eof_inline_image_pdf()).expect("write input");
+
+    let cases: [(&[&str], &str); 2] = [
+        (&["--qdf", "--static-id"], "EOF in inline image"),
+        (
+            &["--qdf", "--externalize-inline-images", "--static-id"],
+            "externalized EOF in inline image",
+        ),
+    ];
+    for (index, (flags, label)) in cases.into_iter().enumerate() {
+        let qpdf_output = directory.path().join(format!("qpdf-eof-{index}.pdf"));
+        let flpdf_output = directory.path().join(format!("flpdf-eof-{index}.pdf"));
+        let flags: Vec<String> = flags.iter().map(|flag| (*flag).to_owned()).collect();
+        let qpdf = run_qpdf_rewrite(&flags, &input, &qpdf_output);
+        let flpdf = run_flpdf_rewrite(&flags, &input, &flpdf_output);
+
+        assert_eq!(qpdf.status.code(), Some(3), "qpdf {label} must exit 3");
+        assert_eq!(flpdf.status.code(), Some(3), "flpdf {label} must exit 3");
+        assert_streams_and_status_match(&qpdf, &flpdf, label);
+        assert_eq!(
+            std::fs::read(&qpdf_output).expect("qpdf output"),
+            std::fs::read(&flpdf_output).expect("flpdf output"),
+            "{label}: --qdf output must be byte-identical to qpdf 11.9.0"
+        );
+    }
 }
 
 #[test]
