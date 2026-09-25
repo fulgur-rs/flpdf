@@ -250,7 +250,7 @@ fn strip_signature_values_from_field<R: Read + Seek>(
     }
 
     let field_type = FormFieldObjectHelper::new(field_ref, pdf)
-        .field_type()?
+        .get_field_type()?
         .map(|name| name.strip_prefix(b"/").unwrap_or(&name).to_vec())
         .or(inherited_type);
     let kids_obj = field.try_get_key(b"/Kids")?;
@@ -339,9 +339,9 @@ fn walk_signature_field<R: Read + Seek>(
 
     let (partial_name, is_signature) = {
         let mut field = FormFieldObjectHelper::new(field_ref, pdf);
-        let partial_name = field.partial_name()?;
+        let partial_name = field.get_partial_name()?;
         let partial_name = (!partial_name.is_empty()).then_some(partial_name);
-        let is_signature = field.field_type()?.as_deref() == Some(b"/Sig");
+        let is_signature = field.get_field_type()?.as_deref() == Some(b"/Sig");
         (partial_name, is_signature)
     };
     let field_name = join_field_name(parent_name, partial_name);

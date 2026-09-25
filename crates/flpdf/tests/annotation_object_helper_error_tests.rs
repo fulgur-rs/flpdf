@@ -126,7 +126,7 @@ fn field_type_wrong_value_type_skipped_returns_none() {
     let bytes = doc(vec![(10, "<< /Type /Annot /FT 42 >>".into())]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(field.field_type().unwrap(), None);
+    assert_eq!(field.get_field_type().unwrap(), None);
 }
 
 #[test]
@@ -137,7 +137,7 @@ fn field_type_parent_not_dictionary_returns_none() {
     ]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(field.field_type().unwrap(), None);
+    assert_eq!(field.get_field_type().unwrap(), None);
 }
 
 // ===========================================================================
@@ -256,7 +256,7 @@ fn field_type_long_acyclic_chain_returns_none() {
     let bytes = deep_field_chain(130);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(field.field_type().unwrap(), None);
+    assert_eq!(field.get_field_type().unwrap(), None);
 }
 
 #[test]

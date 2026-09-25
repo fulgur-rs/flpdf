@@ -775,7 +775,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         for (field_object_gen, field) in form_fields {
             let field_type = {
                 let mut helper = FormFieldObjectHelper::from_object_handle(field.clone(), self.pdf);
-                helper.field_type()?
+                helper.get_field_type()?
             };
             if field_type.as_deref() != Some(b"/Sig") {
                 continue;
@@ -1985,7 +1985,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                     continue;
                 };
                 let mut form_field = FormFieldObjectHelper::from_object_handle(field, self.pdf);
-                if form_field.field_type()?.as_deref() == Some(b"/Btn") {
+                if form_field.get_field_type()?.as_deref() == Some(b"/Btn") {
                     if form_field.is_checkbox()? || form_field.is_radio_button()? {
                         let value = form_field.field_value()?.unwrap_or_else(ObjectHandle::null);
                         form_field.set_value(value, false)?;

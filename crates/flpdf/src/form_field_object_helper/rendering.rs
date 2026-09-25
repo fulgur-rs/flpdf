@@ -185,7 +185,8 @@ fn lookup_appearance_font<R: Read + Seek>(
         }
     }
 
-    let resources = FormFieldObjectHelper::from_object_handle(field, pdf).default_resources()?;
+    let resources =
+        FormFieldObjectHelper::from_object_handle(field, pdf).get_default_resources()?;
     let Some(resources) = resources else {
         return Ok(None);
     };
@@ -466,12 +467,14 @@ pub(crate) fn render_text_field_canonical_handles<R: Read + Seek>(
     field: ObjectHandle,
     widget: ObjectHandle,
 ) -> Result<Option<ObjectRef>> {
-    let field_type = FormFieldObjectHelper::from_object_handle(field.clone(), pdf).field_type()?;
+    let field_type =
+        FormFieldObjectHelper::from_object_handle(field.clone(), pdf).get_field_type()?;
     if field_type.as_deref() != Some(b"/Tx") {
         return Ok(None);
     }
 
-    let value = FormFieldObjectHelper::from_object_handle(field.clone(), pdf).value_as_string()?;
+    let value =
+        FormFieldObjectHelper::from_object_handle(field.clone(), pdf).get_value_as_string()?;
     widget.try_dereference()?;
     let Some(rect) = resolve_appearance_bbox_canonical(&widget)? else {
         return Ok(None);
@@ -487,7 +490,7 @@ pub(crate) fn render_text_field_canonical_handles<R: Read + Seek>(
     }
 
     let mut helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
-    let default_appearance = helper.default_appearance()?;
+    let default_appearance = helper.get_default_appearance()?;
     let da = parse_default_appearance(default_appearance.as_bytes());
     drop(helper);
 
@@ -522,7 +525,8 @@ pub(crate) fn render_choice_field_canonical_handles<R: Read + Seek>(
     field: ObjectHandle,
     widget: ObjectHandle,
 ) -> Result<Option<ObjectRef>> {
-    let field_type = FormFieldObjectHelper::from_object_handle(field.clone(), pdf).field_type()?;
+    let field_type =
+        FormFieldObjectHelper::from_object_handle(field.clone(), pdf).get_field_type()?;
     if field_type.as_deref() != Some(b"/Ch") {
         return Ok(None);
     }
@@ -540,7 +544,7 @@ pub(crate) fn render_choice_field_canonical_handles<R: Read + Seek>(
     }
 
     let mut helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
-    let default_appearance = helper.default_appearance()?;
+    let default_appearance = helper.get_default_appearance()?;
     let da = parse_default_appearance(default_appearance.as_bytes());
     // qpdf's `getFlags()` returns a signed C++ `int` and tests the combo
     // bit directly on that signed value (`getFlags() & ff_ch_combo`,
@@ -562,8 +566,8 @@ pub(crate) fn render_choice_field_canonical_handles<R: Read + Seek>(
         .field_flags()?
         .unwrap_or(0)
         .clamp(i64::from(i32::MIN), i64::from(i32::MAX));
-    let value = helper.value_as_string()?;
-    let options = helper.choices()?;
+    let value = helper.get_value_as_string()?;
+    let options = helper.get_choices()?;
     drop(helper);
 
     let normal_appearance = resolve_normal_appearance_canonical(&widget)?;

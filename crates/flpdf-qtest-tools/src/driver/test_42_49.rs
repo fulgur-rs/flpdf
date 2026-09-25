@@ -352,35 +352,35 @@ pub(crate) fn run_test_43<R: Read + Seek>(
 
         let fully_qualified_name = {
             let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
-            field_helper.fully_qualified_name()?
+            field_helper.get_fully_qualified_name()?
         };
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         writeln!(stdout, "  Fully qualified name: {fully_qualified_name}")?;
 
         let partial_name = {
             let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
-            field_helper.partial_name()?
+            field_helper.get_partial_name()?
         };
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         writeln!(stdout, "  Partial name: {partial_name}")?;
 
         let alternative_name = {
             let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
-            field_helper.alternative_name()?
+            field_helper.get_alternative_name()?
         };
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         writeln!(stdout, "  Alternative name: {alternative_name}")?;
 
         let mapping_name = {
             let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
-            field_helper.mapping_name()?
+            field_helper.get_mapping_name()?
         };
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         writeln!(stdout, "  Mapping name: {mapping_name}")?;
 
         let field_type = {
             let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
-            field_helper.field_type()?.unwrap_or_default()
+            field_helper.get_field_type()?.unwrap_or_default()
         };
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         write!(stdout, "  Field type: ")?;
@@ -389,7 +389,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
 
         let value = {
             let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
-            field_helper.value()?.unwrap_or_else(ObjectHandle::null)
+            field_helper.get_value()?.unwrap_or_else(ObjectHandle::null)
         };
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         write!(stdout, "  Value: ")?;
@@ -398,7 +398,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
 
         let value_as_string = {
             let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
-            field_helper.value_as_string()?
+            field_helper.get_value_as_string()?
         };
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         writeln!(stdout, "  Value as string: {value_as_string}")?;
@@ -406,7 +406,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
         let default_value = {
             let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
             field_helper
-                .default_value()?
+                .get_default_value()?
                 .unwrap_or_else(ObjectHandle::null)
         };
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -416,7 +416,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
 
         let default_value_as_string = {
             let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
-            field_helper.default_value_as_string()?
+            field_helper.get_default_value_as_string()?
         };
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         writeln!(
@@ -426,14 +426,14 @@ pub(crate) fn run_test_43<R: Read + Seek>(
 
         let default_appearance = {
             let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
-            field_helper.default_appearance()?
+            field_helper.get_default_appearance()?
         };
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         writeln!(stdout, "  Default appearance: {default_appearance}")?;
 
         let quadding = {
             let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
-            field_helper.quadding()?
+            field_helper.get_quadding()?
         };
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         writeln!(stdout, "  Quadding: {quadding}")?;
@@ -550,13 +550,13 @@ pub(crate) fn run_test_44<R: Read + Seek>(
 
     for field in fields {
         let mut field_helper = FormFieldObjectHelper::from_object_handle(field, pdf);
-        if field_helper.field_type()?.as_deref() == Some(b"/Tx") {
+        if field_helper.get_field_type()?.as_deref() == Some(b"/Tx") {
             field_helper.set_value_string("3.14 ÷ 0", true)?;
             writeln!(
                 stdout,
                 "Set field value: {} -> {}",
-                field_helper.fully_qualified_name()?,
-                field_helper.value_as_string()?
+                field_helper.get_fully_qualified_name()?,
+                field_helper.get_value_as_string()?
             )?;
         }
     }
@@ -1789,7 +1789,7 @@ Set field value: group.child -> 3.14 \xc3\xb7 0\n"
         for field in fields {
             let mut field = flpdf::FormFieldObjectHelper::from_object_handle(field, &mut written);
             assert_eq!(
-                field.value_as_string().expect("read updated field"),
+                field.get_value_as_string().expect("read updated field"),
                 "3.14 ÷ 0"
             );
         }
