@@ -248,6 +248,15 @@ qpdf の識別子に寄せるかで両者が対立するとき、このクレー
   `/T` を解決し文字列でなければ空文字列にフォールバックしており、
   対応関係は正確。よって `partial_name` も `get_partial_name` へ寄せる
   余地がある対象として `flags`/`value` と同じ扱いにする。
+
+  **解消済み（`flpdf-f6ix`、PR #2336）**: `form_field_object_helper.rs` の
+  計算を伴う public getter 17 件（`flags`/`value`/`partial_name` を含む）は
+  `get_flags`/`get_value`/`get_partial_name` 等へリネームし、旧名の
+  wrapper は残していない。17 件すべて qpdf 側に対応する識別子が実在する
+  （`include/qpdf/QPDFFormFieldObjectHelper.hh:56-128,157-158`、
+  実装は `libqpdf/QPDFFormFieldObjectHelper.cc:66-242,268`）。
+  以下の「drop 済み箇所は見つけ次第 issue 化の対象とする」は、この
+  ファイルについてはもう残件が無い。
   `filespec_helper.rs` の `size()`/`get_size()`・`creation_date()`/
   `get_creation_date()` のような prefix なし/ありの併存は、見かけは同じでも
   中身が違う——`size()` は `/Params /Size` の生の `Option<i64>`、
