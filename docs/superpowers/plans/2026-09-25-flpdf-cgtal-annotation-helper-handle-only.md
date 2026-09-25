@@ -108,7 +108,7 @@ impl AnnotationObjectHelper {
 - [x] Run `python3 scripts/qpdf-module-docs.py --check`.
 - [x] Run `python3 scripts/check-qpdf-route-matrix.py --check`.
 - [x] Run `python3 scripts/check-qpdf-deviation-markers.py --check`.
-- [ ] After committing, run `cargo llvm-cov --workspace --features qpdf-zlib-compat --ignore-run-fail --lcov --output-path target/patch-cov.lcov` and `scripts/patch-coverage.sh --base origin/main --lcov target/patch-cov.lcov`; require zero uncovered executable lines.
+- [x] After committing, run `cargo llvm-cov --workspace --features qpdf-zlib-compat --ignore-run-fail --lcov --output-path target/patch-cov.lcov` and `scripts/patch-coverage.sh --base origin/main --lcov target/patch-cov.lcov`; require zero uncovered executable lines. Result: flpdf 56 changed / 0 uncovered; report 5 changed / 0 uncovered.
 
 ### Task 5: Hand off through a Draft PR
 
@@ -116,9 +116,9 @@ impl AnnotationObjectHelper {
 - Update: Beads issue `flpdf-cgtal`.
 - Create: Draft PR for branch `fix/flpdf-cgtal-annotation-handle-only`.
 
-- [ ] Stage the explicit implementation, test, and plan files; commit with `git commit -m 'refactor(annotation): use handle-only helper'`.
-- [ ] Run `git fetch origin main`, rebase onto `origin/main`, and confirm `git merge-base --is-ancestor origin/main HEAD` succeeds.
-- [ ] Re-run `cargo fmt --all -- --check`, the workspace tests, strict private-item Rustdoc, all-features Clippy, qpdf module/route/deviation checks, and committed patch coverage on the rebased head.
+- [x] Stage the explicit implementation, test, and plan files; commit with `git commit -m 'refactor(annotation): use handle-only helper'`.
+- [x] Run `git fetch origin main`, rebase onto `origin/main`, and confirm `git merge-base --is-ancestor origin/main HEAD` succeeds.
+- [x] Re-run `cargo fmt --all -- --check`, the workspace tests, strict private-item Rustdoc, all-features Clippy, qpdf module/route/deviation checks, and committed patch coverage on the rebased head.
 - [ ] Push `fix/flpdf-cgtal-annotation-handle-only` and create a Draft PR against `main` with `gh pr create --draft --base main --head fix/flpdf-cgtal-annotation-handle-only` and a source-backed body.
 - [ ] Keep the PR Draft until `gh pr checks` reports every exact-head check green, including patch coverage and Windows.
 - [ ] Freshly read back the PR head, base, state, and checks; then run `gh pr ready`.
