@@ -118,6 +118,140 @@ fn assert_cmp_diff_zero(fixture: &str, stem: &str) {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PdfaSnapshot {
+    language: Vec<u8>,
+    mark_info: Vec<u8>,
+    metadata_ref_valid: bool,
+    metadata_filter: Vec<u8>,
+    metadata_packet: Vec<u8>,
+    output_intent_subtype: Vec<u8>,
+    profile_ref_valid: bool,
+    profile_n: Vec<u8>,
+    profile_filter: Vec<u8>,
+    icc_payload: Vec<u8>,
+    struct_tree_ref_valid: bool,
+    struct_element_ref_valid: bool,
+    parent_tree_ref_valid: bool,
+    associated_file: Option<(Vec<u8>, bool, Vec<u8>)>,
+}
+
+fn pdfa_snapshot(bytes: &[u8]) -> PdfaSnapshot {
+    let mut pdf = Pdf::open(std::io::Cursor::new(bytes.to_vec())).expect("open PDF/A fixture");
+    let catalog = pdf.root_handle().expect("catalog handle");
+    let language = catalog
+        .try_get_key(b"/Lang")
+        .expect("catalog Lang")
+        .unparse();
+    let mark_info = catalog
+        .try_get_key(b"/MarkInfo")
+        .expect("catalog MarkInfo")
+        .unparse();
+
+    let metadata = catalog.try_get_key(b"/Metadata").expect("catalog Metadata");
+    let metadata_ref_valid = metadata.object_ref().is_some();
+    let metadata_dict = metadata
+        .try_get_stream_dict()
+        .expect("Metadata stream dictionary");
+    let metadata_filter = metadata_dict
+        .try_get_key(b"/Filter")
+        .expect("Metadata Filter")
+        .unparse();
+    let metadata_packet = metadata
+        .get_stream_data(flpdf::writer::DecodeLevel::All)
+        .expect("decode XMP packet")
+        .as_ref()
+        .clone();
+
+    let output_intents = catalog
+        .try_get_key(b"/OutputIntents")
+        .expect("catalog OutputIntents");
+    let output_intent = output_intents
+        .try_get_array_item(0)
+        .expect("first OutputIntent");
+    let output_intent_subtype = output_intent
+        .try_get_key(b"/S")
+        .expect("OutputIntent subtype")
+        .unparse();
+    let profile = output_intent
+        .try_get_key(b"/DestOutputProfile")
+        .expect("DestOutputProfile stream");
+    let profile_ref_valid = profile.object_ref().is_some();
+    let profile_dict = profile
+        .try_get_stream_dict()
+        .expect("ICC profile dictionary");
+    let profile_n = profile_dict
+        .try_get_key(b"/N")
+        .expect("ICC component count")
+        .unparse();
+    let profile_filter = profile_dict
+        .try_get_key(b"/Filter")
+        .expect("ICC profile Filter")
+        .unparse();
+    let icc_payload = profile
+        .get_stream_data(flpdf::writer::DecodeLevel::All)
+        .expect("decode ICC profile")
+        .as_ref()
+        .clone();
+
+    let struct_tree = catalog
+        .try_get_key(b"/StructTreeRoot")
+        .expect("catalog StructTreeRoot");
+    let struct_tree_ref_valid = struct_tree.object_ref().is_some();
+    let struct_element_ref_valid = struct_tree
+        .try_get_key(b"/K")
+        .expect("StructTreeRoot K")
+        .object_ref()
+        .is_some();
+    let parent_tree_ref_valid = struct_tree
+        .try_get_key(b"/ParentTree")
+        .expect("StructTreeRoot ParentTree")
+        .object_ref()
+        .is_some();
+
+    let associated_files = catalog.try_get_key(b"/AF").expect("catalog AF lookup");
+    let associated_file = if associated_files.try_is_null().expect("AF type") {
+        None
+    } else {
+        let filespec = associated_files
+            .try_get_array_item(0)
+            .expect("first associated Filespec");
+        let relationship = filespec
+            .try_get_key(b"/AFRelationship")
+            .expect("Filespec AFRelationship")
+            .unparse();
+        let embedded_file = filespec
+            .try_get_key(b"/EF")
+            .expect("Filespec EF")
+            .try_get_key(b"/F")
+            .expect("embedded file stream");
+        let embedded_file_ref_valid = embedded_file.object_ref().is_some();
+        let embedded_file_payload = embedded_file
+            .get_stream_data(flpdf::writer::DecodeLevel::All)
+            .expect("read associated-file payload")
+            .as_ref()
+            .clone();
+        Some((relationship, embedded_file_ref_valid, embedded_file_payload))
+    };
+
+    PdfaSnapshot {
+        language,
+        mark_info,
+        metadata_ref_valid,
+        metadata_filter,
+        metadata_packet,
+        output_intent_subtype,
+        profile_ref_valid,
+        profile_n,
+        profile_filter,
+        icc_payload,
+        struct_tree_ref_valid,
+        struct_element_ref_valid,
+        parent_tree_ref_valid,
+        associated_file,
+    }
+}
+
 fn assert_cmp_diff_zero_mode_named(fixture: &str, mode: ObjectStreamMode, stem: &str, name: &str) {
     let actual = rewrite_qpdf_equivalent_mode(fixture, mode);
     assert_cmp_diff_zero_named(&actual, stem, name);
@@ -262,6 +396,61 @@ fn compressed_metadata_xmp_rewrite_matches_qpdf_and_preserves_decoded_packet() {
         output_packet, input_packet,
         "decoded XMP packet bytes must survive"
     );
+}
+
+#[test]
+fn pdfa_part_fixtures_round_trip_like_qpdf() {
+    for (part, fixture, stem) in [
+        (1, "pdfa-1b.pdf", "pdfa-1b"),
+        (2, "pdfa-2b.pdf", "pdfa-2b"),
+        (3, "pdfa-3b.pdf", "pdfa-3b"),
+    ] {
+        let input_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat")
+            .join(fixture);
+        let input = std::fs::read(&input_path)
+            .unwrap_or_else(|error| panic!("read {input_path:?}: {error}"));
+        let before = pdfa_snapshot(&input);
+        assert!(
+            before.metadata_ref_valid,
+            "PDF/A-{part}b Metadata reference"
+        );
+        assert!(before.profile_ref_valid, "PDF/A-{part}b ICC reference");
+        assert!(
+            before.struct_tree_ref_valid,
+            "PDF/A-{part}b StructTreeRoot reference"
+        );
+        assert!(
+            before.struct_element_ref_valid,
+            "PDF/A-{part}b StructElem reference"
+        );
+        assert!(
+            before.parent_tree_ref_valid,
+            "PDF/A-{part}b ParentTree reference"
+        );
+        let marker = format!("pdfaid:part=\"{part}\"");
+        assert!(
+            before
+                .metadata_packet
+                .windows(marker.len())
+                .any(|window| window == marker.as_bytes()),
+            "XMP must identify PDF/A part {part}"
+        );
+        assert_eq!(before.metadata_filter, b"/FlateDecode");
+        assert_eq!(before.profile_filter, b"null");
+        assert_eq!(before.associated_file.is_some(), part == 3);
+
+        let mut expected_after = before.clone();
+        expected_after.metadata_filter = b"null".to_vec();
+        expected_after.profile_filter = b"/FlateDecode".to_vec();
+        let actual = rewrite_qpdf_equivalent(fixture);
+        assert_cmp_diff_zero_named(&actual, stem, "static-id.pdf");
+        assert_eq!(
+            pdfa_snapshot(&actual),
+            expected_after,
+            "decoded PDF/A-{part}b payloads and references must survive qpdf-equivalent rewrite"
+        );
+    }
 }
 
 /// A direct `/Root` survives when Preserve selects a cross-reference stream.
