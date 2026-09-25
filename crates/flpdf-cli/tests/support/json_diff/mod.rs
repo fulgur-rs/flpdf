@@ -19,6 +19,14 @@ use std::process::Command;
 /// The caller is responsible for checking `super::is_qpdf_available()` first;
 /// this helper does not skip on its own.
 pub fn run_qpdf_json(fixture: &Path, password: Option<&str>) -> Result<Value, String> {
+    run_qpdf_json_with_expected_exit_code(fixture, password, 0)
+}
+
+pub fn run_qpdf_json_with_expected_exit_code(
+    fixture: &Path,
+    password: Option<&str>,
+    expected_exit_code: i32,
+) -> Result<Value, String> {
     let mut cmd = Command::new("qpdf");
     cmd.arg("--json=2").arg("--json-stream-data=none");
     if let Some(p) = password {
@@ -26,12 +34,17 @@ pub fn run_qpdf_json(fixture: &Path, password: Option<&str>) -> Result<Value, St
     }
     cmd.arg(fixture);
     let out = cmd.output().map_err(|e| format!("spawn qpdf: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "qpdf exit {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        ));
+    if out.status.code() != Some(expected_exit_code) {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let error = if expected_exit_code == 0 {
+            format!("qpdf exit {}: {stderr}", out.status)
+        } else {
+            format!(
+                "qpdf exit {} (expected code {expected_exit_code}): {stderr}",
+                out.status
+            )
+        };
+        return Err(error);
     }
     serde_json::from_slice(&out.stdout).map_err(|e| format!("qpdf parse: {e}"))
 }
@@ -44,6 +57,14 @@ pub fn run_qpdf_json(fixture: &Path, password: Option<&str>) -> Result<Value, St
 /// `--json-stream-data=none`; see `crates/flpdf-cli/src/main.rs` for the flag
 /// definitions.
 pub fn run_flpdf_json(fixture: &Path, password: Option<&str>) -> Result<Value, String> {
+    run_flpdf_json_with_expected_exit_code(fixture, password, 0)
+}
+
+pub fn run_flpdf_json_with_expected_exit_code(
+    fixture: &Path,
+    password: Option<&str>,
+    expected_exit_code: i32,
+) -> Result<Value, String> {
     let mut cmd = assert_cmd::Command::cargo_bin("flpdf").map_err(|e| e.to_string())?;
     cmd.arg("--json=2").arg("--json-stream-data=none");
     if let Some(p) = password {
@@ -51,12 +72,17 @@ pub fn run_flpdf_json(fixture: &Path, password: Option<&str>) -> Result<Value, S
     }
     cmd.arg(fixture);
     let out = cmd.output().map_err(|e| format!("spawn flpdf: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "flpdf exit {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        ));
+    if out.status.code() != Some(expected_exit_code) {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let error = if expected_exit_code == 0 {
+            format!("flpdf exit {}: {stderr}", out.status)
+        } else {
+            format!(
+                "flpdf exit {} (expected code {expected_exit_code}): {stderr}",
+                out.status
+            )
+        };
+        return Err(error);
     }
     serde_json::from_slice(&out.stdout).map_err(|e| format!("flpdf parse: {e}"))
 }
