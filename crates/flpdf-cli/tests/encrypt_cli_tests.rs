@@ -102,6 +102,21 @@ fn fixture(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
 }
 
+/// Report whether `qpdf` can run, without the `CI`-required panic of
+/// [`ensure_qpdf_or_skip`].
+///
+/// Golden-backed tests already assert the qpdf 11.9.0 bytes from a committed
+/// reference, so the live comparison is an extra confirmation rather than the
+/// only oracle. A minimal CI image without `qpdf` should keep the golden
+/// assertion and skip only the live run.
+fn qpdf_available() -> bool {
+    ShellCommand::new("qpdf")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 fn ensure_qpdf_or_skip() -> bool {
     let available = ShellCommand::new("qpdf")
         .arg("--version")
@@ -2239,13 +2254,12 @@ fn static_aes_iv_matches_the_vector_qpdf_writes() {
 /// `qpdf --static-id --static-aes-iv --encrypt "" "" 256 --` runs on the same
 /// input diverge partway into the first encrypted string. A byte-identical
 /// comparison is therefore not meaningful for the 256-bit case, independent
-/// of flpdf's implementation.
+/// of flpdf's implementation. The committed 11.9.0 golden is checked even
+/// when the qpdf executable is unavailable; a live qpdf comparison is added
+/// when it is present.
 #[cfg(feature = "qpdf-zlib-compat")]
 #[test]
 fn encrypted_document_is_byte_identical_to_qpdf() {
-    if !ensure_qpdf_or_skip() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let ours = tmp.path().join("flpdf.pdf");
     let theirs = tmp.path().join("qpdf.pdf");
@@ -2270,6 +2284,23 @@ fn encrypted_document_is_byte_identical_to_qpdf() {
         .assert()
         .success();
 
+    let mine = std::fs::read(&ours).unwrap();
+    let golden =
+        fixture("../../tests/golden/references/encrypted-document-is-byte-identical-to-qpdf.pdf");
+    let expected = std::fs::read(&golden)
+        .unwrap_or_else(|e| panic!("read qpdf 11.9.0 golden {golden:?}: {e}"));
+    assert_eq!(
+        mine, expected,
+        "AES-128 (V=4/AESV2): flpdf output must match the committed qpdf 11.9.0 golden"
+    );
+
+    // The committed golden above is the oracle, so a CI image without qpdf
+    // still gets full byte coverage; only the live cross-check is optional.
+    if !qpdf_available() {
+        eprintln!("skipping the live qpdf cross-check: qpdf not available");
+        return;
+    }
+
     let qpdf = std::process::Command::new("qpdf")
         .args(args)
         .arg(&input)
@@ -2282,7 +2313,6 @@ fn encrypted_document_is_byte_identical_to_qpdf() {
         String::from_utf8_lossy(&qpdf.stderr)
     );
 
-    let mine = std::fs::read(&ours).unwrap();
     let reference = std::fs::read(&theirs).unwrap();
     assert_eq!(
         mine, reference,

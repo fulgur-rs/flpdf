@@ -3408,6 +3408,17 @@ done
 '
 echo "one-page-ext-indirect/extra-header-qdf-generate.pdf"
 
+# AES-128 (V=4/AESV2) encrypted output. --static-id pins /ID and
+# --static-aes-iv pins the AES initialization vector, so the bytes are
+# reproducible; without both, qpdf draws them randomly and the golden would
+# differ on every run. Consumed by
+# crates/flpdf-cli/tests/encrypt_cli_tests.rs::encrypted_document_is_byte_identical_to_qpdf.
+qpdf --static-id --static-aes-iv \
+    --encrypt "" "" 128 --use-aes=y -- \
+    "$FIX/one-page.pdf" \
+    "$REF/encrypted-document-is-byte-identical-to-qpdf.pdf"
+echo "encrypted-document-is-byte-identical-to-qpdf.pdf"
+
 echo ""
 echo "=== All references generated ==="
 
