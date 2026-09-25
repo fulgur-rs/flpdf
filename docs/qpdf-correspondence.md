@@ -3990,6 +3990,13 @@ provider-backed stream を登録する。`arrayOrStreamToStreamArray`
 flpdf は `PageObjectHelper::coalesce_content_streams` /
 `ObjectHandle::coalesce_content_streams` を唯一の production route とする。手動 `Vec` 結合、
 入力 metadata のコピー、legacy stream write-back は削除済みである。
+qpdf の `ContentNormalizer::handleToken`（`ContentNormalizer.cc:12-62`）も token type ごとの
+generic normalization を行い、BDC operand を `/Resources /Properties` から解決しない。
+`cli_ocproperties_page_ops_qpdf` の
+`normalize_content_preserves_marked_content_and_properties` と
+`coalesce_contents_preserves_marked_content_and_properties` は multi-stream BDC fixture で
+両 route の exit/stdout/stderr、inline-stream JSON、PDF bytes、`/Properties` reference を qpdf
+11.9.0 と比較する。可視性の解釈は対象外である。
 
 ### ObjectHandle consumer slice `flpdf-25kg.3.48.5` (2026-08-30)
 
