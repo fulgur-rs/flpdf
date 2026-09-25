@@ -68,13 +68,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         Self { pdf }
     }
 
-    /// Return qpdf's repaired leaf-page list in document order.
-    ///
-    /// This mirrors `QPDFPageDocumentHelper::getAllPages()`: qpdf repairs the
-    /// effective `/Pages` root and malformed leaf nodes before returning the
-    /// current page list. The returned vector is an owned snapshot, so a later
-    /// page insertion or removal requires a fresh call.
-    pub fn get_all_pages(&mut self) -> Result<Vec<ObjectRef>> {
+    fn prepare_all_pages(&mut self) -> Result<Option<crate::pages::repair::PreparedPages>> {
         // QPDFPageDocumentHelper::getAllPages delegates to QPDF::getAllPages,
         // whose `QPDFObjectHandle pages = getRoot().getKey("/Pages")` calls
         // `getRoot()` first and unconditionally: a missing OR non-dictionary
@@ -93,7 +87,30 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
             return Err(Error::Missing("/Root"));
         }
         self.pdf.root_handle()?;
-        match crate::pages::repair::prepare_for_optimization(self.pdf)? {
+        crate::pages::repair::prepare_for_optimization(self.pdf)
+    }
+
+    /// Return qpdf's repaired leaf-page handles with raw object identity.
+    ///
+    /// This is the internal handle-native form of
+    /// `QPDFPageDocumentHelper::getAllPages()` for qpdf-shaped consumers such
+    /// as writer setup. The page snapshot is owned, so later page-tree
+    /// mutations require a fresh call.
+    pub(crate) fn get_all_page_handles(&mut self) -> Result<Vec<ObjectHandle>> {
+        Ok(self
+            .prepare_all_pages()?
+            .map(|prepared| prepared.pages)
+            .unwrap_or_default())
+    }
+
+    /// Return qpdf's repaired leaf-page list in document order as valid
+    /// `ObjectRef` projections.
+    ///
+    /// This keeps the existing valid-reference surface for callers that
+    /// explicitly require `N G R`; raw-identity consumers should use the
+    /// crate-internal handle form.
+    pub fn get_all_pages(&mut self) -> Result<Vec<ObjectRef>> {
+        match self.prepare_all_pages()? {
             Some(prepared) => prepared.page_refs(),
             None => Ok(Vec::new()),
         }
