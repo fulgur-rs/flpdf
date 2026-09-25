@@ -133,7 +133,7 @@ fn reads_indirect_field_attributes_and_names() {
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
 
-    assert_eq!(field.field_type().unwrap(), Some(b"/Tx".to_vec()));
+    assert_eq!(field.get_field_type().unwrap(), Some(b"/Tx".to_vec()));
     assert_eq!(
         field
             .field_value()
@@ -149,9 +149,9 @@ fn reads_indirect_field_attributes_and_names() {
         Some(b"default".to_vec())
     );
     assert_eq!(field.field_flags().unwrap(), Some(4097));
-    assert_eq!(field.partial_name().unwrap(), "partial");
-    assert_eq!(field.alternative_name().unwrap(), "alternative");
-    assert_eq!(field.mapping_name().unwrap(), "mapping");
+    assert_eq!(field.get_partial_name().unwrap(), "partial");
+    assert_eq!(field.get_alternative_name().unwrap(), "alternative");
+    assert_eq!(field.get_mapping_name().unwrap(), "mapping");
 }
 
 #[test]
@@ -230,10 +230,10 @@ fn field_name_accessors_follow_terminal_holder_chains() {
     let mut pdf = open(bytes);
 
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(field.partial_name().unwrap(), "partial");
-    assert_eq!(field.fully_qualified_name().unwrap(), "partial");
-    assert_eq!(field.alternative_name().unwrap(), "alternative");
-    assert_eq!(field.mapping_name().unwrap(), "mapping");
+    assert_eq!(field.get_partial_name().unwrap(), "partial");
+    assert_eq!(field.get_fully_qualified_name().unwrap(), "partial");
+    assert_eq!(field.get_alternative_name().unwrap(), "alternative");
+    assert_eq!(field.get_mapping_name().unwrap(), "mapping");
 }
 
 #[test]
@@ -245,7 +245,7 @@ fn qualifies_names_from_the_parent_chain() {
     ]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(field.fully_qualified_name().unwrap(), "top.group.child");
+    assert_eq!(field.get_fully_qualified_name().unwrap(), "top.group.child");
 }
 
 #[test]
@@ -257,7 +257,10 @@ fn qualifies_names_through_direct_parent_handles() {
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
 
-    assert_eq!(field.fully_qualified_name().unwrap(), "top.parent.child");
+    assert_eq!(
+        field.get_fully_qualified_name().unwrap(),
+        "top.parent.child"
+    );
 }
 
 #[test]
@@ -309,7 +312,7 @@ fn fully_qualified_name_terminates_on_a_reciprocal_direct_parent_cycle() {
 
     let mut field = FormFieldObjectHelper::new(field_ref, &mut pdf);
     let error = field
-        .fully_qualified_name()
+        .get_fully_qualified_name()
         .expect_err("a reciprocal direct /Parent cycle must not loop forever");
     assert!(matches!(error, Error::Unsupported(ref message)
         if message.contains("/Parent cycle of direct dictionaries")));
@@ -373,7 +376,7 @@ fn fully_qualified_name_resolves_a_long_acyclic_direct_parent_chain() {
 
     let mut field = FormFieldObjectHelper::new(field_ref, &mut pdf);
     let name = field
-        .fully_qualified_name()
+        .get_fully_qualified_name()
         .expect("a long acyclic direct /Parent chain must resolve, not error");
     assert_eq!(name, expected_parts.join("."));
 }
@@ -419,9 +422,9 @@ fn decodes_pdf_text_strings_in_field_names() {
     )]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(field.partial_name().unwrap(), "child");
-    assert_eq!(field.alternative_name().unwrap(), "ユーザー");
-    assert_eq!(field.mapping_name().unwrap(), "マップ");
+    assert_eq!(field.get_partial_name().unwrap(), "child");
+    assert_eq!(field.get_alternative_name().unwrap(), "ユーザー");
+    assert_eq!(field.get_mapping_name().unwrap(), "マップ");
 }
 
 #[test]
@@ -433,9 +436,9 @@ fn field_names_use_qpdf_lossy_text_string_conversion() {
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
 
-    assert_eq!(field.partial_name().unwrap(), "�");
-    assert_eq!(field.alternative_name().unwrap(), "");
-    assert_eq!(field.mapping_name().unwrap(), "A");
+    assert_eq!(field.get_partial_name().unwrap(), "�");
+    assert_eq!(field.get_alternative_name().unwrap(), "");
+    assert_eq!(field.get_mapping_name().unwrap(), "A");
 }
 
 #[test]
@@ -446,11 +449,11 @@ fn mapping_name_falls_back_to_alternative_then_qualified_name() {
     ]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(field.mapping_name().unwrap(), "parent.child");
+    assert_eq!(field.get_mapping_name().unwrap(), "parent.child");
     let bytes = doc(vec![(10, "<< /T (child) /TU (alt) >>".into())]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(field.mapping_name().unwrap(), "alt");
+    assert_eq!(field.get_mapping_name().unwrap(), "alt");
 }
 
 #[test]
@@ -461,7 +464,7 @@ fn name_walkers_terminate_on_parent_cycles() {
     ]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(field.fully_qualified_name().unwrap(), "parent.child");
+    assert_eq!(field.get_fully_qualified_name().unwrap(), "parent.child");
 }
 
 #[test]
@@ -469,13 +472,13 @@ fn non_dictionary_field_has_no_readable_attributes() {
     let bytes = doc(vec![(10, "42".into())]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(field.field_type().unwrap(), None);
+    assert_eq!(field.get_field_type().unwrap(), None);
     assert!(field.field_value().unwrap().is_none());
     assert!(field.field_default_value().unwrap().is_none());
     assert_eq!(field.field_flags().unwrap(), None);
-    assert_eq!(field.fully_qualified_name().unwrap(), "");
-    assert_eq!(field.alternative_name().unwrap(), "");
-    assert_eq!(field.mapping_name().unwrap(), "");
+    assert_eq!(field.get_fully_qualified_name().unwrap(), "");
+    assert_eq!(field.get_alternative_name().unwrap(), "");
+    assert_eq!(field.get_mapping_name().unwrap(), "");
 }
 
 #[test]
@@ -505,7 +508,7 @@ fn field_type_wrong_type_on_child_stops_parent_inheritance() {
     ]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(field.field_type().unwrap(), None);
+    assert_eq!(field.get_field_type().unwrap(), None);
 }
 
 #[test]
@@ -520,7 +523,7 @@ fn field_type_follows_multi_hop_reference_holders_before_testing_its_type() {
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
 
-    assert_eq!(field.field_type().unwrap(), Some(b"/Tx".to_vec()));
+    assert_eq!(field.get_field_type().unwrap(), Some(b"/Tx".to_vec()));
 }
 
 #[test]
@@ -605,7 +608,7 @@ fn choices_returns_only_string_options_from_an_indirect_inherited_array() {
     ]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(field.choices().unwrap(), vec!["one", "two"]);
+    assert_eq!(field.get_choices().unwrap(), vec!["one", "two"]);
 
     let bytes = doc(vec![
         (10, "<< /FT /Ch /Opt [12 0 R (direct)] >>".into()),
@@ -613,12 +616,12 @@ fn choices_returns_only_string_options_from_an_indirect_inherited_array() {
     ]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(field.choices().unwrap(), vec!["indirect", "direct"]);
+    assert_eq!(field.get_choices().unwrap(), vec!["indirect", "direct"]);
 
     let bytes = doc(vec![(10, "<< /FT /Tx /Opt [(one)] >>".into())]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert!(field.choices().unwrap().is_empty());
+    assert!(field.get_choices().unwrap().is_empty());
 }
 
 #[test]
@@ -638,9 +641,9 @@ fn reads_metadata_from_field_inheritance_then_acroform() {
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
 
-    assert_eq!(field.default_appearance().unwrap(), "/Helv 9 Tf 0 g");
-    assert_eq!(field.quadding().unwrap(), 2);
-    let resources = field.default_resources().unwrap();
+    assert_eq!(field.get_default_appearance().unwrap(), "/Helv 9 Tf 0 g");
+    assert_eq!(field.get_quadding().unwrap(), 2);
+    let resources = field.get_default_resources().unwrap();
     assert!(resources.is_some_and(|value| value.as_dictionary().is_some()));
 
     let bytes = doc_with_acroform(vec![
@@ -650,9 +653,9 @@ fn reads_metadata_from_field_inheritance_then_acroform() {
     ]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(field.default_appearance().unwrap(), "/Helv 8 Tf 0 g");
-    assert_eq!(field.quadding().unwrap(), 1);
-    assert!(field.default_resources().unwrap().is_none());
+    assert_eq!(field.get_default_appearance().unwrap(), "/Helv 8 Tf 0 g");
+    assert_eq!(field.get_quadding().unwrap(), 1);
+    assert!(field.get_default_resources().unwrap().is_none());
 
     let bytes = doc_with_acroform(vec![
         (10, "<< /Parent 11 0 R /DA /Wrong /Q /Wrong >>".into()),
@@ -661,8 +664,8 @@ fn reads_metadata_from_field_inheritance_then_acroform() {
     ]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(field.default_appearance().unwrap(), "fallback");
-    assert_eq!(field.quadding().unwrap(), 1);
+    assert_eq!(field.get_default_appearance().unwrap(), "fallback");
+    assert_eq!(field.get_quadding().unwrap(), 1);
 }
 
 #[test]
@@ -680,7 +683,7 @@ fn default_appearance_follows_a_long_acyclic_parent_chain_before_acroform_fallba
     let mut pdf = open(doc_with_acroform(objects));
 
     let appearance = FormFieldObjectHelper::new(ObjectRef::new(100, 0), &mut pdf)
-        .default_appearance()
+        .get_default_appearance()
         .expect("qpdf inheritance walk is cycle-bounded, not depth-bounded");
 
     assert_eq!(appearance, "/Helv 8 Tf 0 g");
@@ -754,33 +757,40 @@ fn exposes_remaining_qpdf_read_and_traversal_accessors() {
     assert!(is_different);
     assert_eq!(
         field
-            .inheritable_value(b"CustomString")
+            .get_inheritable_field_value(b"CustomString")
             .unwrap()
             .and_then(|value| value.as_string()),
         Some(b"inherited".to_vec())
     );
     assert_eq!(
-        field.inheritable_string(b"CustomString").unwrap(),
+        field
+            .get_inheritable_field_value_as_string(b"CustomString")
+            .unwrap(),
         "inherited"
     );
     assert_eq!(
-        field.inheritable_name(b"CustomName").unwrap(),
+        field
+            .get_inheritable_field_value_as_name(b"CustomName")
+            .unwrap(),
         b"/InheritedName"
     );
     assert_eq!(
-        field.value().unwrap().and_then(|value| value.as_string()),
+        field
+            .get_value()
+            .unwrap()
+            .and_then(|value| value.as_string()),
         Some(b"current".to_vec())
     );
-    assert_eq!(field.value_as_string().unwrap(), "current");
+    assert_eq!(field.get_value_as_string().unwrap(), "current");
     assert_eq!(
         field
-            .default_value()
+            .get_default_value()
             .unwrap()
             .and_then(|value| value.as_string()),
         Some(b"default".to_vec())
     );
-    assert_eq!(field.default_value_as_string().unwrap(), "default");
-    assert_eq!(field.flags().unwrap(), 0);
+    assert_eq!(field.get_default_value_as_string().unwrap(), "default");
+    assert_eq!(field.get_flags().unwrap(), 0);
 
     let bytes = doc(vec![(10, "null".into())]);
     let mut pdf = open(bytes);
@@ -956,7 +966,7 @@ fn default_resources_preserves_a_natural_indirect_holder_identity() {
     let mut pdf = open(bytes);
 
     let resources = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
-        .default_resources()
+        .get_default_resources()
         .expect("resolve default resources")
         .expect("default resources handle");
     assert_eq!(resources.object_ref(), Some(ObjectRef::new(21, 0)));
@@ -1502,16 +1512,26 @@ fn field_accessors_return_qpdf_defaults_for_missing_or_wrong_typed_values() {
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
 
-    assert_eq!(field.inheritable_string(b"CustomString").unwrap(), "");
-    assert_eq!(field.inheritable_name(b"CustomName").unwrap(), b"");
-    assert_eq!(field.partial_name().unwrap(), "");
-    assert_eq!(field.choices().unwrap(), Vec::<String>::new());
-    assert_eq!(field.quadding().unwrap(), 0);
+    assert_eq!(
+        field
+            .get_inheritable_field_value_as_string(b"CustomString")
+            .unwrap(),
+        ""
+    );
+    assert_eq!(
+        field
+            .get_inheritable_field_value_as_name(b"CustomName")
+            .unwrap(),
+        b""
+    );
+    assert_eq!(field.get_partial_name().unwrap(), "");
+    assert_eq!(field.get_choices().unwrap(), Vec::<String>::new());
+    assert_eq!(field.get_quadding().unwrap(), 0);
 
     let bytes = doc(vec![(10, "<< /FT /Ch >>".into())]);
     let mut pdf = open(bytes);
     assert!(FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
-        .choices()
+        .get_choices()
         .unwrap()
         .is_empty());
 }
@@ -2029,7 +2049,7 @@ fn raw_value_reference_skips_null_cycles_and_non_dictionary_fields() {
         .into_bytes();
     let mut pdf = open(bytes);
     assert!(FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
-        .default_resources()
+        .get_default_resources()
         .unwrap()
         .is_none());
 }
@@ -2147,7 +2167,7 @@ fn choices_resolve_each_indirect_item_to_its_terminal_string() {
     let mut pdf = open(bytes);
 
     let choices = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
-        .choices()
+        .get_choices()
         .unwrap();
 
     assert_eq!(choices, vec!["terminal"]);

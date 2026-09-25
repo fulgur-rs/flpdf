@@ -184,18 +184,18 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
     /// Return an inheritable field value while preserving the selected
     /// qpdf-style handle identity.
-    pub fn inheritable_value(&mut self, key: &[u8]) -> Result<Option<ObjectHandle>> {
+    pub fn get_inheritable_field_value(&mut self, key: &[u8]) -> Result<Option<ObjectHandle>> {
         self.resolve_inherited_handle(key)
     }
 
     /// Return an inheritable PDF string as qpdf-style UTF-8 text.
-    pub fn inheritable_string(&mut self, key: &[u8]) -> Result<String> {
+    pub fn get_inheritable_field_value_as_string(&mut self, key: &[u8]) -> Result<String> {
         let value = self.resolve_inherited_handle(key)?;
         Ok(self.resolve_string_handle(value)?.unwrap_or_default())
     }
 
     /// Return an inheritable PDF name with its leading slash.
-    pub fn inheritable_name(&mut self, key: &[u8]) -> Result<Vec<u8>> {
+    pub fn get_inheritable_field_value_as_name(&mut self, key: &[u8]) -> Result<Vec<u8>> {
         Ok(self
             .resolve_inherited_name(self.field.clone(), key)?
             .map(|name| {
@@ -209,7 +209,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
     /// Return the inheritable `/FT` field type as qpdf-style name bytes,
     /// including the leading slash.
-    pub fn field_type(&mut self) -> Result<Option<Vec<u8>>> {
+    pub fn get_field_type(&mut self) -> Result<Option<Vec<u8>>> {
         Ok(self
             .resolve_inherited_name(self.field.clone(), b"FT")?
             .map(|name| {
@@ -248,23 +248,23 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     /// Return the inheritable `/V` field value.
-    pub fn value(&mut self) -> Result<Option<ObjectHandle>> {
+    pub fn get_value(&mut self) -> Result<Option<ObjectHandle>> {
         self.field_value()
     }
 
     /// Return the inheritable `/V` as qpdf-style UTF-8 text.
-    pub fn value_as_string(&mut self) -> Result<String> {
-        self.inheritable_string(b"V")
+    pub fn get_value_as_string(&mut self) -> Result<String> {
+        self.get_inheritable_field_value_as_string(b"V")
     }
 
     /// Return the inheritable `/DV` field default value.
-    pub fn default_value(&mut self) -> Result<Option<ObjectHandle>> {
+    pub fn get_default_value(&mut self) -> Result<Option<ObjectHandle>> {
         self.field_default_value()
     }
 
     /// Return the inheritable `/DV` as qpdf-style UTF-8 text.
-    pub fn default_value_as_string(&mut self) -> Result<String> {
-        self.inheritable_string(b"DV")
+    pub fn get_default_value_as_string(&mut self) -> Result<String> {
+        self.get_inheritable_field_value_as_string(b"DV")
     }
 
     /// Return the inheritable `/Ff` field flags.
@@ -273,18 +273,18 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     /// Return the inheritable `/Ff` flags, defaulting to zero.
-    pub fn flags(&mut self) -> Result<i64> {
+    pub fn get_flags(&mut self) -> Result<i64> {
         Ok(self.field_flags()?.unwrap_or(0))
     }
 
     /// Return this field's `/T` partial name as qpdf-style UTF-8 text.
-    pub fn partial_name(&mut self) -> Result<String> {
+    pub fn get_partial_name(&mut self) -> Result<String> {
         self.string_key(self.field.clone(), b"T")
             .map(|value| value.unwrap_or_default())
     }
 
     /// Return the dotted `/T` name formed by this field and its parents.
-    pub fn fully_qualified_name(&mut self) -> Result<String> {
+    pub fn get_fully_qualified_name(&mut self) -> Result<String> {
         let mut current = self.field.clone();
         let mut seen = BTreeSet::new();
         let mut direct_seen = Vec::new();
@@ -315,24 +315,24 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     /// Return `/TU`, or the fully qualified name when `/TU` is absent.
-    pub fn alternative_name(&mut self) -> Result<String> {
+    pub fn get_alternative_name(&mut self) -> Result<String> {
         match self.string_key(self.field.clone(), b"TU")? {
             Some(name) => Ok(name),
-            None => self.fully_qualified_name(),
+            None => self.get_fully_qualified_name(),
         }
     }
 
     /// Return `/TM`, then `/TU`, then the fully qualified name.
-    pub fn mapping_name(&mut self) -> Result<String> {
+    pub fn get_mapping_name(&mut self) -> Result<String> {
         match self.string_key(self.field.clone(), b"TM")? {
             Some(name) => Ok(name),
-            None => self.alternative_name(),
+            None => self.get_alternative_name(),
         }
     }
 
     /// Return the default appearance string, inheriting `/DA` from the field
     /// tree and then falling back to `/AcroForm`.
-    pub fn default_appearance(&mut self) -> Result<String> {
+    pub fn get_default_appearance(&mut self) -> Result<String> {
         if let Some(value) = self.resolve_inherited_handle(b"DA")? {
             if let Some(value) = self.resolve_string_handle(Some(value))? {
                 return Ok(value);
@@ -345,13 +345,13 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     /// Return the document-level `/AcroForm/DR` handle.
     ///
     /// qpdf deliberately does not inherit `/DR` through the field tree.
-    pub fn default_resources(&mut self) -> Result<Option<ObjectHandle>> {
+    pub fn get_default_resources(&mut self) -> Result<Option<ObjectHandle>> {
         self.acroform_value(b"DR")
     }
 
     /// Return the quadding value, inheriting `/Q` and then falling back to
     /// `/AcroForm/Q`. Missing or non-integer values are zero as in qpdf.
-    pub fn quadding(&mut self) -> Result<i64> {
+    pub fn get_quadding(&mut self) -> Result<i64> {
         if let Some(value) = self.resolve_inherited_handle(b"Q")? {
             if let Some(value) = self.dereferenced(value)?.try_as_integer()? {
                 return Ok(value);
@@ -369,12 +369,12 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
     /// Return whether this field is a text field (`/FT /Tx`).
     pub fn is_text(&mut self) -> Result<bool> {
-        Ok(self.field_type()?.as_deref() == Some(b"/Tx"))
+        Ok(self.get_field_type()?.as_deref() == Some(b"/Tx"))
     }
 
     /// Return whether this field is a checkbox button.
     pub fn is_checkbox(&mut self) -> Result<bool> {
-        Ok(self.field_type()?.as_deref() == Some(b"/Btn")
+        Ok(self.get_field_type()?.as_deref() == Some(b"/Btn")
             && self.field_flags()?.unwrap_or(0) & ((1 << 15) | (1 << 16)) == 0)
     }
 
@@ -392,23 +392,23 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
     /// Return whether this field is a radio button (`/Btn`, flag bit 16).
     pub fn is_radio_button(&mut self) -> Result<bool> {
-        Ok(self.field_type()?.as_deref() == Some(b"/Btn")
+        Ok(self.get_field_type()?.as_deref() == Some(b"/Btn")
             && self.field_flags()?.unwrap_or(0) & (1 << 15) == 1 << 15)
     }
 
     /// Return whether this field is a pushbutton (`/Btn`, flag bit 17).
     pub fn is_pushbutton(&mut self) -> Result<bool> {
-        Ok(self.field_type()?.as_deref() == Some(b"/Btn")
+        Ok(self.get_field_type()?.as_deref() == Some(b"/Btn")
             && self.field_flags()?.unwrap_or(0) & (1 << 16) == 1 << 16)
     }
 
     /// Return whether this field is a choice field (`/FT /Ch`).
     pub fn is_choice(&mut self) -> Result<bool> {
-        Ok(self.field_type()?.as_deref() == Some(b"/Ch"))
+        Ok(self.get_field_type()?.as_deref() == Some(b"/Ch"))
     }
 
     /// Return qpdf's choice labels for a choice field.
-    pub fn choices(&mut self) -> Result<Vec<String>> {
+    pub fn get_choices(&mut self) -> Result<Vec<String>> {
         if !self.is_choice()? {
             return Ok(Vec::new());
         }
@@ -445,7 +445,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     /// Set the field's `/V` value using qpdf's form-field dispatch.
     pub fn set_value(&mut self, value: ObjectHandle, need_appearances: bool) -> Result<()> {
         let value = self.dereferenced(value)?;
-        if self.field_type()?.as_deref() == Some(b"/Btn") {
+        if self.get_field_type()?.as_deref() == Some(b"/Btn") {
             if self.is_checkbox()? {
                 if let Some(name) = value.try_as_name()? {
                     self.set_checkbox_value(name != b"Off")?;
@@ -501,7 +501,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         &mut self,
         widget: ObjectHandle,
     ) -> Result<Option<ObjectRef>> {
-        match self.field_type()?.as_deref() {
+        match self.get_field_type()?.as_deref() {
             Some(b"/Tx") => {
                 rendering::render_text_field_canonical_handles(self.pdf, self.field.clone(), widget)
             }

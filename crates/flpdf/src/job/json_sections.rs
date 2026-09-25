@@ -317,20 +317,20 @@ pub(crate) fn build_acroform_section_with_version<R: Read + Seek>(
         ) = {
             let mut field_helper =
                 crate::FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
-            let fieldtype = field_helper.field_type()?.unwrap_or_default();
-            let fieldflags = field_helper.flags()?;
-            let fullname = field_helper.fully_qualified_name()?;
-            let partialname = field_helper.partial_name()?;
-            let alternativename = field_helper.alternative_name()?;
-            let mappingname = field_helper.mapping_name()?;
-            let value = field_helper.value()?;
-            let defaultvalue = field_helper.default_value()?;
-            let quadding = field_helper.quadding()?;
+            let fieldtype = field_helper.get_field_type()?.unwrap_or_default();
+            let fieldflags = field_helper.get_flags()?;
+            let fullname = field_helper.get_fully_qualified_name()?;
+            let partialname = field_helper.get_partial_name()?;
+            let alternativename = field_helper.get_alternative_name()?;
+            let mappingname = field_helper.get_mapping_name()?;
+            let value = field_helper.get_value()?;
+            let defaultvalue = field_helper.get_default_value()?;
+            let quadding = field_helper.get_quadding()?;
             let ischeckbox = field_helper.is_checkbox()?;
             let isradiobutton = field_helper.is_radio_button()?;
             let ischoice = field_helper.is_choice()?;
             let istext = field_helper.is_text()?;
-            let choices = field_helper.choices()?;
+            let choices = field_helper.get_choices()?;
 
             (
                 fieldtype,
