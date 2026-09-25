@@ -305,6 +305,7 @@ fn collect_live_seed_handles(
     // root or trailer value could nest arbitrarily (or form a direct cycle).
     // Bound the direct-seed recursion the same way the parser does rather than
     // overflow the stack.
+    // qpdf-deviation: QPDFWriter::enqueueObject has no MAX_PARSE_DEPTH cap on direct seed values.
     if depth > crate::parser::MAX_PARSE_DEPTH {
         // cov:ignore-start: defensive stack bound; parsed input is parser-capped and factory-built seed trees are acyclic, so this overflow arm is unreachable from the corpus.
         return Err(crate::Error::Unsupported(format!(
@@ -345,6 +346,7 @@ fn collect_live_child_handles(
     found: &mut Vec<ObjectHandle>,
     depth: usize,
 ) -> crate::Result<()> {
+    // qpdf-deviation: QPDFWriter::unparseObject recurses into direct children without this MAX_PARSE_DEPTH cap.
     if depth > crate::parser::MAX_PARSE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
             "plain live writer: emitted value nesting exceeds maximum of {}",
@@ -2104,6 +2106,9 @@ thread_local! {
 struct ContentEmitWalkDepthGuard;
 
 impl ContentEmitWalkDepthGuard {
+    #[deprecated(
+        note = "no qpdf counterpart; QPDFWriter::unparseObject has no upper nesting limit"
+    )]
     fn enter() -> crate::Result<Self> {
         let depth = CONTENT_EMIT_WALK_DEPTH.with(|depth| {
             let entered = depth.get();
@@ -2135,6 +2140,7 @@ impl Drop for ContentEmitWalkDepthGuard {
 /// Every walker in the family routes its body through here, so a direct
 /// container graph that never reaches an indirect boundary is rejected at
 /// the same depth wherever it is met.
+#[allow(deprecated)]
 fn content_emit_walk_hub<T>(body: impl FnOnce() -> crate::Result<T>) -> crate::Result<T> {
     let _depth = ContentEmitWalkDepthGuard::enter()?;
     stacker::maybe_grow(

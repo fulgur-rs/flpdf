@@ -8075,6 +8075,9 @@ thread_local! {
 struct DirectGraphWalkDepthGuard;
 
 impl DirectGraphWalkDepthGuard {
+    #[deprecated(
+        note = "no qpdf counterpart; direct object unparse and shallow copy have no upper nesting limit"
+    )]
     fn enter() -> Result<Self> {
         let depth = DIRECT_GRAPH_WALK_DEPTH.with(|depth| {
             let entered = depth.get();
@@ -8106,6 +8109,7 @@ impl Drop for DirectGraphWalkDepthGuard {
 /// Both hubs in the family route their bodies through here, so a direct
 /// container graph that never reaches an indirect boundary is rejected at
 /// the same depth whether it is being copied or serialized.
+#[allow(deprecated)]
 fn direct_graph_walk_hub<T>(body: impl FnOnce() -> Result<T>) -> Result<T> {
     let _depth = DirectGraphWalkDepthGuard::enter()?;
     stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, body)
@@ -8285,6 +8289,7 @@ impl<'a> ObjectJsonWriter<'a> {
         depth: usize,
         dispatch: ObjectJsonDispatch,
     ) -> std::result::Result<(), ObjectJsonError> {
+        // qpdf-deviation: QPDFObjectHandle::writeJSON has no output-depth cap; JSON::JSONParser's limit only applies to JSON input.
         if depth > crate::parser::MAX_PARSE_DEPTH {
             return Err(ObjectJsonError::Pdf(format!(
                 "object nesting exceeds maximum depth of {}",
