@@ -460,7 +460,7 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     }
 
     let page_tree_diagnostics_seen = diagnostic_count(pdf);
-    let pages_result = PageDocumentHelper::new(pdf).get_all_pages();
+    let pages_result = PageDocumentHelper::new(pdf).get_all_page_handles();
     let pages = match pages_result {
         Ok(pages) => pages,
         // cov:ignore-start: check's qpdf-shaped discard writer above runs the
@@ -480,10 +480,10 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
         } // cov:ignore-end
     };
     let mut page_errors = false;
-    for (index, page_ref) in pages.into_iter().enumerate() {
+    for (index, page_handle) in pages.into_iter().enumerate() {
         let page_diagnostics_seen = diagnostic_count(pdf);
         let page_result = {
-            let mut page = PageObjectHelper::new(page_ref, pdf);
+            let mut page = PageObjectHelper::from_object_handle(page_handle, pdf);
             let mut discard_contents = DiscardContents;
             page.parse_page_contents(&mut discard_contents)
         };
@@ -1759,6 +1759,47 @@ mod tests {
               ERROR: pages-loop.pdf (object 3 0): Loop detected in /Pages structure (getAllPages)\n\
               qpdf: errors detected\n"
         );
+    }
+
+    #[test]
+    fn document_check_parses_page_contents_without_projecting_raw_page_identity() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let mut pdf = Pdf::open(Cursor::new(single_page_content_pdf_bytes(b"")))
+            .expect("single-page fixture should open");
+        let raw_page_ref = ObjectRef::new(5, 65_535);
+        let page = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (
+                b"/Parent".to_vec(),
+                pdf.get_object_handle(ObjectRef::new(2, 0)),
+            ),
+            (
+                b"/MediaBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(612),
+                    ObjectHandle::integer(792),
+                ]),
+            ),
+        ]);
+        pdf.replace_object(raw_page_ref, page)
+            .expect("install raw page object");
+        let raw_page = pdf.get_object_handle_by_raw_identity(5, 65_535);
+        pdf.get_object_handle(ObjectRef::new(2, 0))
+            .replace_key(b"/Kids", ObjectHandle::array(vec![raw_page]))
+            .expect("attach raw page to the page tree");
+
+        let result = check_document(&mut pdf, &logger, "qpdf", "raw-page.pdf");
+
+        let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
+        assert!(
+            result.is_ok(),
+            "qpdf doCheck parses page helper handles without ObjectRef projection; output:\n{output}"
+        );
+        assert!(output.contains("checking raw-page.pdf\n"));
+        assert!(output.contains("No syntax or stream encoding errors found"));
     }
 
     #[test]
