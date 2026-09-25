@@ -390,6 +390,7 @@ dependencies = [
  "proc-macro2",
  "syn 2.0.117",
  "tempfile",
+ "windows-sys",
 ]
 
 [[package]]

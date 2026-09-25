@@ -85,3 +85,6 @@ predicates.workspace = true
 proc-macro2.workspace = true
 syn.workspace = true
 tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Globalization"] }

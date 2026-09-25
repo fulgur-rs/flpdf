@@ -28,18 +28,75 @@ use std::process::ExitCode;
 
 /// Extract the raw password bytes from an argv entry the way qpdf's C API
 /// receives them: as the platform's native `argv[]` bytes, with no forced
-/// UTF-8 validation. On Unix, `OsStr` already holds those bytes directly; a
-/// lossy `to_string_lossy()` conversion would replace any non-UTF-8 byte
-/// with U+FFFD before authentication, rejecting a legacy single-byte-encoded
-/// password (e.g. Latin-1) that qpdf's `qpdf_read` accepts unchanged.
+/// UTF-8 validation. On Unix, `OsStr` already holds those bytes directly. On
+/// Windows, narrow C `main` receives the wide process arguments converted to
+/// the active ANSI code page. A lossy UTF-8 conversion changes those bytes and
+/// can reject a legacy single-byte-encoded password before authentication.
 #[cfg(unix)]
-fn password_bytes(password_arg: &std::ffi::OsStr) -> Vec<u8> {
-    std::os::unix::ffi::OsStrExt::as_bytes(password_arg).to_vec()
+fn password_bytes(password_arg: &std::ffi::OsStr) -> Result<Vec<u8>> {
+    Ok(std::os::unix::ffi::OsStrExt::as_bytes(password_arg).to_vec())
 }
 
-#[cfg(not(unix))]
-fn password_bytes(password_arg: &std::ffi::OsStr) -> Vec<u8> {
-    password_arg.to_string_lossy().into_owned().into_bytes()
+#[cfg(windows)]
+fn password_bytes(password_arg: &std::ffi::OsStr) -> Result<Vec<u8>> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Globalization::{WideCharToMultiByte, CP_ACP};
+
+    let wide: Vec<u16> = password_arg.encode_wide().collect();
+    if wide.is_empty() {
+        return Ok(Vec::new());
+    }
+    let wide_len = i32::try_from(wide.len()).map_err(|_| {
+        Error::Internal("password argument is too long for Windows conversion".into())
+    })?;
+
+    // SAFETY: `wide` is live for `wide_len` UTF-16 units; a null output pointer
+    // with a zero size is the documented `WideCharToMultiByte` sizing call.
+    let required = unsafe {
+        WideCharToMultiByte(
+            CP_ACP,
+            0,
+            wide.as_ptr(),
+            wide_len,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        )
+    };
+    if required == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    let mut output = vec![0_u8; required as usize];
+    // SAFETY: `output` has the exact size returned by the sizing call, and the
+    // same live input pointer and length are used for both conversion calls.
+    let written = unsafe {
+        WideCharToMultiByte(
+            CP_ACP,
+            0,
+            wide.as_ptr(),
+            wide_len,
+            output.as_mut_ptr(),
+            required,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        )
+    };
+    if written == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if written != required {
+        return Err(Error::Internal(
+            "Windows password conversion returned an unexpected byte count".into(),
+        ));
+    }
+    Ok(output)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn password_bytes(password_arg: &std::ffi::OsStr) -> Result<Vec<u8>> {
+    Ok(password_arg.to_string_lossy().into_owned().into_bytes())
 }
 
 #[cfg(unix)]
@@ -177,7 +234,7 @@ fn read_options(input: &std::path::Path, password: Vec<u8>) -> PdfOpenOptions {
 
 fn open_input(input_arg: &std::ffi::OsStr, password_arg: &std::ffi::OsStr) -> Result<Pdf<File>> {
     let input = PathBuf::from(input_arg);
-    let password = password_bytes(password_arg);
+    let password = password_bytes(password_arg)?;
     Pdf::open_with_options(File::open(&input)?, read_options(&input, password))
 }
 
@@ -323,7 +380,7 @@ fn run_test2(
     output_arg: &std::ffi::OsStr,
 ) -> Result<()> {
     let input = PathBuf::from(input_arg);
-    let password = password_bytes(password_arg);
+    let password = password_bytes(password_arg)?;
     // qpdf's `qpdf_read` catches both its input-open and parse exceptions in
     // `trap_errors` (`qpdf-c.cc:68-89,266-282`). Keep the filesystem open in
     // the same reportable result instead of letting `?` terminate the Rust
@@ -392,7 +449,7 @@ fn run_test10(
     _output_arg: &std::ffi::OsStr,
 ) -> Result<()> {
     let input = PathBuf::from(input_arg);
-    let password = password_bytes(password_arg);
+    let password = password_bytes(password_arg)?;
     let result = Pdf::open_with_options(
         File::open(&input)?,
         PdfOpenOptions {
@@ -575,7 +632,7 @@ fn run_test18(
 /// replacement before it reaches the harness.
 fn run_test1(input_arg: &std::ffi::OsStr, password_arg: &std::ffi::OsStr) -> Result<()> {
     let input = PathBuf::from(input_arg);
-    let password = password_bytes(password_arg);
+    let password = password_bytes(password_arg)?;
     let mut pdf = Pdf::open_with_options(
         File::open(&input)?,
         PdfOpenOptions {
@@ -821,7 +878,7 @@ fn run_test19(
 ) -> Result<()> {
     let input = PathBuf::from(input_arg);
     let output = PathBuf::from(output_arg);
-    let password = password_bytes(password_arg);
+    let password = password_bytes(password_arg)?;
     let mut pdf = Pdf::open_with_options(
         File::open(&input)?,
         PdfOpenOptions {
@@ -852,7 +909,7 @@ fn run_test20(
 ) -> Result<()> {
     let input = PathBuf::from(input_arg);
     let output = PathBuf::from(output_arg);
-    let password = password_bytes(password_arg);
+    let password = password_bytes(password_arg)?;
     let mut pdf = Pdf::open_with_options(
         File::open(&input)?,
         PdfOpenOptions {
@@ -908,8 +965,16 @@ mod tests {
 
     #[cfg(unix)]
     use super::password_bytes;
+    #[cfg(windows)]
+    use super::password_bytes;
+    #[cfg(windows)]
+    use std::ffi::OsStr;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
+    #[cfg(windows)]
+    use std::os::windows::ffi::OsStrExt;
+    #[cfg(windows)]
+    use windows_sys::Win32::Globalization::{GetACP, WideCharToMultiByte, CP_ACP, CP_UTF8};
 
     #[cfg(unix)]
     #[test]
@@ -920,7 +985,70 @@ mod tests {
         // replace it with the 3-byte U+FFFD sequence instead.
         let raw = [b'p', b'w', 0xe9, b'!'];
         let arg = std::ffi::OsStr::from_bytes(&raw);
-        assert_eq!(password_bytes(arg), raw.to_vec());
+        assert_eq!(
+            password_bytes(arg).expect("Unix argv conversion cannot fail"),
+            raw.to_vec()
+        );
+    }
+
+    #[cfg(windows)]
+    fn windows_c_main_argv_bytes(value: &OsStr) -> Vec<u8> {
+        let wide: Vec<u16> = value.encode_wide().collect();
+        assert!(!wide.is_empty());
+        let wide_len = i32::try_from(wide.len()).unwrap();
+        // SAFETY: the input pointer is valid for wide_len UTF-16 code units;
+        // a null output pointer with a zero size is the documented sizing call.
+        let required = unsafe {
+            WideCharToMultiByte(
+                CP_ACP,
+                0,
+                wide.as_ptr(),
+                wide_len,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(required > 0);
+        let mut output = vec![0_u8; required as usize];
+        // SAFETY: output has required bytes, and the same live input pointer and
+        // length are passed as in the sizing call above.
+        let written = unsafe {
+            WideCharToMultiByte(
+                CP_ACP,
+                0,
+                wide.as_ptr(),
+                wide_len,
+                output.as_mut_ptr(),
+                required,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(written, required);
+        output
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn password_bytes_matches_the_narrow_c_main_argv_encoding_on_windows() {
+        let password = OsStr::new("pw-é!");
+        let expected = windows_c_main_argv_bytes(password);
+        let actual = password_bytes(password).expect("Windows ACP conversion should succeed");
+        assert_eq!(actual, expected);
+        assert!(password_bytes(OsStr::new(""))
+            .expect("empty Windows argv conversion should succeed")
+            .is_empty());
+        // SAFETY: GetACP takes no arguments and has no pointer preconditions.
+        let active_code_page = unsafe { GetACP() };
+        if active_code_page != CP_UTF8 {
+            assert_ne!(
+                actual,
+                password.to_string_lossy().into_owned().into_bytes(),
+                "non-UTF-8 ACP argv bytes must not be replaced with lossy UTF-8"
+            );
+        }
     }
 
     #[test]
