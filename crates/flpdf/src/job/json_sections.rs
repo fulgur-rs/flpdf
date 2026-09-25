@@ -440,7 +440,7 @@ pub(crate) fn build_pagelabels_section_with_version<R: Read + Seek>(
     // and the observable everCalledGetAllPages metadata state.
     let page_count = {
         let mut page_document = crate::PageDocumentHelper::new(pdf);
-        page_document.get_all_pages()?.len()
+        page_document.get_all_page_handles()?.len()
     };
     let entries = {
         let mut helper = crate::page_label_document_helper::PageLabelDocumentHelper::new(pdf);
@@ -1249,6 +1249,81 @@ mod tests {
             .join("../../tests/fixtures/compat/one-page.pdf");
         Pdf::open_mem_owned(std::fs::read(path).expect("one-page fixture"))
             .expect("open one-page fixture")
+    }
+
+    fn install_raw_generation_page(pdf: &mut Pdf<Cursor<Vec<u8>>>) {
+        let raw_page_ref = ObjectRef::new(5, 65_535);
+        let catalog = pdf.root_handle().expect("catalog");
+        let pages = catalog.try_get_key(b"/Pages").expect("page-tree root");
+        pdf.replace_object(
+            raw_page_ref,
+            ObjectHandle::dictionary(vec![
+                (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+                (b"/Parent".to_vec(), pages.clone()),
+                (
+                    b"/MediaBox".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(612),
+                        ObjectHandle::integer(792),
+                    ]),
+                ),
+            ]),
+        )
+        .expect("install raw-generation page");
+        pages
+            .replace_key(
+                b"/Kids",
+                ObjectHandle::array(vec![pdf.get_object_handle(raw_page_ref)]),
+            )
+            .expect("attach raw-generation page");
+        pages
+            .replace_key(b"/Count", ObjectHandle::integer(1))
+            .expect("update page count");
+    }
+
+    #[test]
+    fn pagelabels_json_counts_raw_generation_page_handles() {
+        let mut pdf = one_page_pdf();
+        install_raw_generation_page(&mut pdf);
+
+        let without_labels = build_pagelabels_section_with_version(&mut pdf, 2)
+            .expect("raw page identity must not prevent an empty page-label section");
+        assert!(pdf.ever_called_get_all_pages());
+        assert!(without_labels.is_array());
+        let mut no_label_count = 0;
+        without_labels.for_each_array_item(|_| no_label_count += 1);
+        assert_eq!(no_label_count, 0);
+
+        let catalog = pdf.root_handle().expect("catalog");
+        catalog
+            .replace_key(
+                b"/PageLabels",
+                ObjectHandle::dictionary(vec![(
+                    b"/Nums".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::dictionary(vec![(
+                            b"/S".to_vec(),
+                            ObjectHandle::name(b"D".to_vec()),
+                        )]),
+                    ]),
+                )]),
+            )
+            .expect("add a decimal PageLabels entry");
+
+        let with_labels = build_pagelabels_section_with_version(&mut pdf, 2)
+            .expect("raw page identity must be counted when PageLabels exists");
+        assert!(with_labels.is_array());
+        let mut entries = Vec::new();
+        with_labels.for_each_array_item(|entry| entries.push(entry));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].get_dict_item(b"index").get_number(),
+            Some(b"0".to_vec())
+        );
+        assert!(entries[0].get_dict_item(b"label").is_dictionary());
     }
 
     fn image_handle(filter: ObjectHandle, decode_parms: ObjectHandle) -> ObjectHandle {
