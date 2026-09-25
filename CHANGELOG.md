@@ -232,6 +232,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/fulgur-rs/flpdf/compare/v0.8.0...v0.9.0) - 2026-09-25
+
+### Fixed
+
+- *(json)* count raw page handles for page labels
+- *(job)* parse checked pages from raw handles
+- *(writer)* keep special stream identity raw
+- *(qdf)* preserve resumed ObjStm at EOF
+- *(qdf)* detect xref before stream object endobj
+- *(qdf)* bound a post-tail holder at its integer line
+- *(qdf)* keep repairing a post-tail holder without endobj
+- *(qdf)* resume scanning after tail length holders
+- *(qdf-fix)* find positional holders after xref
+- *(qdf-fix)* accept empty object tables
+- *(qdf)* check holder integer before successor body
+- *(qdf)* count ignore_newline from endstream
+- *(linearization)* reject unsupported hint signatures
+- *(qdf)* preserve st_after_stream tail behavior
+- *(qdf)* use positional stream length holders
+- *(json)* use unparse keys for v1 object maps
+- *(xref)* preserve default-row warning context
+- *(json)* emit pages opener before traversal
+- *(json)* preserve raw qpdf exception text
+- *(xref)* defer default object-zero warning
+- *(pages)* route page_refs through qpdf repair
+- *(encryption)* match qpdf missing crypt filter warning
+- *(cli)* match qpdf partial-open warning status
+- *(reader)* retain indirect encryption error context
+- *(reader)* validate encryption before authentication
+- *(xref)* keep cross-line lookahead in the live recovery scan
+- *(xref)* allow guarded candidate reentry before trailer
+- *(xref)* share owner reconstruction route
+- *(xref)* keep recovery state on resolver owner
+- *(xref)* arm reconstruction guard before scan
+- retain primary cache for multi-source page jobs
+
+### Other
+
+- *(writer)* match raw identity acceptance fixture
+- *(writer)* document unreachable direct page guard
+- mark qpdf-less depth caps
+- mark direct form-field cycle deviation
+- align getter diagnostics with qpdf names
+- preserve qpdf form getter names
+- use qpdf-shaped form field lookup
+- cover optional-content page-operation parity
+- *(pdfa)* cover qpdf preservation graphs
+- *(writer)* cover cleartext metadata rewrite parity
+- *(linearization)* cover relinearize gc goldens
+- *(linearization)* assert stream probes across passes
+- *(annotation)* make helper handle-only
+- *(qdf-fix)* cover missing xref path
+- *(linearization)* assert hint error without unreachable panic
+- *(qdf)* drop the obsolete missing-holder error promise
+- *(xref)* separate warning formatting from delivery
+- *(pages)* assert the qpdf direct-null error
+- *(linearization)* skip the encrypted differential without qpdf
+- *(linearization)* assert writer-owned length tracking
+- *(linearization)* compare encrypted AES output with qpdf
+- *(linearization)* reuse writer emission state
+- *(writer)* verify indirect content holder resolution
+- *(writer)* use resolving accessors in content body
+- *(xref)* cover stale partial loader rows after repair
+- *(xref)* cover owner registration boundaries
+- normalize page merge source line endings
+- use checkout-relative page helper fixture
+
 ## [0.8.0](https://github.com/fulgur-rs/flpdf/compare/v0.7.0...v0.8.0) - 2026-09-22
 
 ### Fixed
