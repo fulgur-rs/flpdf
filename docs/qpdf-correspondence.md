@@ -5029,6 +5029,10 @@ leaf remains in the qpdf page list and is repaired with qpdf's warning sequence.
 The later multi-source page-copy rejection for a scalar leaf remains a separate
 page-copy responsibility (`object 3 0 R is not a page dictionary or Form
 XObject`); this enumeration change does not resolve that caller behavior.
+`cli_page_tree_orphan_qpdf::orphan_body_page_is_not_promoted_into_the_catalog_page_tree`
+also pins the body boundary: a `/Page` absent from reachable `/Kids` is not
+enumerated; `--preserve-unreferenced` may retain it as an ordinary object
+without adding it to the page tree.
 
 The old `PageWalk` also suppressed type errors from contextless programmatic
 handles. qpdf's `QPDFObjectHandle::warn` throws when there is no owning `QPDF`
