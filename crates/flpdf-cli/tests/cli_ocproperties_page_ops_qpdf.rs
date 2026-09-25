@@ -73,6 +73,12 @@ fn writer_args(input: &Path, output: &Path) -> Vec<String> {
     ]
 }
 
+fn content_transform_args(input: &Path, option: &str, output: &Path) -> Vec<String> {
+    let mut args = writer_args(input, output);
+    args.insert(3, option.to_owned());
+    args
+}
+
 fn page_operation_args(input: &Path, specs: &[String], output: &Path) -> Vec<String> {
     let mut args = vec![
         "--static-id".to_owned(),
@@ -251,6 +257,55 @@ fn assert_secondary_page_graph(json: &Value) {
     );
 }
 
+fn assert_content_ocg_graph_and_streams(json: &Value, expected_stream_data: &[&str]) {
+    let objects = &json["qpdf"][1];
+    let root = value_for_reference(objects, &objects["trailer"]["value"]["/Root"]);
+    let pages = value_for_reference(objects, &root["/Pages"]);
+    let page = value_for_reference(objects, &pages["/Kids"][0]);
+    let resources = value_for_reference(objects, &page["/Resources"]);
+    let properties = value_for_reference(objects, &resources["/Properties"]);
+    let ocg = value_for_reference(objects, &properties["/LayerA"]);
+    assert_eq!(ocg["/Name"], "u:Primary layer");
+
+    let content_references: Vec<&Value> = match page["/Contents"].as_array() {
+        Some(contents) => contents.iter().collect(),
+        None => vec![&page["/Contents"]],
+    };
+    assert_eq!(
+        content_references.len(),
+        expected_stream_data.len(),
+        "content stream shape after the page transformation"
+    );
+    for (reference, expected) in content_references.iter().zip(expected_stream_data) {
+        let stream = object_entry(objects, reference);
+        assert_eq!(
+            stream["stream"]["data"].as_str(),
+            Some(*expected),
+            "marked-content BDC/EMC operands and stream bytes"
+        );
+    }
+}
+
+fn assert_content_transform_matches_qpdf(option: &str, expected_stream_data: &[&str], label: &str) {
+    if !require_qpdf() {
+        return;
+    }
+    let input = fixture("ocproperties-content-transform.pdf");
+    assert!(input.is_file(), "missing OCG content fixture: {input:?}");
+    let directory = tempfile::tempdir().expect("temporary output directory");
+    let qpdf_output = directory.path().join("qpdf.pdf");
+    let flpdf_output = directory.path().join("flpdf.pdf");
+    qpdf_check(&input);
+
+    let qpdf_args = content_transform_args(&input, option, &qpdf_output);
+    let flpdf_args = content_transform_args(&input, option, &flpdf_output);
+    let qpdf = run_qpdf(&qpdf_args);
+    let flpdf = run_flpdf(&flpdf_args);
+    assert_command_parity(label, &qpdf, &flpdf);
+    let json = assert_output_pair(label, &qpdf_output, &flpdf_output);
+    assert_content_ocg_graph_and_streams(&json, expected_stream_data);
+}
+
 fn assert_output_pair(label: &str, qpdf_output: &Path, flpdf_output: &Path) -> Value {
     qpdf_check(qpdf_output);
     qpdf_check(flpdf_output);
@@ -355,4 +410,22 @@ fn multi_source_pages_copy_secondary_oc_graph_without_catalog_union() {
         "this qpdf command retains the primary Catalog optional-content graph and does not union the secondary Catalog"
     );
     assert_secondary_page_graph(&qpdf_json);
+}
+
+#[test]
+fn normalize_content_preserves_marked_content_and_properties() {
+    assert_content_transform_matches_qpdf(
+        "--normalize-content=y",
+        &["L09DIC9MYXllckEgQkRDCjAgMCAyNSAyNSByZSBmCg==", "RU1DCg=="],
+        "normalize content with optional-content BDC",
+    );
+}
+
+#[test]
+fn coalesce_contents_preserves_marked_content_and_properties() {
+    assert_content_transform_matches_qpdf(
+        "--coalesce-contents",
+        &["L09DIC9MYXllckEgQkRDDTAgMCAyNSAyNSByZSBmDQpFTUMN"],
+        "coalesce contents with optional-content BDC",
+    );
 }

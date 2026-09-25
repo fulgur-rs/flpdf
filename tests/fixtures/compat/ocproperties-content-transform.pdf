@@ -1,0 +1,46 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /OCProperties 7 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Properties << /LayerA 4 0 R >> >> /Contents [5 0 R 6 0 R] >>
+endobj
+4 0 obj
+<< /Type /OCG /Name (Primary layer) >>
+endobj
+5 0 obj
+<< /Length 31 >>
+stream
+/OC /LayerA BDC0 0 25 25 re fendstream
+endobj
+6 0 obj
+<< /Length 4 >>
+stream
+EMCendstream
+endobj
+7 0 obj
+<< /OCGs [4 0 R] /D << /Order [4 0 R] >> >>
+endobj
+8 0 obj
+<< /Producer (flpdf optional-content fixture generator) >>
+endobj
+xref
+0 9
+0000000000 65535 f 
+0000000015 00000 n 
+0000000084 00000 n 
+0000000141 00000 n 
+0000000285 00000 n 
+0000000339 00000 n 
+0000000419 00000 n 
+0000000471 00000 n 
+0000000530 00000 n 
+trailer
+<< /Size 9 /Root 1 0 R /Info 8 0 R >>
+startxref
+604
+%%EOF

@@ -91,6 +91,26 @@ def secondary_page_graph() -> bytes:
     return make_pdf(objects, info_object=12)
 
 
+def content_transform() -> bytes:
+    first_content = b"/OC /LayerA BDC\r0 0 25 25 re f\r"
+    second_content = b"EMC\r"
+    objects = {
+        1: b"<< /Type /Catalog /Pages 2 0 R /OCProperties 7 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+            b"/Resources << /Properties << /LayerA 4 0 R >> >> "
+            b"/Contents [5 0 R 6 0 R] >>"
+        ),
+        4: b"<< /Type /OCG /Name (Primary layer) >>",
+        5: stream(first_content),
+        6: stream(second_content),
+        7: b"<< /OCGs [4 0 R] /D << /Order [4 0 R] >> >>",
+        8: b"<< /Producer (flpdf optional-content fixture generator) >>",
+    }
+    return make_pdf(objects, info_object=8)
+
+
 def main() -> None:
     if len(sys.argv) > 2:
         raise SystemExit(f"usage: {sys.argv[0]} [FIXTURE_DIRECTORY]")
@@ -103,6 +123,7 @@ def main() -> None:
     fixtures = {
         "ocproperties-primary-used-unused.pdf": primary_with_used_and_unused_ocgs(),
         "ocproperties-secondary-page-graph.pdf": secondary_page_graph(),
+        "ocproperties-content-transform.pdf": content_transform(),
     }
     for name, data in fixtures.items():
         path = fixture_directory / name
