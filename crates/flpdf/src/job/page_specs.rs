@@ -831,8 +831,8 @@ fn collect_primary_fields<T: Read + Seek>(
         }
     }
     for field in candidate_fields {
-        let (top_level, _) = FormFieldObjectHelper::from_object_handle(field, merged)
-            .get_top_level_field_handle()?;
+        let (top_level, _) =
+            FormFieldObjectHelper::from_object_handle(field, merged).get_top_level_field()?;
         if let Some(object_gen) = top_level.qpdf_obj_gen().filter(|gen| gen.is_indirect()) {
             field_identities.insert(object_gen);
         }

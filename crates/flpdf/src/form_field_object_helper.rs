@@ -151,11 +151,10 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     /// differs from this field.
     ///
     /// Mirrors `QPDFFormFieldObjectHelper::getTopLevelField`
-    /// (`libqpdf/QPDFFormFieldObjectHelper.cc:35-46`). The raw
-    /// `QpdfObjGen` identity remains attached to the returned handle, so a
-    /// generation outside the valid `ObjectRef` projection is not turned into
-    /// an error on this canonical route.
-    pub fn get_top_level_field_handle(&mut self) -> Result<(ObjectHandle, bool)> {
+    /// (`libqpdf/QPDFFormFieldObjectHelper.cc:35-46`). The returned handle
+    /// retains its raw `QpdfObjGen` identity, including generations outside
+    /// the valid `ObjectRef` projection.
+    pub fn get_top_level_field(&mut self) -> Result<(ObjectHandle, bool)> {
         let mut current = self.field.clone();
         let mut seen = BTreeSet::new();
         let mut direct_seen = Vec::new();
@@ -181,63 +180,6 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         }
 
         Ok((current, is_different))
-    }
-
-    /// Return the top-level field and whether it differs from this field.
-    ///
-    /// Mirrors qpdf's `QPDFFormFieldObjectHelper::getTopLevelField`
-    /// (`libqpdf/QPDFFormFieldObjectHelper.cc:35-46`), which climbs `/Parent`
-    /// until a cycle or a terminal node with no upper bound on depth (its
-    /// guard is `QPDFObjGen::set`, a pure cycle detector). This walk shares
-    /// that same cycle-only termination via `mark_field_node_seen` --
-    /// unlike `resolve_inherited_handle_from`, a direct `/Parent` stops here
-    /// because this method's return type is `ObjectRef`. An indirect parent
-    /// that cannot cross the valid `ObjectRef` projection is rejected
-    /// explicitly at that public boundary.
-    pub fn get_top_level_field(&mut self) -> Result<(ObjectRef, bool)> {
-        let Some(field_ref) = self.field_ref else {
-            return Err(Error::Unsupported(
-                "direct field has no ObjectRef top-level identity".to_string(),
-            ));
-        };
-        let mut current = self.field.clone();
-        let mut seen = BTreeSet::new();
-        let mut top = field_ref;
-        let mut is_different = false;
-
-        loop {
-            if !mark_field_node_seen(&mut seen, &current) {
-                break;
-            }
-
-            let node = self.dereferenced(current.clone())?;
-            let parent = node.try_get_key(b"/Parent")?;
-            let parent = self.dereferenced(parent)?;
-            if parent.try_is_null()? {
-                break;
-            }
-            if !parent.is_indirect() {
-                break;
-            }
-            // cov:ignore-start: ObjectHandle::is_indirect is derived from this
-            // same QpdfObjGen, so the identity cannot be absent here.
-            let parent_object_gen = parent.qpdf_obj_gen().ok_or_else(|| {
-                Error::Internal("indirect field parent lost its identity".to_owned())
-            })?;
-            // cov:ignore-end
-            let parent_ref = parent_object_gen.to_object_ref().ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "field parent object {} {} cannot be represented as a valid ObjectRef",
-                    parent_object_gen.get_obj(),
-                    parent_object_gen.get_gen()
-                ))
-            })?;
-            top = parent_ref;
-            current = parent;
-            is_different = true;
-        }
-
-        Ok((top, is_different))
     }
 
     /// Return an inheritable field value while preserving the selected
@@ -991,19 +933,18 @@ mod tests {
     }
 
     #[test]
-    fn direct_field_has_no_top_level_object_reference() {
+    fn direct_field_is_returned_as_the_top_level_handle() {
         let mut pdf = Pdf::empty().expect("empty PDF");
         let mut helper = super::FormFieldObjectHelper::from_object_handle(
             ObjectHandle::dictionary(Vec::new()),
             &mut pdf,
         );
 
-        let error = helper
+        let (top_level, is_different) = helper
             .get_top_level_field()
-            .expect_err("direct field cannot report an indirect top-level reference");
-        assert!(
-            matches!(error, crate::Error::Unsupported(message) if message.contains("no ObjectRef"))
-        );
+            .expect("qpdf returns the direct top-level helper");
+        assert!(top_level.object_ref().is_none());
+        assert!(!is_different);
     }
 
     #[test]

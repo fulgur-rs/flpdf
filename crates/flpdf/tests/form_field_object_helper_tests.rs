@@ -192,7 +192,7 @@ fn typed_inheritable_values_follow_terminal_holder_chains_without_losing_raw_ide
 }
 
 #[test]
-fn top_level_field_rejects_an_unprojectable_raw_parent_explicitly() {
+fn top_level_field_preserves_an_unprojectable_raw_parent_identity() {
     let mut pdf = open(doc(vec![(10, "<< /FT /Tx >>".into())]));
     let raw_ref = ObjectRef::new(11, 65_535);
     pdf.replace_object(
@@ -209,34 +209,10 @@ fn top_level_field_rejects_an_unprojectable_raw_parent_explicitly() {
         .replace_key(b"/Parent", pdf.get_object_handle(raw_ref))
         .unwrap();
 
-    let error = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
-        .get_top_level_field()
-        .expect_err("raw parent identity cannot be returned as ObjectRef");
-
-    assert!(error.to_string().contains("11 65535"));
-}
-
-#[test]
-fn top_level_field_handle_preserves_an_unprojectable_raw_parent_identity() {
-    let mut pdf = open(doc(vec![(10, "<< /FT /Tx >>".into())]));
-    let raw_ref = ObjectRef::new(11, 65_535);
-    pdf.replace_object(
-        raw_ref,
-        ObjectHandle::dictionary(vec![(
-            b"/T".to_vec(),
-            ObjectHandle::string(b"top".to_vec()),
-        )]),
-    )
-    .unwrap();
-    let field = pdf.get_object_handle(ObjectRef::new(10, 0));
-    field.try_is_scalar().unwrap();
-    field
-        .replace_key(b"/Parent", pdf.get_object_handle(raw_ref))
-        .unwrap();
-
-    let (top_level, is_different) = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
-        .get_top_level_field_handle()
-        .expect("qpdf's top-level helper returns the raw live handle");
+    let (top_level, is_different): (flpdf::ObjectHandle, bool) =
+        FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+            .get_top_level_field()
+            .expect("qpdf's top-level helper returns the raw live handle");
 
     assert!(is_different);
     assert!(top_level.object_ref().is_none());
@@ -326,7 +302,7 @@ fn fully_qualified_name_terminates_on_a_reciprocal_direct_parent_cycle() {
 
     let mut field = FormFieldObjectHelper::new(field_ref, &mut pdf);
     let error = field
-        .get_top_level_field_handle()
+        .get_top_level_field()
         .expect_err("the canonical top-level walk must bound direct cycles");
     assert!(matches!(error, Error::Unsupported(ref message)
         if message.contains("/Parent cycle of direct dictionaries")));
@@ -773,10 +749,9 @@ fn exposes_remaining_qpdf_read_and_traversal_accessors() {
 
     assert!(!field.is_null().unwrap());
     assert_eq!(field.parent().unwrap(), Some(ObjectRef::new(11, 0)));
-    assert_eq!(
-        field.get_top_level_field().unwrap(),
-        (ObjectRef::new(12, 0), true)
-    );
+    let (top_level, is_different) = field.get_top_level_field().unwrap();
+    assert_eq!(top_level.object_ref(), Some(ObjectRef::new(12, 0)));
+    assert!(is_different);
     assert_eq!(
         field
             .inheritable_value(b"CustomString")
@@ -821,14 +796,8 @@ fn get_top_level_field_stops_when_a_parent_chain_returns_to_a_seen_handle() {
     ]);
     let mut pdf = open(bytes);
 
-    assert_eq!(
-        FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
-            .get_top_level_field()
-            .unwrap(),
-        (ObjectRef::new(10, 0), true)
-    );
     let (top, is_different) = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
-        .get_top_level_field_handle()
+        .get_top_level_field()
         .unwrap();
     assert_eq!(top.object_ref(), Some(ObjectRef::new(10, 0)));
     assert!(is_different);
@@ -1715,10 +1684,11 @@ fn get_top_level_field_has_no_depth_limit_and_reaches_the_terminal_value() {
     objects.push((112, "(value)".into()));
     let mut pdf = open(doc(objects));
 
-    let top_level = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+    let (top_level, is_different) = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
         .get_top_level_field()
         .expect("a long acyclic indirect /Parent chain must resolve, not error");
-    assert_eq!(top_level, (ObjectRef::new(111, 0), true));
+    assert_eq!(top_level.object_ref(), Some(ObjectRef::new(111, 0)));
+    assert!(is_different);
 
     let field_value_reference = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
         .field_value_reference()
@@ -2191,29 +2161,29 @@ fn get_top_level_field_stops_before_a_parent_that_resolves_to_null() {
     ]);
     let mut pdf = open(bytes);
 
-    assert_eq!(
-        FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
-            .get_top_level_field()
-            .unwrap(),
-        (ObjectRef::new(10, 0), false)
-    );
+    let (top_level, is_different) = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .get_top_level_field()
+        .unwrap();
+    assert_eq!(top_level.object_ref(), Some(ObjectRef::new(10, 0)));
+    assert!(!is_different);
 }
 
 #[test]
-fn get_top_level_field_stops_at_a_direct_parent_since_only_indirect_can_be_reported() {
-    // `get_top_level_field` returns an `ObjectRef`, which cannot represent a
-    // direct dictionary, so a `/Parent` value that resolves to a direct
-    // dictionary (rather than an indirect reference) stops the climb at the
-    // last indirect ancestor instead of erroring or continuing into it.
+fn get_top_level_field_returns_a_direct_parent_handle() {
+    // qpdf returns a QPDFFormFieldObjectHelper for the direct `/Parent`
+    // dictionary too; the handle must not be narrowed to ObjectRef.
     let bytes = doc(vec![(10, "<< /Parent << /T (a) >> >>".into())]);
     let mut pdf = open(bytes);
 
+    let (top_level, is_different) = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .get_top_level_field()
+        .unwrap();
+    assert!(top_level.object_ref().is_none());
     assert_eq!(
-        FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
-            .get_top_level_field()
-            .unwrap(),
-        (ObjectRef::new(10, 0), false)
+        top_level.try_get_key(b"/T").unwrap().as_string(),
+        Some(b"a".to_vec())
     );
+    assert!(is_different);
 }
 
 #[test]
