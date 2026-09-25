@@ -6,6 +6,9 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ShellCommand, Output};
 
+#[path = "support/eol.rs"]
+mod eol;
+
 const EXPECTED_QPDF_VERSION: &str = "qpdf version 11.9.0";
 const ORPHAN_MARKER: &[u8] = b"ORPHAN-PAGE";
 
@@ -147,7 +150,8 @@ fn orphan_body_page_is_not_promoted_into_the_catalog_page_tree() {
     let qpdf_npages = run_qpdf(&show_npages_args(&input));
     let flpdf_npages = run_flpdf(&show_npages_args(&input));
     assert_command_pair("show-npages", &qpdf_npages, &flpdf_npages);
-    assert_eq!(qpdf_npages.stdout, b"1\n");
+    let expected_npages = format!("1{}", eol::EOL);
+    assert_eq!(qpdf_npages.stdout, expected_npages.as_bytes());
     assert_page_list_has_one_reachable_page(&input, Some("3 0 R"));
 
     let directory = tempfile::tempdir().expect("temporary output directory");
