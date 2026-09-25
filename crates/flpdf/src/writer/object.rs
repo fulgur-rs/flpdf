@@ -873,6 +873,9 @@ thread_local! {
 struct UnparseWalkDepthGuard;
 
 impl UnparseWalkDepthGuard {
+    #[deprecated(
+        note = "no qpdf counterpart; QPDFWriter::unparseObject has no upper nesting limit"
+    )]
     fn enter() -> Result<Self> {
         let depth = UNPARSE_WALK_DEPTH.with(|depth| {
             let entered = depth.get();
@@ -904,6 +907,7 @@ impl Drop for UnparseWalkDepthGuard {
 /// Every hub in the family routes its body through here, so a direct
 /// container graph that never reaches an indirect boundary is rejected at
 /// the same depth wherever it is met.
+#[allow(deprecated)]
 fn unparse_object_walk_hub<T>(body: impl FnOnce() -> Result<T>) -> Result<T> {
     let _depth = UnparseWalkDepthGuard::enter()?;
     stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, body)

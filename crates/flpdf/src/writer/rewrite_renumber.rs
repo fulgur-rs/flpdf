@@ -327,6 +327,7 @@ fn collect_canonical_children_with_linearized_omission<R: Read + Seek>(
     found: &mut Vec<ObjectRef>,
     stream_parameter_omission: LinearizedStreamParameterOmission<'_>,
 ) -> crate::Result<()> {
+    // qpdf-deviation: QPDFWriter::enqueueObject recursively visits direct containers without this MAX_PARSE_DEPTH rejection.
     if depth > MAX_PARSE_DEPTH {
         return Err(Error::Unsupported(
             "plain rewrite: inline object nesting exceeds MAX_PARSE_DEPTH during canonical enqueue collection"
@@ -609,6 +610,7 @@ fn walk_resurrectable_handle(
     edge_context: bool,
     state: &mut ResurrectableWalkState<'_>,
 ) -> crate::Result<()> {
+    // qpdf-deviation: qpdf writer traversal has no MAX_PARSE_DEPTH rejection for nested direct values.
     if depth > MAX_PARSE_DEPTH {
         return Err(Error::Unsupported(
             "linearization: inline nesting exceeds MAX_PARSE_DEPTH during resurrectable walk"

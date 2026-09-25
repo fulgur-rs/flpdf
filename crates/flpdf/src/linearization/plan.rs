@@ -229,6 +229,7 @@ fn collect_direct_handle_refs(
     depth: usize,
     out: &mut Vec<ObjectRef>,
 ) -> Result<()> {
+    // qpdf-deviation: the qpdf writer's direct-container traversal has no MAX_PARSE_DEPTH cap.
     if depth > MAX_PARSE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
             "linearization plan: inline object nesting exceeds maximum of {MAX_PARSE_DEPTH}"
@@ -268,6 +269,7 @@ fn collect_direct_handle_refs_with_context(
     in_array: bool,
     out: &mut Vec<(ObjectRef, bool)>,
 ) -> Result<()> {
+    // qpdf-deviation: qpdf linearization object-graph traversal has no MAX_PARSE_DEPTH cap for inline containers.
     if depth > MAX_PARSE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
             "linearization plan: inline object nesting exceeds maximum of {MAX_PARSE_DEPTH}"
@@ -294,6 +296,7 @@ fn collect_direct_handle_refs_with_stream_parameters_context(
     out: &mut Vec<(ObjectRef, bool)>,
     skipped_stream_parameter_streams: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
+    // qpdf-deviation: qpdf linearization object-graph traversal has no MAX_PARSE_DEPTH cap for inline containers.
     if depth > MAX_PARSE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
             "linearization plan: inline object nesting exceeds maximum of {MAX_PARSE_DEPTH}"

@@ -464,6 +464,7 @@ impl Optimization {
         }];
 
         while let Some(pending) = stack.pop() {
+            // qpdf-deviation: QPDF::getCompressibleObjGens uses an explicit work queue without a MAX_PARSE_DEPTH cap.
             if pending.inline_depth > MAX_PARSE_DEPTH {
                 return Err(crate::Error::Unsupported(format!(
                     "optimization: inline object nesting exceeds maximum of {MAX_PARSE_DEPTH}"

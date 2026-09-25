@@ -245,5 +245,122 @@ class CheckTests(unittest.TestCase):
             self.assertEqual(0, code)
 
 
+class MaxParseDepthDeviationInventoryTests(unittest.TestCase):
+    """Keep the qpdf-less depth-limit inventory machine checked."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.repo_root = SCRIPT_PATH.parents[1]
+
+    def source(self, relative_path):
+        return (self.repo_root / relative_path).read_text()
+
+    def function_chunk(self, relative_path, signature):
+        source = self.source(relative_path)
+        start = source.index(signature)
+        endings = [
+            position
+            for token in ("\nfn ", "\n    fn ")
+            if (position := source.find(token, start + len(signature))) >= 0
+        ]
+        end = min(endings) if endings else len(source)
+        return source[start:end]
+
+    def test_qpdf_less_depth_branches_have_single_line_deviation_markers(self):
+        guards = [
+            (
+                "crates/flpdf/src/writer/rewrite_renumber.rs",
+                "fn collect_canonical_children_with_linearized_omission<",
+                "if depth > MAX_PARSE_DEPTH",
+            ),
+            (
+                "crates/flpdf/src/writer/rewrite_renumber.rs",
+                "fn walk_resurrectable_handle(",
+                "if depth > MAX_PARSE_DEPTH",
+            ),
+            (
+                "crates/flpdf/src/writer/plain/body.rs",
+                "fn collect_live_seed_handles(",
+                "if depth > crate::parser::MAX_PARSE_DEPTH",
+            ),
+            (
+                "crates/flpdf/src/writer/plain/body.rs",
+                "fn collect_live_child_handles(",
+                "if depth > crate::parser::MAX_PARSE_DEPTH",
+            ),
+            (
+                "crates/flpdf/src/optimization.rs",
+                "fn update_object_maps<R, F>(",
+                "if pending.inline_depth > MAX_PARSE_DEPTH",
+            ),
+            (
+                "crates/flpdf/src/linearization/plan.rs",
+                "fn collect_direct_handle_refs(",
+                "if depth > MAX_PARSE_DEPTH",
+            ),
+            (
+                "crates/flpdf/src/linearization/plan.rs",
+                "fn collect_direct_handle_refs_with_context(",
+                "if depth > MAX_PARSE_DEPTH",
+            ),
+            (
+                "crates/flpdf/src/linearization/plan.rs",
+                "fn collect_direct_handle_refs_with_stream_parameters_context(",
+                "if depth > MAX_PARSE_DEPTH",
+            ),
+            (
+                "crates/flpdf/src/object_handle.rs",
+                "fn write_handle(\n        &mut self,",
+                "if depth > crate::parser::MAX_PARSE_DEPTH",
+            ),
+        ]
+        for path, signature, guard in guards:
+            with self.subTest(path=path, signature=signature):
+                chunk = self.function_chunk(path, signature)
+                lines = chunk.splitlines()
+                guard_index = next(
+                    (index for index, line in enumerate(lines) if guard in line),
+                    None,
+                )
+                self.assertIsNotNone(guard_index, f"missing guard {guard}")
+                assert guard_index is not None
+                self.assertIn(
+                    "// qpdf-deviation:",
+                    lines[guard_index - 1].strip(),
+                    f"{path}: {guard} must carry a qpdf deviation marker",
+                )
+
+    def test_isolated_depth_guard_helpers_are_deprecated(self):
+        helpers = [
+            ("crates/flpdf/src/writer/object.rs", "UnparseWalkDepthGuard"),
+            ("crates/flpdf/src/writer/plain/body.rs", "ContentEmitWalkDepthGuard"),
+            ("crates/flpdf/src/object_handle.rs", "DirectGraphWalkDepthGuard"),
+        ]
+        for path, helper in helpers:
+            with self.subTest(path=path, helper=helper):
+                lines = self.source(path).splitlines()
+                struct_line = next(
+                    index
+                    for index, line in enumerate(lines)
+                    if line.strip() == f"struct {helper};"
+                )
+                enter_line = next(
+                    index
+                    for index in range(struct_line + 1, len(lines))
+                    if "fn enter()" in lines[index]
+                )
+                prefix = "\n".join(lines[max(0, enter_line - 5) : enter_line])
+                self.assertIn("#[deprecated(", prefix)
+                self.assertIn("no qpdf counterpart", prefix)
+
+    def test_pdf_parser_depth_limit_is_not_marked_as_a_deviation(self):
+        chunk = self.function_chunk(
+            "crates/flpdf/src/parser.rs",
+            "fn push_frame(&mut self, frames: &mut Vec<LiveFrame>, token: LiveToken)",
+        )
+        self.assertIn("frames.len() >= MAX_PARSE_DEPTH", chunk)
+        self.assertNotIn("qpdf-deviation", chunk)
+
+
 if __name__ == "__main__":
     unittest.main()
