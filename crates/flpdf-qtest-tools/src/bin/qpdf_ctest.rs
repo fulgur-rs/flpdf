@@ -982,7 +982,7 @@ mod tests {
         if active_code_page != CP_UTF8 {
             assert_ne!(
                 actual,
-                password.to_string_lossy().into_bytes(),
+                password.to_string_lossy().into_owned().into_bytes(),
                 "non-UTF-8 ACP argv bytes must not be replaced with lossy UTF-8"
             );
         }
