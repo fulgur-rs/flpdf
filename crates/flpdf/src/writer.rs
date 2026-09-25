@@ -5326,9 +5326,9 @@ mod final_handle_writer_tests {
             .expect("Catalog")
             .try_get_key(b"/Pages")
             .expect("page tree");
-        let raw_page_ref = ObjectRef::new(17, 65_535);
-        let raw_contents_ref = ObjectRef::new(18, 65_535);
-        let raw_contents = pdf.get_object_handle_by_raw_identity(18, 65_535);
+        let raw_page_ref = ObjectRef::new(5, 65_535);
+        let raw_contents_ref = ObjectRef::new(6, 65_535);
+        let raw_contents = pdf.get_object_handle_by_raw_identity(6, 65_535);
         pdf.replace_object(
             raw_contents_ref,
             ObjectHandle::stream(
@@ -5337,7 +5337,7 @@ mod final_handle_writer_tests {
             ),
         )
         .expect("install raw content stream");
-        let raw_page = pdf.get_object_handle_by_raw_identity(17, 65_535);
+        let raw_page = pdf.get_object_handle_by_raw_identity(5, 65_535);
         pdf.replace_object(
             raw_page_ref,
             ObjectHandle::dictionary(vec![
@@ -5372,8 +5372,8 @@ mod final_handle_writer_tests {
         let streams = initialize_special_streams(&mut pdf, &options)
             .expect("writer setup must preserve raw identity")
             .expect("QDF creates the special-stream snapshot");
-        let page_gen = QpdfObjGen::new(17, 65_535);
-        let content_gen = QpdfObjGen::new(18, 65_535);
+        let page_gen = QpdfObjGen::new(5, 65_535);
+        let content_gen = QpdfObjGen::new(6, 65_535);
         assert_eq!(streams.pages, vec![page_gen]);
         assert_eq!(streams.page_seq.get(&page_gen), Some(&1));
         assert_eq!(streams.contents_seq.get(&content_gen), Some(&1));
