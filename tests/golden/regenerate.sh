@@ -90,6 +90,11 @@ else
     echo "Skipping compressed-metadata.pdf (already exists)"
 fi
 
+if [[ ! -f "$FIX/pdfa-1b.pdf" || ! -f "$FIX/pdfa-2b.pdf" || ! -f "$FIX/pdfa-3b.pdf" ]]; then
+    echo "Generating synthetic PDF/A preservation fixtures ..."
+    python3 "$ROOT/scripts/generate-pdfa-preservation-fixtures.py" "$FIX"
+fi
+
 if [[ ! -f "$FIX/encrypted-r4-three-page.pdf" ]]; then
     echo "Generating encrypted-r4-three-page.pdf ..."
     qpdf --encrypt "" "" 128 --use-aes=y -- --warning-exit-0 \
@@ -2309,6 +2314,9 @@ mkdir -p \
     "$REF/linearized-two-page" \
     "$REF/linearized-two-stream-overflow" \
     "$REF/compressed-metadata" \
+    "$REF/pdfa-1b" \
+    "$REF/pdfa-2b" \
+    "$REF/pdfa-3b" \
     "$REF/encrypted-r4-three-page" \
     "$REF/encrypted-recovered-eol" \
     "$REF/attachment-two-page" \
@@ -2451,6 +2459,16 @@ qpdf --static-id --warning-exit-0 \
     "$FIX/compressed-metadata.pdf" "$REF/compressed-metadata/static-id.pdf"
 echo "compressed-metadata/static-id.pdf"
 qpdf --check "$REF/compressed-metadata/static-id.pdf"
+
+# Synthetic PDF/A preservation fixtures exercise reachable catalog/structure
+# graphs and stream policy; they do not validate PDF/A conformance.
+for part in 1 2 3; do
+    stem="pdfa-${part}b"
+    qpdf --static-id --warning-exit-0 \
+        "$FIX/${stem}.pdf" "$REF/${stem}/static-id.pdf"
+    echo "${stem}/static-id.pdf"
+    qpdf --check "$REF/${stem}/static-id.pdf"
+done
 
 qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/one-page.pdf" "$REF/one-page/linearize.pdf"
