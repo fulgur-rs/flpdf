@@ -18,19 +18,29 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn require_qpdf() {
-    let output = ShellCommand::new("qpdf")
+fn qpdf_available() -> bool {
+    ShellCommand::new("qpdf")
         .arg("--version")
         .output()
-        .expect("qpdf 11.9.0 must be installed for page-tree parity tests");
-    assert!(output.status.success(), "qpdf --version failed");
-    let version = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_owned();
-    assert_eq!(version, EXPECTED_QPDF_VERSION);
+        .map(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.trim() == EXPECTED_QPDF_VERSION)
+        })
+        .unwrap_or(false)
+}
+
+fn require_qpdf() -> bool {
+    if qpdf_available() {
+        return true;
+    }
+    if std::env::var_os("CI").is_some() {
+        panic!("qpdf 11.9.0 is required for page-tree orphan parity tests");
+    }
+    eprintln!("skipping: qpdf 11.9.0 is not available");
+    false
 }
 
 fn run_qpdf(args: &[String]) -> Output {
@@ -142,7 +152,9 @@ fn assert_output_pair(label: &str, qpdf_path: &Path, flpdf_path: &Path) {
 
 #[test]
 fn orphan_body_page_is_not_promoted_into_the_catalog_page_tree() {
-    require_qpdf();
+    if !require_qpdf() {
+        return;
+    }
     let input = fixture("page-tree-orphan.pdf");
     assert!(input.is_file(), "missing page-tree fixture: {input:?}");
     qpdf_check(&input);
