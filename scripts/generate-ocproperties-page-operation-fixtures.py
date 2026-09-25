@@ -84,8 +84,15 @@ def secondary_page_graph() -> bytes:
             + form
             + b"endstream"
         ),
-        10: b"<< /Type /OCMD /OCGs [6 0 R] /VE [/And 6 0 R [/Not 6 0 R]] >>",
-        11: b"<< /Type /OCMD /OCGs [6 0 R] /VE [/Not 6 0 R] >>",
+        10: (
+            b"<< /Type /OCMD /OCGs [6 0 R] /VE "
+            b"[/And 6 0 R [/Not 6 0 R] "
+            b"<< /Tag (opaque annotation metadata) /Ref 6 0 R >>] >>"
+        ),
+        11: (
+            b"<< /Type /OCMD /VE << /Operator /Not /Operand 6 0 R "
+            b"/Metadata << /Tag (opaque Form metadata) /Ref 6 0 R >> >> >>"
+        ),
         12: b"<< /Producer (flpdf optional-content fixture generator) >>",
     }
     return make_pdf(objects, info_object=12)

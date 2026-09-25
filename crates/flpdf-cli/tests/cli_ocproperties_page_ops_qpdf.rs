@@ -242,15 +242,23 @@ fn assert_secondary_page_graph(json: &Value) {
     assert_eq!(annotation_ve[1], *secondary_ocg_ref);
     assert_eq!(annotation_ve[2][0], "/Not");
     assert_eq!(annotation_ve[2][1], *secondary_ocg_ref);
+    let annotation_ve_metadata = value_for_reference(objects, &annotation_ve[3]);
+    assert_eq!(
+        annotation_ve_metadata["/Tag"],
+        "u:opaque annotation metadata"
+    );
+    assert_eq!(annotation_ve_metadata["/Ref"], *secondary_ocg_ref);
 
     let xobjects = value_for_reference(objects, &resources["/XObject"]);
     let form_entry = object_entry(objects, &xobjects["/Fm"]);
     let form_dict = &form_entry["stream"]["dict"];
     let form_ocmd = value_for_reference(objects, &form_dict["/OC"]);
     assert_eq!(form_ocmd["/Type"], "/OCMD");
-    let form_ve = form_ocmd["/VE"].as_array().expect("Form /VE");
-    assert_eq!(form_ve[0], "/Not");
-    assert_eq!(form_ve[1], *secondary_ocg_ref);
+    let form_ve = value_for_reference(objects, &form_ocmd["/VE"]);
+    assert_eq!(form_ve["/Operator"], "/Not");
+    assert_eq!(form_ve["/Operand"], *secondary_ocg_ref);
+    assert_eq!(form_ve["/Metadata"]["/Tag"], "u:opaque Form metadata");
+    assert_eq!(form_ve["/Metadata"]["/Ref"], *secondary_ocg_ref);
     assert_eq!(
         form_entry["stream"]["data"], SECONDARY_FORM_BASE64,
         "Form-XObject stream bytes remain in the selected page graph"
