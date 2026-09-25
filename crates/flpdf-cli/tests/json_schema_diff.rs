@@ -9,7 +9,8 @@ mod support;
 use std::path::{Path, PathBuf};
 
 use support::json_diff::{
-    compute_matrix, run_flpdf_json, run_qpdf_json, Allowlist, FixtureResult, Report,
+    compute_matrix, run_flpdf_json_with_expected_exit_code, run_qpdf_json_with_expected_exit_code,
+    Allowlist, FixtureResult, Report,
 };
 
 struct FixtureSpec {
@@ -17,6 +18,7 @@ struct FixtureSpec {
     relative_path: &'static str,
     password: Option<&'static str>,
     compared_top_level_key: Option<&'static str>,
+    expected_exit_code: i32,
 }
 
 fn project_top_level_key(value: serde_json::Value, key: Option<&str>) -> serde_json::Value {
@@ -38,54 +40,132 @@ const CORPUS: &[FixtureSpec] = &[
         relative_path: "json-diff/direct-outlines.pdf",
         password: None,
         compared_top_level_key: Some("outlines"),
+        expected_exit_code: 0,
     },
     FixtureSpec {
         label: "minimal.pdf",
         relative_path: "minimal.pdf",
         password: None,
         compared_top_level_key: None,
+        expected_exit_code: 0,
     },
     FixtureSpec {
         label: "compat/one-page.pdf",
         relative_path: "compat/one-page.pdf",
         password: None,
         compared_top_level_key: None,
+        expected_exit_code: 0,
     },
     FixtureSpec {
         label: "compat/two-page.pdf",
         relative_path: "compat/two-page.pdf",
         password: None,
         compared_top_level_key: None,
+        expected_exit_code: 0,
     },
     FixtureSpec {
         label: "compat/three-page.pdf",
         relative_path: "compat/three-page.pdf",
         password: None,
         compared_top_level_key: None,
+        expected_exit_code: 0,
     },
     FixtureSpec {
         label: "compat/linearized-one-page.pdf",
         relative_path: "compat/linearized-one-page.pdf",
         password: None,
         compared_top_level_key: None,
+        expected_exit_code: 0,
     },
     FixtureSpec {
         label: "compat/attachment-two-page.pdf",
         relative_path: "compat/attachment-two-page.pdf",
         password: None,
         compared_top_level_key: None,
+        expected_exit_code: 0,
     },
     FixtureSpec {
         label: "compat/multi-contents-one-page.pdf",
         relative_path: "compat/multi-contents-one-page.pdf",
         password: None,
         compared_top_level_key: None,
+        expected_exit_code: 0,
     },
     FixtureSpec {
         label: "compat/unref-resources-one-page.pdf",
         relative_path: "compat/unref-resources-one-page.pdf",
         password: None,
         compared_top_level_key: None,
+        expected_exit_code: 0,
+    },
+    // AcroForm JSON schema: widget-level projection, field defaults, and
+    // annotation appearance/resource shapes.
+    FixtureSpec {
+        label: "compat/form-fields-and-annotations.pdf",
+        relative_path: "compat/form-fields-and-annotations.pdf",
+        password: None,
+        compared_top_level_key: Some("acroform"),
+        expected_exit_code: 0,
+    },
+    FixtureSpec {
+        label: "compat/form-fields-and-annotations-with-defaults.pdf",
+        relative_path: "compat/form-fields-and-annotations-with-defaults.pdf",
+        password: None,
+        compared_top_level_key: Some("acroform"),
+        expected_exit_code: 0,
+    },
+    FixtureSpec {
+        label: "compat/form-fields-and-annotations-p-and-inline.pdf",
+        relative_path: "compat/form-fields-and-annotations-p-and-inline.pdf",
+        password: None,
+        compared_top_level_key: Some("acroform"),
+        expected_exit_code: 0,
+    },
+    FixtureSpec {
+        label: "compat/form-fields-and-annotations-direct-dr.pdf",
+        relative_path: "compat/form-fields-and-annotations-direct-dr.pdf",
+        password: None,
+        compared_top_level_key: Some("acroform"),
+        expected_exit_code: 0,
+    },
+    // Both tools return exit 3 for this orphaned Widget while still emitting
+    // JSON; compare the AcroForm section while checking that status explicitly.
+    FixtureSpec {
+        label: "compat/acroform-sig-orphan-widget.pdf",
+        relative_path: "compat/acroform-sig-orphan-widget.pdf",
+        password: None,
+        compared_top_level_key: Some("acroform"),
+        expected_exit_code: 3,
+    },
+    // Multi-page and ObjStm-backed widget placements exercise pageposfrom1
+    // and widget ordering beyond the one-page forms above.
+    FixtureSpec {
+        label: "compat/objstm-lin-acroform-widget-page1-page2.pdf",
+        relative_path: "compat/objstm-lin-acroform-widget-page1-page2.pdf",
+        password: None,
+        compared_top_level_key: Some("acroform"),
+        expected_exit_code: 0,
+    },
+    FixtureSpec {
+        label: "compat/objstm-lin-acroform-widget-ap-stream-page0.pdf",
+        relative_path: "compat/objstm-lin-acroform-widget-ap-stream-page0.pdf",
+        password: None,
+        compared_top_level_key: Some("acroform"),
+        expected_exit_code: 0,
+    },
+    FixtureSpec {
+        label: "compat/objstm-lin-acroform-widget-page1-only.pdf",
+        relative_path: "compat/objstm-lin-acroform-widget-page1-only.pdf",
+        password: None,
+        compared_top_level_key: Some("acroform"),
+        expected_exit_code: 0,
+    },
+    FixtureSpec {
+        label: "compat/objstm-lin-acroform-widget-page0-5-10.pdf",
+        relative_path: "compat/objstm-lin-acroform-widget-page0-5-10.pdf",
+        password: None,
+        compared_top_level_key: Some("acroform"),
+        expected_exit_code: 0,
     },
     // qdf-fix/qdf-golden/qdf-roundtrip: QDF-form PDFs (qpdf's debug output
     // format, re-parsed as PDFs). Cover diverse content trees and xref shapes.
@@ -94,18 +174,21 @@ const CORPUS: &[FixtureSpec] = &[
         relative_path: "qdf-fix/one-page-clean.qdf",
         password: None,
         compared_top_level_key: None,
+        expected_exit_code: 0,
     },
     FixtureSpec {
         label: "qdf-golden/minimal.qdf",
         relative_path: "qdf-golden/minimal.qdf",
         password: None,
         compared_top_level_key: None,
+        expected_exit_code: 0,
     },
     FixtureSpec {
         label: "qdf-roundtrip/three-page-clean.qdf",
         relative_path: "qdf-roundtrip/three-page-clean.qdf",
         password: None,
         compared_top_level_key: None,
+        expected_exit_code: 0,
     },
     // SKIP: qdf-roundtrip/three-page-edited-payload.qdf — intentionally damaged
     // (qpdf reconstructs xref with warnings, flpdf rejects with "parse error
@@ -121,12 +204,14 @@ const CORPUS: &[FixtureSpec] = &[
         relative_path: "encrypted/v4-aes-128-r4.pdf",
         password: Some("user-v4-aes"),
         compared_top_level_key: None,
+        expected_exit_code: 0,
     },
     FixtureSpec {
         label: "encrypted/v5-aes-256-r6.pdf",
         relative_path: "encrypted/v5-aes-256-r6.pdf",
         password: Some("user-v5-r6"),
         compared_top_level_key: None,
+        expected_exit_code: 0,
     },
 ];
 
@@ -170,8 +255,10 @@ fn json_schema_diff_corpus() {
     let mut fixtures = Vec::new();
     for spec in CORPUS {
         let path = root.join(spec.relative_path);
-        let qpdf_out = run_qpdf_json(&path, spec.password);
-        let flpdf_out = run_flpdf_json(&path, spec.password);
+        let qpdf_out =
+            run_qpdf_json_with_expected_exit_code(&path, spec.password, spec.expected_exit_code);
+        let flpdf_out =
+            run_flpdf_json_with_expected_exit_code(&path, spec.password, spec.expected_exit_code);
 
         let (cells, qpdf_error, flpdf_error) = match (qpdf_out, flpdf_out) {
             (Ok(qv), Ok(fv)) => {
