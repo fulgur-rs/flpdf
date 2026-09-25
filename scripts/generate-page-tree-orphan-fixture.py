@@ -10,8 +10,10 @@ def page_tree_orphan() -> bytes:
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 5 0 R >>",
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
-        b"/Marker (ORPHAN-PAGE) >>",
+        (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+            + b"/Marker (ORPHAN-PAGE) >>"
+        ),
         b"<< /Length 0 >>\nstream\n\nendstream",
     ]
     pdf = bytearray(b"%PDF-1.7\n")
