@@ -2308,6 +2308,20 @@ mod tests {
         assert!(out.contains("group length: 30\n"));
     }
 
+    #[test]
+    fn committed_relinearization_overflow_fixture_matches_split_hint_builder() {
+        let committed = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/compat/linearized-two-stream-overflow.pdf"),
+        )
+        .expect("committed two-stream overflow fixture");
+        assert_eq!(
+            committed,
+            split_overflow_pdf_bytes(),
+            "the golden-test input must retain distinct primary and overflow hint objects"
+        );
+    }
+
     /// A corrupted overflow stream must still be reported, not silently
     /// ignored — the merge in `show_with_pdf` propagates a genuine decode
     /// failure from the overflow `load_hint_stream` call exactly like it
