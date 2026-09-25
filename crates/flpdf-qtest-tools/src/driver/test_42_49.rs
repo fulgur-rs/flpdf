@@ -481,8 +481,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
             writeln!(stdout)?;
 
             let subtype = {
-                let mut annotation_helper =
-                    AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
+                let mut annotation_helper = AnnotationObjectHelper::new(annotation.clone());
                 annotation_helper.get_subtype()?
             };
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -491,8 +490,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
             writeln!(stdout)?;
 
             let rect = {
-                let mut annotation_helper =
-                    AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
+                let mut annotation_helper = AnnotationObjectHelper::new(annotation.clone());
                 annotation_helper.get_rect()?
             };
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -503,8 +501,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
             )?;
 
             let state = {
-                let mut annotation_helper =
-                    AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
+                let mut annotation_helper = AnnotationObjectHelper::new(annotation.clone());
                 annotation_helper.get_appearance_state()?
             };
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -515,8 +512,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
             }
 
             let normal_appearance = {
-                let mut annotation_helper =
-                    AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
+                let mut annotation_helper = AnnotationObjectHelper::new(annotation.clone());
                 annotation_helper.get_appearance_stream(b"N", None)?
             };
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -525,8 +521,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
             writeln!(stdout)?;
 
             let state_appearance = {
-                let mut annotation_helper =
-                    AnnotationObjectHelper::from_object_handle(annotation, pdf);
+                let mut annotation_helper = AnnotationObjectHelper::new(annotation);
                 annotation_helper.get_appearance_stream(b"N", Some(b"3"))?
             };
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;

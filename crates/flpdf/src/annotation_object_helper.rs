@@ -2,13 +2,10 @@
 //!
 //! qpdf correspondence: `QPDFAnnotationObjectHelper.cc`.
 //!
-//! [`AnnotationObjectHelper`] wraps an annotation [`ObjectRef`] together with
-//! a `&mut Pdf<R>` and exposes typed, fail-soft read-only accessors for the
-//! common annotation attributes, mirroring qpdf's own transparently
-//! dereferencing `QPDFObjectHandle` API on top of this crate's
-//! [`ObjectHandle`], which resolves each handle at the qpdf accessor boundary — see
-//! [`crate::form_field_object_helper::FormFieldObjectHelper`] for the same
-//! established shape.
+//! [`AnnotationObjectHelper`] wraps one annotation [`ObjectHandle`] and
+//! exposes typed, fail-soft read-only accessors for common annotation
+//! attributes. Each accessor resolves through the handle at the qpdf
+//! `QPDFObjectHandle` boundary.
 //!
 //! # Design
 //!
@@ -38,10 +35,10 @@
 //! let page_refs = pages::page_refs(&mut pdf)?;
 //! if let Some(&page_ref) = page_refs.first() {
 //!     let mut page_helper = PageObjectHelper::new(page_ref, &mut pdf);
-//!     let annot_refs = page_helper.get_annotations()?;
+//!     let annot_handles = page_helper.get_annotation_handles(None)?;
 //!     drop(page_helper);
-//!     for annot_ref in annot_refs {
-//!         let mut annot = AnnotationObjectHelper::new(annot_ref, &mut pdf);
+//!     for annot_handle in annot_handles {
+//!         let mut annot = AnnotationObjectHelper::new(annot_handle);
 //!         let subtype = annot.get_subtype()?;
 //!         println!("annotation subtype: {}", String::from_utf8_lossy(&subtype));
 //!         let rect = annot.get_rect()?;
@@ -53,8 +50,7 @@
 
 use crate::object_handle::ObjectHandle;
 use crate::page_object_helper::PageBox;
-use crate::{Matrix, ObjectRef, Pdf, Rectangle, Result};
-use std::io::{Read, Seek};
+use crate::{Matrix, Rectangle, Result};
 
 // ---------------------------------------------------------------------------
 // AnnotationObjectHelper
@@ -62,26 +58,15 @@ use std::io::{Read, Seek};
 
 /// Typed read-only accessor helper for a PDF annotation dictionary.
 ///
-/// Construct with [`AnnotationObjectHelper::new`], passing the [`ObjectRef`]
-/// of any annotation dictionary (e.g. one retrieved from
-/// [`crate::PageObjectHelper::get_annotations`]) and a mutable borrow of the
-/// open document.
+/// Construct with [`AnnotationObjectHelper::new`], passing a canonical
+/// annotation [`ObjectHandle`] (for example one returned by
+/// [`crate::PageObjectHelper::get_annotation_handles`]).
 ///
 /// All accessors are **leaf-only**: they read only the annotation dictionary
 /// itself, consistent with ISO 32000-1 §12.5 which specifies that annotation
 /// attributes are not inheritable.
-pub struct AnnotationObjectHelper<'a, R: Read + Seek + 'static> {
+pub struct AnnotationObjectHelper {
     annot: ObjectHandle,
-    // route-hygiene-allow: _pdf -- not a dead document bridge. qpdf's
-    // `QPDFAnnotationObjectHelper` derives from `QPDFObjectHelper`, whose one
-    // member is `QPDFObjectHandle oh` (`include/qpdf/QPDFObjectHelper.hh:58`);
-    // the document reaches its accessors through the handle's own owner. This
-    // field is the Rust container for that same relationship: it holds the
-    // exclusive borrow of the open document for the helper's lifetime, which is
-    // what lets every accessor take `&self` while the handles they resolve read
-    // through the document. Dropping it would leave `'a` and `R` unconstrained
-    // on a public type rather than remove a bridge.
-    _pdf: &'a mut Pdf<R>,
 }
 
 /// qpdf's `QPDFObjectHandle::getName` dummy-name sentinel
@@ -91,22 +76,14 @@ pub struct AnnotationObjectHelper<'a, R: Read + Seek + 'static> {
 /// carries.
 const QPDF_FAKE_NAME: &[u8] = b"QPDFFakeName";
 
-impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
-    /// Construct a new helper for the annotation at `annot_ref`.
+impl AnnotationObjectHelper {
+    /// Construct a helper from the canonical annotation handle.
     ///
-    /// The constructor does not resolve the object; errors are surfaced by
-    /// the individual accessor methods.
-    pub fn new(annot_ref: ObjectRef, pdf: &'a mut Pdf<R>) -> Self {
-        let annot = pdf.get_object_handle(annot_ref);
-        Self { annot, _pdf: pdf }
-    }
-
-    /// Construct a helper from the canonical annotation handle returned by
-    /// [`crate::PageObjectHelper::get_annotation_handles`]. This preserves
-    /// direct annotation dictionaries, which have no [`ObjectRef`], as qpdf's
-    /// `QPDFAnnotationObjectHelper` does.
-    pub fn from_object_handle(annot: ObjectHandle, pdf: &'a mut Pdf<R>) -> Self {
-        Self { annot, _pdf: pdf }
+    /// Passing the handle directly preserves direct annotation dictionaries,
+    /// which have no indirect object reference, and matches qpdf's
+    /// `QPDFAnnotationObjectHelper(QPDFObjectHandle)` constructor.
+    pub fn new(annot: ObjectHandle) -> Self {
+        Self { annot }
     }
 
     /// Resolve `self.annot` and return the key's resolved child handle.
@@ -147,7 +124,8 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
     /// use std::io::BufReader;
     ///
     /// let mut pdf = Pdf::open(BufReader::new(File::open("a.pdf")?))?;
-    /// let mut annot = AnnotationObjectHelper::new(ObjectRef::new(5, 0), &mut pdf);
+    /// let handle = pdf.get_object_handle(ObjectRef::new(5, 0));
+    /// let mut annot = AnnotationObjectHelper::new(handle);
     /// let subtype = annot.get_subtype()?;
     /// println!("subtype: {}", String::from_utf8_lossy(&subtype));
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -191,7 +169,8 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
     /// use std::io::BufReader;
     ///
     /// let mut pdf = Pdf::open(BufReader::new(File::open("a.pdf")?))?;
-    /// let mut annot = AnnotationObjectHelper::new(ObjectRef::new(5, 0), &mut pdf);
+    /// let handle = pdf.get_object_handle(ObjectRef::new(5, 0));
+    /// let mut annot = AnnotationObjectHelper::new(handle);
     /// let r = annot.get_rect()?;
     /// println!("[{} {} {} {}]", r.llx, r.lly, r.urx, r.ury);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -540,18 +519,14 @@ fn matrix_from_handle(handle: &ObjectHandle) -> Result<Option<Matrix>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use crate::ObjectRef;
 
     #[test]
     fn appearance_stream_propagates_unresolved_child_error() {
         let unresolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(99, 0), -1);
         let appearance = ObjectHandle::dictionary(vec![(b"/N".to_vec(), unresolved)]);
         let annot = ObjectHandle::dictionary(vec![(b"/AP".to_vec(), appearance)]);
-        let mut pdf = Pdf::<Cursor<Vec<u8>>>::empty().expect("empty PDF should be available");
-        let mut helper = AnnotationObjectHelper {
-            annot,
-            _pdf: &mut pdf,
-        };
+        let mut helper = AnnotationObjectHelper::new(annot);
 
         let error = helper
             .get_appearance_stream(b"N", None)

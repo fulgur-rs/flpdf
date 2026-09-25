@@ -50,7 +50,7 @@ fn rect_reference_not_array_returns_zero_box() {
         (11, "42".into()),
     ]);
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(10, 0)));
     assert_eq!(
         annot.get_rect().unwrap(),
         flpdf::PageBox::new(0.0, 0.0, 0.0, 0.0)
@@ -61,7 +61,7 @@ fn rect_reference_not_array_returns_zero_box() {
 fn rect_unexpected_type_returns_zero_box() {
     let bytes = doc(vec![(10, "<< /Type /Annot /Rect 42 >>".into())]);
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(10, 0)));
     assert_eq!(
         annot.get_rect().unwrap(),
         flpdf::PageBox::new(0.0, 0.0, 0.0, 0.0)
@@ -72,7 +72,7 @@ fn rect_unexpected_type_returns_zero_box() {
 fn rect_wrong_length_returns_zero_box() {
     let bytes = doc(vec![(10, "<< /Type /Annot /Rect [0 0 1] >>".into())]);
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(10, 0)));
     assert_eq!(
         annot.get_rect().unwrap(),
         flpdf::PageBox::new(0.0, 0.0, 0.0, 0.0)
@@ -83,7 +83,7 @@ fn rect_wrong_length_returns_zero_box() {
 fn rect_non_numeric_element_returns_zero_box() {
     let bytes = doc(vec![(10, "<< /Type /Annot /Rect [0 0 1 /X] >>".into())]);
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(10, 0)));
     assert_eq!(
         annot.get_rect().unwrap(),
         flpdf::PageBox::new(0.0, 0.0, 0.0, 0.0)
@@ -97,7 +97,7 @@ fn appearance_indirect_null_returns_null_handle() {
         (11, "null".into()),
     ]);
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(10, 0)));
     assert!(annot.get_appearance_dictionary().unwrap().is_null());
 }
 
@@ -110,7 +110,7 @@ fn appearance_reference_not_dict_returns_the_resolved_value_verbatim() {
         (11, "42".into()),
     ]);
     let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
+    let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(10, 0)));
     let ap = annot.get_appearance_dictionary().unwrap();
     assert_eq!(ap.as_integer(), Some(42));
 }
