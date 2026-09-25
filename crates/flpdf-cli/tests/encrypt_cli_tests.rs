@@ -102,6 +102,21 @@ fn fixture(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
 }
 
+/// Report whether `qpdf` can run, without the `CI`-required panic of
+/// [`ensure_qpdf_or_skip`].
+///
+/// Golden-backed tests already assert the qpdf 11.9.0 bytes from a committed
+/// reference, so the live comparison is an extra confirmation rather than the
+/// only oracle. A minimal CI image without `qpdf` should keep the golden
+/// assertion and skip only the live run.
+fn qpdf_available() -> bool {
+    ShellCommand::new("qpdf")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 fn ensure_qpdf_or_skip() -> bool {
     let available = ShellCommand::new("qpdf")
         .arg("--version")
@@ -2279,7 +2294,10 @@ fn encrypted_document_is_byte_identical_to_qpdf() {
         "AES-128 (V=4/AESV2): flpdf output must match the committed qpdf 11.9.0 golden"
     );
 
-    if !ensure_qpdf_or_skip() {
+    // The committed golden above is the oracle, so a CI image without qpdf
+    // still gets full byte coverage; only the live cross-check is optional.
+    if !qpdf_available() {
+        eprintln!("skipping the live qpdf cross-check: qpdf not available");
         return;
     }
 
