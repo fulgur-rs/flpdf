@@ -542,7 +542,7 @@ fn field_type_direct_on_widget() {
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
     assert_eq!(
-        field.get_field_type().expect("field_type()"),
+        field.get_field_type().expect("get_field_type()"),
         Some(b"/Tx".to_vec())
     );
 }
@@ -589,7 +589,7 @@ fn field_absent_returns_none() {
     let bytes = build_leaf_field_pdf("");
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
-    assert_eq!(field.get_field_type().expect("field_type()"), None);
+    assert_eq!(field.get_field_type().expect("get_field_type()"), None);
     assert!(field.field_value().expect("field_value()").is_none());
     assert!(field
         .field_default_value()
@@ -774,7 +774,7 @@ fn field_type_resolves_indirect_reference() {
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
     assert_eq!(
-        field.get_field_type().expect("field_type()"),
+        field.get_field_type().expect("get_field_type()"),
         Some(b"/Tx".to_vec())
     );
 }
@@ -824,7 +824,7 @@ fn field_type_indirect_null_treated_as_absent_inherits_parent() {
     let mut pdf = open(bytes);
     let mut child = FormFieldObjectHelper::new(ObjectRef::new(5, 0), &mut pdf);
     assert_eq!(
-        child.get_field_type().expect("field_type()"),
+        child.get_field_type().expect("get_field_type()"),
         Some(b"/Tx".to_vec())
     );
 }
@@ -873,7 +873,7 @@ fn field_type_inherited_from_parent() {
     // The child (5 0 R) has no /FT, so it must be read from parent (4 0 R).
     let mut child = FormFieldObjectHelper::new(ObjectRef::new(5, 0), &mut pdf);
     assert_eq!(
-        child.get_field_type().expect("field_type()"),
+        child.get_field_type().expect("get_field_type()"),
         Some(b"/Tx".to_vec())
     );
 }
@@ -937,7 +937,7 @@ fn field_type_child_overrides_parent() {
     let mut pdf = open(bytes);
     let mut child = FormFieldObjectHelper::new(ObjectRef::new(5, 0), &mut pdf);
     assert_eq!(
-        child.get_field_type().expect("field_type()"),
+        child.get_field_type().expect("get_field_type()"),
         Some(b"/Btn".to_vec())
     );
 }
@@ -965,7 +965,7 @@ fn field_cycle_guard_does_not_loop_forever() {
     // Should not loop — cycle guard returns None.
     let result = field
         .get_field_type()
-        .expect("field_type() should not error");
+        .expect("get_field_type() should not error");
     assert_eq!(result, None);
 }
 
