@@ -18,12 +18,26 @@ fn run_flpdf_named(args: &[&str], program_name: &str) -> Output {
         .unwrap()
 }
 
-fn help_sections() -> Vec<(&'static str, &'static str)> {
+fn normalize_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
+fn normalized_stdout(output: &[u8]) -> String {
+    normalize_newlines(std::str::from_utf8(output).unwrap())
+}
+
+#[test]
+fn help_golden_comparison_normalizes_windows_console_newlines() {
+    assert_eq!(normalized_stdout(b"qpdf\r\nhelp\r\n"), "qpdf\nhelp\n");
+}
+
+fn help_sections() -> Vec<(String, String)> {
+    let all_help = normalize_newlines(QPDF_HELP_ALL);
     let mut sections = Vec::new();
-    let mut active: Option<(&str, usize)> = None;
+    let mut active: Option<(String, usize)> = None;
     let mut offset = 0;
 
-    for line in QPDF_HELP_ALL.split_inclusive('\n') {
+    for line in all_help.split_inclusive('\n') {
         let line_without_newline = line.strip_suffix('\n').unwrap_or(line);
         let header = line_without_newline
             .strip_prefix("== ")
@@ -33,21 +47,21 @@ fn help_sections() -> Vec<(&'static str, &'static str)> {
         if let Some(header) = header {
             if let Some((name, body_start)) = active.take() {
                 let mut body_end = offset;
-                if QPDF_HELP_ALL[..body_end].ends_with('\n') {
+                if all_help[..body_end].ends_with('\n') {
                     body_end -= 1;
                 }
-                sections.push((name, &QPDF_HELP_ALL[body_start..body_end]));
+                sections.push((name, all_help[body_start..body_end].to_owned()));
             }
 
             let (name, _) = header.split_once(" (").unwrap();
-            active = Some((name, offset + line.len() + 1));
+            active = Some((name.to_owned(), offset + line.len() + 1));
         } else if line_without_newline == "====" {
             if let Some((name, body_start)) = active.take() {
                 let mut body_end = offset;
-                if QPDF_HELP_ALL[..body_end].ends_with('\n') {
+                if all_help[..body_end].ends_with('\n') {
                     body_end -= 1;
                 }
-                sections.push((name, &QPDF_HELP_ALL[body_start..body_end]));
+                sections.push((name, all_help[body_start..body_end].to_owned()));
             }
             break;
         }
@@ -83,7 +97,10 @@ fn bare_qpdf_help_matches_the_qpdf_11_9_top_level_golden() {
     let output = run_flpdf(&["--help"]);
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
-    assert_eq!(output.stdout, QPDF_HELP_TOP.as_bytes());
+    assert_eq!(
+        normalized_stdout(&output.stdout),
+        normalize_newlines(QPDF_HELP_TOP)
+    );
 }
 
 #[test]
@@ -101,12 +118,16 @@ fn qpdf_help_all_matches_the_qpdf_11_9_golden() {
     let output = run_flpdf(&["--help=all"]);
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
-    assert_eq!(output.stdout, QPDF_HELP_ALL.as_bytes());
+    assert_eq!(
+        normalized_stdout(&output.stdout),
+        normalize_newlines(QPDF_HELP_ALL)
+    );
 }
 
 #[test]
 fn every_qpdf_help_topic_and_option_matches_its_help_all_section() {
-    let footer = QPDF_HELP_ALL.split_once("====\n").unwrap().1;
+    let all_help = normalize_newlines(QPDF_HELP_ALL);
+    let footer = all_help.split_once("====\n").unwrap().1;
     for (name, body) in help_sections() {
         let argument = format!("--help={name}");
         let output = run_flpdf(&[&argument]);
@@ -120,8 +141,8 @@ fn every_qpdf_help_topic_and_option_matches_its_help_all_section() {
         );
         assert!(output.stderr.is_empty(), "help entry {name:?}");
         assert_eq!(
-            output.stdout,
-            expected.as_bytes(),
+            normalized_stdout(&output.stdout),
+            expected,
             "qpdf help entry {name:?} must match its all-help section"
         );
     }
