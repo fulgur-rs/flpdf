@@ -62,6 +62,9 @@ fn mark_field_node_seen(seen: &mut BTreeSet<QpdfObjGen>, current: &ObjectHandle)
 /// termination by the raw `QpdfObjGen` seen set); a direct node not yet seen is
 /// recorded and the walk continues. See the module doc for why direct nodes
 /// need this separate, identity-based guard.
+#[deprecated(
+    note = "no qpdf counterpart; QPDFObjGen::set ignores direct identities and qpdf has no direct-parent cycle guard"
+)]
 fn mark_direct_node_seen(direct_seen: &mut Vec<ObjectHandle>, current: &ObjectHandle) -> bool {
     if !current.is_direct() {
         return true;
@@ -80,6 +83,7 @@ fn mark_direct_node_seen(direct_seen: &mut Vec<ObjectHandle>, current: &ObjectHa
 /// repeat. Real PDF bytes cannot produce this shape (see the module doc), so
 /// this is unreachable from a live qpdf parse and exists only to bound the
 /// in-memory `ObjectHandle::replace_key` gap.
+#[deprecated(note = "no qpdf counterpart; qpdf does not report direct-parent cycle errors")]
 fn direct_parent_cycle_error(field_ref: ObjectRef) -> Error {
     Error::Unsupported(format!(
         "field tree contains a /Parent cycle of direct dictionaries at {field_ref}"
@@ -154,6 +158,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     /// (`libqpdf/QPDFFormFieldObjectHelper.cc:35-46`). The returned handle
     /// retains its raw `QpdfObjGen` identity, including generations outside
     /// the valid `ObjectRef` projection.
+    #[allow(deprecated)]
     pub fn get_top_level_field(&mut self) -> Result<(ObjectHandle, bool)> {
         let mut current = self.field.clone();
         let mut seen = BTreeSet::new();
@@ -284,6 +289,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     /// Return the dotted `/T` name formed by this field and its parents.
+    #[allow(deprecated)]
     pub fn get_fully_qualified_name(&mut self) -> Result<String> {
         let mut current = self.field.clone();
         let mut seen = BTreeSet::new();
@@ -804,6 +810,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     /// object identity, not over a materialized reference spelling, so direct
     /// children and indirect children both continue the walk the same way;
     /// only their termination guard differs -- see the module doc for why.
+    #[allow(deprecated)]
     fn resolve_inherited_handle_from(
         &mut self,
         field: ObjectHandle,
@@ -907,6 +914,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn direct_seen_set_ignores_indirect_handles_and_tracks_direct_identity() {
         let mut direct_seen = Vec::new();
 
