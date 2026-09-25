@@ -11,6 +11,7 @@ Before making writer-level changes, read:
 - `docs/qpdf-compat.md` — golden matrix workflow & divergence categories
 - `docs/qpdf-compat-decisions.md` — registry of decision points where
   flpdf may deliberately diverge from qpdf
+- `docs/pdfa.md` — PDF/A preservation scope and conformance-validation limits
 
 When your change moves the matrix (re-blesses `tests/golden/compat-matrix.md`
 or `tests/golden/baseline-static-id.md`), check the boxes in the PR
