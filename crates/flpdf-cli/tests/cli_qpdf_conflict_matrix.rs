@@ -612,6 +612,31 @@ fn json_input_and_update_inspection_apply_overlay_before_show_object() {
 }
 
 #[test]
+fn top_level_json_output_applies_overlay_and_underlay_before_serialization() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let input = fixture("three-page.pdf");
+    let source = fixture("one-page.pdf");
+    for segment in ["--overlay", "--underlay"] {
+        for output_mode in ["--json=2", "--json-output=2"] {
+            let mut args = vec![
+                OsString::from(segment),
+                source.as_os_str().to_owned(),
+                OsString::from("--"),
+                OsString::from(output_mode),
+            ];
+            if output_mode == "--json=2" {
+                args.push(OsString::from("--json-key=pages"));
+            }
+            args.push(input.as_os_str().to_owned());
+            assert_pair(&format!("top-level {segment} with {output_mode}"), &args);
+        }
+    }
+}
+
+#[test]
 fn qpdf_accepts_decrypt_with_show_xref() {
     if skip_without_qpdf() {
         return;
