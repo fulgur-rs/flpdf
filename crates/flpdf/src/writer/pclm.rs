@@ -922,7 +922,7 @@ mod tests {
     #[test]
     fn pclm_seeds_a_raw_generation_page_without_object_ref_projection() {
         if !exact_qpdf_11_9() {
-            return;
+            return; // cov:ignore: this qpdf-oracle regression is skipped when the pinned binary is unavailable.
         }
         let mut pdf = Pdf::empty().expect("empty PDF");
         let pages = pdf
@@ -971,12 +971,7 @@ mod tests {
             .arg(&output_path)
             .output()
             .expect("qpdf checks PCLm output");
-        assert_eq!(
-            check.status.code(),
-            Some(0),
-            "qpdf accepts PCLm output: {}",
-            String::from_utf8_lossy(&check.stderr)
-        );
+        assert_eq!(check.status.code(), Some(0));
         let page_count = Command::new("qpdf")
             .arg("--show-npages")
             .arg(&output_path)
