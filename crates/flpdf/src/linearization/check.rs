@@ -230,7 +230,7 @@ pub(crate) fn check_linearization_parameters<R: Read + Seek>(
     let Some(first_page) = pages.first() else {
         return Ok(LinearizationParameterCheck::Clean);
     };
-    if o.try_as_integer()? != Some(first_page.number as i64) {
+    if o.try_as_integer()? != Some(i64::from(first_page.get_obj_gen().get_obj())) {
         return Ok(LinearizationParameterCheck::Warning(
             "first page object (/O) mismatch",
         ));
@@ -1233,16 +1233,17 @@ fn check_linearization_inner<R: Read + Seek>(
 
         // qpdf records this as a linearization warning in
         // `checkLinearizationInternal` (`QPDF_linearization.cc:419-427`).
-        let Some(first_page_ref) = pages.first().copied() else {
+        let Some(first_page) = pages.first() else {
             fail!("/O ({o_num}) cannot be checked because the document has no pages");
         };
-        if first_page_ref.number as u64 != o_num {
+        let first_page_object = first_page.get_obj_gen().get_obj();
+        if u64::try_from(first_page_object).ok() != Some(o_num) {
             if collect_soft_warnings {
                 warnings.push("first page object (/O) mismatch".to_owned());
             } else {
                 fail!(
                     "/O ({o_num}) does not match the first page object ({})",
-                    first_page_ref.number
+                    first_page_object
                 );
             }
         }
@@ -1461,9 +1462,13 @@ fn check_linearization_inner<R: Read + Seek>(
     // (`QPDF_linearization.cc:539-835`). Keep malformed bitstreams as hard
     // errors, while routing structural mismatches through the same soft-warning
     // channel used by qpdf's `linearizationWarning`.
+    // Hint-table validation still consumes the explicit valid-reference
+    // projection. The page-count and `/O` checks above use the raw qpdf page
+    // handles, so an unprojectable generation is not lost at enumeration.
+    let page_refs = crate::pages::page_refs(pdf).map_err(LinearizationCheckError::from)?;
     check_hint_tables(
         pdf,
-        &pages,
+        &page_refs,
         HintTableCheckInput {
             page_hints: &page_hints,
             shared_hints: &shared_hints,

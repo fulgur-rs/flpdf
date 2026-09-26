@@ -104,7 +104,7 @@ fn build_many_nulls_document(
 #[cfg(test)]
 mod tests {
     use super::build_many_nulls_document;
-    use flpdf::{ObjectStreamMode, PageDocumentHelper, PdfWriter};
+    use flpdf::{ObjectStreamMode, PdfWriter};
 
     #[test]
     fn small_many_nulls_document_preserves_the_qpdf_graph_shape() {
@@ -115,8 +115,7 @@ mod tests {
             assert_eq!(inner.try_get_array_n_items().expect("read inner array"), 3);
         }
         assert_eq!(
-            PageDocumentHelper::new(&mut pdf)
-                .get_all_pages()
+            flpdf::pages::page_refs(&mut pdf)
                 .expect("enumerate page tree")
                 .len(),
             1

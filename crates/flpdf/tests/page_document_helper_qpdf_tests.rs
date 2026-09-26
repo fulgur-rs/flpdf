@@ -1,5 +1,6 @@
 use flpdf::{
-    Error, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, PdfOpenOptions, QpdfErrorCode,
+    Error, ObjectHandle, ObjectRef, PageDocumentHelper, PageInput, Pdf, PdfOpenOptions,
+    QpdfErrorCode, QpdfObjGen,
 };
 use std::io::Cursor;
 
@@ -174,7 +175,7 @@ fn page_tree_cycle_raises_qpdf_pages_exception_with_last_object_description() {
 }
 
 #[test]
-fn raw_generation_page_tree_leaf_does_not_panic_at_the_object_ref_boundary() {
+fn raw_generation_page_tree_leaf_is_returned_as_a_qpdf_page_handle() {
     let bytes = build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
@@ -187,7 +188,7 @@ fn raw_generation_page_tree_leaf_does_not_panic_at_the_object_ref_boundary() {
         1,
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("page fixture should open");
-    let raw_ref = ObjectRef::new(5, 65_535);
+    let raw_ref = ObjectRef::new(17, 65_535);
     pdf.replace_object(
         raw_ref,
         ObjectHandle::dictionary(vec![
@@ -212,14 +213,62 @@ fn raw_generation_page_tree_leaf_does_not_panic_at_the_object_ref_boundary() {
         )
         .expect("attach raw-generation page");
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        PageDocumentHelper::new(&mut pdf).get_all_pages()
-    }));
+    let pages = PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .expect("raw-generation page should remain in qpdf's page list");
+    assert_eq!(pages.len(), 1);
+    let raw_page = &pages[0];
+    assert_eq!(raw_page.get_obj_gen(), QpdfObjGen::new(17, 65_535));
+    assert!(raw_page.is_indirect());
+    assert_eq!(raw_page.unparse(), b"17 65535 R");
+    assert_eq!(raw_page.object_ref(), None);
+}
 
-    let result = result.expect("raw-generation page handling must not panic");
-    assert!(matches!(
-        result,
-        Err(Error::Unsupported(message))
-            if message == "page object 5 65535 cannot be represented as a valid ObjectRef"
-    ));
+#[test]
+fn add_page_at_inserts_a_direct_page_before_its_reference_page() {
+    let mut pdf = Pdf::empty().expect("empty document should be constructible");
+    let first_page = ObjectHandle::dictionary(vec![
+        (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+        (
+            b"/MediaBox".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(612),
+                ObjectHandle::integer(792),
+            ]),
+        ),
+    ]);
+    let first_page_ref = PageDocumentHelper::new(&mut pdf)
+        .add_page(PageInput::direct(first_page), false)
+        .expect("initial page should be added")
+        .new_kids[0];
+
+    let inserted_page = ObjectHandle::dictionary(vec![
+        (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+        (
+            b"/MediaBox".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(612),
+                ObjectHandle::integer(792),
+            ]),
+        ),
+    ]);
+    let inserted_page_ref = PageDocumentHelper::new(&mut pdf)
+        .add_page_at(PageInput::direct(inserted_page), true, first_page_ref)
+        .expect("page should be inserted before the reference page")
+        .new_kids[0];
+
+    let pages = PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .expect("page list should be readable");
+    assert_eq!(
+        pages
+            .iter()
+            .map(ObjectHandle::object_ref)
+            .collect::<Vec<_>>(),
+        vec![Some(inserted_page_ref), Some(first_page_ref)]
+    );
 }

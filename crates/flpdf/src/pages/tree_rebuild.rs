@@ -961,9 +961,7 @@ mod tests {
     #[test]
     fn rebuild_updates_the_cached_page_list_to_the_final_tree() {
         let mut pdf = open(build_nested_pdf());
-        let before = crate::PageDocumentHelper::new(&mut pdf)
-            .get_all_pages()
-            .expect("initial page list");
+        let before = crate::pages::page_refs(&mut pdf).expect("initial page list");
         assert_eq!(
             before,
             vec![
@@ -975,9 +973,7 @@ mod tests {
 
         rebuild_page_tree(&mut pdf, &[ObjectRef::new(5, 0)]).expect("page rebuild");
 
-        let after = crate::PageDocumentHelper::new(&mut pdf)
-            .get_all_pages()
-            .expect("page list after rebuild");
+        let after = crate::pages::page_refs(&mut pdf).expect("page list after rebuild");
         assert_eq!(after, vec![ObjectRef::new(5, 0)]);
     }
 

@@ -460,7 +460,7 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     }
 
     let page_tree_diagnostics_seen = diagnostic_count(pdf);
-    let pages_result = PageDocumentHelper::new(pdf).get_all_page_handles();
+    let pages_result = PageDocumentHelper::new(pdf).get_all_pages();
     let pages = match pages_result {
         Ok(pages) => pages,
         // cov:ignore-start: check's qpdf-shaped discard writer above runs the

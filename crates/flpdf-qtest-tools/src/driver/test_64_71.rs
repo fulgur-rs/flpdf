@@ -73,10 +73,10 @@ fn test_64_67_body<R: Read + Seek>(
     let arg2_diagnostic = os_str_diagnostic_bytes(arg2);
     let mut secondary_diagnostics_written = pdf2.repair_diagnostics().entries().len();
 
-    let qpdf_flush_result_72 = PageDocumentHelper::new(pdf).get_all_pages();
+    let qpdf_flush_result_72 = flpdf::pages::page_refs(pdf);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let pages1 = qpdf_flush_result_72?;
-    let qpdf_flush_result_73 = PageDocumentHelper::new(&mut pdf2).get_all_pages();
+    let qpdf_flush_result_73 = flpdf::pages::page_refs(&mut pdf2);
     emit_new_diagnostics(
         &pdf2,
         &mut secondary_diagnostics_written,
@@ -316,7 +316,7 @@ pub(crate) fn run_test_69<R: Read + Seek>(
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     pdf.set_immediate_copy_from(true);
-    let qpdf_flush_result_74 = PageDocumentHelper::new(pdf).get_all_pages();
+    let qpdf_flush_result_74 = flpdf::pages::page_refs(pdf);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let pages = qpdf_flush_result_74?;
     for (index, page_ref) in pages.into_iter().enumerate() {
@@ -405,7 +405,7 @@ pub(crate) fn run_test_71<R: Read + Seek>(
     // uncaught on an empty page list; indexing `pages[0]` panics the same
     // way on the fixture this test is designed for, preserving crash parity
     // at this exact point even though nothing downstream can use the page.
-    let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    let pages = flpdf::pages::page_refs(pdf)?;
     let page_ref = pages[0];
 
     writeln!(stdout, "--- recursive, all ---")?;

@@ -3888,14 +3888,15 @@ impl QPDFJob {
         if configuration.rotations.is_empty() {
             return Ok(());
         }
-        let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
-        let page_count = crate::qutil::qpdf_size_to_int(page_refs.len())?;
+        let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+        let page_count = crate::qutil::qpdf_size_to_int(pages.len())?;
         for (range, rotation) in &configuration.rotations {
             let selected = crate::qutil::parse_numrange(range, page_count)?;
             for page in selected {
                 let index = page.wrapping_sub(1);
                 if index >= 0 && index < page_count {
-                    let mut page = PageObjectHelper::new(page_refs[index as usize], pdf);
+                    let mut page =
+                        PageObjectHelper::from_object_handle(pages[index as usize].clone(), pdf);
                     page.rotate_page(rotation.angle, rotation.relative)?;
                 }
             }
@@ -3966,9 +3967,9 @@ impl QPDFJob {
                 image_options,
             )?; // cov:ignore: llvm-cov attributes this successful multiline image phase call to its opening expressions
         } else if configuration.externalize_inline_images {
-            let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
-            for page_ref in page_refs {
-                PageObjectHelper::new(page_ref, pdf).externalize_inline_images(
+            let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+            for page in pages {
+                PageObjectHelper::from_object_handle(page, pdf).externalize_inline_images(
                     configuration.image_options.inline_min_bytes,
                     false,
                 )?; // cov:ignore: llvm-cov attributes this successful multiline image externalization call to its opening expressions
@@ -3999,9 +4000,9 @@ impl QPDFJob {
         // provider-backed PageObjectHelper route; do not decode page contents
         // into a new eager buffer here.
         if configuration.coalesce_contents {
-            let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
-            for page_ref in page_refs {
-                PageObjectHelper::new(page_ref, pdf).coalesce_content_streams()?;
+            let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+            for page in pages {
+                PageObjectHelper::from_object_handle(page, pdf).coalesce_content_streams()?;
             }
         }
 
@@ -4010,7 +4011,7 @@ impl QPDFJob {
         // (`QPDFJob.cc:2190-2194`). The existing job rotation module owns the
         // page-level matrix, box, and annotation semantics.
         if configuration.flatten_rotation {
-            let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
+            let page_refs = crate::pages::page_refs(pdf)?;
             flatten_rotation_on_pages(pdf, &page_refs)?;
         }
 
@@ -6019,8 +6020,7 @@ mod tests {
             std::fs::read(&output_path).expect("written PDF bytes"),
         ))
         .expect("written PDF should reopen");
-        let page_ref = PageDocumentHelper::new(&mut written)
-            .get_all_pages()
+        let page_ref = crate::pages::page_refs(&mut written)
             .expect("written page list")
             .into_iter()
             .next()
@@ -6413,9 +6413,7 @@ mod tests {
             .to_vec(),
         ))
         .expect("one-page fixture parses");
-        let page_ref = PageDocumentHelper::new(&mut pdf)
-            .get_all_pages()
-            .expect("page tree resolves")[0];
+        let page_ref = crate::pages::page_refs(&mut pdf).expect("page tree resolves")[0];
         let page = pdf.get_object_handle(page_ref);
         page.try_dereference().expect("page resolves");
         page.replace_key(b"/Contents", ObjectHandle::integer(42))

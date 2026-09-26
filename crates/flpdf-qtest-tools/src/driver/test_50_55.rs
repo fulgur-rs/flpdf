@@ -335,8 +335,7 @@ pub(crate) fn run_test_55<R: Read + Seek>(
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let mut helper = PageDocumentHelper::new(pdf);
-    let qpdf_flush_result_68 = helper.get_all_pages();
+    let qpdf_flush_result_68 = PageDocumentHelper::new(pdf).get_all_pages();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let pages = qpdf_flush_result_68?;
     // qpdf constructs the array before the loop and appends both
@@ -346,9 +345,9 @@ pub(crate) fn run_test_55<R: Read + Seek>(
     // lazy content, and the conditional transformation matrix
     // (`libqpdf/QPDFPageObjectHelper.cc:706-733`).
     let qtest = ObjectHandle::array(Vec::new());
-    for page_ref in pages {
+    for page_handle in pages {
         let transformed = {
-            let mut page = PageObjectHelper::new(page_ref, pdf);
+            let mut page = PageObjectHelper::from_object_handle(page_handle.clone(), pdf);
             page.get_form_xobject_for_page(true)
         };
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -356,7 +355,7 @@ pub(crate) fn run_test_55<R: Read + Seek>(
         qtest.append_array_item(transformed)?;
 
         let untransformed = {
-            let mut page = PageObjectHelper::new(page_ref, pdf);
+            let mut page = PageObjectHelper::from_object_handle(page_handle, pdf);
             page.get_form_xobject_for_page(false)
         };
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;

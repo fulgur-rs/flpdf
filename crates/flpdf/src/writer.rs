@@ -1846,7 +1846,7 @@ fn initialize_special_streams<R: Read + Seek>(
         return Ok(None);
     }
 
-    let pages = crate::PageDocumentHelper::new(pdf).get_all_page_handles()?;
+    let pages = crate::PageDocumentHelper::new(pdf).get_all_pages()?;
     let mut streams = SpecialStreams {
         pages: Vec::with_capacity(pages.len()),
         page_seq: HashMap::with_capacity(pages.len()),

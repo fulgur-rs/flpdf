@@ -29,7 +29,6 @@ use std::io::{Read, Seek};
 use std::rc::Rc;
 
 use super::page_range::PageRange;
-use crate::page_document_helper::PageDocumentHelper;
 use crate::page_form_xobject::get_form_xobject_for_page;
 use crate::page_object_helper::{rectangle_from_handle, PageBox, PageObjectHelper};
 use crate::{Error, Matrix, ObjectHandle, ObjectRef, Pdf, Rectangle, Result};
@@ -347,7 +346,7 @@ where
     // Snapshot the source page list before mapping. The applied patches change
     // page dictionaries in place but never reorder or remove page objects, so
     // the 1-based page numbers stay valid when the later lazy import runs.
-    let source_pages = PageDocumentHelper::new(source).get_all_pages()?;
+    let source_pages = crate::pages::page_refs(source)?;
     let n_source = u32_len(source_pages.len());
     let pairs = resolve_spec_pairs(n_source, from, to, repeat, n_dest)?;
 
@@ -468,7 +467,7 @@ where
 ///
 /// # Errors
 ///
-/// Propagates any error from [`PageDocumentHelper::get_all_pages`], [`page_ref_for`], the placement
+/// Propagates any error from [`crate::PageDocumentHelper::get_all_pages`], [`page_ref_for`], the placement
 /// facade, or the source document handles.
 fn apply_aggregated_sources<R: Read + Seek, RS: Read + Seek>(
     dest: &mut Pdf<R>,
@@ -479,7 +478,7 @@ fn apply_aggregated_sources<R: Read + Seek, RS: Read + Seek>(
     // in place but never reorder or remove page objects, so 1-based numbers
     // stay valid. qpdf prepares all destination pages before it reads any
     // placement boxes or converts the page to a Form XObject.
-    let dest_pages = PageDocumentHelper::new(dest).get_all_pages()?;
+    let dest_pages = crate::pages::page_refs(dest)?;
     let mut imported_sources = BTreeMap::new();
     for (dest_page, sources) in by_page {
         let dest_ref = page_ref_for(&dest_pages, dest_page, "destination")?;
@@ -549,7 +548,7 @@ where
     // instead of re-walking it per spec.
     // qpdf's overlay job obtains the repaired destination page list before
     // resolving any source ranges or performing placement.
-    let n_dest = u32_len(PageDocumentHelper::new(dest).get_all_pages()?.len());
+    let n_dest = u32_len(crate::pages::page_refs(dest)?.len());
     // qpdf still validates/opens the configured source documents, but its
     // page loop has no work when the destination has no pages
     // (`QPDFJob.cc:1970-1978`). Do not feed the zero count into the ordinary
@@ -615,7 +614,7 @@ pub struct OverlayVerbosePage {
 ///
 /// The source documents are taken by `&mut` because [`PageRange::resolve`]
 /// reads their page trees; the destination is taken by `&mut` for the same
-/// reason, and because [`PageDocumentHelper::get_all_pages`] repairs any page
+/// reason, and because [`crate::PageDocumentHelper::get_all_pages`] repairs any page
 /// lacking an effective `/MediaBox` in place, matching qpdf's own
 /// `QPDFPageDocumentHelper::getAllPages` (qpdf 11.9.0). No source page is
 /// imported and no destination content stream is drawn on. Calling this before
@@ -627,7 +626,7 @@ pub struct OverlayVerbosePage {
 /// - [`Error::Parse`] when a `--from`/`--to`/`--repeat` range references a
 ///   page number outside its document (propagated from
 ///   [`PageRange::resolve`]).
-/// - Any error propagated from [`PageDocumentHelper::get_all_pages`]
+/// - Any error propagated from [`crate::PageDocumentHelper::get_all_pages`]
 ///   — typically [`Error::Missing`] for a missing `/Root`/`/Pages`, or
 ///   [`Error::Unsupported`] for a malformed page tree.
 pub fn overlay_verbose_report<RS, RT>(
@@ -638,15 +637,11 @@ where
     RS: Read + Seek,
     RT: Read + Seek,
 {
-    let n_dest = u32_len(PageDocumentHelper::new(dest).get_all_pages()?.len());
+    let n_dest = u32_len(crate::pages::page_refs(dest)?.len());
     // Flatten every spec's (dest_page, source) pairs in declaration order.
     let mut flat: Vec<(u32, OverlayVerboseSource)> = Vec::new();
     for (spec_index, spec) in specs.iter_mut().enumerate() {
-        let n_source = u32_len(
-            PageDocumentHelper::new(&mut spec.source)
-                .get_all_pages()?
-                .len(),
-        );
+        let n_source = u32_len(crate::pages::page_refs(&mut spec.source)?.len());
         let pairs =
             resolve_spec_pairs(n_source, &spec.from, &spec.to, spec.repeat.as_ref(), n_dest)?;
         for (dest_page, src_page) in pairs {

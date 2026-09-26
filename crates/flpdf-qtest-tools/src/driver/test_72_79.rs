@@ -15,8 +15,8 @@ use std::rc::Rc;
 
 use flpdf::{
     pipeline::Discard, DecodeLevel, EmbeddedFileDocumentHelper, EmbeddedFileStream, Error,
-    FileSpec, NameTree, NumberTree, ObjectHandle, ObjectHandleParserCallbacks, PageDocumentHelper,
-    ParseControl, Pdf, PdfWriter, TokenFilter, TokenFilterOutput,
+    FileSpec, NameTree, NumberTree, ObjectHandle, ObjectHandleParserCallbacks, ParseControl, Pdf,
+    PdfWriter, TokenFilter, TokenFilterOutput,
 };
 
 use super::emit_new_diagnostics;
@@ -145,7 +145,7 @@ pub(crate) fn run_test_72<R: Read + Seek>(
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     // Call some QPDFPageObjectHelper methods on form XObjects.
-    let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
+    let page_refs = flpdf::pages::page_refs(pdf)?;
     let page = pdf.get_object_handle(page_refs[0]);
     let resources = page.try_get_key(b"/Resources")?;
     let xobject = resources.try_get_key(b"/XObject")?;
@@ -728,7 +728,7 @@ pub(crate) fn run_test_79<R: Read + Seek>(
     // qpdf/test_driver.cc:2705-2758 retains the original streams and their
     // independent copies in the live trailer before the QDF writer runs.
 
-    let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
+    let page_refs = flpdf::pages::page_refs(pdf)?;
     let page = pdf.get_object_handle(page_refs[0]);
     let s1 = page.try_get_key(b"/Contents")?;
 

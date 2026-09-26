@@ -236,12 +236,14 @@ fn emit_show_pages<R: Read + Seek>(
     logger: &crate::QPDFLogger,
     show_page_images: bool,
 ) -> Result<()> {
-    let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
-    for (index, page_ref) in page_refs.iter().enumerate() {
-        logger.info(format!("page {}: {}\n", index + 1, page_ref))?;
+    let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    for (index, page_handle) in pages.into_iter().enumerate() {
+        let page_reference = String::from_utf8_lossy(&page_handle.unparse()).into_owned();
+        logger.info(format!("page {}: {}\n", index + 1, page_reference))?;
 
         if show_page_images {
-            let images = PageObjectHelper::new(*page_ref, pdf).get_images()?;
+            let images =
+                PageObjectHelper::from_object_handle(page_handle.clone(), pdf).get_images()?;
             if !images.is_empty() {
                 logger.info("  images:\n")?;
                 for (name, image) in images {
@@ -276,7 +278,8 @@ fn emit_show_pages<R: Read + Seek>(
         // its stream array (`QPDFJob.cc:869-872`). This preserves warning
         // order when a malformed `/Contents` value is encountered.
         logger.info("  content:\n")?;
-        let contents = PageObjectHelper::new(*page_ref, pdf).get_page_contents()?;
+        let contents =
+            PageObjectHelper::from_object_handle(page_handle, pdf).get_page_contents()?;
         for content in contents {
             let mut line = b"    ".to_vec();
             line.extend_from_slice(&content.unparse());

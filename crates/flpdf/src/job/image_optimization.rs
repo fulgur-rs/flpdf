@@ -67,19 +67,19 @@ pub fn optimize_images<R: Read + Seek + 'static>(
     options: ImageOptimizationOptions,
 ) -> Result<()> {
     if !options.keep_inline_images {
-        let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
-        for page_ref in page_refs {
-            PageObjectHelper::new(page_ref, pdf)
+        let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+        for page in pages {
+            PageObjectHelper::from_object_handle(page, pdf)
                 .externalize_inline_images(options.inline_min_bytes, false)?;
         }
     }
 
-    let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
-    for (page_index, page_ref) in page_refs.into_iter().enumerate() {
+    let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    for (page_index, page_handle) in pages.into_iter().enumerate() {
         let page_number = page_index + 1;
         let mut replacements = Vec::new();
         {
-            let mut page = PageObjectHelper::new(page_ref, pdf);
+            let mut page = PageObjectHelper::from_object_handle(page_handle, pdf);
             page.for_each_image(true, |image, xobjects, key| {
                 let description = format!(
                     "image {} on page {page_number}",

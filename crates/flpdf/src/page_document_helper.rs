@@ -90,30 +90,18 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         crate::pages::repair::prepare_for_optimization(self.pdf)
     }
 
-    /// Return qpdf's repaired leaf-page handles with raw object identity.
+    /// Return qpdf's repaired leaf-page handles in document order.
     ///
-    /// This is the internal handle-native form of
-    /// `QPDFPageDocumentHelper::getAllPages()` for qpdf-shaped consumers such
-    /// as writer setup. The page snapshot is owned, so later page-tree
-    /// mutations require a fresh call.
-    pub(crate) fn get_all_page_handles(&mut self) -> Result<Vec<ObjectHandle>> {
+    /// This is the Rust equivalent of `QPDFPageDocumentHelper::getAllPages()`:
+    /// each result retains its raw object/generation identity, including
+    /// generations that are outside valid PDF `N G R` reference syntax. The
+    /// page snapshot is owned, so later page-tree mutations require a fresh
+    /// call.
+    pub fn get_all_pages(&mut self) -> Result<Vec<ObjectHandle>> {
         Ok(self
             .prepare_all_pages()?
             .map(|prepared| prepared.pages)
             .unwrap_or_default())
-    }
-
-    /// Return qpdf's repaired leaf-page list in document order as valid
-    /// `ObjectRef` projections.
-    ///
-    /// This keeps the existing valid-reference surface for callers that
-    /// explicitly require `N G R`; raw-identity consumers should use the
-    /// crate-internal handle form.
-    pub fn get_all_pages(&mut self) -> Result<Vec<ObjectRef>> {
-        match self.prepare_all_pages()? {
-            Some(prepared) => prepared.page_refs(),
-            None => Ok(Vec::new()),
-        }
     }
 
     /// Materialize inherited page attributes on each leaf page.
@@ -159,7 +147,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         before: bool,
         reference_page: ObjectRef,
     ) -> Result<RebuildResult> {
-        let pages = self.get_all_pages()?;
+        let pages = crate::pages::page_refs(self.pdf)?;
         let index = pages
             .iter()
             .position(|&candidate| candidate == reference_page)
@@ -183,7 +171,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         idx: usize,
         page: PageInput<'_, RS>,
     ) -> Result<RebuildResult> {
-        let mut refs = self.get_all_pages()?;
+        let mut refs = crate::pages::page_refs(self.pdf)?;
         if idx > refs.len() {
             return Err(Error::Unsupported(format!(
                 "insert index {idx} is out of bounds (page count {})",
@@ -360,7 +348,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// - [`Error::Unsupported`] when `idx >= page_count`.
     /// - Any error from [`rebuild_page_tree`] when pages remain after removal.
     fn remove_page_at(&mut self, idx: usize) -> Result<RebuildResult> {
-        let mut refs = self.get_all_pages()?;
+        let mut refs = crate::pages::page_refs(self.pdf)?;
         if idx >= refs.len() {
             return Err(Error::Unsupported(format!(
                 "remove index {idx} is out of bounds (page count {})",
@@ -393,7 +381,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// Returns [`Error::Pages`] when `page` is not in the repaired page list,
     /// preserving qpdf's source description and page-object context.
     pub fn remove_page(&mut self, page: ObjectRef) -> Result<RebuildResult> {
-        let pages = self.get_all_pages()?;
+        let pages = crate::pages::page_refs(self.pdf)?;
         let Some(index) = pages.iter().position(|&candidate| candidate == page) else {
             // qpdf's QPDF::findPage sets the last object description to
             // `page object` and throws qpdf_e_pages with the owning input
@@ -419,7 +407,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// invoking qpdf-style page-scoped pruning once for every current page.
     pub fn remove_unreferenced_resources(&mut self) -> Result<()> {
         for page in self.get_all_pages()? {
-            let mut helper = PageObjectHelper::new(page, self.pdf);
+            let mut helper = PageObjectHelper::from_object_handle(page, self.pdf);
             helper.remove_unreferenced_resources()?;
         }
         Ok(())
@@ -437,7 +425,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         // qpdf's document helper obtains `getAllPages()` before flattening.
         // This repairs a catalog /Pages pointer that lands on a leaf, so the
         // lower-level document primitive subsequently sees every page.
-        let pages = self.get_all_pages()?;
+        let pages = crate::pages::page_refs(self.pdf)?;
         crate::page_annotation_flatten::flatten_annotations_qpdf(
             self.pdf,
             &pages,
@@ -451,14 +439,13 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// `rebuild_page_tree`, so this method only performs the final empty-tree
     /// mutation that qpdf's `removePage` leaves behind.
     fn clear_page_tree(&mut self) -> Result<RebuildResult> {
-        // `get_all_pages` is the public `ObjectRef` reference-spelling
-        // boundary; a page number outside qpdf's signed-int domain is
-        // dropped here, matching the canonical rebuild constructor's own
-        // `try_from_object_ref(...).ok()` filter (`pages/tree_rebuild.rs`).
+        // Keep the removed-page bookkeeping in qpdf's raw identity domain;
+        // `RebuildResult` uses the same QpdfObjGen keys.
         let removed_page_objgens: BTreeSet<QpdfObjGen> = self
             .get_all_pages()?
             .into_iter()
-            .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok())
+            .map(|page| page.get_obj_gen())
+            .filter(|object_gen| object_gen.is_indirect())
             .collect();
         let catalog = self.pdf.root_handle()?;
         let Some(catalog_dict) = catalog.as_dictionary() else {

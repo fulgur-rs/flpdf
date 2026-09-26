@@ -13,8 +13,8 @@ use std::io::{Read, Seek, Write};
 use flpdf::json_inspect::{DecodeLevel, StreamDataMode};
 use flpdf::pipeline::PlString;
 use flpdf::{
-    document_json, Error, ObjectHandle, ObjectRef, PageDocumentHelper, PageObjectHelper, Pdf,
-    Pipeline, PipelineError, PipelineResult, QpdfStreamJsonData,
+    document_json, Error, ObjectHandle, ObjectRef, PageObjectHelper, Pdf, Pipeline, PipelineError,
+    PipelineResult, QpdfStreamJsonData,
 };
 
 use super::{
@@ -494,7 +494,7 @@ pub(crate) fn run_test_94<R: Read + Seek>(
     let root_media = root_media_result?;
     let root_media_unparse = root_media.unparse();
 
-    let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    let pages = flpdf::pages::page_refs(pdf)?;
     assert_eq!(pages.len(), 5);
     let p1_ref = pages[0];
     let p2_ref = pages[1];
@@ -1092,7 +1092,7 @@ mod tests {
 #[cfg(test)]
 mod test_94_tests {
     use super::run_test_94;
-    use flpdf::{PageDocumentHelper, Pdf};
+    use flpdf::Pdf;
     use std::collections::BTreeMap;
 
     fn boxes2_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
@@ -1155,9 +1155,8 @@ mod test_94_tests {
         )
         .expect("test 94 should execute the page-box assertion matrix");
 
-        let pages = PageDocumentHelper::new(&mut pdf)
-            .get_all_pages()
-            .expect("boxes2 fixture should retain five pages");
+        let pages =
+            flpdf::pages::page_refs(&mut pdf).expect("boxes2 fixture should retain five pages");
         assert_eq!(pages.len(), 5);
 
         for key in [b"/MediaBox".as_slice(), b"/CropBox", b"/ArtBox"] {
