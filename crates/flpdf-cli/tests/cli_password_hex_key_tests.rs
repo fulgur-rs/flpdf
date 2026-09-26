@@ -164,16 +164,30 @@ fn assert_short_hex_key_mode_matches_qpdf(mode: ShortHexKeyMode) {
 
 fn normalize_undefined_short_key_inflate_detail(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr)
-        .lines()
-        .map(|line| {
+        .split_inclusive('\n')
+        .map(|line_with_newline| {
+            let (line, newline) = line_with_newline
+                .strip_suffix('\n')
+                .map_or((line_with_newline, ""), |line| (line, "\n"));
             line.split_once("stream inflate: inflate: data: ")
                 .map(|(prefix, _)| {
-                    format!("{prefix}stream inflate: inflate: data: <undefined short-key tail>")
+                    format!(
+                        "{prefix}stream inflate: inflate: data: <undefined short-key tail>{newline}"
+                    )
                 })
-                .unwrap_or_else(|| line.to_string())
+                .unwrap_or_else(|| line_with_newline.to_string())
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect()
+}
+
+#[test]
+fn short_key_inflate_normalization_preserves_the_final_newline() {
+    assert_eq!(
+        normalize_undefined_short_key_inflate_detail(
+            b"warning: decode failed\nstream inflate: inflate: data: incorrect header check\n"
+        ),
+        "warning: decode failed\nstream inflate: inflate: data: <undefined short-key tail>\n"
+    );
 }
 
 /// Run `show-encryption-key` to recover the hex key, asserting it matches the
