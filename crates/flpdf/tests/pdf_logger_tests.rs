@@ -3,7 +3,7 @@ use common::PdfCanonicalTestExt;
 
 use flpdf::job::QPDFJob;
 use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
-use flpdf::{DecodeLevel, Error, ObjectRef, Pdf, PdfOpenOptions, QPDFLogger};
+use flpdf::{DecodeLevel, Error, ObjectRef, Pdf, PdfOpenOptions, QPDFLogger, QpdfErrorCode};
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
@@ -680,6 +680,12 @@ fn unknown_xref_entry_type_matches_qpdf_after_reconstruction() {
         error,
         Error::QpdfExc(warning) if warning.get_message_detail() == b"unable to find /Root dictionary"
     ));
+    let diagnostics = pdf.repair_diagnostics();
+    assert_eq!(diagnostics.entries().len(), 6);
+    assert!(diagnostics
+        .entries()
+        .iter()
+        .all(|warning| warning.get_error_code() == QpdfErrorCode::DamagedPdf));
     assert_eq!(
         output.lock().unwrap().as_slice(),
         b"WARNING: input.pdf (xref stream, offset 9): Cross-reference stream data has the wrong size; expected = 2; actual = 4\n\

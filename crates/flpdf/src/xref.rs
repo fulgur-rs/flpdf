@@ -7033,6 +7033,36 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn repair_diagnostics_preserve_the_trigger_qpdf_error_code() {
+        let trigger = QpdfExc::new(
+            QpdfErrorCode::Object,
+            b"input.pdf",
+            b"object 4 0",
+            4,
+            b"trigger",
+        );
+        let mut diagnostics = Diagnostics::default();
+
+        push_repair_diagnostics(
+            &mut diagnostics,
+            &Error::QpdfExc(trigger.clone()),
+            Some(99),
+            b"input.pdf",
+        );
+
+        assert_eq!(diagnostics.entries().len(), 3);
+        assert_eq!(
+            diagnostics.entries()[0].get_error_code(),
+            QpdfErrorCode::DamagedPdf
+        );
+        assert_eq!(diagnostics.entries()[1], trigger);
+        assert_eq!(
+            diagnostics.entries()[2].get_error_code(),
+            QpdfErrorCode::DamagedPdf
+        );
+    }
+
+    #[test]
     fn trailer_parser_diagnostics_retain_qpdf_object_description() {
         let diagnostics = trailer_diagnostics(
             750,
