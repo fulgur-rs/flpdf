@@ -671,7 +671,7 @@ pub(crate) fn emit_live<R: Read + Seek + 'static>(
 fn qdf_page_context<R: Read + Seek>(
     pdf: &mut Pdf<R>,
 ) -> crate::Result<crate::writer::LiveContentStreamState> {
-    let pages = PageDocumentHelper::new(pdf).get_all_page_handles()?;
+    let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
     let mut page_sequences = BTreeMap::new();
     let mut contents_sequences = BTreeMap::new();
     let mut normalized_streams = BTreeSet::new();
@@ -3352,10 +3352,8 @@ mod final_handle_tests {
 
     fn page_contents_depth(source: Vec<u8>) -> crate::Result<usize> {
         let mut pdf = crate::Pdf::open(std::io::Cursor::new(source))?;
-        let page = crate::PageDocumentHelper::new(&mut pdf).get_all_pages()?[0];
-        Ok(direct_array_depth(
-            &pdf.get_object_handle(page).try_get_key(b"/Contents")?,
-        ))
+        let page = crate::PageDocumentHelper::new(&mut pdf).get_all_pages()?[0].clone();
+        Ok(direct_array_depth(&page.try_get_key(b"/Contents")?))
     }
 
     // The content-emission bound must never reject input the parser accepts.
@@ -3391,9 +3389,9 @@ mod final_handle_tests {
         );
 
         let mut reread = crate::Pdf::open(std::io::Cursor::new(written))?;
-        let page = crate::PageDocumentHelper::new(&mut reread).get_all_pages()?[0];
+        let page = crate::PageDocumentHelper::new(&mut reread).get_all_pages()?[0].clone();
         assert_eq!(
-            direct_array_depth(&reread.get_object_handle(page).try_get_key(b"/Contents")?),
+            direct_array_depth(&page.try_get_key(b"/Contents")?),
             deepest,
             "every nested level must round-trip"
         );
@@ -3440,8 +3438,8 @@ mod final_handle_tests {
         let deepest = crate::parser::MAX_PARSE_DEPTH;
         let mut source =
             crate::Pdf::open(std::io::Cursor::new(indirect_contents_holder_pdf(deepest)))?;
-        let page = crate::PageDocumentHelper::new(&mut source).get_all_pages()?[0];
-        let holder = source.get_object_handle(page).try_get_key(b"/Contents")?;
+        let page = crate::PageDocumentHelper::new(&mut source).get_all_pages()?[0].clone();
+        let holder = page.try_get_key(b"/Contents")?;
         holder.try_dereference()?;
         assert_eq!(
             direct_array_depth(&holder),
@@ -4450,16 +4448,14 @@ mod object_emitter_tests {
             include_bytes!("../../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
         ))?; // cov:ignore: LLVM attributes the executed multiline Pdf::open call terminator to an unhit continuation line.
         let root_source = pdf.root_ref();
-        let page_ref = PageDocumentHelper::new(&mut pdf).get_all_pages()?[0];
+        let page = PageDocumentHelper::new(&mut pdf).get_all_pages()?[0].clone();
         let options = WriterOptions {
             qdf: true,
             compress_streams: CompressStreams::No,
             ..WriterOptions::default()
         };
         let content_stream_state = crate::writer::LiveContentStreamState {
-            page_sequences: [(QpdfObjGen::from_valid_object_ref_for_test(page_ref), 99)]
-                .into_iter()
-                .collect(),
+            page_sequences: [(page.get_obj_gen(), 99)].into_iter().collect(),
             ..Default::default()
         };
         let mut output = Vec::new();
@@ -4502,10 +4498,7 @@ mod object_emitter_tests {
         ))?; // cov:ignore: LLVM attributes the executed multiline Pdf::open call terminator to an unhit continuation line.
         let page_ref = ObjectRef::new(3, 0);
         let content_ref = ObjectRef::new(7, 0);
-        assert_eq!(
-            PageDocumentHelper::new(&mut pdf).get_all_pages()?,
-            vec![page_ref]
-        );
+        assert_eq!(crate::pages::page_refs(&mut pdf)?, vec![page_ref]);
 
         let content_stream_state = qdf_page_context(&mut pdf)?;
 

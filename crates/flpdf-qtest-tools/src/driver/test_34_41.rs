@@ -13,8 +13,8 @@ use std::rc::Rc;
 
 use flpdf::pipeline::{FlateAction, PlFlate};
 use flpdf::{
-    DecodeLevel, ObjectHandle, PageDocumentHelper, PageObjectHelper, Pdf, PdfWriter, Pipeline,
-    PipelineResult, TokenFilter, TokenFilterOutput,
+    DecodeLevel, ObjectHandle, PageObjectHelper, Pdf, PdfWriter, Pipeline, PipelineResult,
+    TokenFilter, TokenFilterOutput,
 };
 
 use super::emit_new_diagnostics;
@@ -530,7 +530,7 @@ pub(crate) fn run_test_37<R: Read + Seek>(
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
+    let page_refs = flpdf::pages::page_refs(pdf)?;
     for page_ref in page_refs {
         let page = pdf.get_object_handle(page_ref);
         let result = {
@@ -600,7 +600,7 @@ pub(crate) fn run_test_39<R: Read + Seek>(
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
+    let page_refs = flpdf::pages::page_refs(pdf)?;
     for (index, page_ref) in page_refs.into_iter().enumerate() {
         writeln!(stdout, "page {}", index + 1)?;
 
@@ -698,7 +698,7 @@ pub(crate) fn run_test_41<R: Read + Seek>(
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
+    let page_refs = flpdf::pages::page_refs(pdf)?;
     for page_ref in page_refs {
         let page = pdf.get_object_handle(page_ref);
         let filter: Rc<RefCell<dyn TokenFilter>> = Rc::new(RefCell::new(PotatoSaladTokenFilter));

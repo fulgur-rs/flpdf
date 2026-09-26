@@ -10,9 +10,8 @@ use super::{
 };
 use flpdf::{
     job::{JobExitCode, QPDFJob},
-    AcroFormDocumentHelper, Error, Matrix, ObjectHandle, ObjectRef, PageDocumentHelper,
-    PageObjectHelper, Pdf, PdfOpenOptions, PdfWriter, Pipeline, PipelineError, PipelineHandle,
-    PipelineResult,
+    AcroFormDocumentHelper, Error, Matrix, ObjectHandle, ObjectRef, PageObjectHelper, Pdf,
+    PdfOpenOptions, PdfWriter, Pipeline, PipelineError, PipelineHandle, PipelineResult,
 };
 
 struct CapturedPipeline {
@@ -94,8 +93,7 @@ pub(crate) fn run_test_80<R: Read + Seek>(
     // remain in AcroFormDocumentHelper; this driver only sequences their live
     // handles and delegates the foreign-page copy to PageObjectHelper.
     let arg2 = arg2.ok_or_else(|| Error::Internal("test 80 requires arg2".to_owned()))?;
-    let page1_ref = PageDocumentHelper::new(pdf)
-        .get_all_pages()?
+    let page1_ref = flpdf::pages::page_refs(pdf)?
         .into_iter()
         .next()
         .ok_or_else(|| Error::Internal("test 80 requires a first page".to_owned()))?;
@@ -124,8 +122,7 @@ pub(crate) fn run_test_80<R: Read + Seek>(
     let secondary_filename = os_str_diagnostic_bytes(arg2).into_owned();
     let mut pdf2 = open_test_80_secondary(arg2, stdout, stderr)?;
     let mut secondary_diagnostics = pdf2.repair_diagnostics().entries().len();
-    let page2_ref = PageDocumentHelper::new(&mut pdf2)
-        .get_all_pages()?
+    let page2_ref = flpdf::pages::page_refs(&mut pdf2)?
         .into_iter()
         .next()
         .ok_or_else(|| Error::Internal("test 80 requires a second page".to_owned()))?;

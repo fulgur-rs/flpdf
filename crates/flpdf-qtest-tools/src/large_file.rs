@@ -320,7 +320,7 @@ fn check_pdf(path: &Path, large: bool, output: &Output) -> flpdf::Result<()> {
             ..flpdf::PdfOpenOptions::default()
         },
     )?;
-    let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
+    let pages = flpdf::pages::page_refs(&mut pdf)?;
     if pages.len() != NPAGES {
         return Err(Error::Unsupported(format!(
             "expected {NPAGES} pages, found {}",
@@ -430,8 +430,7 @@ mod tests {
         create_pdf(&path, false, &generation_output).expect("write helper PDF");
 
         let mut pdf = Pdf::open(BufReader::new(File::open(&path).unwrap())).unwrap();
-        let page = PageDocumentHelper::new(&mut pdf)
-            .get_all_pages()
+        let page = flpdf::pages::page_refs(&mut pdf)
             .unwrap()
             .into_iter()
             .next()

@@ -231,13 +231,13 @@ fn media_boxes_of(path: &Path) -> Vec<String> {
 fn page_attribute_values(path: &Path, key: &[u8]) -> Vec<String> {
     let mut pdf = Pdf::open(Cursor::new(std::fs::read(path).expect("read PDF")))
         .expect("open PDF for page attribute inspection");
-    let page_refs = PageDocumentHelper::new(&mut pdf)
+    let page_handles = PageDocumentHelper::new(&mut pdf)
         .get_all_pages()
         .expect("enumerate PDF pages");
-    page_refs
+    page_handles
         .into_iter()
-        .filter_map(|page_ref| {
-            let mut page = PageObjectHelper::new(page_ref, &mut pdf);
+        .filter_map(|page_handle| {
+            let mut page = PageObjectHelper::from_object_handle(page_handle, &mut pdf);
             let value = page
                 .get_attribute(key, false)
                 .expect("read effective page attribute");

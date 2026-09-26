@@ -109,7 +109,7 @@ fn resource_image<R: std::io::Read + std::io::Seek + 'static>(
         .into_iter()
         .next()
         .expect("one page");
-    let mut page = PageObjectHelper::new(page_ref, pdf);
+    let mut page = PageObjectHelper::from_object_handle(page_ref, pdf);
     let resources = page.get_resources(false).expect("page resources");
     drop(page);
     let xobjects = resources

@@ -4,9 +4,8 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use flpdf::{
-    pipeline::Discard, qutil, EncryptParams, Error, NameTree, ObjectHandle, PageDocumentHelper,
-    PageObjectHelper, Pdf, PdfOpenOptions, PdfWriter, Pipeline, PipelineError, PipelineResult,
-    QPDFLogger, ReadSeek,
+    pipeline::Discard, qutil, EncryptParams, Error, NameTree, ObjectHandle, PageObjectHelper, Pdf,
+    PdfOpenOptions, PdfWriter, Pipeline, PipelineError, PipelineResult, QPDFLogger, ReadSeek,
 };
 
 use super::{emit_new_diagnostics, os_str_diagnostic_bytes};
@@ -80,10 +79,10 @@ fn test_56_59_body<R: Read + Seek>(
 
     // `QPDFPageDocumentHelper(pdf).getAllPages()` / `QPDFPageDocumentHelper(pdf2).getAllPages()`
     // (test_driver.cc:2089-2091).
-    let qpdf_flush_result_69 = PageDocumentHelper::new(pdf).get_all_pages();
+    let qpdf_flush_result_69 = flpdf::pages::page_refs(pdf);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let pages1 = qpdf_flush_result_69?;
-    let qpdf_flush_result_70 = PageDocumentHelper::new(&mut pdf2).get_all_pages();
+    let qpdf_flush_result_70 = flpdf::pages::page_refs(&mut pdf2);
     emit_new_diagnostics(
         &pdf2,
         &mut secondary_diagnostics_written,

@@ -41,22 +41,20 @@ pub(crate) fn run_test_18<R: Read + Seek + 'static>(
     // live, internally-cached page vector that `addPage`/`removePage` keep
     // updated in place (`include/qpdf/QPDF.hh:673-680`), so the C++ test
     // re-reads through the *same* `pages` variable after each mutation.
-    // `PageDocumentHelper::get_all_pages` intentionally returns an owned
-    // snapshot instead (its own doc: "a later page insertion or removal
-    // requires a fresh call") -- there is no live-updating container to
-    // alias here, so this re-fetches explicitly after each mutation. Every
-    // assertion qpdf makes (page count, and the final page's identity) is
-    // preserved by doing so.
-    let mut helper = PageDocumentHelper::new(pdf);
-    let mut pages = helper.get_all_pages()?;
+    // The qpdf test keeps a live vector; this driver uses the explicit
+    // `pages::page_refs()` projection because its insert/remove API consumes
+    // valid ObjectRefs. Each projection is an owned snapshot, so re-fetch it
+    // after every mutation. Every assertion qpdf makes (page count and the
+    // final page's identity) is preserved by doing so.
+    let mut pages = flpdf::pages::page_refs(pdf)?;
     assert_eq!(pages.len(), 10);
     let page5 = pages[5];
-    helper.remove_page(page5)?;
-    pages = helper.get_all_pages()?;
+    PageDocumentHelper::new(pdf).remove_page(page5)?;
+    pages = flpdf::pages::page_refs(pdf)?;
     assert_eq!(pages.len(), 9);
     let page5_input: PageInput<'_, std::io::Cursor<Vec<u8>>> = PageInput::existing(page5);
-    helper.add_page(page5_input, false)?;
-    pages = helper.get_all_pages()?;
+    PageDocumentHelper::new(pdf).add_page(page5_input, false)?;
+    pages = flpdf::pages::page_refs(pdf)?;
     assert_eq!(pages.len(), 10);
     // `page5` was removed just above, so it is absent from the page list
     // when `add_page` re-inserts it: `PageDocumentHelper::insert_page`'s
@@ -90,13 +88,12 @@ pub(crate) fn run_test_19<R: Read + Seek + 'static>(
     // comment documents for qpdf's live `getAllPages()` vector; `count`
     // must be captured from the *pre*-`add_page` snapshot to match qpdf's
     // `count = pages.size()` before the mutation.
-    let mut helper = PageDocumentHelper::new(pdf);
-    let pages = helper.get_all_pages()?;
+    let pages = flpdf::pages::page_refs(pdf)?;
     let newpage = pages[5];
     let count = pages.len();
     let newpage_input: PageInput<'_, std::io::Cursor<Vec<u8>>> = PageInput::existing(newpage);
-    helper.add_page(newpage_input, false)?;
-    let pages = helper.get_all_pages()?;
+    PageDocumentHelper::new(pdf).add_page(newpage_input, false)?;
+    let pages = flpdf::pages::page_refs(pdf)?;
     let last = *pages
         .last()
         .expect("add_page leaves at least one more page than before");
@@ -175,10 +172,11 @@ pub(crate) fn run_test_21<R: Read + Seek + 'static>(
     // (the qpdf correspondence in `object_handle.rs`) and `?` -- the
     // `writeln!` below it is real translated source text, but the preceding
     // `?` is where qpdf's exception leaves this function, so it never executes.
-    let mut helper = PageDocumentHelper::new(pdf);
-    let pages = helper.get_all_pages()?;
-    let page = pages[0];
-    let page_handle = pdf.get_object_handle(page);
+    let page_handle = PageDocumentHelper::new(pdf)
+        .get_all_pages()?
+        .into_iter()
+        .next()
+        .expect("page tree has a page");
     let qpdf_flush_result_10 = page_handle.try_get_key(b"/Contents");
 
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -203,18 +201,16 @@ pub(crate) fn run_test_22<R: Read + Seek + 'static>(
     // (`PageDocumentHelper::remove_page`'s own doc), propagated by `?` the
     // same way run_test_21's stream error is -- leaving the following
     // `std::cout << "you can't see this"` line dead code again.
-    let mut helper = PageDocumentHelper::new(pdf);
-    let pages = helper.get_all_pages()?;
+    let pages = flpdf::pages::page_refs(pdf)?;
     let page = pages[0];
-    let qpdf_flush_result_11 = helper.remove_page(page);
+    let qpdf_flush_result_11 = PageDocumentHelper::new(pdf).remove_page(page);
 
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     qpdf_flush_result_11?;
 
     // Re-borrow: `helper`'s first mutable borrow of `pdf` must end before
     // `emit_new_diagnostics` above can immutably borrow `pdf`.
-    let mut helper = PageDocumentHelper::new(pdf);
-    helper.remove_page(page)?;
+    PageDocumentHelper::new(pdf).remove_page(page)?;
     writeln!(stdout, "you can't see this")?;
     Ok(())
 }
@@ -231,12 +227,11 @@ pub(crate) fn run_test_23<R: Read + Seek + 'static>(
     // own body has neither a `QPDFWriter` call nor any output of its own
     // (the shared "test N done" footer belongs to `runtest`/this crate's
     // `run`, not to the individual test function).
-    let mut helper = PageDocumentHelper::new(pdf);
-    let pages = helper.get_all_pages()?;
+    let pages = flpdf::pages::page_refs(pdf)?;
     let last = *pages
         .last()
         .expect("a page-manipulation fixture has at least one page");
-    let qpdf_flush_result_12 = helper.remove_page(last);
+    let qpdf_flush_result_12 = PageDocumentHelper::new(pdf).remove_page(last);
 
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     qpdf_flush_result_12?;

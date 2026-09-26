@@ -17,7 +17,8 @@ fn production_consumers_call_the_canonical_coalesce_owner() {
     assert!(cli.contains("apply_transformations_for_cli(job, pdf)?"));
     assert!(cli.contains("match job.apply_transformations(pdf)"));
     assert!(cli.contains("job.write_qpdf(&mut pdf)"));
-    assert!(lifecycle.contains("PageObjectHelper::new(page_ref, pdf).coalesce_content_streams()?"));
+    assert!(lifecycle
+        .contains("PageObjectHelper::from_object_handle(page, pdf).coalesce_content_streams()?"));
     assert!(flatten.contains("PageObjectHelper::new(page_ref, pdf).coalesce_content_streams()?"));
 }
 
@@ -35,7 +36,7 @@ fn cli_transformation_order_matches_qpdf_job() {
         .find("if let Some(mode) = configuration.flatten_annotations {")
         .expect("annotation flatten route");
     let coalesce = transformations
-        .find("PageObjectHelper::new(page_ref, pdf).coalesce_content_streams()?")
+        .find("PageObjectHelper::from_object_handle(page, pdf).coalesce_content_streams()?")
         .expect("coalesce route");
     let rotation = transformations
         .find("flatten_rotation_on_pages(pdf, &page_refs)?")

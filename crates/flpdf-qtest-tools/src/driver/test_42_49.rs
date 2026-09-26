@@ -3,8 +3,8 @@ use std::io::{Read, Seek, Write};
 
 use flpdf::{
     AcroFormDocumentHelper, AnnotationObjectHelper, Error, FormFieldObjectHelper, Matrix, NameTree,
-    NumberTree, ObjectHandle, ObjectHandleMatrix, OutlineDocumentHelper, PageDocumentHelper,
-    PageLabelDocumentHelper, Pdf, PdfWriter, Rectangle,
+    NumberTree, ObjectHandle, ObjectHandleMatrix, OutlineDocumentHelper, PageLabelDocumentHelper,
+    Pdf, PdfWriter, Rectangle,
 };
 
 use super::emit_new_diagnostics;
@@ -230,8 +230,7 @@ pub(crate) fn run_test_42<R: Read + Seek>(
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     invalid_nested_string?;
 
-    let page_ref = PageDocumentHelper::new(pdf)
-        .get_all_pages()?
+    let page_ref = flpdf::pages::page_refs(pdf)?
         .into_iter()
         .next()
         .expect("qpdf test_42 requires one page");
@@ -452,7 +451,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
     }
 
     writeln!(stdout, "iterating over annotations per page")?;
-    let qpdf_flush_result_37 = PageDocumentHelper::new(pdf).get_all_pages();
+    let qpdf_flush_result_37 = flpdf::pages::page_refs(pdf);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let pages = qpdf_flush_result_37?;
     for page_ref in pages {
@@ -1114,7 +1113,7 @@ pub(crate) fn run_test_49<R: Read + Seek>(
         let mut tree_helper = OutlineDocumentHelper::new(pdf);
         tree_helper.get_tree()?
     };
-    let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    let pages = flpdf::pages::page_refs(pdf)?;
     let mut helper = OutlineDocumentHelper::new(pdf);
     for (pageno, page_ref) in pages.into_iter().enumerate() {
         let mut lines: Vec<(String, Vec<u8>)> = Vec::new();

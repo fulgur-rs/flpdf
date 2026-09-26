@@ -131,10 +131,7 @@ pub(crate) fn build_pages_section_with_options<R: Read + Seek>(
     version: i32,
     decode_level: DecodeLevel,
 ) -> Result<Vec<Json>, ConvertError> {
-    let page_refs = {
-        let mut page_document = crate::PageDocumentHelper::new(pdf);
-        page_document.get_all_pages()?
-    };
+    let page_refs = crate::pages::page_refs(pdf)?;
 
     // qpdf constructs the page-label and outline helpers once for the whole
     // page walk (`QPDFJob.cc:1035-1087`). Materialize those per-page values
@@ -271,10 +268,7 @@ pub(crate) fn build_acroform_section_with_version<R: Read + Seek>(
     // qpdf's page helper repairs and snapshots the page list before the
     // AcroForm helper starts its cached annotation-to-field analysis. Rust's
     // mutable borrow rules require the same sequencing explicitly.
-    let page_refs = {
-        let mut page_document = crate::PageDocumentHelper::new(pdf);
-        page_document.get_all_pages()?
-    };
+    let page_refs = crate::pages::page_refs(pdf)?;
 
     // Keep the helper alive for the whole page/widget walk so every lookup
     // uses one qpdf-shaped analysis cache. The handles are collected before
@@ -440,7 +434,7 @@ pub(crate) fn build_pagelabels_section_with_version<R: Read + Seek>(
     // and the observable everCalledGetAllPages metadata state.
     let page_count = {
         let mut page_document = crate::PageDocumentHelper::new(pdf);
-        page_document.get_all_page_handles()?.len()
+        page_document.get_all_pages()?.len()
     };
     let entries = {
         let mut helper = crate::page_label_document_helper::PageLabelDocumentHelper::new(pdf);
@@ -546,15 +540,11 @@ pub(crate) fn build_outlines_section_with_version<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     version: i32,
 ) -> Result<Json, ConvertError> {
-    let page_numbers = {
-        let mut page_document = crate::PageDocumentHelper::new(pdf);
-        page_document
-            .get_all_pages()?
-            .into_iter()
-            .enumerate()
-            .map(|(index, reference)| (reference, index as i64 + 1))
-            .collect::<std::collections::BTreeMap<_, _>>()
-    };
+    let page_numbers = crate::pages::page_refs(pdf)?
+        .into_iter()
+        .enumerate()
+        .map(|(index, reference)| (reference, index as i64 + 1))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let mut helper = pdf.outline();
     let tree = helper.get_tree()?;
     let mut entries = Vec::with_capacity(tree.roots().len());

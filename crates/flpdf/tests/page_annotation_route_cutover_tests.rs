@@ -62,8 +62,8 @@ fn build_non_array_fields_pdf() -> Vec<u8> {
 fn canonical_helpers_preserve_grouped_widget_field_association() {
     let bytes = include_bytes!("../../../tests/fixtures/compat/form-fields-and-annotations.pdf");
     let mut pdf = Pdf::open(Cursor::new(bytes.as_slice())).unwrap();
-    let page_ref = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap()[0];
-    let widgets = PageObjectHelper::new(page_ref, &mut pdf)
+    let page = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap()[0].clone();
+    let widgets = PageObjectHelper::from_object_handle(page, &mut pdf)
         .get_annotations_filtered(Some(b"/Widget"))
         .unwrap();
     assert_eq!(widgets.len(), 5);

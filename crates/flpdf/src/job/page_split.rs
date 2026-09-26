@@ -218,7 +218,7 @@ impl QPDFJob {
         if remove_resources {
             PageDocumentHelper::new(source).remove_unreferenced_resources()?;
         }
-        let pages = PageDocumentHelper::new(source).get_all_pages()?;
+        let pages = crate::pages::page_refs(source)?;
         let chunk_size = options
             .qpdf_chunk_size
             .map_or(Ok(options.chunk_size), qpdf_split_page_size)?;

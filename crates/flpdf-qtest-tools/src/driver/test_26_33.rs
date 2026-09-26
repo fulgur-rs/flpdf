@@ -414,16 +414,14 @@ pub(crate) fn run_test_30<R: Read + Seek>(
     // any warning that read raises is emitted at that point, so drain `pdf`'s
     // diagnostics right after `orig_contents`, before reading `final_pdf`'s.
     let mut final_pdf = open_secondary_pdf(OsStr::new("b.pdf"), b"user", stdout, stderr)?;
-    let orig_page = PageDocumentHelper::new(pdf)
-        .get_all_pages()?
+    let orig_page = flpdf::pages::page_refs(pdf)?
         .into_iter()
         .next()
         .ok_or_else(|| flpdf::Error::System("pdf has no pages".to_string()))?;
     let qpdf_flush_result_14 = page_contents(pdf, orig_page);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let orig_contents = qpdf_flush_result_14?;
-    let new_page = PageDocumentHelper::new(&mut final_pdf)
-        .get_all_pages()?
+    let new_page = flpdf::pages::page_refs(&mut final_pdf)?
         .into_iter()
         .next()
         .ok_or_else(|| flpdf::Error::System("final has no pages".to_string()))?;
@@ -892,9 +890,7 @@ logic error: Attempting to add an object from a different QPDF. Use QPDF::copyFo
         // page (test_driver.cc:991, `QPDFPageDocumentHelper(pdf).addPage(O3,
         // false)`) must grow the page count to two, using the resolving
         // `try_get_key` path this case now exercises for `/O3`.
-        let pages = flpdf::PageDocumentHelper::new(&mut written)
-            .get_all_pages()
-            .expect("read written page list");
+        let pages = flpdf::pages::page_refs(&mut written).expect("read written page list");
         assert_eq!(pages.len(), 2, "O3 must be appended as a second page");
 
         // qpdf's `pdf.getTrailer().replaceKey("/QTest",

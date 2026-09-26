@@ -140,7 +140,7 @@ pub(crate) fn run_test_10<R: Read + Seek>(
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    let pages = flpdf::pages::page_refs(pdf)?;
     let page_ref = *pages
         .first()
         .ok_or_else(|| Error::Internal("test 10 requires at least one page".to_string()))?;
@@ -284,7 +284,7 @@ pub(crate) fn run_test_14<R: Read + Seek>(
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    let pages = flpdf::pages::page_refs(pdf)?;
     if pages.len() != 4 {
         return Err(Error::Internal(
             "test 14 not called 4-page file".to_string(),
@@ -453,24 +453,25 @@ pub(crate) fn run_test_15<R: Read + Seek>(
     // helper is constructed at each call site below rather than held across
     // statements that also need direct `pdf` access -- each temporary
     // borrow ends with the statement that creates it.
-    let mut pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    let mut pages = flpdf::pages::page_refs(pdf)?;
     assert_eq!(pages.len(), 10);
 
     // Remove pages from various places, checking that the (re-fetched) page
     // list reflects each removal -- see this function's own doc for why a
-    // fresh `get_all_pages()` call stands in for qpdf's live vector here.
+    // fresh `pages::page_refs()` projection stands in for qpdf's live vector
+    // at this ObjectRef-based mutation boundary.
     let last = page_at(&pages, pages.len() - 1)?;
     PageDocumentHelper::new(pdf).remove_page(last)?; // original page 9
-    pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    pages = flpdf::pages::page_refs(pdf)?;
     assert_eq!(pages.len(), 9);
     let first = page_at(&pages, 0)?;
     PageDocumentHelper::new(pdf).remove_page(first)?; // original page 0
-    pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    pages = flpdf::pages::page_refs(pdf)?;
     assert_eq!(pages.len(), 8);
     check_page_contents(pdf, page_at(&pages, 4)?, "Original page 5", stdout)?;
     let fifth = page_at(&pages, 4)?;
     PageDocumentHelper::new(pdf).remove_page(fifth)?; // original page 5
-    pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    pages = flpdf::pages::page_refs(pdf)?;
     assert_eq!(pages.len(), 7);
     check_page_contents(pdf, page_at(&pages, 4)?, "Original page 6", stdout)?;
     check_page_contents(pdf, page_at(&pages, 0)?, "Original page 1", stdout)?;
@@ -509,7 +510,7 @@ pub(crate) fn run_test_15<R: Read + Seek>(
     // Now insert the pages.
     let new_page0 = new_pages.remove(0);
     PageDocumentHelper::new(pdf).add_page(PageInput::<'_, R>::Direct(new_page0), true)?;
-    pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    pages = flpdf::pages::page_refs(pdf)?;
     check_page_contents(pdf, page_at(&pages, 0)?, "New page 1", stdout)?;
 
     let new_page1_ref = new_page_refs[1]
@@ -520,7 +521,7 @@ pub(crate) fn run_test_15<R: Read + Seek>(
         true,
         reference0,
     )?;
-    pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    pages = flpdf::pages::page_refs(pdf)?;
     assert_eq!(page_at(&pages, 0)?, new_page1_ref);
 
     let new_page2_ref = new_page_refs[2]
@@ -531,7 +532,7 @@ pub(crate) fn run_test_15<R: Read + Seek>(
         true,
         reference5,
     )?;
-    pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    pages = flpdf::pages::page_refs(pdf)?;
     assert_eq!(page_at(&pages, 5)?, new_page2_ref);
 
     let new_page3_ref = new_page_refs[3]
@@ -542,14 +543,14 @@ pub(crate) fn run_test_15<R: Read + Seek>(
         false,
         reference5_after,
     )?;
-    pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    pages = flpdf::pages::page_refs(pdf)?;
     assert_eq!(page_at(&pages, 6)?, new_page3_ref);
     assert_eq!(pages.len(), 11);
 
     let new_page4_ref = new_page_refs[4]
         .ok_or_else(|| Error::Internal("test 15 new page 4 was not made indirect".to_string()))?;
     PageDocumentHelper::new(pdf).add_page(PageInput::<'_, R>::Existing(new_page4_ref), false)?;
-    pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    pages = flpdf::pages::page_refs(pdf)?;
     assert_eq!(page_at(&pages, 11)?, new_page4_ref);
 
     let new_page5_ref = new_page_refs[5]
@@ -560,7 +561,7 @@ pub(crate) fn run_test_15<R: Read + Seek>(
         false,
         back,
     )?;
-    pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    pages = flpdf::pages::page_refs(pdf)?;
     assert_eq!(pages.len(), 13);
     check_page_contents(pdf, page_at(&pages, 0)?, "New page 0", stdout)?;
     check_page_contents(pdf, page_at(&pages, 1)?, "New page 1", stdout)?;
@@ -585,12 +586,11 @@ pub(crate) fn run_test_15<R: Read + Seek>(
 /// refresh the cache `get_all_pages` reads.
 ///
 /// qpdf's `getAllPages()` returns a live reference into its own cache, so
-/// its test rereads the refreshed vector through the same binding.
-/// [`PageDocumentHelper::get_all_pages`] returns an owned snapshot instead
-/// (`crates/flpdf/src/page_document_helper.rs`'s own doc notes a later
-/// mutation requires a fresh call), so this port calls it again after
-/// [`flpdf::Pdf::update_all_pages_cache`] to observe the same refreshed
-/// state.
+/// its test rereads the refreshed vector through the same binding. The Rust
+/// helper returns an owned raw-handle snapshot; this driver uses the explicit
+/// `pages::page_refs()` projection because the following assertions and page
+/// mutation APIs require valid `ObjectRef`s, then re-fetches after
+/// [`flpdf::Pdf::update_all_pages_cache`] to observe the refreshed state.
 pub(crate) fn run_test_16<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     _filename: &[u8],
@@ -600,7 +600,7 @@ pub(crate) fn run_test_16<R: Read + Seek>(
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     assert!(!pdf.ever_called_get_all_pages());
-    let all_pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    let all_pages = flpdf::pages::page_refs(pdf)?;
     assert!(pdf.ever_called_get_all_pages());
 
     let contents = create_page_contents(pdf, "New page 10")?;
@@ -636,7 +636,7 @@ pub(crate) fn run_test_16<R: Read + Seek>(
     // refresh the canonical page-list cache before the remaining assertions.
     pdf.update_all_pages_cache()?;
     assert!(pdf.ever_called_get_all_pages());
-    let refreshed_pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    let refreshed_pages = flpdf::pages::page_refs(pdf)?;
     assert_eq!(refreshed_pages.len(), 11);
     assert_eq!(refreshed_pages.last().copied(), Some(page_ref));
 
@@ -679,7 +679,7 @@ pub(crate) fn run_test_17<R: Read + Seek>(
     let kid1 = page_kids.try_get_array_item(1)?;
     assert_eq!(kid0.object_ref(), kid1.object_ref());
 
-    let qpdf_flush_result_9 = PageDocumentHelper::new(pdf).get_all_pages();
+    let qpdf_flush_result_9 = flpdf::pages::page_refs(pdf);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let mut pages = qpdf_flush_result_9?;
     assert_eq!(pages.len(), 3);
@@ -693,7 +693,7 @@ pub(crate) fn run_test_17<R: Read + Seek>(
     );
 
     PageDocumentHelper::new(pdf).remove_page(pages[0])?;
-    pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    pages = flpdf::pages::page_refs(pdf)?;
     assert_eq!(pages.len(), 2);
 
     let remaining = pdf.get_object_handle(pages[0]);
@@ -711,8 +711,8 @@ mod tests {
         run_test_13, run_test_16, run_test_17, CapturedPipeline,
     };
     use flpdf::{
-        linearization::show_linearization_bytes, DecodeLevel, ObjectHandle, PageDocumentHelper,
-        Pdf, PdfOpenOptions, Pipeline,
+        linearization::show_linearization_bytes, DecodeLevel, ObjectHandle, Pdf, PdfOpenOptions,
+        Pipeline,
     };
     use std::path::PathBuf;
     use std::rc::Rc;
@@ -1183,13 +1183,11 @@ mod tests {
         // `run_test_16`'s own local `all_pages` snapshot (taken before the
         // manual edit) stays 10, matching qpdf's *stale* `all_pages`
         // reference before `updateAllPagesCache()` runs (`test_driver.cc:761`).
-        // A fresh `PageDocumentHelper::get_all_pages()` call after that
+        // A fresh `pages::page_refs()` call after that
         // already sees the eleventh page this test just proved was correctly
         // wired up -- `run_test_16` itself makes the same call and asserts
         // the same count.
-        let pages = PageDocumentHelper::new(&mut pdf)
-            .get_all_pages()
-            .expect("get_all_pages");
+        let pages = flpdf::pages::page_refs(&mut pdf).expect("get_all_pages");
         assert_eq!(pages.len(), 11);
     }
 }

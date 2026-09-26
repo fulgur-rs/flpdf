@@ -204,7 +204,11 @@ pub fn page_refs<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<ObjectRef>> {
         pdf.mark_get_all_pages_called();
         return prepared.page_refs();
     }
-    crate::PageDocumentHelper::new(pdf).get_all_pages()
+    let pages = crate::PageDocumentHelper::new(pdf).get_all_pages()?;
+    pages
+        .iter()
+        .map(crate::pages::repair::page_ref_from_handle)
+        .collect()
 }
 
 /// Return the decoded content-stream bytes for a single `Page` object.

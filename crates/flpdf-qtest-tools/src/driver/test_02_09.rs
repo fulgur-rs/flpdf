@@ -290,12 +290,9 @@ pub(crate) fn run_test_5<R: Read + Seek>(
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let page_refs = {
-        let mut helper = PageDocumentHelper::new(pdf);
-        helper.get_all_pages()?
-    };
+    let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
 
-    for (index, page_ref) in page_refs.iter().enumerate() {
+    for (index, page_handle) in pages.into_iter().enumerate() {
         let pageno = index + 1;
         writeln!(stdout, "page {pageno}:")?;
         writeln!(stdout, "  images:")?;
@@ -311,7 +308,7 @@ pub(crate) fn run_test_5<R: Read + Seek>(
         // delivers a warning the instant `warn()` records it
         // (`libqpdf/QPDF.cc:487-494`), so a later image's warning must follow
         // the earlier images' lines, not precede all of them.
-        let images = PageObjectHelper::new(*page_ref, pdf).get_images()?;
+        let images = PageObjectHelper::from_object_handle(page_handle.clone(), pdf).get_images()?;
         for (name, image) in images {
             let image_dict = image
                 .as_stream_dict()
@@ -330,7 +327,7 @@ pub(crate) fn run_test_5<R: Read + Seek>(
             writeln!(stdout, ": {width} x {height}")?;
         }
         writeln!(stdout, "  content:")?;
-        let mut page_helper = PageObjectHelper::new(*page_ref, pdf);
+        let mut page_helper = PageObjectHelper::from_object_handle(page_handle, pdf);
         let content = page_helper.get_page_contents()?;
         for item in &content {
             write!(stdout, "    ")?;

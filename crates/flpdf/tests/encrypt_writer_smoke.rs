@@ -346,7 +346,7 @@ fn encrypted_standard_writes_preserve_missing_page_resources_like_qpdf_11_9() {
             .expect("enumerate rewritten pages");
         assert_eq!(pages.len(), 1);
         let page = reopened
-            .resolve_canonical_object(pages[0])
+            .resolve_canonical_object(pages[0].object_ref().expect("valid page reference"))
             .expect("resolve rewritten page");
         assert!(
             page.as_dictionary()
