@@ -1640,7 +1640,10 @@ flpdf now passes raw keys to the shared `PlAesPdf` provider and zero-fills only
 the missing tail, avoiding an out-of-bounds read while preserving qpdf's
 AES-128 fallback. On the pinned GnuTLS qpdf build, two runs with `--static-id`
 and `--static-aes-iv` on the `/Length 040` donor were byte-identical and flpdf
-matched them; the regression test compares bytes only when qpdf repeats
+matched them. `copy_encryption_uses_qpdf_provider_fallback_for_a_short_object_key`
+covers the password-derived key, while
+`raw_five_byte_hex_key_matches_repeatable_qpdf_output` covers the raw
+`--password-is-hex-key` route; both compare bytes only when qpdf repeats
 stably. For 1-byte R=6 raw keys, qpdf output changes across runs, so the test
 gates exit/stderr rather than claiming undefined ciphertext bytes.
 
