@@ -607,6 +607,73 @@ fn copy_encryption_uses_qpdf_provider_fallback_for_a_short_object_key() {
     );
 }
 
+/// A five-byte raw hex key on a V=4 AES donor produces a 14-byte per-object
+/// key. Compare the CLI's `--password-is-hex-key` route with qpdf when qpdf's
+/// out-of-bounds AES provider read happens to repeat deterministically.
+#[test]
+fn raw_five_byte_hex_key_matches_repeatable_qpdf_output() {
+    if !qpdf_available() {
+        eprintln!("skipping qpdf differential: qpdf 11.9.0 is not available");
+        return;
+    }
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let donor = donor_with_patched_length(
+        directory.path(),
+        "v4-len040-raw-hex-key",
+        &[
+            "--user-password=u",
+            "--owner-password=o",
+            "--bits=128",
+            "--use-aes=y",
+        ],
+        b"/Length 128 /O",
+        b"/Length 040 /O",
+    );
+    let donor_path = donor.to_str().expect("donor path must be UTF-8");
+    let qpdf_output = directory.path().join("raw-key-qpdf.pdf");
+    let qpdf_repeat_output = directory.path().join("raw-key-qpdf-repeat.pdf");
+    let flpdf_output = directory.path().join("raw-key-flpdf.pdf");
+    let args = [
+        "--static-id",
+        "--static-aes-iv",
+        "--allow-weak-crypto",
+        "--password-is-hex-key",
+        "--password=6161616161",
+        donor_path,
+    ];
+    let mut qpdf_args = args.to_vec();
+    qpdf_args.push(qpdf_output.to_str().expect("output path must be UTF-8"));
+    let qpdf = run_qpdf(&qpdf_args);
+    let mut qpdf_repeat_args = args.to_vec();
+    qpdf_repeat_args.push(
+        qpdf_repeat_output
+            .to_str()
+            .expect("repeated output path must be UTF-8"),
+    );
+    let qpdf_repeat = run_qpdf(&qpdf_repeat_args);
+    let mut flpdf_args = args.to_vec();
+    flpdf_args.push(flpdf_output.to_str().expect("output path must be UTF-8"));
+    let flpdf = run_flpdf(&flpdf_args);
+
+    assert_eq!(qpdf_repeat.stdout, qpdf.stdout, "qpdf stdout must repeat");
+    assert_eq!(qpdf_repeat.stderr, qpdf.stderr, "qpdf stderr must repeat");
+    assert_eq!(flpdf.status.code(), qpdf.status.code(), "exit status");
+    assert_eq!(flpdf.stdout, qpdf.stdout, "stdout");
+    assert_eq!(flpdf.stderr, qpdf.stderr, "stderr");
+
+    let qpdf_bytes = std::fs::read(qpdf_output).expect("read qpdf output");
+    let qpdf_repeat_bytes = std::fs::read(qpdf_repeat_output).expect("read repeated qpdf output");
+    let flpdf_bytes = std::fs::read(flpdf_output).expect("read flpdf output");
+    if qpdf_bytes == qpdf_repeat_bytes {
+        assert!(
+            flpdf_bytes == qpdf_bytes,
+            "raw five-byte hex-key output must match repeatable qpdf bytes (flpdf {flpdf_len} bytes, qpdf {qpdf_len} bytes)",
+            flpdf_len = flpdf_bytes.len(),
+            qpdf_len = qpdf_bytes.len()
+        );
+    }
+}
+
 /// Same-width in-place patch of an existing donor. The `/Encrypt` dictionary
 /// is never itself encrypted, so replacing a marker of identical width keeps
 /// every xref offset valid.
