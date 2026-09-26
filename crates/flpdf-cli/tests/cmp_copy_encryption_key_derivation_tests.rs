@@ -517,18 +517,14 @@ fn copy_encryption_rederives_the_key_from_an_empty_hex_key_password() {
     }
 }
 
-/// The one malformed-`/Length` shape that stays divergent on purpose.
-///
 /// A V=4 donor with `/Length 040` yields a 5-byte file key, hence a 14-byte
-/// per-object AES key (`QPDF::compute_data_key`). qpdf hands that buffer to
-/// its crypto provider, which selects AES-128 for every length other than
-/// 24/32 and reads 16 bytes from it (`QPDFCrypto_gnutls.cc:197-213`,
-/// `QPDFCrypto_openssl.cc:225-241`), so the last two key bytes are an
-/// out-of-bounds read with no defined value. flpdf rejects the key rather
-/// than fabricating them; see the `qpdf-deviation` markers on
-/// `pipeline::aes::PlAesPdf` and `writer::encrypted_strings`.
+/// per-object AES key (`QPDF::compute_data_key`). qpdf passes that raw key to
+/// its AES-128 fallback, whose provider reads 16 bytes from the shorter
+/// buffer (`QPDFCrypto_gnutls.cc:197-213`, `QPDFCrypto_openssl.cc:225-241`).
+/// This read is undefined, so the test compares bytes only when two qpdf
+/// runs with fixed ID and IV produce the same output.
 #[test]
-fn copy_encryption_rejects_an_aes_key_qpdf_would_read_out_of_bounds() {
+fn copy_encryption_uses_qpdf_provider_fallback_for_a_short_object_key() {
     if !qpdf_available() {
         eprintln!("skipping qpdf differential: qpdf 11.9.0 is not available");
         return;
@@ -547,39 +543,67 @@ fn copy_encryption_rejects_an_aes_key_qpdf_would_read_out_of_bounds() {
         b"/Length 040 /O",
     );
     let donor_path = donor.to_str().expect("donor path must be UTF-8");
-    let output = directory.path().join("v4-len040-out.pdf");
-
+    let qpdf_output = directory.path().join("v4-len040-qpdf.pdf");
+    let qpdf_repeat_output = directory.path().join("v4-len040-qpdf-repeat.pdf");
+    let flpdf_output = directory.path().join("v4-len040-flpdf.pdf");
+    let args = [
+        "--static-id",
+        "--static-aes-iv",
+        "--allow-weak-crypto",
+        "--password=u",
+        donor_path,
+    ];
     let qpdf = run_qpdf(&[
-        "--static-id",
-        "--static-aes-iv",
-        "--allow-weak-crypto",
-        "--password=u",
-        donor_path,
-        directory
-            .path()
-            .join("v4-len040-qpdf.pdf")
+        args[0],
+        args[1],
+        args[2],
+        args[3],
+        args[4],
+        qpdf_output
             .to_str()
-            .expect("output path must be UTF-8"),
+            .expect("qpdf output path must be UTF-8"),
     ]);
-    assert!(qpdf.status.success(), "qpdf accepts the over-read key");
-
+    let qpdf_repeat = run_qpdf(&[
+        args[0],
+        args[1],
+        args[2],
+        args[3],
+        args[4],
+        qpdf_repeat_output
+            .to_str()
+            .expect("repeated qpdf output path must be UTF-8"),
+    ]);
     let flpdf = run_flpdf(&[
-        "--static-id",
-        "--static-aes-iv",
-        "--allow-weak-crypto",
-        "--password=u",
-        donor_path,
-        output.to_str().expect("output path must be UTF-8"),
+        args[0],
+        args[1],
+        args[2],
+        args[3],
+        args[4],
+        flpdf_output
+            .to_str()
+            .expect("flpdf output path must be UTF-8"),
     ]);
-    assert_eq!(flpdf.status.code(), Some(2), "flpdf rejects the short key");
-    // Whichever encrypted object is emitted first decides which of the two
-    // marked sites reports it: the string pre-check in
-    // `writer::encrypted_strings` or the `Pl_AES_PDF` key check itself.
+
+    assert_eq!(qpdf_repeat.status.code(), qpdf.status.code());
+    assert_eq!(qpdf_repeat.stderr, qpdf.stderr);
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    let qpdf_bytes = std::fs::read(qpdf_output).expect("read qpdf output");
+    let qpdf_repeat_bytes = std::fs::read(qpdf_repeat_output).expect("read repeated qpdf output");
+    let flpdf_bytes = std::fs::read(flpdf_output).expect("read flpdf output");
+    if qpdf_bytes == qpdf_repeat_bytes {
+        assert_eq!(
+            flpdf_bytes, qpdf_bytes,
+            "flpdf output should match reproducible qpdf short-key output"
+        );
+    }
+    // When qpdf's out-of-bounds provider read changes between runs, its byte
+    // output is undefined; exit status and diagnostics remain the observable
+    // contract for that case.
     let stderr = String::from_utf8_lossy(&flpdf.stderr).into_owned();
     assert!(
-        stderr.contains("V=4 AES-128 data key is not 16 bytes")
-            || stderr.contains("Pl_AES_PDF: key must be at least 16 bytes"),
-        "flpdf must name the short AES key: {stderr}"
+        stderr.is_empty(),
+        "the qpdf provider fallback must not reject the short key: {stderr}"
     );
 }
 

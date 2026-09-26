@@ -20,10 +20,13 @@ use predicates::prelude::PredicateBooleanExt;
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
+use std::process::{Command as ProcessCommand, Output};
 
 #[path = "support/eol.rs"]
 mod eol;
 use eol::EOL;
+#[path = "support/text_newlines.rs"]
+mod text_newlines;
 
 /// V=5 R=6 AES-256 fixture, user password `user-v5-r6`. Reference key
 /// captured from qpdf 11.9.0 (see cli_encryption_inspect.rs module header).
@@ -44,6 +47,147 @@ const V2_RC4: &str = "../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf";
 
 fn flpdf() -> Command {
     Command::cargo_bin("flpdf").unwrap()
+}
+
+const EXPECTED_QPDF_VERSION: &str = "qpdf version 11.9.0";
+
+#[derive(Debug, Clone, Copy)]
+enum ShortHexKeyMode {
+    Check,
+    StaticId,
+    Json,
+}
+
+fn qpdf_11_9_available() -> bool {
+    let observation = match ProcessCommand::new("qpdf").arg("--version").output() {
+        Ok(output)
+            if output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .map(str::trim)
+                    == Some(EXPECTED_QPDF_VERSION) =>
+        {
+            return true;
+        }
+        Ok(output) => format!(
+            "found {:?} (status {})",
+            String::from_utf8_lossy(&output.stdout).lines().next(),
+            output.status
+        ),
+        Err(error) => format!("unable to run qpdf --version: {error}"),
+    };
+
+    if std::env::var_os("CI").is_some() {
+        panic!("qpdf 11.9.0 is required for short hex-key parity tests; {observation}");
+    }
+    eprintln!("skipping short hex-key parity: qpdf 11.9.0 is required; {observation}");
+    false
+}
+
+fn run_short_hex_key_command(
+    program: &str,
+    key: &str,
+    mode: ShortHexKeyMode,
+    output_path: Option<&Path>,
+) -> Output {
+    let mut command = ProcessCommand::new(program);
+    command.args(["--password-is-hex-key", &format!("--password={key}")]);
+    match mode {
+        ShortHexKeyMode::Check => {
+            command.args(["--check", "../../tests/fixtures/compat/one-page-enc-u.pdf"]);
+        }
+        ShortHexKeyMode::StaticId => {
+            command.args([
+                "--static-id",
+                "../../tests/fixtures/compat/one-page-enc-u.pdf",
+            ]);
+            command.arg(output_path.expect("static-id mode requires an output path"));
+        }
+        ShortHexKeyMode::Json => {
+            command.args(["--json=2", "../../tests/fixtures/compat/one-page-enc-u.pdf"]);
+        }
+    }
+    if program != "qpdf" {
+        command.env("FLPDF_PROGNAME", "qpdf");
+    }
+    command.output().expect("run short-key command")
+}
+
+fn assert_short_hex_key_mode_matches_qpdf(mode: ShortHexKeyMode) {
+    if !qpdf_11_9_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary output directory");
+    for key_bytes in 1..16 {
+        let key = "00".repeat(key_bytes);
+        let output_path = (matches!(mode, ShortHexKeyMode::StaticId))
+            .then(|| temp.path().join("short-key-output.pdf"));
+        if output_path.as_ref().is_some_and(|path| path.exists()) {
+            fs::remove_file(output_path.as_ref().unwrap()).expect("remove previous output");
+        }
+        let qpdf = run_short_hex_key_command("qpdf", &key, mode, output_path.as_deref());
+        if output_path.as_ref().is_some_and(|path| path.exists()) {
+            fs::remove_file(output_path.as_ref().unwrap()).expect("remove qpdf output");
+        }
+        let flpdf = run_short_hex_key_command(
+            assert_cmd::cargo::cargo_bin!("flpdf")
+                .to_str()
+                .expect("flpdf path"),
+            &key,
+            mode,
+            output_path.as_deref(),
+        );
+
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "{mode:?}, {key_bytes}-byte key: exit status"
+        );
+        let flpdf_stderr = text_newlines::normalize_text_newlines(&flpdf.stderr);
+        let qpdf_stderr = text_newlines::normalize_text_newlines(&qpdf.stderr);
+        if matches!(mode, ShortHexKeyMode::Check) {
+            assert_eq!(
+                normalize_undefined_short_key_inflate_detail(&flpdf_stderr),
+                normalize_undefined_short_key_inflate_detail(&qpdf_stderr),
+                "{mode:?}, {key_bytes}-byte key: stderr outside qpdf's undefined AES tail"
+            );
+        } else {
+            assert_eq!(
+                flpdf_stderr, qpdf_stderr,
+                "{mode:?}, {key_bytes}-byte key: stderr"
+            );
+        }
+    }
+}
+
+fn normalize_undefined_short_key_inflate_detail(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .split_inclusive('\n')
+        .map(|line_with_newline| {
+            let (line, newline) = line_with_newline
+                .strip_suffix('\n')
+                .map_or((line_with_newline, ""), |line| (line, "\n"));
+            line.split_once("stream inflate: inflate: data: ")
+                .map(|(prefix, _)| {
+                    format!(
+                        "{prefix}stream inflate: inflate: data: <undefined short-key tail>{newline}"
+                    )
+                })
+                .unwrap_or_else(|| line_with_newline.to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn short_key_inflate_normalization_preserves_the_final_newline() {
+    assert_eq!(
+        normalize_undefined_short_key_inflate_detail(
+            b"warning: decode failed\nstream inflate: inflate: data: incorrect header check\n"
+        ),
+        "warning: decode failed\nstream inflate: inflate: data: <undefined short-key tail>\n"
+    );
 }
 
 /// Run `show-encryption-key` to recover the hex key, asserting it matches the
@@ -265,6 +409,29 @@ fn hex_key_ignores_non_hex_input_like_qpdf() {
         ])
         .assert()
         .success();
+}
+
+#[test]
+fn short_hex_key_check_exit_and_error_chain_match_qpdf() {
+    // qpdf decodes short raw file keys without a length check and reaches its
+    // AES-128 provider fallback. On this R=6 fixture, `--check` then reports
+    // the resulting invalid Flate header rather than rejecting the key.
+    assert_short_hex_key_mode_matches_qpdf(ShortHexKeyMode::Check);
+}
+
+#[test]
+fn short_hex_key_static_id_exit_and_stderr_match_qpdf() {
+    // qpdf writes the document successfully for the same raw keys. The
+    // provider's short-key fallback is exercised while rewriting encrypted
+    // strings and streams.
+    assert_short_hex_key_mode_matches_qpdf(ShortHexKeyMode::StaticId);
+}
+
+#[test]
+fn short_hex_key_json_exit_and_stderr_match_qpdf() {
+    // qpdf JSON v2 serializes the page/object graph without forcing the
+    // content stream decode that `--check` performs.
+    assert_short_hex_key_mode_matches_qpdf(ShortHexKeyMode::Json);
 }
 
 #[test]

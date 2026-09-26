@@ -7378,7 +7378,7 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_aes_object_key_propagates_before_the_pipe_try() {
+    fn a_short_aes_object_key_uses_the_qpdf_provider_fallback() {
         let mut encryption = v4_encryption(EncryptionMode::Aes128);
         encryption.file_key.clear();
         encryption.cached_object_encryption_key.clear();
@@ -7387,9 +7387,8 @@ mod tests {
         *resolver.encryption_parameters().borrow_mut() = Some(encryption);
         let dict = crate::ObjectHandle::dictionary(vec![]);
         let mut sink = crate::pipeline::test_support::RecordingSink::new(&[], &[]);
-        let trace = sink.trace();
 
-        let error = resolver
+        resolver
             .pipe_stream_data(
                 ObjectRef::new(4, 0),
                 0,
@@ -7399,11 +7398,7 @@ mod tests {
                 false,
                 false,
             )
-            .expect_err("decryptStream stage-construction errors propagate");
-        assert!(error
-            .to_string()
-            .contains("Pl_AES_PDF: key must be at least 16 bytes"));
-        assert!(trace.borrow().calls.is_empty(), "the sink is untouched");
+            .expect("short keys use qpdf's AES-128 provider fallback");
         assert!(resolver.repair_diagnostics().entries().is_empty());
     }
 
@@ -7510,7 +7505,7 @@ mod tests {
         let mut ciphertext = plaintext.to_vec();
         crate::encryption::standard::encrypt_cipher_bytes(
             &mut ciphertext,
-            crate::encryption::standard::StringEncryptCipher::Aes128 { key: &key },
+            crate::encryption::standard::StringEncryptCipher::Aes { key: &key },
             &[0x5a; 16],
         )
         .expect("build AES ciphertext");
@@ -7546,7 +7541,7 @@ mod tests {
         let mut ciphertext = plaintext.to_vec();
         crate::encryption::standard::encrypt_cipher_bytes(
             &mut ciphertext,
-            crate::encryption::standard::StringEncryptCipher::Aes256 { key: &key },
+            crate::encryption::standard::StringEncryptCipher::Aes { key: &key },
             &[0x5a; 16],
         )
         .expect("build AES-256 ciphertext");
@@ -7587,7 +7582,7 @@ mod tests {
         let mut ciphertext = plaintext.to_vec();
         crate::encryption::standard::encrypt_cipher_bytes(
             &mut ciphertext,
-            crate::encryption::standard::StringEncryptCipher::Aes128 { key: &key },
+            crate::encryption::standard::StringEncryptCipher::Aes { key: &key },
             &[0x5a; 16],
         )
         .expect("build AES ciphertext with qpdf's cached key");
@@ -7642,7 +7637,7 @@ mod tests {
         let mut stream_ciphertext = stream_plaintext.to_vec();
         crate::encryption::standard::encrypt_cipher_bytes(
             &mut stream_ciphertext,
-            crate::encryption::standard::StringEncryptCipher::Aes128 { key: &key },
+            crate::encryption::standard::StringEncryptCipher::Aes { key: &key },
             &[0x5a; 16],
         )
         .expect("build AES ciphertext");
@@ -7697,7 +7692,7 @@ mod tests {
         let mut ciphertext = plaintext.to_vec();
         crate::encryption::standard::encrypt_cipher_bytes(
             &mut ciphertext,
-            crate::encryption::standard::StringEncryptCipher::Aes128 { key: &key },
+            crate::encryption::standard::StringEncryptCipher::Aes { key: &key },
             &[0x5a; 16],
         )
         .expect("build AES ciphertext");
@@ -8043,7 +8038,7 @@ mod tests {
         let mut ciphertext = plaintext.to_vec();
         crate::encryption::standard::encrypt_cipher_bytes(
             &mut ciphertext,
-            crate::encryption::standard::StringEncryptCipher::Aes128 { key: &key },
+            crate::encryption::standard::StringEncryptCipher::Aes { key: &key },
             &[0x5a; 16],
         )
         .expect("build AES ciphertext");
@@ -9148,38 +9143,6 @@ mod tests {
             .as_ref()
             .cloned()
             .expect("encrypted fixture has encryption parameters")
-    }
-
-    // This catches a production regression where the resolver adapter accepts
-    // a string cipher failure and returns ciphertext. Replacing the parser
-    // callback's `?` with recovery makes this resolution succeed instead.
-    //
-    // The failure has to come from key derivation rather than from the
-    // ciphertext: `Pl_AES_PDF` never rejects a payload for its length or its
-    // padding (see the lenient-acceptance test below), so a short file key —
-    // which leaves the shared `compute_data_key` returning something that is neither an
-    // AES-128 nor an AES-256 key — is what a string cipher failure looks like.
-    #[test]
-    fn canonical_resolver_propagates_string_decryption_errors() {
-        let resolver = ResolverHandle::new_shared(
-            Cursor::new(b"1 0 obj\n(bad AES ciphertext)\nendobj\n".to_vec()),
-            0,
-            BTreeMap::from([(ObjectRef::new(1, 0), XrefEntry::Uncompressed { offset: 0 })]),
-            false,
-            false, // already_reconstructed
-            Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
-            0,
-        );
-        let mut state = aes128_encryption_state();
-        state.file_key.truncate(5);
-        *resolver.encryption_parameters().borrow_mut() = Some(state);
-
-        let error = resolver
-            .read_object_at_offset(0, ObjectRef::new(1, 0))
-            .expect_err("an underivable AES object key must fail object parsing");
-
-        assert!(matches!(error, Error::Encrypted(_)), "got {error:?}");
     }
 
     /// qpdf's `decryptString` runs the stored bytes through `Pl_AES_PDF` into a

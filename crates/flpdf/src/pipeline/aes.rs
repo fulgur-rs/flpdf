@@ -126,7 +126,7 @@ impl<'a> PlAesPdf<'a> {
     ) -> PipelineResult<Self> {
         let key = match key.len() {
             16 | 24 | 32 => key.to_vec(),
-            len if len > 16 && len != 24 => {
+            len if len > 16 => {
                 // qpdf's GnuTLS and OpenSSL providers select AES-128 for every
                 // key length other than 16/24/32 and configure a 16-byte
                 // provider key (`QPDFCrypto_gnutls.cc:197-213`,
@@ -135,11 +135,14 @@ impl<'a> PlAesPdf<'a> {
                 // projection uses its first 16 bytes.
                 key[..16].to_vec()
             }
-            // qpdf-deviation: qpdf's providers read 16 key bytes past the end of a shorter raw key (undefined contents); reject instead of fabricating them
             len => {
-                return Err(PipelineError::logic(format!(
-                    "Pl_AES_PDF: key must be at least 16 bytes, got {len}"
-                )))
+                // qpdf's providers still choose AES-128 and request a
+                // 16-byte provider key for a shorter raw key. Their C++ path
+                // reads past the string's logical length; give the Rust
+                // provider a bounded buffer with the same available prefix.
+                let mut provider_key = vec![0; 16];
+                provider_key[..len].copy_from_slice(key);
+                provider_key
             }
         };
         Ok(Self {
@@ -165,13 +168,6 @@ impl<'a> PlAesPdf<'a> {
     /// key_bytes)`. Unless a vector is supplied, the initialization vector is
     /// read from the head of the input, which is where a PDF stream carries it.
     ///
-    /// # Errors
-    ///
-    /// [`PipelineError`] when `key` is shorter than 16 bytes. qpdf's crypto
-    /// providers select AES-192 for a 24-byte key and AES-128 for other
-    /// unsupported lengths using at least 16 bytes of key material. The
-    /// normal PDF-facing contract remains AES-128/AES-256
-    /// (`libqpdf/qpdf/Pl_AES_PDF.hh:8-9`).
     pub(crate) fn new_decrypt(
         identifier: impl Into<String>,
         next: &'a mut dyn Pipeline,
@@ -197,10 +193,6 @@ impl<'a> PlAesPdf<'a> {
     /// that does not look like padding is left in place (`:183-196`), neither
     /// of which is an error.
     ///
-    /// # Errors
-    ///
-    /// Same key-length contract as [`Self::new_decrypt`], including qpdf's
-    /// AES-192 and unsupported-length provider dispatch.
     pub(crate) fn decrypt_to_vec(
         identifier: impl Into<String>,
         data: &[u8],
@@ -277,10 +269,6 @@ impl<'a> PlAesPdf<'a> {
     /// key_bytes)`. Unless a vector is supplied or zeroed, a fresh random
     /// initialization vector is generated and written ahead of the ciphertext.
     ///
-    /// # Errors
-    ///
-    /// Same key-length contract as [`Self::new_decrypt`], including qpdf's
-    /// AES-192 and unsupported-length provider dispatch.
     pub(crate) fn new_encrypt(
         identifier: impl Into<String>,
         next: &'a mut dyn Pipeline,
@@ -1008,31 +996,19 @@ mod tests {
         twenty.extend_from_slice(&[0x5a; 4]);
         assert_eq!(encrypt(&twenty), encrypt(&KEY128));
 
-        // Below 16 bytes qpdf's providers read past the key buffer, which has
-        // no reproducible result; this port rejects such keys.
-        let mut sink = Buffer::new("ciphertext", None);
-        let short = PlAesPdf::new_encrypt("AES stream encryption", &mut sink, &[0u8; 8])
-            .err()
-            .map(|error| error.to_string());
-        assert!(short.as_deref().is_some_and(|m| m.contains("got 8")));
-    }
-
-    // A key shorter than the qpdf provider's 16-byte fallback input is
-    // rejected because qpdf's provider reads beyond the raw key buffer there.
-    // That undefined behavior is recorded by the deviation marker above.
-    #[test]
-    fn a_key_shorter_than_the_provider_fallback_is_rejected() {
-        let mut sink = Buffer::new("ciphertext", None);
-
-        let message = PlAesPdf::new_encrypt("AES stream encryption", &mut sink, &[0u8; 8])
-            .err()
-            .map(|error| error.to_string());
-
-        assert_eq!(
-            message.as_deref().map(|m| m.contains("at least 16 bytes")),
-            Some(true),
-            "8 bytes is below the provider fallback boundary: {message:?}"
-        );
+        // qpdf's GnuTLS/OpenSSL providers also select AES-128 for a short
+        // key, but their 16-byte read crosses the C++ string's boundary. The
+        // Rust provider uses a zero-filled tail to keep that path bounded.
+        for key_bytes in 0..16 {
+            let short = vec![0xa5; key_bytes];
+            let mut padded = [0u8; 16];
+            padded[..key_bytes].copy_from_slice(&short);
+            assert_eq!(
+                encrypt(&short),
+                encrypt(&padded),
+                "short key length {key_bytes} follows the AES-128 provider fallback"
+            );
+        }
     }
 
     // `setIV` throws when the vector is not exactly the block size
@@ -1166,8 +1142,7 @@ mod tests {
         }
     }
 
-    /// The one-shot inherits `new_decrypt`'s key-length contract, including
-    /// qpdf's AES-192 provider dispatch.
+    /// The one-shot preserves qpdf's AES-192 and AES-128 fallback dispatch.
     #[test]
     fn decrypt_to_vec_accepts_an_aes192_key() {
         let key = [0xa5u8; 24];

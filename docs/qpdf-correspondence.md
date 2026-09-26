@@ -1631,17 +1631,22 @@ V5R6 128）と `--password-is-hex-key`（4 長）を `--copy-encryption` / prese
 空のままなので qpdf は空パスワードから鍵を導出し、qpdf 自身の出力が qpdf 自身の
 `--check` を通らなくなるが、CLAUDE.md の oracle 方針に従い flpdf もその出力を再現する。
 
-**残る逸脱**: V=4 donor の `/Length 040` は 5 バイトの file key、すなわち 14 バイトの
-per-object AES key を生む。qpdf はそのバッファを crypto provider に渡し、provider は
-24/32 以外の長さを AES-128 に写して 16 バイトを読む（`QPDFCrypto_gnutls.cc:197-213`、
-`QPDFCrypto_openssl.cc:225-241`）ため、末尾 2 バイトは未定義の over-read になる。
-flpdf は既存方針どおりこれを捏造せず拒否する（`pipeline/aes.rs` と
-`writer/encrypted_strings.rs` の `qpdf-deviation` マーカー、および本節下表の
-`QPDF_encryption.cc` 行の記載）。この 1 形状だけ exit code が qpdf と異なる。
+**2026-09-26 (`flpdf-ehl7u`) provider boundary update**: V=4 donor の
+`/Length 040` は 5-byte file key から 14-byte per-object AES key を生む。
+qpdf passes that key to its AES-128 provider, which reads 16 bytes for every
+length other than 24/32 (`QPDFCrypto_gnutls.cc:197-213`,
+`QPDFCrypto_openssl.cc:225-241`). The final bytes are undefined in qpdf.
+flpdf now passes raw keys to the shared `PlAesPdf` provider and zero-fills only
+the missing tail, avoiding an out-of-bounds read while preserving qpdf's
+AES-128 fallback. On the pinned GnuTLS qpdf build, two runs with `--static-id`
+and `--static-aes-iv` on the `/Length 040` donor were byte-identical and flpdf
+matched them; the regression test compares bytes only when qpdf repeats
+stably. For 1-byte R=6 raw keys, qpdf output changes across runs, so the test
+gates exit/stderr rather than claiming undefined ciphertext bytes.
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDF_encryption.cc` | 1410 | `encryption.rs` (facade) + `encryption/state.rs` + `encryption/crypt_filters.rs` + `encryption/keys.rs` + `encryption/standard.rs`(1879) + `encryption/permissions.rs`(206) + `encryption/password.rs`(380: `password_bytes_for_read` + `password_candidates_for_read` — qpdf `QPDFJob.cc:1734-1790` の read-side hex decode、raw-byte pass-through、alternate encoding retry と suppress gate、`QUtil.cc:1821-1900` の PDFDoc/WinAnsi/MacRoman candidates、V=5 の 127-byte 切り詰めは Standard handler が担当。`--password-is-hex-key` は `QPDF_encryption.cc:933-934` の通り decoded key に通常の 32-byte 上限を適用せず、`QPDFJob.cc:1245-1252` の JSON bits も実 key 長を報告する。AES provider は 16/24/32 以外の鍵長を AES-128（先頭 16 バイト、`QPDFCrypto_gnutls.cc:197-213` / `QPDFCrypto_openssl.cc:225-244` の default arm）へ投影し、24 バイトは AES-192 を選ぶ。16 バイト未満は qpdf が鍵バッファを over-read する未定義挙動のため flpdf は拒否する（reader 側 `encryption/state.rs::aes128_object_key` と writer 側 `writer/encrypted_strings.rs` / `pipeline/aes.rs` の `qpdf-deviation` マーカー。writer 側は copy-encryption の V=4 `/Length 040` donor から到達する）) | 🔀 |
+| `QPDF_encryption.cc` | 1410 | `encryption.rs` (facade) + `encryption/state.rs` + `encryption/crypt_filters.rs` + `encryption/keys.rs` + `encryption/standard.rs`(1879) + `encryption/permissions.rs`(206) + `encryption/password.rs`(380: `password_bytes_for_read` + `password_candidates_for_read` — qpdf `QPDFJob.cc:1734-1790` の read-side hex decode、raw-byte pass-through、alternate encoding retry と suppress gate、`QUtil.cc:1821-1900` の PDFDoc/WinAnsi/MacRoman candidates、V=5 の 127-byte 切り詰めは Standard handler が担当。`--password-is-hex-key` は `QPDF_encryption.cc:933-934` の通り decoded key に通常の 32-byte 上限を適用せず、`QPDFJob.cc:1245-1252` の JSON bits も実 key 長を報告する。AES provider は 16/24/32 以外の鍵長を AES-128（先頭 16 バイト、`QPDFCrypto_gnutls.cc:197-213` / `QPDFCrypto_openssl.cc:225-244` の default arm）へ投影し、24 バイトは AES-192 を選ぶ。16 バイト未満でも raw object key を AES-128 provider へ渡し、`PlAesPdf` が不足分を zero-fill して key-length 拒否を行わない。qpdf の不足分は C++ buffer over-read で未定義のため byte 列は契約せず、`flpdf-ehl7u` が 1〜15 byte の check/status と static-id / JSON status を検証する。V=4 `/Length 040` の copy-encryption 経路も同じ provider を通り、qpdf repeat が安定した環境では byte 比較する。) | 🔀 |
 | `rijndael.cc` / `AES_PDF_native` / `MD5_native` / `SHA2_native` | 1668 | `encryption/primitives.rs`(106: AES single-block ECB と MD5) + `pipeline/sha2.rs` の `Sha2Digest`(SHA2)（外部 crate）。AES-CBC は `pipeline/aes.rs` の `PlAesPdf` に一本化済みで、`encryption/primitives.rs` には V=5 R=6 Algorithm 10/13 の single-block ECB だけが残る。qpdf は `SHA2_native` へ `Pl_SHA2` 経由でしか到達しない（`QPDF_encryption.cc:246,296` が唯一の production 利用）ため、RustCrypto の SHA-2 hasher も `Pl_SHA2` 移植の内部に閉じている。`encryption/primitives.rs` の一括 `sha256`/`sha384`/`sha512` wrapper は consumer cutover で削除済み | ⚪ |
 | `RC4.cc` / `RC4_native.cc` | 63 | `encryption/rc4.rs`(80)（明示長キー / C-string キー、state 保持、separate / in-place processing） | ✅ |
 | `QPDFCryptoProvider.cc` / `QPDFCrypto_*` | 774 | provider 抽象が無い | ⚪ |

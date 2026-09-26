@@ -1528,12 +1528,9 @@ pub(crate) fn build_v5_r5_encrypt_dict(
 pub(crate) enum StringCipher<'a> {
     /// RC4 with an already-derived object key (V<5) or selected CF key.
     Rc4 { key: &'a [u8] },
-    /// AES-128-CBC with an already-derived object key. PDF string bytes include the IV.
-    Aes128 { key: &'a [u8; 16] },
-    /// AES-192-CBC with a raw provider key. PDF string bytes include the IV.
-    Aes192 { key: &'a [u8; 24] },
-    /// AES-256-CBC for V=5. PDF string bytes include the IV.
-    Aes256 { key: &'a [u8; 32] },
+    /// AES with the raw qpdf object key. The crypto provider chooses AES-128,
+    /// AES-192, or AES-256 from the key length. PDF string bytes include the IV.
+    Aes { key: &'a [u8] },
 }
 
 pub(crate) fn decrypt_cipher_bytes(bytes: &mut Vec<u8>, cipher: StringCipher<'_>) -> Result<()> {
@@ -1550,15 +1547,7 @@ pub(crate) fn decrypt_cipher_bytes(bytes: &mut Vec<u8>, cipher: StringCipher<'_>
         // split off here and a payload of one block or less simply yields no
         // plaintext. Keeping this on the stage rather than a one-shot cipher is
         // what preserves qpdf's tolerance for a short or unpadded tail.
-        StringCipher::Aes128 { key } => {
-            *bytes = PlAesPdf::decrypt_to_vec("AES string decryption", bytes, key)?;
-            Ok(())
-        }
-        StringCipher::Aes192 { key } => {
-            *bytes = PlAesPdf::decrypt_to_vec("AES string decryption", bytes, key)?;
-            Ok(())
-        }
-        StringCipher::Aes256 { key } => {
+        StringCipher::Aes { key } => {
             *bytes = PlAesPdf::decrypt_to_vec("AES string decryption", bytes, key)?;
             Ok(())
         }
@@ -1591,12 +1580,10 @@ pub(crate) enum StringEncryptCipher<'a> {
     /// RC4 (V=1, V=2, V=4 `/CFM /V2`) with an already-derived per-object key.
     /// IV is unused (RC4 is a stream cipher with no IV).
     Rc4 { key: &'a [u8] },
-    /// AES-128-CBC (V=4 `/CFM /AESV2`) with an already-derived per-object key.
-    /// Output is `IV ‖ AES-CBC(plaintext, key, IV)` with PKCS#7 padding.
-    Aes128 { key: &'a [u8; 16] },
-    /// AES-256-CBC (V=5 `/CFM /AESV3`) with the file key.
-    /// Output is `IV ‖ AES-CBC(plaintext, key, IV)` with PKCS#7 padding.
-    Aes256 { key: &'a [u8; 32] },
+    /// AES-CBC with the raw qpdf key. The crypto provider selects the cipher
+    /// from the key length. Output is `IV ‖ AES-CBC(plaintext, key, IV)` with
+    /// PKCS#7 padding.
+    Aes { key: &'a [u8] },
 }
 
 /// Encrypt a single byte buffer in place — the writer-side inverse of
@@ -1606,7 +1593,7 @@ pub(crate) enum StringEncryptCipher<'a> {
 ///
 /// - `Rc4`: RC4-encrypts `bytes` in place; the buffer length is unchanged.
 ///   `iv` is ignored.
-/// - `Aes128` / `Aes256`: PKCS#7-pads `bytes` to a 16-byte block boundary,
+/// - `Aes`: PKCS#7-pads `bytes` to a 16-byte block boundary,
 ///   AES-CBC-encrypts under `key` with `iv`, then sets `bytes` to
 ///   `iv ‖ ciphertext`. The output is always at least 32 bytes (16-byte IV
 ///   + at least one 16-byte ciphertext block).
@@ -1625,17 +1612,9 @@ pub(crate) fn encrypt_cipher_bytes(
             cipher.process_in_place(bytes);
             Ok(())
         }
-        StringEncryptCipher::Aes128 { key } => {
+        StringEncryptCipher::Aes { key } => {
             let encrypted =
-                PlAesPdf::encrypt_to_vec_with_iv("AES-128 string encryption", bytes, key, iv)?;
-            bytes.clear();
-            bytes.extend_from_slice(iv);
-            bytes.extend_from_slice(&encrypted);
-            Ok(())
-        }
-        StringEncryptCipher::Aes256 { key } => {
-            let encrypted =
-                PlAesPdf::encrypt_to_vec_with_iv("AES-256 string encryption", bytes, key, iv)?;
+                PlAesPdf::encrypt_to_vec_with_iv("AES string encryption", bytes, key, iv)?;
             bytes.clear();
             bytes.extend_from_slice(iv);
             bytes.extend_from_slice(&encrypted);

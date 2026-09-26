@@ -2,31 +2,16 @@
 //!
 //! qpdf correspondence: `QPDF.hh:899-923` and `QPDF_encryption.cc:700-1205` encryption state, crypt-filter dispatch, object-key cache, and inspection projection.
 //!
-//! Deviation: qpdf's AES providers map every key length other than 24 and 32
-//! to AES-128 and hand the cipher 16 bytes from the key buffer
-//! (`QPDFCrypto_gnutls.cc:197-213`, `QPDFCrypto_openssl.cc:225-241`), so an
-//! *object* key shorter than 16 bytes is read past its end. What reaches the
-//! provider is the per-object key, not the document key: for `V` below 5
-//! [`super::primitives::compute_data_key_qpdf_obj_gen`] appends the object and
-//! generation bytes plus `sAlT` and truncates the digest to that input's
-//! length, so a document key of 7 bytes already yields a full 16, while for
-//! `V` 5 and above the document key is used unchanged. Such a key is
-//! reachable through `--password-is-hex-key`, which uses the decoded bytes
-//! without a length check (`QPDF_encryption.cc:933-934`).
-//!
-//! The bytes qpdf reads past the end are undefined, so
-//! [`aes128_object_key`] rejects the key instead of fabricating them. Against
-//! the qpdf 11.9.0 build used here the exit codes sometimes agree and
-//! sometimes do not, and which paths diverge depends on the input as much
-//! as on the build: on one file `--check` agreed while the write and
-//! `--json` paths differed (0 vs. 2, 0 vs. 3), while on
-//! `enc-XI-R6,V5,O=master` all of `--check`, the write path, `--json` and
-//! `--show-npages` differed the same way (3 vs. 2), and on
-//! `enc-XI-R6,V5,U=attachment,encrypted-attachments` `--json` agreed while
-//! the other two differed. An out-of-bounds read has no guaranteed outcome,
-//! so none of these pairings is part of the deviation's contract -- they
-//! are observations, not a target to port. See
-//! `docs/qpdf-correspondence.md` for the corresponding row.
+//! AES object keys remain raw through encryption-state lookup and are passed
+//! to the shared `PlAesPdf` provider, matching qpdf's `getKeyForObject` then
+//! `QPDFCryptoProvider` boundary. qpdf's GnuTLS/OpenSSL providers select
+//! AES-128 for key lengths other than 16, 24, or 32 bytes. For a key shorter
+//! than 16 bytes qpdf reads past the key buffer; the bytes beyond the string
+//! length are undefined. `PlAesPdf` zero-fills only that missing tail so the
+//! Rust implementation reaches the same AES-128 fallback without an
+//! out-of-bounds read. The resulting plaintext bytes for an unauthenticated
+//! short key are not a stable qpdf contract, but the CLI exit/stderr paths are
+//! checked against qpdf 11.9.0. See `docs/qpdf-correspondence.md`.
 //!
 
 use super::crypt_filters::{crypt_filter_modes_from_handle, interpret_cf_selector_from_handle};
@@ -38,7 +23,7 @@ use super::standard::{
     check_user_password_r6, check_user_password_v4, StandardHandlerInputs, StandardHandlerR5Inputs,
 };
 use crate::encryption::standard::{decrypt_cipher_bytes, StringCipher};
-use crate::error::{EncryptedError, Result};
+use crate::error::Result;
 use crate::pipeline::aes::PlAesPdf;
 use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::{ObjectHandle, ObjectRef};
@@ -148,13 +133,8 @@ impl EncryptionState {
             let key = self.key_for_qpdf_obj_gen(object_gen, use_aes).to_vec();
             if !use_aes {
                 decrypt_cipher_bytes(bytes, StringCipher::Rc4 { key: &key })?;
-            } else if let Ok(key) = <&[u8; 32]>::try_from(key.as_slice()) {
-                decrypt_cipher_bytes(bytes, StringCipher::Aes256 { key })?;
-            } else if let Ok(key) = aes192_object_key(&key) {
-                decrypt_cipher_bytes(bytes, StringCipher::Aes192 { key: &key })?;
             } else {
-                let key = aes128_object_key(&key)?;
-                decrypt_cipher_bytes(bytes, StringCipher::Aes128 { key: &key })?;
+                decrypt_cipher_bytes(bytes, StringCipher::Aes { key: &key })?;
             }
         }
         Ok(())
@@ -198,36 +178,6 @@ impl EncryptionState {
         }
         &self.cached_object_encryption_key
     }
-}
-
-pub(crate) fn aes128_object_key(key: &[u8]) -> Result<[u8; 16]> {
-    match key.len() {
-        16 => key.try_into().map_err(|_| unreachable!("length checked")),
-        // qpdf's providers map every key length other than 16/24/32 to
-        // AES-128 and hand the provider the first 16 bytes
-        // (`QPDFCrypto_gnutls.cc:197-213`, `QPDFCrypto_openssl.cc:225-241`).
-        // A 32-byte key is dispatched to AES-256 by the caller, and 24 bytes
-        // selects AES-192 before reaching this AES-128 helper.
-        len if len > 16 && len != 24 && len != 32 => {
-            let mut object_key = [0u8; 16];
-            object_key.copy_from_slice(&key[..16]);
-            Ok(object_key)
-        }
-        // qpdf-deviation: qpdf's providers read 16 key bytes past the end of a shorter raw key (undefined contents); reject instead of fabricating them
-        _ => Err(EncryptedError::Malformed {
-            reason: "AES-128 object key is not 16 bytes".into(),
-        }
-        .into()),
-    }
-}
-
-pub(crate) fn aes192_object_key(key: &[u8]) -> Result<[u8; 24]> {
-    key.try_into().map_err(|_| {
-        EncryptedError::Malformed {
-            reason: "AES-192 object key is not 24 bytes".into(),
-        }
-        .into()
-    })
 }
 
 /// qpdf `QPDF::encryption_method_e` (`QPDF.hh:436`).
