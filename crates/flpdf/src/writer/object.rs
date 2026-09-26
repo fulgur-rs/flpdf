@@ -7521,3 +7521,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "object/unparse_object_tests.rs"]
+mod unparse_object_tests;
