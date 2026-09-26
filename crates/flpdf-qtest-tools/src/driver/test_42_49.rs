@@ -1113,11 +1113,11 @@ pub(crate) fn run_test_49<R: Read + Seek>(
         let mut tree_helper = OutlineDocumentHelper::new(pdf);
         tree_helper.get_tree()?
     };
-    let pages = flpdf::pages::page_refs(pdf)?;
+    let pages = flpdf::PageDocumentHelper::new(pdf).get_all_pages()?;
     let mut helper = OutlineDocumentHelper::new(pdf);
-    for (pageno, page_ref) in pages.into_iter().enumerate() {
+    for (pageno, page) in pages.into_iter().enumerate() {
         let mut lines: Vec<(String, Vec<u8>)> = Vec::new();
-        for (_, item) in tree.get_outlines_for_page(&mut helper, Some(page_ref))? {
+        for (_, item) in tree.get_outlines_for_page(&mut helper, page.get_obj_gen())? {
             let title = item.get_title(&mut helper)?;
             let dest = item.get_dest(&mut helper)?.unparse_resolved();
             lines.push((title, dest));
