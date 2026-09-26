@@ -524,18 +524,18 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             .unwrap_or_default())
     }
 
-    /// Return the Widget annotations listed by a page, preserving their live
-    /// handles for qpdf-shaped consumers.
+    /// Return the Widget annotations listed by a raw page handle, preserving
+    /// their live identities for qpdf-shaped consumers.
     ///
-    /// This is the handle-native counterpart of
-    /// `QPDFAcroFormDocumentHelper::getWidgetAnnotationsForPage`, which is a
-    /// thin delegation to `QPDFPageObjectHelper::getAnnotations("/Widget")`
+    /// This is the Rust counterpart of
+    /// `QPDFAcroFormDocumentHelper::getWidgetAnnotationsForPage(QPDFPageObjectHelper)`,
+    /// which delegates to `QPDFPageObjectHelper::getAnnotations("/Widget")`
     /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:197-201`).
     pub fn get_widget_annotations_for_page(
         &mut self,
-        page_ref: ObjectRef,
+        page_handle: ObjectHandle,
     ) -> Result<Vec<ObjectHandle>> {
-        let mut page = PageObjectHelper::new(page_ref, self.pdf);
+        let mut page = PageObjectHelper::from_object_handle(page_handle, self.pdf);
         page.get_annotation_handles(Some(b"/Widget"))
     }
 
@@ -596,14 +596,13 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             *self.cache.borrow_mut() = Some(AcroFormCache::default());
             return Ok(());
         };
-        // qpdf's orphan-widget fallback walks the canonical page annotation
-        // route and associates an otherwise-unreachable widget with itself.
-        // `pages::page_refs` uses the same repaired page-list route and returns
-        // qpdf's empty result when the catalog has no `/Pages` entry.
-        // qpdf's `analyze()` obtains the Catalog through `QPDF::getRoot`
-        // before scanning all pages (`QPDFAcroFormDocumentHelper.cc:235-286`);
-        // use the same direct-or-indirect root gate here. Invalid root shapes
-        // retain the existing no-op analysis behavior.
+        // qpdf's orphan-widget fallback walks the raw page handles through
+        // `QPDFPageDocumentHelper::getAllPages` and associates each
+        // otherwise-unreachable Widget with itself. qpdf's `analyze()` obtains
+        // the Catalog through `QPDF::getRoot` before scanning all pages
+        // (`QPDFAcroFormDocumentHelper.cc:235-286`); use the same
+        // direct-or-indirect root gate here. Invalid root shapes retain the
+        // existing no-op analysis behavior.
         let pages = match self.pdf.root_handle() {
             Ok(root) => Some(root.try_get_key(b"/Pages")?),
             Err(_) => None, // cov:ignore: analyze_field_tree returns before this fallback for the same invalid root
@@ -613,10 +612,10 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             // has `/Kids`; `try_has_key` also preserves qpdf's type warning
             // and empty-result behavior for a non-dictionary `/Pages` value.
             if pages.try_has_key(b"/Kids")? {
-                let page_refs = crate::pages::page_refs(self.pdf)?;
-                for page_ref in page_refs {
+                let page_handles = crate::PageDocumentHelper::new(self.pdf).get_all_pages()?;
+                for page_handle in page_handles {
                     let widgets = {
-                        let mut page = PageObjectHelper::new(page_ref, self.pdf);
+                        let mut page = PageObjectHelper::from_object_handle(page_handle, self.pdf);
                         page.get_annotation_handles(Some(b"/Widget"))?
                     };
                     for annotation in widgets {

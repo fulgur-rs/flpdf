@@ -2846,7 +2846,7 @@ loggerで再openする経路はtop-level CLIから除去し、`--show-linearizat
 | `doJSONPages`(1030) | `job/json_sections.rs::build_pages_section` (raw page handles; outline association keyed by `QpdfObjGen`) |
 | `doJSONPageLabels`(1095) | `job/json_sections.rs::build_pagelabels_section` |
 | `doJSONOutlines`(1143) | `job/json_sections.rs::build_outlines_section` (page positions and indirect destinations keyed by raw `QpdfObjGen`) |
-| `doJSONAcroform`(1159) | `job/json_sections.rs::build_acroform_section` |
+| `doJSONAcroform`(1159) | `job/json_sections.rs::build_acroform_section` (raw page handles from `PageDocumentHelper::get_all_pages()`; Widget lookup and orphan association preserve raw `ObjectHandle` identity) |
 | `doJSONEncrypt`(1206) | `job/json_sections.rs::build_encrypt_section` |
 | `doJSONAttachments`(1281) | `job/json_sections.rs::build_attachments_section` |
 | `json_schema`(1332) / `json_out_schema`(1533) | `JsonKey` ほか |

@@ -451,18 +451,17 @@ pub(crate) fn run_test_43<R: Read + Seek>(
     }
 
     writeln!(stdout, "iterating over annotations per page")?;
-    let qpdf_flush_result_37 = flpdf::pages::page_refs(pdf);
+    let qpdf_flush_result_37 = flpdf::PageDocumentHelper::new(pdf).get_all_pages();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let pages = qpdf_flush_result_37?;
-    for page_ref in pages {
-        let page = pdf.get_object_handle(page_ref);
+    for page in pages {
         write!(stdout, "Page: ")?;
         write_bytes(stdout, &page.unparse())?;
         writeln!(stdout)?;
 
         let annotations = {
             let mut acroform = AcroFormDocumentHelper::new(pdf)?;
-            acroform.get_widget_annotations_for_page(page_ref)?
+            acroform.get_widget_annotations_for_page(page)?
         };
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         for annotation in annotations {
@@ -1715,9 +1714,10 @@ mod tests {
     fn get_form_fields_preserves_qpdf_zero_objgen_orphan_membership() {
         let mut pdf = pdf_with_direct_orphan_widget();
         let (fields, annotations, widgets, first_field, second_field) = {
+            let page = pdf.get_object_handle(flpdf::ObjectRef::new(3, 0));
             let mut acroform = AcroFormDocumentHelper::new(&mut pdf).expect("AcroForm helper");
             let widgets = acroform
-                .get_widget_annotations_for_page(flpdf::ObjectRef::new(3, 0))
+                .get_widget_annotations_for_page(page)
                 .expect("get page widgets");
             assert_eq!(widgets.len(), 2);
             let first_field = acroform
