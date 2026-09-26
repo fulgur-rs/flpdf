@@ -2416,7 +2416,7 @@ self-overlayのcontroller状態を回帰テストで固定した。これはE-4�
 
 `coalesceContents` も生成 handler (`auto_job_json_init.hh:311-313`)、Config (`QPDFJob_config.cc:88-91`)、変換順序 (`QPDFJob.cc:2185-2188`) に対応し、既存の provider-backed `ObjectHandle::coalesce_content_streams` を `job/lifecycle.rs` から呼ぶ。
 
-`flattenRotation` も生成 handler (`auto_job_json_init.hh:377-382`)、Config (`QPDFJob_config.cc:204-207`)、変換順序 (`QPDFJob.cc:2190-2194`) に対応し、既存の `flatten_rotation_on_pages` (`QPDFPageObjectHelper.cc:862-991`) を `job/lifecycle.rs` から呼ぶ。`coalesceContents` の直後に配置して、qpdfのページ変換順序を保つ。
+`flattenRotation` も生成 handler (`auto_job_json_init.hh:377-382`)、Config (`QPDFJob_config.cc:204-207`)、変換順序 (`QPDFJob.cc:2190-2194`) に対応する。qpdfは共有 AcroForm helper を構築した後、`QPDFPageDocumentHelper::getAllPages` が返す raw page helper を順に `QPDFPageObjectHelper::flattenRotation` へ渡す。flpdfの `flatten_rotation_on_document` も同じ順序で AcroForm helper を初期化し、`PageDocumentHelper::get_all_pages` の raw handle を `flatten_rotation_on_page_handles` から `PageObjectHelper::from_object_handle` へ渡す。`PageObjectHelper::flatten_rotation` は live page handle を使い、`ObjectRef` への projection を要求しない。`coalesceContents` の直後に配置してqpdfの変換順序を保ち、qpdfに対応物のない公開 `flatten_rotation_on_pages(&[ObjectRef])` wrapper は撤去した。
 
 2026-09-10（`flpdf-v7vr`）では、top-level の no-`--pages` `--rotate`/`--split-pages`
 consumerも `QPDFJobConfig::rotate` / `split_pages` へ raw parameterを渡し、

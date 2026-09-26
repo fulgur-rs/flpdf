@@ -23,7 +23,8 @@ fn page_rotation_uses_separate_job_route_without_the_legacy_module() {
 
     let job = fs::read_to_string(src.join("job/mod.rs")).expect("job/mod.rs must be readable");
     assert!(job.contains("mod rotate;"));
-    assert!(job.contains("pub use rotate::"));
+    assert!(job.contains("pub(crate) use rotate::flatten_rotation_on_document;"));
+    assert!(!job.contains("pub use rotate::flatten_rotation_on_pages;"));
 
     let rotate_spec =
         fs::read_to_string(src.join("job/rotate_spec.rs")).expect("rotate_spec.rs must exist");

@@ -6,6 +6,7 @@
 
 use super::attachments::AttachmentAddOptions;
 use super::attachments::AttachmentCopyOptions;
+use super::flatten_rotation_on_document;
 use super::image_optimization::{optimize_images, ImageOptimizationOptions};
 use super::json::{JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData};
 use super::overlay::{
@@ -15,7 +16,6 @@ use super::page_range::PageRange;
 use super::page_specs::PageSpecInput;
 use super::page_split::SplitPageOptions;
 use super::resource_pruning::RemoveUnreferencedResources;
-use super::rotate::flatten_rotation_on_pages;
 use super::rotate_spec::{parse_rotation_parameter, RotationSpec};
 use crate::encryption::{
     EncryptMethod, EncryptParams, PasswordMode, PermissionsConfig, R2PermissionsConfig,
@@ -4009,10 +4009,10 @@ impl QPDFJob {
         // qpdf's `handleTransformations` flattens rotation after coalescing
         // content streams and before page-label/output completion
         // (`QPDFJob.cc:2190-2194`). The existing job rotation module owns the
-        // page-level matrix, box, and annotation semantics.
+        // page-level matrix, box, and annotation semantics. Preserve qpdf's
+        // raw page-helper boundary instead of projecting through ObjectRef.
         if configuration.flatten_rotation {
-            let page_refs = crate::pages::page_refs(pdf)?;
-            flatten_rotation_on_pages(pdf, &page_refs)?;
+            flatten_rotation_on_document(pdf)?;
         }
 
         self.apply_page_label_transformations(pdf, configuration)?;
@@ -5855,8 +5855,150 @@ fn parse_object_stream_mode(value: &str) -> Result<ObjectStreamMode> {
 mod tests {
     use super::*;
     use crate::job::overlay::OverlayVerboseSource;
+    use crate::object_handle::ObjectValue;
     use crate::{Error, ObjectHandle, ObjectRef, PageDocumentHelper, PageInput, PdfOpenOptions};
     use std::io::Cursor;
+
+    #[test]
+    fn flatten_rotation_lifecycle_accepts_raw_page_and_widget_handles() {
+        let mut pdf = Pdf::empty().expect("empty PDF should open");
+        let catalog = pdf.root_handle().expect("empty PDF has a catalog");
+        let pages = catalog
+            .try_get_key(b"/Pages")
+            .expect("catalog has a page tree");
+        let raw_page = pdf.get_object_handle_by_raw_identity(5, 65_535);
+        let raw_widget = pdf.get_object_handle_by_raw_identity(6, 65_535);
+        raw_widget.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+                (b"/FT".to_vec(), ObjectHandle::name(b"Tx".to_vec())),
+                (b"/T".to_vec(), ObjectHandle::string(b"raw-page".to_vec())),
+                (b"/V".to_vec(), ObjectHandle::string(b"value".to_vec())),
+                (
+                    b"/Rect".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(10),
+                        ObjectHandle::integer(20),
+                        ObjectHandle::integer(60),
+                        ObjectHandle::integer(40),
+                    ]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        raw_page.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+                (b"/Parent".to_vec(), pages.clone()),
+                (
+                    b"/MediaBox".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(200),
+                        ObjectHandle::integer(300),
+                    ]),
+                ),
+                (b"/Rotate".to_vec(), ObjectHandle::integer(90)),
+                (
+                    b"/Annots".to_vec(),
+                    ObjectHandle::array(vec![raw_widget.clone()]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        pages
+            .replace_key(b"/Kids", ObjectHandle::array(vec![raw_page.clone()]))
+            .expect("install raw-generation page");
+        pages
+            .replace_key(b"/Count", ObjectHandle::integer(1))
+            .expect("set page count");
+        raw_widget
+            .replace_key(b"/P", raw_page.clone())
+            .expect("associate Widget with raw-generation page");
+        catalog
+            .replace_key(
+                b"/AcroForm",
+                ObjectHandle::dictionary(vec![(
+                    b"/Fields".to_vec(),
+                    ObjectHandle::array(vec![raw_widget]),
+                )]),
+            )
+            .expect("install AcroForm");
+
+        let configuration = JobConfiguration {
+            flatten_rotation: true,
+            ..JobConfiguration::default()
+        };
+        let mut job = QPDFJob::new();
+        job.prepare_document_transformations(&mut pdf, &configuration)
+            .expect("rotation flattening must keep the raw page and Widget identities");
+
+        raw_page.try_is_scalar().expect("raw page resolves");
+        assert!(
+            !raw_page.try_has_key(b"/Rotate").expect("read /Rotate"),
+            "flattening removes the direct page rotation"
+        );
+        let media_box = raw_page
+            .try_get_key(b"/MediaBox")
+            .expect("read rotated MediaBox");
+        let media_box = media_box.as_array().expect("MediaBox is an array");
+        let media_box = media_box
+            .iter()
+            .map(|item| {
+                item.as_integer()
+                    .map(|value| value as f64)
+                    .or_else(|| item.as_real())
+                    .expect("MediaBox coordinate")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(media_box, vec![0.0, 0.0, 300.0, 200.0]);
+
+        let page_contents = PageObjectHelper::from_object_handle(raw_page.clone(), &mut pdf)
+            .get_page_contents()
+            .expect("read flattened page contents");
+        assert_eq!(page_contents.len(), 2);
+        let prefix = page_contents[0]
+            .get_stream_data(crate::writer::DecodeLevel::Generalized)
+            .expect("read rotation matrix stream");
+        assert_eq!(prefix.as_slice(), b"q\n0 -1 1 0 0 200 cm\n");
+        let suffix = page_contents[1]
+            .get_stream_data(crate::writer::DecodeLevel::Generalized)
+            .expect("read graphics-state restore stream");
+        assert_eq!(suffix.as_slice(), b"\nQ\n");
+
+        let annots = raw_page
+            .try_get_key(b"/Annots")
+            .expect("read transformed /Annots");
+        let annots = annots.as_array().expect("/Annots remains an array");
+        assert_eq!(annots.len(), 1);
+        let rect = annots[0]
+            .try_get_key(b"/Rect")
+            .expect("read transformed Widget /Rect");
+        let rect = rect.as_array().expect("Widget /Rect is an array");
+        let rect = rect
+            .iter()
+            .map(|item| {
+                item.as_integer()
+                    .map(|value| value as f64)
+                    .or_else(|| item.as_real())
+                    .expect("Widget rectangle coordinate")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rect, vec![20.0, 140.0, 40.0, 190.0]);
+
+        let acroform = catalog
+            .try_get_key(b"/AcroForm")
+            .expect("AcroForm remains in Catalog");
+        acroform.try_is_scalar().expect("AcroForm resolves");
+        let fields = acroform
+            .try_get_key(b"/Fields")
+            .expect("read transformed field tree");
+        let fields = fields.as_array().expect("/Fields remains an array");
+        assert_eq!(fields.len(), 1);
+    }
 
     #[test]
     fn keep_files_open_policy_counts_distinct_page_sources_and_honors_overrides() {

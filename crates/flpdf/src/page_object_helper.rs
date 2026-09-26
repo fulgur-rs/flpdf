@@ -909,11 +909,12 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// (`libqpdf/QPDFPageObjectHelper.cc:862-991`). qpdf intentionally reads
     /// `/Rotate`, `/MediaBox`, and the optional page boxes directly from the
     /// page object here; inherited values are not materialized by this method.
+    /// It operates on the live page handle and does not require an
+    /// `ObjectRef` projection.
     /// The page-document orchestration that calls this method remains outside
     /// [`PageObjectHelper`]. Annotation field-tree work is delegated to
     /// [`crate::AcroFormDocumentHelper`]'s canonical transform route.
     pub fn flatten_rotation(&mut self) -> Result<()> {
-        self.require_page_ref()?;
         let page = self.resolved_page_handle()?;
 
         let rotate = page.try_get_key(b"/Rotate")?.try_as_integer()?.unwrap_or(0);
