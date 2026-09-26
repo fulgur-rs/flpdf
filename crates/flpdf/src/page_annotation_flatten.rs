@@ -834,12 +834,16 @@ fn acroform_need_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
 }
 
 fn remove_acroform<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
-    // `root_handle` accepts a direct trailer /Root; a missing/dangling/
-    // non-dictionary root is a no-op the same way the pre-existing
-    // `root_ref()`-based checks were.
-    let Ok(root) = pdf.root_handle() else {
-        return Ok(()); // cov:ignore: a parsed Pdf always has a resolvable root
-    };
+    // qpdf's `flattenAnnotations` tail is
+    // `this->qpdf.getRoot().removeKey("/AcroForm")`
+    // (`QPDFPageDocumentHelper.cc:76-78`), and `getRoot()` throws
+    // "unable to find /Root dictionary" for a missing or non-dictionary root
+    // (`QPDF.cc:2355-2360`). Propagate that instead of treating an
+    // unresolvable root as a silent no-op: `getAllPages()` skips its own
+    // `getRoot()` once the page list is cached (`QPDF_pages.cc:41-47` guards
+    // on `m->all_pages.empty()`), so this tail is the boundary that reports a
+    // catalog invalidated after the walk.
+    let root = pdf.root_handle()?;
     root.remove_key(b"/AcroForm");
     // qpdf's own `flattenAnnotations` (`QPDFPageDocumentHelper.cc:56-77`)
     // analyzes through a scope-local `QPDFAcroFormDocumentHelper` that goes
@@ -3779,6 +3783,37 @@ mod tests {
             !root_after_rotation.try_has_key(b"/AcroForm").unwrap(),
             "flatten_rotation must not resurrect /AcroForm from a stale \
              pre-removal AcroForm association cache"
+        );
+    }
+
+    #[test]
+    fn flatten_annotations_reports_a_catalog_invalidated_after_the_page_walk() {
+        // qpdf's getAllPages() skips its own getRoot() once the page list is
+        // cached (`QPDF_pages.cc:41-47` guards on `m->all_pages.empty()`), so
+        // a catalog invalidated after the walk is only reported by the
+        // flattenAnnotations tail `getRoot().removeKey("/AcroForm")`
+        // (`QPDFPageDocumentHelper.cc:76-78`). A live qpdf 11.9.0 probe on
+        // this shape returns the cached page list and then throws
+        // "unable to find /Root dictionary" from flattenAnnotations.
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+        let root_ref = pdf.root_ref().unwrap();
+        pdf.replace_object(
+            root_ref,
+            crate::ObjectHandle::array(vec![crate::ObjectHandle::integer(1)]),
+        )
+        .unwrap();
+
+        let error = flatten_annotations_qpdf(&mut pdf, &[page_ref], 0, 0)
+            .expect_err("an invalidated catalog must surface qpdf's getRoot failure");
+        assert!(
+            matches!(
+                error,
+                crate::Error::QpdfExc(ref exc)
+                    if exc.get_message_detail() == b"unable to find /Root dictionary"
+            ),
+            "unexpected error: {error:?}"
         );
     }
 }
