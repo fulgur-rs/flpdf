@@ -52,7 +52,7 @@ Expected: fail because qpdf reports `/Fx0 /Length` 89 while flpdf omits it; `/Fx
 
 - [x] **Step 3: Materialize `/Fx0` in the overlay consumer.**
 
-In `apply_overlays_to_page`, immediately after `get_form_xobject_for_page`, obtain the destination-owned handle, call `get_raw_stream_data`, then `replace_stream_data(data, None, None)` before adding `/Fx0` to the resource entries. Propagate the raw-read error with `?`.
+In `under_overlay_for_page`, immediately after `get_form_xobject_for_page`, obtain the destination-owned handle, call `get_raw_stream_data`, then `replace_stream_data(data, None, None)` before adding `/Fx0` to the resource entries. Propagate the raw-read error with `?`.
 
 - [x] **Step 4: Run the new test and verify GREEN.**
 
@@ -72,7 +72,7 @@ Commit: `fix(cli): preserve qpdf overlay Fx0 stream length in JSON`
 
 **Files:** no additional source files; Beads and GitHub metadata only after verification.
 
-- [ ] **Step 1: Run required local gates.**
+- [x] **Step 1: Run required local gates.**
 
 Run each gate:
 
@@ -92,9 +92,9 @@ Run each gate:
 
 Expected: every gate exits successfully and changed executable lines have 100% patch coverage.
 
-- [ ] **Step 2: Rebase onto current `origin/main` and rerun affected gates.**
+- [x] **Step 2: Rebase onto current `origin/main` and verify the tested head.**
 
-Expected: clean rebase; no source or test behavior changes outside the reviewed issue scope. Rerun the focused CLI matrix, `cargo fmt --all -- --check`, `cargo test --workspace`, all-feature Clippy, strict Rustdoc, qpdf module/deviation/route checks, and fresh patch coverage on the rebased head.
+Expected: clean rebase. If `HEAD` changes, rerun the focused CLI matrix, formatting, workspace tests, all-feature Clippy, strict Rustdoc, qpdf module/deviation/route checks, and fresh patch coverage. If rebase is a no-op and all gates already ran on the same `HEAD` and merge-base, record those exact SHAs and retain the existing gate results.
 
 - [ ] **Step 3: Push and create a Draft PR.**
 
