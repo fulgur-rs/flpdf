@@ -920,6 +920,73 @@ mod tests {
     }
 
     #[test]
+    fn pclm_seeds_a_raw_generation_page_without_object_ref_projection() {
+        if !exact_qpdf_11_9() {
+            return; // cov:ignore: this qpdf-oracle regression is skipped when the pinned binary is unavailable.
+        }
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let pages = pdf
+            .root_handle()
+            .expect("Catalog")
+            .try_get_key(b"/Pages")
+            .expect("root Pages");
+        let page_ref = ObjectRef::new(17, 65_535);
+        let page = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (b"/Parent".to_vec(), pages.clone()),
+            (
+                b"/MediaBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(612),
+                    ObjectHandle::integer(792),
+                ]),
+            ),
+            (
+                b"/Resources".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/XObject".to_vec(),
+                    ObjectHandle::dictionary(Vec::new()),
+                )]),
+            ),
+        ]);
+        pdf.replace_object(page_ref, page)
+            .expect("install qpdf raw-generation page");
+        let raw_page = pdf.get_object_handle_by_raw_identity(17, 65_535);
+        pages
+            .replace_key(b"/Kids", ObjectHandle::array(vec![raw_page]))
+            .expect("attach raw-generation page");
+        pages
+            .replace_key(b"/Count", ObjectHandle::integer(1))
+            .expect("set page count");
+
+        let output = write_pclm_bytes(&mut pdf)
+            .expect("PCLm queue must enqueue the raw page handle without ObjectRef projection");
+        let directory = tempfile::tempdir().expect("PCLm output directory");
+        let output_path = directory.path().join("raw-generation-pclm.pdf");
+        std::fs::write(&output_path, output).expect("write PCLm output");
+        let check = Command::new("qpdf")
+            .arg("--check")
+            .arg(&output_path)
+            .output()
+            .expect("qpdf checks PCLm output");
+        let check_stderr = String::from_utf8_lossy(&check.stderr);
+        assert_eq!(
+            check.status.code(),
+            Some(0),
+            "qpdf accepts PCLm output: {check_stderr}"
+        );
+        let page_count = Command::new("qpdf")
+            .arg("--show-npages")
+            .arg(&output_path)
+            .output()
+            .expect("qpdf reads PCLm page count");
+        assert!(page_count.status.success());
+        assert_eq!(String::from_utf8_lossy(&page_count.stdout).trim(), "1");
+    }
+
+    #[test]
     fn pclm_propagates_page_contents_resolution_errors() {
         let mut pdf = Pdf::open(ReadFailingCursor {
             inner: Cursor::new(

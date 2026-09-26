@@ -40,7 +40,7 @@ fn pclm_planning_and_emission_do_not_materialize_legacy_objects() {
 }
 
 #[test]
-fn pclm_planning_uses_canonical_resolving_accessors() {
+fn pclm_seed_uses_the_raw_qpdf_page_handle_route() {
     let seed = live_queue_seed_source(include_str!("../src/writer/plain/body.rs"));
 
     for forbidden in [
@@ -54,9 +54,20 @@ fn pclm_planning_uses_canonical_resolving_accessors() {
             "PCLm seeding retains legacy accessor route {forbidden}"
         );
     }
+    let pclm_seed = seed
+        .split_once("fn enqueue_objects_pclm<")
+        .expect("PCLm seed")
+        .1
+        .split_once("fn initialize_live_queue<")
+        .expect("live queue initializer")
+        .0;
     assert!(
-        seed.contains("try_dereference") && seed.contains("try_is_null"),
-        "PCLm seeding must use canonical resolving accessors"
+        pclm_seed.contains("PageDocumentHelper::new(pdf).get_all_pages()?"),
+        "PCLm seeding must consume qpdf's repaired raw page-handle list"
+    );
+    assert!(
+        !pclm_seed.contains("pages::page_refs") && !pclm_seed.contains("get_object_handle("),
+        "PCLm seeding must not project a raw page handle through ObjectRef"
     );
 }
 

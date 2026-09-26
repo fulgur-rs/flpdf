@@ -476,14 +476,9 @@ fn enqueue_objects_pclm<R: Read + Seek>(
     let image_transform_content = Rc::new(b"q /image Do Q\n".to_vec());
 
     // enqueue all pages first
-    for page in crate::pages::page_refs(pdf)? {
-        // enqueue page
-        //
-        // qpdf's `getAllPages()` hands back resolved handles; `page_refs`
-        // returns identities, so resolve here to reach the same state (and to
-        // surface a source read failure at the same point qpdf does).
-        let page = pdf.get_object_handle(page);
-        page.try_dereference()?;
+    for page in crate::PageDocumentHelper::new(pdf).get_all_pages()? {
+        // qpdf's `getAllPages()` returns raw page handles. Keep that identity
+        // through the PCLm seed instead of projecting through ObjectRef.
         enqueue_object(queue, pdf, &page)?;
 
         // enqueue page contents stream
