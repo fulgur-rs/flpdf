@@ -1281,6 +1281,27 @@ mod tests {
             .expect("update page count");
     }
 
+    fn install_outline_with_null_page_destination(pdf: &mut Pdf<Cursor<Vec<u8>>>) {
+        let item = ObjectHandle::dictionary(vec![
+            (
+                b"/Dest".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::null(),
+                    ObjectHandle::name(b"Fit".to_vec()),
+                ]),
+            ),
+            (
+                b"/Title".to_vec(),
+                ObjectHandle::string(b"Null destination outline".to_vec()),
+            ),
+        ]);
+        let outlines = ObjectHandle::dictionary(vec![(b"/First".to_vec(), item)]);
+        pdf.root_handle()
+            .expect("catalog")
+            .replace_key(b"/Outlines", outlines)
+            .expect("install outline with null destination");
+    }
+
     fn install_outline_targeting_raw_generation_page(pdf: &mut Pdf<Cursor<Vec<u8>>>) {
         let page = pdf.get_object_handle(ObjectRef::new(5, 65_535));
         let item = ObjectHandle::dictionary(vec![
@@ -1483,6 +1504,28 @@ mod tests {
             items[0].get_dict_item(b"destpageposfrom1").get_number(),
             Some(b"1".to_vec())
         );
+    }
+
+    #[test]
+    fn outlines_json_keeps_the_zero_identity_bucket_for_null_destinations() {
+        let mut pdf = one_page_pdf();
+        install_outline_with_null_page_destination(&mut pdf);
+
+        let zero_bucket_count = {
+            let mut helper = pdf.outline();
+            let tree = helper.get_tree().expect("materialize outline tree");
+            tree.get_outlines_for_page(&mut helper, crate::QpdfObjGen::default())
+                .expect("query qpdf's zero-identity bucket")
+                .count()
+        };
+        assert_eq!(zero_bucket_count, 1);
+
+        let outlines = build_outlines_section_with_version(&mut pdf, 2)
+            .expect("direct destination page position is null");
+        let mut items = Vec::new();
+        assert!(outlines.for_each_array_item(|item| items.push(item)));
+        assert_eq!(items.len(), 1);
+        assert!(items[0].get_dict_item(b"destpageposfrom1").is_null());
     }
 
     #[test]
