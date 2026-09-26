@@ -971,7 +971,12 @@ mod tests {
             .arg(&output_path)
             .output()
             .expect("qpdf checks PCLm output");
-        assert_eq!(check.status.code(), Some(0));
+        let check_stderr = String::from_utf8_lossy(&check.stderr);
+        assert_eq!(
+            check.status.code(),
+            Some(0),
+            "qpdf accepts PCLm output: {check_stderr}"
+        );
         let page_count = Command::new("qpdf")
             .arg("--show-npages")
             .arg(&output_path)
