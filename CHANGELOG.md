@@ -232,6 +232,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1](https://github.com/fulgur-rs/flpdf/compare/v0.9.0...v0.9.1) - 2026-09-26
+
+### Added
+
+- expose qpdf raw object generation identity
+
+### Fixed
+
+- *(cli)* preserve qpdf overlay Fx0 stream length in JSON
+- keep PCLm page seeds on raw handles
+- follow qpdf short hex-key provider fallback
+- *(flatten)* propagate the getRoot failure from the AcroForm tail
+- return raw qpdf handles from page list
+
+### Other
+
+- Test zero-identity outline destination bucket
+- Preserve raw page identity in JSON outlines
+- add summary to writer emission test module
+- move writer emission tests to writer module
+- *(linearization)* guard reachable scan count
+- *(pclm)* retain qpdf failure diagnostics
+- *(pclm)* keep qpdf oracle coverage precise
+
 ## [0.9.0](https://github.com/fulgur-rs/flpdf/compare/v0.8.0...v0.9.0) - 2026-09-25
 
 ### Fixed
