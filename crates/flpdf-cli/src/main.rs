@@ -3149,7 +3149,11 @@ fn main() {
             || args.show_linearization
             || args.list_attachments
             || args.show_attachment.is_some();
-        if !target_is_rewrite && !target_is_inspection {
+        // qpdf prepares underlay/overlay in createQPDF before JSON output is
+        // serialized (`QPDFJob.cc:428-481,484-489`), so JSON is a valid
+        // consumer for these parsed groups too.
+        let target_is_json_output = args.json.is_some() || args.json_output.is_some();
+        if !target_is_rewrite && !target_is_inspection && !target_is_json_output {
             emit_logger_error(
                 "flpdf: --overlay/--underlay can only be used with rewrite output, \
                  not with inspection or other commands\n",
@@ -3244,6 +3248,7 @@ fn main() {
             &args,
             top_level_inspection_transform_options,
             &attachment_segments,
+            &overlay_specs,
             args.page_ops.empty,
         )
     } else if let Some(command) = args.command {
@@ -4145,6 +4150,7 @@ fn run_json(
     cli: &Cli,
     transform_options: InspectionTransformOptions<'_>,
     attachment_segments: &[Vec<Vec<u8>>],
+    overlay_specs: &[OverlaySpec],
     empty: bool,
 ) -> CliResult<()> {
     const QPDF_JSON_KEY_NAMES: &[&str] = &[
@@ -4287,6 +4293,7 @@ fn run_json(
     // configurator sets it only when it has a transformation to install.
     job.set_verbose(cli.verbose);
     configure_top_level_attachment_mutations(&mut job, cli, attachment_segments)?;
+    configure_cli_overlay_specs(&mut job, overlay_specs)?;
     // The page-source file lifetime is a property of the job that runs the
     // merge, not of the write route: `QPDFJob::handlePageSpecs` consults
     // `m->keep_files_open` when it decides whether to hold every donor open
