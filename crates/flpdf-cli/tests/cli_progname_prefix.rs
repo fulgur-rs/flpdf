@@ -146,6 +146,9 @@ fn flpdf_only_static_id_notice_keeps_product_prefix_under_qpdf_shim() {
     Command::cargo_bin("flpdf")
         .expect("flpdf binary")
         .env("FLPDF_PROGNAME", "qpdf")
+        // This assertion needs the static-id notice itself, so drop an ambient
+        // FLPDF_STATIC_ID_QUIET the way the prefix helper drops FLPDF_PROGNAME.
+        .env_remove("FLPDF_STATIC_ID_QUIET")
         .arg("rewrite")
         .arg("--static-id")
         .arg(fixture)
