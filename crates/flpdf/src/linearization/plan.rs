@@ -4590,6 +4590,26 @@ mod tests {
     }
 
     #[test]
+    fn linearization_plan_reuses_object_user_map_without_fallback_reachability_scan() {
+        let mut pdf = Pdf::open(Cursor::new(parameter_probe_fixture())).expect("parse fixture");
+        let options = WriterOptions {
+            object_streams: ObjectStreamMode::Disable,
+            ..WriterOptions::default()
+        };
+        crate::writer::rewrite_renumber::test_support::reset_fallback_reachability_walk_calls();
+
+        let plan = LinearizationPlan::from_pdf_with_writer_options(&mut pdf, &options)
+            .expect("build linearization plan from qpdf object-user map");
+
+        assert!(!plan.part2_objects.is_empty());
+        assert_eq!(
+            crate::writer::rewrite_renumber::test_support::fallback_reachability_walk_calls(),
+            0,
+            "complete page-parent ownership should reuse the optimization object-user map"
+        );
+    }
+
+    #[test]
     fn stream_parameter_probe_uses_a_live_dictionary_lookup_with_warning_fallback() {
         let source = include_str!("plan.rs").replace("\r\n", "\n");
         let start = source

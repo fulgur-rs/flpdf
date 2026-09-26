@@ -47,6 +47,27 @@ use crate::Pdf;
 #[cfg(test)]
 use crate::XrefEntry;
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static FALLBACK_REACHABILITY_WALK_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn reset_fallback_reachability_walk_calls() {
+        FALLBACK_REACHABILITY_WALK_CALLS.with(|calls| calls.set(0));
+    }
+
+    pub(crate) fn fallback_reachability_walk_calls() -> usize {
+        FALLBACK_REACHABILITY_WALK_CALLS.with(Cell::get)
+    }
+
+    pub(super) fn record_fallback_reachability_walk() {
+        FALLBACK_REACHABILITY_WALK_CALLS.with(|calls| calls.set(calls.get() + 1));
+    }
+}
+
 type LinearizedStreamParameterOmission<'a> =
     Option<&'a dyn Fn(&crate::ObjectHandle) -> crate::Result<bool>>;
 
@@ -435,6 +456,9 @@ pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
     skip_length: bool,
     skipped_stream_parameter_streams: &BTreeSet<crate::qpdf_obj_gen::QpdfObjGen>,
 ) -> crate::Result<BTreeSet<ObjectRef>> {
+    #[cfg(test)]
+    test_support::record_fallback_reachability_walk();
+
     let root = pdf.root_handle()?;
     let mut seeds = Vec::new();
     let trailer_entries = pdf.trailer().try_as_dictionary()?.unwrap_or_default();
@@ -1102,6 +1126,21 @@ mod tests {
                 .as_bytes(),
         );
         bytes
+    }
+
+    #[test]
+    fn test_support_counts_actual_fallback_reachability_walks() {
+        let mut pdf = Pdf::open(Cursor::new(raw_stream_pdf())).expect("open raw stream PDF");
+        super::test_support::reset_fallback_reachability_walk_calls();
+
+        reachable_object_set_with_stream_parameters(&mut pdf, true, &BTreeSet::new())
+            .expect("walk reachable objects");
+
+        assert_eq!(
+            super::test_support::fallback_reachability_walk_calls(),
+            1,
+            "the test-only observer must count calls to the real fallback walk"
+        );
     }
 
     #[test]
