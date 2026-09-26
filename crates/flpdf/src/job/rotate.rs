@@ -659,6 +659,35 @@ mod tests {
     // flatten_rotation_on_pages
     // -----------------------------------------------------------------------
 
+    #[test]
+    fn flatten_rotation_rejects_an_unowned_direct_page_like_qpdf() {
+        let mut pdf = Pdf::empty().expect("empty PDF should open");
+        let page = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (b"/Rotate".to_vec(), ObjectHandle::integer(0)),
+            (
+                b"/MediaBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(200),
+                    ObjectHandle::integer(300),
+                ]),
+            ),
+        ]);
+        assert_eq!(page.owning_pdf_unique_id(), None);
+
+        let mut page_helper = PageObjectHelper::from_object_handle(page, &mut pdf);
+        let error = page_helper
+            .flatten_rotation()
+            .expect_err("qpdf getQPDF rejects a detached direct page handle");
+        assert!(matches!(
+            error,
+            Error::System(message)
+                if message == "QPDFPageObjectHelper::flattenRotation called with a direct object"
+        ));
+    }
+
     /// Assemble a minimal PDF from `(number, body)` objects numbered 1..=N in
     /// order. `body` excludes the `N 0 obj` / `endobj` wrapper.
     fn assemble_pdf(objs: &[(u32, String)]) -> Vec<u8> {
