@@ -1,3 +1,5 @@
+//! Tests for writer-owned PDF object and trailer emission.
+//!
 //! qpdf correspondence: tests for `QPDFWriter::unparseObject`, `unparseChild`, and `writeTrailer` writer emission.
 
 use crate::object_handle::identity_tests::{error_resolving_handle, resolver_bearing_handle};
