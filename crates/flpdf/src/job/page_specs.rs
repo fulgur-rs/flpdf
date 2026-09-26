@@ -818,10 +818,14 @@ fn collect_primary_fields<T: Read + Seek>(
 ) -> Result<Vec<ObjectHandle>> {
     let mut field_identities = BTreeSet::<QpdfObjGen>::new();
     let mut candidate_fields = Vec::new();
+    let page_handles = pages
+        .iter()
+        .map(|&page_ref| merged.get_object_handle(page_ref))
+        .collect::<Vec<_>>();
     {
         let mut acroform = AcroFormDocumentHelper::new_for_field_tree(merged)?;
-        for &page_ref in pages {
-            let widgets = acroform.get_widget_annotations_for_page(page_ref)?;
+        for page_handle in page_handles {
+            let widgets = acroform.get_widget_annotations_for_page(page_handle)?;
             for widget in widgets {
                 let field = acroform.get_field_for_annotation_handle(widget)?;
                 if field.qpdf_obj_gen().is_some_and(QpdfObjGen::is_indirect) {

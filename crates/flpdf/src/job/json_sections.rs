@@ -267,28 +267,28 @@ pub(crate) fn build_acroform_section_with_version<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     version: i32,
 ) -> Result<Json, ConvertError> {
-    // qpdf's page helper repairs and snapshots the page list before the
-    // AcroForm helper starts its cached annotation-to-field analysis. Rust's
-    // mutable borrow rules require the same sequencing explicitly.
-    let page_refs = crate::pages::page_refs(pdf)?;
-
-    // Keep the helper alive for the whole page/widget walk so every lookup
-    // uses one qpdf-shaped analysis cache. The handles are collected before
-    // the field and annotation accessors borrow the Pdf again below.
-    let (has_acroform, need_appearances, widgets) = {
+    // qpdf constructs the AcroForm helper and reads these catalog values
+    // before its outer page walk (`QPDFJob.cc:1162-1168`). The helper eagerly
+    // analyzes field and orphan-Widget associations in its constructor.
+    let (has_acroform, need_appearances) = {
         let mut acroform = crate::AcroFormDocumentHelper::new(pdf)?;
-        let has_acroform = acroform.has_acro_form()?;
-        let need_appearances = acroform.get_need_appearances()?;
-        let mut widgets = Vec::new();
+        (acroform.has_acro_form()?, acroform.get_need_appearances()?)
+    };
+    let page_handles = crate::PageDocumentHelper::new(pdf).get_all_pages()?;
 
-        for (page_index, page_ref) in page_refs.into_iter().enumerate() {
-            for annotation in acroform.get_widget_annotations_for_page(page_ref)? {
+    // The AcroForm cache belongs to Pdf, so this reborrow retains qpdf's
+    // construction-time analysis while respecting Rust's exclusive Pdf borrow
+    // between the helper construction and the page snapshot.
+    let widgets = {
+        let mut acroform = crate::AcroFormDocumentHelper::new(pdf)?;
+        let mut widgets = Vec::new();
+        for (page_index, page_handle) in page_handles.into_iter().enumerate() {
+            for annotation in acroform.get_widget_annotations_for_page(page_handle)? {
                 let field = acroform.get_field_for_annotation_handle(annotation.clone())?;
                 widgets.push((page_index as i64 + 1, field, annotation));
             }
         }
-
-        (has_acroform, need_appearances, widgets)
+        widgets
     };
 
     let fields = Json::make_array();
@@ -1281,6 +1281,48 @@ mod tests {
             .expect("update page count");
     }
 
+    fn install_raw_generation_widget_page(pdf: &mut Pdf<Cursor<Vec<u8>>>) {
+        install_raw_generation_page(pdf);
+        let widget_ref = ObjectRef::new(6, 65_535);
+        pdf.replace_object(
+            widget_ref,
+            ObjectHandle::dictionary(vec![
+                (b"/FT".to_vec(), ObjectHandle::name(b"Tx".to_vec())),
+                (
+                    b"/T".to_vec(),
+                    ObjectHandle::string(b"Raw generation widget".to_vec()),
+                ),
+                (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+                (
+                    b"/Rect".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(10),
+                        ObjectHandle::integer(10),
+                    ]),
+                ),
+            ]),
+        )
+        .expect("install raw-generation widget");
+        pdf.get_object_handle(ObjectRef::new(5, 65_535))
+            .replace_key(
+                b"/Annots",
+                ObjectHandle::array(vec![pdf.get_object_handle(widget_ref)]),
+            )
+            .expect("attach raw-generation widget");
+        pdf.root_handle()
+            .expect("catalog")
+            .replace_key(
+                b"/AcroForm",
+                ObjectHandle::dictionary(vec![(
+                    b"/Fields".to_vec(),
+                    ObjectHandle::array(Vec::new()),
+                )]),
+            )
+            .expect("install empty AcroForm field array");
+    }
+
     fn install_outline_with_null_page_destination(pdf: &mut Pdf<Cursor<Vec<u8>>>) {
         let item = ObjectHandle::dictionary(vec![
             (
@@ -1458,6 +1500,51 @@ mod tests {
         .expect("open encrypted fixture");
         build_encrypt_section_with_options(&mut pdf, 2, true)
             .expect("encrypted section with file key");
+    }
+
+    #[test]
+    fn acroform_helper_scans_raw_generation_page_widgets() {
+        let mut pdf = one_page_pdf();
+        install_raw_generation_widget_page(&mut pdf);
+
+        let helper = crate::AcroFormDocumentHelper::new(&mut pdf)
+            .expect("AcroForm analysis must keep raw page identity");
+        drop(helper);
+        let warnings = pdf.get_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings.entries()[0]
+            .get_message_detail()
+            .windows(b"this widget annotation is not reachable from /AcroForm".len())
+            .any(|window| window == b"this widget annotation is not reachable from /AcroForm"));
+    }
+
+    #[test]
+    fn acroform_json_keeps_raw_generation_widget_page_position() {
+        let mut pdf = one_page_pdf();
+        install_raw_generation_widget_page(&mut pdf);
+
+        let acroform = build_acroform_section_with_version(&mut pdf, 2)
+            .expect("AcroForm JSON must keep raw page identity");
+        let mut fields = Vec::new();
+        assert!(acroform
+            .get_dict_item(b"fields")
+            .for_each_array_item(|field| fields.push(field)));
+        assert_eq!(fields.len(), 1);
+        assert_eq!(
+            fields[0].get_dict_item(b"object").get_string(),
+            Some(b"6 65535 R".to_vec())
+        );
+        assert_eq!(
+            fields[0].get_dict_item(b"pageposfrom1").get_number(),
+            Some(b"1".to_vec())
+        );
+        assert_eq!(
+            fields[0]
+                .get_dict_item(b"annotation")
+                .get_dict_item(b"object")
+                .get_string(),
+            Some(b"6 65535 R".to_vec())
+        );
     }
 
     #[test]
