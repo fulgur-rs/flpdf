@@ -10,22 +10,20 @@
 
 use crate::ObjectRef;
 
-/// Raw qpdf object/generation identity for xref registration and cache keys.
+/// Raw qpdf object/generation identity carried by an object handle.
 ///
-/// Parsed qpdf identities are constructed through [`Self::new`], whose inputs
-/// match qpdf's signed `int` fields. [`ObjectRef`] is a wider Rust projection;
-/// callers crossing into this raw identity use [`Self::try_from_object_ref`]
-/// so an object number outside qpdf's signed-int domain is rejected rather
-/// than truncated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct QpdfObjGen {
+/// This matches qpdf's public `QPDFObjGen` value and keeps its signed object
+/// and generation fields without imposing the stricter PDF `N G R` reference
+/// range. [`ObjectRef`] remains a separate checked projection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct QpdfObjGen {
     object: i32,
     generation: i32,
 }
 
 impl QpdfObjGen {
     /// Construct qpdf's signed object/generation pair.
-    pub(crate) const fn new(object: i32, generation: i32) -> Self {
+    pub const fn new(object: i32, generation: i32) -> Self {
         Self { object, generation }
     }
 
@@ -47,18 +45,33 @@ impl QpdfObjGen {
     }
 
     /// Match `QPDFObjGen::isIndirect`: only object number zero is non-indirect.
-    pub(crate) const fn is_indirect(self) -> bool {
+    pub const fn is_indirect(self) -> bool {
         self.object != 0
     }
 
     /// Return qpdf's object number (`QPDFObjGen::getObj`).
-    pub(crate) const fn get_obj(self) -> i32 {
+    pub const fn get_obj(self) -> i32 {
         self.object
     }
 
     /// Return qpdf's generation (`QPDFObjGen::getGen`).
-    pub(crate) const fn get_gen(self) -> i32 {
+    pub const fn get_gen(self) -> i32 {
         self.generation
+    }
+
+    /// Format the raw identity with qpdf's default comma separator.
+    ///
+    /// This matches `QPDFObjGen::unparse()` (`QPDFObjGen.cc:18-22`).
+    pub fn unparse(self) -> String {
+        self.unparse_with_separator(',')
+    }
+
+    /// Format the raw identity with a caller-selected separator.
+    ///
+    /// This matches `QPDFObjGen::unparse(char)`
+    /// (`include/qpdf/QPDFObjGen.hh:82-83`).
+    pub fn unparse_with_separator(self, separator: char) -> String {
+        format!("{}{}{}", self.object, separator, self.generation)
     }
 
     /// Convert only a valid parsed indirect reference to flpdf's `ObjectRef`.
@@ -74,6 +87,12 @@ impl QpdfObjGen {
             u32::try_from(self.object).ok()?,
             u16::try_from(self.generation).ok()?,
         ))
+    }
+}
+
+impl std::fmt::Display for QpdfObjGen {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{},{}", self.object, self.generation)
     }
 }
 

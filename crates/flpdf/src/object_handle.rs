@@ -1919,6 +1919,17 @@ impl ObjectHandle {
         self.0.borrow().object_ref()
     }
 
+    /// Return qpdf's raw object/generation identity for this handle.
+    ///
+    /// This mirrors `QPDFObjectHandle::getObjGen`
+    /// (`include/qpdf/QPDFObjectHandle.hh:1145-1152`): direct and
+    /// uninitialized handles return `(0, 0)`, while indirect handles retain
+    /// their signed raw identity even when it cannot be represented as an
+    /// `N G R` [`ObjectRef`].
+    pub fn get_obj_gen(&self) -> QpdfObjGen {
+        self.qpdf_obj_gen().unwrap_or_default()
+    }
+
     /// The qpdf raw object identity carried by this handle, if it has one.
     /// Unlike [`Self::object_ref`], this preserves generations that
     /// qpdf accepts in an object header but rejects in an `N G R` reference.
