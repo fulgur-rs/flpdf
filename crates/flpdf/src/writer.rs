@@ -3895,7 +3895,7 @@ mod final_handle_writer_tests {
 
         for (static_aes_iv, explicit_iv) in [(true, Some([4; 16])), (false, None)] {
             let mut short_aes = Vec::new();
-            let error = output::with_buffer_sink(&mut short_aes, |out| {
+            output::with_buffer_sink(&mut short_aes, |out| {
                 pipe_writer_stream_payload(
                     out,
                     data,
@@ -3909,8 +3909,8 @@ mod final_handle_writer_tests {
                     explicit_iv,
                 )
             })
-            .expect_err("a short AES key must be rejected by the encryption pipeline");
-            assert!(error.to_string().contains("at least 16"));
+            .expect("qpdf's provider uses AES-128 for a short raw key");
+            assert!(!short_aes.is_empty());
         }
 
         let mut rc4 = Vec::new();

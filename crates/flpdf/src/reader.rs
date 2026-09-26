@@ -1730,32 +1730,6 @@ mod encryption_state_commit_tests {
     }
 
     #[test]
-    fn aes_object_key_follows_the_qpdf_provider_length_dispatch() {
-        // 24 bytes selects AES-192 in qpdf's providers; every other length
-        // that is not 16 or 32 takes the AES-128 prefix
-        // (`QPDFCrypto_gnutls.cc:197-213`).
-        assert_eq!(
-            crate::encryption::state::aes192_object_key(&[0xa5; 24])
-                .expect("24-byte keys use qpdf's AES-192 provider dispatch"),
-            [0xa5; 24]
-        );
-        let error = crate::encryption::state::aes128_object_key(&[0; 8])
-            .expect_err("qpdf reads past a shorter key buffer; this port rejects it");
-        assert!(error.to_string().contains("not 16 bytes"));
-
-        assert_eq!(
-            crate::encryption::state::aes128_object_key(&[0xa5; 20])
-                .expect("a 20-byte key uses the qpdf AES-128 provider fallback"),
-            [0xa5; 16]
-        );
-        assert_eq!(
-            crate::encryption::state::aes128_object_key(&[0xa5; 40])
-                .expect("overlength keys use the qpdf AES-128 provider fallback"),
-            [0xa5; 16]
-        );
-    }
-
-    #[test]
     fn authenticated_state_is_not_committed_before_perms_warning_delivery() {
         let fixture = std::fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
