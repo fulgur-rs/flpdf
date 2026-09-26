@@ -31,7 +31,7 @@
 //! ```
 
 use crate::outline_document_helper::OutlineDocumentHelper;
-use crate::{ObjectHandle, ObjectRef, Result};
+use crate::{ObjectHandle, ObjectRef, QpdfObjGen, Result};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Seek};
 use std::ops::Index;
@@ -233,7 +233,7 @@ impl OutlineItem {
 pub struct OutlineTree {
     pub(crate) items: Vec<OutlineItem>,
     pub(crate) roots: Vec<OutlineId>,
-    by_page: OnceLock<BTreeMap<Option<ObjectRef>, Vec<OutlineId>>>,
+    by_page: OnceLock<BTreeMap<QpdfObjGen, Vec<OutlineId>>>,
 }
 
 impl OutlineTree {
@@ -245,17 +245,11 @@ impl OutlineTree {
         }
     }
 
-    fn normalize_page_key(page: Option<ObjectRef>) -> Option<ObjectRef> {
-        page.filter(|reference| *reference != ObjectRef::new(0, 0))
-    }
-
     fn page_key<R: Read + Seek>(
         item: &OutlineItem,
         helper: &mut OutlineDocumentHelper<'_, R>,
-    ) -> Result<Option<ObjectRef>> {
-        Ok(Self::normalize_page_key(
-            item.get_dest_page(helper)?.object_ref(),
-        ))
+    ) -> Result<QpdfObjGen> {
+        Ok(item.get_dest_page(helper)?.get_obj_gen())
     }
 
     // qpdf-deviation: `initializeByPage`'s cache placement has no counterpart
@@ -269,8 +263,8 @@ impl OutlineTree {
     fn initialize_by_page<R: Read + Seek>(
         &self,
         helper: &mut OutlineDocumentHelper<'_, R>,
-    ) -> Result<BTreeMap<Option<ObjectRef>, Vec<OutlineId>>> {
-        let mut index = BTreeMap::<Option<ObjectRef>, Vec<OutlineId>>::new();
+    ) -> Result<BTreeMap<QpdfObjGen, Vec<OutlineId>>> {
+        let mut index = BTreeMap::<QpdfObjGen, Vec<OutlineId>>::new();
         let mut queue: VecDeque<OutlineId> = self.roots.iter().copied().collect();
         while let Some(id) = queue.pop_front() {
             let key = Self::page_key(&self[id], helper)?;
@@ -283,7 +277,7 @@ impl OutlineTree {
     fn by_page<R: Read + Seek>(
         &self,
         helper: &mut OutlineDocumentHelper<'_, R>,
-    ) -> Result<&BTreeMap<Option<ObjectRef>, Vec<OutlineId>>> {
+    ) -> Result<&BTreeMap<QpdfObjGen, Vec<OutlineId>>> {
         if self.by_page.get().is_none() {
             let built = self.initialize_by_page(helper)?;
             let _ = self.by_page.set(built);
@@ -296,8 +290,10 @@ impl OutlineTree {
 
     /// Return outlines targeting `page` in qpdf breadth-first order.
     ///
-    /// `None` represents qpdf's `QPDFObjGen(0, 0)` bucket and therefore also
-    /// contains destinations whose page operand is not an indirect reference.
+    /// `QpdfObjGen::default()` represents qpdf's `QPDFObjGen(0, 0)` bucket and
+    /// therefore also contains destinations whose page operand is not an
+    /// indirect reference. Other raw object/generation pairs remain distinct,
+    /// including generations outside valid `N G R` syntax.
     ///
     /// The page-to-outline mapping is computed once (calling each item's
     /// [`OutlineItem::get_dest_page`] live, exactly like qpdf) and cached for
@@ -318,11 +314,11 @@ impl OutlineTree {
     pub fn get_outlines_for_page<R: Read + Seek>(
         &self,
         helper: &mut OutlineDocumentHelper<'_, R>,
-        page: Option<ObjectRef>,
+        page: QpdfObjGen,
     ) -> Result<impl Iterator<Item = (OutlineId, &OutlineItem)>> {
         Ok(self
             .by_page(helper)?
-            .get(&Self::normalize_page_key(page))
+            .get(&page)
             .into_iter()
             .flatten()
             .copied()

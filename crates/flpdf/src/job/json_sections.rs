@@ -119,8 +119,10 @@ fn stream_decode_level(level: DecodeLevel) -> crate::writer::DecodeLevel {
 /// order:
 /// `contents`, `images`, `label`, `object`, `outlines`, `pageposfrom1`.
 ///
-/// - `label` is always `null` (placeholder; not yet populated).
-/// - `outlines` is always `[]` (placeholder; not yet populated).
+/// - `label` contains the page label at this page position, or `null` when
+///   the document has no label for it.
+/// - `outlines` contains outline items targeting this page in qpdf breadth-first
+///   order.
 ///
 /// # Errors
 ///
@@ -131,7 +133,7 @@ pub(crate) fn build_pages_section_with_options<R: Read + Seek>(
     version: i32,
     decode_level: DecodeLevel,
 ) -> Result<Vec<Json>, ConvertError> {
-    let page_refs = crate::pages::page_refs(pdf)?;
+    let page_handles = crate::PageDocumentHelper::new(pdf).get_all_pages()?;
 
     // qpdf constructs the page-label and outline helpers once for the whole
     // page walk (`QPDFJob.cc:1035-1087`). Materialize those per-page values
@@ -139,7 +141,7 @@ pub(crate) fn build_pages_section_with_options<R: Read + Seek>(
     // than replaced with independent, potentially divergent helper walks.
     let labels = {
         let mut helper = pdf.page_labels();
-        page_refs
+        page_handles
             .iter()
             .enumerate()
             .map(|(index, _)| {
@@ -160,9 +162,9 @@ pub(crate) fn build_pages_section_with_options<R: Read + Seek>(
         let mut helper = pdf.outline();
         let tree = helper.get_tree().map_err(ConvertError::from)?;
         let mut by_page = std::collections::BTreeMap::new();
-        for &page_ref in &page_refs {
+        for page in &page_handles {
             let ids = tree
-                .get_outlines_for_page(&mut helper, Some(page_ref))
+                .get_outlines_for_page(&mut helper, page.get_obj_gen())
                 .map_err(ConvertError::from)?
                 .map(|(id, _)| id)
                 .collect::<Vec<_>>();
@@ -184,23 +186,23 @@ pub(crate) fn build_pages_section_with_options<R: Read + Seek>(
                     ("title".to_string(), Json::make_string(title)),
                 ])?);
             }
-            by_page.insert(page_ref, json_array(page_entries)?);
+            by_page.insert(page.get_obj_gen(), json_array(page_entries)?);
         }
         by_page
     };
 
-    let mut entries: Vec<Json> = Vec::with_capacity(page_refs.len());
+    let mut entries: Vec<Json> = Vec::with_capacity(page_handles.len());
 
-    for (idx, page_ref) in page_refs.into_iter().enumerate() {
+    for (idx, page) in page_handles.into_iter().enumerate() {
         let pageposfrom1 = (idx as i64) + 1;
-        let object_str = format!("{} {} R", page_ref.number, page_ref.generation);
+        let object = pdf_object_to_json_with_version(&page, version)?;
 
         // qpdf obtains page contents through QPDFPageObjectHelper::getPageContents,
         // which also owns malformed /Contents warning delivery. Serialize each
         // canonical stream handle without dereferencing it, matching qpdf's
         // QPDFObjectHandle::getJSON(..., false) call.
         let contents: Vec<Json> = {
-            let mut page = PageObjectHelper::new(page_ref, pdf);
+            let mut page = PageObjectHelper::from_object_handle(page.clone(), pdf);
             page.get_page_contents()?
                 .into_iter()
                 .map(|stream| pdf_object_to_json_with_version(&stream, version))
@@ -212,7 +214,7 @@ pub(crate) fn build_pages_section_with_options<R: Read + Seek>(
         // Keep the page helper's resource-name order and build each descriptor
         // from the live stream dictionary.
         let image_handles = {
-            let mut page = PageObjectHelper::new(page_ref, pdf);
+            let mut page = PageObjectHelper::from_object_handle(page.clone(), pdf);
             page.get_images()?
         };
         let images: Vec<Json> = image_handles
@@ -229,11 +231,11 @@ pub(crate) fn build_pages_section_with_options<R: Read + Seek>(
                 "label".to_string(),
                 labels[pageposfrom1 as usize - 1].clone(),
             ),
-            ("object".to_string(), Json::make_string(object_str)),
+            ("object".to_string(), object),
             (
                 "outlines".to_string(),
                 outlines
-                    .get(&page_ref)
+                    .get(&page.get_obj_gen())
                     .cloned()
                     .unwrap_or_else(Json::make_array),
             ),
@@ -480,7 +482,7 @@ pub(crate) fn build_pagelabels_section_with_version<R: Read + Seek>(
 fn outline_item_to_json<R: Read + Seek>(
     tree: &crate::OutlineTree,
     id: crate::OutlineId,
-    page_numbers: &std::collections::BTreeMap<crate::ObjectRef, i64>,
+    page_numbers: &std::collections::BTreeMap<crate::QpdfObjGen, i64>,
     helper: &mut crate::OutlineDocumentHelper<'_, R>,
     version: i32,
 ) -> Result<Json, ConvertError> {
@@ -496,12 +498,17 @@ fn outline_item_to_json<R: Read + Seek>(
     let title = item.get_title(helper)?;
     let dest = pdf_dest_to_json_with_version(&item.get_dest(helper)?, version)?;
     let count = item.get_count(helper)?;
-    let destpageposfrom1 = item
-        .get_dest_page(helper)?
-        .object_ref()
-        .and_then(|reference| page_numbers.get(&reference).copied())
-        .map(Json::make_int)
-        .unwrap_or_else(Json::make_null);
+    let dest_page = item.get_dest_page(helper)?;
+    let dest_page_obj_gen = dest_page.get_obj_gen();
+    let destpageposfrom1 = if dest_page_obj_gen.is_indirect() {
+        page_numbers
+            .get(&dest_page_obj_gen)
+            .copied()
+            .map(Json::make_int)
+            .unwrap_or_else(Json::make_null)
+    } else {
+        Json::make_null()
+    };
     let mut kids = Vec::with_capacity(item.kids.len());
     for kid in item.kids.iter().copied() {
         kids.push(outline_item_to_json(
@@ -540,10 +547,11 @@ pub(crate) fn build_outlines_section_with_version<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     version: i32,
 ) -> Result<Json, ConvertError> {
-    let page_numbers = crate::pages::page_refs(pdf)?
+    let page_numbers = crate::PageDocumentHelper::new(pdf)
+        .get_all_pages()?
         .into_iter()
         .enumerate()
-        .map(|(index, reference)| (reference, index as i64 + 1))
+        .map(|(index, page)| (page.get_obj_gen(), index as i64 + 1))
         .collect::<std::collections::BTreeMap<_, _>>();
     let mut helper = pdf.outline();
     let tree = helper.get_tree()?;
@@ -1273,6 +1281,46 @@ mod tests {
             .expect("update page count");
     }
 
+    fn install_outline_with_null_page_destination(pdf: &mut Pdf<Cursor<Vec<u8>>>) {
+        let item = ObjectHandle::dictionary(vec![
+            (
+                b"/Dest".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::null(),
+                    ObjectHandle::name(b"Fit".to_vec()),
+                ]),
+            ),
+            (
+                b"/Title".to_vec(),
+                ObjectHandle::string(b"Null destination outline".to_vec()),
+            ),
+        ]);
+        let outlines = ObjectHandle::dictionary(vec![(b"/First".to_vec(), item)]);
+        pdf.root_handle()
+            .expect("catalog")
+            .replace_key(b"/Outlines", outlines)
+            .expect("install outline with null destination");
+    }
+
+    fn install_outline_targeting_raw_generation_page(pdf: &mut Pdf<Cursor<Vec<u8>>>) {
+        let page = pdf.get_object_handle(ObjectRef::new(5, 65_535));
+        let item = ObjectHandle::dictionary(vec![
+            (
+                b"/Dest".to_vec(),
+                ObjectHandle::array(vec![page, ObjectHandle::name(b"Fit".to_vec())]),
+            ),
+            (
+                b"/Title".to_vec(),
+                ObjectHandle::string(b"Raw generation outline".to_vec()),
+            ),
+        ]);
+        let outlines = ObjectHandle::dictionary(vec![(b"/First".to_vec(), item)]);
+        pdf.root_handle()
+            .expect("catalog")
+            .replace_key(b"/Outlines", outlines)
+            .expect("install outline targeting raw-generation page");
+    }
+
     #[test]
     fn pagelabels_json_counts_raw_generation_page_handles() {
         let mut pdf = one_page_pdf();
@@ -1410,6 +1458,74 @@ mod tests {
         .expect("open encrypted fixture");
         build_encrypt_section_with_options(&mut pdf, 2, true)
             .expect("encrypted section with file key");
+    }
+
+    #[test]
+    fn pages_json_associates_outline_with_raw_generation_page() {
+        let mut pdf = one_page_pdf();
+        install_raw_generation_page(&mut pdf);
+        install_outline_targeting_raw_generation_page(&mut pdf);
+
+        let pages = build_pages_section_with_options(&mut pdf, 2, DecodeLevel::Generalized)
+            .expect("pages JSON must preserve the raw page identity");
+        assert_eq!(pages.len(), 1);
+        assert_eq!(
+            pages[0].get_dict_item(b"object").get_string(),
+            Some(b"5 65535 R".to_vec())
+        );
+        let mut outlines = Vec::new();
+        assert!(pages[0]
+            .get_dict_item(b"outlines")
+            .for_each_array_item(|item| outlines.push(item)));
+        assert_eq!(outlines.len(), 1);
+        assert_eq!(
+            outlines[0].get_dict_item(b"title").get_string(),
+            Some(b"Raw generation outline".to_vec())
+        );
+        let mut destination = Vec::new();
+        assert!(outlines[0]
+            .get_dict_item(b"dest")
+            .for_each_array_item(|item| destination.push(item)));
+        assert_eq!(destination[0].get_string(), Some(b"5 65535 R".to_vec()));
+    }
+
+    #[test]
+    fn outlines_json_uses_raw_generation_page_position() {
+        let mut pdf = one_page_pdf();
+        install_raw_generation_page(&mut pdf);
+        install_outline_targeting_raw_generation_page(&mut pdf);
+
+        let outlines = build_outlines_section_with_version(&mut pdf, 2)
+            .expect("outlines JSON must preserve the raw page identity");
+        let mut items = Vec::new();
+        assert!(outlines.for_each_array_item(|item| items.push(item)));
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].get_dict_item(b"destpageposfrom1").get_number(),
+            Some(b"1".to_vec())
+        );
+    }
+
+    #[test]
+    fn outlines_json_keeps_the_zero_identity_bucket_for_null_destinations() {
+        let mut pdf = one_page_pdf();
+        install_outline_with_null_page_destination(&mut pdf);
+
+        let zero_bucket_count = {
+            let mut helper = pdf.outline();
+            let tree = helper.get_tree().expect("materialize outline tree");
+            tree.get_outlines_for_page(&mut helper, crate::QpdfObjGen::default())
+                .expect("query qpdf's zero-identity bucket")
+                .count()
+        };
+        assert_eq!(zero_bucket_count, 1);
+
+        let outlines = build_outlines_section_with_version(&mut pdf, 2)
+            .expect("direct destination page position is null");
+        let mut items = Vec::new();
+        assert!(outlines.for_each_array_item(|item| items.push(item)));
+        assert_eq!(items.len(), 1);
+        assert!(items[0].get_dict_item(b"destpageposfrom1").is_null());
     }
 
     #[test]
