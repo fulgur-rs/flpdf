@@ -496,6 +496,14 @@ mod tests {
             media_warning < type_warning,
             "qpdf repairs MediaBox before /Type"
         );
+        assert_eq!(
+            warnings.entries()[media_warning].get_error_code(),
+            crate::QpdfErrorCode::DamagedPdf
+        );
+        assert_eq!(
+            warnings.entries()[type_warning].get_error_code(),
+            crate::QpdfErrorCode::DamagedPdf
+        );
     }
 
     #[test]
@@ -538,10 +546,16 @@ mod tests {
                 .object_ref(),
             Some(actual[1])
         );
-        assert!(pdf.repair_diagnostics().entries().iter().any(|warning| {
-            warning.get_message_detail()
-                == b"kid 1 (from 0) appears more than once in the pages tree; creating a new page object as a copy"
-        }));
+        let diagnostics = pdf.repair_diagnostics();
+        let warning = diagnostics
+            .entries()
+            .iter()
+            .find(|warning| {
+                warning.get_message_detail()
+                    == b"kid 1 (from 0) appears more than once in the pages tree; creating a new page object as a copy"
+            })
+            .expect("qpdf duplicate-page warning");
+        assert_eq!(warning.get_error_code(), crate::QpdfErrorCode::DamagedPdf);
     }
 
     #[test]

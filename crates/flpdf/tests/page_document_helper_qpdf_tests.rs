@@ -32,6 +32,29 @@ fn one_page_nested_tree_with_unknown_key() -> Vec<u8> {
 }
 
 #[test]
+fn page_tree_root_correction_warning_uses_qpdf_damaged_pdf_code() {
+    let mut pdf = Pdf::open_mem_owned(
+        include_bytes!("../../../tests/fixtures/compat/root-pages-points-into-tree.pdf").to_vec(),
+    )
+    .expect("root-points-into-tree fixture should open");
+
+    let pages = PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .expect("qpdf corrects the page-tree root");
+    assert_eq!(pages.len(), 1);
+    let diagnostics = pdf.repair_diagnostics();
+    let warning = diagnostics
+        .entries()
+        .iter()
+        .find(|warning| {
+            warning.get_message_detail()
+                == b"document page tree root (root -> /Pages) doesn't point to the root of the page tree; attempting to correct"
+        })
+        .expect("qpdf root-correction warning");
+    assert_eq!(warning.get_error_code(), QpdfErrorCode::DamagedPdf);
+}
+
+#[test]
 fn removing_the_last_page_flattens_intermediate_pages_with_qpdf_warnings() {
     let mut pdf = Pdf::open(Cursor::new(one_page_nested_tree_with_unknown_key())).unwrap();
     PageDocumentHelper::new(&mut pdf)

@@ -9753,6 +9753,7 @@ mod tests {
             .expect("the incorrect-key warning must be recorded");
         assert_eq!(warning.get_file_position(), 11_551);
         assert_eq!(warning.get_object(), b"object 1 0");
+        assert_eq!(warning.get_error_code(), QpdfErrorCode::DamagedPdf);
     }
 
     #[test]
@@ -10390,13 +10391,17 @@ mod tests {
                 .as_integer(),
             Some(1)
         );
-        assert!(resolver
-            .repair_diagnostics()
+        let diagnostics = resolver.repair_diagnostics();
+        let warning = diagnostics
             .entries()
             .iter()
-            .any(|diagnostic| diagnostic
-                .message_string()
-                .contains("supposed object stream 4 has wrong type")));
+            .find(|diagnostic| {
+                diagnostic
+                    .message_string()
+                    .contains("supposed object stream 4 has wrong type")
+            })
+            .expect("qpdf wrong-ObjStm-type warning");
+        assert_eq!(warning.get_error_code(), QpdfErrorCode::DamagedPdf);
     }
 
     #[test]
