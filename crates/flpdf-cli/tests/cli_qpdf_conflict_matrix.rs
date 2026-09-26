@@ -3,6 +3,7 @@
 
 use assert_cmd::Command;
 use regex::Regex;
+use serde_json::Value;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -172,6 +173,55 @@ fn assert_json_output_pair(label: &str, extra: &[OsString], input: &Path) {
         normalize_text_newlines(&fs::read(&flpdf_output).expect("flpdf JSON output")),
         normalize_text_newlines(&fs::read(&qpdf_output).expect("qpdf JSON output")),
         "{label}: JSON output differs"
+    );
+}
+
+fn assert_form_xobject_length(json_bytes: &[u8], resource_name: &str, expected: Option<u64>) {
+    let json: Value = serde_json::from_slice(json_bytes).expect("valid qpdf JSON");
+    let objects = json["qpdf"][1].as_object().expect("qpdf object map");
+    let page = objects
+        .values()
+        .find_map(|object| {
+            let value = object.get("value")?.as_object()?;
+            (value.get("/Type").and_then(Value::as_str) == Some("/Page")).then_some(value)
+        })
+        .expect("page object in qpdf JSON");
+    let reference = page["/Resources"]["/XObject"][resource_name]
+        .as_str()
+        .expect("Form XObject reference on page");
+    let object_key = format!("obj:{reference}");
+    let stream_dict = objects[&object_key]["stream"]["dict"]
+        .as_object()
+        .expect("Form XObject stream dictionary");
+    let length = stream_dict.get("/Length").and_then(Value::as_u64);
+    assert_eq!(length, expected, "{resource_name} stream /Length");
+}
+
+fn assert_json_stdout_pair_with_fx0_length(label: &str, args: &[OsString]) {
+    let (qpdf, flpdf) = run_qpdf_and_flpdf(args);
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "{label}: exit status differs"
+    );
+    assert!(
+        qpdf.status.success(),
+        "{label}: qpdf must accept the combination; stderr={}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    assert_form_xobject_length(&qpdf.stdout, "/Fx0", Some(89));
+    assert_form_xobject_length(&qpdf.stdout, "/Fx1", None);
+    assert_form_xobject_length(&flpdf.stdout, "/Fx0", Some(89));
+    assert_form_xobject_length(&flpdf.stdout, "/Fx1", None);
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout),
+        "{label}: stdout differs"
+    );
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr),
+        "{label}: stderr differs"
     );
 }
 
@@ -634,6 +684,47 @@ fn top_level_json_output_applies_overlay_and_underlay_before_serialization() {
             assert_pair(&format!("top-level {segment} with {output_mode}"), &args);
         }
     }
+}
+
+#[test]
+fn top_level_json_overlay_fx0_length_matches_qpdf() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let input = fixture("one-page.pdf");
+    let source = fixture("fxo-red.pdf");
+    for segment in ["--overlay", "--underlay"] {
+        let segment_args = [
+            OsString::from(segment),
+            source.as_os_str().to_owned(),
+            OsString::from("--"),
+        ];
+        let json_args = json_args(&segment_args, &input);
+        assert_json_stdout_pair_with_fx0_length(
+            &format!("{segment} + dictionary-only JSON"),
+            &json_args,
+        );
+
+        let mut stream_data_none = segment_args.to_vec();
+        stream_data_none.push(OsString::from("--json-stream-data=none"));
+        assert_json_output_pair(
+            &format!("{segment} + JSON stream data none"),
+            &stream_data_none,
+            &input,
+        );
+
+        assert_json_output_pair(
+            &format!("{segment} + default inline JSON"),
+            &segment_args,
+            &input,
+        );
+    }
+
+    assert_pair(
+        "plain dictionary-only JSON baseline",
+        &json_args(&[], &input),
+    );
 }
 
 #[test]

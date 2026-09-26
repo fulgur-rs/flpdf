@@ -138,6 +138,11 @@ fn under_overlay_for_page<R: Read + Seek, RS: Read + Seek>(
 
     // 1. Convert the destination page itself to Form XObject /Fx0.
     let fx0_ref = get_form_xobject_for_page(dest, dest_page_ref)?;
+    // qpdf's handleUnderOverlay materializes this destination Form before
+    // replacing /Contents; imported source Forms remain provider-backed.
+    let fx0 = dest.get_object_handle(fx0_ref);
+    let fx0_data = fx0.get_raw_stream_data()?;
+    fx0.replace_stream_data(fx0_data, None, None);
 
     // 2. Name the sources /Fx1.. in underlays-then-overlays order and build the
     //    new page /Resources /XObject mapping. /Fx0 is the page; the unique-name
