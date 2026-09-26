@@ -1957,8 +1957,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// Generate appearances when `/NeedAppearances` is true, then remove the
     /// marker.
     ///
-    /// Pages and Widget annotations are visited in qpdf's document order. Each
-    /// Widget is resolved through the cached AcroForm annotation-to-field map;
+    /// Raw page handles and Widget annotations are visited in qpdf's document
+    /// order. Each Widget is resolved through the cached AcroForm
+    /// annotation-to-field map;
     /// text and choice fields use the canonical appearance renderer, while
     /// checkbox and radio fields reset their value through the form-field
     /// helper so their `/AS` state agrees with `/V`. Other button fields are
@@ -1974,11 +1975,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             return Ok(());
         }
 
-        for page_ref in crate::pages::page_refs(self.pdf)? {
-            let widgets = {
-                let mut page = PageObjectHelper::new(page_ref, self.pdf);
-                page.get_annotation_handles(Some(b"/Widget"))?
-            };
+        let page_handles = crate::PageDocumentHelper::new(self.pdf).get_all_pages()?;
+        for page_handle in page_handles {
+            let widgets = self.get_widget_annotations_for_page(page_handle)?;
             for widget in widgets {
                 let Some(field) = self.canonical_field_for_annotation(widget.clone())? else {
                     continue;
@@ -2640,6 +2639,96 @@ mod final_handle_tests {
             "the raw Widget must resolve to its own merged field, not the direct-orphan bucket"
         );
         drop(helper);
+    }
+
+    #[test]
+    fn generate_appearances_accepts_a_raw_generation_page() {
+        let mut pdf = Pdf::empty().expect("empty PDF should open");
+        let catalog = pdf.root_handle().expect("empty PDF has a catalog");
+        let pages = catalog
+            .try_get_key(b"/Pages")
+            .expect("catalog page-tree root");
+        let raw_page = pdf.get_object_handle_by_raw_identity(5, 65_535);
+        let raw_widget = pdf.get_object_handle_by_raw_identity(6, 65_535);
+
+        raw_widget.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+                (b"/FT".to_vec(), ObjectHandle::name(b"Tx".to_vec())),
+                (b"/T".to_vec(), ObjectHandle::string(b"raw-page".to_vec())),
+                (b"/V".to_vec(), ObjectHandle::string(b"value".to_vec())),
+                (
+                    b"/Rect".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(100),
+                        ObjectHandle::integer(20),
+                    ]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        raw_page.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+                (b"/Parent".to_vec(), pages.clone()),
+                (
+                    b"/MediaBox".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(612),
+                        ObjectHandle::integer(792),
+                    ]),
+                ),
+                (
+                    b"/Annots".to_vec(),
+                    ObjectHandle::array(vec![raw_widget.clone()]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        pages
+            .replace_key(b"/Kids", ObjectHandle::array(vec![raw_page.clone()]))
+            .expect("install raw-generation page");
+        pages
+            .replace_key(b"/Count", ObjectHandle::integer(1))
+            .expect("set page count");
+        raw_widget
+            .replace_key(b"/P", raw_page)
+            .expect("associate Widget with raw-generation page");
+
+        let acroform = ObjectHandle::dictionary(vec![
+            (
+                b"/Fields".to_vec(),
+                ObjectHandle::array(vec![raw_widget.clone()]),
+            ),
+            (b"/NeedAppearances".to_vec(), ObjectHandle::boolean(true)),
+            (
+                b"/DA".to_vec(),
+                ObjectHandle::string(b"/Helv 12 Tf 0 g".to_vec()),
+            ),
+        ]);
+        catalog
+            .replace_key(b"/AcroForm", acroform.clone())
+            .expect("install AcroForm");
+
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).expect("AcroForm helper");
+        helper
+            .generate_appearances_if_needed()
+            .expect("raw page should not require ObjectRef projection");
+        drop(helper);
+
+        assert!(raw_widget.try_has_key(b"/AP").expect("read appearance"));
+        assert!(
+            !acroform
+                .try_has_key(b"/NeedAppearances")
+                .expect("read appearance marker"),
+            "successful generation clears /NeedAppearances"
+        );
     }
 
     #[test]
