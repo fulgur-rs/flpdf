@@ -300,6 +300,100 @@ fn cli_three_page_linearize_byte_identical() {
     assert_byte_identical("three-page", "linearize", &[]);
 }
 
+fn malformed_live_page_contents_pdf() -> Vec<u8> {
+    let objects: [&[u8]; 4] = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 100 100] >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R /Resources << >> >>",
+        b"[",
+    ];
+    let mut bytes = b"%PDF-1.3\n".to_vec();
+    let mut offsets = [0usize; 5];
+    for (index, body) in objects.iter().enumerate() {
+        let object_number = index + 1;
+        offsets[object_number] = bytes.len();
+        bytes.extend_from_slice(format!("{object_number} 0 obj\n").as_bytes());
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(b"trailer\n<< /Root 1 0 R /Size 5 >>\nstartxref\n");
+    bytes.extend_from_slice(format!("{xref_offset}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+/// qpdf keeps warning-to-null recovery for a page-closure object whose xref
+/// row is live but whose body fails parsing. The linearization writer then
+/// emits the null-resolved object and completes with warnings.
+#[test]
+fn linearize_malformed_live_page_contents_matches_qpdf_recovery() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for linearization recovery parity");
+        }
+        eprintln!("skipping malformed-object linearization parity: qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("malformed-live-content.pdf");
+    let qpdf_output = directory.path().join("qpdf-linearized.pdf");
+    let flpdf_output = directory.path().join("flpdf-linearized.pdf");
+    std::fs::write(&input, malformed_live_page_contents_pdf()).expect("write synthetic input");
+
+    let qpdf = StdCommand::new("qpdf")
+        .args(["--linearize", "--static-id"])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .expect("run qpdf 11.9.0 linearization");
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--linearize", "--static-id"])
+        .arg(&input)
+        .arg(&flpdf_output)
+        .output()
+        .expect("run flpdf linearization");
+
+    assert_eq!(
+        qpdf.status.code(),
+        Some(3),
+        "qpdf must report its parser warnings"
+    );
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "warning exit status"
+    );
+    assert_eq!(flpdf.stdout, qpdf.stdout, "stdout");
+    assert_eq!(flpdf.stderr, qpdf.stderr, "ordered parser warnings");
+
+    let qpdf_bytes = std::fs::read(&qpdf_output).expect("qpdf must write despite warnings");
+    let flpdf_bytes = std::fs::read(&flpdf_output).expect("flpdf must write despite warnings");
+    assert!(
+        qpdf_bytes == flpdf_bytes,
+        "warning-to-null linearized outputs must match (flpdf {} bytes, qpdf {} bytes)",
+        flpdf_bytes.len(),
+        qpdf_bytes.len()
+    );
+
+    let check = StdCommand::new("qpdf")
+        .arg("--check")
+        .arg(&qpdf_output)
+        .output()
+        .expect("check qpdf linearized output");
+    assert!(
+        check.status.success(),
+        "qpdf output must remain readable: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
 #[test]
 fn cli_linearize_normalize_content_is_byte_identical_to_qpdf() {
     for stem in [
