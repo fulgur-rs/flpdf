@@ -2251,6 +2251,21 @@ fn acroform_original_direct_widget_with_dropped_sibling_page_pdf() -> Vec<u8> {
     ])
 }
 
+/// One page whose top-level field has a scalar `/Parent`. qpdf follows that
+/// parent once through `getFullyQualifiedName` and `getTopLevelField`, issuing
+/// its dictionary type warnings before filtering the non-dictionary result.
+fn acroform_scalar_parent_field_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [7 0 R] >>\nendobj\n".to_vec(),
+        b"4 0 obj\n<< /Type /Unused >>\nendobj\n".to_vec(),
+        b"5 0 obj\n<< /Fields [6 0 R] >>\nendobj\n".to_vec(),
+        b"6 0 obj\n<< /FT /Tx /T (Top) /Parent 42 /Kids [7 0 R] >>\nendobj\n".to_vec(),
+        b"7 0 obj\n<< /Type /Annot /Subtype /Widget /Parent 6 0 R /P 3 0 R /Rect [0 0 10 10] >>\nendobj\n".to_vec(),
+    ])
+}
+
 /// A direct (inline) widget's dangling `/P` to a dropped sibling page is
 /// stripped identically to an indirect widget's, matching qpdf.
 #[test]
@@ -2298,6 +2313,62 @@ fn original_direct_widget_dropped_sibling_page_is_not_repaired() {
         widget_page_ref(&flpdf_output, "DirectField"),
         None,
         "flpdf must not repair a direct widget's /P to its current owner"
+    );
+}
+
+#[test]
+fn scalar_parent_field_warnings_match_qpdf_during_page_pruning() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let primary = temp.path().join("primary.pdf");
+    std::fs::write(&primary, acroform_scalar_parent_field_pdf()).expect("write primary");
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let qpdf = Shell::new(QPDF)
+        .arg(&primary)
+        .args(["--pages", ".", "1", "--"])
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf should spawn");
+    assert_eq!(
+        qpdf.status.code(),
+        Some(3),
+        "qpdf stderr: {:?}",
+        qpdf.stderr
+    );
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&primary)
+        .args(["--pages", ".", "1", "--"])
+        .arg(&flpdf_output)
+        .output()
+        .expect("flpdf should spawn");
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "flpdf stderr: {:?}",
+        flpdf.stderr
+    );
+
+    let warning_lines = |stderr: &[u8]| {
+        String::from_utf8_lossy(stderr)
+            .lines()
+            .filter(|line| line.starts_with("WARNING:"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        warning_lines(&flpdf.stderr),
+        warning_lines(&qpdf.stderr),
+        "a scalar /Parent follows qpdf's warning-producing getKeyIfDict path; qpdf stderr: {}; flpdf stderr: {}",
+        String::from_utf8_lossy(&qpdf.stderr),
+        String::from_utf8_lossy(&flpdf.stderr),
     );
 }
 

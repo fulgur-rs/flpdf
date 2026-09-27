@@ -176,7 +176,21 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             }
 
             let node = self.dereferenced(current.clone())?;
-            let parent = self.dereferenced(node.try_get_key(b"/Parent")?)?;
+            let parent = if node.try_is_null()? {
+                ObjectHandle::null()
+            } else {
+                match node.try_get_key(b"/Parent") {
+                    Err(Error::QpdfExc(warning)) if !node.try_is_dictionary()? => {
+                        // qpdf's getKeyIfDict invokes getKey for non-null
+                        // scalars, warns, and returns null instead of
+                        // aborting top-level field lookup.
+                        self.pdf.push_qpdf_warning(warning)?;
+                        ObjectHandle::null()
+                    }
+                    result => result?,
+                }
+            };
+            let parent = self.dereferenced(parent)?;
             if parent.try_is_null()? {
                 break;
             }
@@ -886,8 +900,8 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
 #[cfg(test)]
 mod tests {
-    use super::mark_field_node_seen;
-    use crate::object_handle::ObjectHandle;
+    use super::{mark_field_node_seen, FormFieldObjectHelper};
+    use crate::object_handle::{ObjectHandle, ObjectValue};
     use crate::{ObjectRef, Pdf};
     use std::collections::BTreeSet;
 
@@ -911,6 +925,50 @@ mod tests {
 
         assert!(mark_field_node_seen(&mut seen, &raw));
         assert!(!mark_field_node_seen(&mut seen, &raw));
+    }
+
+    #[test]
+    fn top_level_field_scalar_parent_warns_and_returns_the_scalar_like_qpdf() {
+        let mut pdf = Pdf::empty().expect("empty PDF should open");
+        let field = pdf.get_object_handle(ObjectRef::new(17, 0));
+        field.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"/T".to_vec(), ObjectHandle::string(b"field".to_vec())),
+                (b"/Parent".to_vec(), ObjectHandle::integer(42)),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+
+        let mut helper = FormFieldObjectHelper::from_object_handle(field, &mut pdf);
+        let (top_level, is_different) = helper
+            .get_top_level_field()
+            .expect("a scalar parent warns and terminates the top-level walk");
+        drop(helper);
+
+        assert_eq!(top_level.as_integer(), Some(42));
+        assert!(is_different);
+        let warnings = pdf.get_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings.entries()[0].get_message_detail(),
+            b"operation for dictionary attempted on object of type integer: returning null for attempted key retrieval"
+        );
+    }
+
+    #[test]
+    fn top_level_null_field_returns_null_without_a_type_warning() {
+        let mut pdf = Pdf::empty().expect("empty PDF should open");
+        let mut helper = FormFieldObjectHelper::from_object_handle(ObjectHandle::null(), &mut pdf);
+
+        let (top_level, is_different) = helper
+            .get_top_level_field()
+            .expect("qpdf getKeyIfDict short-circuits a null receiver");
+        drop(helper);
+
+        assert!(top_level.is_null());
+        assert!(!is_different);
+        assert!(pdf.get_warnings().is_empty());
     }
 
     #[test]

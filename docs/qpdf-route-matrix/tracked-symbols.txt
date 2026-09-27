@@ -198,6 +198,7 @@ crates/flpdf/src/writer/object_streams/eligibility.rs::compressible_objgens_qpdf
 
 # --- (a) deletable route ---
 crates/flpdf/src/job/attachment_list.rs::format_attachment_list_with_sink # E-9
+crates/flpdf/src/acroform_document_helper.rs::get_form_fields_for_page # E-26 raw page helper
 crates/flpdf/src/job/acroform_field_prune.rs::prune_acroform_after_subset # E-26（pub(crate) free implementation + method owner）
 
 # --- (b) baseline denominator ---
