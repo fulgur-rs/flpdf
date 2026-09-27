@@ -910,14 +910,21 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// `/Rotate`, `/MediaBox`, and the optional page boxes directly from the
     /// page object here; inherited values are not materialized by this method.
     /// It operates on the live page handle and does not require an
-    /// `ObjectRef` projection, but the handle must still belong to a PDF.
+    /// `ObjectRef` projection. Since flpdf stores the mutable `Pdf` separately
+    /// from the handle, the handle must belong to that same `Pdf`; qpdf's
+    /// `QPDFObjectHelper` stores only the handle.
     /// The page-document orchestration that calls this method remains outside
     /// [`PageObjectHelper`]. Annotation field-tree work is delegated to
     /// [`crate::AcroFormDocumentHelper`]'s canonical transform route.
     pub fn flatten_rotation(&mut self) -> Result<()> {
-        if self.object.owning_pdf_unique_id().is_none() {
+        let Some(page_pdf_id) = self.object.owning_pdf_unique_id() else {
             return Err(Error::System(
                 "QPDFPageObjectHelper::flattenRotation called with a direct object".to_owned(),
+            ));
+        };
+        if page_pdf_id != self.pdf.unique_id() {
+            return Err(Error::Unsupported(
+                "flattenRotation: page belongs to another Pdf".to_owned(),
             ));
         }
         let page = self.resolved_page_handle()?;
@@ -3012,6 +3019,66 @@ mod tests {
             Rectangle::new(240.0, 30.0, 290.0, 70.0)
         );
         assert_eq!(flatten_rotation_box(0, media, rectangle), rectangle);
+    }
+
+    #[test]
+    fn flatten_rotation_rejects_a_page_owned_by_another_pdf_before_mutation() {
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned()),
+                (
+                    3,
+                    "<< /Type /Page /Parent 2 0 R /Rotate 90 /MediaBox [0 0 200 100] /Contents 4 0 R >>"
+                        .to_owned(),
+                ),
+                (4, "<< /Length 0 >>\nstream\n\nendstream".to_owned()),
+            ],
+        );
+        let mut source = Pdf::open(Cursor::new(bytes)).expect("source PDF should parse");
+        let page = source.get_object_handle(ObjectRef::new(3, 0));
+        let mut other = Pdf::<Cursor<Vec<u8>>>::empty().expect("other PDF should be available");
+        let other_object_count = other
+            .get_object_count()
+            .expect("other PDF object count should resolve");
+
+        let result =
+            PageObjectHelper::from_object_handle(page.clone(), &mut other).flatten_rotation();
+
+        assert!(
+            matches!(result, Err(Error::Unsupported(ref message)) if message.contains("another Pdf")),
+            "a page handle owned by another Pdf must be rejected, got {result:?}"
+        );
+        assert_eq!(
+            page.try_get_key(b"/Rotate")
+                .expect("page rotation should resolve")
+                .try_as_integer()
+                .expect("page rotation should be an integer"),
+            Some(90),
+            "the source page must remain unchanged"
+        );
+        assert_eq!(
+            page.try_get_key(b"/MediaBox")
+                .expect("page box should resolve")
+                .unparse_resolved(),
+            b"[ 0 0 200 100 ]",
+            "the source page box must remain unchanged"
+        );
+        assert_eq!(
+            page.try_get_key(b"/Contents")
+                .expect("page contents should resolve")
+                .object_ref(),
+            Some(ObjectRef::new(4, 0)),
+            "the source page contents must remain unchanged"
+        );
+        assert_eq!(
+            other
+                .get_object_count()
+                .expect("other PDF object count should resolve"),
+            other_object_count,
+            "the helper PDF must not receive rotation streams"
+        );
     }
 
     #[test]
