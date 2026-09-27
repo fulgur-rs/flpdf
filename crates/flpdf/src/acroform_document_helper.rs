@@ -1756,12 +1756,33 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         })
     }
 
+    fn get_key_with_qpdf_type_warning(
+        &mut self,
+        receiver: &ObjectHandle,
+        key: &[u8],
+    ) -> Result<ObjectHandle> {
+        match receiver.try_get_key(key) {
+            Err(Error::QpdfExc(warning)) if !receiver.try_is_dictionary()? => {
+                // qpdf's getKey returns a null handle after issuing
+                // typeWarning. A direct child handle may have no warning
+                // context of its own, so deliver that warning through the
+                // owning Pdf and continue with qpdf's null result.
+                self.pdf.push_qpdf_warning(warning)?;
+                Ok(ObjectHandle::null())
+            }
+            result => result,
+        }
+    }
+
     #[allow(clippy::mutable_key_type)]
     fn canonical_fully_qualified_name(&mut self, start: ObjectHandle) -> Result<String> {
         start.try_dereference()?;
         let mut current = start;
         let mut seen = HashSet::new();
         let mut parts = Vec::new();
+        // qpdf getFullyQualifiedName reads /T and /Parent for every non-null
+        // node, including a scalar /Parent, so each such getKey type warning
+        // remains observable (`QPDFFormFieldObjectHelper.cc:116-132`).
         loop {
             if !seen.insert(current.identity_key()) {
                 if !is_indirect_handle(&current) {
@@ -1769,13 +1790,13 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 }
                 break;
             }
-            let partial = current.try_get_key(b"/T")?;
+            let partial = self.get_key_with_qpdf_type_warning(&current, b"/T")?;
             partial.try_dereference()?;
             if let Some(name) = partial.as_string() {
                 parts.push(decode_field_name(&name));
             }
-            let parent = current.try_get_key(b"/Parent")?;
-            if parent.try_is_null()? || !parent.try_is_dictionary()? {
+            let parent = self.get_key_with_qpdf_type_warning(&current, b"/Parent")?;
+            if parent.try_is_null()? {
                 break;
             }
             parent.try_dereference()?;

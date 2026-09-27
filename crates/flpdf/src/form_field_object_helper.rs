@@ -176,7 +176,21 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             }
 
             let node = self.dereferenced(current.clone())?;
-            let parent = self.dereferenced(node.try_get_key(b"/Parent")?)?;
+            let parent = if node.try_is_null()? {
+                ObjectHandle::null()
+            } else {
+                match node.try_get_key(b"/Parent") {
+                    Err(Error::QpdfExc(warning)) if !node.try_is_dictionary()? => {
+                        // qpdf's getKeyIfDict invokes getKey for non-null
+                        // scalars, warns, and returns null instead of
+                        // aborting top-level field lookup.
+                        self.pdf.push_qpdf_warning(warning)?;
+                        ObjectHandle::null()
+                    }
+                    result => result?,
+                }
+            };
+            let parent = self.dereferenced(parent)?;
             if parent.try_is_null()? {
                 break;
             }

@@ -190,6 +190,19 @@ pub(crate) fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
     let mut kept_fields = Vec::new();
 
     for field in fields_arr {
+        if field.get_obj_gen().is_indirect() {
+            // Preserve the caller-supplied safety limit for field branches
+            // whose Widgets are all on dropped pages. qpdf's per-page helper
+            // supplies field membership; this raw walk retains the existing
+            // bounded traversal contract independently of that result.
+            let _ = field_has_retained_widget_with_depth_limit(
+                field.clone(),
+                &widget_to_page,
+                &mut BTreeSet::new(),
+                0,
+                max_depth,
+            )?;
+        }
         if referenced_fields.contains(&field.get_obj_gen()) {
             kept_fields.push(field);
         }
@@ -254,6 +267,62 @@ pub(crate) fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Walk a field's raw `/Kids` tree until a retained Widget is found, preserving
+/// the caller-supplied depth limit used by the previous subset pruning path.
+///
+/// The result does not select `/Fields`; qpdf's per-page helper supplies that
+/// raw-identity membership. This traversal preserves the explicit safety
+/// boundary even for top-level fields that will be dropped.
+#[allow(clippy::mutable_key_type)]
+fn field_has_retained_widget_with_depth_limit(
+    field: ObjectHandle,
+    widget_to_page: &WidgetPageMap,
+    visited: &mut BTreeSet<QpdfObjGen>,
+    depth: usize,
+    max_depth: usize,
+) -> Result<bool> {
+    let field_objgen = field.get_obj_gen();
+    if depth > max_depth {
+        return Err(crate::Error::Unsupported(format!(
+            "acroform_field_prune: field-tree depth limit {max_depth} exceeded at {field_objgen}"
+        )));
+    }
+    if !field_objgen.is_indirect() || !visited.insert(field_objgen) {
+        return Ok(false);
+    }
+    if widget_to_page.contains_key(&field.identity_key()) {
+        return Ok(true);
+    }
+    if !field.try_is_dictionary()? {
+        return Ok(false);
+    }
+
+    let kids = field.try_get_key(b"/Kids")?;
+    let Some(kids) = kids.try_as_array()? else {
+        return Ok(false);
+    };
+    for kid in kids {
+        kid.try_dereference()?;
+        let kid_objgen = kid.get_obj_gen();
+        if !kid_objgen.is_indirect() {
+            continue;
+        }
+        if widget_to_page.contains_key(&kid.identity_key()) {
+            return Ok(true);
+        }
+        if field_has_retained_widget_with_depth_limit(
+            kid,
+            widget_to_page,
+            visited,
+            depth + 1,
+            max_depth,
+        )? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 
 /// Preserve a valid widget `/P` and remove only a dangling (nulled) page ref.
 ///
@@ -837,6 +906,39 @@ mod tests {
 
         let error = prune_acroform_after_subset_with_max_depth(&mut pdf, &result, 1)
             .expect_err("nested sub-fields exceed the caller-supplied depth limit");
+
+        assert!(matches!(
+            error,
+            crate::Error::Unsupported(message)
+                if message == "acroform_field_prune: field-tree depth limit 1 exceeded at 8,0"
+        ));
+    }
+
+    #[test]
+    fn prune_enforces_the_depth_limit_on_fields_with_only_dropped_widgets() {
+        let objects: Vec<(u32, &[u8])> = vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>"),
+            (
+                2,
+                b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 612 792] >>",
+            ),
+            (3, b"<< /Type /Page /Parent 2 0 R >>"),
+            (4, b"<< /Type /Page /Parent 2 0 R /Annots [9 0 R] >>"),
+            (5, b"<< /Fields [6 0 R] >>"),
+            (6, b"<< /FT /Tx /T (Top) /Kids [7 0 R] >>"),
+            (7, b"<< /T (Middle) /Parent 6 0 R /Kids [8 0 R] >>"),
+            (8, b"<< /T (Inner) /Parent 7 0 R /Kids [9 0 R] >>"),
+            (
+                9,
+                b"<< /Type /Annot /Subtype /Widget /Parent 8 0 R /P 4 0 R /Rect [0 0 10 10] >>",
+            ),
+        ];
+        let mut pdf = open(build_pdf(&objects));
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)])
+            .expect("keep the page without Widgets");
+
+        let error = prune_acroform_after_subset_with_max_depth(&mut pdf, &result, 1)
+            .expect_err("the caller limit applies even when all Widgets are on dropped pages");
 
         assert!(matches!(
             error,
