@@ -3775,7 +3775,7 @@ mod tests {
             "/AcroForm must be removed once every widget lacks /NeedAppearances"
         );
 
-        crate::job::flatten_rotation_on_pages(&mut pdf, &[page_ref]).unwrap();
+        crate::job::flatten_rotation_on_document(&mut pdf).unwrap();
 
         let root_after_rotation = pdf.get_object_handle(root_ref);
         root_after_rotation.try_is_scalar().unwrap();

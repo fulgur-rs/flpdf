@@ -38,17 +38,34 @@ fn cli_transformation_order_matches_qpdf_job() {
     let coalesce = transformations
         .find("PageObjectHelper::from_object_handle(page, pdf).coalesce_content_streams()?")
         .expect("coalesce route");
-    let rotation = transformations
-        .find("flatten_rotation_on_pages(pdf, &page_refs)?")
+    let rotation_branch = transformations
+        .find("if configuration.flatten_rotation {")
+        .expect("rotation configuration branch");
+    let rotation_transform = &transformations[rotation_branch..];
+    let rotation = rotation_transform
+        .find("flatten_rotation_on_document(pdf)?")
         .expect("rotation route");
+    let rotation_module = include_str!("../src/job/rotate.rs");
+    let acroform = rotation_module
+        .find("AcroFormDocumentHelper::new(pdf)?")
+        .expect("eager AcroForm analysis");
+    let page_enumeration = rotation_module
+        .find("PageDocumentHelper::new(pdf).get_all_pages()?")
+        .expect("raw page enumeration");
+    let page_iteration = rotation_module
+        .find("flatten_rotation_on_page_handles(pdf, &pages)")
+        .expect("raw page handle iteration");
     let labels = transformations
         .find("self.apply_page_label_transformations(pdf, configuration)?")
         .expect("page-label route");
 
     assert!(generate < flatten);
     assert!(flatten < coalesce);
-    assert!(coalesce < rotation);
-    assert!(rotation < labels);
+    assert!(coalesce < rotation_branch);
+    let rotation_call = rotation_branch + "if configuration.flatten_rotation {".len() + rotation;
+    assert!(rotation_call < labels);
+    assert!(acroform < page_enumeration);
+    assert!(page_enumeration < page_iteration);
 }
 
 #[test]

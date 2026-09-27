@@ -486,8 +486,8 @@ crates/flpdf/src/job/lifecycle.rs::prepare_document_transformations: prod 4 (1 f
     crates/flpdf/src/job/lifecycle.rs 4
 crates/flpdf/src/job/image_optimization.rs::optimize_images: prod 23 (2 files) / test 2
     crates/flpdf-cli/src/main.rs 20, crates/flpdf/src/job/lifecycle.rs 3
-crates/flpdf/src/job/rotate.rs::flatten_rotation_on_pages: prod 3 (2 files) / test 10
-    crates/flpdf-cli/src/main.rs 2, crates/flpdf/src/job/lifecycle.rs 1
+crates/flpdf/src/job/rotate.rs::flatten_rotation_on_document: prod 1 (1 file) / test 1
+    crates/flpdf/src/job/lifecycle.rs 1; tests: page_annotation_flatten.rs 1
 crates/flpdf/src/job/lifecycle.rs::apply_configured_rotations: prod 4 (1 files) / test 0
     crates/flpdf/src/job/lifecycle.rs 4
 crates/flpdf/src/job/rotate.rs::apply_rotate_to_pages: absent (prod 0 / test 0; removed by flpdf-v55s)

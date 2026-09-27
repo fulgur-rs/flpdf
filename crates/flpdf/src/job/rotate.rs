@@ -7,8 +7,8 @@
 //!
 //! # `/Rotate` flattening
 //!
-//! [`flatten_rotation_on_pages`] delegates to the live
-//! [`PageObjectHelper::flatten_rotation`] facade. That facade follows qpdf's
+//! The internal document transformation delegates raw page handles to the
+//! live [`PageObjectHelper::flatten_rotation`] facade. That facade follows qpdf's
 //! direct-key semantics, prepends the affine matrix to page contents, remaps
 //! every direct page box, and delegates annotation/field/AP transformation to
 //! [`crate::AcroFormDocumentHelper`].
@@ -18,23 +18,20 @@ use crate::page_object_helper::PageObjectHelper;
 use crate::page_object_helper::{
     resolve_inherited_rotate, resolve_inherited_rotate_with_max_depth,
 };
-use crate::{ObjectRef, Pdf, Result};
+use crate::{ObjectHandle, PageDocumentHelper, Pdf, Result};
 use std::io::{Read, Seek};
 
 // ---------------------------------------------------------------------------
-// Public API: flatten_rotation_on_pages
+// Internal qpdf job page transformation
 // ---------------------------------------------------------------------------
 
-/// Apply qpdf's `QPDFPageObjectHelper::flattenRotation` to each selected page.
-/// The page-level facade owns the direct `/Rotate` and box semantics; this
-/// function only performs page selection and iteration.
+/// Apply qpdf's `QPDFJob::handleTransformations` rotation phase. Build the
+/// shared AcroForm analysis first, then enumerate raw page handles in order and
+/// delegate each page to its live page facade.
 ///
 /// # Errors
 /// Propagates the facade's validation, warning, and resolver errors.
-pub fn flatten_rotation_on_pages<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    pages: &[ObjectRef],
-) -> Result<()> {
+pub(crate) fn flatten_rotation_on_document<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
     // qpdf's `QPDFJob::handleTransformations` eagerly constructs its shared
     // AcroForm helper before entering the page loop
     // (`QPDFJob.cc:2190-2193`), even when no page later needs annotation
@@ -43,8 +40,17 @@ pub fn flatten_rotation_on_pages<R: Read + Seek>(
     // `Pdf` for the page helpers below.
     let acroform = crate::AcroFormDocumentHelper::new(pdf)?;
     drop(acroform);
-    for &page_ref in pages {
-        let mut page = PageObjectHelper::new(page_ref, pdf);
+
+    let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    flatten_rotation_on_page_handles(pdf, &pages)
+}
+
+fn flatten_rotation_on_page_handles<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    pages: &[ObjectHandle],
+) -> Result<()> {
+    for page in pages {
+        let mut page = PageObjectHelper::from_object_handle(page.clone(), pdf);
         page.flatten_rotation()?;
     }
     Ok(())
@@ -58,8 +64,21 @@ pub fn flatten_rotation_on_pages<R: Read + Seek>(
 mod tests {
     use super::*;
     use crate::writer::write_qpdf_to_memory;
-    use crate::{pages, Error, ObjectHandle, PageBox, Pdf};
+    use crate::{pages, Error, ObjectHandle, ObjectRef, PageBox, Pdf};
     use std::io::Cursor;
+
+    fn flatten_rotation_on_pages<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        pages: &[ObjectRef],
+    ) -> Result<()> {
+        let acroform = crate::AcroFormDocumentHelper::new(pdf)?;
+        drop(acroform);
+        let page_handles = pages
+            .iter()
+            .map(|page_ref| pdf.get_object_handle(*page_ref))
+            .collect::<Vec<_>>();
+        flatten_rotation_on_page_handles(pdf, &page_handles)
+    }
 
     fn handle_to_pagebox(obj: &ObjectHandle) -> Option<PageBox> {
         obj.try_is_scalar().ok()?;
@@ -639,6 +658,35 @@ mod tests {
     // -----------------------------------------------------------------------
     // flatten_rotation_on_pages
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn flatten_rotation_rejects_an_unowned_direct_page_like_qpdf() {
+        let mut pdf = Pdf::empty().expect("empty PDF should open");
+        let page = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (b"/Rotate".to_vec(), ObjectHandle::integer(0)),
+            (
+                b"/MediaBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(200),
+                    ObjectHandle::integer(300),
+                ]),
+            ),
+        ]);
+        assert_eq!(page.owning_pdf_unique_id(), None);
+
+        let mut page_helper = PageObjectHelper::from_object_handle(page, &mut pdf);
+        let error = page_helper
+            .flatten_rotation()
+            .expect_err("qpdf getQPDF rejects a detached direct page handle");
+        assert!(matches!(
+            error,
+            Error::System(message)
+                if message == "QPDFPageObjectHelper::flattenRotation called with a direct object"
+        ));
+    }
 
     /// Assemble a minimal PDF from `(number, body)` objects numbered 1..=N in
     /// order. `body` excludes the `N 0 obj` / `endobj` wrapper.
