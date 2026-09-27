@@ -539,6 +539,55 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         page.get_annotation_handles(Some(b"/Widget"))
     }
 
+    /// Return the top-level form fields associated with Widget annotations
+    /// listed by a raw page handle, preserving first-Widget order.
+    ///
+    /// This mirrors `QPDFAcroFormDocumentHelper::getFormFieldsForPage`
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:204-216`). qpdf resolves each
+    /// Widget to its top-level field, deduplicates by `QPDFObjGen`, and
+    /// returns dictionary fields in page annotation order. Keeping raw
+    /// identities here avoids requiring the page or field to project to an
+    /// `ObjectRef`.
+    pub fn get_form_fields_for_page(
+        &mut self,
+        page_handle: ObjectHandle,
+    ) -> Result<Vec<ObjectHandle>> {
+        self.analyze()?;
+        let widgets = self.get_widget_annotations_for_page(page_handle)?;
+        self.get_form_fields_for_widget_annotations(&widgets)
+    }
+
+    /// Resolve an already ordered page Widget list to qpdf's top-level fields.
+    ///
+    /// The page-subset caller also needs the raw Widget handles for its
+    /// existing `/P` cleanup, so it shares the single `getWidgetAnnotations`
+    /// traversal with this field mapping.
+    pub(crate) fn get_form_fields_for_widget_annotations(
+        &mut self,
+        widgets: &[ObjectHandle],
+    ) -> Result<Vec<ObjectHandle>> {
+        self.analyze()?;
+        let mut seen = BTreeSet::<QpdfObjGen>::new();
+        let mut fields = Vec::new();
+
+        for widget in widgets {
+            let field = self.get_field_for_annotation_handle(widget.clone())?;
+            // qpdf's getTopLevelField calls getKeyIfDict on the associated
+            // field. A null association therefore remains null without a
+            // dictionary type warning and is filtered out below.
+            if field.try_is_null()? {
+                continue;
+            }
+            let mut form_field = FormFieldObjectHelper::from_object_handle(field, self.pdf);
+            let (top_level, _) = form_field.get_top_level_field()?;
+            if seen.insert(top_level.get_obj_gen()) && top_level.try_is_dictionary()? {
+                fields.push(top_level);
+            }
+        }
+
+        Ok(fields)
+    }
+
     /// Return the live field handle associated with a Widget annotation.
     ///
     /// A missing association returns qpdf's null helper, matching
@@ -2639,6 +2688,116 @@ mod final_handle_tests {
             "the raw Widget must resolve to its own merged field, not the direct-orphan bucket"
         );
         drop(helper);
+    }
+
+    #[test]
+    fn get_form_fields_for_page_keeps_raw_top_level_fields_once_in_widget_order() {
+        let mut pdf = Pdf::empty().expect("empty PDF should open");
+        let catalog = pdf.root_handle().expect("empty PDF has a catalog");
+        let pages = catalog
+            .try_get_key(b"/Pages")
+            .expect("empty PDF page-tree root");
+        let raw_page = pdf.get_object_handle_by_raw_identity(17, 65_535);
+        let field_a = pdf.get_object_handle_by_raw_identity(21, 65_535);
+        let widget_a = pdf.get_object_handle_by_raw_identity(22, 65_535);
+        let field_b = pdf.get_object_handle_by_raw_identity(23, 65_535);
+        let widget_b = pdf.get_object_handle_by_raw_identity(24, 65_535);
+
+        widget_a.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+                (b"/Parent".to_vec(), field_a.clone()),
+                (b"/P".to_vec(), raw_page.clone()),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        widget_b.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+                (b"/Parent".to_vec(), field_b.clone()),
+                (b"/P".to_vec(), raw_page.clone()),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        field_a.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"/FT".to_vec(), ObjectHandle::name(b"Tx".to_vec())),
+                (b"/T".to_vec(), ObjectHandle::string(b"field-a".to_vec())),
+                (
+                    b"/Kids".to_vec(),
+                    ObjectHandle::array(vec![widget_a.clone()]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        field_b.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"/FT".to_vec(), ObjectHandle::name(b"Tx".to_vec())),
+                (b"/T".to_vec(), ObjectHandle::string(b"field-b".to_vec())),
+                (
+                    b"/Kids".to_vec(),
+                    ObjectHandle::array(vec![widget_b.clone()]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        raw_page.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+                (b"/Parent".to_vec(), pages.clone()),
+                (
+                    b"/MediaBox".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(612),
+                        ObjectHandle::integer(792),
+                    ]),
+                ),
+                (
+                    b"/Annots".to_vec(),
+                    ObjectHandle::array(vec![widget_b.clone(), widget_a.clone(), widget_a.clone()]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        pages
+            .replace_key(b"/Kids", ObjectHandle::array(vec![raw_page.clone()]))
+            .expect("install raw-generation page");
+        pages
+            .replace_key(b"/Count", ObjectHandle::integer(1))
+            .expect("set page count");
+        catalog
+            .replace_key(
+                b"/AcroForm",
+                ObjectHandle::dictionary(vec![(
+                    b"/Fields".to_vec(),
+                    ObjectHandle::array(vec![field_a.clone(), field_b.clone()]),
+                )]),
+            )
+            .expect("install AcroForm");
+
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).expect("AcroForm helper");
+        let fields = helper
+            .get_form_fields_for_page(raw_page)
+            .expect("page field lookup accepts raw identity");
+
+        assert_eq!(
+            fields
+                .iter()
+                .map(ObjectHandle::get_obj_gen)
+                .collect::<Vec<_>>(),
+            vec![
+                crate::QpdfObjGen::new(23, 65_535),
+                crate::QpdfObjGen::new(21, 65_535),
+            ],
+            "top-level fields follow first Widget order and deduplicate by raw QpdfObjGen"
+        );
     }
 
     #[test]

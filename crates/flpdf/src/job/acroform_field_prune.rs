@@ -3,12 +3,11 @@
 //! qpdf correspondence: QPDFJob.cc removal of unreferenced form fields after page selection.
 //!
 //! After [`crate::pages::tree_rebuild::rebuild_page_tree`] has rebuilt the page
-//! tree so that only the selected pages remain reachable from `/Root`, this
-//! module prunes the `/AcroForm /Fields` array to remove any top-level field
-//! whose **all** widget annotations live on dropped pages. Fields that have at
-//! least one widget on a retained page are kept. Stale or dangling `/P` page
-//! back-pointers are removed, but the current `/Annots` owner is never used to
-//! synthesize a new `/P`.
+//! tree so that only selected pages remain reachable from `/Root`, this module
+//! enumerates those pages as raw handles, asks the AcroForm helper for each
+//! page's top-level Widget fields, and filters `/AcroForm /Fields` by raw
+//! `QpdfObjGen`. Stale or dangling `/P` page back-pointers are removed, but
+//! the current `/Annots` owner is never used to synthesize a new `/P`.
 //!
 //! # qpdf 11.9.0 observed behaviour (truth source `/usr/bin/qpdf`)
 //!
@@ -65,10 +64,9 @@
 //! extract-time field/widget survival filter and stale `/P` cleanup.
 
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
-use crate::page_object_helper::PageObjectHelper;
 use crate::pages::tree_rebuild::RebuildResult;
 use crate::qpdf_obj_gen::QpdfObjGen;
-use crate::{ObjectRef, Pdf, Result};
+use crate::{AcroFormDocumentHelper, Pdf, Result};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Seek};
 
@@ -81,20 +79,18 @@ use std::io::{Read, Seek};
 /// Matches the depth limit used by the outline-remap module.
 pub const DEFAULT_MAX_ACROFORM_DEPTH: usize = 100;
 
-/// Canonical widget identity plus the first retained page that contains it.
-/// qpdf's page annotation walk preserves direct dictionaries, so `ObjectRef`
-/// alone cannot represent every widget in the page subset. The page value is
-/// used for field survival and retained-page membership, not to synthesize
-/// widget `/P`.
+/// Canonical identities of Widget handles found on retained raw page handles.
 #[allow(clippy::mutable_key_type)]
-type WidgetPageMap = HashMap<ObjectHandleIdentity, (ObjectHandle, ObjectRef)>;
+type WidgetPageMap = HashMap<ObjectHandleIdentity, ObjectHandle>;
 
 /// Prune `/AcroForm /Fields` after a page-subset extraction and remove stale
 /// widget `/P` back-pointers.
 ///
 /// `result` is the [`RebuildResult`] from
-/// [`crate::pages::tree_rebuild::rebuild_page_tree`].  Its `new_kids` encodes
-/// the retained pages; its `ref_map` maps old page refs to new page refs.
+/// [`crate::pages::tree_rebuild::rebuild_page_tree`]. Retained pages come from
+/// the current raw page-handle list; `removed_page_objgens` identifies the
+/// original leaves removed by the rebuild for callers that have not run the
+/// production null-out pass yet.
 ///
 /// The function mutates `pdf` in place and is a no-op when there is no
 /// `/AcroForm` in the catalog.
@@ -123,30 +119,32 @@ pub(crate) fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
     result: &RebuildResult,
     max_depth: usize,
 ) -> Result<()> {
-    // ── Step 1: collect widget handles found on retained pages ─────────────
-    // Walk *every* retained page's /Annots array through the canonical
-    // helper, including every duplicate-selection occurrence -- not just
-    // ref_map[old][0]. For every entry whose resolved /Subtype is /Widget,
-    // retain the live handle AND the new page ref it lives on.
-    //
-    // An *indirect* widget on a duplicate page selection shares its
-    // ObjectHandle identity with the original page's widget
-    // (rebuild_page_tree leaves indirect sub-objects shared, only the page
-    // dictionary itself is cloned per duplicate); collect_page_widgets's own
-    // `.or_insert` on that identity naturally keeps the first occurrence's
-    // page, matching the /P update rule used by outline_dest_remap for
-    // /Dest. A *direct* widget, however, is embedded inside the deep-cloned
-    // page dictionary (`pages/tree_rebuild.rs`'s own doc: "deep-clone the
-    // post-materialization page dictionary"), so each duplicate occurrence
-    // gets its own distinct direct widget with its own distinct identity --
-    // visiting only the first occurrence would leave every later
-    // occurrence's /P dangling at its pre-rebuild value. Visiting every
-    // occurrence lets collect_page_widgets's identity-keyed map do the
-    // right thing for both shapes.
+    // ── Step 1: collect raw pages, fields, and Widgets in qpdf order ───────
+    // QPDFJob asks QPDFAcroFormDocumentHelper for the top-level fields on
+    // each selected QPDFPageObjectHelper (`QPDFJob.cc:2599-2608`). Keep page
+    // and field identity in qpdf's raw QpdfObjGen domain; a page or field
+    // need not have a valid ObjectRef projection.
+    let page_handles = crate::PageDocumentHelper::new(pdf).get_all_pages()?;
     let mut widget_to_page = WidgetPageMap::new();
-    for new_refs in result.ref_map.values() {
-        for &new_page in new_refs {
-            collect_page_widgets(pdf, new_page, &mut widget_to_page)?;
+    let mut retained_page_objgens = BTreeSet::new();
+    let mut referenced_fields = BTreeSet::new();
+    {
+        // QPDFJob clears the primary page tree before constructing its
+        // AcroForm helper (`QPDFJob.cc:2469-2471,2515`). Its initial analysis
+        // therefore traverses the field tree without page-orphan Widgets;
+        // selected raw pages are passed to getFormFieldsForPage afterward.
+        let mut acroform_helper = AcroFormDocumentHelper::new_for_field_tree(pdf)?;
+        for page_handle in page_handles {
+            retained_page_objgens.insert(page_handle.get_obj_gen());
+            let page_widgets = acroform_helper.get_widget_annotations_for_page(page_handle)?;
+            let page_fields =
+                acroform_helper.get_form_fields_for_widget_annotations(&page_widgets)?;
+            referenced_fields.extend(page_fields.into_iter().map(|field| field.get_obj_gen()));
+            for widget in page_widgets {
+                widget_to_page
+                    .entry(widget.identity_key())
+                    .or_insert(widget);
+            }
         }
     }
 
@@ -185,30 +183,14 @@ pub(crate) fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
         None
     };
 
-    // ── Step 4: for each top-level field, decide keep/drop ────────────────
-    // A field is kept when it (or any descendant in its /Kids tree) has at
-    // least one widget in `widget_to_page` (i.e. a widget on a retained page).
-    // Matching qpdf: we do NOT prune /Kids of kept fields — the retained-page
-    // test is purely a keep-or-drop decision at the /Fields list level.
+    // ── Step 4: keep fields referenced by retained pages ──────────────────
+    // `getFormFieldsForPage` returns top-level fields and qpdf stores their
+    // raw identities in `referenced_fields`; /Kids on a surviving field are
+    // not pruned.
     let mut kept_fields = Vec::new();
 
     for field in fields_arr {
-        if field.object_ref().is_none() {
-            // qpdf's AcroForm traversal ignores direct field entries
-            // (`QPDFAcroFormDocumentHelper.cc:297-301`).
-            continue;
-        }
-
-        let has_widget = field_has_retained_widget(
-            pdf,
-            field.object_ref().expect("field entries are indirect"),
-            &widget_to_page,
-            &mut BTreeSet::new(),
-            0,
-            max_depth,
-        )?;
-
-        if has_widget {
+        if referenced_fields.contains(&field.get_obj_gen()) {
             kept_fields.push(field);
         }
     }
@@ -225,18 +207,15 @@ pub(crate) fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
     // not prune /Kids), we must *remove* /P so the widget does not hold a
     // dangling reference to the orphaned page dict after prune_after_subset
     // GCs it (qpdf 11.9.0 observed: B2 had no /P in pages-1,2 output).
-    let retained_page_refs: BTreeSet<ObjectRef> = result.new_kids.iter().copied().collect();
-    for (widget, _) in widget_to_page.values() {
-        remove_stale_widget_page_ref(widget, &retained_page_refs, &result.removed_page_objgens)?;
+    for widget in widget_to_page.values() {
+        remove_stale_widget_page_ref(widget, &retained_page_objgens, &result.removed_page_objgens)?;
     }
     // Collect all widgets reachable from kept fields; strip /P from any that
     // are NOT in widget_to_page (i.e. live in a kept field's /Kids but were on
     // a dropped page).
     for field in &kept_fields {
-        let field_ref = field.object_ref().expect("kept field entries are indirect");
         strip_dropped_widget_p_refs(
-            pdf,
-            field_ref,
+            field.clone(),
             &widget_to_page,
             &mut BTreeSet::new(),
             0,
@@ -276,99 +255,6 @@ pub(crate) fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Walk a page's `/Annots` array and insert any `/Subtype /Widget` handles into
-/// `widget_to_page`, mapping them to `page_ref`.
-///
-/// `PageObjectHelper::get_annotation_handles` is the canonical qpdf-shaped
-/// enumeration boundary (`QPDFPageObjectHelper.cc:439-454`): it resolves an
-/// indirect `/Annots` carrier, filters non-dictionaries, resolves `/Subtype`,
-/// and preserves direct dictionary members instead of projecting them to
-/// `ObjectRef`.
-#[allow(clippy::mutable_key_type)]
-fn collect_page_widgets<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
-    widget_to_page: &mut WidgetPageMap,
-) -> Result<()> {
-    let widgets = {
-        let mut page = PageObjectHelper::new(page_ref, pdf);
-        page.get_annotations_filtered(Some(b"/Widget"))?
-    };
-    for widget in widgets {
-        // First-occurrence rule: don't overwrite if already present from a
-        // duplicate-page selection (ref_map iteration is in BTreeMap order,
-        // first occurrence is recorded first).
-        widget_to_page
-            .entry(widget.identity_key())
-            .or_insert((widget, page_ref));
-    }
-
-    Ok(())
-}
-
-/// Returns `true` when `field_ref` or any descendant in its `/Kids` tree has a
-/// widget annotation that lives on a retained page (i.e. is in `widget_to_page`).
-///
-/// `visited` / `depth` / `max_depth` guard against cycles and over-deep trees
-/// in hostile PDFs.
-#[allow(clippy::mutable_key_type)]
-fn field_has_retained_widget<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    field_ref: ObjectRef,
-    widget_to_page: &WidgetPageMap,
-    visited: &mut BTreeSet<ObjectRef>,
-    depth: usize,
-    max_depth: usize,
-) -> Result<bool> {
-    if depth > max_depth {
-        // Per the public contract, an over-deep field tree is an explicit
-        // error: silently treating it as "no retained widget" would drop
-        // valid /Fields. Propagate so the caller can decide.
-        return Err(crate::Error::Unsupported(format!(
-            "acroform_field_prune: field-tree depth limit {max_depth} exceeded at {field_ref}"
-        )));
-    }
-    if !visited.insert(field_ref) {
-        // Cycle — treat as no retained widget to avoid infinite loop.
-        return Ok(false);
-    }
-
-    let field = pdf.get_object_handle(field_ref);
-
-    // A merged field+widget dict is its own widget.
-    if widget_to_page.contains_key(&field.identity_key()) {
-        return Ok(true);
-    }
-
-    // Walk /Kids: entries may be sub-fields (have /T) or pure widgets.
-    let kids = field.try_get_key(b"/Kids")?;
-    let Some(kids_arr) = kids.try_as_array()? else {
-        return Ok(false);
-    };
-
-    for kid in kids_arr {
-        kid.try_dereference()?;
-        // qpdf's field-tree traversal ignores direct field/kid entries. Only
-        // indirect kids can participate in `/Fields` association; direct
-        // page annotations are already collected by `collect_page_widgets`.
-        let Some(kid_ref) = kid.object_ref() else {
-            continue;
-        };
-
-        // A pure widget kid is directly in widget_to_page.
-        if widget_to_page.contains_key(&kid.identity_key()) {
-            return Ok(true);
-        }
-
-        // A sub-field kid: recurse.
-        if field_has_retained_widget(pdf, kid_ref, widget_to_page, visited, depth + 1, max_depth)? {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
-}
-
 /// Preserve a valid widget `/P` and remove only a dangling (nulled) page ref.
 ///
 /// qpdf establishes `/P` during copied-annotation graph remapping, not through
@@ -390,7 +276,7 @@ fn field_has_retained_widget<R: Read + Seek>(
 /// annotations should not be streams, but we guard defensively.
 fn remove_stale_widget_page_ref(
     widget: &ObjectHandle,
-    retained_page_refs: &BTreeSet<ObjectRef>,
+    retained_page_objgens: &BTreeSet<QpdfObjGen>,
     removed_pages: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
     if !widget.try_is_dictionary()? || !widget.try_has_key(b"/P")? {
@@ -400,10 +286,7 @@ fn remove_stale_widget_page_ref(
     let Some(existing_gen) = existing.qpdf_obj_gen() else {
         return Ok(());
     };
-    if existing_gen
-        .to_object_ref()
-        .is_some_and(|existing_ref| retained_page_refs.contains(&existing_ref))
-    {
+    if retained_page_objgens.contains(&existing_gen) {
         return Ok(());
     }
     if removed_pages.contains(&existing_gen) {
@@ -425,24 +308,23 @@ fn remove_stale_widget_page_ref(
 ///
 /// `visited` / `depth` / `max_depth` guard against cycles and over-deep trees.
 #[allow(clippy::mutable_key_type)]
-fn strip_dropped_widget_p_refs<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    field_ref: ObjectRef,
+fn strip_dropped_widget_p_refs(
+    field: ObjectHandle,
     widget_to_page: &WidgetPageMap,
-    visited: &mut BTreeSet<ObjectRef>,
+    visited: &mut BTreeSet<QpdfObjGen>,
     depth: usize,
     max_depth: usize,
 ) -> Result<()> {
+    let field_objgen = field.get_obj_gen();
     if depth > max_depth {
         return Err(crate::Error::Unsupported(format!(
-            "acroform_field_prune: field-tree depth limit {max_depth} exceeded at {field_ref}"
+            "acroform_field_prune: field-tree depth limit {max_depth} exceeded at {field_objgen}"
         )));
     }
-    if !visited.insert(field_ref) {
+    if !visited.insert(field_objgen) {
         return Ok(()); // Cycle guard.
     }
 
-    let field = pdf.get_object_handle(field_ref);
     let kids = field.try_get_key(b"/Kids")?;
     let Some(kids_arr) = kids.try_as_array()? else {
         // Leaf node with no /Kids. Merged field+widget dicts that were
@@ -455,9 +337,9 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
         kid.try_dereference()?;
         // qpdf ignores direct field-tree entries, so do not promote or mutate
         // a direct `/Kids` member here.
-        let Some(kid_ref) = kid.object_ref() else {
+        if !kid.get_obj_gen().is_indirect() {
             continue;
-        };
+        }
 
         let subtype = kid.try_get_key(b"/Subtype")?;
         let is_widget = subtype.try_as_name()?.as_deref() == Some(b"Widget".as_slice());
@@ -471,14 +353,7 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
             // annotation is a leaf); no need to recurse.
         } else {
             // Sub-field: recurse.
-            strip_dropped_widget_p_refs(
-                pdf,
-                kid_ref,
-                widget_to_page,
-                visited,
-                depth + 1,
-                max_depth,
-            )?;
+            strip_dropped_widget_p_refs(kid, widget_to_page, visited, depth + 1, max_depth)?;
         }
     }
 
@@ -493,9 +368,11 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
 mod tests {
     use super::*;
     use crate::job::check_bytes_for_test;
+    use crate::object_handle::ObjectValue;
     use crate::pages::page_refs;
     use crate::pages::tree_rebuild::rebuild_page_tree;
     use crate::writer::write_qpdf_to_memory;
+    use crate::ObjectRef;
     use crate::Pdf;
     use std::collections::BTreeMap;
     use std::io::Cursor;
@@ -714,7 +591,7 @@ mod tests {
     fn non_dictionary_widget_handle_is_ignored() {
         let widget = ObjectHandle::integer(1);
 
-        let retained = BTreeSet::from([ObjectRef::new(3, 0)]);
+        let retained = BTreeSet::from([QpdfObjGen::new(3, 0)]);
         remove_stale_widget_page_ref(&widget, &retained, &BTreeSet::new()).unwrap();
     }
 
@@ -722,7 +599,7 @@ mod tests {
     fn retained_indirect_widget_keeps_existing_page_reference() {
         let mut pdf = open(build_acroform_pdf());
         let widget = pdf.get_object_handle(ObjectRef::new(7, 0));
-        let retained = BTreeSet::from([ObjectRef::new(3, 0)]);
+        let retained = BTreeSet::from([QpdfObjGen::new(3, 0)]);
 
         remove_stale_widget_page_ref(&widget, &retained, &BTreeSet::new()).unwrap();
 
@@ -746,7 +623,7 @@ mod tests {
         let mut pdf = open(build_acroform_pdf());
         let widget = pdf.get_object_handle(ObjectRef::new(11, 0));
         widget.try_is_scalar().unwrap();
-        let retained = BTreeSet::from([ObjectRef::new(3, 0), ObjectRef::new(4, 0)]);
+        let retained = BTreeSet::from([QpdfObjGen::new(3, 0), QpdfObjGen::new(4, 0)]);
         let removed_pages = BTreeSet::from([QpdfObjGen::new(5, 0)]);
 
         remove_stale_widget_page_ref(&widget, &retained, &removed_pages).unwrap();
@@ -834,6 +711,138 @@ mod tests {
             !fields.contains(&ObjectRef::new(11, 0)),
             "FieldC should be removed; fields={fields:?}"
         );
+    }
+
+    #[test]
+    fn raw_generation_page_keeps_its_acroform_field_after_subset_pruning() {
+        let mut pdf = Pdf::empty().expect("empty PDF should open");
+        let catalog = pdf.root_handle().expect("empty PDF has a catalog");
+        let pages = catalog
+            .try_get_key(b"/Pages")
+            .expect("empty PDF page-tree root");
+        let page = pdf.get_object_handle_by_raw_identity(17, 65_535);
+        let field = pdf.get_object_handle(ObjectRef::new(21, 0));
+        let widget = pdf.get_object_handle(ObjectRef::new(22, 0));
+
+        widget.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+                (b"/Parent".to_vec(), field.clone()),
+                (b"/P".to_vec(), page.clone()),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        field.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"/FT".to_vec(), ObjectHandle::name(b"Tx".to_vec())),
+                (b"/T".to_vec(), ObjectHandle::string(b"raw-page".to_vec())),
+                (b"/Kids".to_vec(), ObjectHandle::array(vec![widget.clone()])),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        page.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+                (b"/Parent".to_vec(), pages.clone()),
+                (
+                    b"/MediaBox".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(612),
+                        ObjectHandle::integer(792),
+                    ]),
+                ),
+                (
+                    b"/Annots".to_vec(),
+                    ObjectHandle::array(vec![widget.clone()]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        pages
+            .replace_key(b"/Kids", ObjectHandle::array(vec![page.clone()]))
+            .expect("install raw-generation page");
+        pages
+            .replace_key(b"/Count", ObjectHandle::integer(1))
+            .expect("set page count");
+        catalog
+            .replace_key(
+                b"/AcroForm",
+                ObjectHandle::dictionary(vec![(
+                    b"/Fields".to_vec(),
+                    ObjectHandle::array(vec![field.clone()]),
+                )]),
+            )
+            .expect("install AcroForm");
+
+        prune_acroform_after_subset(&mut pdf, &RebuildResult::default())
+            .expect("raw page should not require ObjectRef projection");
+
+        assert!(
+            catalog
+                .try_has_key(b"/AcroForm")
+                .expect("check AcroForm presence"),
+            "a Widget on a retained raw page must keep /AcroForm"
+        );
+        let acroform = catalog.try_get_key(b"/AcroForm").expect("read AcroForm");
+        let fields = acroform
+            .try_get_key(b"/Fields")
+            .expect("read fields")
+            .try_as_array()
+            .expect("read fields array")
+            .expect("fields must remain an array");
+        assert_eq!(
+            fields
+                .iter()
+                .map(ObjectHandle::get_obj_gen)
+                .collect::<Vec<_>>(),
+            vec![QpdfObjGen::new(21, 0)],
+            "a field with a Widget on the retained raw page must remain in /Fields"
+        );
+        assert_eq!(
+            widget
+                .try_get_key(b"/P")
+                .expect("read Widget page")
+                .get_obj_gen(),
+            QpdfObjGen::new(17, 65_535),
+            "the existing /P keeps the raw identity of its retained page"
+        );
+    }
+
+    #[test]
+    fn prune_preserves_the_caller_supplied_field_tree_depth_limit() {
+        let objects: Vec<(u32, &[u8])> = vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>"),
+            (
+                2,
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+            ),
+            (3, b"<< /Type /Page /Parent 2 0 R /Annots [9 0 R] >>"),
+            (5, b"<< /Fields [6 0 R] >>"),
+            (6, b"<< /FT /Tx /T (Top) /Kids [7 0 R] >>"),
+            (7, b"<< /T (Middle) /Parent 6 0 R /Kids [8 0 R] >>"),
+            (8, b"<< /T (Inner) /Parent 7 0 R /Kids [9 0 R] >>"),
+            (
+                9,
+                b"<< /Type /Annot /Subtype /Widget /Parent 8 0 R /P 3 0 R /Rect [0 0 10 10] >>",
+            ),
+        ];
+        let mut pdf = open(build_pdf(&objects));
+        let result =
+            rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).expect("keep the only page");
+
+        let error = prune_acroform_after_subset_with_max_depth(&mut pdf, &result, 1)
+            .expect_err("nested sub-fields exceed the caller-supplied depth limit");
+
+        assert!(matches!(
+            error,
+            crate::Error::Unsupported(message)
+                if message == "acroform_field_prune: field-tree depth limit 1 exceeded at 8,0"
+        ));
     }
 
     /// All widgets on dropped pages → field removed from /Fields.
