@@ -232,6 +232,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/fulgur-rs/flpdf/compare/v0.9.0...v0.10.0) - 2026-09-27
+
+### Added
+
+- expose qpdf raw object generation identity
+
+### Fixed
+
+- reject foreign page owners during rotation flattening
+- preserve AcroForm pruning warning and depth behavior
+- preserve raw page identity in AcroForm field pruning
+- require a PDF owner for rotation flattening
+- preserve raw page handles in rotation flattening (flpdf-ihyup.15)
+- preserve raw pages in AcroForm appearance generation
+- preserve raw page handles in AcroForm JSON
+- *(cli)* preserve qpdf overlay Fx0 stream length in JSON
+- keep PCLm page seeds on raw handles
+- follow qpdf short hex-key provider fallback
+- *(flatten)* propagate the getRoot failure from the AcroForm tail
+- return raw qpdf handles from page list
+
+### Other
+
+- cover AcroForm warning and depth branches
+- cover scalar AcroForm parent warnings
+- pin qpdf repair error code classifications
+- Test zero-identity outline destination bucket
+- Preserve raw page identity in JSON outlines
+- add summary to writer emission test module
+- move writer emission tests to writer module
+- *(linearization)* guard reachable scan count
+- *(pclm)* retain qpdf failure diagnostics
+- *(pclm)* keep qpdf oracle coverage precise
+
 ## [0.9.0](https://github.com/fulgur-rs/flpdf/compare/v0.8.0...v0.9.0) - 2026-09-25
 
 ### Fixed
