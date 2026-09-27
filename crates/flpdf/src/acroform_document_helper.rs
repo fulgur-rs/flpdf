@@ -2822,6 +2822,44 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn qpdf_type_warning_from_ownerless_scalar_is_forwarded_to_the_pdf() {
+        let mut pdf = Pdf::empty().expect("empty PDF should open");
+        let mut helper =
+            AcroFormDocumentHelper::new_for_field_tree(&mut pdf).expect("field-tree helper");
+        let value = helper
+            .get_key_with_qpdf_type_warning(&ObjectHandle::integer(42), b"/T")
+            .expect("qpdf type warning should become a PDF warning and null value");
+        drop(helper);
+
+        assert!(value.is_null());
+        let warnings = pdf.get_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings.entries()[0].get_message_detail(),
+            b"operation for dictionary attempted on object of type integer: returning null for attempted key retrieval"
+        );
+    }
+
+    #[test]
+    fn ownerless_scalar_type_warning_is_delivered_by_the_helper_pdf() {
+        let mut pdf = Pdf::empty().expect("empty PDF should open");
+        let mut helper =
+            AcroFormDocumentHelper::new_for_field_tree(&mut pdf).expect("field-tree helper");
+        let value = helper
+            .get_key_with_qpdf_type_warning(&ObjectHandle::integer(42), b"/T")
+            .expect("type warning is delivered through the owning PDF");
+        drop(helper);
+
+        assert!(value.is_null());
+        let warnings = pdf.get_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings.entries()[0].get_message_detail(),
+            b"operation for dictionary attempted on object of type integer: returning null for attempted key retrieval"
+        );
+    }
+
+    #[test]
     fn generate_appearances_accepts_a_raw_generation_page() {
         let mut pdf = Pdf::empty().expect("empty PDF should open");
         let catalog = pdf.root_handle().expect("empty PDF has a catalog");

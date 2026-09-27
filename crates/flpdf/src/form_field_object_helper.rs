@@ -957,6 +957,21 @@ mod tests {
     }
 
     #[test]
+    fn top_level_null_field_returns_null_without_a_type_warning() {
+        let mut pdf = Pdf::empty().expect("empty PDF should open");
+        let mut helper = FormFieldObjectHelper::from_object_handle(ObjectHandle::null(), &mut pdf);
+
+        let (top_level, is_different) = helper
+            .get_top_level_field()
+            .expect("qpdf getKeyIfDict short-circuits a null receiver");
+        drop(helper);
+
+        assert!(top_level.is_null());
+        assert!(!is_different);
+        assert!(pdf.get_warnings().is_empty());
+    }
+
+    #[test]
     #[allow(deprecated)]
     fn direct_seen_set_ignores_indirect_handles_and_tracks_direct_identity() {
         let mut direct_seen = Vec::new();

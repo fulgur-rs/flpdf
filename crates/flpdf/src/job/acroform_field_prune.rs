@@ -947,6 +947,63 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn prune_checks_the_depth_limit_on_later_subfields_after_a_retained_widget() {
+        let objects: Vec<(u32, &[u8])> =
+            vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>"),
+            (
+                2,
+                b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 612 792] >>",
+            ),
+            (3, b"<< /Type /Page /Parent 2 0 R /Annots [7 0 R] >>"),
+            (4, b"<< /Type /Page /Parent 2 0 R >>"),
+            (6, b"<< /Fields [8 0 R] >>"),
+            (7, b"<< /Type /Annot /Subtype /Widget /Parent 8 0 R /P 3 0 R /Rect [0 0 10 10] >>"),
+            (8, b"<< /FT /Tx /T (Top) /Kids [7 0 R 9 0 R] >>"),
+            (9, b"<< /T (Middle) /Parent 8 0 R /Kids [10 0 R] >>"),
+            (10, b"<< /T (Inner) /Parent 9 0 R /Kids [11 0 R] >>"),
+            (11, b"<< /Type /Annot /Subtype /Widget /Parent 10 0 R /P 4 0 R /Rect [0 0 10 10] >>"),
+        ];
+        let mut pdf = open(build_pdf(&objects));
+        let result =
+            rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).expect("keep the first page");
+
+        let error = prune_acroform_after_subset_with_max_depth(&mut pdf, &result, 1)
+            .expect_err("a later dropped-page branch exceeds the depth limit");
+
+        assert!(matches!(
+            error,
+            crate::Error::Unsupported(message)
+                if message == "acroform_field_prune: field-tree depth limit 1 exceeded at 10,0"
+        ));
+    }
+
+    #[test]
+    fn prune_ignores_a_non_dictionary_top_level_field() {
+        let objects: Vec<(u32, &[u8])> = vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>"),
+            (
+                2,
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+            ),
+            (3, b"<< /Type /Page /Parent 2 0 R >>"),
+            (5, b"<< /Fields [6 0 R] >>"),
+            (6, b"42"),
+        ];
+        let mut pdf = open(build_pdf(&objects));
+        let result =
+            rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).expect("keep the only page");
+
+        prune_acroform_after_subset(&mut pdf, &result)
+            .expect("a non-dictionary field is ignored after warning");
+
+        assert!(
+            !dict_of(&mut pdf, ObjectRef::new(1, 0)).contains_key(b"/AcroForm".as_slice()),
+            "the invalid field cannot be referenced by a retained page"
+        );
+    }
+
     /// All widgets on dropped pages → field removed from /Fields.
     #[test]
     fn all_widgets_dropped_removes_field() {
