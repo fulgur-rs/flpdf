@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use yaml_rust2::{Yaml, YamlLoader};
 
@@ -15,6 +15,8 @@ const TEST_JOB_RUNS_ON: &str = "${{ matrix.os }}";
 const RELEASE_JOB_NAME: &str = "release";
 const RELEASE_JOB_RUNS_ON: &str = "ubuntu-latest";
 const RELEASE_TEST_COMMAND: &str = "cargo test --workspace --profile release-ci";
+const FILTERED_TEST_CONTRACT_COMMAND: &str =
+    "cargo test -p flpdf-cli --test ci_workflow_contract -- --ignored";
 const LIBJPEG_COMPAT_TEST_CONDITION: &str = "${{ runner.os == 'Linux' && matrix.arch == 'amd64' }}";
 /// Filtered commands whose step installs a system library on an earlier line of
 /// its own `run:` block. The workspace test run happens before that install, so
@@ -682,11 +684,12 @@ fn assert_filtered_cargo_tests_are_nonempty(workflow: &str) -> ContractResult<()
             args.push("--".to_owned());
         }
         args.push("--list".to_owned());
-        // The parent `cargo test` holds the lock on the workspace artifact
-        // directory for the whole run, so a child cargo sharing it blocks
-        // until the parent exits -- which never happens. Give the child its
-        // own target directory.
-        let target_dir = workspace.join("target/ci-workflow-contract");
+        // Cargo releases the artifact lock before running test binaries. The
+        // contract is invoked from a separate CI step after the filtered
+        // feature targets are built, so the child reuses those artifacts.
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| workspace.join("target"));
         let output = Command::new("cargo")
             .args(&args)
             .current_dir(&workspace)
@@ -796,6 +799,7 @@ fn listed_test_count_distinguishes_a_real_filter_from_zero_matches() {
 }
 
 #[test]
+#[ignore = "run once from the Linux CI step after filtered feature targets are built"]
 fn workflow_filtered_cargo_tests_match_at_least_one_test() {
     assert_filtered_cargo_tests_are_nonempty(CI_WORKFLOW)
         .expect("every filtered cargo test command in CI must list a test");
@@ -1142,6 +1146,53 @@ fn test_matrix_runs_qpdf_libjpeg_compat_suite_on_linux_amd64() {
         )
         .expect("ci workflow must be valid and define the test job"),
         "the Linux amd64 test cell must run the system-libjpeg compatibility suite"
+    );
+}
+
+#[test]
+fn filtered_test_contract_runs_after_the_feature_gates_once() {
+    let workflow = parse_workflow(CI_WORKFLOW).expect("ci workflow must be valid");
+    let jobs = mapping_get(&workflow, "jobs").expect("workflow must define jobs");
+    let test_job = mapping_get(jobs, "test").expect("workflow must define test job");
+    let steps = mapping_get(test_job, "steps")
+        .and_then(Yaml::as_vec)
+        .expect("test job must define steps");
+
+    let step_index = |name: &str| {
+        steps
+            .iter()
+            .position(|step| mapping_get(step, "name").and_then(Yaml::as_str) == Some(name))
+            .unwrap_or_else(|| panic!("test job is missing step `{name}`"))
+    };
+    let dct_step = step_index("qpdf-compatible DCT backend tests (Linux amd64)");
+    let zlib_step = step_index("bytes-identical zlib compat (Linux amd64)");
+    let contract_step = steps
+        .iter()
+        .position(|step| {
+            mapping_get(step, "run")
+                .and_then(Yaml::as_str)
+                .is_some_and(|run| {
+                    run_exact_command_line_count(run, FILTERED_TEST_CONTRACT_COMMAND) == 1
+                })
+        })
+        .expect("filtered test contract must run in a dedicated step");
+
+    assert!(dct_step < zlib_step && zlib_step < contract_step);
+    assert_eq!(
+        mapping_get(&steps[contract_step], "if").and_then(Yaml::as_str),
+        Some(LIBJPEG_COMPAT_TEST_CONDITION)
+    );
+    assert_eq!(
+        steps
+            .iter()
+            .filter(|step| mapping_get(step, "run")
+                .and_then(Yaml::as_str)
+                .is_some_and(|run| {
+                    run_exact_command_line_count(run, FILTERED_TEST_CONTRACT_COMMAND) > 0
+                }))
+            .count(),
+        1,
+        "the filtered test contract should run once after all feature-gated tests"
     );
 }
 
