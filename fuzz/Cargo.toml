@@ -56,3 +56,11 @@ path = "fuzz_targets/primitive_parser.rs"
 test = false
 doc = false
 bench = false
+
+# Object-stream body parser safety harness through the canonical reader.
+[[bin]]
+name = "objstm"
+path = "fuzz_targets/objstm.rs"
+test = false
+doc = false
+bench = false
