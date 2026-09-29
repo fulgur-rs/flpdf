@@ -10,7 +10,6 @@ use super::emit_new_diagnostics;
 use super::handle::{resolve_handle, write_qpdf_object_handle};
 use crate::output::write_bytes;
 
-#[derive(Clone, Debug)]
 enum OrderedStreamEvent {
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
@@ -29,6 +28,21 @@ fn record_stream_event(
     Ok(())
 }
 
+fn record_stdout_data(events: &OrderedStreamEvents, data: &[u8]) -> PipelineResult<()> {
+    let mut events = events
+        .lock()
+        .map_err(|_| PipelineError::runtime("ordered stream event mutex poisoned"))?;
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    match events.last_mut() {
+        Some(OrderedStreamEvent::Stdout(previous)) => previous.extend_from_slice(data),
+        _ => events.push(OrderedStreamEvent::Stdout(data.to_vec())),
+    }
+    Ok(())
+}
+
 struct OrderedStreamOutput {
     events: OrderedStreamEvents,
 }
@@ -39,7 +53,7 @@ impl Pipeline for OrderedStreamOutput {
     }
 
     fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
-        record_stream_event(&self.events, OrderedStreamEvent::Stdout(data.to_vec()))
+        record_stdout_data(&self.events, data)
     }
 
     fn finish(&mut self) -> PipelineResult<()> {
@@ -70,10 +84,12 @@ fn replay_stream_events(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> flpdf::Result<()> {
-    let events = events
-        .lock()
-        .map_err(|_| Error::System("ordered stream event mutex poisoned".to_owned()))?
-        .clone();
+    let events = {
+        let mut events = events
+            .lock()
+            .map_err(|_| Error::System("ordered stream event mutex poisoned".to_owned()))?;
+        std::mem::take(&mut *events)
+    };
     stdout.flush()?;
     for event in events {
         match event {
@@ -347,7 +363,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
-    use super::{run_test_0_1, write_object_details};
+    use super::{replay_stream_events, run_test_0_1, write_object_details, OrderedStreamEvent};
     use flpdf::{ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, Pipeline};
     use std::io::{self, Write};
 
@@ -397,6 +413,68 @@ mod tests {
             .expect("replay ordered stream events");
         assert_eq!(stdout, b"decoded");
         assert_eq!(stderr, b"warning\n");
+    }
+
+    #[test]
+    fn adjacent_stdout_chunks_coalesce_without_crossing_warning_events() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut output = super::OrderedStreamOutput {
+            events: Arc::clone(&events),
+        };
+        output.write(b"de").expect("record first stream chunk");
+        output.write(b"coded").expect("record second stream chunk");
+
+        let mut warning = super::OrderedStreamWarning {
+            events: Arc::clone(&events),
+        };
+        warning
+            .write(b"first warning\n")
+            .expect("record first stream warning");
+        warning
+            .write(b"second warning\n")
+            .expect("record second stream warning");
+        output
+            .write(b" after")
+            .expect("record stream data after warning");
+
+        let recorded_events = events.lock().expect("ordered stream events");
+        assert!(matches!(
+            recorded_events.as_slice(),
+            [
+                OrderedStreamEvent::Stdout(before_warning),
+                OrderedStreamEvent::Stderr(first_warning),
+                OrderedStreamEvent::Stderr(second_warning),
+                OrderedStreamEvent::Stdout(after_warning),
+            ] if before_warning == b"decoded"
+                && first_warning == b"first warning\n"
+                && second_warning == b"second warning\n"
+                && after_warning == b" after"
+        ));
+        drop(recorded_events);
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        replay_stream_events(&events, &mut stdout, &mut stderr).expect("replay ordered events");
+        assert_eq!(stdout, b"decoded after");
+        assert_eq!(stderr, b"first warning\nsecond warning\n");
+    }
+
+    #[test]
+    fn replay_takes_ownership_of_recorded_events() {
+        let events = Arc::new(Mutex::new(vec![
+            OrderedStreamEvent::Stdout(b"decoded".to_vec()),
+            OrderedStreamEvent::Stderr(b"warning\n".to_vec()),
+        ]));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        replay_stream_events(&events, &mut stdout, &mut stderr).expect("replay events");
+
+        assert_eq!(stdout, b"decoded");
+        assert_eq!(stderr, b"warning\n");
+        let events = events.lock().expect("ordered stream events");
+        assert!(events.is_empty());
+        assert_eq!(events.capacity(), 0);
     }
 
     fn pdf_with_qtest(qtest: &[u8], extras: &[(u32, Vec<u8>)]) -> Vec<u8> {
