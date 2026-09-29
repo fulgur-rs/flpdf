@@ -327,6 +327,13 @@ impl<'a> PlAesPdf<'a> {
 
     /// qpdf `Pl_AES_PDF::initializeVector` (`Pl_AES_PDF.cc:126-143`).
     fn initialize_vector(&mut self) -> PipelineResult<()> {
+        self.initialize_vector_with(getrandom::fill)
+    }
+
+    fn initialize_vector_with(
+        &mut self,
+        mut fill_random: impl FnMut(&mut [u8]) -> Result<(), getrandom::Error>,
+    ) -> PipelineResult<()> {
         if self.use_zero_iv {
             self.cbc_block = [0; BUF_SIZE];
         } else if self.use_specified_iv {
@@ -335,13 +342,11 @@ impl<'a> PlAesPdf<'a> {
             self.cbc_block = static_initialization_vector();
         } else {
             // qpdf `QUtil::initializeWithRandomBytes` (`:141`).
-            // cov:ignore-start: a getrandom failure cannot be injected here
-            getrandom::fill(&mut self.cbc_block).map_err(|error| {
+            fill_random(&mut self.cbc_block).map_err(|error| {
                 PipelineError::runtime(format!(
                     "Pl_AES_PDF: OS CSPRNG unavailable for AES IV generation: {error}"
                 ))
             })?;
-            // cov:ignore-end
         }
         Ok(())
     }
@@ -780,6 +785,22 @@ mod tests {
         };
 
         assert_ne!(encrypt_once()[..16], encrypt_once()[..16]);
+    }
+
+    #[test]
+    fn a_vector_generation_error_is_reported_when_the_os_csprng_fails() {
+        let _guard = super::tests_support::static_iv_guard();
+        let mut sink = Buffer::new("ciphertext", None);
+        let mut stage = PlAesPdf::new_encrypt("AES stream encryption", &mut sink, &KEY128)
+            .expect("AES-128 key is a supported length");
+
+        let error = stage
+            .initialize_vector_with(|_| Err(getrandom::Error::UNEXPECTED))
+            .expect_err("an OS CSPRNG failure must be reported");
+
+        assert!(error
+            .message()
+            .contains("OS CSPRNG unavailable for AES IV generation"));
     }
 
     // `disableCBC` drops the chaining entirely, so each block stands alone and
