@@ -22,9 +22,10 @@ template's "Compat matrix" section.
 Pull requests run the `Fuzz (short)` Actions job. It seeds the gitignored
 corpora with `tools/seed-corpus.sh`, then runs `roundtrip`, `xref`,
 `filter_pipeline`, `primitive_parser`, and `objstm` for 60 seconds each. Each
-input has a 10-second timeout and the job caps RSS at 2 GiB. Local setup,
-target-specific commands, and longer acceptance runs are documented in
-[`fuzz/README.md`](fuzz/README.md).
+input has a 10-second timeout and the job caps RSS at 2 GiB. See
+[`docs/fuzzing.md`](docs/fuzzing.md) for local setup, crash triage, and the
+new-target checklist; [`fuzz/README.md`](fuzz/README.md) documents target
+internals, corpus formats, and recorded runs.
 
 A crash or timeout makes the target exit nonzero and fails the job. Crash logs
 show libFuzzer's stack trace, and the reproducer is written under
