@@ -55,6 +55,15 @@ per requested stage, then the remaining bytes become raw stream data. Selector
 `0xff` exercises PNG row-width wrap-to-error; selector `0xfe` on LZW exercises
 the TIFF predictor's overflow preflight.
 
+### Rebuild local corpora from fixtures
+
+Run `tools/seed-corpus.sh` to populate all five gitignored writable corpora.
+It copies every PDF fixture to `roundtrip` and `xref`, test-driver PDFs to
+`primitive_parser`, small ObjStm PDFs to `objstm`, and committed synthetic inputs
+to the matching targets. Inputs use content-hash names; rerunning the script
+adds updated fixtures without deleting existing libFuzzer discoveries. The
+versioned seed sources remain under `fuzz/seeds/`.
+
 The `xref` target follows qpdf 11.9.0's fuzzing boundary rather than
 reimplementing qpdf output checks: qpdf lists its whole-document and focused
 fuzzers in `fuzz/CMakeLists.txt:4-14`, and defines the arbitrary-input safety
@@ -144,6 +153,9 @@ flpdf --check fuzz/seeds/prev_chain/deep-128-cycle.pdf -> exit 3, loop detected
 # One-time: install the runner.
 cargo install cargo-fuzz
 
+# Populate the local, ignored corpora from fixtures and committed seeds.
+tools/seed-corpus.sh
+
 # Fuzz the whole-document target (Ctrl-C to stop). `-timeout` flags a
 # non-terminating input as a hang; without it libFuzzer's default is 1200s.
 #
@@ -152,45 +164,45 @@ cargo install cargo-fuzz
 # (e.g. from `cargo binstall`) would otherwise build for musl, whose static
 # libc is incompatible with -Zsanitizer=address.
 cargo +nightly fuzz run --target x86_64-unknown-linux-gnu roundtrip \
-  fuzz/corpus/roundtrip fuzz/seeds/roundtrip \
+  fuzz/corpus/roundtrip \
   -- -timeout=10 -rss_limit_mb=2048
 
 # Fuzz strict and repair xref/trailer loading with focused /Prev and general
 # document seeds.
 cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu xref \
-  fuzz/corpus/xref fuzz/seeds/prev_chain fuzz/seeds/roundtrip \
+  fuzz/corpus/xref \
   -- -timeout=10 -rss_limit_mb=2048
 
 # Fuzz the public stream-decode route. Each seed selects a filter or chain;
 # remaining bytes become raw stream payload and DecodeParms selectors. The
 # fuzz-only sink bounds each stream to 1 MiB of decoded output or 4,096 writes.
 cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu filter_pipeline \
-  fuzz/corpus/filter_pipeline fuzz/seeds/filter_pipeline \
+  fuzz/corpus/filter_pipeline \
   -- -timeout=10 -rss_limit_mb=2048
 
 # Fuzz primitive objects and object bodies extracted from test-driver fixtures.
 cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu primitive_parser \
-  fuzz/corpus/primitive_parser fuzz/seeds/primitive_parser \
+  fuzz/corpus/primitive_parser \
   -- -timeout=10 -rss_limit_mb=2048
 
 # Fuzz compressed object streams through the canonical reader.
 cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu objstm \
-  fuzz/corpus/objstm fuzz/seeds/objstm \
+  fuzz/corpus/objstm \
   -- -max_len=4096 -timeout=10 -rss_limit_mb=2048
 
 # Exercise the focused /Prev corpus for the five-minute acceptance budget.
 cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu xref \
-  fuzz/corpus/xref fuzz/seeds/prev_chain \
+  fuzz/corpus/xref \
   -- -max_total_time=300 -timeout=10 -rss_limit_mb=2048 -verbosity=0
 
 # Exercise the primitive parser seed corpus for the five-minute acceptance budget.
 cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu primitive_parser \
-  fuzz/corpus/primitive_parser fuzz/seeds/primitive_parser \
+  fuzz/corpus/primitive_parser \
   -- -max_total_time=300 -timeout=10 -rss_limit_mb=2048 -verbosity=0
 
 # Exercise ObjStm fixtures for the six-minute acceptance budget.
 cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu objstm \
-  fuzz/corpus/objstm fuzz/seeds/objstm \
+  fuzz/corpus/objstm \
   -- -max_total_time=360 -max_len=4096 -timeout=10 -rss_limit_mb=2048 -verbosity=0
 
 # Reproduce a crash artifact.
@@ -207,8 +219,9 @@ cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu filter_pipe
 ```
 
 The first positional dir for each target (for example,
-`fuzz/corpus/roundtrip` or `fuzz/corpus/xref`, both gitignored) is the writable
-corpus; the following `fuzz/seeds/...` dir is committed, read-only seed input.
+`fuzz/corpus/roundtrip` or `fuzz/corpus/xref`) is the writable, gitignored
+corpus. Run `tools/seed-corpus.sh` before fuzzing; it populates each active
+corpus from fixtures and committed synthetic seeds without removing discoveries.
 
 ## When the fuzzer finds a crash
 
