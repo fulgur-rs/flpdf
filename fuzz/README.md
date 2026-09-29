@@ -26,6 +26,22 @@ it.
   failure, or timeout is the defect under test. Its focused `/Prev` seeds
   include conflicting entries across generations, a 128-revision acyclic chain,
   and a 128-revision cycle.
+- **`filter_pipeline`** — constructs document-owned streams and drives
+  `ObjectHandle::pipe_stream_data` with one to seventeen filter stages, raw
+  payload bytes, and aligned `/DecodeParms`. It covers qpdf-registered filters,
+  qpdf-unfilterable CCITTFax/JPX/JBIG2 labels, predictor geometry, and malformed
+  input without exposing an internal fuzz-only API. The harness allows one
+  RunLength stage per chain to limit compounded expansion. Its sink stops one
+  iteration after 1 MiB of decoded output or 4,096 downstream writes; product
+  stream behavior and qpdf's unbounded-chain support are unchanged.
+
+The `filter_pipeline` seed format is: first byte selects one to seventeen
+requested stages; the next bytes select filter IDs in this order: Flate,
+ASCIIHex, ASCII85, RunLength, LZW, CCITTFax, DCT, JPX, JBIG2. The fuzz harness
+omits repeated RunLength stages after the first. One parameter selector follows
+per requested stage, then the remaining bytes become raw stream data. Selector
+`0xff` exercises PNG row-width wrap-to-error; selector `0xfe` on LZW exercises
+the TIFF predictor's overflow preflight.
 
 The `xref` target follows qpdf 11.9.0's fuzzing boundary rather than
 reimplementing qpdf output checks: qpdf lists its whole-document and focused
@@ -133,6 +149,13 @@ cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu xref \
   fuzz/corpus/xref fuzz/seeds/prev_chain fuzz/seeds/roundtrip \
   -- -timeout=10 -rss_limit_mb=2048
 
+# Fuzz the public stream-decode route. Each seed selects a filter or chain;
+# remaining bytes become raw stream payload and DecodeParms selectors. The
+# fuzz-only sink bounds each stream to 1 MiB of decoded output or 4,096 writes.
+cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu filter_pipeline \
+  fuzz/corpus/filter_pipeline fuzz/seeds/filter_pipeline \
+  -- -timeout=10 -rss_limit_mb=2048
+
 # Exercise the focused /Prev corpus for the five-minute acceptance budget.
 cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu xref \
   fuzz/corpus/xref fuzz/seeds/prev_chain \
@@ -145,6 +168,10 @@ cargo +nightly fuzz run --target x86_64-unknown-linux-gnu roundtrip \
 # Reproduce an xref crash artifact.
 cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu xref \
   fuzz/artifacts/xref/crash-<hash>
+
+# Reproduce a filter-pipeline crash artifact.
+cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu filter_pipeline \
+  fuzz/artifacts/filter_pipeline/crash-<hash>
 ```
 
 The first positional dir for each target (for example,
@@ -167,7 +194,7 @@ corpus; the following `fuzz/seeds/...` dir is committed, read-only seed input.
 
 ## CI
 
-CI runs short (60s) `roundtrip` and `xref` fuzz sessions on every PR with
-`-timeout=10`, so a panic, abort, OOM, or hang fails the build. The xref session
-uses the focused `/Prev` seeds plus the general roundtrip seeds. See the `fuzz`
-job in `.github/workflows/ci.yml`.
+CI runs short (60s) `roundtrip`, `xref`, and `filter_pipeline` fuzz sessions on
+every PR with `-timeout=10`, so a panic, abort, OOM, or hang fails the build.
+The xref session uses the focused `/Prev` seeds plus general document seeds.
+See the `fuzz` job in `.github/workflows/ci.yml`.

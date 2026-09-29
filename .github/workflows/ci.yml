@@ -645,6 +645,16 @@ jobs:
             fuzz/corpus/xref fuzz/seeds/prev_chain fuzz/seeds/roundtrip \
             -- -max_total_time=60 -timeout=10 -rss_limit_mb=2048
 
+      # Exercise arbitrary filter chains and DecodeParms through the public
+      # document-owned stream-data pipeline.
+      - name: Short fuzz (filter pipeline, 60s)
+        run: |
+          set -euo pipefail
+          mkdir -p fuzz/corpus/filter_pipeline
+          cargo fuzz run --target x86_64-unknown-linux-gnu filter_pipeline \
+            fuzz/corpus/filter_pipeline fuzz/seeds/filter_pipeline \
+            -- -max_total_time=60 -timeout=10 -rss_limit_mb=2048
+
   # qtest regression detection against the qpdf 11.9.0 acceptance corpus,
   # which flpdf's own suites do not cover: the survey is 2811 subtests across
   # 101 suites, run through the real qtest driver with flpdf behind a PATH

@@ -40,3 +40,11 @@ path = "fuzz_targets/xref.rs"
 test = false
 doc = false
 bench = false
+
+# Canonical stream filter and DecodeParms chain harness.
+[[bin]]
+name = "filter_pipeline"
+path = "fuzz_targets/filter_pipeline.rs"
+test = false
+doc = false
+bench = false
