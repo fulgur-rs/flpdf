@@ -17,18 +17,12 @@ updates:
       github-actions:
         patterns:
           - "*"
-    # Label dependabot PRs at creation, independent of pr-labeler parsing the PR
-    # title. `release-notes:internal` puts them in the "Internal" release-notes
-    # bucket (release.yml maps it); `dependencies` restores the standard
-    # dependency-PR filter label. NB: specifying `labels` replaces dependabot's
-    # default label set, so both are listed explicitly (both exist in the repo —
-    # dependabot auto-created `dependencies` on the first update PR).
+    # Keep the standard dependency-PR filter label. release-plz builds the
+    # changelog from conventional commit messages.
     labels:
       - "dependencies"
-      - "release-notes:internal"
     commit-message:
-      # "build(deps): …" keeps the merged commit message conventional; it is no
-      # longer relied on for release-notes categorization (see `labels` above).
+      # release-plz consumes this conventional commit prefix for the changelog.
       prefix: "build"
       include: "scope"
     # github-actions supports only default-days for cooldown (the semver-*-days
@@ -49,7 +43,6 @@ updates:
           - "*"
     labels:
       - "dependencies"
-      - "release-notes:internal"
     commit-message:
       prefix: "build"
       include: "scope"
