@@ -48,3 +48,11 @@ path = "fuzz_targets/filter_pipeline.rs"
 test = false
 doc = false
 bench = false
+
+# Primitive PDF object parser safety harness.
+[[bin]]
+name = "primitive_parser"
+path = "fuzz_targets/primitive_parser.rs"
+test = false
+doc = false
+bench = false
