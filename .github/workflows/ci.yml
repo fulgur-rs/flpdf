@@ -616,6 +616,9 @@ jobs:
         with:
           tool: cargo-fuzz
 
+      - name: Populate fixture-based fuzz corpora
+        run: tools/seed-corpus.sh
+
       # Short whole-document fuzz. -timeout=10 makes the "traversal terminates"
       # guarantee testable (libFuzzer's default per-input timeout is 1200s, which
       # would let a single hang silently eat the whole time budget). A crash,
@@ -632,7 +635,7 @@ jobs:
           set -euo pipefail
           mkdir -p fuzz/corpus/roundtrip
           cargo fuzz run --target x86_64-unknown-linux-gnu roundtrip \
-            fuzz/corpus/roundtrip fuzz/seeds/roundtrip \
+            fuzz/corpus/roundtrip \
             -- -max_total_time=60 -timeout=10 -rss_limit_mb=2048
 
       # Exercise the existing strict/repair xref target with the committed
@@ -642,7 +645,7 @@ jobs:
           set -euo pipefail
           mkdir -p fuzz/corpus/xref
           cargo fuzz run --target x86_64-unknown-linux-gnu xref \
-            fuzz/corpus/xref fuzz/seeds/prev_chain fuzz/seeds/roundtrip \
+            fuzz/corpus/xref \
             -- -max_total_time=60 -timeout=10 -rss_limit_mb=2048
 
       # Exercise arbitrary filter chains and DecodeParms through the public
@@ -652,7 +655,7 @@ jobs:
           set -euo pipefail
           mkdir -p fuzz/corpus/filter_pipeline
           cargo fuzz run --target x86_64-unknown-linux-gnu filter_pipeline \
-            fuzz/corpus/filter_pipeline fuzz/seeds/filter_pipeline \
+            fuzz/corpus/filter_pipeline \
             -- -max_total_time=60 -timeout=10 -rss_limit_mb=2048
 
       # Exercise standalone primitive parsing and direct-object bodies from the
@@ -662,7 +665,7 @@ jobs:
           set -euo pipefail
           mkdir -p fuzz/corpus/primitive_parser
           cargo fuzz run --target x86_64-unknown-linux-gnu primitive_parser \
-            fuzz/corpus/primitive_parser fuzz/seeds/primitive_parser \
+            fuzz/corpus/primitive_parser \
             -- -max_total_time=60 -timeout=10 -rss_limit_mb=2048
 
       # Resolve all effective xref objects so compressed members exercise the
@@ -672,7 +675,7 @@ jobs:
           set -euo pipefail
           mkdir -p fuzz/corpus/objstm
           cargo fuzz run --target x86_64-unknown-linux-gnu objstm \
-            fuzz/corpus/objstm fuzz/seeds/objstm \
+            fuzz/corpus/objstm \
             -- -max_total_time=60 -max_len=4096 -timeout=10 -rss_limit_mb=2048
 
   # qtest regression detection against the qpdf 11.9.0 acceptance corpus,
