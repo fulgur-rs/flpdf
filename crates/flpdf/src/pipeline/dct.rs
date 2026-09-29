@@ -190,7 +190,7 @@ impl<'a> PlDct<'a> {
                     return Err(Self::runtime_error("invalid jpeg data reading from buffer"));
                 }
             }
-        } // cov:ignore: LLVM attributes this branch-closing line to the non-baseline path; baseline EOI success and error arms are covered.
+        }
         Ok(())
     }
 
@@ -375,6 +375,72 @@ mod tests {
             .expect("compatibility test sink write must succeed");
         sink.finish()
             .expect("compatibility test sink finish must succeed");
+    }
+
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+    #[test]
+    fn baseline_jpeg_without_eoi_is_rejected_by_boundary_check() {
+        let jpeg = libjpeg_turbo_rs::compress(
+            &[128u8; 64],
+            8,
+            8,
+            libjpeg_turbo_rs::PixelFormat::Grayscale,
+            75,
+            libjpeg_turbo_rs::Subsampling::S444,
+        )
+        .expect("fixture JPEG must encode");
+        assert!(jpeg.starts_with(&[0xff, 0xd8]));
+        assert!(jpeg.ends_with(&[0xff, 0xd9]));
+        let truncated = &jpeg[..jpeg.len() - 2];
+
+        let metadata = libjpeg_turbo_rs::decode::marker::MarkerReader::new(truncated)
+            .read_markers()
+            .expect("baseline marker metadata remains readable without EOI");
+        assert!(!metadata.frame.is_progressive);
+        assert_eq!(metadata.scans.len(), 1);
+        assert!(matches!(
+            libjpeg_turbo_rs::decode::boundary::scan_next_boundary(
+                truncated,
+                metadata.entropy_data_offset,
+            ),
+            libjpeg_turbo_rs::decode::boundary::MarkerBoundary::NeedMore(_)
+                | libjpeg_turbo_rs::decode::boundary::MarkerBoundary::Sos(_)
+        ));
+
+        let mut sink = Sink;
+        let stage = PlDct::new("DCT decode", &mut sink);
+        let error = stage
+            .require_baseline_eoi(truncated)
+            .expect_err("a one-scan baseline JPEG must include EOI");
+        assert_eq!(error.message(), "invalid jpeg data reading from buffer");
+    }
+
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+    #[test]
+    fn progressive_jpeg_skips_the_baseline_eoi_boundary_check() {
+        let jpeg = libjpeg_turbo_rs::compress_progressive(
+            &[128u8; 64],
+            8,
+            8,
+            libjpeg_turbo_rs::PixelFormat::Grayscale,
+            75,
+            libjpeg_turbo_rs::Subsampling::S444,
+        )
+        .expect("progressive fixture JPEG must encode");
+        assert!(jpeg.starts_with(&[0xff, 0xd8]));
+        assert!(jpeg.ends_with(&[0xff, 0xd9]));
+
+        let metadata = libjpeg_turbo_rs::decode::marker::MarkerReader::new(&jpeg)
+            .read_markers()
+            .expect("progressive marker metadata must parse");
+        assert!(metadata.frame.is_progressive);
+        assert!(metadata.scans.len() > 1);
+
+        let mut sink = Sink;
+        let stage = PlDct::new("DCT decode", &mut sink);
+        stage
+            .require_baseline_eoi(&jpeg)
+            .expect("progressive JPEGs skip the baseline-only EOI boundary check");
     }
 
     #[test]
