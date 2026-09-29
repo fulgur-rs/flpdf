@@ -5290,6 +5290,25 @@ mod final_handle_tests {
         );
     }
 
+    #[test]
+    fn strict_prev_loop_returns_qpdf_structured_error() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let xref = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 /Prev {xref} >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+
+        let (_owner, result) = load_xref_snapshot(std::io::Cursor::new(bytes), false, 33);
+        let error = result.expect_err("strict parsing must reject a cyclic /Prev chain");
+        assert!(matches!(
+            error,
+            Error::Parse { message, .. } if message == "loop detected following xref tables"
+        ));
+    }
+
     fn trailer_value_offset(bytes: &[u8]) -> usize {
         bytes
             .windows(b"trailer".len())
