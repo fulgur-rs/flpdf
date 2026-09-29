@@ -185,6 +185,10 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the contributor guide and
 Issue tracking uses [beads](https://github.com/steveyegge/beads); start with
 `bd ready` to see available work.
 
+## Releasing
+
+See [release setup and operations](docs/RELEASE_SETUP.md).
+
 ## License
 
 Licensed under either of
