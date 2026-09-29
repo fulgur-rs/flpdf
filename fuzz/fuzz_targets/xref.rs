@@ -20,6 +20,9 @@
 //! path and the line-scan recovery path. Returned errors are expected for
 //! malformed input; a panic, abort, sanitizer failure, or timeout is the fuzz
 //! failure.
+//!
+//! `fuzz/seeds/prev_chain` focuses mutations on valid incremental-update
+//! chains, conflicting xref entries, long acyclic chains, and a deep cycle.
 
 use flpdf::PdfOpenOptions;
 use libfuzzer_sys::fuzz_target;

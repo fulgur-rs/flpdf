@@ -23,7 +23,9 @@ it.
   `suppress_warnings: true` so recovery diagnostics stay off the default
   logger's stderr. The input is shared as one `Arc<[u8]>` because `Pdf::open`
   requires `R: 'static`. Parse errors are expected; a panic, abort, sanitizer
-  failure, or timeout is the defect under test.
+  failure, or timeout is the defect under test. Its focused `/Prev` seeds
+  include conflicting entries across generations, a 128-revision acyclic chain,
+  and a 128-revision cycle.
 
 The `xref` target follows qpdf 11.9.0's fuzzing boundary rather than
 reimplementing qpdf output checks: qpdf lists its whole-document and focused
@@ -76,9 +78,37 @@ cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu xref \
 -> exit 0; 300-second budget completed
 ```
 
-The dedicated committed xref/recovery seed corpus remains the responsibility
-of `flpdf-9hc.19.7`; this target records the safety run without adding that
-seed-ownership scope here.
+The focused `/Prev` seeds are owned by `flpdf-9hc.19.6`. The broader
+xref/recovery seed corpus remains the responsibility of `flpdf-9hc.19.7`.
+
+### Recorded `/Prev` fuzz run
+
+On 2026-09-29, the pinned-nightly xref target ran for the full 300-second
+budget with the three committed `/Prev` seeds and an empty local corpus. It
+exited 0 without a crash, abort, sanitizer failure, timeout, or artifact.
+
+```text
+cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu xref \
+  fuzz/corpus/xref fuzz/seeds/prev_chain \
+  -- -max_total_time=300 -timeout=10 -rss_limit_mb=2048 -verbosity=0
+-> exit 0; 300-second budget completed
+```
+
+### Recorded `/Prev` chain probe
+
+On 2026-09-29, qpdf 11.9.0 and flpdf both accepted the 128-revision acyclic
+chain and returned the same loop warning for the 128-revision cycle. qpdf's
+`QPDF::read_xref` walks `/Prev` iteratively and rejects a repeated xref offset;
+it does not impose a maximum length on acyclic chains. The flpdf strict-reader
+regression test checks that the cycle returns the corresponding structured
+parse error.
+
+```text
+qpdf --check fuzz/seeds/prev_chain/deep-128-generations.pdf -> exit 0
+flpdf --check fuzz/seeds/prev_chain/deep-128-generations.pdf -> exit 0
+qpdf --check fuzz/seeds/prev_chain/deep-128-cycle.pdf -> exit 3, loop detected
+flpdf --check fuzz/seeds/prev_chain/deep-128-cycle.pdf -> exit 3, loop detected
+```
 
 ## Run locally
 
@@ -97,11 +127,16 @@ cargo +nightly fuzz run --target x86_64-unknown-linux-gnu roundtrip \
   fuzz/corpus/roundtrip fuzz/seeds/roundtrip \
   -- -timeout=10 -rss_limit_mb=2048
 
-# Fuzz strict and repair xref/trailer loading. Until the dedicated xref seed
-# corpus is added, reuse the committed PDF seeds already used by roundtrip.
+# Fuzz strict and repair xref/trailer loading with focused /Prev and general
+# document seeds.
 cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu xref \
-  fuzz/corpus/xref fuzz/seeds/roundtrip \
+  fuzz/corpus/xref fuzz/seeds/prev_chain fuzz/seeds/roundtrip \
   -- -timeout=10 -rss_limit_mb=2048
+
+# Exercise the focused /Prev corpus for the five-minute acceptance budget.
+cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu xref \
+  fuzz/corpus/xref fuzz/seeds/prev_chain \
+  -- -max_total_time=300 -timeout=10 -rss_limit_mb=2048 -verbosity=0
 
 # Reproduce a crash artifact.
 cargo +nightly fuzz run --target x86_64-unknown-linux-gnu roundtrip \
@@ -132,6 +167,7 @@ corpus; the following `fuzz/seeds/...` dir is committed, read-only seed input.
 
 ## CI
 
-CI runs a short (60s) fuzz session on every PR with `-timeout=10`, so a panic,
-abort, OOM, or hang fails the build. See the `fuzz` job in
-`.github/workflows/ci.yml`.
+CI runs short (60s) `roundtrip` and `xref` fuzz sessions on every PR with
+`-timeout=10`, so a panic, abort, OOM, or hang fails the build. The xref session
+uses the focused `/Prev` seeds plus the general roundtrip seeds. See the `fuzz`
+job in `.github/workflows/ci.yml`.

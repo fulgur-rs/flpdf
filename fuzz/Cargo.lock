@@ -157,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "flpdf"
-version = "0.5.1"
+version = "0.10.0"
 dependencies = [
  "aes",
  "ar_archive_writer",
@@ -173,6 +173,7 @@ dependencies = [
  "stacker",
  "thiserror",
  "windows-sys",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -467,3 +468,9 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
