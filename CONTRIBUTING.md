@@ -17,6 +17,35 @@ When your change moves the matrix (re-blesses `tests/golden/compat-matrix.md`
 or `tests/golden/baseline-static-id.md`), check the boxes in the PR
 template's "Compat matrix" section.
 
+## Fuzzing
+
+Pull requests run the `Fuzz (short)` Actions job. It seeds the gitignored
+corpora with `tools/seed-corpus.sh`, then runs `roundtrip`, `xref`,
+`filter_pipeline`, `primitive_parser`, and `objstm` for 60 seconds each. Each
+input has a 10-second timeout and the job caps RSS at 2 GiB. Local setup,
+target-specific commands, and longer acceptance runs are documented in
+[`fuzz/README.md`](fuzz/README.md).
+
+A crash or timeout makes the target exit nonzero and fails the job. Crash logs
+show libFuzzer's stack trace, and the reproducer is written under
+`fuzz/artifacts/<target>/`. For example, replay a crash with:
+
+```bash
+cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu roundtrip \
+  fuzz/artifacts/roundtrip/crash-<hash>
+```
+
+An example crash log (addresses and intermediate frames abbreviated) looks
+like this:
+
+```text
+==<pid>== ERROR: libFuzzer: deadly signal
+    #0 ... in <fuzz target frame>
+    #1 ... in <caller>
+SUMMARY: libFuzzer: deadly signal
+Test unit written to fuzz/artifacts/<target>/crash-<hash>
+```
+
 ## Signed PDFs
 
 flpdf preserves digital signatures by default and refuses operations that
