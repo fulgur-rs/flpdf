@@ -190,15 +190,165 @@ const CORPUS: &[FixtureSpec] = &[
         compared_top_level_key: None,
         expected_exit_code: 0,
     },
-    // SKIP: qdf-roundtrip/three-page-edited-payload.qdf — intentionally damaged
-    // (qpdf reconstructs xref with warnings, flpdf rejects with "parse error
-    // at byte 3: expected integer"). Schema-diff is not the right test
-    // surface for repair-path divergence.
-    // SKIP: qdf-fix/corrupt-*.qdf — all intentionally corrupted variants used
-    // by the qdf-fix repair test; same reason as above.
-    // Encrypted: AES-128 (V=4 R=4) and AES-256 (V=5 R=6). RC4 fixtures
-    // require flpdf's --allow-weak-crypto flag, which the support module's
-    // run_flpdf_json helper does not currently pass, so they are excluded.
+    // Both tools repair these damaged QDF inputs, return exit code 3, and emit
+    // identical JSON. Nine other corrupt-*.qdf inputs return exit code 2
+    // without JSON from either tool, so they cannot participate in this diff.
+    FixtureSpec {
+        label: "qdf-fix/corrupt-combo.qdf",
+        relative_path: "qdf-fix/corrupt-combo.qdf",
+        password: None,
+        compared_top_level_key: None,
+        expected_exit_code: 3,
+    },
+    FixtureSpec {
+        label: "qdf-fix/corrupt-comment-type-xref.qdf",
+        relative_path: "qdf-fix/corrupt-comment-type-xref.qdf",
+        password: None,
+        compared_top_level_key: None,
+        expected_exit_code: 3,
+    },
+    FixtureSpec {
+        label: "qdf-fix/corrupt-decoy-xref-after-last-object.qdf",
+        relative_path: "qdf-fix/corrupt-decoy-xref-after-last-object.qdf",
+        password: None,
+        compared_top_level_key: None,
+        expected_exit_code: 3,
+    },
+    FixtureSpec {
+        label: "qdf-fix/corrupt-decoy-xref-line.qdf",
+        relative_path: "qdf-fix/corrupt-decoy-xref-line.qdf",
+        password: None,
+        compared_top_level_key: None,
+        expected_exit_code: 3,
+    },
+    FixtureSpec {
+        label: "qdf-fix/corrupt-length-holder-after-xref-next-stream.qdf",
+        relative_path: "qdf-fix/corrupt-length-holder-after-xref-next-stream.qdf",
+        password: None,
+        compared_top_level_key: None,
+        expected_exit_code: 3,
+    },
+    FixtureSpec {
+        label: "qdf-fix/corrupt-length-holder-after-xref-second-xref.qdf",
+        relative_path: "qdf-fix/corrupt-length-holder-after-xref-second-xref.qdf",
+        password: None,
+        compared_top_level_key: None,
+        expected_exit_code: 3,
+    },
+    FixtureSpec {
+        label: "qdf-fix/corrupt-length-marker-before-endobj.qdf",
+        relative_path: "qdf-fix/corrupt-length-marker-before-endobj.qdf",
+        password: None,
+        compared_top_level_key: None,
+        expected_exit_code: 3,
+    },
+    FixtureSpec {
+        label: "qdf-fix/corrupt-length-position-markers.qdf",
+        relative_path: "qdf-fix/corrupt-length-position-markers.qdf",
+        password: None,
+        compared_top_level_key: None,
+        expected_exit_code: 3,
+    },
+    FixtureSpec {
+        label: "qdf-fix/corrupt-length-position-no-successor.qdf",
+        relative_path: "qdf-fix/corrupt-length-position-no-successor.qdf",
+        password: None,
+        compared_top_level_key: None,
+        expected_exit_code: 3,
+    },
+    FixtureSpec {
+        label: "qdf-fix/corrupt-length-position.qdf",
+        relative_path: "qdf-fix/corrupt-length-position.qdf",
+        password: None,
+        compared_top_level_key: None,
+        expected_exit_code: 3,
+    },
+    FixtureSpec {
+        label: "qdf-fix/corrupt-length.qdf",
+        relative_path: "qdf-fix/corrupt-length.qdf",
+        password: None,
+        compared_top_level_key: None,
+        expected_exit_code: 3,
+    },
+    FixtureSpec {
+        label: "qdf-fix/corrupt-nested-type-xref.qdf",
+        relative_path: "qdf-fix/corrupt-nested-type-xref.qdf",
+        password: None,
+        compared_top_level_key: None,
+        expected_exit_code: 3,
+    },
+    FixtureSpec {
+        label: "qdf-fix/corrupt-shift.qdf",
+        relative_path: "qdf-fix/corrupt-shift.qdf",
+        password: None,
+        compared_top_level_key: None,
+        expected_exit_code: 3,
+    },
+    FixtureSpec {
+        label: "qdf-fix/corrupt-size.qdf",
+        relative_path: "qdf-fix/corrupt-size.qdf",
+        password: None,
+        compared_top_level_key: None,
+        expected_exit_code: 3,
+    },
+    FixtureSpec {
+        label: "qdf-fix/corrupt-startxref.qdf",
+        relative_path: "qdf-fix/corrupt-startxref.qdf",
+        password: None,
+        compared_top_level_key: None,
+        expected_exit_code: 3,
+    },
+    FixtureSpec {
+        label: "qdf-fix/corrupt-string-type-xref.qdf",
+        relative_path: "qdf-fix/corrupt-string-type-xref.qdf",
+        password: None,
+        compared_top_level_key: None,
+        expected_exit_code: 3,
+    },
+    FixtureSpec {
+        label: "qdf-fix/corrupt-trailing-garbage.qdf",
+        relative_path: "qdf-fix/corrupt-trailing-garbage.qdf",
+        password: None,
+        compared_top_level_key: None,
+        expected_exit_code: 3,
+    },
+    FixtureSpec {
+        label: "qdf-roundtrip/three-page-edited-payload.qdf",
+        relative_path: "qdf-roundtrip/three-page-edited-payload.qdf",
+        password: None,
+        compared_top_level_key: None,
+        expected_exit_code: 3,
+    },
+    // RC4 and R5 encrypted inputs are read-only JSON operations; weak-crypto
+    // opt-in applies to writes and is not required to inspect them.
+    FixtureSpec {
+        label: "encrypted/v1-rc4-40-r2.pdf",
+        relative_path: "encrypted/v1-rc4-40-r2.pdf",
+        password: Some("user-v1"),
+        compared_top_level_key: None,
+        expected_exit_code: 0,
+    },
+    FixtureSpec {
+        label: "encrypted/v2-rc4-128-r3.pdf",
+        relative_path: "encrypted/v2-rc4-128-r3.pdf",
+        password: Some("user-v2"),
+        compared_top_level_key: None,
+        expected_exit_code: 0,
+    },
+    FixtureSpec {
+        label: "encrypted/v4-rc4-128-r4.pdf",
+        relative_path: "encrypted/v4-rc4-128-r4.pdf",
+        password: Some("user-v4-rc4"),
+        compared_top_level_key: None,
+        expected_exit_code: 0,
+    },
+    FixtureSpec {
+        label: "encrypted/v5-aes-256-r5.pdf",
+        relative_path: "encrypted/v5-aes-256-r5.pdf",
+        password: Some("user-v5-r5"),
+        compared_top_level_key: None,
+        expected_exit_code: 0,
+    },
     FixtureSpec {
         label: "encrypted/v4-aes-128-r4.pdf",
         relative_path: "encrypted/v4-aes-128-r4.pdf",
