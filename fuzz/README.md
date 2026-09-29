@@ -34,6 +34,12 @@ it.
   RunLength stage per chain to limit compounded expansion. Its sink stops one
   iteration after 1 MiB of decoded output or 4,096 downstream writes; product
   stream behavior and qpdf's unbounded-chain support are unchanged.
+- **`primitive_parser`** — calls the public `ObjectHandle::parse` API on
+  arbitrary bytes, then extracts up to 64 indirect-object bodies from each
+  small PDF input and parses those independently. Its seeds are copied from
+  `tests/fixtures/test_driver/`, so valid names, strings, arrays, dictionaries,
+  numbers, and malformed objects reach the standalone parser after the PDF
+  header.
 
 The `filter_pipeline` seed format is: first byte selects one to seventeen
 requested stages; the next bytes select filter IDs in this order: Flate,
@@ -156,9 +162,19 @@ cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu filter_pipe
   fuzz/corpus/filter_pipeline fuzz/seeds/filter_pipeline \
   -- -timeout=10 -rss_limit_mb=2048
 
+# Fuzz primitive objects and object bodies extracted from test-driver fixtures.
+cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu primitive_parser \
+  fuzz/corpus/primitive_parser fuzz/seeds/primitive_parser \
+  -- -timeout=10 -rss_limit_mb=2048
+
 # Exercise the focused /Prev corpus for the five-minute acceptance budget.
 cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu xref \
   fuzz/corpus/xref fuzz/seeds/prev_chain \
+  -- -max_total_time=300 -timeout=10 -rss_limit_mb=2048 -verbosity=0
+
+# Exercise the primitive parser seed corpus for the five-minute acceptance budget.
+cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu primitive_parser \
+  fuzz/corpus/primitive_parser fuzz/seeds/primitive_parser \
   -- -max_total_time=300 -timeout=10 -rss_limit_mb=2048 -verbosity=0
 
 # Reproduce a crash artifact.
@@ -194,7 +210,7 @@ corpus; the following `fuzz/seeds/...` dir is committed, read-only seed input.
 
 ## CI
 
-CI runs short (60s) `roundtrip`, `xref`, and `filter_pipeline` fuzz sessions on
-every PR with `-timeout=10`, so a panic, abort, OOM, or hang fails the build.
-The xref session uses the focused `/Prev` seeds plus general document seeds.
-See the `fuzz` job in `.github/workflows/ci.yml`.
+CI runs short (60s) `roundtrip`, `xref`, `filter_pipeline`, and `primitive_parser`
+fuzz sessions on every PR with `-timeout=10`, so a panic, abort, OOM, or hang
+fails the build. The xref session uses the focused `/Prev` seeds plus general
+document seeds. See the `fuzz` job in `.github/workflows/ci.yml`.

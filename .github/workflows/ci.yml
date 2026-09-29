@@ -655,6 +655,16 @@ jobs:
             fuzz/corpus/filter_pipeline fuzz/seeds/filter_pipeline \
             -- -max_total_time=60 -timeout=10 -rss_limit_mb=2048
 
+      # Exercise standalone primitive parsing and direct-object bodies from the
+      # test-driver fixture corpus.
+      - name: Short fuzz (primitive parser, 60s)
+        run: |
+          set -euo pipefail
+          mkdir -p fuzz/corpus/primitive_parser
+          cargo fuzz run --target x86_64-unknown-linux-gnu primitive_parser \
+            fuzz/corpus/primitive_parser fuzz/seeds/primitive_parser \
+            -- -max_total_time=60 -timeout=10 -rss_limit_mb=2048
+
   # qtest regression detection against the qpdf 11.9.0 acceptance corpus,
   # which flpdf's own suites do not cover: the survey is 2811 subtests across
   # 101 suites, run through the real qtest driver with flpdf behind a PATH
