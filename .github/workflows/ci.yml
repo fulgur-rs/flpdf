@@ -665,6 +665,16 @@ jobs:
             fuzz/corpus/primitive_parser fuzz/seeds/primitive_parser \
             -- -max_total_time=60 -timeout=10 -rss_limit_mb=2048
 
+      # Resolve all effective xref objects so compressed members exercise the
+      # canonical ObjStm header/body parser.
+      - name: Short fuzz (object streams, 60s)
+        run: |
+          set -euo pipefail
+          mkdir -p fuzz/corpus/objstm
+          cargo fuzz run --target x86_64-unknown-linux-gnu objstm \
+            fuzz/corpus/objstm fuzz/seeds/objstm \
+            -- -max_total_time=60 -max_len=4096 -timeout=10 -rss_limit_mb=2048
+
   # qtest regression detection against the qpdf 11.9.0 acceptance corpus,
   # which flpdf's own suites do not cover: the survey is 2811 subtests across
   # 101 suites, run through the real qtest driver with flpdf behind a PATH

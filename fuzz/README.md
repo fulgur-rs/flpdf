@@ -40,6 +40,12 @@ it.
   `tests/fixtures/test_driver/`, so valid names, strings, arrays, dictionaries,
   numbers, and malformed objects reach the standalone parser after the PDF
   header.
+- **`objstm`** — opens arbitrary PDF bytes with the canonical reader and calls
+  `Pdf::get_all_objects`, which resolves every effective xref object and
+  exercises compressed type-2 entries through the ObjStm header/body parser.
+  Its seeds are small PDFs copied from `tests/fixtures/` whose xref entries
+  include compressed objects. The target adds no fuzz-only or public parser
+  API.
 
 The `filter_pipeline` seed format is: first byte selects one to seventeen
 requested stages; the next bytes select filter IDs in this order: Flate,
@@ -167,6 +173,11 @@ cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu primitive_p
   fuzz/corpus/primitive_parser fuzz/seeds/primitive_parser \
   -- -timeout=10 -rss_limit_mb=2048
 
+# Fuzz compressed object streams through the canonical reader.
+cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu objstm \
+  fuzz/corpus/objstm fuzz/seeds/objstm \
+  -- -max_len=4096 -timeout=10 -rss_limit_mb=2048
+
 # Exercise the focused /Prev corpus for the five-minute acceptance budget.
 cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu xref \
   fuzz/corpus/xref fuzz/seeds/prev_chain \
@@ -176,6 +187,11 @@ cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu xref \
 cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu primitive_parser \
   fuzz/corpus/primitive_parser fuzz/seeds/primitive_parser \
   -- -max_total_time=300 -timeout=10 -rss_limit_mb=2048 -verbosity=0
+
+# Exercise ObjStm fixtures for the six-minute acceptance budget.
+cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu objstm \
+  fuzz/corpus/objstm fuzz/seeds/objstm \
+  -- -max_total_time=360 -max_len=4096 -timeout=10 -rss_limit_mb=2048 -verbosity=0
 
 # Reproduce a crash artifact.
 cargo +nightly fuzz run --target x86_64-unknown-linux-gnu roundtrip \
@@ -210,7 +226,7 @@ corpus; the following `fuzz/seeds/...` dir is committed, read-only seed input.
 
 ## CI
 
-CI runs short (60s) `roundtrip`, `xref`, `filter_pipeline`, and `primitive_parser`
-fuzz sessions on every PR with `-timeout=10`, so a panic, abort, OOM, or hang
-fails the build. The xref session uses the focused `/Prev` seeds plus general
-document seeds. See the `fuzz` job in `.github/workflows/ci.yml`.
+CI runs short (60s) `roundtrip`, `xref`, `filter_pipeline`, `primitive_parser`,
+and `objstm` fuzz sessions on every PR with `-timeout=10`, so a panic, abort,
+OOM, or hang fails the build. The xref session uses the focused `/Prev` seeds
+plus general document seeds. See the `fuzz` job in `.github/workflows/ci.yml`.
