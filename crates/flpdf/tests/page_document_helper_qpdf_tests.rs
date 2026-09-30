@@ -57,8 +57,12 @@ fn page_tree_root_correction_warning_uses_qpdf_damaged_pdf_code() {
 #[test]
 fn removing_the_last_page_flattens_intermediate_pages_with_qpdf_warnings() {
     let mut pdf = Pdf::open(Cursor::new(one_page_nested_tree_with_unknown_key())).unwrap();
+    let page = PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .expect("enumerate nested page")
+        .remove(0);
     PageDocumentHelper::new(&mut pdf)
-        .remove_page(ObjectRef::new(4, 0))
+        .remove_page(page)
         .expect("qpdf-style final page removal");
 
     assert!(
@@ -84,10 +88,13 @@ fn removing_an_already_removed_page_preserves_qpdf_exception_context() {
         },
     )
     .unwrap();
-    let page = ObjectRef::new(4, 0);
+    let page = PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .expect("enumerate nested page")
+        .remove(0);
 
     PageDocumentHelper::new(&mut pdf)
-        .remove_page(page)
+        .remove_page(page.clone())
         .expect("the first removal should succeed");
     let error = PageDocumentHelper::new(&mut pdf)
         .remove_page(page)
@@ -97,6 +104,218 @@ fn removing_an_already_removed_page_preserves_qpdf_exception_context() {
         error.to_string(),
         "page_api_1.pdf (page object: object 4 0): page object not referenced in /Pages tree"
     );
+}
+
+#[test]
+fn removing_a_raw_page_handle_outside_the_tree_preserves_its_identity() {
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(one_page_nested_tree_with_unknown_key()),
+        PdfOpenOptions {
+            description: b"page_api_raw.pdf".to_vec(),
+            suppress_warnings: true,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("nested one-page PDF should parse");
+    pdf.replace_object(
+        ObjectRef::new(17, 65_535),
+        ObjectHandle::dictionary(vec![(
+            b"/Type".to_vec(),
+            ObjectHandle::name(b"Page".to_vec()),
+        )]),
+    )
+    .expect("install a detached raw-generation page");
+    let raw_page = pdf.get_object_handle_by_raw_identity(17, 65_535);
+
+    let error = PageDocumentHelper::new(&mut pdf)
+        .remove_page(raw_page)
+        .expect_err("a page outside the tree must produce qpdf's page error");
+
+    assert!(matches!(error, Error::QpdfExc(_)));
+    assert_eq!(
+        error.to_string(),
+        "page_api_raw.pdf (page object: object 17 65535): page object not referenced in /Pages tree"
+    );
+}
+
+#[test]
+fn remove_page_flattens_with_qpdf_unsigned_count_warnings() {
+    for (count, warning) in [
+        (
+            "-1",
+            "unsigned value request for negative number; returning 0",
+        ),
+        (
+            "/bad",
+            "operation for integer attempted on object of type name: returning 0",
+        ),
+    ] {
+        let bytes = build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
+                (2, format!("<< /Type /Pages /Kids [] /Count {count} >>")),
+            ],
+            1,
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("empty page tree should parse");
+
+        let error = PageDocumentHelper::new(&mut pdf)
+            .remove_page(ObjectHandle::dictionary(Vec::new()))
+            .expect_err("the direct page is not a member of the empty page tree");
+
+        assert!(matches!(error, Error::QpdfExc(_)));
+        assert!(
+            pdf.repair_diagnostics().entries().iter().any(|diagnostic| {
+                String::from_utf8_lossy(diagnostic.get_message_detail()).contains(warning)
+            }),
+            "qpdf /Count conversion warning should be preserved for /Count {count}"
+        );
+    }
+}
+
+#[test]
+fn remove_page_rejects_a_mismatched_count_after_flattening() {
+    let bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 2 >>".to_owned()),
+            (3, "<< /Type /Page /Parent 2 0 R >>".to_owned()),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("one-page tree should parse");
+    let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+
+    let error = PageDocumentHelper::new(&mut pdf)
+        .remove_page(page)
+        .expect_err("flattening must reject an incorrect /Count");
+
+    assert!(matches!(
+        error,
+        Error::Internal(message) if message == "/Count is wrong after flattening pages tree"
+    ));
+}
+
+#[test]
+fn remove_page_accepts_a_raw_generation_page_handle() {
+    let mut pdf = Pdf::open(Cursor::new(one_page_nested_tree_with_unknown_key()))
+        .expect("nested one-page PDF should parse");
+    let raw_page_ref = ObjectRef::new(17, 65_535);
+    let raw_page = ObjectHandle::dictionary(vec![
+        (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+        (
+            b"/Parent".to_vec(),
+            pdf.get_object_handle(ObjectRef::new(3, 0)),
+        ),
+        (
+            b"/MediaBox".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(612),
+                ObjectHandle::integer(792),
+            ]),
+        ),
+    ]);
+    pdf.replace_object(raw_page_ref, raw_page)
+        .expect("install raw-generation page");
+    let raw_page = pdf.get_object_handle_by_raw_identity(17, 65_535);
+    let intermediate = pdf.get_object_handle(ObjectRef::new(3, 0));
+    intermediate
+        .replace_key(b"/Kids", ObjectHandle::array(vec![raw_page.clone()]))
+        .expect("attach raw page to nested page tree");
+
+    let pages = PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .expect("qpdf page-list route retains raw identity");
+    assert_eq!(pages[0].get_obj_gen(), QpdfObjGen::new(17, 65_535));
+
+    PageDocumentHelper::new(&mut pdf)
+        .remove_page(raw_page.clone())
+        .expect("raw-generation page removal should match qpdf");
+
+    let pages = PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .expect("enumerate the empty page tree");
+    assert!(pages.is_empty());
+    let root = pdf.get_object_handle(ObjectRef::new(2, 0));
+    assert_eq!(
+        root.try_get_key(b"/Count")
+            .expect("read /Count")
+            .as_integer(),
+        Some(0)
+    );
+    assert_eq!(
+        root.try_get_key(b"/Kids")
+            .expect("read /Kids")
+            .try_get_array_n_items()
+            .expect("read /Kids item count"),
+        0
+    );
+}
+
+#[test]
+fn repeated_page_removal_reuses_the_flattened_kids_array() {
+    let bytes = build_pdf(&[
+        (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 2 >>".to_owned()),
+        (
+            3,
+            "<< /Type /Pages /Parent 2 0 R /Kids [4 0 R 5 0 R] /Count 2 /MediaBox [0 0 612 792] >>".to_owned(),
+        ),
+        (4, "<< /Type /Page /Parent 3 0 R >>".to_owned()),
+        (5, "<< /Type /Page /Parent 3 0 R >>".to_owned()),
+    ], 1);
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("two-page nested tree should parse");
+    let raw_page_ref = ObjectRef::new(17, 65_535);
+    let intermediate = pdf.get_object_handle(ObjectRef::new(3, 0));
+    pdf.replace_object(
+        raw_page_ref,
+        ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (b"/Parent".to_vec(), intermediate.clone()),
+            (
+                b"/MediaBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(612),
+                    ObjectHandle::integer(792),
+                ]),
+            ),
+        ]),
+    )
+    .expect("install raw page");
+    let raw_page = pdf.get_object_handle_by_raw_identity(17, 65_535);
+    intermediate
+        .replace_key(
+            b"/Kids",
+            ObjectHandle::array(vec![
+                raw_page.clone(),
+                pdf.get_object_handle(ObjectRef::new(5, 0)),
+            ]),
+        )
+        .expect("replace first page with the raw page");
+
+    PageDocumentHelper::new(&mut pdf)
+        .remove_page(raw_page)
+        .expect("remove raw first page");
+    let pages_root = pdf.get_object_handle(ObjectRef::new(2, 0));
+    let kids = pages_root
+        .try_get_key(b"/Kids")
+        .expect("read flattened /Kids");
+    assert_eq!(kids.try_get_array_n_items().unwrap(), 1);
+
+    let last_page = pdf.get_object_handle(ObjectRef::new(5, 0));
+    PageDocumentHelper::new(&mut pdf)
+        .remove_page(last_page)
+        .expect("remove the last remaining page");
+    let current_kids = pages_root.try_get_key(b"/Kids").expect("read final /Kids");
+    assert!(
+        kids.is_same_object_as(&current_kids),
+        "qpdf erases the same flattened /Kids array on subsequent removals"
+    );
+    assert_eq!(kids.try_get_array_n_items().unwrap(), 0);
 }
 
 #[test]

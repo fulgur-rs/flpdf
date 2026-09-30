@@ -8,12 +8,10 @@
 //! flattening. The helper holds no copied page-tree state.
 
 use crate::object_handle::DocumentResolver;
-use crate::pages::tree_rebuild::{rebuild_page_tree, RebuildResult};
-use crate::qpdf_obj_gen::QpdfObjGen;
+use crate::pages::tree_rebuild::{page_tree_root_handle, rebuild_page_tree, RebuildResult};
 use crate::{
     Error, ObjectHandle, ObjectRef, PageObjectHelper, Pdf, QpdfErrorCode, QpdfExc, Result,
 };
-use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
 /// High-level page-document helper.
@@ -213,7 +211,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     ///
     /// qpdf's `findPage` calls `flattenPagesTree` once, then `removePage`
     /// erases the matching `/Kids` entry and updates `/Count` in place
-    /// (`QPDF_pages.cc:253-266,303-320`). `current_pages` is the corresponding
+    /// (`QPDF_pages.cc:253-275,303-319`). `current_pages` is the corresponding
     /// live `m->all_pages` sequence maintained by the caller for this job.
     pub(crate) fn remove_flattened_page_for_job(
         &mut self,
@@ -257,6 +255,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         pages.replace_key(b"/Count", ObjectHandle::integer(count))?;
         current_pages.remove(index);
         self.pdf.invalidate_page_list_cache();
+        self.pdf.page_tree_flattened = !current_pages.is_empty();
         *self.pdf.acroform_cache.borrow_mut() = None;
         Ok(())
     }
@@ -308,6 +307,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         pages.replace_key(b"/Count", ObjectHandle::integer(count))?;
         current_pages.push(page_ref);
         self.pdf.invalidate_page_list_cache();
+        self.pdf.page_tree_flattened = true;
         *self.pdf.acroform_cache.borrow_mut() = None;
         Ok(page_ref)
     }
@@ -341,55 +341,80 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         }
     }
 
-    /// Remove the page at 0-based position `idx`.
+    /// Remove `page` from the document by its raw page-object identity.
+    ///
+    /// Mirrors `QPDFPageDocumentHelper::removePage(QPDFPageObjectHelper)`:
+    /// qpdf flattens the page tree once, locates the page through its raw
+    /// `QPDFObjGen`, erases that `/Kids` item, and updates `/Count` in place
+    /// (`QPDF_pages.cc:145-183,254-275,303-319`). The page object itself remains in
+    /// the document object cache, as it does in qpdf.
     ///
     /// # Errors
     ///
-    /// - [`Error::Unsupported`] when `idx >= page_count`.
-    /// - Any error from [`rebuild_page_tree`] when pages remain after removal.
-    fn remove_page_at(&mut self, idx: usize) -> Result<RebuildResult> {
-        let mut refs = crate::pages::page_refs(self.pdf)?;
-        if idx >= refs.len() {
-            return Err(Error::Unsupported(format!(
-                "remove index {idx} is out of bounds (page count {})",
-                refs.len()
-            )));
-        }
-        let removed_page = refs[idx];
-        refs.remove(idx);
-        if refs.is_empty() {
-            // qpdf's removePage flattens the page tree before erasing the
-            // final leaf (`QPDF_pages.cc:304-306`). Do the same here so
-            // skipped intermediate `/Pages` keys are warned about before the
-            // empty-tree mutation takes the fast path.
-            rebuild_page_tree(self.pdf, &[removed_page])?;
-            return self.clear_page_tree();
-        }
-        let result = rebuild_page_tree(self.pdf, &refs)?;
-        // The page mutation changes qpdf's page-based orphan-Widget analysis.
-        // `QPDFAcroFormDocumentHelper::invalidateCache` is the explicit
-        // boundary for such external mutations (qpdf/include/qpdf/
-        // QPDFAcroFormDocumentHelper.hh:68-78).
-        *self.pdf.acroform_cache.borrow_mut() = None;
-        Ok(result)
-    }
+    /// - [`Error::QpdfExc`] when `page` is not a member of the repaired page
+    ///   tree; the error retains the source description and raw page identity.
+    /// - Any error propagated from page-tree repair, inherited-attribute
+    ///   materialization, or live page-tree mutation.
+    pub fn remove_page(&mut self, page: ObjectHandle) -> Result<()> {
+        let prepared = self.prepare_all_pages()?.ok_or(Error::Missing("/Pages"))?;
+        let pages_root = page_tree_root_handle(self.pdf, &prepared.root)?;
 
-    /// Remove the specified page from the document.
-    ///
-    /// Mirrors `QPDFPageDocumentHelper::removePage`. qpdf permits removal of
-    /// the final page, leaving an empty `/Pages` `/Kids` array and `/Count 0`.
-    /// Returns [`Error::Pages`] when `page` is not in the repaired page list,
-    /// preserving qpdf's source description and page-object context.
-    pub fn remove_page(&mut self, page: ObjectRef) -> Result<RebuildResult> {
-        let pages = crate::pages::page_refs(self.pdf)?;
-        let Some(index) = pages.iter().position(|&candidate| candidate == page) else {
-            // qpdf's QPDF::findPage sets the last object description to
-            // `page object` and throws qpdf_e_pages with the owning input
-            // filename (`QPDF_pages.cc:304-316`). Keep the complete exception
-            // text on the canonical page-helper error so callers do not need
-            // to reconstruct it at the driver boundary.
+        // qpdf's findPage() first calls flattenPagesTree(). Its
+        // pageobj_to_pages_pos map is the sentinel that makes later removals
+        // erase from the same live /Kids array instead of flattening again.
+        if !self.pdf.page_tree_flattened {
+            crate::optimization::inherited_attrs::push(self.pdf, &prepared, true, true)?;
+            self.pdf.ever_pushed_inherited_attributes_to_pages = true;
+            for page_handle in &prepared.pages {
+                page_handle.replace_key(b"/Parent", pages_root.clone())?;
+            }
+            pages_root.replace_key(b"/Kids", ObjectHandle::array(prepared.pages.clone()))?;
+            self.pdf.page_tree_flattened = !prepared.pages.is_empty();
+            self.pdf.cache_page_list(&prepared);
+
+            // QPDF::flattenPagesTree verifies the pre-existing /Count after it
+            // replaces /Kids (`QPDF_pages.cc:171-183`). getUIntValue warns and
+            // returns zero for non-integers or negative values.
+            let count_handle = pages_root.try_get_key(b"/Count")?;
+            let declared_count = match count_handle.try_as_integer()? {
+                Some(count) if count >= 0 => count as u64,
+                Some(_) => {
+                    count_handle.warn_if_possible(
+                        "unsigned value request for negative number; returning 0",
+                    )?; // cov:ignore: warning-sink failure is not injectable through qpdf's successful Count conversion
+                    0
+                }
+                None => {
+                    let type_name = count_handle.type_name()?;
+                    let warning = format!(
+                        "operation for integer attempted on object of type {type_name}: returning 0"
+                    );
+                    count_handle.warn_if_possible(&warning)?;
+                    0
+                }
+            };
+            if declared_count != prepared.pages.len() as u64 {
+                return Err(Error::Internal(
+                    "/Count is wrong after flattening pages tree".to_owned(),
+                ));
+            }
+        }
+
+        let page_obj_gen = page.get_obj_gen();
+        let Some(index) = prepared
+            .pages
+            .iter()
+            .position(|candidate| candidate.get_obj_gen() == page_obj_gen)
+        else {
+            // qpdf's findPage sets the last object description to `page
+            // object` and throws qpdf_e_pages with the owning input filename
+            // (`QPDF_pages.cc:303-319`). Keep its raw object/generation pair.
             let description_bytes = self.pdf.resolver.input_description();
-            let object = format!("page object: object {} {}", page.number, page.generation);
+            let object = format!(
+                "page object: object {} {}",
+                page_obj_gen.get_obj(),
+                page_obj_gen.get_gen()
+            );
             return Err(Error::QpdfExc(QpdfExc::new(
                 QpdfErrorCode::Pages,
                 description_bytes,
@@ -398,7 +423,31 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
                 b"page object not referenced in /Pages tree",
             )));
         };
-        self.remove_page_at(index)
+
+        let kids = pages_root.try_get_key(b"/Kids")?;
+        kids.erase_array_item(index)?;
+        let remaining_count = i64::try_from(kids.try_get_array_n_items()?).map_err(|_| {
+            // cov:ignore-start: an in-memory page tree cannot allocate more than i64::MAX Kids entries.
+            Error::Unsupported("page count exceeds qpdf's signed integer range".into())
+        })?; // cov:ignore-end
+        pages_root.replace_key(b"/Count", ObjectHandle::integer(remaining_count))?;
+
+        let mut remaining_pages = prepared.pages;
+        remaining_pages.remove(index);
+        if remaining_pages.is_empty() {
+            // qpdf's empty all_pages vector is the cache sentinel, and its
+            // page-position map is empty again after the last page is erased.
+            self.pdf.invalidate_page_list_cache();
+        } else {
+            self.pdf
+                .cache_page_list(&crate::pages::repair::PreparedPages {
+                    root: prepared.root,
+                    pages: remaining_pages,
+                });
+            self.pdf.page_tree_flattened = true;
+        }
+        *self.pdf.acroform_cache.borrow_mut() = None;
+        Ok(())
     }
 
     /// Remove unused `/Font` and `/XObject` resources from each page.
@@ -432,64 +481,6 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
             required_flags,
             forbidden_flags,
         )
-    }
-
-    /// Clear the live document's root page tree after qpdf-style final-page
-    /// removal. `remove_page_at` has already flattened a one-page tree through
-    /// `rebuild_page_tree`, so this method only performs the final empty-tree
-    /// mutation that qpdf's `removePage` leaves behind.
-    fn clear_page_tree(&mut self) -> Result<RebuildResult> {
-        // Keep the removed-page bookkeeping in qpdf's raw identity domain;
-        // `RebuildResult` uses the same QpdfObjGen keys.
-        let removed_page_objgens: BTreeSet<QpdfObjGen> = self
-            .get_all_pages()?
-            .into_iter()
-            .map(|page| page.get_obj_gen())
-            .filter(|object_gen| object_gen.is_indirect())
-            .collect();
-        let catalog = self.pdf.root_handle()?;
-        let Some(catalog_dict) = catalog.as_dictionary() else {
-            // cov:ignore-start: remove obtains pages through get_all_pages, which proves /Root is a dictionary before clear_page_tree runs
-            return Err(Error::Unsupported(
-                "document catalog is not a dictionary".into(),
-            ));
-            // cov:ignore-end
-        };
-        // cov:ignore-start: get_all_pages must have found the removed page through catalog /Pages before this final-page path can run
-        if !catalog_dict.contains_key(b"/Pages".as_slice()) {
-            return Err(Error::Missing("/Pages"));
-        }
-        // cov:ignore-end
-        let pages = catalog.try_get_key(b"/Pages")?;
-        let root = pages;
-        if !root.try_is_dictionary()? {
-            // cov:ignore-start: remove_page first obtains a repaired, dictionary /Pages root
-            return Err(Error::Unsupported(
-                "document /Pages root is not a dictionary".into(),
-            ));
-            // cov:ignore-end
-        }
-
-        // QPDF::removePage itself only erases the removed child and updates
-        // /Count on the existing /Pages handle (QPDF_pages.cc:253-266); the
-        // preceding `rebuild_page_tree` call supplied the
-        // `findPage()->flattenPagesTree()` precondition
-        // (`QPDF_pages.cc:304-306`). Preserve the direct catalog `/Pages`
-        // root while applying the final empty-tree values in place.
-        root.replace_key(b"/Type", ObjectHandle::name(b"Pages".to_vec()))?;
-        root.replace_key(b"/Kids", ObjectHandle::array(Vec::new()))?;
-        root.replace_key(b"/Count", ObjectHandle::integer(0))?;
-        root.remove_key(b"/Parent");
-        self.pdf.invalidate_page_list_cache();
-        // Final-page removal is the same page mutation as the non-empty
-        // rebuild above; keep the shared AcroForm analysis from observing
-        // the removed page on the next helper call.
-        *self.pdf.acroform_cache.borrow_mut() = None;
-        Ok(RebuildResult {
-            new_kids: Vec::new(),
-            ref_map: BTreeMap::new(),
-            removed_page_objgens,
-        })
     }
 }
 

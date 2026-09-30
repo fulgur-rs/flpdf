@@ -41,15 +41,15 @@ pub(crate) fn run_test_18<R: Read + Seek + 'static>(
     // live, internally-cached page vector that `addPage`/`removePage` keep
     // updated in place (`include/qpdf/QPDF.hh:673-680`), so the C++ test
     // re-reads through the *same* `pages` variable after each mutation.
-    // The qpdf test keeps a live vector; this driver makes an explicit checked
-    // projection because its insert/remove API consumes valid ObjectRefs. Each
-    // projection is an owned snapshot, so re-fetch it after every mutation.
-    // Every assertion qpdf makes (page count and the final page's identity) is
-    // preserved by doing so.
+    // The qpdf test keeps a live vector; this driver uses a checked projection
+    // for page indexing and insertion, and passes a live ObjectHandle to
+    // remove_page. Re-fetch the page list after each mutation. Every assertion
+    // qpdf makes (page count and the final page's identity) is preserved.
     let mut pages = crate::common::checked_page_refs(pdf)?;
     assert_eq!(pages.len(), 10);
     let page5 = pages[5];
-    PageDocumentHelper::new(pdf).remove_page(page5)?;
+    let page5_handle = pdf.get_object_handle(page5);
+    PageDocumentHelper::new(pdf).remove_page(page5_handle)?;
     pages = crate::common::checked_page_refs(pdf)?;
     assert_eq!(pages.len(), 9);
     let page5_input: PageInput<'_, std::io::Cursor<Vec<u8>>> = PageInput::existing(page5);
@@ -197,19 +197,19 @@ pub(crate) fn run_test_22<R: Read + Seek + 'static>(
 ) -> flpdf::Result<()> {
     // test_driver.cc:862-872 -- "Try to remove a page we don't have". The
     // first `removePage` succeeds; the second, on the same already-removed
-    // page, fails with `Error::Missing("page is not in the document")`
-    // (`PageDocumentHelper::remove_page`'s own doc), propagated by `?` the
+    // page, fails with qpdf's `qpdf_e_pages` context
+    // (`QPDF_pages.cc:303-319`), propagated by `?` the
     // same way run_test_21's stream error is -- leaving the following
     // `std::cout << "you can't see this"` line dead code again.
     let pages = crate::common::checked_page_refs(pdf)?;
-    let page = pages[0];
-    let qpdf_flush_result_11 = PageDocumentHelper::new(pdf).remove_page(page);
+    let page = pdf.get_object_handle(pages[0]);
+    let qpdf_flush_result_11 = PageDocumentHelper::new(pdf).remove_page(page.clone());
 
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     qpdf_flush_result_11?;
 
-    // Re-borrow: `helper`'s first mutable borrow of `pdf` must end before
-    // `emit_new_diagnostics` above can immutably borrow `pdf`.
+    // The first temporary helper borrow ended before `emit_new_diagnostics`
+    // immutably borrowed `pdf`; construct a fresh helper for the retry.
     PageDocumentHelper::new(pdf).remove_page(page)?;
     writeln!(stdout, "you can't see this")?;
     Ok(())
@@ -231,7 +231,8 @@ pub(crate) fn run_test_23<R: Read + Seek + 'static>(
     let last = *pages
         .last()
         .expect("a page-manipulation fixture has at least one page");
-    let qpdf_flush_result_12 = PageDocumentHelper::new(pdf).remove_page(last);
+    let last_page = pdf.get_object_handle(last);
+    let qpdf_flush_result_12 = PageDocumentHelper::new(pdf).remove_page(last_page);
 
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     qpdf_flush_result_12?;

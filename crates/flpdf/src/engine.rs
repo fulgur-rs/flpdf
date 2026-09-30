@@ -85,6 +85,7 @@ impl<R: Read + Seek> Pdf<R> {
             ever_called_get_all_pages: false,
             ever_pushed_inherited_attributes_to_pages: false,
             page_list_cache: None,
+            page_tree_flattened: false,
             encryption,
             encryption_inspection: Rc::new(RefCell::new(None)),
         }
@@ -305,6 +306,7 @@ impl<R: Read + Seek> Pdf<R> {
             ever_called_get_all_pages: false,
             ever_pushed_inherited_attributes_to_pages: false,
             page_list_cache: None,
+            page_tree_flattened: false,
             encryption,
             encryption_inspection: Rc::new(RefCell::new(None)),
         };

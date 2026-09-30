@@ -221,6 +221,11 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// vector is not cached by qpdf (it is its cache sentinel), so this is
     /// populated only for a non-empty page list.
     pub(crate) page_list_cache: Option<PreparedPages>,
+    /// Whether the live page tree is already flattened and the current raw
+    /// page order is cached. This represents qpdf's non-empty page-position
+    /// map sentinel (`QPDF_pages.cc:145-183`); invalidating the page-list cache
+    /// also invalidates the flattened-tree state.
+    pub(crate) page_tree_flattened: bool,
     pub(crate) encryption: Rc<RefCell<Option<EncryptionState>>>,
     /// qpdf's parsed encryption parameters retained for read-only inspection,
     /// including the partial state visible after a bad password.
@@ -411,6 +416,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// Invalidate qpdf's page-list cache after a page-tree mutation.
     pub(crate) fn invalidate_page_list_cache(&mut self) {
         self.page_list_cache = None;
+        self.page_tree_flattened = false;
     }
 
     /// Adobe extension level from the catalog's `/Extensions /ADBE

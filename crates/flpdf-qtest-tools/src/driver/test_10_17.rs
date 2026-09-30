@@ -456,21 +456,23 @@ pub(crate) fn run_test_15<R: Read + Seek>(
     let mut pages = crate::common::checked_page_refs(pdf)?;
     assert_eq!(pages.len(), 10);
 
-    // Remove pages from various places, checking that the (re-fetched) page
-    // list reflects each removal -- see this function's own doc for why a
-    // fresh checked projection stands in for qpdf's live vector
-    // at this ObjectRef-based mutation boundary.
+    // Remove pages from various places, passing live page handles just as
+    // QPDFPageDocumentHelper::removePage does. Re-fetch the checked page list
+    // after each mutation before observing its new length or position.
     let last = page_at(&pages, pages.len() - 1)?;
-    PageDocumentHelper::new(pdf).remove_page(last)?; // original page 9
+    let last_page = pdf.get_object_handle(last);
+    PageDocumentHelper::new(pdf).remove_page(last_page)?; // original page 9
     pages = crate::common::checked_page_refs(pdf)?;
     assert_eq!(pages.len(), 9);
     let first = page_at(&pages, 0)?;
-    PageDocumentHelper::new(pdf).remove_page(first)?; // original page 0
+    let first_page = pdf.get_object_handle(first);
+    PageDocumentHelper::new(pdf).remove_page(first_page)?; // original page 0
     pages = crate::common::checked_page_refs(pdf)?;
     assert_eq!(pages.len(), 8);
     check_page_contents(pdf, page_at(&pages, 4)?, "Original page 5", stdout)?;
     let fifth = page_at(&pages, 4)?;
-    PageDocumentHelper::new(pdf).remove_page(fifth)?; // original page 5
+    let fifth_page = pdf.get_object_handle(fifth);
+    PageDocumentHelper::new(pdf).remove_page(fifth_page)?; // original page 5
     pages = crate::common::checked_page_refs(pdf)?;
     assert_eq!(pages.len(), 7);
     check_page_contents(pdf, page_at(&pages, 4)?, "Original page 6", stdout)?;
@@ -694,7 +696,8 @@ pub(crate) fn run_test_17<R: Read + Seek>(
         page1_contents_ref.object_ref()
     );
 
-    PageDocumentHelper::new(pdf).remove_page(pages[0])?;
+    let page_to_remove = pdf.get_object_handle(pages[0]);
+    PageDocumentHelper::new(pdf).remove_page(page_to_remove)?;
     pages = crate::common::checked_page_refs(pdf)?;
     assert_eq!(pages.len(), 2);
 
