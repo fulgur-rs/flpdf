@@ -1,6 +1,6 @@
 //! Integration tests for [`flpdf::extract_page`] / [`flpdf::extract_pages`].
 
-use flpdf::{extract_page, extract_pages, ObjectHandle, ObjectRef, Pdf};
+use flpdf::{extract_page, extract_pages, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf};
 use std::collections::BTreeMap;
 
 /// Build a PDF from `(number, body)` object definitions plus a `/Root` number.
@@ -1699,6 +1699,60 @@ fn three_page_shared_font_pdf() -> Vec<u8> {
         ],
         1,
     )
+}
+
+#[test]
+fn extract_pages_copies_a_raw_generation_page_handle_by_index() {
+    let mut source = Pdf::open_mem_owned(two_page_pdf()).unwrap();
+    let raw_page_ref = ObjectRef::new(17, 65_535);
+    let parent = source.get_object_handle(ObjectRef::new(2, 0));
+    source
+        .replace_object(
+            raw_page_ref,
+            ObjectHandle::dictionary(vec![
+                (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+                (b"/Parent".to_vec(), parent),
+                (
+                    b"/MediaBox".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(612),
+                        ObjectHandle::integer(792),
+                    ]),
+                ),
+            ]),
+        )
+        .unwrap();
+    let pages_root = source.get_object_handle(ObjectRef::new(2, 0));
+    pages_root
+        .replace_key(
+            b"/Kids",
+            ObjectHandle::array(vec![source.get_object_handle(raw_page_ref)]),
+        )
+        .unwrap();
+    pages_root
+        .replace_key(b"/Count", ObjectHandle::integer(1))
+        .unwrap();
+
+    let source_pages = PageDocumentHelper::new(&mut source)
+        .get_all_pages()
+        .unwrap();
+    assert_eq!(source_pages.len(), 1);
+    assert_eq!(
+        source_pages[0].get_obj_gen(),
+        flpdf::QpdfObjGen::new(17, 65_535)
+    );
+
+    let mut extracted = extract_pages(&mut source, &[0]).expect("copy the raw page handle");
+    let extracted_pages = PageDocumentHelper::new(&mut extracted)
+        .get_all_pages()
+        .expect("read the extracted page list");
+    assert_eq!(extracted_pages.len(), 1);
+    assert!(
+        extracted_pages[0].object_ref().is_some(),
+        "the fresh destination allocator gives its copied page valid N G R syntax"
+    );
 }
 
 /// Count objects whose dict is `/Type /Font` with the given `/BaseFont`.

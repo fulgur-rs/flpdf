@@ -55,9 +55,8 @@
 use crate::page_label_document_helper::{
     copy_raw_page_label_entries, merge_adjacent_raw_page_labels, RawPageLabelEntry,
 };
-use crate::pages::page_refs;
 use crate::pdf::WriterObjectOrderKey;
-use crate::{Error, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, Result};
+use crate::{Error, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, QpdfObjGen, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
 
@@ -118,16 +117,16 @@ pub fn extract_pages<R: Read + Seek>(
     if page_indices.is_empty() {
         return Err(Error::Unsupported("empty page selection".to_string()));
     }
-    let all_pages = page_refs(source)?;
-    let mut selected: Vec<ObjectRef> = Vec::with_capacity(page_indices.len());
+    let all_pages = PageDocumentHelper::new(source).get_all_pages()?;
+    let mut selected: Vec<ObjectHandle> = Vec::with_capacity(page_indices.len());
     for &idx in page_indices {
-        let page_ref = *all_pages.get(idx).ok_or_else(|| {
+        let page = all_pages.get(idx).cloned().ok_or_else(|| {
             Error::Unsupported(format!(
                 "page index {idx} out of range (document has {} pages)",
                 all_pages.len()
             ))
         })?;
-        selected.push(page_ref);
+        selected.push(page);
     }
 
     // qpdf first flattens the destination page tree, then prepares inherited
@@ -142,25 +141,21 @@ pub fn extract_pages<R: Read + Seek>(
     // Copy each unique selected page through the destination's persistent
     // qpdf ObjCopier map. If a page was encountered earlier as a nested
     // `/Page` boundary, a later top-level copy fills that same reservation.
-    let mut page_map = BTreeMap::new();
-    for &source_page_ref in &selected {
-        if page_map.contains_key(&source_page_ref) {
+    let mut page_map: BTreeMap<QpdfObjGen, ObjectHandle> = BTreeMap::new();
+    for source_page in &selected {
+        let source_obj_gen = source_page.get_obj_gen();
+        if page_map.contains_key(&source_obj_gen) {
             continue;
         }
-        let source_page = source.get_object_handle(source_page_ref);
-        let copied_page = target.copy_foreign_object(&source_page)?;
-        let copied_page_ref = copied_page
-            .object_ref()
-            .ok_or(Error::Missing("extracted page missing from copy map"))?;
-        page_map.insert(source_page_ref, copied_page_ref);
+        let copied_page = target.copy_foreign_object(source_page)?;
+        page_map.insert(source_obj_gen, copied_page);
     }
 
     // qpdf::insertPage replaces the copied page's `/Parent` through the live
     // destination handle, before it inserts that page into `/Kids`.
     let pages_handle = target.get_object_handle(pages_root_ref);
-    for &copied_page_ref in page_map.values() {
-        let page = target.get_object_handle(copied_page_ref);
-        page.replace_key(b"/Parent", pages_handle.clone())?;
+    for copied_page in page_map.values() {
+        copied_page.replace_key(b"/Parent", pages_handle.clone())?;
     }
 
     // Build `/Kids` in selection order. Repeated selections reuse the copied
@@ -169,32 +164,24 @@ pub fn extract_pages<R: Read + Seek>(
     // identities exactly as QPDF_pages.cc:233-237 does.
     let mut kids = Vec::with_capacity(selected.len());
     let mut used = BTreeSet::new();
-    for &source_page_ref in &selected {
-        let copied_page_ref = *page_map
-            .get(&source_page_ref)
+    for source_page in &selected {
+        let source_obj_gen = source_page.get_obj_gen();
+        let copied_page = page_map
+            .get(&source_obj_gen)
+            .cloned()
             .ok_or(Error::Missing("extracted page missing from copy map"))?;
-        let kid = if used.insert(copied_page_ref) {
-            copied_page_ref
+        let kid = if used.insert(copied_page.get_obj_gen()) {
+            copied_page
         } else {
-            let page = target.get_object_handle(copied_page_ref);
-            let clone = target.make_indirect_object_handle(page.shallow_copy()?)?;
-            clone.object_ref().ok_or(Error::Missing(
-                "duplicate extracted page missing from target",
-            ))?
+            target.make_indirect_object_handle(copied_page.shallow_copy()?)?
         };
         kids.push(kid);
     }
 
     let root = target.get_object_handle(pages_root_ref);
-    root.replace_key(
-        b"/Kids",
-        ObjectHandle::array(
-            kids.iter()
-                .map(|&kid| target.get_object_handle(kid))
-                .collect(),
-        ),
-    )?; // cov:ignore: Pdf::empty creates a dictionary /Pages root, so this defensive replace_key error is unreachable
-    root.replace_key(b"/Count", ObjectHandle::integer(kids.len() as i64))?;
+    let page_count = kids.len();
+    root.replace_key(b"/Kids", ObjectHandle::array(kids))?; // cov:ignore: Pdf::empty creates a dictionary /Pages root, so this defensive replace_key error is unreachable
+    root.replace_key(b"/Count", ObjectHandle::integer(page_count as i64))?;
 
     // /PageLabels (qpdf `addPage`-based reconstruction parity — the same
     // per-page accumulation `QPDFJob::handlePageSpecs` performs while adding
