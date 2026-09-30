@@ -735,7 +735,7 @@ matches qpdf's `catch (QPDFExc&)` (`libqpdf/QPDF.cc:1614`) for every producer, r
 `flpdf-15qk` completes the `QPDF_pages.cc` cache boundary: `Pdf::page_list_cache`
 stores the prepared root and ordered leaf identities after the canonical repair
 walk, `PageDocumentHelper` consumers reuse it across JSON sections, and
-`Pdf::update_all_pages_cache` plus page-tree rebuild/clear boundaries mirror
+`Pdf::update_all_pages_cache` plus page-tree rebuild/mutation boundaries mirror
 `QPDF::updateAllPagesCache` and the mutation-owned cache invalidation contract
 (`QPDF_pages.cc:141-150`; `QPDF.hh:671-704`).
 
@@ -767,13 +767,18 @@ prepares it again (`QPDF_pages.cc:39-75,141-150,225-250`).
 flattens the page tree and throws a `qpdf_e_pages` `QPDFExc` for a non-member
 page. Its exception uses the input source name, the `page object` description,
 zero offset, and `page object not referenced in /Pages tree`
-(`QPDF_pages.cc:254-316`); `QPDFPageDocumentHelper::removePage` is a direct
+(`QPDF_pages.cc:254-275,303-319`); `QPDFPageDocumentHelper::removePage` is a direct
 delegation (`QPDFPageDocumentHelper.cc:50-52`). `test_driver.cc:862-872`
 removes the same page twice, so `page_api_1.out2` records
 `page_api_1.pdf (page object: object 4 0): page object not referenced in /Pages tree`
-with exit status 2. flpdf's `PageDocumentHelper::remove_page` now raises the
-canonical `Error::Pages` with that complete `QPDFExc::what()` text from the
-resolver's source description; the qtest driver propagates it unchanged.
+with exit status 2. flpdf's `PageDocumentHelper::remove_page` takes a live
+`ObjectHandle` and returns `Result<()>`, preserving its raw `QpdfObjGen`
+through membership lookup. The first removal pushes inherited values, flattens
+`/Kids`, reparents the leaves, and checks the existing `/Count`; later
+removals erase from the same flattened array and update `/Count` in place.
+For a non-member it returns `Error::QpdfExc` with qpdf's source description,
+raw page identity, zero offset, and message; the qtest driver propagates that
+context unchanged.
 
 `flpdf-egzr.3.2.6.19` の `pages/tree_rebuild.rs` は、`QPDF_optimization.cc:159-228`
 に合わせて選択ページへ inheritable attributes を materialize した後、元の page-tree

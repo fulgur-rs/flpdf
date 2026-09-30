@@ -1392,8 +1392,11 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
         }
 
         if is_primary {
-            for &page_ref in &all {
-                PageDocumentHelper::new(input.source).remove_page(page_ref)?;
+            // QPDFPageDocumentHelper::removePage receives each live raw page
+            // handle. Read them at the mutation boundary and pass them through
+            // without projecting the removal input through ObjectRef.
+            for page in PageDocumentHelper::new(input.source).get_all_pages()? {
+                PageDocumentHelper::new(input.source).remove_page(page)?;
             }
             primary_max_object = input.source.get_object_count()?;
             // cov:ignore-start: a source object-number universe ending at

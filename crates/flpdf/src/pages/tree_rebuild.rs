@@ -322,7 +322,7 @@ fn promote_page_tree_inheritable_values<R: Read + Seek>(
     Ok(())
 }
 
-fn page_tree_root_handle<R: Read + Seek>(
+pub(crate) fn page_tree_root_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_root: &PageTreeRoot,
 ) -> Result<ObjectHandle> {
@@ -675,6 +675,7 @@ fn rebuild_page_tree_canonical<R: Read + Seek>(
             .collect(),
     };
     pdf.cache_page_list(&final_pages);
+    pdf.page_tree_flattened = !final_pages.pages.is_empty();
 
     // A removed page is an original leaf that no selection kept (absent from
     // `ref_map`). New refs minted for duplicate selections are fresh object
