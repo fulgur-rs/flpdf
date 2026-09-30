@@ -115,9 +115,7 @@ mod tests {
             assert_eq!(inner.try_get_array_n_items().expect("read inner array"), 3);
         }
         assert_eq!(
-            flpdf::pages::page_refs(&mut pdf)
-                .expect("enumerate page tree")
-                .len(),
+            crate::common::raw_page_count(&mut pdf).expect("enumerate page tree"),
             1
         );
     }

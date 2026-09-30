@@ -73,10 +73,10 @@ fn test_64_67_body<R: Read + Seek>(
     let arg2_diagnostic = os_str_diagnostic_bytes(arg2);
     let mut secondary_diagnostics_written = pdf2.repair_diagnostics().entries().len();
 
-    let qpdf_flush_result_72 = flpdf::pages::page_refs(pdf);
+    let qpdf_flush_result_72 = crate::common::raw_page_handles(pdf);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let pages1 = qpdf_flush_result_72?;
-    let qpdf_flush_result_73 = flpdf::pages::page_refs(&mut pdf2);
+    let qpdf_flush_result_73 = crate::common::raw_page_handles(&mut pdf2);
     emit_new_diagnostics(
         &pdf2,
         &mut secondary_diagnostics_written,
@@ -89,7 +89,8 @@ fn test_64_67_body<R: Read + Seek>(
 
     for index in 0..npages {
         let source_form = {
-            let mut source_page = PageObjectHelper::new(pages2[index], &mut pdf2);
+            let mut source_page =
+                PageObjectHelper::from_object_handle(pages2[index].clone(), &mut pdf2);
             source_page.get_form_xobject_for_page(true)?
         };
         emit_new_diagnostics(
@@ -102,7 +103,8 @@ fn test_64_67_body<R: Read + Seek>(
         let form = pdf.copy_foreign_object(&source_form)?;
 
         let content = {
-            let mut destination_page = PageObjectHelper::new(pages1[index], pdf);
+            let mut destination_page =
+                PageObjectHelper::from_object_handle(pages1[index].clone(), pdf);
             let resources = destination_page.get_resources(true)?;
             let mut min_suffix = 1;
             let name = resources.get_unique_resource_name(b"/Fx", &mut min_suffix, None)?;
@@ -129,7 +131,7 @@ fn test_64_67_body<R: Read + Seek>(
         let q_stream = pdf.new_stream_with_data(Rc::new(b"q\n".to_vec()))?;
         let placed_stream =
             pdf.new_stream_with_data(Rc::new(format!("\nQ\n{content}").into_bytes()))?;
-        let mut destination_page = PageObjectHelper::new(pages1[index], pdf);
+        let mut destination_page = PageObjectHelper::from_object_handle(pages1[index].clone(), pdf);
         destination_page.add_page_contents(q_stream, true)?;
         destination_page.add_page_contents(placed_stream, false)?;
 
@@ -316,7 +318,7 @@ pub(crate) fn run_test_69<R: Read + Seek>(
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     pdf.set_immediate_copy_from(true);
-    let qpdf_flush_result_74 = flpdf::pages::page_refs(pdf);
+    let qpdf_flush_result_74 = crate::common::checked_page_refs(pdf);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let pages = qpdf_flush_result_74?;
     for (index, page_ref) in pages.into_iter().enumerate() {
@@ -405,47 +407,47 @@ pub(crate) fn run_test_71<R: Read + Seek>(
     // uncaught on an empty page list; indexing `pages[0]` panics the same
     // way on the fixture this test is designed for, preserving crash parity
     // at this exact point even though nothing downstream can use the page.
-    let pages = flpdf::pages::page_refs(pdf)?;
-    let page_ref = pages[0];
+    let pages = crate::common::raw_page_handles(pdf)?;
+    let page = pages[0].clone();
 
     writeln!(stdout, "--- recursive, all ---")?;
     {
-        let mut page = PageObjectHelper::new(page_ref, pdf);
+        let mut page = PageObjectHelper::from_object_handle(page.clone(), pdf);
         page.for_each_xobject(true, |object, xobject_dict, key| {
             write_xobject_line(stdout, object, xobject_dict, key)
         })?;
     }
     writeln!(stdout, "--- non-recursive, all ---")?;
     {
-        let mut page = PageObjectHelper::new(page_ref, pdf);
+        let mut page = PageObjectHelper::from_object_handle(page.clone(), pdf);
         page.for_each_xobject(false, |object, xobject_dict, key| {
             write_xobject_line(stdout, object, xobject_dict, key)
         })?;
     }
     writeln!(stdout, "--- recursive, images ---")?;
     {
-        let mut page = PageObjectHelper::new(page_ref, pdf);
+        let mut page = PageObjectHelper::from_object_handle(page.clone(), pdf);
         page.for_each_image(true, |object, xobject_dict, key| {
             write_xobject_line(stdout, object, xobject_dict, key)
         })?;
     }
     writeln!(stdout, "--- non-recursive, images ---")?;
     {
-        let mut page = PageObjectHelper::new(page_ref, pdf);
+        let mut page = PageObjectHelper::from_object_handle(page.clone(), pdf);
         page.for_each_image(false, |object, xobject_dict, key| {
             write_xobject_line(stdout, object, xobject_dict, key)
         })?;
     }
     writeln!(stdout, "--- recursive, form XObjects ---")?;
     {
-        let mut page = PageObjectHelper::new(page_ref, pdf);
+        let mut page = PageObjectHelper::from_object_handle(page.clone(), pdf);
         page.for_each_form_xobject(true, |object, xobject_dict, key| {
             write_xobject_line(stdout, object, xobject_dict, key)
         })?;
     }
     writeln!(stdout, "--- non-recursive, form XObjects ---")?;
     {
-        let mut page = PageObjectHelper::new(page_ref, pdf);
+        let mut page = PageObjectHelper::from_object_handle(page.clone(), pdf);
         page.for_each_form_xobject(false, |object, xobject_dict, key| {
             write_xobject_line(stdout, object, xobject_dict, key)
         })?;
@@ -453,8 +455,8 @@ pub(crate) fn run_test_71<R: Read + Seek>(
 
     // qpdf obtains Fx1 directly from the page's resource dictionary after the
     // six page-level traversals, then constructs a helper over that Form.
-    let page = pdf.get_object_handle(page_ref);
-    let resources = page.try_get_key(b"/Resources")?;
+    let page_handle = page.clone();
+    let resources = page_handle.try_get_key(b"/Resources")?;
     let xobjects = resources.try_get_key(b"/XObject")?;
     let fx1 = xobjects.try_get_key(b"/Fx1")?;
 
@@ -474,7 +476,7 @@ pub(crate) fn run_test_71<R: Read + Seek>(
     }
     writeln!(stdout, "--- get images, page ---")?;
     {
-        let mut page = PageObjectHelper::new(page_ref, pdf);
+        let mut page = PageObjectHelper::from_object_handle(page.clone(), pdf);
         for (key, object) in page.get_images()? {
             write_xobject_map_line(stdout, key, object)?;
         }
@@ -488,7 +490,7 @@ pub(crate) fn run_test_71<R: Read + Seek>(
     }
     writeln!(stdout, "--- get form XObjects, page ---")?;
     {
-        let mut page = PageObjectHelper::new(page_ref, pdf);
+        let mut page = PageObjectHelper::from_object_handle(page, pdf);
         for (key, object) in page.get_form_xobjects()? {
             write_xobject_map_line(stdout, key, object)?;
         }

@@ -98,9 +98,7 @@ fn annotation_helpers_from_handles_can_coexist_with_pdf_access() {
     assert_eq!(text.get_subtype().expect("text subtype"), b"Text".to_vec());
     assert_eq!(link.get_subtype().expect("link subtype"), b"Link".to_vec());
     assert_eq!(
-        flpdf::pages::page_refs(&mut pdf)
-            .expect("Pdf remains independently usable")
-            .len(),
+        common::raw_page_count(&mut pdf).expect("Pdf remains independently usable"),
         1
     );
 }
@@ -997,3 +995,5 @@ fn annotation_object_helper_on_non_dict_returns_defaults() {
     );
     assert_eq!(annot.get_flags().expect("get_flags()"), 0);
 }
+
+mod common;

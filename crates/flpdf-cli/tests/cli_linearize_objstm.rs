@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 
 use assert_cmd::Command;
-use flpdf::{pages, Pdf};
+use flpdf::{PageDocumentHelper, Pdf};
 
 const FIXTURE: &str = "../../tests/fixtures/compat/three-page.pdf";
 
@@ -485,7 +485,9 @@ fn assert_acceptance_invariants(mode: &str, out: &Path, input_page_count: usize)
             .unwrap_or_else(|e| panic!("mode={mode}: object {r} did not resolve: {e}"));
     }
     let mut pdf2 = Pdf::open(Cursor::new(bytes.clone())).expect("Pdf::open for page count");
-    let out_pages = pages::page_refs(&mut pdf2).expect("page_refs");
+    let out_pages = PageDocumentHelper::new(&mut pdf2)
+        .get_all_pages()
+        .expect("get_all_pages");
     assert_eq!(
         out_pages.len(),
         input_page_count,
@@ -494,22 +496,26 @@ fn assert_acceptance_invariants(mode: &str, out: &Path, input_page_count: usize)
     );
 
     // --- (c) per-page-1 plain indirect: first page must NOT be compressed ---
-    let first_page_ref = out_pages[0];
+    let first_page_obj_gen = out_pages[0].get_obj_gen();
+    let first_page_num = u32::try_from(first_page_obj_gen.get_obj())
+        .expect("first page object number fits the PDF xref domain");
     let xref_text = qpdf_show_xref(out);
     let xref_entries = parse_xref_entries(&xref_text);
     let compressed_nums = compressed_obj_numbers(&xref_entries);
     assert!(
-        !compressed_nums.contains(&first_page_ref.number),
-        "mode={mode}: first-page object {} must be plain indirect (not inside ObjStm); \
+        !compressed_nums.contains(&first_page_num),
+        "mode={mode}: first-page object {} {} must be plain indirect (not inside ObjStm); \
          xref shows it as compressed — Part-3 first-page packing invariant violated",
-        first_page_ref
+        first_page_obj_gen.get_obj(),
+        first_page_obj_gen.get_gen()
     );
     // First page must have an uncompressed xref entry with a valid offset.
-    let fp_offset = uncompressed_offset(&xref_entries, first_page_ref.number);
+    let fp_offset = uncompressed_offset(&xref_entries, first_page_num);
     assert!(
         fp_offset.is_some(),
-        "mode={mode}: first-page object {} has no uncompressed xref entry",
-        first_page_ref
+        "mode={mode}: first-page object {} {} has no uncompressed xref entry",
+        first_page_obj_gen.get_obj(),
+        first_page_obj_gen.get_gen()
     );
 
     // --- (b) First-half ObjStm packing: for a multi-page document qpdf 11.9.0
@@ -739,17 +745,22 @@ fn qpdf_crosscheck_per_page1_plain_both_tools() {
     // assert here.  What we assert is that the FIRST PAGE OBJECT is always plain,
     // which both tools must satisfy.
     let mut pdf_qpdf = Pdf::open(Cursor::new(qpdf_bytes)).expect("Pdf::open qpdf output");
-    let qpdf_page_refs = pages::page_refs(&mut pdf_qpdf).expect("page_refs on qpdf output");
+    let qpdf_pages = PageDocumentHelper::new(&mut pdf_qpdf)
+        .get_all_pages()
+        .expect("get_all_pages on qpdf output");
     assert!(
-        !qpdf_page_refs.is_empty(),
+        !qpdf_pages.is_empty(),
         "qpdf lin+gen output must expose at least one page"
     );
-    let qpdf_first_page_num = qpdf_page_refs[0].number;
+    let qpdf_first_page_obj_gen = qpdf_pages[0].get_obj_gen();
+    let qpdf_first_page_num = u32::try_from(qpdf_first_page_obj_gen.get_obj())
+        .expect("qpdf first page object number fits the PDF xref domain");
     let qpdf_compressed = compressed_obj_numbers(&qpdf_xref_entries);
     assert!(
         !qpdf_compressed.contains(&qpdf_first_page_num),
-        "qpdf reference: first-page object {} must be plain indirect (not inside ObjStm)",
-        qpdf_page_refs[0]
+        "qpdf reference: first-page object {} {} must be plain indirect (not inside ObjStm)",
+        qpdf_first_page_obj_gen.get_obj(),
+        qpdf_first_page_obj_gen.get_gen()
     );
 
     // Now produce flpdf's generate output on the same fixture and verify the
@@ -795,18 +806,23 @@ fn qpdf_crosscheck_per_page1_plain_both_tools() {
     );
 
     let mut pdf_flpdf = Pdf::open(Cursor::new(flpdf_bytes)).expect("Pdf::open flpdf output");
-    let flpdf_page_refs = pages::page_refs(&mut pdf_flpdf).expect("page_refs on flpdf output");
+    let flpdf_pages = PageDocumentHelper::new(&mut pdf_flpdf)
+        .get_all_pages()
+        .expect("get_all_pages on flpdf output");
     assert_eq!(
-        flpdf_page_refs.len(),
-        qpdf_page_refs.len(),
+        flpdf_pages.len(),
+        qpdf_pages.len(),
         "flpdf and qpdf outputs must have the same page count"
     );
-    let flpdf_first_page_num = flpdf_page_refs[0].number;
+    let flpdf_first_page_obj_gen = flpdf_pages[0].get_obj_gen();
+    let flpdf_first_page_num = u32::try_from(flpdf_first_page_obj_gen.get_obj())
+        .expect("flpdf first page object number fits the PDF xref domain");
     let flpdf_compressed = compressed_obj_numbers(&flpdf_xref_entries);
     assert!(
         !flpdf_compressed.contains(&flpdf_first_page_num),
-        "flpdf: first-page object {} must be plain indirect — \
+        "flpdf: first-page object {} {} must be plain indirect — \
          both flpdf and qpdf agree: first-page object is not packed into ObjStm",
-        flpdf_page_refs[0]
+        flpdf_first_page_obj_gen.get_obj(),
+        flpdf_first_page_obj_gen.get_gen()
     );
 }

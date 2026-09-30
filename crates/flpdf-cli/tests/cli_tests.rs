@@ -1,7 +1,7 @@
 use assert_cmd::Command;
 use flpdf::{
-    acroform_sig_flags, filespec_helper::encode_utf16be, pages, AnnotationObjectHelper,
-    PageObjectHelper, Pdf,
+    acroform_sig_flags, filespec_helper::encode_utf16be, AnnotationObjectHelper, PageObjectHelper,
+    Pdf,
 };
 use predicates::prelude::*;
 use std::fs::File;
@@ -2076,14 +2076,13 @@ fn top_level_linearize_rewrites_output() {
 
 fn first_page_content(path: &std::path::Path) -> Vec<u8> {
     let mut pdf = Pdf::open(BufReader::new(File::open(path).unwrap())).unwrap();
-    let page = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
-    flpdf::pages::page_content_bytes(&mut pdf, page).unwrap()
+    let page_ref = common::checked_page_ref(&common::first_page_handle(&mut pdf));
+    flpdf::pages::page_content_bytes(&mut pdf, page_ref).unwrap()
 }
 
 fn first_page_content_filter(path: &std::path::Path) -> Option<Vec<u8>> {
     let mut pdf = Pdf::open(BufReader::new(File::open(path).unwrap())).unwrap();
-    let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
-    let page = pdf.resolve_canonical_object(page_ref).unwrap().clone();
+    let page = common::first_page_handle(&mut pdf);
     let contents_ref = page.try_get_key(b"/Contents").ok()?.object_ref()?;
     let stream = pdf.resolve_canonical_object(contents_ref).ok()?;
     stream
@@ -3182,8 +3181,7 @@ fn pages_external_source_matches_qpdf_resource_copy_modes() {
             .success();
 
         let mut pdf = Pdf::open(std::io::BufReader::new(File::open(&output).unwrap())).unwrap();
-        let page_ref = pages::page_refs(&mut pdf).unwrap()[0];
-        let page = pdf.resolve_canonical_object(page_ref).unwrap();
+        let page = common::first_page_handle(&mut pdf);
         let resources = page.try_get_key(b"/Resources").unwrap();
         assert_eq!(
             resources.is_direct(),
@@ -5212,8 +5210,7 @@ fn resource_category_keys_from_path(
     category: &str,
 ) -> Vec<String> {
     let mut pdf = Pdf::open(BufReader::new(File::open(path).unwrap())).unwrap();
-    let page_ref = pages::page_refs(&mut pdf).unwrap()[page_index];
-    let page = pdf.resolve_canonical_object(page_ref).unwrap();
+    let page = common::raw_page_handles(&mut pdf).unwrap()[page_index].clone();
     let resources = page
         .try_get_key(b"/Resources")
         .expect("page resources should exist");
@@ -5990,7 +5987,7 @@ fn rewrite_normalize_content_bad_token_writes_output_warns_and_exits_three() {
 
     assert!(output.exists(), "qpdf warning exit must retain output");
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let page = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+    let page = common::checked_page_ref(&common::first_page_handle(&mut pdf));
     assert_eq!(
         flpdf::pages::page_content_bytes(&mut pdf, page).unwrap(),
         b"\n<0g"
@@ -6030,7 +6027,7 @@ fn rewrite_normalize_content_follows_indirect_contents_array() {
     );
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let page = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+    let page = common::checked_page_ref(&common::first_page_handle(&mut pdf));
     assert_eq!(
         flpdf::pages::page_content_bytes(&mut pdf, page).unwrap(),
         b"\n<0g"
@@ -6109,8 +6106,7 @@ fn rewrite_normalize_content_skips_null_array_entries_like_qpdf() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
-    let page = pdf.resolve_canonical_object(page_ref).unwrap();
+    let page = common::first_page_handle(&mut pdf);
     let contents = page
         .try_get_key(b"/Contents")
         .expect("rewritten page must have /Contents");
@@ -6279,9 +6275,9 @@ fn rewrite_normalize_content_deduplicates_terminal_stream_aliases() {
     );
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    for page in flpdf::pages::page_refs(&mut pdf).unwrap() {
+    for page in common::raw_page_handles(&mut pdf).unwrap() {
         assert_eq!(
-            flpdf::pages::page_content_bytes(&mut pdf, page).unwrap(),
+            flpdf::pages::page_content_bytes(&mut pdf, common::checked_page_ref(&page)).unwrap(),
             b"\n<0g"
         );
     }
@@ -7279,11 +7275,11 @@ fn rotate_single_spec_rewrites_all_pages() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let rotations = pages::page_refs(&mut pdf)
+    let rotations = common::raw_page_handles(&mut pdf)
         .unwrap()
         .into_iter()
-        .map(|page_ref| {
-            PageObjectHelper::new(page_ref, &mut pdf)
+        .map(|page| {
+            PageObjectHelper::from_object_handle(page, &mut pdf)
                 .get_attribute(b"/Rotate", false)
                 .unwrap()
                 .try_get_int_value()
@@ -7479,11 +7475,11 @@ fn pages_then_rotate_targets_output_page_numbering() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let rotations = pages::page_refs(&mut pdf)
+    let rotations = common::raw_page_handles(&mut pdf)
         .unwrap()
         .into_iter()
-        .map(|page_ref| {
-            PageObjectHelper::new(page_ref, &mut pdf)
+        .map(|page| {
+            PageObjectHelper::from_object_handle(page, &mut pdf)
                 .get_attribute(b"/Rotate", false)
                 .unwrap()
                 .try_get_int_value()
@@ -7676,8 +7672,7 @@ fn pages_extraction_materializes_inherited_indirect_resources_before_prune() {
         command.assert().success();
 
         let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-        let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
-        let page = pdf.resolve_canonical_object(page_ref).unwrap();
+        let page = common::first_page_handle(&mut pdf);
         let resources = page.try_get_key(b"/Resources").unwrap();
         assert!(
             resources.try_is_dictionary().unwrap(),
@@ -7716,8 +7711,7 @@ fn pages_extraction_resource_modes_match_qpdf_copy_boundary() {
         command.assert().success();
 
         let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-        let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
-        let page = pdf.resolve_canonical_object(page_ref).unwrap();
+        let page = common::first_page_handle(&mut pdf);
         let resources = page.try_get_key(b"/Resources").unwrap();
         if should_materialize {
             assert!(
@@ -9833,8 +9827,7 @@ fn rewrite_flatten_rotation_removes_rotate() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let page_refs = flpdf::pages::page_refs(&mut pdf).unwrap();
-    let page = pdf.resolve_canonical_object(page_refs[0]).unwrap();
+    let page = common::first_page_handle(&mut pdf);
     // After flattening, /Rotate is either absent or normalized to 0.
     let rotate = page.try_get_key(b"/Rotate").unwrap().as_integer();
     assert!(
@@ -9927,8 +9920,8 @@ fn rewrite_flatten_annotations_all_removes_widget_from_annots() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let page_refs = flpdf::pages::page_refs(&mut pdf).unwrap();
-    let annots = page_annotation_handles(&mut pdf, page_refs[0]);
+    let pages = common::raw_page_handles(&mut pdf).unwrap();
+    let annots = page_annotation_handles(&mut pdf, pages[0].clone());
     assert!(
         annots.is_empty(),
         "flattened widget should be removed from /Annots, found {} annotation(s)",
@@ -9959,8 +9952,8 @@ fn top_level_flatten_annotations_all_removes_widget_from_annots() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let page_refs = flpdf::pages::page_refs(&mut pdf).unwrap();
-    let annots = page_annotation_handles(&mut pdf, page_refs[0]);
+    let pages = common::raw_page_handles(&mut pdf).unwrap();
+    let annots = page_annotation_handles(&mut pdf, pages[0].clone());
     assert!(
         annots.is_empty(),
         "top-level flattening should remove the widget from /Annots"
@@ -9990,8 +9983,8 @@ fn top_level_flatten_annotations_linearize_removes_widget_from_annots() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let page_refs = flpdf::pages::page_refs(&mut pdf).unwrap();
-    let annots = page_annotation_handles(&mut pdf, page_refs[0]);
+    let pages = common::raw_page_handles(&mut pdf).unwrap();
+    let annots = page_annotation_handles(&mut pdf, pages[0].clone());
     assert!(
         annots.is_empty(),
         "linearized top-level flattening should remove the widget from /Annots"
@@ -10091,8 +10084,8 @@ fn rewrite_generate_then_flatten_cooperate() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let page_refs = flpdf::pages::page_refs(&mut pdf).unwrap();
-    let annots = page_annotation_handles(&mut pdf, page_refs[0]);
+    let pages = common::raw_page_handles(&mut pdf).unwrap();
+    let annots = page_annotation_handles(&mut pdf, pages[0].clone());
     assert!(
         annots.is_empty(),
         "widget should be generated-then-flattened away, found {} annotation(s)",

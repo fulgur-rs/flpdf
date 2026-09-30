@@ -530,9 +530,8 @@ pub(crate) fn run_test_37<R: Read + Seek>(
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let page_refs = flpdf::pages::page_refs(pdf)?;
-    for page_ref in page_refs {
-        let page = pdf.get_object_handle(page_ref);
+    let pages = crate::common::raw_page_handles(pdf)?;
+    for page in pages {
         let result = {
             let mut callbacks = ContentParserCallbacks {
                 stdout,
@@ -600,8 +599,8 @@ pub(crate) fn run_test_39<R: Read + Seek>(
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let page_refs = flpdf::pages::page_refs(pdf)?;
-    for (index, page_ref) in page_refs.into_iter().enumerate() {
+    let pages = crate::common::raw_page_handles(pdf)?;
+    for (index, page) in pages.into_iter().enumerate() {
         writeln!(stdout, "page {}", index + 1)?;
 
         // qpdf's `getImages` owns the inherited resource/XObject walk and
@@ -610,7 +609,7 @@ pub(crate) fn run_test_39<R: Read + Seek>(
         // helper has the same boundary; keep resolution at the stream-dict,
         // key, and unparseResolved accessors rather than rebuilding that walk
         // in the qtest consumer.
-        let images = PageObjectHelper::new(page_ref, pdf).get_images()?;
+        let images = PageObjectHelper::from_object_handle(page, pdf).get_images()?;
         for (_key, image) in images {
             let dict = image.try_get_stream_dict()?;
             let filter = dict.try_get_key(b"/Filter")?.try_unparse_resolved()?;
@@ -698,9 +697,8 @@ pub(crate) fn run_test_41<R: Read + Seek>(
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let page_refs = flpdf::pages::page_refs(pdf)?;
-    for page_ref in page_refs {
-        let page = pdf.get_object_handle(page_ref);
+    let pages = crate::common::raw_page_handles(pdf)?;
+    for page in pages {
         let filter: Rc<RefCell<dyn TokenFilter>> = Rc::new(RefCell::new(PotatoSaladTokenFilter));
         page.add_content_token_filter(filter)?;
     }

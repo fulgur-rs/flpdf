@@ -145,8 +145,8 @@ pub(crate) fn run_test_72<R: Read + Seek>(
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     // Call some QPDFPageObjectHelper methods on form XObjects.
-    let page_refs = flpdf::pages::page_refs(pdf)?;
-    let page = pdf.get_object_handle(page_refs[0]);
+    let pages = crate::common::raw_page_handles(pdf)?;
+    let page = pages[0].clone();
     let resources = page.try_get_key(b"/Resources")?;
     let xobject = resources.try_get_key(b"/XObject")?;
     let fx1 = xobject.try_get_key(b"/Fx1")?;
@@ -728,8 +728,8 @@ pub(crate) fn run_test_79<R: Read + Seek>(
     // qpdf/test_driver.cc:2705-2758 retains the original streams and their
     // independent copies in the live trailer before the QDF writer runs.
 
-    let page_refs = flpdf::pages::page_refs(pdf)?;
-    let page = pdf.get_object_handle(page_refs[0]);
+    let pages = crate::common::raw_page_handles(pdf)?;
+    let page = pages[0].clone();
     let s1 = page.try_get_key(b"/Contents")?;
 
     let s2 = pdf.new_stream()?;

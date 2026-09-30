@@ -1,6 +1,6 @@
 //! Integration tests for [`flpdf::extract_page`] / [`flpdf::extract_pages`].
 
-use flpdf::{extract_page, extract_pages, pages, ObjectHandle, ObjectRef, Pdf};
+use flpdf::{extract_page, extract_pages, ObjectHandle, ObjectRef, Pdf};
 use std::collections::BTreeMap;
 
 /// Build a PDF from `(number, body)` object definitions plus a `/Root` number.
@@ -83,7 +83,7 @@ fn pages_dict(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> ObjectHandle {
 
 /// Fetch the single extracted leaf page dict.
 fn only_leaf(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> ObjectHandle {
-    let refs = pages::page_refs(doc).unwrap();
+    let refs = common::checked_page_refs(doc).unwrap();
     assert_eq!(refs.len(), 1);
     resolved_handle(doc, refs[0])
 }
@@ -173,12 +173,8 @@ fn extracts_single_page_with_count_one() {
     let mut out = extract_page(&mut source, 0).unwrap();
 
     // Exactly one page in the extracted document.
-    let page_refs = pages::page_refs(&mut out).unwrap();
-    assert_eq!(
-        page_refs.len(),
-        1,
-        "extracted doc must have exactly one page"
-    );
+    let page_count = common::raw_page_count(&mut out).unwrap();
+    assert_eq!(page_count, 1, "extracted doc must have exactly one page");
 
     // /Pages root: /Count 1, /Kids has one element.
     let root = pages_dict(&mut out);
@@ -502,14 +498,14 @@ fn extracted_doc_has_no_unrelated_objects() {
         1,
         "only the fresh destination /Pages root must remain"
     );
-    assert_eq!(pages::page_refs(&mut out).unwrap().len(), 1);
+    assert_eq!(common::raw_page_count(&mut out).unwrap(), 1);
 
     // Sanity: the minimal document still writes and reopens to a single page,
     // with no source /Pages node reappearing.
     let mut bytes = Vec::new();
     write_default(&mut out, &mut bytes).unwrap();
     let mut rt = Pdf::open_mem_owned(bytes).unwrap();
-    assert_eq!(pages::page_refs(&mut rt).unwrap().len(), 1);
+    assert_eq!(common::raw_page_count(&mut rt).unwrap(), 1);
     assert_eq!(
         count_type(&mut rt, b"Pages"),
         1,
@@ -526,7 +522,7 @@ fn extracted_contents_match_source_page() {
     let src = two_page_pdf();
     let mut source = Pdf::open_mem_owned(src).unwrap();
 
-    let src_pages = pages::page_refs(&mut source).unwrap();
+    let src_pages = common::checked_page_refs(&mut source).unwrap();
     let src_leaf = resolved_handle(&mut source, src_pages[0]);
     let src_contents_ref = resolved_key(&src_leaf, b"/Contents")
         .object_ref()
@@ -571,14 +567,14 @@ fn out_of_range_index_errors() {
 fn source_page_membership_and_order_remain_stable_after_extract() {
     let src = two_page_pdf();
     let mut source = Pdf::open_mem_owned(src).unwrap();
-    let before = pages::page_refs(&mut source).unwrap();
+    let before = common::checked_page_refs(&mut source).unwrap();
     assert_eq!(before.len(), 2);
 
     let _ = extract_page(&mut source, 0).unwrap();
 
     // qpdf may materialize inherited attributes, but source page membership
     // and ordering remain unchanged.
-    let after = pages::page_refs(&mut source).unwrap();
+    let after = common::checked_page_refs(&mut source).unwrap();
     assert_eq!(
         after, before,
         "extract_page must preserve the source page tree"
@@ -624,7 +620,7 @@ fn cross_page_link_keeps_dest_and_nulls_removed_page() {
     );
 
     // Annotation and /Dest are retained; the referenced page resolves to null.
-    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf_refs = common::checked_page_refs(&mut out).unwrap();
     assert_eq!(leaf_refs.len(), 1);
     let leaf = resolved_handle(&mut out, leaf_refs[0]);
     let annots = resolved_array_key(&leaf, b"/Annots");
@@ -686,7 +682,7 @@ fn self_page_link_is_preserved() {
     let mut source = Pdf::open_mem_owned(src).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
     assert_eq!(count_type(&mut out, b"Page"), 1);
-    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf_refs = common::checked_page_refs(&mut out).unwrap();
     let leaf = resolved_handle(&mut out, leaf_refs[0]);
     let annot = first_annotation(&mut out, &leaf);
     assert!(
@@ -722,7 +718,7 @@ fn named_dest_is_preserved_no_leak() {
         1,
         "named dest must not leak a sibling"
     );
-    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf_refs = common::checked_page_refs(&mut out).unwrap();
     let leaf = resolved_handle(&mut out, leaf_refs[0]);
     let annot = first_annotation(&mut out, &leaf);
     assert_eq!(
@@ -751,7 +747,7 @@ fn action_goto_keeps_d_and_nulls_removed_page() {
         1,
         "copied unselected page must be nulled"
     );
-    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf_refs = common::checked_page_refs(&mut out).unwrap();
     let leaf = resolved_handle(&mut out, leaf_refs[0]);
     let annot = first_annotation(&mut out, &leaf);
     // The /A action and /D are retained; the referenced page is null.
@@ -791,7 +787,7 @@ fn annot_aa_goto_keeps_d_and_nulls_removed_page() {
         1,
         "copied unselected page must be nulled"
     );
-    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf_refs = common::checked_page_refs(&mut out).unwrap();
     let leaf = resolved_handle(&mut out, leaf_refs[0]);
     let annot = first_annotation(&mut out, &leaf);
     let aa = resolved_key(&annot, b"/AA");
@@ -832,7 +828,7 @@ fn action_next_chain_keeps_d_and_nulls_removed_page() {
         1,
         "copied unselected page must be nulled"
     );
-    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf_refs = common::checked_page_refs(&mut out).unwrap();
     let leaf = resolved_handle(&mut out, leaf_refs[0]);
     let annot = first_annotation(&mut out, &leaf);
     let action = resolved_key(&annot, b"/A");
@@ -881,7 +877,7 @@ fn next_array_goto_keeps_d_and_nulls_removed_page() {
         1,
         "copied unselected page must be nulled"
     );
-    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf_refs = common::checked_page_refs(&mut out).unwrap();
     let leaf = resolved_handle(&mut out, leaf_refs[0]);
     let annot = first_annotation(&mut out, &leaf);
     let action = resolved_key(&annot, b"/A");
@@ -934,7 +930,7 @@ fn page_level_aa_goto_keeps_d_and_nulls_removed_page() {
         1,
         "copied unselected page must be nulled"
     );
-    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf_refs = common::checked_page_refs(&mut out).unwrap();
     let leaf = resolved_handle(&mut out, leaf_refs[0]);
     let aa = resolved_key(&leaf, b"/AA");
     let o = resolved_key(&aa, b"/O");
@@ -980,7 +976,7 @@ fn indirect_action_goto_keeps_d_and_nulls_removed_page() {
         1,
         "copied unselected page must be nulled"
     );
-    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf_refs = common::checked_page_refs(&mut out).unwrap();
     let leaf = resolved_handle(&mut out, leaf_refs[0]);
     let annot = first_annotation(&mut out, &leaf);
     // /A remains an indirect ref to the unchanged action carrier.
@@ -1020,7 +1016,7 @@ fn selflink_dest_and_crosspage_action_carriers_are_preserved() {
         1,
         "copied unselected page must be nulled"
     );
-    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf_refs = common::checked_page_refs(&mut out).unwrap();
     let leaf = resolved_handle(&mut out, leaf_refs[0]);
     let annot = first_annotation(&mut out, &leaf);
     assert!(
@@ -1051,7 +1047,7 @@ fn action_uri_is_preserved() {
     );
     let mut source = Pdf::open_mem_owned(src).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
-    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf_refs = common::checked_page_refs(&mut out).unwrap();
     let leaf = resolved_handle(&mut out, leaf_refs[0]);
     let annot = first_annotation(&mut out, &leaf);
     assert!(
@@ -1087,7 +1083,7 @@ fn indirect_dest_is_preserved_and_removed_page_is_null() {
         1,
         "copied unselected page must be nulled"
     );
-    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf_refs = common::checked_page_refs(&mut out).unwrap();
     let leaf = resolved_handle(&mut out, leaf_refs[0]);
     let annot = first_annotation(&mut out, &leaf);
     assert_destination_key_is_null(
@@ -1126,7 +1122,7 @@ fn indirect_aa_goto_keeps_d_and_nulls_removed_page() {
         1,
         "copied unselected page must be nulled"
     );
-    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf_refs = common::checked_page_refs(&mut out).unwrap();
     let leaf = resolved_handle(&mut out, leaf_refs[0]);
     let annot = first_annotation(&mut out, &leaf);
     // /AA stays an indirect reference.
@@ -1326,7 +1322,7 @@ fn aa_with_only_local_subaction_is_unchanged() {
     let mut source = Pdf::open_mem_owned(src).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
     assert_eq!(count_type(&mut out, b"Page"), 1);
-    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf_refs = common::checked_page_refs(&mut out).unwrap();
     let leaf = resolved_handle(&mut out, leaf_refs[0]);
     let annot = first_annotation(&mut out, &leaf);
     let aa = resolved_key(&annot, b"/AA");
@@ -1416,7 +1412,7 @@ fn action_goto_self_link_is_preserved() {
     let mut source = Pdf::open_mem_owned(src).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
     assert_eq!(count_type(&mut out, b"Page"), 1);
-    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf_refs = common::checked_page_refs(&mut out).unwrap();
     let leaf = resolved_handle(&mut out, leaf_refs[0]);
     let annot = first_annotation(&mut out, &leaf);
     let a = resolved_key(&annot, b"/A");
@@ -1747,7 +1743,7 @@ fn extract_pages_copies_shared_resource_once() {
 
     let mut out = extract_pages(&mut source, &[0, 1]).unwrap();
 
-    let page_refs = pages::page_refs(&mut out).unwrap();
+    let page_refs = common::checked_page_refs(&mut out).unwrap();
     assert_eq!(page_refs.len(), 2, "extracted doc must have two pages");
     let root = pages_dict(&mut out);
     assert_eq!(resolved_key(&root, b"/Count").as_integer(), Some(2));
@@ -1793,7 +1789,7 @@ fn extract_pages_preserves_selection_order() {
 
     let mut out = extract_pages(&mut source, &[2, 0]).unwrap();
 
-    let page_refs = pages::page_refs(&mut out).unwrap();
+    let page_refs = common::checked_page_refs(&mut out).unwrap();
     assert_eq!(page_refs.len(), 2);
     assert_eq!(
         leaf_font_basefont(&mut out, page_refs[0]),
@@ -1846,7 +1842,7 @@ fn extract_pages_duplicate_index_shallow_clones_page() {
 
     let mut out = extract_pages(&mut source, &[0, 0]).unwrap();
 
-    let page_refs = pages::page_refs(&mut out).unwrap();
+    let page_refs = common::checked_page_refs(&mut out).unwrap();
     assert_eq!(page_refs.len(), 2, "duplicate selection yields two kids");
     assert_ne!(
         page_refs[0], page_refs[1],
@@ -1910,7 +1906,7 @@ fn extract_pages_keeps_dest_between_selected_pages() {
 
     let mut out = extract_pages(&mut source, &[0, 1]).unwrap();
 
-    let page_refs = pages::page_refs(&mut out).unwrap();
+    let page_refs = common::checked_page_refs(&mut out).unwrap();
     assert_eq!(page_refs.len(), 2, "two selected pages enumerated");
     let second_page_ref = page_refs[1];
 
@@ -1972,7 +1968,7 @@ fn extract_pages_materializes_inherited_attrs_per_parent() {
 
     let mut out = extract_pages(&mut source, &[0, 1]).unwrap();
 
-    let page_refs = pages::page_refs(&mut out).unwrap();
+    let page_refs = common::checked_page_refs(&mut out).unwrap();
     assert_eq!(page_refs.len(), 2);
 
     let leaf0 = resolved_handle(&mut out, page_refs[0]);

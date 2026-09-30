@@ -9,10 +9,35 @@ use flpdf::job::{CheckError, QPDFJob};
 use flpdf::ObjectRef;
 use flpdf::{
     CompressStreams, CopyEncryptionSource, DecodeLevel, EncryptParams, NewlineBeforeEndstream,
-    ObjectHandle, ObjectStreamMode, Pdf, PdfWriter, Result, StreamDataMode,
+    ObjectHandle, ObjectStreamMode, PageDocumentHelper, Pdf, PdfWriter, Result, StreamDataMode,
 };
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, Write};
+
+/// Project repaired raw page handles only for integration cases whose API
+/// contract specifically exercises valid `N G R` references.
+pub fn checked_page_refs<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<ObjectRef>> {
+    raw_page_handles(pdf)?
+        .into_iter()
+        .map(|page| {
+            page.object_ref().ok_or_else(|| {
+                flpdf::Error::Unsupported(
+                    "test page identity is not a valid N G R reference".to_owned(),
+                )
+            })
+        })
+        .collect()
+}
+
+/// Enumerate qpdf's repaired page list while preserving each raw page handle.
+pub fn raw_page_handles<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<ObjectHandle>> {
+    PageDocumentHelper::new(pdf).get_all_pages()
+}
+
+/// Count qpdf's repaired raw page list without requiring indirect references.
+pub fn raw_page_count<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<usize> {
+    Ok(raw_page_handles(pdf)?.len())
+}
 
 /// Resolve one canonical object for integration assertions without creating
 /// an owned second object model.

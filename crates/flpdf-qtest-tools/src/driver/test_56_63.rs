@@ -79,10 +79,10 @@ fn test_56_59_body<R: Read + Seek>(
 
     // `QPDFPageDocumentHelper(pdf).getAllPages()` / `QPDFPageDocumentHelper(pdf2).getAllPages()`
     // (test_driver.cc:2089-2091).
-    let qpdf_flush_result_69 = flpdf::pages::page_refs(pdf);
+    let qpdf_flush_result_69 = crate::common::raw_page_handles(pdf);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let pages1 = qpdf_flush_result_69?;
-    let qpdf_flush_result_70 = flpdf::pages::page_refs(&mut pdf2);
+    let qpdf_flush_result_70 = crate::common::raw_page_handles(&mut pdf2);
     emit_new_diagnostics(
         &pdf2,
         &mut secondary_diagnostics_written,
@@ -98,7 +98,8 @@ fn test_56_59_body<R: Read + Seek>(
         // imports that live indirect handle into the destination
         // (`test_driver.cc:2095-2096`).
         let source_form = {
-            let mut source_page = PageObjectHelper::new(pages2[index], &mut pdf2);
+            let mut source_page =
+                PageObjectHelper::from_object_handle(pages2[index].clone(), &mut pdf2);
             source_page.get_form_xobject_for_page(handle_from_transformation)?
         };
         emit_new_diagnostics(
@@ -115,7 +116,8 @@ fn test_56_59_body<R: Read + Seek>(
         // installed. The live PageObjectHelper and ObjectHandle routes do the
         // same work here.
         let content = {
-            let mut destination_page = PageObjectHelper::new(pages1[index], pdf);
+            let mut destination_page =
+                PageObjectHelper::from_object_handle(pages1[index].clone(), pdf);
             let resources = destination_page.get_resources(true)?;
             let mut min_suffix = 1;
             let name = resources.get_unique_resource_name(b"/Fx", &mut min_suffix, None)?;
@@ -144,7 +146,7 @@ fn test_56_59_body<R: Read + Seek>(
         let q_stream = pdf.new_stream_with_data(Rc::new(b"q\n".to_vec()))?;
         let placed_stream =
             pdf.new_stream_with_data(Rc::new(format!("\nQ\n{content}").into_bytes()))?;
-        let mut destination_page = PageObjectHelper::new(pages1[index], pdf);
+        let mut destination_page = PageObjectHelper::from_object_handle(pages1[index].clone(), pdf);
         destination_page.add_page_contents(q_stream, true)?;
         let qpdf_flush_result_71 = destination_page.add_page_contents(placed_stream, false);
 

@@ -494,18 +494,12 @@ pub(crate) fn run_test_94<R: Read + Seek>(
     let root_media = root_media_result?;
     let root_media_unparse = root_media.unparse();
 
-    let pages = flpdf::pages::page_refs(pdf)?;
+    let pages = crate::common::raw_page_handles(pdf)?;
     assert_eq!(pages.len(), 5);
-    let p1_ref = pages[0];
-    let p2_ref = pages[1];
-    let p3_ref = pages[2];
-    let p4_ref = pages[3];
-    let p5_ref = pages[4];
-
-    let p1 = pdf.get_object_handle(p1_ref);
+    let p1 = pages[0].clone();
     assert!(p1.try_get_key(b"/MediaBox")?.is_null());
     {
-        let mut page = PageObjectHelper::new(p1_ref, pdf);
+        let mut page = PageObjectHelper::from_object_handle(p1.clone(), pdf);
         assert!(page.get_media_box(false)?.is_same_object_as(&root_media));
         assert!(page
             .get_crop_box(false, false)?
@@ -540,7 +534,7 @@ pub(crate) fn run_test_94<R: Read + Seek>(
     }
 
     {
-        let mut page = PageObjectHelper::new(p2_ref, pdf);
+        let mut page = PageObjectHelper::from_object_handle(pages[1].clone(), pdf);
         assert!(page.get_media_box(false)?.is_same_object_as(&root_media));
         let p2_crop = page.get_crop_box(false, false)?;
         let p2_new_trim = page.get_trim_box(false, true)?;
@@ -550,7 +544,7 @@ pub(crate) fn run_test_94<R: Read + Seek>(
     }
 
     {
-        let mut page = PageObjectHelper::new(p3_ref, pdf);
+        let mut page = PageObjectHelper::from_object_handle(pages[2].clone(), pdf);
         let p3_media = page.get_media_box(false)?;
         let p3_crop = page.get_crop_box(false, false)?;
         assert!(page.get_media_box(true)?.is_same_object_as(&p3_media));
@@ -558,9 +552,9 @@ pub(crate) fn run_test_94<R: Read + Seek>(
     }
 
     {
-        let p4 = pdf.get_object_handle(p4_ref);
+        let p4 = pages[3].clone();
         let p4_orig_crop = p4.try_get_key(b"/CropBox")?;
-        let mut page = PageObjectHelper::new(p4_ref, pdf);
+        let mut page = PageObjectHelper::from_object_handle(p4, pdf);
         let p4_crop = page.get_crop_box(false, false)?;
         assert!(p4_orig_crop.is_same_object_as(&p4_crop));
         let p4_bleed1 = page.get_bleed_box(false, false)?;
@@ -579,7 +573,7 @@ pub(crate) fn run_test_94<R: Read + Seek>(
     }
 
     {
-        let mut page = PageObjectHelper::new(p5_ref, pdf);
+        let mut page = PageObjectHelper::from_object_handle(pages[4].clone(), pdf);
         assert!(page.get_media_box(false)?.is_same_object_as(&root_media));
         assert!(page
             .get_crop_box(false, false)?
@@ -1155,31 +1149,21 @@ mod test_94_tests {
         )
         .expect("test 94 should execute the page-box assertion matrix");
 
-        let pages =
-            flpdf::pages::page_refs(&mut pdf).expect("boxes2 fixture should retain five pages");
+        let pages = crate::common::raw_page_handles(&mut pdf)
+            .expect("boxes2 fixture should retain five pages");
         assert_eq!(pages.len(), 5);
 
         for key in [b"/MediaBox".as_slice(), b"/CropBox", b"/ArtBox"] {
             assert!(
-                pdf.get_object_handle(pages[0])
-                    .try_has_key(key)
-                    .expect("page 1 key lookup"),
+                pages[0].try_has_key(key).expect("page 1 key lookup"),
                 "test 94 should copy {key:?} onto page 1"
             );
         }
-        assert!(pdf
-            .get_object_handle(pages[1])
-            .try_has_key(b"/TrimBox")
-            .unwrap());
-        assert!(pdf
-            .get_object_handle(pages[3])
-            .try_has_key(b"/BleedBox")
-            .unwrap());
+        assert!(pages[1].try_has_key(b"/TrimBox").unwrap());
+        assert!(pages[3].try_has_key(b"/BleedBox").unwrap());
         for key in [b"/MediaBox".as_slice(), b"/CropBox", b"/BleedBox"] {
             assert!(
-                pdf.get_object_handle(pages[4])
-                    .try_has_key(key)
-                    .expect("page 5 key lookup"),
+                pages[4].try_has_key(key).expect("page 5 key lookup"),
                 "test 94 should copy {key:?} onto page 5"
             );
         }

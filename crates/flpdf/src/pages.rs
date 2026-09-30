@@ -4,6 +4,15 @@
 //!
 //! Returns the document's qpdf-ordered page list through
 //! [`crate::PageDocumentHelper::get_all_pages`], including qpdf's page-tree repairs.
+//!
+//! The checked `ObjectRef` page-list projection is crate-internal. External
+//! callers use [`crate::PageDocumentHelper::get_all_pages`] to retain raw qpdf
+//! page identity:
+//!
+//! ```compile_fail
+//! let mut pdf = flpdf::Pdf::<std::io::Cursor<Vec<u8>>>::uninitialized();
+//! let _ = flpdf::pages::page_refs(&mut pdf);
+//! ```
 
 #[cfg(not(feature = "qtest-driver"))]
 pub(crate) mod repair;
@@ -177,29 +186,11 @@ pub(crate) fn resolve_inherited_handle_with_max_depth<R: Read + Seek>(
     resolve_inherited_handle_from_node_with_max_depth(page, key, max_depth)
 }
 
-/// Return every `Page` object in document order using qpdf's unbounded default walk.
-///
-/// # Errors
-///
-/// - [`Error::Missing`] when the trailer has no `/Root` entry.
-/// - [`Error::Unsupported`] when `/Root` is not a dictionary.
-/// - A missing `/Pages` entry yields an empty list after qpdf's containment warning.
-/// - An explicit null or other invalid `/Pages` value propagates its qpdf type error.
-/// - Any [`Error`] propagated from canonical ObjectHandle resolution while repairing the tree.
-///
-/// # Examples
-///
-/// ```no_run
-/// use std::fs::File;
-/// use std::io::BufReader;
-/// use flpdf::{pages, Pdf};
-///
-/// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-/// let pages = pages::page_refs(&mut pdf)?;
-/// println!("{} pages", pages.len());
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-pub fn page_refs<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<ObjectRef>> {
+/// Return qpdf's repaired page list projected to valid `N G R` references for
+/// crate-internal consumers whose interface requires [`ObjectRef`]. Public
+/// page enumeration uses [`crate::PageDocumentHelper::get_all_pages`] and
+/// retains raw page handles.
+pub(crate) fn page_refs<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<ObjectRef>> {
     if let Some(prepared) = pdf.cached_page_list() {
         pdf.mark_get_all_pages_called();
         return prepared.page_refs();
@@ -234,11 +225,11 @@ pub fn page_refs<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<ObjectRef>> {
 /// ```no_run
 /// use std::fs::File;
 /// use std::io::BufReader;
-/// use flpdf::{pages, Pdf};
+/// use flpdf::{pages, PageDocumentHelper, Pdf};
 ///
 /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-/// let page_refs = pages::page_refs(&mut pdf)?;
-/// if let Some(&page_ref) = page_refs.first() {
+/// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
+/// if let Some(page_ref) = pages.first().and_then(|page| page.object_ref()) {
 ///     let content = pages::page_content_bytes(&mut pdf, page_ref)?;
 ///     println!("{} content bytes", content.len());
 /// }

@@ -13,8 +13,7 @@
 
 use flpdf::job::{JobExitCode, QPDFJob};
 use flpdf::{
-    extract_pages, pages, rebuild_page_tree, ObjectHandle, ObjectRef, Pdf,
-    RemoveUnreferencedResources,
+    extract_pages, rebuild_page_tree, ObjectHandle, ObjectRef, Pdf, RemoveUnreferencedResources,
 };
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -124,7 +123,7 @@ fn assert_unreferenced_page_is_omitted_by_writer(pdf: &mut Pdf<Cursor<Vec<u8>>>)
     );
     let mut written = Pdf::open(Cursor::new(out)).expect("reopen subset");
     assert_eq!(
-        pages::page_refs(&mut written).unwrap().len(),
+        common::raw_page_count(&mut written).unwrap(),
         2,
         "writer output must retain only the selected pages"
     );
@@ -251,7 +250,7 @@ fn duplicate_selection_shares_bead_and_p_points_at_first_occurrence() {
     let mut src = Pdf::open(Cursor::new(build_fixture())).expect("open fixture");
     let mut out = extract_pages(&mut src, &[0, 0]).expect("extract duplicate selection");
 
-    let page_refs = pages::page_refs(&mut out).expect("output page refs");
+    let page_refs = common::checked_page_refs(&mut out).expect("output page refs");
     assert_eq!(page_refs.len(), 2, "duplicate selection yields two pages");
     assert_ne!(
         page_refs[0], page_refs[1],

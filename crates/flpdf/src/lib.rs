@@ -22,13 +22,14 @@
 //! ```no_run
 //! use std::fs::File;
 //! use std::io::BufReader;
-//! use flpdf::{pages, Pdf, PdfWriter};
+//! use flpdf::{PageDocumentHelper, Pdf, PdfWriter};
 //!
 //! let file = BufReader::new(File::open("input.pdf")?);
 //! let mut pdf = Pdf::open(file)?;
 //!
-//! for object_ref in pages::page_refs(&mut pdf)? {
-//!     println!("page: {object_ref}");
+//! for page in PageDocumentHelper::new(&mut pdf).get_all_pages()? {
+//!     let id = page.get_obj_gen();
+//!     println!("page: {} {}", id.get_obj(), id.get_gen());
 //! }
 //!
 //! let mut writer = PdfWriter::new(&mut pdf);

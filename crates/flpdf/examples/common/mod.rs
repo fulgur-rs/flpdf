@@ -5,7 +5,29 @@
 //! Every example uses only a subset of these helpers, so `dead_code` is allowed.
 
 use std::collections::BTreeMap;
+use std::io::{Read, Seek};
 use std::path::PathBuf;
+
+use flpdf::{Error, ObjectRef, PageDocumentHelper, Pdf};
+
+/// Project the qpdf-shaped raw page list only for examples that call an
+/// `ObjectRef`-typed page operation such as `rebuild_page_tree`.
+pub fn checked_page_refs<R: Read + Seek>(pdf: &mut Pdf<R>) -> flpdf::Result<Vec<ObjectRef>> {
+    PageDocumentHelper::new(pdf)
+        .get_all_pages()?
+        .into_iter()
+        .map(|page| {
+            let object_gen = page.get_obj_gen();
+            page.object_ref().ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "example page {} {} is not a valid N G R reference",
+                    object_gen.get_obj(),
+                    object_gen.get_gen()
+                ))
+            })
+        })
+        .collect()
+}
 
 /// Append a classic `xref` table + `trailer` + `startxref`/`%%EOF` for objects
 /// `1..=last`. `offsets` must contain a byte offset for every object `1..=last`.

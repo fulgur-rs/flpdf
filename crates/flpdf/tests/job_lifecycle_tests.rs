@@ -2889,7 +2889,7 @@ fn json_job_empty_input_uses_the_job_document_boundary() {
     assert_eq!(job.run().unwrap(), JobExitCode::Success);
     let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
     assert_eq!(pdf.version(), "1.3");
-    assert_eq!(flpdf::pages::page_refs(&mut pdf).unwrap().len(), 0);
+    assert_eq!(common::raw_page_count(&mut pdf).unwrap(), 0);
 }
 
 #[test]
@@ -2990,7 +2990,7 @@ fn json_job_run_applies_pages_and_attachments() {
 
     assert_eq!(job.run().unwrap(), JobExitCode::Success);
     let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
-    assert_eq!(flpdf::pages::page_refs(&mut pdf).unwrap().len(), 1);
+    assert_eq!(common::raw_page_count(&mut pdf).unwrap(), 1);
     assert!(pdf
         .embedded_files()
         .get_embedded_file(b"fixture-key")
@@ -3097,7 +3097,7 @@ fn json_job_run_applies_rotate_to_a_collate_zero_empty_page_selection() {
 
     assert_eq!(job.run().unwrap(), JobExitCode::Success);
     let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
-    assert_eq!(flpdf::pages::page_refs(&mut pdf).unwrap().len(), 0);
+    assert_eq!(common::raw_page_count(&mut pdf).unwrap(), 0);
 }
 
 #[test]
@@ -3120,7 +3120,7 @@ fn json_job_run_applies_relative_rotation_to_a_real_page() {
     assert_eq!(job.run().unwrap(), JobExitCode::Success);
 
     let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
-    let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+    let page_ref = common::checked_page_refs(&mut pdf).unwrap()[0];
     let page = pdf.get_object_handle(page_ref);
     page.try_is_scalar().unwrap();
     assert_eq!(page.try_get_key(b"/Rotate").unwrap().as_integer(), Some(90));
@@ -3154,7 +3154,7 @@ fn create_qpdf_skips_the_stages_for_an_encryption_status_job() {
         .expect("a status-only job must not fail on the unread update file")
         .expect("createQPDF should still return the document");
 
-    let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+    let page_ref = common::checked_page_refs(&mut pdf).unwrap()[0];
     let page = pdf.get_object_handle(page_ref);
     page.try_is_scalar().unwrap();
     assert_eq!(
@@ -3187,7 +3187,7 @@ fn create_qpdf_returns_the_primary_after_rotation_transformation() {
         .unwrap()
         .expect("createQPDF should return the transformed document");
 
-    let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+    let page_ref = common::checked_page_refs(&mut pdf).unwrap()[0];
     let page = pdf.get_object_handle(page_ref);
     page.try_is_scalar().unwrap();
     assert_eq!(page.try_get_key(b"/Rotate").unwrap().as_integer(), Some(90));
@@ -3213,7 +3213,7 @@ fn create_qpdf_applies_page_selection_before_returning() {
         .expect("createQPDF should return the page-selected document");
 
     assert_eq!(
-        flpdf::pages::page_refs(&mut pdf).unwrap().len(),
+        common::raw_page_count(&mut pdf).unwrap(),
         1,
         "qpdf createQPDF returns after handlePageSpecs, before writeQPDF"
     );
@@ -3241,7 +3241,7 @@ fn create_qpdf_write_qpdf_preserves_a_between_stage_mutation() {
 
     let root = pdf.root_handle().unwrap();
     assert_eq!(
-        flpdf::pages::page_refs(&mut pdf).unwrap().len(),
+        common::raw_page_count(&mut pdf).unwrap(),
         1,
         "the create stage must have prepared the primary before returning"
     );
@@ -3287,12 +3287,12 @@ fn create_qpdf_returns_the_primary_with_multi_source_pages_for_later_write() {
         .create_qpdf()
         .unwrap()
         .expect("createQPDF should return the primary JobDocument");
-    assert_eq!(flpdf::pages::page_refs(&mut pdf).unwrap().len(), 2);
+    assert_eq!(common::raw_page_count(&mut pdf).unwrap(), 2);
 
     job.write_qpdf(&mut pdf).unwrap();
     assert_eq!(job.get_exit_code(), JobExitCode::Success);
     let mut written = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
-    assert_eq!(flpdf::pages::page_refs(&mut written).unwrap().len(), 2);
+    assert_eq!(common::raw_page_count(&mut written).unwrap(), 2);
 }
 
 /// A failed `create_qpdf` must reset the status from its previous document.
@@ -3680,7 +3680,7 @@ fn json_job_run_reuses_an_already_opened_page_source_for_a_repeated_filename() {
          source and never consult a later spec's password"
     );
     let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
-    assert_eq!(flpdf::pages::page_refs(&mut pdf).unwrap().len(), 2);
+    assert_eq!(common::raw_page_count(&mut pdf).unwrap(), 2);
 }
 
 /// 2-page document with an outline item pointing at page 2 (obj 4).
@@ -3760,7 +3760,7 @@ fn json_job_run_in_place_page_subset_remaps_outline_dests() {
     assert_eq!(job.run().unwrap(), JobExitCode::Success);
 
     let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
-    assert_eq!(flpdf::pages::page_refs(&mut pdf).unwrap().len(), 1);
+    assert_eq!(common::raw_page_count(&mut pdf).unwrap(), 1);
 
     // Writing renumbers objects, so locate the removed page through the
     // surviving outline item's `/Dest` rather than assuming the original
@@ -5885,7 +5885,7 @@ fn config_add_page_spec_matches_the_json_configured_path_single_source() {
     let source_order = {
         let mut source = Pdf::open(BufReader::new(File::open(&input).unwrap()))
             .expect("three-page fixture opens");
-        let refs = flpdf::pages::page_refs(&mut source).expect("source pages resolve");
+        let refs = common::checked_page_refs(&mut source).expect("source pages resolve");
         assert_eq!(refs.len(), 3, "the fixture has three pages");
         [refs[1], refs[2], refs[0]]
             .into_iter()
@@ -5897,7 +5897,7 @@ fn config_add_page_spec_matches_the_json_configured_path_single_source() {
     };
     let mut selected =
         Pdf::open(BufReader::new(File::open(&via_config).unwrap())).expect("selected output opens");
-    let selected_refs = flpdf::pages::page_refs(&mut selected).expect("selected pages resolve");
+    let selected_refs = common::checked_page_refs(&mut selected).expect("selected pages resolve");
     assert_eq!(selected_refs.len(), 3, "`2-3,1` selects three pages");
     for (index, page) in selected_refs.into_iter().enumerate() {
         assert_eq!(
@@ -6010,7 +6010,7 @@ fn config_collate_zero_selects_no_pages() {
 
     let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
     assert!(
-        flpdf::pages::page_refs(&mut pdf).unwrap().is_empty(),
+        common::raw_page_count(&mut pdf).unwrap() == 0,
         "qpdf collate=0 must produce an empty selected-page result"
     );
 }
@@ -6040,7 +6040,7 @@ fn config_collate_appends_values_in_declaration_order() {
 
     let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
     assert_eq!(
-        flpdf::pages::page_refs(&mut pdf).unwrap().len(),
+        common::raw_page_count(&mut pdf).unwrap(),
         1,
         "collate values must append as [0, 1], not replace the first group"
     );
@@ -6495,3 +6495,5 @@ fn a_falsy_split_pages_value_still_preserves_primary_orphans() {
          unreferenced objects"
     );
 }
+
+mod common;

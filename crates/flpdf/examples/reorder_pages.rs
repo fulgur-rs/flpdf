@@ -8,17 +8,17 @@ mod common;
 use std::fs::File;
 use std::io::BufReader;
 
-use flpdf::{pages::page_refs, rebuild_page_tree, ObjectRef, PageObjectHelper, Pdf, PdfWriter};
+use flpdf::{rebuild_page_tree, PageDocumentHelper, PageObjectHelper, Pdf, PdfWriter};
 
 /// Read each page's MediaBox width (`urx - llx`, rounded to `i64`) in document
 /// order. The shared-font fixture assigns distinct widths so order is observable.
 fn page_widths<R: std::io::Read + std::io::Seek>(
     pdf: &mut Pdf<R>,
 ) -> Result<Vec<i64>, Box<dyn std::error::Error>> {
-    let refs: Vec<ObjectRef> = page_refs(pdf)?;
-    let mut widths = Vec::with_capacity(refs.len());
-    for page_ref in refs {
-        let mut helper = PageObjectHelper::new(page_ref, pdf);
+    let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    let mut widths = Vec::with_capacity(pages.len());
+    for page in pages {
+        let mut helper = PageObjectHelper::from_object_handle(page, pdf);
         let mb = helper.media_box()?.ok_or("page has no MediaBox")?;
         widths.push((mb.urx - mb.llx).round() as i64);
     }
@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     expected_reversed.reverse(); // [103, 102, 101]
 
     // Reverse the page refs and rebuild the page tree in the new order.
-    let mut reversed = page_refs(&mut pdf)?;
+    let mut reversed = common::checked_page_refs(&mut pdf)?;
     reversed.reverse();
     rebuild_page_tree(&mut pdf, &reversed)?;
 

@@ -12,7 +12,7 @@ use flpdf::{
 use std::cell::RefCell;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Write};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -249,14 +249,12 @@ fn create_pdf(path: &Path, large: bool, output: &Output) -> flpdf::Result<()> {
     writer.write()
 }
 
-fn check_page_contents<R: Read + std::io::Seek>(
-    pdf: &mut Pdf<R>,
-    page: flpdf::ObjectRef,
+fn check_page_contents(
+    page: &ObjectHandle,
     page_number: usize,
     output: &Output,
 ) -> flpdf::Result<()> {
-    let page_handle = pdf.get_object_handle(page);
-    let contents = page_handle
+    let contents = page
         .get_key(b"/Contents")
         .get_stream_data(DecodeLevel::Generalized)?;
     let expected = generate_page_contents(page_number);
@@ -270,15 +268,13 @@ fn check_page_contents<R: Read + std::io::Seek>(
     Ok(())
 }
 
-fn check_image<R: Read + std::io::Seek>(
-    pdf: &mut Pdf<R>,
-    page: flpdf::ObjectRef,
+fn check_image(
+    page: &ObjectHandle,
     page_number: usize,
     stripesize: usize,
     output: &Output,
 ) -> flpdf::Result<()> {
-    let page_handle = pdf.get_object_handle(page);
-    let image = page_handle
+    let image = page
         .get_key(b"/Resources")
         .get_key(b"/XObject")
         .get_key(b"/Im1");
@@ -320,7 +316,7 @@ fn check_pdf(path: &Path, large: bool, output: &Output) -> flpdf::Result<()> {
             ..flpdf::PdfOpenOptions::default()
         },
     )?;
-    let pages = flpdf::pages::page_refs(&mut pdf)?;
+    let pages = crate::common::raw_page_handles(&mut pdf)?;
     if pages.len() != NPAGES {
         return Err(Error::Unsupported(format!(
             "expected {NPAGES} pages, found {}",
@@ -330,8 +326,8 @@ fn check_pdf(path: &Path, large: bool, output: &Output) -> flpdf::Result<()> {
     for (index, page) in pages.into_iter().enumerate() {
         let page_number = index + 1;
         output.append(format_args!("page {page_number} of {NPAGES}\n"));
-        check_page_contents(&mut pdf, page, page_number, output)?;
-        check_image(&mut pdf, page, page_number, stripesize, output)?;
+        check_page_contents(&page, page_number, output)?;
+        check_image(&page, page_number, stripesize, output)?;
     }
     Ok(())
 }
@@ -430,13 +426,13 @@ mod tests {
         create_pdf(&path, false, &generation_output).expect("write helper PDF");
 
         let mut pdf = Pdf::open(BufReader::new(File::open(&path).unwrap())).unwrap();
-        let page = flpdf::pages::page_refs(&mut pdf)
+        let page = crate::common::raw_page_handles(&mut pdf)
             .unwrap()
             .into_iter()
             .next()
             .unwrap();
         let output = Output::new();
-        check_page_contents(&mut pdf, page, 2, &output).unwrap();
+        check_page_contents(&page, 2, &output).unwrap();
         let mut checker = ImageChecker {
             page: 512,
             width: 1,

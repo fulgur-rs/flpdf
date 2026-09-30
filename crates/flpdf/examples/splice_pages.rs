@@ -8,7 +8,7 @@ mod common;
 use std::fs::File;
 use std::io::BufReader;
 
-use flpdf::{pages::page_refs, splice_pages, Pdf, PdfWriter};
+use flpdf::{splice_pages, PageDocumentHelper, Pdf, PdfWriter};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Source A: 3 pages. Target B: 2 pages. Insert A's pages into B at index 1.
@@ -20,12 +20,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut b = Pdf::open(BufReader::new(File::open(&b_path)?))?;
 
     // Copy A's pages through the destination's persistent foreign-object map.
-    let a_pages = page_refs(&mut a)?;
+    let a_pages = PageDocumentHelper::new(&mut a).get_all_pages()?;
     let mut copied = Vec::with_capacity(a_pages.len());
-    for &page_ref in &a_pages {
-        let source_page = a.get_object_handle(page_ref);
+    for source_page in &a_pages {
         let copied_page = b
-            .copy_foreign_object(&source_page)?
+            .copy_foreign_object(source_page)?
             .object_ref()
             .ok_or("copyForeignObject did not return an indirect page")?;
         copied.push(copied_page);
@@ -42,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify: B grew from 2 to 5 pages (2 original + 3 inserted).
     let mut out_pdf = Pdf::open(BufReader::new(File::open(&out_path)?))?;
-    let count = page_refs(&mut out_pdf)?.len();
+    let count = PageDocumentHelper::new(&mut out_pdf).get_all_pages()?.len();
     assert_eq!(count, 5, "expected 5 pages after splice, got {count}");
     println!("splice_pages: inserted 3 pages at index {n} -> output has {count} pages");
 

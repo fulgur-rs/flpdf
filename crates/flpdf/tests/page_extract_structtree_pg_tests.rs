@@ -135,7 +135,7 @@ fn dangling_pg_dropped_and_page_gced() {
     );
     let mut written = Pdf::open(Cursor::new(out)).expect("reopen subset");
     assert_eq!(
-        flpdf::pages::page_refs(&mut written).unwrap().len(),
+        common::raw_page_count(&mut written).unwrap(),
         2,
         "writer output must retain only the selected pages"
     );

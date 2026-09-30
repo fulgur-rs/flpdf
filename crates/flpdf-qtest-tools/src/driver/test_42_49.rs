@@ -230,11 +230,10 @@ pub(crate) fn run_test_42<R: Read + Seek>(
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     invalid_nested_string?;
 
-    let page_ref = flpdf::pages::page_refs(pdf)?
+    let page = crate::common::raw_page_handles(pdf)?
         .into_iter()
         .next()
         .expect("qpdf test_42 requires one page");
-    let page = pdf.get_object_handle(page_ref);
     let contents = page.try_get_key(b"/Contents")?;
     let stream_dictionary = contents.try_get_stream_dict()?;
     let potato_value = stream_dictionary.try_get_key(b"/Potato");

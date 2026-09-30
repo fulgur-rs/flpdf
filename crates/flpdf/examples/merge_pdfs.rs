@@ -12,18 +12,14 @@ mod common;
 use std::fs::File;
 use std::io::BufReader;
 
-use flpdf::{pages::page_refs, splice_pages, ObjectHandle, ObjectRef, Pdf, PdfWriter};
+use flpdf::{splice_pages, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, PdfWriter};
 
 /// Resolve a page's `/Resources /Font /F1` indirect reference.
 ///
 /// The synthetic pages keep `/Resources` inline, so resolving the page and
 /// then each child handle is enough; the nested dictionaries remain live
 /// ObjectHandle values throughout the inspection.
-fn font_ref_of_page<R: std::io::Read + std::io::Seek>(
-    pdf: &mut Pdf<R>,
-    page: ObjectRef,
-) -> Option<ObjectRef> {
-    let page_obj: ObjectHandle = pdf.get_object_handle(page);
+fn font_ref_of_page(page_obj: &ObjectHandle) -> Option<ObjectRef> {
     page_obj.try_is_scalar().ok()?;
     let resources = page_obj.try_get_key(b"/Resources").ok()?;
     resources.try_is_scalar().ok()?;
@@ -45,19 +41,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Copy each page through the same target-side foreign-object map so the
     // font they share is copied once (sharing preserved).
-    let b_pages = page_refs(&mut b)?;
+    let b_pages = PageDocumentHelper::new(&mut b).get_all_pages()?;
     let mut copied = Vec::with_capacity(b_pages.len());
-    for &page_ref in &b_pages {
-        let source_page = b.get_object_handle(page_ref);
+    for source_page in &b_pages {
         let copied_page = a
-            .copy_foreign_object(&source_page)?
+            .copy_foreign_object(source_page)?
             .object_ref()
             .ok_or("copyForeignObject did not return an indirect page")?;
         copied.push(copied_page);
     }
 
     // Append B's copied pages at the end of A.
-    let a_len = page_refs(&mut a)?.len();
+    let a_len = PageDocumentHelper::new(&mut a).get_all_pages()?.len();
     splice_pages(&mut a, a_len..a_len, &copied)?;
 
     // The canonical writer emits one fresh qpdf-style document.
@@ -68,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Verify on the output: merged doc has 4 pages, and the two merged-in pages
     // reference a single shared font object.
     let mut out_pdf = Pdf::open(BufReader::new(File::open(&out_path)?))?;
-    let out_pages = page_refs(&mut out_pdf)?;
+    let out_pages = PageDocumentHelper::new(&mut out_pdf).get_all_pages()?;
     assert_eq!(
         out_pages.len(),
         4,
@@ -76,8 +71,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         out_pages.len()
     );
 
-    let f_last = font_ref_of_page(&mut out_pdf, out_pages[2]).expect("page 3 font");
-    let f_last2 = font_ref_of_page(&mut out_pdf, out_pages[3]).expect("page 4 font");
+    let f_last = font_ref_of_page(&out_pages[2]).expect("page 3 font");
+    let f_last2 = font_ref_of_page(&out_pages[3]).expect("page 4 font");
     assert_eq!(
         f_last, f_last2,
         "merged-in pages must share one font object (got {f_last:?} vs {f_last2:?})"
