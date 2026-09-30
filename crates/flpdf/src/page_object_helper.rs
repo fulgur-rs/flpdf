@@ -39,12 +39,12 @@
 //! ```no_run
 //! use std::fs::File;
 //! use std::io::BufReader;
-//! use flpdf::{pages, Pdf, PageObjectHelper};
+//! use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
 //!
 //! let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-//! let page_refs = pages::page_refs(&mut pdf)?;
-//! if let Some(&page_ref) = page_refs.first() {
-//!     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+//! let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
+//! if let Some(page) = pages.into_iter().next() {
+//!     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
 //!     let objects = helper.content_stream_objects()?;
 //!     println!("{} content-stream objects on page 1", objects.len());
 //! }
@@ -56,12 +56,12 @@
 //! ```no_run
 //! use std::fs::File;
 //! use std::io::BufReader;
-//! use flpdf::{pages, Pdf, PageObjectHelper};
+//! use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
 //!
 //! let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-//! let page_refs = pages::page_refs(&mut pdf)?;
-//! if let Some(&page_ref) = page_refs.first() {
-//!     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+//! let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
+//! if let Some(page) = pages.into_iter().next() {
+//!     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
 //!     if let Some(mb) = helper.media_box()? {
 //!         println!("MediaBox: {:?}", mb);
 //!     }
@@ -74,12 +74,12 @@
 //! ```no_run
 //! use std::fs::File;
 //! use std::io::BufReader;
-//! use flpdf::{pages, Pdf, PageObjectHelper};
+//! use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
 //!
 //! let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-//! let page_refs = pages::page_refs(&mut pdf)?;
-//! if let Some(&page_ref) = page_refs.first() {
-//!     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+//! let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
+//! if let Some(page) = pages.into_iter().next() {
+//!     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
 //!     let degrees = helper.rotate()?;
 //!     println!("page rotation: {degrees}°");
 //! }
@@ -91,12 +91,12 @@
 //! ```no_run
 //! use std::fs::File;
 //! use std::io::BufReader;
-//! use flpdf::{pages, Pdf, PageObjectHelper};
+//! use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
 //!
 //! let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-//! let page_refs = pages::page_refs(&mut pdf)?;
-//! if let Some(&page_ref) = page_refs.first() {
-//!     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+//! let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
+//! if let Some(page) = pages.into_iter().next() {
+//!     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
 //!     let annots = helper.get_annotations()?;
 //!     println!("{} annotations on page 1", annots.len());
 //! }
@@ -854,12 +854,12 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// ```no_run
     /// use std::fs::File;
     /// use std::io::BufReader;
-    /// use flpdf::{pages, Pdf, PageObjectHelper};
+    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
     ///
     /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let page_refs = pages::page_refs(&mut pdf)?;
-    /// if let Some(&page_ref) = page_refs.first() {
-    ///     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
+    /// if let Some(page) = pages.into_iter().next() {
+    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
     ///     let objects = helper.content_stream_objects()?;
     ///     println!("{} objects", objects.len());
     /// }
@@ -1607,12 +1607,12 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// ```no_run
     /// use std::fs::File;
     /// use std::io::BufReader;
-    /// use flpdf::{pages, Pdf, PageObjectHelper};
+    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
     ///
     /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let page_refs = pages::page_refs(&mut pdf)?;
-    /// if let Some(&page_ref) = page_refs.first() {
-    ///     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
+    /// if let Some(page) = pages.into_iter().next() {
+    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
     ///     let deg = helper.rotate()?;
     ///     println!("rotation: {deg}°");
     /// }
@@ -1648,12 +1648,12 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// ```no_run
     /// use std::fs::File;
     /// use std::io::BufReader;
-    /// use flpdf::{pages, Pdf, PageObjectHelper};
+    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
     ///
     /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let page_refs = pages::page_refs(&mut pdf)?;
-    /// if let Some(&page_ref) = page_refs.first() {
-    ///     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
+    /// if let Some(page) = pages.into_iter().next() {
+    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
     ///     let annots = helper.get_annotations()?;
     ///     for annot_ref in &annots {
     ///         println!("annotation: {annot_ref}");
@@ -1755,12 +1755,12 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// ```no_run
     /// use std::fs::File;
     /// use std::io::BufReader;
-    /// use flpdf::{pages, Pdf, PageObjectHelper};
+    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
     ///
     /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let page_refs = pages::page_refs(&mut pdf)?;
-    /// if let Some(&page_ref) = page_refs.first() {
-    ///     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
+    /// if let Some(page) = pages.into_iter().next() {
+    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
     ///     if let Some(mb) = helper.media_box()? {
     ///         println!("[{} {} {} {}]", mb.llx, mb.lly, mb.urx, mb.ury);
     ///     }
@@ -1787,12 +1787,12 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// ```no_run
     /// use std::fs::File;
     /// use std::io::BufReader;
-    /// use flpdf::{pages, Pdf, PageObjectHelper};
+    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
     ///
     /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let page_refs = pages::page_refs(&mut pdf)?;
-    /// if let Some(&page_ref) = page_refs.first() {
-    ///     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
+    /// if let Some(page) = pages.into_iter().next() {
+    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
     ///     if let Some(cb) = helper.crop_box()? {
     ///         println!("[{} {} {} {}]", cb.llx, cb.lly, cb.urx, cb.ury);
     ///     }
@@ -1818,12 +1818,12 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// ```no_run
     /// use std::fs::File;
     /// use std::io::BufReader;
-    /// use flpdf::{pages, Pdf, PageObjectHelper};
+    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
     ///
     /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let page_refs = pages::page_refs(&mut pdf)?;
-    /// if let Some(&page_ref) = page_refs.first() {
-    ///     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
+    /// if let Some(page) = pages.into_iter().next() {
+    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
     ///     if let Some(bb) = helper.bleed_box()? {
     ///         println!("[{} {} {} {}]", bb.llx, bb.lly, bb.urx, bb.ury);
     ///     }
@@ -1849,12 +1849,12 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// ```no_run
     /// use std::fs::File;
     /// use std::io::BufReader;
-    /// use flpdf::{pages, Pdf, PageObjectHelper};
+    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
     ///
     /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let page_refs = pages::page_refs(&mut pdf)?;
-    /// if let Some(&page_ref) = page_refs.first() {
-    ///     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
+    /// if let Some(page) = pages.into_iter().next() {
+    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
     ///     if let Some(tb) = helper.trim_box()? {
     ///         println!("[{} {} {} {}]", tb.llx, tb.lly, tb.urx, tb.ury);
     ///     }
@@ -1880,12 +1880,12 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// ```no_run
     /// use std::fs::File;
     /// use std::io::BufReader;
-    /// use flpdf::{pages, Pdf, PageObjectHelper};
+    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
     ///
     /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let page_refs = pages::page_refs(&mut pdf)?;
-    /// if let Some(&page_ref) = page_refs.first() {
-    ///     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
+    /// if let Some(page) = pages.into_iter().next() {
+    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
     ///     if let Some(ab) = helper.art_box()? {
     ///         println!("[{} {} {} {}]", ab.llx, ab.lly, ab.urx, ab.ury);
     ///     }

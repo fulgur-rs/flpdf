@@ -4,8 +4,8 @@ use std::io::{Read, Seek, Write};
 use std::rc::Rc;
 
 use flpdf::{
-    DecodeLevel, Error, ObjectHandle, ObjectRef, PageDocumentHelper, PageInput, Pdf,
-    PdfOpenOptions, PdfWriter, Pipeline, PipelineResult, StreamDataMode,
+    DecodeLevel, Error, ObjectHandle, PageDocumentHelper, PageInput, Pdf, PdfOpenOptions,
+    PdfWriter, Pipeline, PipelineResult, StreamDataMode,
 };
 
 use super::{emit_new_diagnostics, os_str_diagnostic_bytes};
@@ -75,9 +75,8 @@ fn open_secondary_pdf(
 /// Like qpdf's helper, this assumes `/Contents` is a single stream (not an
 /// array); it is only used by `run_test_30`, whose fixture pages qpdf's own
 /// test asset guarantees have a single content stream.
-fn page_contents<R: Read + Seek>(pdf: &mut Pdf<R>, page: ObjectRef) -> flpdf::Result<Vec<u8>> {
-    let handle = pdf.get_object_handle(page);
-    let contents = handle.try_get_key(b"/Contents")?;
+fn page_contents(page: &ObjectHandle) -> flpdf::Result<Vec<u8>> {
+    let contents = page.try_get_key(b"/Contents")?;
     let data = contents.get_stream_data(DecodeLevel::Generalized)?;
     let mut owned = data.as_ref().clone();
     owned.push(0);
@@ -414,18 +413,18 @@ pub(crate) fn run_test_30<R: Read + Seek>(
     // any warning that read raises is emitted at that point, so drain `pdf`'s
     // diagnostics right after `orig_contents`, before reading `final_pdf`'s.
     let mut final_pdf = open_secondary_pdf(OsStr::new("b.pdf"), b"user", stdout, stderr)?;
-    let orig_page = flpdf::pages::page_refs(pdf)?
+    let orig_page = crate::common::raw_page_handles(pdf)?
         .into_iter()
         .next()
         .ok_or_else(|| flpdf::Error::System("pdf has no pages".to_string()))?;
-    let qpdf_flush_result_14 = page_contents(pdf, orig_page);
+    let qpdf_flush_result_14 = page_contents(&orig_page);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let orig_contents = qpdf_flush_result_14?;
-    let new_page = flpdf::pages::page_refs(&mut final_pdf)?
+    let new_page = crate::common::raw_page_handles(&mut final_pdf)?
         .into_iter()
         .next()
         .ok_or_else(|| flpdf::Error::System("final has no pages".to_string()))?;
-    let new_contents = page_contents(&mut final_pdf, new_page)?;
+    let new_contents = page_contents(&new_page)?;
     if orig_contents != new_contents {
         writeln!(stdout, "oops -- page contents don't match")?;
         writeln!(stdout, "original:")?;
@@ -890,8 +889,9 @@ logic error: Attempting to add an object from a different QPDF. Use QPDF::copyFo
         // page (test_driver.cc:991, `QPDFPageDocumentHelper(pdf).addPage(O3,
         // false)`) must grow the page count to two, using the resolving
         // `try_get_key` path this case now exercises for `/O3`.
-        let pages = flpdf::pages::page_refs(&mut written).expect("read written page list");
-        assert_eq!(pages.len(), 2, "O3 must be appended as a second page");
+        let page_count =
+            crate::common::raw_page_count(&mut written).expect("read written page list");
+        assert_eq!(page_count, 2, "O3 must be appended as a second page");
 
         // qpdf's `pdf.getTrailer().replaceKey("/QTest",
         // pdf.copyForeignObject(qtest))` (test_driver.cc:993) leaves a live

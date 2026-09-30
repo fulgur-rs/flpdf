@@ -9,7 +9,7 @@ use std::fs::File;
 use std::io::BufReader;
 
 use flpdf::{
-    pages::page_refs, rebuild_page_tree, ObjectRef, PageObjectHelper, PageRange, Pdf, PdfWriter,
+    rebuild_page_tree, ObjectRef, PageDocumentHelper, PageObjectHelper, PageRange, Pdf, PdfWriter,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pdf = Pdf::open(BufReader::new(File::open(&src_path)?))?;
 
     // Resolve the qpdf page-range syntax 1-5 to concrete page ObjectRefs.
-    let all_pages = page_refs(&mut pdf)?;
+    let all_pages = common::checked_page_refs(&mut pdf)?;
     let page_count = u32::try_from(all_pages.len())?;
     let selected_indices = PageRange::parse_numrange("1-5")?.resolve(page_count)?;
     let selected: Vec<ObjectRef> = selected_indices
@@ -38,10 +38,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // MediaBox widths (the fixture assigns width = 100 + 1-based page index, so
     // pages 1..=5 carry widths 101..=105).
     let mut out_pdf = Pdf::open(BufReader::new(File::open(&out_path)?))?;
-    let refs: Vec<ObjectRef> = page_refs(&mut out_pdf)?;
-    let mut widths = Vec::with_capacity(refs.len());
-    for page_ref in refs {
-        let mut helper = PageObjectHelper::new(page_ref, &mut out_pdf);
+    let pages = PageDocumentHelper::new(&mut out_pdf).get_all_pages()?;
+    let mut widths = Vec::with_capacity(pages.len());
+    for page in pages {
+        let mut helper = PageObjectHelper::from_object_handle(page, &mut out_pdf);
         let mb = helper.media_box()?.ok_or("page has no MediaBox")?;
         widths.push((mb.urx - mb.llx).round() as i64);
     }

@@ -1,5 +1,5 @@
 use assert_cmd::Command;
-use flpdf::{PageDocumentHelper, PageObjectHelper, Pdf};
+use flpdf::{ObjectHandle, PageDocumentHelper, PageObjectHelper, Pdf};
 use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -30,6 +30,20 @@ fn page_count(path: &std::path::Path) -> usize {
         .get_all_pages()
         .unwrap()
         .len()
+}
+
+fn first_page_handle(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> ObjectHandle {
+    PageDocumentHelper::new(pdf)
+        .get_all_pages()
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("fixture has a page")
+}
+
+fn checked_page_ref(page: &ObjectHandle) -> flpdf::ObjectRef {
+    page.object_ref()
+        .expect("page-content API fixture uses valid N G R syntax")
 }
 
 fn one_page_with_image_pdf() -> Vec<u8> {
@@ -3069,8 +3083,8 @@ fn job_json_file_coalesce_contents_replaces_a_page_contents_array() {
         fs::read(directory.path().join("coalesced.pdf")).unwrap(),
     ))
     .unwrap();
-    let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
-    let page = pdf.get_object_handle(page_ref);
+    let page = first_page_handle(&mut pdf);
+    let page_ref = checked_page_ref(&page);
     page.try_is_scalar().unwrap();
     let contents = page.try_get_key(b"/Contents").unwrap();
     contents.try_is_scalar().unwrap();
@@ -3108,8 +3122,7 @@ fn job_json_file_flatten_rotation_bakes_rotate_into_page_content() {
         fs::read(directory.path().join("flattened.pdf")).unwrap(),
     ))
     .unwrap();
-    let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
-    let page = pdf.get_object_handle(page_ref);
+    let page = first_page_handle(&mut pdf);
     page.try_is_scalar().unwrap();
     assert!(
         !page.try_has_key(b"/Rotate").unwrap(),
@@ -3127,6 +3140,7 @@ fn job_json_file_flatten_rotation_bakes_rotate_into_page_content() {
         vec![Some(0), Some(0), Some(792), Some(612)]
     );
 
+    let page_ref = checked_page_ref(&page);
     assert!(
         flpdf::pages::page_content_bytes(&mut pdf, page_ref)
             .unwrap()
@@ -3200,8 +3214,7 @@ fn job_json_file_generate_appearances_clears_need_marker_and_adds_ap() {
         "generateAppearances must clear qpdf's NeedAppearances marker"
     );
 
-    let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
-    let page = pdf.get_object_handle(page_ref);
+    let page = first_page_handle(&mut pdf);
     page.try_is_scalar().unwrap();
     let annots = page.try_get_key(b"/Annots").unwrap();
     annots.try_is_scalar().unwrap();
@@ -3243,9 +3256,9 @@ fn job_json_file_flatten_annotations_all_removes_widget_from_annots() {
         fs::read(directory.path().join("flattened.pdf")).unwrap(),
     ))
     .unwrap();
-    let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+    let page = first_page_handle(&mut pdf);
     assert!(
-        PageObjectHelper::new(page_ref, &mut pdf)
+        PageObjectHelper::from_object_handle(page, &mut pdf)
             .get_annotations_filtered(None)
             .unwrap()
             .is_empty(),
@@ -3313,8 +3326,9 @@ fn job_json_file_flatten_annotations_modes_follow_qpdf_flag_masks() {
             fs::read(directory.path().join("flattened.pdf")).unwrap(),
         ))
         .unwrap();
-        let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
-        let remaining = PageObjectHelper::new(page_ref, &mut pdf)
+        let page = first_page_handle(&mut pdf);
+        let page_ref = checked_page_ref(&page);
+        let remaining = PageObjectHelper::from_object_handle(page.clone(), &mut pdf)
             .get_annotations_filtered(None)
             .unwrap()
             .len();
@@ -3337,7 +3351,8 @@ fn job_json_file_flatten_annotations_modes_follow_qpdf_flag_masks() {
                 fs::read(directory.path().join("qpdf.pdf")).unwrap(),
             ))
             .unwrap();
-            let qpdf_page_ref = flpdf::pages::page_refs(&mut qpdf).unwrap()[0];
+            let qpdf_page = first_page_handle(&mut qpdf);
+            let qpdf_page_ref = checked_page_ref(&qpdf_page);
             let qpdf_content = flpdf::pages::page_content_bytes(&mut qpdf, qpdf_page_ref).unwrap();
             let qpdf_drawn = qpdf_content
                 .windows(b" Do\n".len())
@@ -3381,9 +3396,9 @@ fn job_json_file_generate_appearances_runs_before_flatten_annotations() {
         fs::read(directory.path().join("flattened.pdf")).unwrap(),
     ))
     .unwrap();
-    let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+    let page = first_page_handle(&mut pdf);
     assert!(
-        PageObjectHelper::new(page_ref, &mut pdf)
+        PageObjectHelper::from_object_handle(page, &mut pdf)
             .get_annotations_filtered(None)
             .unwrap()
             .is_empty(),
@@ -4033,11 +4048,10 @@ fn job_json_file_remove_restrictions_disables_signature_fields() {
 
 fn page_rotations(bytes: &[u8]) -> Vec<Option<i64>> {
     let mut pdf = Pdf::open(Cursor::new(bytes.to_vec())).unwrap();
-    let pages = flpdf::pages::page_refs(&mut pdf).unwrap();
+    let pages = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap();
     pages
         .into_iter()
-        .map(|page_ref| {
-            let page = pdf.get_object_handle(page_ref);
+        .map(|page| {
             page.try_is_scalar().unwrap();
             let rotate = page.try_get_key(b"/Rotate").unwrap();
             rotate.try_is_scalar().unwrap();

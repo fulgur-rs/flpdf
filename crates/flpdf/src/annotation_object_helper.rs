@@ -29,12 +29,12 @@
 //! ```no_run
 //! use std::fs::File;
 //! use std::io::BufReader;
-//! use flpdf::{pages, Pdf, PageObjectHelper, AnnotationObjectHelper};
+//! use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper, AnnotationObjectHelper};
 //!
 //! let mut pdf = Pdf::open(BufReader::new(File::open("annotated.pdf")?))?;
-//! let page_refs = pages::page_refs(&mut pdf)?;
-//! if let Some(&page_ref) = page_refs.first() {
-//!     let mut page_helper = PageObjectHelper::new(page_ref, &mut pdf);
+//! let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
+//! if let Some(page) = pages.into_iter().next() {
+//!     let mut page_helper = PageObjectHelper::from_object_handle(page, &mut pdf);
 //!     let annot_handles = page_helper.get_annotation_handles(None)?;
 //!     drop(page_helper);
 //!     for annot_handle in annot_handles {

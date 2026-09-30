@@ -10,7 +10,7 @@
 //! cargo run --example inspect -- path/to/file.pdf
 //! ```
 
-use flpdf::{pages, Pdf};
+use flpdf::{PageDocumentHelper, Pdf};
 use std::env;
 use std::fs::File;
 use std::io::BufReader;
@@ -34,8 +34,8 @@ fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("version: {}", pdf.version());
 
-    let page_refs = pages::page_refs(&mut pdf)?;
-    println!("pages: {}", page_refs.len());
+    let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
+    println!("pages: {}", pages.len());
 
     let mut outline_helper = pdf.outline();
     let outline = outline_helper.get_tree()?;

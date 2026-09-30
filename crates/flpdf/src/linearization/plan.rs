@@ -1559,16 +1559,16 @@ impl LinearizationPlan {
     ///
     /// # Errors
     ///
-    /// Propagates any error from [`crate::pages::page_refs`] when collecting the
-    /// document's page references (e.g. a malformed or unresolvable `/Pages`
-    /// tree). Also propagates any error from resolving objects while computing
-    /// each page's reachability closure (via canonical ObjectHandle resolution /
-    /// canonical ObjectHandle resolution) — typically an [`crate::Error::Io`] or
-    /// [`crate::Error::Parse`] on a truncated or malformed object. Before any
-    /// of that, this also pushes inherited page attributes down the `/Pages`
-    /// tree, which propagates the same object-resolution errors and returns
-    /// [`crate::Error::Unsupported`] if the tree exceeds the page-tree depth
-    /// bound.
+    /// Propagates errors from [`crate::PageDocumentHelper::get_all_pages`] when
+    /// enumerating the repaired page tree. It also returns
+    /// [`crate::Error::Unsupported`] if a raw page identity cannot be represented
+    /// as a valid [`ObjectRef`] for linearization planning. Errors from resolving
+    /// objects while computing each page's reachability closure are also
+    /// propagated — typically an [`crate::Error::Io`] or [`crate::Error::Parse`]
+    /// on a truncated or malformed object. Before any of that, this pushes
+    /// inherited page attributes down the `/Pages` tree, which propagates the
+    /// same object-resolution errors and returns [`crate::Error::Unsupported`]
+    /// if the tree exceeds the page-tree depth bound.
     pub fn from_pdf<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         use_generate_objstm: bool,

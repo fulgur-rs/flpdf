@@ -8,7 +8,7 @@ mod common;
 use std::fs::File;
 use std::io::BufReader;
 
-use flpdf::{pages::page_refs, rebuild_page_tree, ObjectRef, PageRange, Pdf, PdfWriter};
+use flpdf::{rebuild_page_tree, ObjectRef, PageDocumentHelper, PageRange, Pdf, PdfWriter};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A 5-page source document (all pages share one font object).
@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pdf = Pdf::open(BufReader::new(File::open(&src_path)?))?;
 
     // Resolve the qpdf page-range syntax 1,3,5 to concrete page ObjectRefs.
-    let all_pages = page_refs(&mut pdf)?;
+    let all_pages = common::checked_page_refs(&mut pdf)?;
     let page_count = u32::try_from(all_pages.len())?;
     let selected_indices = PageRange::parse_numrange("1,3,5")?.resolve(page_count)?;
     let selected: Vec<ObjectRef> = selected_indices
@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Re-open the output and verify it has exactly 3 pages.
     let mut out_pdf = Pdf::open(BufReader::new(File::open(&out_path)?))?;
-    let count = page_refs(&mut out_pdf)?.len();
+    let count = PageDocumentHelper::new(&mut out_pdf).get_all_pages()?.len();
     assert_eq!(count, 3, "expected 3 extracted pages, got {count}");
     println!("extract_pages: extracted pages 1,3,5 -> output has {count} pages");
 

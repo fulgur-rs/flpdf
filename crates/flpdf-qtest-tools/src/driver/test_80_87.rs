@@ -93,7 +93,7 @@ pub(crate) fn run_test_80<R: Read + Seek>(
     // remain in AcroFormDocumentHelper; this driver only sequences their live
     // handles and delegates the foreign-page copy to PageObjectHelper.
     let arg2 = arg2.ok_or_else(|| Error::Internal("test 80 requires arg2".to_owned()))?;
-    let page1_ref = flpdf::pages::page_refs(pdf)?
+    let page1 = crate::common::raw_page_handles(pdf)?
         .into_iter()
         .next()
         .ok_or_else(|| Error::Internal("test 80 requires a first page".to_owned()))?;
@@ -103,7 +103,6 @@ pub(crate) fn run_test_80<R: Read + Seek>(
     // `transform_annotations`'s own resolving `try_as_array` step resolves
     // `old_annots` in turn, so no standalone resolve is needed for either
     // handle.
-    let page1 = pdf.get_object_handle(page1_ref);
     let old_annots = page1.try_get_key(b"/Annots")?;
 
     let mut first_matrix = Matrix::default();
@@ -122,7 +121,7 @@ pub(crate) fn run_test_80<R: Read + Seek>(
     let secondary_filename = os_str_diagnostic_bytes(arg2).into_owned();
     let mut pdf2 = open_test_80_secondary(arg2, stdout, stderr)?;
     let mut secondary_diagnostics = pdf2.repair_diagnostics().entries().len();
-    let page2_ref = flpdf::pages::page_refs(&mut pdf2)?
+    let page2 = crate::common::raw_page_handles(&mut pdf2)?
         .into_iter()
         .next()
         .ok_or_else(|| Error::Internal("test 80 requires a second page".to_owned()))?;
@@ -130,7 +129,7 @@ pub(crate) fn run_test_80<R: Read + Seek>(
     second_matrix.translate(612.0, 0.0);
     second_matrix.scale(-1.0, 1.0);
     {
-        let mut page2 = PageObjectHelper::new(page2_ref, &mut pdf2);
+        let mut page2 = PageObjectHelper::from_object_handle(page2, &mut pdf2);
         page2.copy_annotations_from(page1.clone(), second_matrix, pdf)?;
     }
     emit_new_diagnostics(

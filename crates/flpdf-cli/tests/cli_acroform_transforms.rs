@@ -1039,10 +1039,10 @@ fn flatten_all_annot_removed_and_do_in_content() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let page_refs = flpdf::pages::page_refs(&mut pdf).unwrap();
+    let page = common::first_page_handle(&mut pdf);
 
     // Annotation must be gone from /Annots.
-    let annots = page_annotation_handles(&mut pdf, page_refs[0]);
+    let annots = page_annotation_handles(&mut pdf, page.clone());
     assert!(
         annots.is_empty(),
         "flatten=all must remove widget from /Annots, found {} annotation(s)",
@@ -1050,7 +1050,8 @@ fn flatten_all_annot_removed_and_do_in_content() {
     );
 
     // Page content must contain a Do operator (the flattened XObject).
-    let content = flpdf::pages::page_content_bytes(&mut pdf, page_refs[0]).unwrap();
+    let content =
+        flpdf::pages::page_content_bytes(&mut pdf, common::checked_page_ref(&page)).unwrap();
     assert!(
         content.windows(2).any(|w| w == b"Do"),
         "flatten=all must insert a Do operator into page content; \
@@ -1084,16 +1085,17 @@ fn generate_then_flatten_all_do_in_content() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let page_refs = flpdf::pages::page_refs(&mut pdf).unwrap();
+    let page = common::first_page_handle(&mut pdf);
 
-    let annots = page_annotation_handles(&mut pdf, page_refs[0]);
+    let annots = page_annotation_handles(&mut pdf, page.clone());
     assert!(
         annots.is_empty(),
         "generate+flatten=all must remove widget from /Annots, found {} annotation(s)",
         annots.len()
     );
 
-    let content = flpdf::pages::page_content_bytes(&mut pdf, page_refs[0]).unwrap();
+    let content =
+        flpdf::pages::page_content_bytes(&mut pdf, common::checked_page_ref(&page)).unwrap();
     assert!(
         content.windows(2).any(|w| w == b"Do"),
         "generate+flatten=all must insert Do into page content; \
@@ -1125,9 +1127,9 @@ fn generate_then_flatten_clears_need_appearances() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+    let page = common::first_page_handle(&mut pdf);
     assert!(
-        page_annotation_handles(&mut pdf, page_ref).is_empty(),
+        page_annotation_handles(&mut pdf, page).is_empty(),
         "generated widget must be flattened after qpdf clears NeedAppearances"
     );
 }
@@ -1153,12 +1155,13 @@ fn generate_then_flatten_replaces_indirect_null_normal_appearance() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+    let page = common::first_page_handle(&mut pdf);
     assert!(
-        page_annotation_handles(&mut pdf, page_ref).is_empty(),
+        page_annotation_handles(&mut pdf, page.clone()).is_empty(),
         "generated widget must be flattened after qpdf clears NeedAppearances"
     );
-    let content = flpdf::pages::page_content_bytes(&mut pdf, page_ref).unwrap();
+    let content =
+        flpdf::pages::page_content_bytes(&mut pdf, common::checked_page_ref(&page)).unwrap();
     assert!(
         content.windows(2).any(|window| window == b"Do"),
         "an indirect null /AP/N must be regenerated before flattening; content={:?}",
@@ -1190,13 +1193,14 @@ fn flatten_print_draws_print_bit_annot_and_removes_all_selected_appearances() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let page_refs = flpdf::pages::page_refs(&mut pdf).unwrap();
+    let pages = common::raw_page_handles(&mut pdf).unwrap();
 
-    let annots = page_annotation_handles(&mut pdf, page_refs[0]);
+    let annots = page_annotation_handles(&mut pdf, pages[0].clone());
     assert!(annots.is_empty());
 
     // Page content must have a Do (from the Print-bit annotation being flattened).
-    let content = flpdf::pages::page_content_bytes(&mut pdf, page_refs[0]).unwrap();
+    let content =
+        flpdf::pages::page_content_bytes(&mut pdf, common::checked_page_ref(&pages[0])).unwrap();
     assert!(
         content.windows(2).any(|w| w == b"Do"),
         "flatten=print must insert Do for the Print-bit annotation; \
@@ -1242,12 +1246,11 @@ fn flatten_rotation_processes_all_pages() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let page_refs = flpdf::pages::page_refs(&mut pdf).unwrap();
-    assert_eq!(page_refs.len(), 2, "output must have 2 pages");
+    let pages = common::raw_page_handles(&mut pdf).unwrap();
+    assert_eq!(pages.len(), 2, "output must have 2 pages");
 
-    for (i, &page_ref) in page_refs.iter().enumerate() {
-        let page_obj = pdf.resolve_canonical_object(page_ref).unwrap();
-        let rotate = page_obj.try_get_key(b"/Rotate").unwrap().as_integer();
+    for (i, page) in pages.into_iter().enumerate() {
+        let rotate = page.try_get_key(b"/Rotate").unwrap().as_integer();
         assert!(
             rotate.is_none() || rotate == Some(0),
             "page {} /Rotate should be absent or 0 after --flatten-rotation, got {rotate:?}",

@@ -16,11 +16,11 @@ use flpdf::writer::DecodeLevel as StreamDecodeLevel;
 use flpdf::PasswordWriteNotice;
 use flpdf::{
     json_inspect::{DecodeLevel, JsonKey},
-    normalize_content_stream, pages, parse_pdf_version, CompressStreams, CopyEncryptionSource,
+    normalize_content_stream, parse_pdf_version, CompressStreams, CopyEncryptionSource,
     EncryptMethod, EncryptParams, Error, Matrix, NewlineBeforeEndstream, ObjectHandle,
-    ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageObjectHelper, PasswordMode, Pdf, PdfOpenOptions,
-    PdfVersion, PermissionsConfig, PrintPermission, QPDFLogger, R2PermissionsConfig,
-    StreamDataMode, UsageError, WriterConfiguration,
+    ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, PageObjectHelper, PasswordMode,
+    Pdf, PdfOpenOptions, PdfVersion, PermissionsConfig, PrintPermission, QPDFLogger,
+    R2PermissionsConfig, StreamDataMode, UsageError, WriterConfiguration,
 };
 use flpdf::{
     pages::tree_rebuild::{rebuild_page_tree_with_duplicate_hook, RebuildResult},
@@ -7516,7 +7516,7 @@ fn run_empty_page_extraction(
                 .map_or(floor, |current| current.max(floor)),
         );
     }
-    let selected_pages = pages::page_refs(&mut merged)?;
+    let selected_pages = PageDocumentHelper::new(&mut merged).get_all_pages()?;
 
     let result = run_page_extraction_after_plan(
         &mut merged,
@@ -7675,7 +7675,7 @@ fn run_page_extraction_from_multiple_sources(
     // The Job has already mutated the primary page tree and copied selected
     // foreign pages into that same document. Use its resulting page list for
     // the CLI-specific post-selection transformations.
-    let selected_pages = pages::page_refs(&mut merged)?;
+    let selected_pages = PageDocumentHelper::new(&mut merged).get_all_pages()?;
 
     let result = run_page_extraction_after_plan(
         &mut merged,
@@ -7832,7 +7832,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     _standard_output: Option<PipelineWriter>,
     prior_warnings: bool,
     page_job_result: Option<(RebuildResult, RemoveUnreferencedResources)>,
-    selected_pages: Vec<ObjectRef>,
+    selected_pages: Vec<ObjectHandle>,
     image_options: ImageTransformOptions,
     coalesce_contents: bool,
     generate_appearances: bool,
@@ -7841,8 +7841,6 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     no_warn: bool,
 ) -> CliResult<()> {
     pdf.set_suppress_warnings(no_warn);
-    let selected = selected_pages;
-
     let (result, prune_mode) = if let Some((result, prune_mode)) = page_job_result {
         (result, prune_mode)
     } else {
@@ -7863,8 +7861,24 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
             destination_page.remove_key(b"/Annots");
             PageObjectHelper::new(new_page, pdf).copy_annotations(source_page, Matrix::default())
         };
-        let result =
-            rebuild_page_tree_with_duplicate_hook(pdf, &selected, &mut copy_duplicate_annotations)?;
+        let selected_refs: Vec<ObjectRef> = selected_pages
+            .into_iter()
+            .map(|page| {
+                let object_gen = page.get_obj_gen();
+                page.object_ref().ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "selected page {} {} is not a valid N G R reference",
+                        object_gen.get_obj(),
+                        object_gen.get_gen()
+                    ))
+                })
+            })
+            .collect::<flpdf::Result<_>>()?;
+        let result = rebuild_page_tree_with_duplicate_hook(
+            pdf,
+            &selected_refs,
+            &mut copy_duplicate_annotations,
+        )?;
         (result, RemoveUnreferencedResources::No)
     };
     QPDFJob::complete_in_place_page_selection(pdf, &result, prune_mode)?;
@@ -8230,9 +8244,9 @@ fn normalize_page_contents<R: Read + Seek>(
 ) -> CliResult<Vec<ContentNormalizationWarning>> {
     let mut warnings = Vec::new();
     let mut seen = HashSet::new();
-    let page_refs = pages::page_refs(pdf)?;
-    for page_ref in page_refs {
-        warnings.extend(apply_normalize_content(pdf, page_ref, &mut seen)?);
+    let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    for page in pages {
+        warnings.extend(apply_normalize_content(page, &mut seen)?);
     }
     Ok(warnings)
 }
@@ -8247,13 +8261,11 @@ fn normalize_page_contents<R: Read + Seek>(
 /// (normalized) byte count. No filter is applied here — the canonical writer
 /// emits the already-normalized bytes through qpdf's normalization branch,
 /// which takes precedence over ordinary stream compression.
-fn apply_normalize_content<R: std::io::Read + std::io::Seek>(
-    pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
+fn apply_normalize_content(
+    page: ObjectHandle,
     seen: &mut HashSet<ObjectRef>,
 ) -> CliResult<Vec<ContentNormalizationWarning>> {
     let mut warnings = Vec::new();
-    let page = pdf.get_object_handle(page_ref);
     let contents = page.try_get_key(b"/Contents")?;
     let contents_ref = contents.object_ref();
 

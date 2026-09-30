@@ -1,14 +1,21 @@
-use flpdf::{pages, Error, ObjectRef, Pdf};
+use flpdf::{pages, Error, ObjectRef, PageDocumentHelper, Pdf};
 use std::io::Cursor;
 use std::io::Write;
 use std::process::Command;
 
 #[test]
-fn page_refs_returns_pages_in_document_order() {
+fn get_all_pages_returns_raw_page_handles_in_document_order() {
     let pdf = nested_pages_pdf();
     let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();
-    let pages = pages::page_refs(&mut pdf).unwrap();
-    assert_eq!(pages, vec![ObjectRef::new(3, 0), ObjectRef::new(6, 0)]);
+    let pages = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap();
+    let object_gens: Vec<_> = pages
+        .into_iter()
+        .map(|page| {
+            let object_gen = page.get_obj_gen();
+            (object_gen.get_obj(), object_gen.get_gen())
+        })
+        .collect();
+    assert_eq!(object_gens, vec![(3, 0), (6, 0)]);
 }
 
 #[test]
@@ -45,7 +52,7 @@ fn qpdf_available() -> bool {
 }
 
 #[test]
-fn page_refs_accepts_a_120_level_tree_like_qpdf() {
+fn get_all_pages_accepts_a_120_level_tree_like_qpdf() {
     let bytes = deep_nested_pages_pdf(120);
     if !qpdf_available() {
         if std::env::var_os("CI").is_some() {
@@ -68,8 +75,10 @@ fn page_refs_accepts_a_120_level_tree_like_qpdf() {
     }
 
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-    let pages = pages::page_refs(&mut pdf).unwrap();
-    assert_eq!(pages, vec![ObjectRef::new(122, 0)]);
+    let pages = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap();
+    let page = pages.first().expect("deep tree has one raw page");
+    let object_gen = page.get_obj_gen();
+    assert_eq!((object_gen.get_obj(), object_gen.get_gen()), (122, 0));
 }
 
 #[test]

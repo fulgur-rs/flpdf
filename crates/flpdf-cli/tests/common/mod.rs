@@ -6,7 +6,34 @@
 
 #![allow(dead_code)]
 
-use flpdf::{ObjectHandle, ObjectRef, PageObjectHelper, Pdf, Result};
+use flpdf::{ObjectHandle, ObjectRef, PageDocumentHelper, PageObjectHelper, Pdf, Result};
+
+/// Enumerate qpdf's repaired page list while preserving each raw page handle.
+pub fn raw_page_handles<R: std::io::Read + std::io::Seek>(
+    pdf: &mut Pdf<R>,
+) -> Result<Vec<ObjectHandle>> {
+    PageDocumentHelper::new(pdf).get_all_pages()
+}
+
+/// Count qpdf's repaired raw page list without requiring indirect references.
+pub fn raw_page_count<R: std::io::Read + std::io::Seek>(pdf: &mut Pdf<R>) -> Result<usize> {
+    Ok(raw_page_handles(pdf)?.len())
+}
+
+/// Project one raw handle only for test operations whose input is an `ObjectRef`.
+pub fn checked_page_ref(page: &ObjectHandle) -> ObjectRef {
+    page.object_ref()
+        .expect("fixture page must have valid N G R syntax")
+}
+
+/// Return the first page's raw handle from qpdf's repaired page list.
+pub fn first_page_handle<R: std::io::Read + std::io::Seek>(pdf: &mut Pdf<R>) -> ObjectHandle {
+    raw_page_handles(pdf)
+        .expect("enumerate page tree")
+        .into_iter()
+        .next()
+        .expect("fixture must have at least one page")
+}
 
 /// Canonical object access for integration assertions after the library's
 /// owned raw-object resolver was removed.
@@ -36,9 +63,9 @@ pub fn canonical_object_refs<R: std::io::Read + std::io::Seek + 'static>(
 /// Return the canonical annotation handles listed by a page.
 pub fn page_annotation_handles<R: std::io::Read + std::io::Seek>(
     pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
+    page: ObjectHandle,
 ) -> Vec<ObjectHandle> {
-    PageObjectHelper::new(page_ref, pdf)
+    PageObjectHelper::from_object_handle(page, pdf)
         .get_annotations_filtered(None)
         .unwrap()
 }
@@ -51,11 +78,8 @@ pub fn page_annotation_handles<R: std::io::Read + std::io::Seek>(
 /// `annot_ref` is the dict that holds `/AP`. Panics unless the first page
 /// carries exactly one Widget annotation, so a fixture change is caught.
 pub fn first_widget_ref<R: std::io::Read + std::io::Seek>(pdf: &mut Pdf<R>) -> ObjectRef {
-    let page_ref = *flpdf::pages::page_refs(pdf)
-        .unwrap()
-        .first()
-        .expect("fixture must have at least one page");
-    let widgets: Vec<_> = PageObjectHelper::new(page_ref, pdf)
+    let page = first_page_handle(pdf);
+    let widgets: Vec<_> = PageObjectHelper::from_object_handle(page, pdf)
         .get_annotations_filtered(Some(b"/Widget"))
         .unwrap();
     assert_eq!(

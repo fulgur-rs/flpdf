@@ -1874,9 +1874,12 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "test 71 retains the qpdf-less caller-side Pdf::resolve bridge"
     );
     assert!(
-        test_71.contains("page.try_get_key(")
+        test_71.contains("page_handle.try_get_key(")
             && test_71.contains("resources.try_get_key(")
-            && test_71.contains("xobjects.try_get_key("),
+            && test_71.contains("xobjects.try_get_key(")
+            && test_71.contains("raw_page_handles(pdf)?")
+            && test_71.contains("PageObjectHelper::from_object_handle(")
+            && !test_71.contains("checked_page_refs("),
         "test 71 must use canonical resolving key accessors for the Fx1 chain"
     );
 

@@ -12,7 +12,7 @@
 //! absent entry; resolving an indirect one here would preempt qpdf's own
 //! classification.
 
-use flpdf::{pages, Pdf};
+use flpdf::{PageDocumentHelper, Pdf};
 use std::collections::BTreeMap;
 
 fn build(trailer_extra: &str, objects: &[(u32, &str)]) -> Vec<u8> {
@@ -35,10 +35,11 @@ fn build(trailer_extra: &str, objects: &[(u32, &str)]) -> Vec<u8> {
     out
 }
 
-fn page_refs_result(bytes: Vec<u8>) -> Result<usize, String> {
+fn page_count_result(bytes: Vec<u8>) -> Result<usize, String> {
     let mut pdf = Pdf::open_mem_owned(bytes).map_err(|error| format!("open: {error}"))?;
-    pages::page_refs(&mut pdf)
-        .map(|refs| refs.len())
+    PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .map(|pages| pages.len())
         .map_err(|error| error.to_string())
 }
 
@@ -51,7 +52,7 @@ fn indirect_root_resolving_to_null_reports_the_qpdf_root_error() {
         &[(1, "<< /Type /Pages /Kids [] /Count 0 >>")],
     );
     assert_eq!(
-        page_refs_result(bytes),
+        page_count_result(bytes),
         Err("unable to find /Root dictionary".to_owned())
     );
 }
@@ -65,7 +66,7 @@ fn indirect_root_resolving_to_a_non_dictionary_reports_the_qpdf_root_error() {
         &[(1, "<< /Type /Pages /Kids [] /Count 0 >>"), (9, "42")],
     );
     assert_eq!(
-        page_refs_result(bytes),
+        page_count_result(bytes),
         Err("unable to find /Root dictionary".to_owned())
     );
 }
@@ -76,7 +77,7 @@ fn indirect_root_resolving_to_a_non_dictionary_reports_the_qpdf_root_error() {
 fn absent_root_reports_a_missing_entry() {
     let bytes = build("", &[(1, "<< /Type /Pages /Kids [] /Count 0 >>")]);
     assert_eq!(
-        page_refs_result(bytes),
+        page_count_result(bytes),
         Err("missing required PDF entry: /Root".to_owned())
     );
 }
@@ -86,7 +87,7 @@ fn absent_root_reports_a_missing_entry() {
 #[test]
 fn indirect_pages_resolving_to_null_enumerates_no_pages() {
     let bytes = build("/Root 1 0 R", &[(1, "<< /Type /Catalog /Pages 9 0 R >>")]);
-    assert_eq!(page_refs_result(bytes), Ok(0));
+    assert_eq!(page_count_result(bytes), Ok(0));
 }
 
 /// An explicit direct null `/Pages` reaches qpdf's `/Kids` type-error boundary.
@@ -94,7 +95,7 @@ fn indirect_pages_resolving_to_null_enumerates_no_pages() {
 fn direct_null_pages_reports_the_qpdf_type_error() {
     let bytes = build("/Root 1 0 R", &[(1, "<< /Type /Catalog /Pages null >>")]);
     assert_eq!(
-        page_refs_result(bytes),
+        page_count_result(bytes),
         Err("operation for dictionary attempted on object of type null: returning false for a key containment request".to_owned())
     );
 }
