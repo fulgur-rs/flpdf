@@ -1488,6 +1488,96 @@ mod tests {
         raw_page
     }
 
+    fn direct_page_handle() -> ObjectHandle {
+        ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (
+                b"/MediaBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(612),
+                    ObjectHandle::integer(792),
+                ]),
+            ),
+            (b"/Resources".to_vec(), ObjectHandle::dictionary(Vec::new())),
+        ])
+    }
+
+    fn assert_direct_source_form_error_is_propagated(kind: OverlayKind) {
+        let mut dest = Pdf::open(Cursor::new(one_page_pdf(false))).expect("destination PDF");
+        let dest_page = crate::PageDocumentHelper::new(&mut dest)
+            .get_all_pages()
+            .expect("enumerate destination page")
+            .into_iter()
+            .next()
+            .expect("destination has a page");
+        let mut source = Pdf::empty().expect("source PDF");
+        let sources = [OverlaySource {
+            kind,
+            source_page: (0, 1, direct_page_handle()),
+        }];
+        let mut source_documents = [&mut source];
+        let error = under_overlay_for_page(
+            &mut dest,
+            dest_page,
+            &sources,
+            &mut BTreeMap::new(),
+            &mut source_documents,
+        )
+        .expect_err("qpdf rejects getFormXObjectForPage on a direct source page");
+        assert!(
+            error.to_string().contains(
+                "QPDFPageObjectHelper::getFormXObjectForPage called with a direct object"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn underlay_propagates_direct_source_form_conversion_error() {
+        assert_direct_source_form_error_is_propagated(OverlayKind::Underlay);
+    }
+
+    #[test]
+    fn overlay_propagates_direct_source_form_conversion_error() {
+        assert_direct_source_form_error_is_propagated(OverlayKind::Overlay);
+    }
+
+    #[test]
+    fn overlay_page_handle_rejects_a_page_owned_by_another_pdf() {
+        let mut destination = Pdf::open(Cursor::new(one_page_pdf(false))).expect("destination PDF");
+        let mut source = Pdf::open(Cursor::new(one_page_pdf(false))).expect("source PDF");
+        let foreign_page = crate::PageDocumentHelper::new(&mut source)
+            .get_all_pages()
+            .expect("enumerate source page")
+            .into_iter()
+            .next()
+            .expect("source has a page");
+
+        let error = overlay_page_handle(&mut destination, foreign_page)
+            .expect_err("overlay must not mutate a page owned by another document");
+        assert!(
+            error
+                .to_string()
+                .contains("overlay destination page belongs to another Pdf"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn overlay_page_handle_rejects_a_non_dictionary_object() {
+        let mut pdf = Pdf::open(Cursor::new(one_page_pdf(false))).expect("PDF");
+        let stream = pdf.get_object_handle(ObjectRef::new(4, 0));
+
+        let error = overlay_page_handle(&mut pdf, stream)
+            .expect_err("overlay destination must be a page dictionary");
+        assert!(
+            error.to_string().contains("is not a dictionary"),
+            "unexpected error: {error}"
+        );
+    }
+
     #[test]
     fn overlay_keeps_raw_generation_source_and_destination_pages_through_annotation_copy() {
         let mut dest = Pdf::open(Cursor::new(one_page_pdf(false))).expect("destination PDF");
