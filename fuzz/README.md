@@ -7,7 +7,8 @@ aborts, or hangs**, and document traversal always terminates.
 This is a standalone crate (its own `[workspace]` table) and lives at the repo
 root so it is never bundled into the published `flpdf` crate. It requires a
 **nightly** toolchain; stable `cargo build/test/clippy --workspace` never touches
-it.
+it. See [`docs/fuzzing.md`](../docs/fuzzing.md) for shared contributor steps
+such as setup, corpus seeding, crash triage, and regression fixtures.
 
 ## Targets
 
@@ -55,14 +56,15 @@ per requested stage, then the remaining bytes become raw stream data. Selector
 `0xff` exercises PNG row-width wrap-to-error; selector `0xfe` on LZW exercises
 the TIFF predictor's overflow preflight.
 
-### Rebuild local corpora from fixtures
+### Seed sources and local corpora
 
 Run `tools/seed-corpus.sh` to populate all five gitignored writable corpora.
 It copies every PDF fixture to `roundtrip` and `xref`, test-driver PDFs to
 `primitive_parser`, small ObjStm PDFs to `objstm`, and committed synthetic inputs
 to the matching targets. Inputs use content-hash names; rerunning the script
 adds updated fixtures without deleting existing libFuzzer discoveries. The
-versioned seed sources remain under `fuzz/seeds/`.
+versioned seed sources remain under `fuzz/seeds/`; the contributor guide has the
+seeding command and workflow.
 
 The `xref` target follows qpdf 11.9.0's fuzzing boundary rather than
 reimplementing qpdf output checks: qpdf lists its whole-document and focused
@@ -147,23 +149,15 @@ qpdf --check fuzz/seeds/prev_chain/deep-128-cycle.pdf -> exit 3, loop detected
 flpdf --check fuzz/seeds/prev_chain/deep-128-cycle.pdf -> exit 3, loop detected
 ```
 
-## Run locally
+## Target-specific commands
+
+For installation, corpus seeding, the standard CI-duration run, and crash
+triage, follow [`docs/fuzzing.md`](../docs/fuzzing.md). The examples here focus
+on target-specific corpora and longer campaigns.
 
 ```bash
-# One-time: install the runner.
-cargo install cargo-fuzz
-
-# Populate the local, ignored corpora from fixtures and committed seeds.
-tools/seed-corpus.sh
-
-# Fuzz the whole-document target (Ctrl-C to stop). `-timeout` flags a
-# non-terminating input as a hang; without it libFuzzer's default is 1200s.
-#
-# `--target x86_64-unknown-linux-gnu` is pinned because cargo-fuzz defaults its
-# build target to the triple it was itself built for; a musl-built cargo-fuzz
-# (e.g. from `cargo binstall`) would otherwise build for musl, whose static
-# libc is incompatible with -Zsanitizer=address.
-cargo +nightly fuzz run --target x86_64-unknown-linux-gnu roundtrip \
+# Whole-document parse and rewrite; runs until interrupted.
+cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu roundtrip \
   fuzz/corpus/roundtrip \
   -- -timeout=10 -rss_limit_mb=2048
 
@@ -205,37 +199,11 @@ cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu objstm \
   fuzz/corpus/objstm \
   -- -max_total_time=360 -max_len=4096 -timeout=10 -rss_limit_mb=2048 -verbosity=0
 
-# Reproduce a crash artifact.
-cargo +nightly fuzz run --target x86_64-unknown-linux-gnu roundtrip \
-  fuzz/artifacts/roundtrip/crash-<hash>
-
-# Reproduce an xref crash artifact.
-cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu xref \
-  fuzz/artifacts/xref/crash-<hash>
-
-# Reproduce a filter-pipeline crash artifact.
-cargo +nightly-2026-05-24 fuzz run --target x86_64-unknown-linux-gnu filter_pipeline \
-  fuzz/artifacts/filter_pipeline/crash-<hash>
 ```
 
-The first positional dir for each target (for example,
-`fuzz/corpus/roundtrip` or `fuzz/corpus/xref`) is the writable, gitignored
-corpus. Run `tools/seed-corpus.sh` before fuzzing; it populates each active
-corpus from fixtures and committed synthetic seeds without removing discoveries.
-
-## When the fuzzer finds a crash
-
-1. Minimize it with the target that found it, for example:
-   `cargo +nightly-2026-05-24 fuzz tmin roundtrip fuzz/artifacts/roundtrip/crash-<hash>`
-   or
-   `cargo +nightly-2026-05-24 fuzz tmin xref fuzz/artifacts/xref/crash-<hash>`.
-2. Copy the minimized bytes into `tests/fixtures/fuzz_regressions/` with a
-   descriptive name (e.g. `deep-nested-array.pdf`).
-3. `crates/flpdf/tests/fuzz_regression_tests.rs` replays the whole directory
-   through both fuzz pipelines on **stable** (`cargo test -p flpdf`), so the
-   fix is gated without a nightly/libFuzzer dependency.
-4. Fix the defect; confirm `cargo test -p flpdf --test fuzz_regression_tests`
-   passes.
+Each first positional corpus directory (such as `fuzz/corpus/roundtrip`) is
+writable and gitignored. The contributor guide explains how to populate it
+without deleting existing discoveries.
 
 ## CI
 

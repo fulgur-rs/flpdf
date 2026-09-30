@@ -1,8 +1,9 @@
 # Fuzzing flpdf
 
-This guide covers the contributor workflow for running flpdf's cargo-fuzz
-targets, triaging findings, and adding a target. The target-specific harnesses,
-seed formats, and recorded runs are documented in [`fuzz/README.md`](../fuzz/README.md).
+Use this guide for the contributor workflow: setting up cargo-fuzz, running
+targets, triaging findings, adding regression fixtures, and adding a target.
+The harness contracts, target-specific input and seed formats, and recorded
+runs are documented in [`fuzz/README.md`](../fuzz/README.md).
 
 ## Prerequisites
 
@@ -65,7 +66,7 @@ the failure type, stack trace, and artifact path. Minimize a reproducer with the
 same target before investigating:
 
 ```bash
-cargo +nightly-2026-05-24 fuzz tmin roundtrip \
+cargo +nightly-2026-05-24 fuzz tmin --target x86_64-unknown-linux-gnu roundtrip \
   fuzz/artifacts/roundtrip/crash-<hash>
 ```
 
