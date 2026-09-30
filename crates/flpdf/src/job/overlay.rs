@@ -4,7 +4,7 @@
 //!
 //!
 //! Each destination page that receives at least one overlay or underlay is
-//! rewritten as follows (see [`get_form_xobject_for_page`](crate::page_form_xobject)):
+//! rewritten as follows (see [`crate::PageObjectHelper::get_form_xobject_for_page`]):
 //!
 //! 1. The destination page itself becomes a Form XObject named `/Fx0`.
 //! 2. Each source (underlay or overlay) is a Form XObject already imported into
@@ -29,9 +29,9 @@ use std::io::{Read, Seek};
 use std::rc::Rc;
 
 use super::page_range::PageRange;
-use crate::page_form_xobject::get_form_xobject_for_page;
+use crate::page_form_xobject::get_form_xobject_for_handle;
 use crate::page_object_helper::{rectangle_from_handle, PageBox, PageObjectHelper};
-use crate::{Error, Matrix, ObjectHandle, ObjectRef, Pdf, Rectangle, Result};
+use crate::{Error, Matrix, ObjectHandle, Pdf, Rectangle, Result};
 
 /// Whether a source page is drawn beneath (`Underlay`) or above (`Overlay`) the
 /// destination page's own content.
@@ -50,9 +50,11 @@ pub enum OverlayKind {
 pub(crate) struct OverlaySource {
     /// The source's kind (overlay or underlay).
     pub kind: OverlayKind,
-    /// `(source document index, source page reference)` used for per-placement
-    /// annotation copying and lazy Form XObject import.
-    pub source_page: (usize, ObjectRef),
+    /// `(source document index, one-based source page number, source page
+    /// handle)` used for per-placement annotation copying and lazy Form
+    /// XObject import. The page number is the qpdf cache key; the handle keeps
+    /// the source identity raw through helper construction.
+    pub source_page: (usize, u32, ObjectHandle),
 }
 
 /// Resolve an overlay source's imported Form XObject, importing it only on the
@@ -60,13 +62,14 @@ pub(crate) struct OverlaySource {
 /// map from `doUnderOverlayForPage`.
 fn resolve_overlay_xobject<R: Read + Seek, RS: Read + Seek>(
     dest: &mut Pdf<R>,
-    source_page: (usize, ObjectRef),
-    imported_sources: &mut BTreeMap<(usize, ObjectRef), ObjectRef>,
+    source_page: (usize, u32, ObjectHandle),
+    imported_sources: &mut BTreeMap<(usize, u32), ObjectHandle>,
     source_documents: &mut [&mut Pdf<RS>],
-) -> Result<ObjectRef> {
-    let (source_index, source_page_ref) = source_page;
-    if let Some(&xobject_ref) = imported_sources.get(&(source_index, source_page_ref)) {
-        return Ok(xobject_ref);
+) -> Result<ObjectHandle> {
+    let (source_index, source_page_number, source_page_handle) = source_page;
+    let cache_key = (source_index, source_page_number);
+    if let Some(xobject) = imported_sources.get(&cache_key) {
+        return Ok(xobject.clone());
     }
     // cov:ignore-start: OverlaySpec constructs source-document indices from
     // the same source_documents slice; this is a defensive public-helper guard.
@@ -77,14 +80,10 @@ fn resolve_overlay_xobject<R: Read + Seek, RS: Read + Seek>(
         ))
     })?;
     // cov:ignore-end
-    let mut source_page = PageObjectHelper::new(source_page_ref, source);
-    let source_form = source_page.get_form_xobject_for_page(true)?;
+    let source_form = get_form_xobject_for_handle(source, source_page_handle)?;
     let copied = dest.copy_foreign_object(&source_form)?;
-    let xobject_ref = copied
-        .object_ref()
-        .ok_or_else(|| Error::Unsupported("imported Form XObject is not indirect".into()))?;
-    imported_sources.insert((source_index, source_page_ref), xobject_ref);
-    Ok(xobject_ref)
+    imported_sources.insert(cache_key, copied.clone());
+    Ok(copied)
 }
 
 /// Apply an ordered list of overlay/underlay `sources` to the destination page
@@ -98,9 +97,9 @@ fn resolve_overlay_xobject<R: Read + Seek, RS: Read + Seek>(
 /// then the overlays.
 fn under_overlay_for_page<R: Read + Seek, RS: Read + Seek>(
     dest: &mut Pdf<R>,
-    dest_page_ref: ObjectRef,
+    dest_page: ObjectHandle,
     sources: &[OverlaySource],
-    imported_sources: &mut BTreeMap<(usize, ObjectRef), ObjectRef>,
+    imported_sources: &mut BTreeMap<(usize, u32), ObjectHandle>,
     source_documents: &mut [&mut Pdf<RS>],
 ) -> Result<()> {
     // qpdf orders sources underlays-then-overlays for BOTH naming and drawing.
@@ -110,11 +109,11 @@ fn under_overlay_for_page<R: Read + Seek, RS: Read + Seek>(
     // enforced below when we consume `underlays` before `overlays` while
     // building the /Fx1.. names and the new content stream.
     //
-    type PlacementEntry = (usize, ObjectRef);
+    type PlacementEntry = (usize, u32, ObjectHandle);
     let mut underlays: Vec<PlacementEntry> = Vec::new();
     let mut overlays: Vec<PlacementEntry> = Vec::new();
     for src in sources {
-        let entry = src.source_page;
+        let entry = src.source_page.clone();
         match src.kind {
             OverlayKind::Underlay => underlays.push(entry),
             OverlayKind::Overlay => overlays.push(entry),
@@ -124,8 +123,8 @@ fn under_overlay_for_page<R: Read + Seek, RS: Read + Seek>(
     // Destination placement rectangles, read before /Fx0 conversion mutates the
     // page dict (it does not touch the boxes, but reading first keeps the box
     // accessors operating on the original /Type /Page dictionary).
-    let media_box = page_box_or_err(dest, dest_page_ref, BoxKind::Media)?;
-    let trim_box = page_box_or_err(dest, dest_page_ref, BoxKind::Trim)?;
+    let media_box = page_box_or_err(dest, dest_page.clone(), BoxKind::Media)?;
+    let trim_box = page_box_or_err(dest, dest_page.clone(), BoxKind::Trim)?;
 
     // The destination page's inverse transform, folded into every placement
     // (qpdf's placeFormXObject is called with invert_transformations=true for both
@@ -137,10 +136,9 @@ fn under_overlay_for_page<R: Read + Seek, RS: Read + Seek>(
     // been wrapped as /Fx0.
 
     // 1. Convert the destination page itself to Form XObject /Fx0.
-    let fx0_ref = get_form_xobject_for_page(dest, dest_page_ref)?;
+    let fx0 = get_form_xobject_for_handle(dest, dest_page.clone())?;
     // qpdf's handleUnderOverlay materializes this destination Form before
     // replacing /Contents; imported source Forms remain provider-backed.
-    let fx0 = dest.get_object_handle(fx0_ref);
     let fx0_data = fx0.get_raw_stream_data()?;
     fx0.replace_stream_data(fx0_data, None, None);
 
@@ -149,7 +147,7 @@ fn under_overlay_for_page<R: Read + Seek, RS: Read + Seek>(
     //    counter continues from there (getUniqueResourceName).
     let mut xobject_entries: Vec<(Vec<u8>, ObjectHandle)> =
         Vec::with_capacity(1 + underlays.len() + overlays.len());
-    xobject_entries.push((b"/Fx0".to_vec(), dest.get_object_handle(fx0_ref)));
+    xobject_entries.push((b"/Fx0".to_vec(), fx0.clone()));
     let mut next_index = 1u32;
 
     // 3. Build the new page /Contents in draw order: underlays -> /Fx0 ->
@@ -165,16 +163,21 @@ fn under_overlay_for_page<R: Read + Seek, RS: Read + Seek>(
     let media_rect = normalize_rectangle(media_box);
     let mut content = String::new();
     for source_page in &underlays {
-        let xref = resolve_overlay_xobject(dest, *source_page, imported_sources, source_documents)?;
+        let xobject = resolve_overlay_xobject(
+            dest,
+            source_page.clone(),
+            imported_sources,
+            source_documents,
+        )?;
         let name = format!("Fx{next_index}");
-        xobject_entries.push((name.as_bytes().to_vec(), dest.get_object_handle(xref)));
+        xobject_entries.push((name.as_bytes().to_vec(), xobject.clone()));
         // cov:ignore-start: the trailing `)?;` is the defensive error edge of
         // a multiline placement call; valid source and destination pages are
         // covered by the byte-identical overlay gates.
         let (fragment, cm) = place_form_xobject_canonical(
             dest,
-            dest_page_ref,
-            xref,
+            dest_page.clone(),
+            xobject,
             trim_rect,
             true,
             true,
@@ -187,16 +190,16 @@ fn under_overlay_for_page<R: Read + Seek, RS: Read + Seek>(
         // planning OverlaySpec; the successful annotation facade continuation
         // is exercised by the end-to-end qpdf overlay matrix.
         {
-            let (source_index, source_page_ref) = *source_page;
-            let source = source_documents.get_mut(source_index).ok_or_else(|| {
+            let (source_index, _, source_page_handle) = source_page;
+            let source = source_documents.get_mut(*source_index).ok_or_else(|| {
                 Error::Unsupported(format!(
                     "overlay source document index {} is out of range",
                     source_index
                 ))
             })?;
-            let source_page = source.get_object_handle(source_page_ref);
-            let mut destination_page = PageObjectHelper::new(dest_page_ref, dest);
-            destination_page.copy_annotations_from(source_page, cm, source)?;
+            let mut destination_page =
+                PageObjectHelper::from_object_handle(dest_page.clone(), dest);
+            destination_page.copy_annotations_from(source_page_handle.clone(), cm, source)?;
         }
         // cov:ignore-end
         next_index += 1;
@@ -207,8 +210,8 @@ fn under_overlay_for_page<R: Read + Seek, RS: Read + Seek>(
         // covered by the byte-identical overlay gates.
         let (fragment, _cm) = place_form_xobject_canonical(
             dest,
-            dest_page_ref,
-            fx0_ref,
+            dest_page.clone(),
+            fx0.clone(),
             media_rect,
             true,
             false,
@@ -219,15 +222,20 @@ fn under_overlay_for_page<R: Read + Seek, RS: Read + Seek>(
         content.push_str(&fragment);
     }
     for source_page in &overlays {
-        let xref = resolve_overlay_xobject(dest, *source_page, imported_sources, source_documents)?;
+        let xobject = resolve_overlay_xobject(
+            dest,
+            source_page.clone(),
+            imported_sources,
+            source_documents,
+        )?;
         let name = format!("Fx{next_index}");
-        xobject_entries.push((name.as_bytes().to_vec(), dest.get_object_handle(xref)));
+        xobject_entries.push((name.as_bytes().to_vec(), xobject.clone()));
         // cov:ignore-start: symmetric defensive error edge for the multiline
         // placement call; byte gates cover successful overlay placements.
         let (fragment, cm) = place_form_xobject_canonical(
             dest,
-            dest_page_ref,
-            xref,
+            dest_page.clone(),
+            xobject,
             trim_rect,
             true,
             true,
@@ -240,16 +248,16 @@ fn under_overlay_for_page<R: Read + Seek, RS: Read + Seek>(
         // planning OverlaySpec; the successful annotation facade continuation
         // is exercised by the end-to-end qpdf overlay matrix.
         {
-            let (source_index, source_page_ref) = *source_page;
-            let source = source_documents.get_mut(source_index).ok_or_else(|| {
+            let (source_index, _, source_page_handle) = source_page;
+            let source = source_documents.get_mut(*source_index).ok_or_else(|| {
                 Error::Unsupported(format!(
                     "overlay source document index {} is out of range",
                     source_index
                 ))
             })?;
-            let source_page = source.get_object_handle(source_page_ref);
-            let mut destination_page = PageObjectHelper::new(dest_page_ref, dest);
-            destination_page.copy_annotations_from(source_page, cm, source)?;
+            let mut destination_page =
+                PageObjectHelper::from_object_handle(dest_page.clone(), dest);
+            destination_page.copy_annotations_from(source_page_handle.clone(), cm, source)?;
         }
         // cov:ignore-end
         next_index += 1;
@@ -263,7 +271,7 @@ fn under_overlay_for_page<R: Read + Seek, RS: Read + Seek>(
     // copyAnnotations has already appended to this same page's /Annots value;
     // retaining the page handle means that annotation state survives without a
     // raw page-dictionary snapshot or a second resolution route.
-    let overlay_page = overlay_page_handle(dest, dest_page_ref)?;
+    let overlay_page = overlay_page_handle(dest, dest_page)?;
     let resources = ObjectHandle::dictionary(vec![(
         b"/XObject".to_vec(),
         ObjectHandle::dictionary(xobject_entries),
@@ -351,7 +359,7 @@ where
     // Snapshot the source page list before mapping. The applied patches change
     // page dictionaries in place but never reorder or remove page objects, so
     // the 1-based page numbers stay valid when the later lazy import runs.
-    let source_pages = crate::pages::page_refs(source)?;
+    let source_pages = crate::PageDocumentHelper::new(source).get_all_pages()?;
     let n_source = u32_len(source_pages.len());
     let pairs = resolve_spec_pairs(n_source, from, to, repeat, n_dest)?;
 
@@ -364,7 +372,8 @@ where
                     kind,
                     source_page: (
                         source_document_index,
-                        page_ref_for(&source_pages, source_page, "source")?,
+                        source_page,
+                        page_handle_for(&source_pages, source_page, "source")?,
                     ),
                 },
             ))
@@ -472,27 +481,27 @@ where
 ///
 /// # Errors
 ///
-/// Propagates any error from [`crate::PageDocumentHelper::get_all_pages`], [`page_ref_for`], the placement
+/// Propagates any error from [`crate::PageDocumentHelper::get_all_pages`], [`page_handle_for`], the placement
 /// facade, or the source document handles.
 fn apply_aggregated_sources<R: Read + Seek, RS: Read + Seek>(
     dest: &mut Pdf<R>,
+    dest_pages: Vec<ObjectHandle>,
     by_page: BTreeMap<u32, Vec<OverlaySource>>,
     source_documents: &mut [&mut Pdf<RS>],
 ) -> Result<()> {
-    // Snapshot the repaired dest page refs once; the patches mutate page dicts
-    // in place but never reorder or remove page objects, so 1-based numbers
-    // stay valid. qpdf prepares all destination pages before it reads any
-    // placement boxes or converts the page to a Form XObject.
-    let dest_pages = crate::pages::page_refs(dest)?;
-    let mut imported_sources = BTreeMap::new();
+    // `dest_pages` is the live raw-handle snapshot prepared by
+    // `handle_under_overlay`; applying overlays mutates page dictionaries but
+    // never reorders or removes page objects, so 1-based numbers stay valid.
+    // qpdf likewise retains QPDFPageObjectHelper vectors through placement.
+    let mut imported_sources: BTreeMap<(usize, u32), ObjectHandle> = BTreeMap::new();
     for (dest_page, sources) in by_page {
-        let dest_ref = page_ref_for(&dest_pages, dest_page, "destination")?;
+        let dest_page = page_handle_for(&dest_pages, dest_page, "destination")?;
         // cov:ignore-start: the delegated page application is exercised by the
         // overlay byte/QDF matrix; llvm-cov attributes its success continuation
         // to an argument line in this multiline call.
         under_overlay_for_page(
             dest,
-            dest_ref,
+            dest_page,
             &sources,
             &mut imported_sources,
             source_documents,
@@ -553,7 +562,8 @@ where
     // instead of re-walking it per spec.
     // qpdf's overlay job obtains the repaired destination page list before
     // resolving any source ranges or performing placement.
-    let n_dest = u32_len(crate::pages::page_refs(dest)?.len());
+    let dest_pages = crate::PageDocumentHelper::new(dest).get_all_pages()?;
+    let n_dest = u32_len(dest_pages.len());
     // qpdf still validates/opens the configured source documents, but its
     // page loop has no work when the destination has no pages
     // (`QPDFJob.cc:1970-1978`). Do not feed the zero count into the ordinary
@@ -579,6 +589,7 @@ where
         specs.iter_mut().map(|spec| &mut spec.source).collect();
     apply_aggregated_sources(
         dest,
+        dest_pages,
         group_sources_by_dest_page(&entries),
         &mut source_documents,
     )
@@ -642,11 +653,15 @@ where
     RS: Read + Seek,
     RT: Read + Seek,
 {
-    let n_dest = u32_len(crate::pages::page_refs(dest)?.len());
+    let n_dest = u32_len(crate::PageDocumentHelper::new(dest).get_all_pages()?.len());
     // Flatten every spec's (dest_page, source) pairs in declaration order.
     let mut flat: Vec<(u32, OverlayVerboseSource)> = Vec::new();
     for (spec_index, spec) in specs.iter_mut().enumerate() {
-        let n_source = u32_len(crate::pages::page_refs(&mut spec.source)?.len());
+        let n_source = u32_len(
+            crate::PageDocumentHelper::new(&mut spec.source)
+                .get_all_pages()?
+                .len(),
+        );
         let pairs =
             resolve_spec_pairs(n_source, &spec.from, &spec.to, spec.repeat.as_ref(), n_dest)?;
         for (dest_page, src_page) in pairs {
@@ -685,10 +700,10 @@ fn u32_len(len: usize) -> u32 {
     u32::try_from(len).unwrap_or(u32::MAX)
 }
 
-/// Look up the [`ObjectRef`] of a 1-based `page` number in `pages`, erroring when
-/// it is out of range. `which` names the document (`"source"`/`"destination"`)
+/// Look up the raw page handle for a 1-based `page` number in `pages`, erroring
+/// when it is out of range. `which` names the document (`"source"`/`"destination"`)
 /// for the error message.
-fn page_ref_for(pages: &[ObjectRef], page: u32, which: &str) -> Result<ObjectRef> {
+fn page_handle_for(pages: &[ObjectHandle], page: u32, which: &str) -> Result<ObjectHandle> {
     let idx = (page as usize)
         .checked_sub(1)
         .filter(|&i| i < pages.len())
@@ -698,7 +713,7 @@ fn page_ref_for(pages: &[ObjectRef], page: u32, which: &str) -> Result<ObjectRef
                 pages.len()
             ))
         })?;
-    Ok(pages[idx])
+    Ok(pages[idx].clone())
 }
 
 /// Which destination page box a placement rectangle comes from.
@@ -714,10 +729,10 @@ enum BoxKind {
 /// effective box is an error.
 fn page_box_or_err<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
+    page: ObjectHandle,
     kind: BoxKind,
 ) -> Result<PageBox> {
-    let mut helper = PageObjectHelper::new(page_ref, pdf);
+    let mut helper = PageObjectHelper::from_object_handle(page.clone(), pdf);
     let value = match kind {
         BoxKind::Media => helper.get_media_box(false)?,
         BoxKind::Trim => helper.get_trim_box(false, false)?,
@@ -735,7 +750,8 @@ fn page_box_or_err<R: Read + Seek>(
     // consistent so a future caller with different arguments stays correct.
     if value.try_is_null()? {
         return Err(Error::Unsupported(format!(
-            "destination page {page_ref} has no usable placement box"
+            "destination page {} has no usable placement box",
+            page.get_obj_gen()
         )));
     }
     // qpdf's getArrayAsRectangle returns the zero rectangle for a present but
@@ -763,16 +779,15 @@ fn page_box_or_err<R: Read + Seek>(
 )]
 fn place_form_xobject_canonical<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    dest_page_ref: ObjectRef,
-    form_ref: ObjectRef,
+    dest_page: ObjectHandle,
+    form: ObjectHandle,
     rect: Rectangle,
     invert_transformations: bool,
     allow_shrink: bool,
     allow_expand: bool,
     name: &str,
 ) -> Result<(String, Matrix)> {
-    let form = pdf.get_object_handle(form_ref);
-    let mut helper = PageObjectHelper::new(dest_page_ref, pdf);
+    let mut helper = PageObjectHelper::from_object_handle(dest_page, pdf);
     let resource_name = format!("/{name}");
     helper.place_form_xobject(
         form,
@@ -803,13 +818,18 @@ fn normalize_rectangle(rectangle: PageBox) -> Rectangle {
 /// validate its dictionary shape before mutating it.
 fn overlay_page_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
+    page: ObjectHandle,
 ) -> Result<ObjectHandle> {
-    let page = pdf.get_object_handle(page_ref);
+    if page.owning_pdf_unique_id() != Some(pdf.unique_id()) {
+        return Err(Error::Unsupported(
+            "overlay destination page belongs to another Pdf".to_owned(),
+        ));
+    }
     page.try_dereference()?;
     if !page.try_is_dictionary()? {
         return Err(Error::Unsupported(format!(
-            "page {page_ref} is not a dictionary"
+            "page {} is not a dictionary",
+            page.get_obj_gen()
         )));
     }
     Ok(page)
@@ -1373,6 +1393,7 @@ mod byte_gate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ObjectRef, PdfWriter};
     use std::io::Cursor;
 
     /// Build a minimal PDF from a contiguous run of `1..=objects.len()`
@@ -1400,6 +1421,228 @@ mod tests {
         data
     }
 
+    fn one_page_pdf(with_link_annotation: bool) -> Vec<u8> {
+        let mut page =
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /Contents 4 0 R"
+                .to_owned();
+        if with_link_annotation {
+            page.push_str(" /Annots [5 0 R]");
+        }
+        page.push_str(" >>");
+        let mut objects = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned()),
+            (3, page),
+            (4, "<< /Length 0 >>\nstream\n\nendstream".to_owned()),
+        ];
+        if with_link_annotation {
+            objects.push((
+                5,
+                "<< /Type /Annot /Subtype /Link /Rect [0 0 100 20] /Border [0 0 0] /P 3 0 R /A << /S /URI /URI (https://example.org/) >> >>".to_owned(),
+            ));
+        }
+        pdf_from_objects(1, &objects)
+    }
+
+    fn install_raw_generation_page(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> ObjectHandle {
+        let raw_page_ref = ObjectRef::new(17, 65_535);
+        let existing_page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        let annots = existing_page
+            .try_get_key(b"/Annots")
+            .expect("read the original page annotations");
+        let mut page_entries = vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (
+                b"/Parent".to_vec(),
+                pdf.get_object_handle(ObjectRef::new(2, 0)),
+            ),
+            (
+                b"/MediaBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(612),
+                    ObjectHandle::integer(792),
+                ]),
+            ),
+            (b"/Resources".to_vec(), ObjectHandle::dictionary(Vec::new())),
+            (
+                b"/Contents".to_vec(),
+                pdf.get_object_handle(ObjectRef::new(4, 0)),
+            ),
+        ];
+        if !annots.try_is_null().expect("resolve original annotations") {
+            page_entries.push((b"/Annots".to_vec(), annots));
+        }
+        let page = ObjectHandle::dictionary(page_entries);
+        pdf.replace_object(raw_page_ref, page)
+            .expect("install page with a raw generation");
+        let raw_page = pdf.get_object_handle_by_raw_identity(17, 65_535);
+        let pages_root = pdf.get_object_handle(ObjectRef::new(2, 0));
+        pages_root
+            .replace_key(b"/Kids", ObjectHandle::array(vec![raw_page.clone()]))
+            .expect("attach raw page to the tree");
+        pages_root
+            .replace_key(b"/Count", ObjectHandle::integer(1))
+            .expect("keep the page count aligned");
+        raw_page
+    }
+
+    fn direct_page_handle() -> ObjectHandle {
+        ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (
+                b"/MediaBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(612),
+                    ObjectHandle::integer(792),
+                ]),
+            ),
+            (b"/Resources".to_vec(), ObjectHandle::dictionary(Vec::new())),
+        ])
+    }
+
+    fn assert_direct_source_form_error_is_propagated(kind: OverlayKind) {
+        let mut dest = Pdf::open(Cursor::new(one_page_pdf(false))).expect("destination PDF");
+        let dest_page = crate::PageDocumentHelper::new(&mut dest)
+            .get_all_pages()
+            .expect("enumerate destination page")
+            .into_iter()
+            .next()
+            .expect("destination has a page");
+        let mut source = Pdf::empty().expect("source PDF");
+        let sources = [OverlaySource {
+            kind,
+            source_page: (0, 1, direct_page_handle()),
+        }];
+        let mut source_documents = [&mut source];
+        let error = under_overlay_for_page(
+            &mut dest,
+            dest_page,
+            &sources,
+            &mut BTreeMap::new(),
+            &mut source_documents,
+        )
+        .expect_err("qpdf rejects getFormXObjectForPage on a direct source page");
+        assert!(
+            error.to_string().contains(
+                "QPDFPageObjectHelper::getFormXObjectForPage called with a direct object"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn underlay_propagates_direct_source_form_conversion_error() {
+        assert_direct_source_form_error_is_propagated(OverlayKind::Underlay);
+    }
+
+    #[test]
+    fn overlay_propagates_direct_source_form_conversion_error() {
+        assert_direct_source_form_error_is_propagated(OverlayKind::Overlay);
+    }
+
+    #[test]
+    fn overlay_page_handle_rejects_a_page_owned_by_another_pdf() {
+        let mut destination = Pdf::open(Cursor::new(one_page_pdf(false))).expect("destination PDF");
+        let mut source = Pdf::open(Cursor::new(one_page_pdf(false))).expect("source PDF");
+        let foreign_page = crate::PageDocumentHelper::new(&mut source)
+            .get_all_pages()
+            .expect("enumerate source page")
+            .into_iter()
+            .next()
+            .expect("source has a page");
+
+        let error = overlay_page_handle(&mut destination, foreign_page)
+            .expect_err("overlay must not mutate a page owned by another document");
+        assert!(
+            error
+                .to_string()
+                .contains("overlay destination page belongs to another Pdf"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn overlay_page_handle_rejects_a_non_dictionary_object() {
+        let mut pdf = Pdf::open(Cursor::new(one_page_pdf(false))).expect("PDF");
+        let stream = pdf.get_object_handle(ObjectRef::new(4, 0));
+
+        let error = overlay_page_handle(&mut pdf, stream)
+            .expect_err("overlay destination must be a page dictionary");
+        assert!(
+            error.to_string().contains("is not a dictionary"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn overlay_keeps_raw_generation_source_and_destination_pages_through_annotation_copy() {
+        let mut dest = Pdf::open(Cursor::new(one_page_pdf(false))).expect("destination PDF");
+        let mut source = Pdf::open(Cursor::new(one_page_pdf(true))).expect("source PDF");
+        let dest_page = install_raw_generation_page(&mut dest);
+        let source_page = install_raw_generation_page(&mut source);
+        source
+            .get_object_handle(ObjectRef::new(5, 0))
+            .replace_key(b"/P", source_page.clone())
+            .expect("point the source annotation at its raw page");
+
+        assert_eq!(dest_page.get_obj_gen(), crate::QpdfObjGen::new(17, 65_535));
+        assert_eq!(
+            crate::PageDocumentHelper::new(&mut source)
+                .get_all_pages()
+                .expect("enumerate source page handles")[0]
+                .get_obj_gen(),
+            crate::QpdfObjGen::new(17, 65_535)
+        );
+
+        let mut specs = vec![OverlaySpec {
+            source,
+            kind: OverlayKind::Overlay,
+            from: PageRange::all(),
+            to: PageRange::all(),
+            repeat: None,
+        }];
+        handle_under_overlay(&mut dest, &mut specs)
+            .expect("overlay should use raw page handles through annotation copy");
+
+        let pages = crate::PageDocumentHelper::new(&mut dest)
+            .get_all_pages()
+            .expect("enumerate destination page handles");
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].get_obj_gen(), crate::QpdfObjGen::new(17, 65_535));
+        let annots = pages[0]
+            .try_get_key(b"/Annots")
+            .expect("read destination annotations")
+            .try_as_array()
+            .expect("read destination annotation array")
+            .expect("source Link annotation is copied");
+        assert_eq!(annots.len(), 1);
+        assert_eq!(
+            annots[0]
+                .try_get_key(b"/Subtype")
+                .expect("read copied annotation subtype")
+                .as_name(),
+            Some(b"Link".to_vec())
+        );
+
+        let mut writer = PdfWriter::new(&mut dest);
+        writer.set_static_id(true);
+        writer.set_output_memory().expect("select memory output");
+        writer.write().expect("write overlay result");
+        let output = writer.get_buffer().expect("read overlay output");
+        let mut reopened = Pdf::open(Cursor::new(output)).expect("reopen rewritten output");
+        assert_eq!(
+            crate::PageDocumentHelper::new(&mut reopened)
+                .get_all_pages()
+                .expect("enumerate rewritten output pages")
+                .len(),
+            1
+        );
+    }
+
     /// `page_box_or_err` must reject a destination page whose `/MediaBox` is
     /// absent from its whole ancestor chain, exercising the resolving
     /// `try_is_null()` check (not the non-resolving `is_null()` that never
@@ -1414,8 +1657,9 @@ mod tests {
         let bytes = pdf_from_objects(1, &objects);
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
         let page_ref = ObjectRef::new(3, 0);
+        let page = pdf.get_object_handle(page_ref);
 
-        let error = page_box_or_err(&mut pdf, page_ref, BoxKind::Media)
+        let error = page_box_or_err(&mut pdf, page, BoxKind::Media)
             .expect_err("a page with no /MediaBox anywhere in its ancestry has no usable box");
         assert!(
             error.to_string().contains("has no usable placement box"),
@@ -1439,8 +1683,9 @@ mod tests {
         let bytes = pdf_from_objects(1, &objects);
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
         let page_ref = ObjectRef::new(3, 0);
+        let page = pdf.get_object_handle(page_ref);
 
-        let page_box = page_box_or_err(&mut pdf, page_ref, BoxKind::Media)
+        let page_box = page_box_or_err(&mut pdf, page, BoxKind::Media)
             .expect("a page with a direct /MediaBox has a usable box");
         assert_eq!(page_box, PageBox::new(0.0, 0.0, 612.0, 792.0));
     }

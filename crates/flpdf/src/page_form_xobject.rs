@@ -40,23 +40,23 @@
 //! qpdf 11.9.0 keeps this operation warning-based when the effective `/BBox`
 //! is absent or malformed: `QPDFPageObjectHelper::getFormXObjectForPage`
 //! creates the stream, calls `warnIfPossible`, and continues
-//! (`libqpdf/QPDFPageObjectHelper.cc:706-733`). The production wrapper below
-//! therefore delegates directly to the canonical `PageObjectHelper` instead
-//! of pre-validating the box through a separate value snapshot. Attribute
+//! (`libqpdf/QPDFPageObjectHelper.cc:706-733`). The raw-handle wrapper below
+//! delegates through `PageObjectHelper::from_object_handle` instead of
+//! pre-validating the box through a separate value snapshot. Attribute
 //! inheritance and content streaming remain owned by the live handle route
 //! (`libqpdf/QPDFPageObjectHelper.cc:220-310,439-476`;
 //! `libqpdf/QPDFObjectHandle.cc:1289-1341`).
 //!
-// The production entry point below is consumed by the overlay/underlay
-// content-wiring path. Test-only helpers, where present, use the same
-// PageObjectHelper/ObjectHandle implementation.
+// The production wrapper below keeps qpdf's raw page handle at this boundary;
+// tests also retain a reference-based adapter for ordinary fixture identities.
 use std::io::{Read, Seek};
 
 use crate::page_object_helper::PageObjectHelper;
-use crate::{Error, ObjectRef, Pdf, Result};
+use crate::{ObjectHandle, Pdf, Result};
 
 #[cfg(test)]
-use crate::object_handle::ObjectHandle;
+use crate::{Error, ObjectRef};
+
 #[cfg(test)]
 use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 #[cfg(test)]
@@ -64,8 +64,7 @@ use crate::Matrix;
 #[cfg(test)]
 use std::collections::BTreeSet;
 
-/// Convert the page at `page_ref` into a Form XObject within the same document,
-/// insert it as a new object, and return its [`ObjectRef`].
+/// Convert the raw page handle into a Form XObject within the same document.
 ///
 /// Mirrors `QPDFPageObjectHelper::getFormXObjectForPage` (qpdf 11.9.0): the new
 /// XObject's `/BBox` is the page's effective `/TrimBox` (copied verbatim),
@@ -76,15 +75,25 @@ use std::collections::BTreeSet;
 ///
 /// # Errors
 ///
-/// - [`Error::Unsupported`] when `page_ref` is not a `/Type /Page` dictionary
-///   or when the object-number space is exhausted.
+/// - [`crate::Error::Unsupported`] when `page` is not an indirect `/Type /Page`
+///   dictionary or when the object-number space is exhausted.
 /// - Any error propagated from canonical ObjectHandle resolution or content extraction.
+pub(crate) fn get_form_xobject_for_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page: ObjectHandle,
+) -> Result<ObjectHandle> {
+    let mut helper = PageObjectHelper::from_object_handle(page, pdf);
+    helper.get_form_xobject_for_page(true)
+}
+
+/// Test adapter for converting an ordinary page reference to a Form XObject.
+#[cfg(test)]
 pub(crate) fn get_form_xobject_for_page<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
 ) -> Result<ObjectRef> {
-    let mut helper = PageObjectHelper::new(page_ref, pdf);
-    let form = helper.get_form_xobject_for_page(true)?;
+    let page = pdf.get_object_handle(page_ref);
+    let form = get_form_xobject_for_handle(pdf, page)?;
     // cov:ignore-start: Pdf::new_stream registers every canonical Form as an
     // indirect document-owned object; this is an allocation invariant guard.
     form.object_ref().ok_or_else(|| {

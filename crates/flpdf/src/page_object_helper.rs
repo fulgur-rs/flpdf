@@ -445,9 +445,12 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     }
 
     fn target_description(&self) -> String {
-        self.page_ref
-            .map(|object_ref| object_ref.to_string())
-            .unwrap_or_else(|| "direct object".to_owned())
+        let object_gen = self.object.get_obj_gen();
+        if object_gen.is_indirect() {
+            object_gen.to_string()
+        } else {
+            "direct object".to_owned()
+        }
     }
 
     fn require_page_ref(&self) -> Result<ObjectRef> {
@@ -568,6 +571,12 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         handle_transformations: bool,
     ) -> Result<ObjectHandle> {
         let page = self.resolved_page_handle()?;
+        if !page.get_obj_gen().is_indirect() {
+            return Err(Error::Unsupported(
+                "QPDFPageObjectHelper::getFormXObjectForPage called with a direct object"
+                    .to_owned(),
+            ));
+        }
         // Capture the page's original content container before a consumer can
         // replace `/Contents` on the page (overlay does exactly that after
         // creating /Fx0). The provider remains lazy and ObjectHandle-backed,
@@ -1228,11 +1237,15 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         field_tree_only: bool,
     ) -> Result<()> {
         let destination = self.resolved_page_handle()?;
-        self.require_page_ref()?;
-        validate_foreign_page_handle(source, self.pdf, &from_page)?;
         let old_annots = from_page.try_get_key(b"/Annots")?;
         if !old_annots.try_is_array()? {
             return Ok(());
+        }
+        validate_foreign_page_handle(source, self.pdf, &from_page)?;
+        if !destination.get_obj_gen().is_indirect() {
+            return Err(Error::Unsupported(
+                "QPDFPageObjectHelper::copyAnnotations: this page is a direct object".to_owned(),
+            ));
         }
 
         let (transformed, invalidate_cache) = {
@@ -2164,7 +2177,7 @@ fn validate_foreign_page_handle<RS: Read + Seek, RD: Read + Seek>(
     destination: &Pdf<RD>,
     page: &ObjectHandle,
 ) -> Result<()> {
-    if page.object_ref().is_none() {
+    if !page.get_obj_gen().is_indirect() {
         return Err(Error::Unsupported(
             "copyAnnotations: source page is a direct object".to_owned(),
         ));
@@ -2399,6 +2412,72 @@ mod tests {
         );
         data.extend_from_slice(trailer.as_bytes());
         data
+    }
+
+    fn direct_page_handle() -> ObjectHandle {
+        ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (
+                b"/MediaBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(612),
+                    ObjectHandle::integer(792),
+                ]),
+            ),
+            (b"/Resources".to_vec(), ObjectHandle::dictionary(Vec::new())),
+            (b"/Annots".to_vec(), ObjectHandle::array(Vec::new())),
+        ])
+    }
+
+    #[test]
+    fn get_form_xobject_for_page_rejects_a_direct_page_handle() {
+        let mut pdf = Pdf::empty().expect("empty document should be available");
+        let mut helper = PageObjectHelper::from_object_handle(direct_page_handle(), &mut pdf);
+
+        let error = helper
+            .get_form_xobject_for_page(true)
+            .expect_err("qpdf rejects getFormXObjectForPage on a direct page");
+        assert!(
+            error.to_string().contains(
+                "QPDFPageObjectHelper::getFormXObjectForPage called with a direct object"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn copy_annotations_rejects_a_direct_destination_page_handle() {
+        let source_bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
+                (
+                    2,
+                    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
+                ),
+                (
+                    3,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /Annots [] >>".to_owned(),
+                ),
+            ],
+        );
+        let mut source = Pdf::open(Cursor::new(source_bytes)).expect("source PDF should parse");
+        let source_page = source.get_object_handle(ObjectRef::new(3, 0));
+        let mut target = Pdf::empty().expect("empty document should be available");
+        let mut destination =
+            PageObjectHelper::from_object_handle(direct_page_handle(), &mut target);
+
+        let error = destination
+            .copy_annotations_from(source_page, Matrix::default(), &mut source)
+            .expect_err("qpdf rejects copyAnnotations on a direct destination page");
+        assert!(
+            error
+                .to_string()
+                .contains("QPDFPageObjectHelper::copyAnnotations: this page is a direct object"),
+            "unexpected error: {error}"
+        );
     }
 
     /// `get_attribute` (via `get_media_box`) must reach exactly qpdf's
