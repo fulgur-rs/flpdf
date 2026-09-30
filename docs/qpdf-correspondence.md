@@ -3671,9 +3671,15 @@ Buffer/provider/original-source 選択は `reader/resolver.rs` の resolver-owne
 boundary に委譲し、qpdf の `ot_reserved` は外部に露出しない内部 reservation
 sentinel として destination-owned indirect null slot で表現する。
 
-`page_extract.rs::extract_pages` はこの canonical foreign-copy route へ切り替え済みで、
+`page_extract.rs::extract_pages` は qpdf に同名の standalone API はない flpdf 固有の
+library convenience だが、qpdf `QPDFJob::PageData` が `QPDF::getAllPages()` の raw
+page handles と selected indices を保持する責務に合わせ、選択元は
+`PageDocumentHelper::get_all_pages()` の raw handles のまま扱う
+（`QPDFJob.cc:72-80,259-269,2531-2545`）。unique-page map と duplicate tracking は
+raw `QpdfObjGen` で行い、`ObjectRef` の generation gate を通さずに canonical
+`copyForeignObject` 相当へ渡す（`QPDF.cc:2019-2134`; `QPDF_pages.cc:205-250`）。
 qpdf の source-side inherited-attribute preparation と destination-side page-tree
-mutation を組み合わせる。`job/page_merge.rs` も `pushInheritedAttributesToPage` 相当の
+mutation もこのまま組み合わせる。`job/page_merge.rs` も `pushInheritedAttributesToPage` 相当の
 source preparation と live-handle による destination `/Parent` replacement を使い、
 選択 page graph の legacy pre-closed copy を削除した。primary の document-level /
 AcroForm / PageLabels merge は Catalog/trailer の各 direct value を同じ persistent
