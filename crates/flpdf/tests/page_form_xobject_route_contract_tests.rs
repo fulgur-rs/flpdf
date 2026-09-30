@@ -1,7 +1,8 @@
 //! Route contract for the page-form-xobject A6/A7 accessor cutover.
 //!
-//! `page_form_xobject.rs` ships exactly one item: the `get_form_xobject_for_page`
-//! wrapper. Everything else in the module is gated on `#[cfg(test)]`.
+//! `page_form_xobject.rs` ships one production item:
+//! `get_form_xobject_for_handle`, which retains raw page identity through
+//! helper construction. The reference adapter and fixtures are `#[cfg(test)]`.
 //!
 //! Earlier revisions of this contract scanned the whole file and tried to
 //! decide, node by node, which parts survive into a production build. That
@@ -21,14 +22,14 @@ use std::path::PathBuf;
 use syn::visit::Visit;
 
 /// The single production entry point this module ships.
-const WRAPPER: &str = "get_form_xobject_for_page";
+const WRAPPER: &str = "get_form_xobject_for_handle";
+const HELPER_METHOD: &str = "get_form_xobject_for_page";
 
 /// qpdf's `QPDFPageObjectHelper::getFormXObjectForPage`
-/// (`libqpdf/QPDFPageObjectHelper.cc:706-732`) owns the conversion; this
-/// wrapper's whole job is to hand the page over and return the new object's
-/// identity.
+/// (`libqpdf/QPDFPageObjectHelper.cc:706-732`) owns conversion; this wrapper
+/// passes the raw page handle to that helper and returns the Form handle.
 #[test]
-fn the_production_wrapper_delegates_without_inspecting_handles() {
+fn the_production_wrapper_preserves_raw_identity_through_conversion() {
     let wrapper = production_wrapper();
     let mut audit = WrapperAudit {
         live_parameters: wrapper
@@ -56,17 +57,12 @@ fn the_production_wrapper_delegates_without_inspecting_handles() {
     // here deliberately, whether it resolves or not.
     //
     // qpdf's `getFormXObjectForPage` (`libqpdf/QPDFPageObjectHelper.cc:706-732`)
-    // owns the conversion; this wrapper hands the page over and returns the
-    // new object's identity.
+    // owns conversion; this wrapper passes the live page handle and returns
+    // the Form handle without projecting either identity.
     let permitted: std::collections::BTreeSet<String> = [
         // The canonical construction and delegation.
-        "PageObjectHelper::new",
-        "get_form_xobject_for_page",
-        // Returning the new object's identity, and the allocation guard.
-        "object_ref",
-        "ok_or_else",
-        "Error::Internal",
-        "to_owned",
+        "PageObjectHelper::from_object_handle",
+        HELPER_METHOD,
     ]
     .iter()
     .map(|name| (*name).to_owned())
@@ -89,8 +85,8 @@ fn the_production_wrapper_delegates_without_inspecting_handles() {
     assert_eq!(
         audit.helper_conversions,
         vec![true],
-        "the wrapper must call get_form_xobject_for_page(true) exactly once \
-         on a PageObjectHelper it constructed: {audit:?}"
+        "the wrapper must call PageObjectHelper::get_form_xobject_for_page(true) exactly once \
+         on a helper constructed from its raw page handle: {audit:?}"
     );
 
     // A macro would hide its expansion from this audit. The wrapper uses none,
@@ -239,7 +235,7 @@ impl<'ast> Visit<'ast> for WrapperAudit {
         syn::visit::visit_expr_reference(self, reference);
     }
 
-    /// `helper = PageObjectHelper::new(other_page, pdf)` rebinds without a
+    /// `helper = PageObjectHelper::from_object_handle(other_page, pdf)` rebinds without a
     /// `let`, and `helper = something_else` ends the provenance entirely.
     fn visit_expr_assign(&mut self, assign: &'ast syn::ExprAssign) {
         syn::visit::visit_expr_assign(self, assign);
@@ -327,7 +323,7 @@ impl<'ast> Visit<'ast> for WrapperAudit {
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         let method = unraw(&call.method);
         let on_helper = receiver_is_helper(&call.receiver, &self.helper_bindings);
-        if on_helper && method == WRAPPER {
+        if on_helper && method == HELPER_METHOD {
             self.helper_conversions.push(passes_true(call));
         }
         self.calls.insert(method);
@@ -445,8 +441,9 @@ fn unwrap_transparent(expr: &syn::Expr) -> &syn::Expr {
 }
 
 impl WrapperAudit {
-    /// `PageObjectHelper::new(<page>, <pdf>)`, however the path is spelled,
-    /// where the arguments still resolve to the wrapper's own parameters.
+    /// `PageObjectHelper::from_object_handle(<page>, <pdf>)`, however the path
+    /// is spelled, where the arguments still resolve to the wrapper's own
+    /// parameters.
     ///
     /// qpdf's helper is constructed on the page the caller asked about
     /// (`QPDFPageObjectHelper(oh)`); handing it a different page would
@@ -485,7 +482,7 @@ fn constructs_helper_shape(expr: &syn::Expr) -> Option<Vec<String>> {
             _ => "<expr>".to_owned(),
         })
         .collect();
-    if argument_names != ["page_ref", "pdf"] {
+    if argument_names != ["page", "pdf"] {
         return None;
     }
     let syn::Expr::Path(path) = call.func.as_ref() else {
@@ -497,9 +494,10 @@ fn constructs_helper_shape(expr: &syn::Expr) -> Option<Vec<String>> {
         .iter()
         .rev()
         .map(|segment| unraw(&segment.ident));
-    // Matching the tail accepts `crate::page_object_helper::PageObjectHelper::new`
-    // as readily as the imported `PageObjectHelper::new`.
-    if tail.next().as_deref() == Some("new") && tail.next().as_deref() == Some("PageObjectHelper") {
+    // Matching the tail accepts fully-qualified or imported helper paths.
+    if tail.next().as_deref() == Some("from_object_handle")
+        && tail.next().as_deref() == Some("PageObjectHelper")
+    {
         Some(argument_names)
     } else {
         None
