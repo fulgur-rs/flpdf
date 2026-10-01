@@ -128,7 +128,7 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
     // absent key, so this checks the chased terminal value rather than
     // `ObjectHandle::has_key` (which only reports raw map presence; see its
     // own doc distinguishing it from this exact case).
-    if chased.is_null() {
+    if chased.try_is_null()? {
         writeln!(stdout, "/QTest is implicit")?;
     }
 
@@ -179,24 +179,15 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
     Ok(())
 }
 
-// `dict`'s entries are resolved once through the canonical object cache to
-// decide null-omission, mirroring qpdf's own `hasKey`/`getKeys`/`ditems()` rule
-// that a dictionary entry resolving to null is equivalent to a missing key
-// (`libqpdf/QPDF_Dictionary.cc:98-125`). Indirectness in the returned pairs
-// reflects the child handle's own identity after that one cache resolution.
-fn dictionary_items<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    dict: &ObjectHandle,
-) -> flpdf::Result<Vec<(Vec<u8>, bool)>> {
-    let entries = dict
-        .as_dictionary()
-        .ok_or_else(|| Error::System("dictionary access on non-dictionary object".to_string()))?;
+// `getKeys()` resolves values through the canonical object cache and omits
+// keys whose values resolve to null (`libqpdf/QPDF_Dictionary.cc:117-125`).
+// Looking up each retained key separately preserves the child's raw indirect
+// identity for qtest's directness report.
+fn dictionary_items(dict: &ObjectHandle) -> flpdf::Result<Vec<(Vec<u8>, bool)>> {
     let mut items = Vec::new();
-    for (key, child) in entries {
-        pdf.resolve(&child)?;
-        if !child.is_null() {
-            items.push((key, child.object_ref().is_some()));
-        }
+    for key in dict.try_get_keys()? {
+        let child = dict.try_get_key(&key)?;
+        items.push((key, child.object_ref().is_some()));
     }
     Ok(items)
 }
@@ -267,9 +258,7 @@ fn write_object_details<R: Read + Seek>(
             writeln!(stdout, "/QTest is Boolean with value {value}")?;
         }
         4 => {
-            let value = chased
-                .as_integer()
-                .expect("type_code confirmed an integer value");
+            let value = chased.try_get_int_value()?;
             writeln!(stdout, "/QTest is an integer with value {value}")?;
         }
         5 => {
@@ -278,23 +267,19 @@ fn write_object_details<R: Read + Seek>(
             writeln!(stdout)?;
         }
         7 => {
-            let value = chased.as_name().expect("type_code confirmed a name value");
+            let value = chased.try_get_name()?;
             write!(stdout, "/QTest is a name with value /")?;
-            write_bytes(stdout, &value)?;
+            write_bytes(stdout, value.strip_prefix(b"/").unwrap_or(&value))?;
             writeln!(stdout)?;
         }
         6 => {
-            let value = chased
-                .as_string()
-                .expect("type_code confirmed a string value");
+            let value = chased.try_get_string_value()?;
             write!(stdout, "/QTest is a string with value ")?;
             write_bytes(stdout, &value)?;
             writeln!(stdout)?;
         }
         8 => {
-            let items = chased
-                .as_array()
-                .expect("type_code confirmed an array value");
+            let items = chased.try_get_array_as_vector()?;
             writeln!(stdout, "/QTest is an array with {} items", items.len())?;
             for (index, item) in items.iter().enumerate() {
                 let direct_prefix = if item.object_ref().is_some() {
@@ -307,7 +292,7 @@ fn write_object_details<R: Read + Seek>(
         }
         9 => {
             writeln!(stdout, "/QTest is a dictionary")?;
-            let qpdf_flush_result_7 = dictionary_items(pdf, chased);
+            let qpdf_flush_result_7 = dictionary_items(chased);
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             let items = qpdf_flush_result_7?;
             for (key, is_indirect) in items {
