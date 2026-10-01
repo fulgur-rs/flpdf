@@ -31,7 +31,7 @@ set the version bump.
 The pre-1.0 compatibility policy does not promise that these surfaces stay
 compatible, but the breaking marker still tells downstream users that the
 release contains an incompatible change. The `show-stream` and `dump-object`
-subcommands were removed in 0.1.0 without markers; the next intentional
+subcommands were removed in 0.6.0 without markers; the next intentional
 breaking release must call out both removals in its release notes.
 
 ## Fuzzing
