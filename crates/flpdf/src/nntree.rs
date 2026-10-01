@@ -1862,16 +1862,23 @@ impl<K: TreeKey> NNTree<K> {
         if !first.positioned() {
             return Ok(self.end());
         }
-        if let (Some(leaf), Some(item_number)) = (&first.leaf, first.item_number) {
-            let dictionary = self.load_node(pdf, leaf)?;
-            if let Some(items) = resolved_array(dictionary.get(K::ITEMS_KEY)?.as_ref())? {
-                if let Some(raw_key) = items.values.get(item_number) {
-                    if let Some(first_key) = resolved_key::<K>(raw_key)? {
-                        if K::compare(key, &first_key) == Ordering::Less {
-                            return Ok(self.end());
-                        }
-                    }
-                }
+        let leaf = first
+            .leaf
+            .as_ref()
+            .expect("a positioned cursor retains its leaf");
+        let item_number = first
+            .item_number
+            .expect("a positioned cursor retains its item number");
+        let dictionary = self.load_node(pdf, leaf)?;
+        let items = resolved_array(dictionary.get(K::ITEMS_KEY)?.as_ref())?
+            .expect("a positioned cursor retains its items array");
+        let raw_key = items
+            .values
+            .get(item_number)
+            .expect("a positioned cursor retains its key slot");
+        if let Some(first_key) = resolved_key::<K>(raw_key)? {
+            if K::compare(key, &first_key) == Ordering::Less {
+                return Ok(self.end());
             }
         }
         // qpdf 11.9.0 initializes its `last_item` check with end(), not
@@ -2291,17 +2298,13 @@ impl<K: TreeKey> NNTree<K> {
                             .expect("descended non-empty leaf has an item number");
                         let leaf = cursor.leaf.as_ref().expect("descended leaf is present");
                         let dictionary = self.load_node(pdf, leaf)?;
-                        let Some(items) = resolved_array(dictionary.get(K::ITEMS_KEY)?.as_ref())?
-                        else {
-                            return Err(structural_error(
-                                &pdf.input_description(),
-                                leaf.diagnostic_ref(),
-                                format!("update ivalue: /{} is not an array", K::ITEMS_KEY),
-                            ));
-                        };
-                        if item_number + 1 >= items.values.len() {
-                            self.warn(pdf, leaf, "items array doesn't have enough elements")?;
-                        } else if !K::is_valid_key(&items.values[item_number])? {
+                        let items = resolved_array(dictionary.get(K::ITEMS_KEY)?.as_ref())?
+                            .expect("descend selected a leaf with an items array");
+                        let raw_key = items
+                            .values
+                            .get(item_number)
+                            .expect("descend selected an in-range key slot");
+                        if !K::is_valid_key(raw_key)? {
                             self.warn(pdf, leaf, format!("item {item_number} has the wrong type"))?;
                         } else {
                             found_valid_position = true;
