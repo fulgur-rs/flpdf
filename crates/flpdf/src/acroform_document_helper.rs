@@ -2459,6 +2459,31 @@ mod appearance_matrix_accessor_tests {
             Some(Matrix::from([2.0, 0.5, 0.0, 3.0, 10.0, 11.0]))
         );
     }
+
+    #[test]
+    fn matrix_from_handle_keeps_default_for_invalid_shapes_like_qpdf() {
+        assert_eq!(
+            matrix_from_handle(&ObjectHandle::integer(42)).expect("non-array matrix"),
+            None
+        );
+        assert_eq!(
+            matrix_from_handle(&ObjectHandle::array(vec![ObjectHandle::integer(1)]))
+                .expect("short matrix"),
+            None
+        );
+        assert_eq!(
+            matrix_from_handle(&ObjectHandle::array(vec![
+                ObjectHandle::integer(1),
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(1),
+                ObjectHandle::integer(0),
+                ObjectHandle::name(b"not-a-number".to_vec()),
+            ]))
+            .expect("nonnumeric matrix component"),
+            None
+        );
+    }
 }
 
 fn ensure_foreign_indirect<R: Read + Seek>(
