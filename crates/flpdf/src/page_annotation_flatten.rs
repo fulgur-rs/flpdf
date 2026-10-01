@@ -2,7 +2,7 @@
 //!
 //! qpdf correspondence: QPDFPageObjectHelper.cc annotation flattening split from the page helper.
 //!
-//! [`flatten_annotations_on_page`] processes every eligible annotation on a
+//! [`flatten_annotations_on_page_handle`] processes every eligible annotation on a
 //! single leaf page:
 //!
 //! 1. Selects the annotation's `/AP/N` appearance stream (a Form XObject).
@@ -19,10 +19,13 @@
 //! its caller-supplied required and forbidden annotation-flag masks.
 
 use crate::object_handle::ObjectHandleIdentity;
+#[cfg(test)]
 use crate::pages::page_content_bytes;
+#[cfg(test)]
+use crate::ObjectRef;
 use crate::{
-    AcroFormDocumentHelper, AnnotationObjectHelper, Error, ObjectHandle, ObjectRef,
-    PageObjectHelper, Pdf, Result,
+    AcroFormDocumentHelper, AnnotationObjectHelper, Error, ObjectHandle, PageObjectHelper, Pdf,
+    Result,
 };
 use std::collections::HashSet;
 use std::io::{Read, Seek};
@@ -82,9 +85,19 @@ const FLAG_NO_VIEW: i64 = 0x20;
 /// - [`Error::Unsupported`] if `page_ref` does not resolve to a `/Type /Page`
 ///   dictionary.
 /// - Any error from canonical ObjectHandle resolution or content-stream decoding.
+#[cfg(test)]
 fn flatten_annotations_on_page<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
+    mode: FlattenMode,
+) -> Result<usize> {
+    let page = pdf.get_object_handle(page_ref);
+    flatten_annotations_on_page_handle(pdf, page, mode)
+}
+
+fn flatten_annotations_on_page_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page: ObjectHandle,
     mode: FlattenMode,
 ) -> Result<usize> {
     // ── Step 1: enumerate annotations without reading /Rect ──────────────
@@ -94,7 +107,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
     // away before the appearance/flag gate. The annotation helper validates
     // /Rect only after that gate, so this route stays lazy and does not
     // materialize /Rect before eligibility is known.
-    let annotations = page_annotation_handles(pdf, page_ref)?;
+    let annotations = page_annotation_handles(pdf, &page)?;
 
     // ── Step 2: for each annotation, decide eligibility and collect data ───
     struct AnnotData {
@@ -238,15 +251,17 @@ fn flatten_annotations_on_page<R: Read + Seek>(
     }
 
     if candidates.is_empty() {
-        let page = pdf.get_object_handle(page_ref);
         if !page.try_is_dictionary()? {
             // cov:ignore-start: repaired PageDocumentHelper snapshots contain leaf dictionaries
+            let object_gen = page.get_obj_gen();
             return Err(Error::Unsupported(format!(
-                "object {page_ref} is not a dictionary after flatten"
+                "object {} {} is not a dictionary after flatten",
+                object_gen.get_obj(),
+                object_gen.get_gen()
             )));
             // cov:ignore-end
         }
-        replace_pruned_annots(pdf, page_ref, &to_remove, qpdf_flag_contract)?; // cov:ignore: llvm-cov maps this covered multiline call terminator to a zero-hit line
+        replace_pruned_annots(pdf, &page, &to_remove, qpdf_flag_contract)?; // cov:ignore: llvm-cov maps this covered multiline call terminator to a zero-hit line
         if qpdf_flag_contract {
             // qpdf wraps the page whenever the annotation array changed, even
             // if every selected appearance produced empty drawing content.
@@ -259,7 +274,9 @@ fn flatten_annotations_on_page<R: Read + Seek>(
     // stream, but coalescing itself must use the canonical provider-backed
     // page route. Production `Flags` mode uses `add_qpdf_flatten_contents`
     // below and does not need this compatibility-only branch.
+    #[cfg(test)]
     if !qpdf_flag_contract {
+        let page_ref = test_page_ref(&page)?;
         PageObjectHelper::new(page_ref, pdf).coalesce_content_streams()?;
     }
 
@@ -274,9 +291,8 @@ fn flatten_annotations_on_page<R: Read + Seek>(
     // annotation, only inside the `!content.empty()` branch
     // (`resources.mergeResources("<< /XObject << >> >>"_qpdf)`,
     // `QPDFPageDocumentHelper.cc:123`) -- see Step 5.
-    let mut page_helper = PageObjectHelper::new(page_ref, pdf);
+    let mut page_helper = PageObjectHelper::from_object_handle(page.clone(), pdf);
     let resources = page_helper.get_attribute(b"/Resources", true)?;
-    let page = pdf.get_object_handle(page_ref);
     let resources = if resources.try_is_dictionary()? {
         resources
     } else {
@@ -355,21 +371,24 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         xobj_dict.replace_key(&xobj_name, xobject)?;
         append_bytes.extend_from_slice(&content);
         flattened_count += 1;
+        #[cfg(test)]
         if !qpdf_flag_contract {
             to_remove.push(data.annotation.clone());
         }
     }
 
     if flattened_count == 0 {
-        let page = pdf.get_object_handle(page_ref);
         if !page.try_is_dictionary()? {
             // cov:ignore-start: repaired PageDocumentHelper snapshots contain leaf dictionaries
+            let object_gen = page.get_obj_gen();
             return Err(Error::Unsupported(format!(
-                "object {page_ref} is not a dictionary after flatten"
+                "object {} {} is not a dictionary after flatten",
+                object_gen.get_obj(),
+                object_gen.get_gen()
             )));
             // cov:ignore-end
         }
-        replace_pruned_annots(pdf, page_ref, &to_remove, qpdf_flag_contract)?; // cov:ignore: llvm-cov maps this covered multiline call terminator to a zero-hit line
+        replace_pruned_annots(pdf, &page, &to_remove, qpdf_flag_contract)?; // cov:ignore: llvm-cov maps this covered multiline call terminator to a zero-hit line
         if qpdf_flag_contract {
             add_qpdf_flatten_contents(pdf, &page, Vec::new())?; // cov:ignore: covered structurally by indirect-contents public fixture
         } // cov:ignore: llvm-cov maps the tested qpdf wrapper branch to this synthetic closing brace
@@ -377,41 +396,46 @@ fn flatten_annotations_on_page<R: Read + Seek>(
     }
 
     // ── Step 6: Add qpdf-shaped page-content wrappers ─────────────────────
-    let page = pdf.get_object_handle(page_ref);
     if !page.try_is_dictionary()? {
+        let object_gen = page.get_obj_gen();
         return Err(Error::Unsupported(format!(
-            "object {page_ref} is not a dictionary after flatten"
+            "object {} {} is not a dictionary after flatten",
+            object_gen.get_obj(),
+            object_gen.get_gen()
         )));
     }
 
     if qpdf_flag_contract {
         add_qpdf_flatten_contents(pdf, &page, append_bytes)?;
     } else {
-        let existing_content = page_content_bytes(pdf, page_ref)?;
-        let mut new_content = existing_content;
-        if !new_content.is_empty() && new_content.last() != Some(&b'\n') {
-            new_content.push(b'\n');
+        #[cfg(test)]
+        {
+            let page_ref = test_page_ref(&page)?;
+            let existing_content = page_content_bytes(pdf, page_ref)?;
+            let mut new_content = existing_content;
+            if !new_content.is_empty() && new_content.last() != Some(&b'\n') {
+                new_content.push(b'\n');
+            }
+            new_content.extend_from_slice(&append_bytes);
+            let stream = add_content_stream(pdf, new_content)?;
+            page.replace_key(b"/Contents", stream)?;
         }
-        new_content.extend_from_slice(&append_bytes);
-        let stream = add_content_stream(pdf, new_content)?;
-        page.replace_key(b"/Contents", stream)?;
     }
 
     // ── Step 8: Remove flattened annotations from /Annots ─────────────────
-    replace_pruned_annots(pdf, page_ref, &to_remove, qpdf_flag_contract)?; // cov:ignore: llvm-cov maps this covered multiline call terminator to a zero-hit line
+    replace_pruned_annots(pdf, &page, &to_remove, qpdf_flag_contract)?; // cov:ignore: llvm-cov maps this covered multiline call terminator to a zero-hit line
 
     Ok(flattened_count)
 }
 
 fn replace_pruned_annots<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
+    page: &ObjectHandle,
     to_remove: &[ObjectHandle],
     preserve_indirect_holder: bool,
 ) -> Result<()> {
-    let page = pdf.get_object_handle(page_ref);
     let old_annots = page.try_get_key(b"/Annots")?;
-    let new_annots = build_pruned_annots_array(pdf, page_ref, to_remove)?;
+    let new_annots = build_pruned_annots_array_from_handle(page, to_remove)?;
     if new_annots
         .try_array_len()?
         .is_some_and(|length| length == 0)
@@ -466,8 +490,8 @@ fn add_content_stream<R: Read + Seek>(pdf: &mut Pdf<R>, data: Vec<u8>) -> Result
 ///
 /// # Errors
 ///
-/// Propagates any error from [`flatten_annotations_on_page`] or
-/// [`crate::pages::page_refs`].
+/// Propagates errors from qpdf page-list preparation or page annotation
+/// processing.
 #[cfg(test)]
 fn flatten_annotations<R: Read + Seek>(pdf: &mut Pdf<R>, mode: FlattenMode) -> Result<usize> {
     let page_refs = crate::pages::page_refs(pdf)?;
@@ -485,7 +509,6 @@ fn flatten_annotations<R: Read + Seek>(pdf: &mut Pdf<R>, mode: FlattenMode) -> R
 )]
 pub(crate) fn flatten_annotations_qpdf<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    page_refs: &[ObjectRef],
     required_flags: i64,
     forbidden_flags: i64,
 ) -> Result<()> {
@@ -500,6 +523,10 @@ pub(crate) fn flatten_annotations_qpdf<R: Read + Seek>(
             "document does not have updated appearance streams, so form fields will not be flattened",
         )?;
     }
+    // qpdf enumerates pages only after the AcroForm analysis and
+    // NeedAppearances warning. Keep the returned helpers live through the
+    // per-page resource, annotation, and content mutations.
+    let page_handles = crate::PageDocumentHelper::new(pdf).get_all_pages()?;
     let default_resources = acroform_default_resources(pdf)?;
     // qpdf resolves the Widget's field helper from one cached
     // AcroFormDocumentHelper analysis before asking it for `/DR`. Build the
@@ -511,8 +538,8 @@ pub(crate) fn flatten_annotations_qpdf<R: Read + Seek>(
     } else {
         None
     };
-    for &page_ref in page_refs {
-        materialize_page_resources(pdf, page_ref)?;
+    for page in page_handles {
+        materialize_page_resources(pdf, &page)?;
         if !need_appearances {
             if let Some(default_resources) = default_resources.as_ref() {
                 let field_annotation_ids = field_annotation_ids
@@ -520,16 +547,16 @@ pub(crate) fn flatten_annotations_qpdf<R: Read + Seek>(
                     .expect("default resources require the association set");
                 merge_widget_default_resources_on_page_with_associations(
                     pdf,
-                    page_ref,
+                    &page,
                     default_resources,
                     field_annotation_ids,
                 )?;
             }
         }
-        let page_rotate = direct_page_rotate(pdf, page_ref)?;
-        flatten_annotations_on_page(
+        let page_rotate = direct_page_rotate(&page)?;
+        flatten_annotations_on_page_handle(
             pdf,
-            page_ref,
+            page,
             FlattenMode::Flags {
                 required: required_flags,
                 forbidden: forbidden_flags,
@@ -544,8 +571,7 @@ pub(crate) fn flatten_annotations_qpdf<R: Read + Seek>(
     Ok(())
 }
 
-fn direct_page_rotate<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<i32> {
-    let page = pdf.get_object_handle(page_ref);
+fn direct_page_rotate(page: &ObjectHandle) -> Result<i32> {
     if !page.try_is_dictionary()? {
         return Ok(0); // cov:ignore: repaired page snapshot is always a dictionary
     }
@@ -556,12 +582,19 @@ fn direct_page_rotate<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> 
         .unwrap_or(0))
 }
 
-fn materialize_page_resources<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<()> {
+#[cfg(test)]
+fn test_page_ref(page: &ObjectHandle) -> Result<ObjectRef> {
+    page.object_ref().ok_or_else(|| {
+        Error::Unsupported("test-only flatten modes require a valid ObjectRef".to_owned())
+    })
+}
+
+fn materialize_page_resources<R: Read + Seek>(pdf: &mut Pdf<R>, page: &ObjectHandle) -> Result<()> {
     // `getAttribute("/Resources", true)` may yield a malformed value. qpdf
     // replaces that value with an empty dictionary instead of rejecting the
     // whole flattening operation.
     let resources = {
-        let mut helper = PageObjectHelper::new(page_ref, pdf);
+        let mut helper = PageObjectHelper::from_object_handle(page.clone(), pdf);
         match helper.get_attribute(b"/Resources", true) {
             Ok(resources) if resources.try_is_dictionary()? => resources,
             Ok(_) => ObjectHandle::dictionary(Vec::new()),
@@ -573,11 +606,13 @@ fn materialize_page_resources<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
             Err(error) => return Err(error), // cov:ignore: non-Resources page-walk failures propagate unchanged
         }
     };
-    let page = pdf.get_object_handle(page_ref);
     // cov:ignore-start: public page traversal guarantees a page dictionary at this boundary
     if !page.try_is_dictionary()? {
+        let object_gen = page.get_obj_gen();
         return Err(Error::Unsupported(format!(
-            "object {page_ref} is not a page dictionary"
+            "object {} {} is not a page dictionary",
+            object_gen.get_obj(),
+            object_gen.get_gen()
         ))); // cov:ignore: repaired page snapshot is always a dictionary
     }
     // cov:ignore-end
@@ -594,9 +629,9 @@ fn materialize_page_resources<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
 /// available to every flattening consumer.
 fn page_annotation_handles<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
+    page: &ObjectHandle,
 ) -> Result<Vec<ObjectHandle>> {
-    let mut page_helper = PageObjectHelper::new(page_ref, pdf);
+    let mut page_helper = PageObjectHelper::from_object_handle(page.clone(), pdf);
     page_helper.get_annotations_filtered(None)
 }
 
@@ -746,9 +781,10 @@ fn merge_widget_default_resources_on_page<R: Read + Seek>(
     default_resources: &ObjectHandle,
 ) -> Result<()> {
     let field_annotation_ids = acroform_annotation_identities(pdf)?;
+    let page = pdf.get_object_handle(page_ref);
     merge_widget_default_resources_on_page_with_associations(
         pdf,
-        page_ref,
+        &page,
         default_resources,
         &field_annotation_ids,
     )
@@ -760,11 +796,11 @@ fn merge_widget_default_resources_on_page<R: Read + Seek>(
 )]
 fn merge_widget_default_resources_on_page_with_associations<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
+    page: &ObjectHandle,
     default_resources: &ObjectHandle,
     field_annotation_ids: &HashSet<ObjectHandleIdentity>,
 ) -> Result<()> {
-    for annotation in page_annotation_handles(pdf, page_ref)? {
+    for annotation in page_annotation_handles(pdf, page)? {
         let mut annotation_object_helper = AnnotationObjectHelper::new(annotation.clone());
         if annotation_object_helper.get_subtype()? != b"Widget" {
             continue;
@@ -868,12 +904,10 @@ fn remove_acroform<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
 /// `ObjectRef`s. Direct dictionaries are therefore compared by canonical
 /// handle identity and retained directly; indirect entries retain their
 /// original references.
-fn build_pruned_annots_array<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
+fn build_pruned_annots_array_from_handle(
+    page: &ObjectHandle,
     to_remove: &[ObjectHandle],
 ) -> Result<ObjectHandle> {
-    let page = pdf.get_object_handle(page_ref);
     let annots = page.try_get_key(b"/Annots")?;
     let Some(annots_arr) = annots.try_as_array()? else {
         return Ok(ObjectHandle::array(Vec::new()));
@@ -887,6 +921,16 @@ fn build_pruned_annots_array<R: Read + Seek>(
     }
 
     Ok(ObjectHandle::array(pruned))
+}
+
+#[cfg(test)]
+fn build_pruned_annots_array<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+    to_remove: &[ObjectHandle],
+) -> Result<ObjectHandle> {
+    let page = pdf.get_object_handle(page_ref);
+    build_pruned_annots_array_from_handle(&page, to_remove)
 }
 
 /// Return whether an annotation handle is one of the qpdf removal candidates.
@@ -982,12 +1026,88 @@ mod tests {
     #[test]
     fn qpdf_document_flatten_empty_page_exercises_public_contract() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
-        flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
+        flatten_annotations_qpdf(&mut pdf, 0, 0x3).unwrap();
         let page = pdf.get_object_handle(ObjectRef::new(3, 0));
         page.try_is_scalar().unwrap();
         let resources = page.try_get_key(b"/Resources").unwrap();
         resources.try_is_scalar().unwrap();
         assert!(resources.as_dictionary().is_some());
+    }
+
+    #[test]
+    fn public_qpdf_flatten_copies_a_raw_generation_page_handle() {
+        let xobj_body = make_xobj_stream([0.0, 0.0, 100.0, 20.0], b"");
+        let (n4, obj4_bytes) = obj_dict(
+            4,
+            "<< /Type /Annot /Subtype /Link /Rect [0 0 100 20] /AP << /N 5 0 R >> >>",
+        );
+        let (n5, obj5_bytes) = obj_wrap(5, xobj_body);
+        let mut pdf = Pdf::open(Cursor::new(build_pdf(
+            "",
+            &[(n4, obj4_bytes), (n5, obj5_bytes)],
+        )))
+        .expect("open source with an appearance annotation");
+
+        let raw_page_ref = ObjectRef::new(17, 65_535);
+        let raw_page = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (
+                b"/Parent".to_vec(),
+                pdf.get_object_handle(ObjectRef::new(2, 0)),
+            ),
+            (
+                b"/MediaBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(612),
+                    ObjectHandle::integer(792),
+                ]),
+            ),
+            (
+                b"/Annots".to_vec(),
+                ObjectHandle::array(vec![pdf.get_object_handle(ObjectRef::new(4, 0))]),
+            ),
+        ]);
+        pdf.replace_object(raw_page_ref, raw_page)
+            .expect("install raw-generation page");
+        let pages_root = pdf.get_object_handle(ObjectRef::new(2, 0));
+        pages_root
+            .replace_key(
+                b"/Kids",
+                ObjectHandle::array(vec![pdf.get_object_handle(raw_page_ref)]),
+            )
+            .expect("select raw-generation page");
+        pages_root
+            .replace_key(b"/Count", ObjectHandle::integer(1))
+            .expect("update page count");
+
+        crate::PageDocumentHelper::new(&mut pdf)
+            .flatten_annotations(0, 0x3)
+            .expect("flatten the raw-generation page");
+
+        let pages = crate::PageDocumentHelper::new(&mut pdf)
+            .get_all_pages()
+            .expect("read the flattened raw page");
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].get_obj_gen(), crate::QpdfObjGen::new(17, 65_535));
+        assert_eq!(pages[0].object_ref(), None);
+        assert!(
+            pages[0]
+                .try_get_key(b"/Annots")
+                .unwrap()
+                .try_is_null()
+                .unwrap(),
+            "the selected appearance annotation must be removed"
+        );
+        assert!(
+            !pages[0]
+                .try_get_key(b"/Contents")
+                .unwrap()
+                .try_is_null()
+                .unwrap(),
+            "the selected appearance must be appended to page contents"
+        );
     }
 
     #[test]
@@ -1002,7 +1122,7 @@ mod tests {
         pdf.replace_object(ObjectRef::new(4, 0), ObjectHandle::integer(270))
             .expect("indirect rotate value must be replaceable");
 
-        assert_eq!(direct_page_rotate(&mut pdf, page_ref).unwrap(), 270);
+        assert_eq!(direct_page_rotate(&page).unwrap(), 270);
     }
 
     #[test]
@@ -1022,7 +1142,7 @@ mod tests {
 
         assert!(acroform_need_appearances(&mut pdf).unwrap());
 
-        flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
+        flatten_annotations_qpdf(&mut pdf, 0, 0x3).unwrap();
         let diagnostics = pdf.repair_diagnostics();
         assert!(!diagnostics.entries().iter().any(|diagnostic| {
             diagnostic.message_string() == "document does not have updated appearance streams, so form fields will not be flattened" // cov:ignore: test-only assertion line is not part of production execution
@@ -1053,7 +1173,7 @@ mod tests {
         pdf.set_logger(logger);
 
         assert!(matches!(
-            flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3),
+            flatten_annotations_qpdf(&mut pdf, 0, 0x3),
             Err(Error::System(message)) if message == "sink write failure 1"
         ));
     }
@@ -1284,7 +1404,7 @@ mod tests {
         catalog.try_is_scalar().unwrap();
         catalog.replace_key(b"/AcroForm", acroform).unwrap();
 
-        let error = flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3)
+        let error = flatten_annotations_qpdf(&mut pdf, 0, 0x3)
             .expect_err("production flatten must propagate the DR merge failure");
         assert!(matches!(
             error,
@@ -2083,7 +2203,7 @@ mod tests {
             .replace_key(b"/AP", ObjectHandle::dictionary(Vec::new()))
             .unwrap();
 
-        flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
+        flatten_annotations_qpdf(&mut pdf, 0, 0x3).unwrap();
 
         let page = pdf.get_object_handle(ObjectRef::new(3, 0));
         page.try_is_scalar().unwrap();
@@ -2199,7 +2319,7 @@ mod tests {
         let acroform_handle = pdf.get_object_handle(acroform_ref);
         root.replace_key(b"/AcroForm", acroform_handle).unwrap();
 
-        flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
+        flatten_annotations_qpdf(&mut pdf, 0, 0x3).unwrap();
         let appearance = pdf.get_object_handle(appearance_ref);
         appearance.try_is_scalar().unwrap();
         let stream_dict = appearance
@@ -3148,9 +3268,7 @@ mod tests {
             &[(n4, obj4_bytes), (n5, obj5_bytes), (n6, obj6_bytes)],
         );
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let page_ref = ObjectRef::new(3, 0);
-
-        flatten_annotations_qpdf(&mut pdf, &[page_ref], 0, 0).unwrap();
+        flatten_annotations_qpdf(&mut pdf, 0, 0).unwrap();
 
         let diagnostics = pdf.repair_diagnostics().entries().to_vec();
         assert!(
@@ -3763,9 +3881,8 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         register_acroform_fields(&mut pdf, &[ObjectRef::new(4, 0), ObjectRef::new(7, 0)]);
 
-        let page_ref = ObjectRef::new(3, 0);
         // Print mode: required=0x4, forbidden=0x3 (matches CliFlattenMode::Print).
-        flatten_annotations_qpdf(&mut pdf, &[page_ref], 0x4, 0x3).unwrap();
+        flatten_annotations_qpdf(&mut pdf, 0x4, 0x3).unwrap();
 
         let root_ref = pdf.root_ref().unwrap();
         let root_after_flatten = pdf.get_object_handle(root_ref);
@@ -3797,7 +3914,6 @@ mod tests {
         // "unable to find /Root dictionary" from flattenAnnotations.
         let bytes = build_pdf("", &[]);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let page_ref = ObjectRef::new(3, 0);
         let root_ref = pdf.root_ref().unwrap();
         pdf.replace_object(
             root_ref,
@@ -3805,7 +3921,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = flatten_annotations_qpdf(&mut pdf, &[page_ref], 0, 0)
+        let error = flatten_annotations_qpdf(&mut pdf, 0, 0)
             .expect_err("an invalidated catalog must surface qpdf's getRoot failure");
         assert!(
             matches!(
