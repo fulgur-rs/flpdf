@@ -189,6 +189,50 @@ fn check_linearization_subcommand_uses_job_run() {
 }
 
 #[test]
+fn pages_subcommands_use_job_run() {
+    let source = production_main_source();
+    let after_npages = source
+        .split_once("fn run_show_npages(")
+        .and_then(|(_, tail)| tail.split_once("fn run_show_pages("))
+        .map(|(body, _)| body)
+        .expect("show-npages subcommand route");
+    let show_pages = source
+        .split_once("fn run_show_pages(")
+        .and_then(|(_, tail)| tail.split_once("// Encryption inspection subcommands"))
+        .map(|(body, _)| body)
+        .expect("show-pages subcommand route");
+
+    assert!(
+        after_npages.contains("configuration.show_npages()"),
+        "pages --show-npages must configure the canonical Job flag"
+    );
+    assert!(
+        after_npages.contains("job.run()"),
+        "pages --show-npages must use QPDFJob::run"
+    );
+    assert!(
+        show_pages.contains("configuration.show_pages()"),
+        "default pages must configure the canonical Job flag"
+    );
+    assert!(
+        show_pages.contains("job.run()"),
+        "default pages must use QPDFJob::run"
+    );
+
+    for forbidden in [
+        "job.show_npages(",
+        "job.show_pages(",
+        "open_pdf_with_suppression(",
+        "complete_report(",
+    ] {
+        assert!(
+            !after_npages.contains(forbidden) && !show_pages.contains(forbidden),
+            "pages subcommand retains a direct route: {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn page_selection_overlay_uses_the_canonical_job_owner() {
     let source = production_main_source();
     let after_plan = source

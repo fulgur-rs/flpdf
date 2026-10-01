@@ -2,7 +2,7 @@
 
 use assert_cmd::Command;
 use std::path::Path;
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Output};
 
 const EXPECTED_QPDF_VERSION: &str = "qpdf version 11.9.0";
 
@@ -39,6 +39,91 @@ fn check(path: &Path) {
         .output()
         .expect("run qpdf --check");
     assert!(output.status.success(), "qpdf --check failed: {output:?}");
+}
+
+fn assert_cli_output_matches(label: &str, actual: &Output, expected: &Output) {
+    assert_eq!(
+        actual.status.code(),
+        expected.status.code(),
+        "{label}: exit status differs"
+    );
+    assert_eq!(actual.stdout, expected.stdout, "{label}: stdout differs");
+    assert_eq!(actual.stderr, expected.stderr, "{label}: stderr differs");
+}
+
+#[test]
+fn pages_subcommands_match_qpdf_outputs_exactly() {
+    if !qpdf_available() {
+        eprintln!("qpdf 11.9.0 is unavailable; skipping native pages report differential");
+        return;
+    }
+
+    let input =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/three-page.pdf");
+    let qpdf_npages = ProcessCommand::new("qpdf")
+        .args(["--show-npages"])
+        .arg(&input)
+        .output()
+        .expect("run qpdf --show-npages");
+    let flpdf_npages = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["pages", "--show-npages"])
+        .arg(&input)
+        .output()
+        .expect("run flpdf pages --show-npages");
+    assert_cli_output_matches("pages --show-npages", &flpdf_npages, &qpdf_npages);
+
+    let qpdf_pages = ProcessCommand::new("qpdf")
+        .args(["--show-pages"])
+        .arg(&input)
+        .output()
+        .expect("run qpdf --show-pages");
+    let flpdf_pages = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg("pages")
+        .arg(&input)
+        .output()
+        .expect("run flpdf pages");
+    assert_cli_output_matches("pages", &flpdf_pages, &qpdf_pages);
+}
+
+#[test]
+fn pages_subcommands_preserve_qpdf_repair_warning_order() {
+    if !qpdf_available() {
+        eprintln!("qpdf 11.9.0 is unavailable; skipping native pages warning differential");
+        return;
+    }
+
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/test_driver/repairable_input.pdf");
+    for (label, qpdf_flag, flpdf_flag) in [
+        (
+            "pages --show-npages",
+            "--show-npages",
+            Some("--show-npages"),
+        ),
+        ("pages", "--show-pages", None),
+    ] {
+        let qpdf = ProcessCommand::new("qpdf")
+            .arg(qpdf_flag)
+            .arg(&input)
+            .output()
+            .expect("run qpdf page inspection on repairable input");
+        let mut flpdf = Command::cargo_bin("flpdf").expect("flpdf binary");
+        flpdf.env("FLPDF_PROGNAME", "qpdf").arg("pages");
+        if let Some(flag) = flpdf_flag {
+            flpdf.arg(flag);
+        }
+        let flpdf = flpdf
+            .arg(&input)
+            .output()
+            .expect("run flpdf page inspection on repairable input");
+
+        assert_eq!(qpdf.status.code(), Some(3), "qpdf warning exit for {label}");
+        assert_cli_output_matches(label, &flpdf, &qpdf);
+    }
 }
 
 #[test]

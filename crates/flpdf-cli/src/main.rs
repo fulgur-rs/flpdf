@@ -4603,26 +4603,9 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
         }
         Commands::Pages(cmd) => {
             if cmd.show_npages {
-                run_show_npages(
-                    Some(cmd.input),
-                    cmd.repair,
-                    &cmd.password,
-                    false,
-                    false,
-                    InspectionTransformOptions::new(ImageTransformOptions::default(), false, None),
-                    false,
-                )
+                run_show_npages(cmd.input, cmd.repair, &cmd.password, false)
             } else {
-                run_show_pages(
-                    Some(cmd.input),
-                    cmd.repair,
-                    &cmd.password,
-                    false,
-                    false,
-                    false,
-                    InspectionTransformOptions::new(ImageTransformOptions::default(), false, None),
-                    false,
-                )
+                run_show_pages(cmd.input, cmd.repair, &cmd.password, false)
             }
         }
         Commands::Qdf(cmd) => run_qdf(
@@ -8621,59 +8604,53 @@ fn qpdf_selector_integer(value: &str) -> CliResult<i32> {
     })?)
 }
 
-/// `flpdf pages FILE --show-npages`: the flpdf-native subcommand form. No
-/// qpdf argv counterpart (qpdf has no subcommand grammar), so it keeps its
-/// own standalone document-open/report sequence.
+/// `flpdf pages FILE --show-npages`: the flpdf-native spelling for qpdf's
+/// `--show-npages` inspection, dispatched through the configured Job.
 fn run_show_npages(
-    input: Option<PathBuf>,
+    input: PathBuf,
     repair: bool,
     password: &PasswordArgs,
     suppress_warnings: bool,
-    empty: bool,
-    transform_options: InspectionTransformOptions<'_>,
-    verbose: bool,
 ) -> CliResult<()> {
-    if empty {
-        reject_empty_inspection_output(input.as_deref())?;
-        let mut job = new_cli_job(suppress_warnings);
-        let mut pdf = create_empty_primary_document(&mut job, None)?;
-        apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-        return finish_job_exit_status(job.show_npages(&mut pdf)?);
-    }
-    let input = input.ok_or_else(missing_input_usage_error)?;
-    let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = new_cli_job(suppress_warnings);
-    apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-    finish_job_exit_status(job.show_npages(&mut pdf)?)
+    {
+        let mut configuration = job.config();
+        configuration.show_npages();
+    }
+    let input_options = pdf_open_options(repair, password)?;
+    job.set_password(input_options.password);
+    job.set_password_mode(password.password_mode.into());
+    job.set_password_is_hex_key(password.password_is_hex_key);
+    job.set_suppress_password_recovery(password.suppress_password_recovery);
+    job.set_suppress_recovery(password.recovery.suppress_recovery);
+    job.set_ignore_xref_streams(password.recovery.ignore_xref_streams);
+    job.set_input_file(input)?;
+    finish_job_exit_status(job.run()?)
 }
 
 /// `flpdf pages FILE` (default, without `--show-npages`): the flpdf-native
-/// subcommand form -- same qpdf-grammar-free scope as `run_show_npages`.
-#[allow(clippy::too_many_arguments)]
+/// spelling for qpdf's `--show-pages` inspection, dispatched through the
+/// configured Job.
 fn run_show_pages(
-    input: Option<PathBuf>,
+    input: PathBuf,
     repair: bool,
     password: &PasswordArgs,
-    with_images: bool,
     suppress_warnings: bool,
-    empty: bool,
-    transform_options: InspectionTransformOptions<'_>,
-    verbose: bool,
 ) -> CliResult<()> {
-    if empty {
-        reject_empty_inspection_output(input.as_deref())?;
-        let mut job = new_cli_job(suppress_warnings);
-        job.set_with_images(with_images);
-        let mut pdf = create_empty_primary_document(&mut job, None)?;
-        apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-        return finish_job_exit_status(job.show_pages(&mut pdf)?);
-    }
-    let input = input.ok_or_else(missing_input_usage_error)?;
-    let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = new_cli_job(suppress_warnings);
-    job.set_with_images(with_images);
-    apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-    finish_job_exit_status(job.show_pages(&mut pdf)?)
+    {
+        let mut configuration = job.config();
+        configuration.show_pages();
+    }
+    let input_options = pdf_open_options(repair, password)?;
+    job.set_password(input_options.password);
+    job.set_password_mode(password.password_mode.into());
+    job.set_password_is_hex_key(password.password_is_hex_key);
+    job.set_suppress_password_recovery(password.suppress_password_recovery);
+    job.set_suppress_recovery(password.recovery.suppress_recovery);
+    job.set_ignore_xref_streams(password.recovery.ignore_xref_streams);
+    job.set_input_file(input)?;
+    finish_job_exit_status(job.run()?)
 }
 
 // ---------------------------------------------------------------------------
@@ -8939,15 +8916,6 @@ fn apply_json_update_with_job<R: Read + Seek + 'static>(
     Ok(())
 }
 
-fn open_pdf_with_suppression(
-    input: &PathBuf,
-    repair: bool,
-    password: &PasswordArgs,
-    suppress_warnings: bool,
-) -> CliResult<Pdf<BufReader<File>>> {
-    open_pdf_impl(input, repair, password, suppress_warnings)
-}
-
 /// Open for the read-only encryption inspections (`show-encryption`,
 /// `show-encryption-key`).
 ///
@@ -8963,16 +8931,6 @@ fn open_pdf_for_inspection(
 ) -> CliResult<Pdf<BufReader<File>>> {
     let file = File::open(input).map_err(|error| open_error_with_file(input, error.into()))?;
     open_pdf_file_impl(input, file, repair, password, false, true)
-}
-
-fn open_pdf_impl(
-    input: &PathBuf,
-    repair: bool,
-    password: &PasswordArgs,
-    suppress_warnings: bool,
-) -> CliResult<Pdf<BufReader<File>>> {
-    let file = File::open(input).map_err(|error| open_error_with_file(input, error.into()))?;
-    open_pdf_file_impl(input, file, repair, password, suppress_warnings, false)
 }
 
 fn open_pdf_file_impl(
