@@ -1915,13 +1915,15 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::Cursor;
 
-    fn linearized_two_page_inputs() -> (
-        Vec<u8>,
-        Pdf<Cursor<Vec<u8>>>,
-        Vec<QpdfObjGen>,
-        HPageOffset,
-        HSharedObject,
-    ) {
+    struct LinearizedTwoPageInputs {
+        file_bytes: Vec<u8>,
+        pdf: Pdf<Cursor<Vec<u8>>>,
+        pages: Vec<QpdfObjGen>,
+        page_hints: HPageOffset,
+        shared_hints: HSharedObject,
+    }
+
+    fn linearized_two_page_inputs() -> LinearizedTwoPageInputs {
         let file_bytes = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/compat/linearized-two-page.pdf"
@@ -1949,7 +1951,13 @@ mod tests {
                 .map(ObjectHandle::get_obj_gen)
                 .collect()
         };
-        (file_bytes, pdf, pages, page_hints, shared_hints)
+        LinearizedTwoPageInputs {
+            file_bytes,
+            pdf,
+            pages,
+            page_hints,
+            shared_hints,
+        }
     }
 
     fn fixture_hint_input<'a>(
@@ -2104,8 +2112,13 @@ mod tests {
 
     #[test]
     fn check_hint_tables_warns_when_shared_total_is_below_first_page_count() {
-        let (file_bytes, mut pdf, pages, mut page_hints, mut shared_hints) =
-            linearized_two_page_inputs();
+        let LinearizedTwoPageInputs {
+            file_bytes,
+            mut pdf,
+            pages,
+            mut page_hints,
+            mut shared_hints,
+        } = linearized_two_page_inputs();
         shared_hints.nshared_total = 0;
         for entry in &mut page_hints.entries {
             entry.nshared_objects = 0;
@@ -2128,8 +2141,13 @@ mod tests {
 
     #[test]
     fn check_hint_tables_warns_for_a_mismatched_first_shared_object_number() {
-        let (file_bytes, mut pdf, pages, mut page_hints, mut shared_hints) =
-            linearized_two_page_inputs();
+        let LinearizedTwoPageInputs {
+            file_bytes,
+            mut pdf,
+            pages,
+            mut page_hints,
+            mut shared_hints,
+        } = linearized_two_page_inputs();
         let mut computed = compute_hint_data(&mut pdf, &pages).expect("compute page users");
         // Exercise the Part-8 verifier boundary with an object that has a real
         // raw xref row; the production classifier is covered separately.
@@ -2159,8 +2177,13 @@ mod tests {
 
     #[test]
     fn check_hint_tables_casts_high_bit_shared_object_number_like_qpdf() {
-        let (file_bytes, mut pdf, pages, mut page_hints, mut shared_hints) =
-            linearized_two_page_inputs();
+        let LinearizedTwoPageInputs {
+            file_bytes,
+            mut pdf,
+            pages,
+            mut page_hints,
+            mut shared_hints,
+        } = linearized_two_page_inputs();
         let mut computed = compute_hint_data(&mut pdf, &pages).expect("compute page users");
         computed.part8_objects = vec![pages[1]];
         for entry in &mut page_hints.entries {
@@ -2193,8 +2216,13 @@ mod tests {
 
     #[test]
     fn check_hint_tables_treats_negative_shared_group_count_as_empty_like_qpdf() {
-        let (file_bytes, mut pdf, pages, mut page_hints, mut shared_hints) =
-            linearized_two_page_inputs();
+        let LinearizedTwoPageInputs {
+            file_bytes,
+            mut pdf,
+            pages,
+            mut page_hints,
+            mut shared_hints,
+        } = linearized_two_page_inputs();
         for entry in &mut page_hints.entries {
             entry.nshared_objects = 0;
             entry.shared_identifiers.clear();
@@ -2222,8 +2250,13 @@ mod tests {
 
     #[test]
     fn check_hint_tables_rejects_shared_object_sequence_integer_overflow() {
-        let (file_bytes, mut pdf, pages, page_hints, mut shared_hints) =
-            linearized_two_page_inputs();
+        let LinearizedTwoPageInputs {
+            file_bytes,
+            mut pdf,
+            pages,
+            page_hints,
+            mut shared_hints,
+        } = linearized_two_page_inputs();
         let mut computed = compute_hint_data(&mut pdf, &pages).expect("compute page users");
         computed.part8_objects.clear();
         shared_hints.nshared_total = shared_hints.nshared_first_page + 1;
@@ -2247,8 +2280,13 @@ mod tests {
 
     #[test]
     fn check_hint_tables_reports_a_page_shared_identifier_missing_from_shared_table() {
-        let (file_bytes, mut pdf, pages, page_hints, mut shared_hints) =
-            linearized_two_page_inputs();
+        let LinearizedTwoPageInputs {
+            file_bytes,
+            mut pdf,
+            pages,
+            page_hints,
+            mut shared_hints,
+        } = linearized_two_page_inputs();
         shared_hints.nshared_total = 0;
         shared_hints.nshared_first_page = 0;
         shared_hints.entries.clear();
@@ -2269,8 +2307,13 @@ mod tests {
 
     #[test]
     fn check_hint_tables_warns_for_page_object_count_mismatch() {
-        let (file_bytes, mut pdf, pages, mut page_hints, shared_hints) =
-            linearized_two_page_inputs();
+        let LinearizedTwoPageInputs {
+            file_bytes,
+            mut pdf,
+            pages,
+            mut page_hints,
+            shared_hints,
+        } = linearized_two_page_inputs();
         page_hints.min_nobjects += 1;
 
         let mut warnings = Vec::new();
