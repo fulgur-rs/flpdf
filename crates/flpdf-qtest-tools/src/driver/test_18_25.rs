@@ -278,7 +278,7 @@ pub(crate) fn run_test_24<R: Read + Seek + 'static>(
 
     // Make sure trying to ask questions about a reserved object doesn't
     // break it.
-    if res1.as_array().is_some() {
+    if res1.try_is_array()? {
         writeln!(stdout, "oops -- res1 is an array")?;
     }
     if res1.is_reserved() {
@@ -295,7 +295,7 @@ pub(crate) fn run_test_24<R: Read + Seek + 'static>(
     } else {
         writeln!(stdout, "res1 is no longer reserved")?;
     }
-    assert!(res1.as_array().is_some());
+    assert!(res1.try_is_array()?);
     writeln!(stdout, "res1 is an array")?;
 
     // qpdf's `res2.unparseResolved()` throws from the reserved value
@@ -316,7 +316,7 @@ pub(crate) fn run_test_24<R: Read + Seek + 'static>(
         Err(error) => writeln!(stdout, "logic error: {error}")?,
     }
     pdf.replace_reserved(res2.clone(), array2.clone())?;
-    assert!(res2.as_array().is_some());
+    assert!(res2.try_is_array()?);
     writeln!(stdout, "res2 is an array")?;
 
     // qpdf's `res1.getArrayItem(0).getArrayItem(1).getIntValueAsInt()`
