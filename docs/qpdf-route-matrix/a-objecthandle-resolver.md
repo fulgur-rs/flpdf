@@ -940,6 +940,34 @@ session can preserve its existing boundary; those callers are an explicitly
 excluded denominator, not normal library routes. The route contract is
 `crates/flpdf/tests/final_accessor_route_tests.rs`.
 
+### A6 name/number-tree accessor slice `flpdf-3yn9.48.208.7` (2026-10-01)
+
+`nntree.rs` now keeps the qpdf key-validity and iterator-value boundaries
+separate. `TreeKey::is_valid_key` uses resolving `try_is_string`/
+`try_is_integer`, while `value_from_handle` uses qpdf-shaped
+`try_get_utf8_value`/`try_get_int_value`; `resolved_key` composes those
+operations. `update_current` uses the value accessor for every in-range
+iterator slot, matching qpdf `updateIValue`; `increment` calls key validity
+before advancing and skips malformed keys with qpdf's warning. The optional
+`LiveDictionary` lookup uses `try_is_null` on the returned child handle.
+
+The RED/GREEN route contract covers all three former non-resolving production
+calls. Behavior tests cover indirect string/integer keys, qpdf's empty-string
+and zero defaults on wrong-typed iterator keys, malformed-key skip and warning
+order, structural find errors, and indirect-null `/Kids`. A pinned qpdf 11.9.0
+C++ probe confirms a direct unowned wrong-typed key raises `QPDFExc` from
+`typeWarning`; appending an uninitialized handle to a qpdf array throws before
+an NNTree exists, so it is excluded as an NNTree input. Focused name/number-tree,
+logger-failure, page-label, and embedded-files tests pass.
+
+The post-cutover `qpdf-route-callers.py` inventory in this worktree based on
+main `810bd8d7` is 234 production calls across the nine symbols, down from
+237: `as_integer` 18,
+`as_string` 36, and `is_null` 73; the other six counts are unchanged. This is a
+syntactic inventory and still includes non-resolving accessor implementations
+inside `object_handle.rs`. A6 remains `mixed`; the remaining production caller
+families require their own source and call-chain audits.
+
 ### 分類集計
 
 <!-- route-matrix-aggregate: document-tally unit=area-physical file=a-objecthandle-resolver.md -->

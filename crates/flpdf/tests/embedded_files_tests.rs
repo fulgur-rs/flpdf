@@ -1415,7 +1415,7 @@ fn helper_lookup_returns_none_for_missing_key_in_existing_tree() {
 }
 
 #[test]
-fn helper_listing_rejects_a_first_non_string_name_tree_key() {
+fn helper_listing_preserves_qpdf_type_warning_for_a_direct_non_string_name_key() {
     let mut pdf = open(build_no_names_pdf());
     let filespec = make_filespec(&mut pdf, b"valid.txt");
     filespec.try_is_scalar().expect("resolve filespec");
@@ -1433,8 +1433,9 @@ fn helper_listing_rejects_a_first_non_string_name_tree_key() {
 
     assert!(matches!(
         pdf.embedded_files().get_embedded_files(),
-        Err(Error::Internal(message))
-            if message == "attempt made to dereference an invalid name/number tree iterator"
+        Err(Error::QpdfExc(error))
+            if error.get_message_detail()
+                == b"operation for string attempted on object of type name: returning empty string"
     ));
 }
 

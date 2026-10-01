@@ -25,7 +25,7 @@
 //! `libqpdf/QPDFObjectHandle.cc:224-227`).
 
 use crate::object_handle::{canonical_dictionary_key, ObjectHandleIdentity};
-use crate::pdf_string::{new_unicode_string, normalized_utf8_value, utf8_value};
+use crate::pdf_string::{new_unicode_string, normalized_utf8_value};
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, QpdfErrorCode, QpdfExc, Result};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
@@ -46,7 +46,18 @@ pub(crate) trait TreeKey {
     type Key: Clone + Debug + Eq + Ord;
     const ITEMS_KEY: &'static str;
 
-    fn from_handle(handle: &ObjectHandle) -> Option<Self::Key>;
+    /// qpdf `NameTreeDetails::keyValid` / `NumberTreeDetails::keyValid`, using
+    /// the resolving `isString` / `isInteger` boundaries
+    /// (`QPDFNameTreeObjectHelper.cc:17-32`,
+    /// `QPDFNumberTreeObjectHelper.cc:17-32`).
+    fn is_valid_key(handle: &ObjectHandle) -> Result<bool>;
+
+    /// qpdf's iterator value read: `getUTF8Value` or `getIntValue`. This is
+    /// intentionally separate from key validity because qpdf's begin adapter
+    /// reads an in-range slot even when keyValid would reject it
+    /// (`QPDFNameTreeObjectHelper.cc:88-98`,
+    /// `QPDFNumberTreeObjectHelper.cc:91-100`).
+    fn value_from_handle(handle: &ObjectHandle) -> Result<Self::Key>;
     fn to_handle(key: &Self::Key) -> ObjectHandle;
 
     fn compare(left: &Self::Key, right: &Self::Key) -> Ordering {
@@ -60,8 +71,12 @@ impl TreeKey for NameKey {
     type Key = Vec<u8>;
     const ITEMS_KEY: &'static str = "Names";
 
-    fn from_handle(handle: &ObjectHandle) -> Option<Self::Key> {
-        handle.as_string().map(|value| utf8_value(&value))
+    fn is_valid_key(handle: &ObjectHandle) -> Result<bool> {
+        handle.try_is_string()
+    }
+
+    fn value_from_handle(handle: &ObjectHandle) -> Result<Self::Key> {
+        handle.try_get_utf8_value()
     }
 
     fn to_handle(key: &Self::Key) -> ObjectHandle {
@@ -76,8 +91,12 @@ impl TreeKey for NumberKey {
     type Key = i64;
     const ITEMS_KEY: &'static str = "Nums";
 
-    fn from_handle(handle: &ObjectHandle) -> Option<Self::Key> {
-        handle.as_integer()
+    fn is_valid_key(handle: &ObjectHandle) -> Result<bool> {
+        handle.try_is_integer()
+    }
+
+    fn value_from_handle(handle: &ObjectHandle) -> Result<Self::Key> {
+        handle.try_get_int_value()
     }
 
     fn to_handle(key: &Self::Key) -> ObjectHandle {
@@ -192,9 +211,13 @@ fn resolved_array(value: Option<&ObjectHandle>) -> Result<Option<ResolvedArray>>
 }
 
 fn resolved_key<K: TreeKey>(value: &ObjectHandle) -> Result<Option<K::Key>> {
-    value.try_dereference()?;
-    let value = value.clone();
-    Ok(K::from_handle(&value))
+    // qpdf compareKeyItem checks keyValid before compareKeys; keep validation
+    // and value decoding on their distinct resolving accessor boundaries.
+    if K::is_valid_key(value)? {
+        Ok(Some(K::value_from_handle(value)?))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Reject a handle-native tree value that does not belong to `pdf`.
@@ -267,7 +290,11 @@ impl LiveDictionary {
         let value = self.handle.try_get_key(&key)?;
         // qpdf dereferences the value before its array/type checks, so a
         // dangling reference has the same null outcome as a literal null.
-        Ok((!value.is_null()).then_some(value))
+        if value.try_is_null()? {
+            Ok(None)
+        } else {
+            Ok(Some(value))
+        }
     }
 
     fn insert(&self, key: &str, value: ObjectHandle) -> Result<()> {
@@ -2142,11 +2169,17 @@ impl<K: TreeKey> NNTree<K> {
                     cursor.current = None;
                     continue;
                 }
+                // qpdf NNTreeIterator::increment skips a wrong-typed key after
+                // a resolving keyValid check (NNTree.cc:138-151).
+                if !K::is_valid_key(&items.values[candidate])? {
+                    self.warn(pdf, &leaf, format!("item {candidate} has the wrong type"))?;
+                    cursor.current = None;
+                    continue;
+                }
                 self.update_current(pdf, cursor, true)?;
                 if cursor.current.is_some() {
                     return Ok(());
                 }
-                self.warn(pdf, &leaf, format!("item {candidate} has the wrong type"))?;
                 continue;
             }
 
@@ -2242,18 +2275,24 @@ impl<K: TreeKey> NNTree<K> {
         }
         let raw_key = items.values[item_number].clone();
         let raw_value = items.values[item_number + 1].clone();
-        // cov:ignore-start: malformed item keys are rejected by find before update_current is reached
-        let Some(key) = resolved_key::<K>(&raw_key)? else {
-            if allow_invalid {
-                return Ok(());
+        let key = if allow_invalid {
+            // qpdf's iterator adapter calls getUTF8Value/getIntValue for every
+            // in-range slot, including a key that keyValid would reject.
+            K::value_from_handle(&raw_key)?
+        } else {
+            // cov:ignore-start: malformed item keys are rejected by find before strict update_current is reached
+            match resolved_key::<K>(&raw_key)? {
+                Some(key) => key,
+                None => {
+                    return Err(structural_error(
+                        &pdf.input_description(),
+                        leaf.diagnostic_ref(),
+                        format!("item at index {item_number} is not the right type"),
+                    ));
+                }
             }
-            return Err(structural_error(
-                &pdf.input_description(),
-                leaf.diagnostic_ref(),
-                format!("item at index {item_number} is not the right type"),
-            ));
+            // cov:ignore-end
         };
-        // cov:ignore-end
         cursor.current = Some((key, raw_value));
         Ok(())
     }
