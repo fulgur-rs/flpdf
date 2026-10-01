@@ -232,11 +232,17 @@ fn ownerless_xref_api_is_removed_in_favor_of_the_canonical_pdf_route() {
 ///   `_pdf: Pdf<R>` is already reported where that field is *declared*, by the
 ///   same walk. Destructuring only re-binds a carrier the guard has seen.
 /// * **A closure parameter with no type annotation.** `|_pdf| ...` has no type
-///   to read; only the inference engine has one. It is left open because a
-///   closure is not a signature qpdf mirrors -- the carriers this guard exists
-///   to fence out were function parameters and struct fields, which is where
-///   flpdf's shapes answer to qpdf's. An annotated closure parameter is still
-///   checked.
+///   written in its pattern; `syn` only sees the expected type after Rust's
+///   type inference. qpdf 11.9 does use callback signatures that carry a QPDF
+///   owner: private `QPDFJob::doProcess` and `doProcessOnce` accept
+///   `std::function<void(QPDF*, char const*)>` (`QPDFJob.hh:497-510`), and
+///   their callers bind QPDF member functions (`QPDFJob.cc:1801-1815`). So
+///   closures are not categorically outside qpdf's callback surface. This
+///   syntax-only scan has no call-site expected-type propagation; treating
+///   every untyped closure parameter as an unknown PDF carrier would also
+///   conflate unrelated callbacks. Keep untyped closure parameters outside
+///   this guard until a call-site-aware qpdf callback mapping exists. An
+///   annotated closure parameter is still checked.
 /// * **A binding name produced by a macro.** `bind!(_pdf)` is a `Pat::Macro`,
 ///   and the name only exists after expansion.
 ///
@@ -1378,6 +1384,51 @@ fn unrelated<R>((_first, _second): (usize, R)) {}
         "each destructured `_pdf` must be reported, and a tuple of unrelated \
          types must not be"
     );
+}
+
+/// A destructuring parameter does not create an unobserved carrier when its
+/// field belongs to a local struct: the field declaration itself is scanned
+/// and reports the `Pdf` type. The parameter pattern's outer `Holder` type is
+/// not treated as a `Pdf` merely because one field contains one.
+#[test]
+fn struct_destructuring_keeps_the_pdf_field_visible_at_its_declaration() {
+    let source = "\
+struct Holder<R> {
+    _pdf: Pdf<R>,
+}
+fn consume<R>(Holder { _pdf }: Holder<R>) {}
+";
+    let found: Vec<(usize, String, String)> = dead_pdf_carriers(source)
+        .into_iter()
+        .map(|carrier| (carrier.line, carrier.binding, carrier.owner))
+        .collect();
+    assert_eq!(
+        found,
+        vec![(2, "_pdf".to_owned(), "struct Holder".to_owned())]
+    );
+}
+
+/// An untyped closure parameter has no type node in the syntax tree. Inferring
+/// its expected type needs the call site, so the syntax-only guard leaves it
+/// open rather than treating every callback parameter as a PDF carrier.
+#[test]
+fn untyped_closure_parameter_waits_for_callsite_type_information() {
+    let source = "\
+fn accepts_callback<F: FnOnce(Pdf<()>)>(_callback: F) {}
+fn caller() {
+    accepts_callback(|_pdf| ());
+}
+";
+    assert!(dead_pdf_carriers(source).is_empty());
+}
+
+/// A macro pattern is not expanded by `syn`; its binding name is unavailable
+/// to this guard. The current production tree has no such carrier, and a
+/// fail-closed rule for this shape needs a macro-expansion-aware route map.
+#[test]
+fn macro_pattern_binding_waits_for_macro_expansion_aware_analysis() {
+    let source = "fn f<R>(bind!(_pdf): &mut Pdf<R>) {}\n";
+    assert!(dead_pdf_carriers(source).is_empty());
 }
 
 /// Two markers resolving to one declaration used to collapse into a single
