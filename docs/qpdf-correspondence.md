@@ -3729,6 +3729,15 @@ handle mutation で行うため、page merge に raw metadata closure bridge は
 `copyForeignObject` が拒否する shape であり、後方互換 adapter は追加せず明示的 rejection
 を維持する。
 
+`QPDFJob::doSplitPages` は `QPDF::getAllPages()` の `QPDFObjectHandle` vector を保持し、
+各 chunk のページ位置を index で選択して `addPage(page, false)` へ直接渡す
+（`QPDFJob.cc:2967-2987`）。flpdf の `job/page_split.rs` も
+`PageDocumentHelper::get_all_pages()` が返す raw handle を chunk slice として使い、
+`PageInput::foreign` と AcroForm copied-annotation fixup へ同じ handle を渡す。
+この consumer は有効な `ObjectRef` への射影を要求しない。raw identity `(17, 65535)`
+を選択して chunk を書き出す回帰を `job::page_split::tests::split_pages_copies_a_raw_generation_page_handle`
+で固定する。
+
 `.4wq4` では、single-source `PageSpecJobOutput::InPlace` の page-selection
 completion（navigation remap、structural `/Pg`/`/P` drop、subset prune、
 AcroForm prune）を `QPDFJob::complete_in_place_page_selection` に集約する。

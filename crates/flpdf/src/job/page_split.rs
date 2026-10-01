@@ -218,7 +218,7 @@ impl QPDFJob {
         if remove_resources {
             PageDocumentHelper::new(source).remove_unreferenced_resources()?;
         }
-        let pages = crate::pages::page_refs(source)?;
+        let pages = PageDocumentHelper::new(source).get_all_pages()?;
         let chunk_size = options
             .qpdf_chunk_size
             .map_or(Ok(options.chunk_size), qpdf_split_page_size)?;
@@ -288,10 +288,9 @@ impl QPDFJob {
             // collected for exit status but are not delivered under
             // `--no-warn`.
             output.set_suppress_warnings(source.suppress_warnings());
-            for &page_ref in &pages[chunk_start..chunk_end] {
-                let source_page = source.get_object_handle(page_ref);
+            for source_page in &pages[chunk_start..chunk_end] {
                 PageDocumentHelper::new(&mut output)
-                    .add_page(PageInput::foreign(source, source_page), false)?;
+                    .add_page(PageInput::foreign(source, source_page.clone()), false)?;
                 let new_page = PageDocumentHelper::new(&mut output)
                     .get_all_pages()?
                     .last()
@@ -303,9 +302,9 @@ impl QPDFJob {
                 // canonical PageObjectHelper facade owns the corresponding
                 // field-tree copy and annotation transform.
                 if has_acro_form {
-                    let source_page = source.get_object_handle(page_ref);
                     PageObjectHelper::from_object_handle(new_page, &mut output)
-                        .fix_copied_annotations_from(source_page, source)?; // cov:ignore: malformed foreign annotation errors are covered by the canonical PageObjectHelper tests
+                        .fix_copied_annotations_from(source_page.clone(), source)?;
+                    // cov:ignore: malformed foreign annotation errors are covered by the canonical PageObjectHelper tests
                 }
             }
 
@@ -1556,6 +1555,64 @@ mod tests {
         assert_eq!(page_count_of(&std::fs::read(&out1).unwrap()), 1);
         assert_eq!(page_count_of(&std::fs::read(&out2).unwrap()), 1);
         assert_eq!(page_count_of(&std::fs::read(&out3).unwrap()), 1);
+    }
+
+    #[test]
+    fn split_pages_copies_a_raw_generation_page_handle() {
+        let mut source = Pdf::open_mem_owned(build_n_page_pdf(3)).expect("open source PDF");
+        let raw_page_ref = crate::ObjectRef::new(17, 65_535);
+        let parent = source.get_object_handle(crate::ObjectRef::new(2, 0));
+        source
+            .replace_object(
+                raw_page_ref,
+                ObjectHandle::dictionary(vec![
+                    (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+                    (b"/Parent".to_vec(), parent),
+                    (
+                        b"/MediaBox".to_vec(),
+                        ObjectHandle::array(vec![
+                            ObjectHandle::integer(0),
+                            ObjectHandle::integer(0),
+                            ObjectHandle::integer(612),
+                            ObjectHandle::integer(792),
+                        ]),
+                    ),
+                ]),
+            )
+            .expect("install raw-generation page");
+        let pages_root = source.get_object_handle(crate::ObjectRef::new(2, 0));
+        pages_root
+            .replace_key(
+                b"/Kids",
+                ObjectHandle::array(vec![source.get_object_handle(raw_page_ref)]),
+            )
+            .expect("select raw-generation page");
+        pages_root
+            .replace_key(b"/Count", ObjectHandle::integer(1))
+            .expect("update page count");
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let template = temp.path().join("raw.pdf");
+        let mut job = QPDFJob::new();
+        let output_paths = job
+            .split_pages(
+                &mut source,
+                SplitPageOptions::new(1, &template)
+                    .with_remove_unreferenced_resources(RemoveUnreferencedResources::No),
+            )
+            .expect("split must copy a raw-generation page handle");
+
+        assert_eq!(output_paths, vec![temp.path().join("raw-1.pdf")]);
+        let bytes = std::fs::read(&output_paths[0]).expect("read split output");
+        let mut output = Pdf::open_mem_owned(bytes).expect("split output is a PDF");
+        let output_pages = PageDocumentHelper::new(&mut output)
+            .get_all_pages()
+            .expect("read split output pages");
+        assert_eq!(output_pages.len(), 1);
+        assert!(
+            output_pages[0].object_ref().is_some(),
+            "the fresh chunk must write the copied page with a valid indirect reference"
+        );
     }
 
     #[test]
