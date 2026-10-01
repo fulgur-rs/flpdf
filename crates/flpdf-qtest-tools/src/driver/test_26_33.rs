@@ -133,11 +133,8 @@ pub(crate) fn run_test_26<R: Read + Seek>(
         // qpdf never checks that `/O3` is indirect before calling `addPage`; a
         // page-tree entry is always an indirect object in a well-formed PDF,
         // matching the fixture this test is designed for.
-        let o3_ref = o3
-            .object_ref()
-            .expect("/O3 is a page, always an indirect object");
         let qpdf_flush_result_13 =
-            PageDocumentHelper::new(pdf).add_page(PageInput::foreign(&mut oldpdf, o3_ref), false);
+            PageDocumentHelper::new(pdf).add_page(PageInput::foreign(&mut oldpdf, o3), false);
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         qpdf_flush_result_13?;
 
@@ -225,19 +222,13 @@ pub(crate) fn run_test_27<R: Read + Seek>(
         let qtest = oldpdf.trailer_key_handle(b"QTest");
         let o3 = qtest.try_get_key(b"/O3")?;
         let other_page = o3.try_get_key(b"/OtherPage")?;
-        let other_page_ref = other_page
-            .object_ref()
-            .expect("/O3/OtherPage is a page, always an indirect object");
-        let o3_ref = o3
-            .object_ref()
-            .expect("/O3 is a page, always an indirect object");
         {
             // qpdf: `dh.addPage(O3.getKey("/OtherPage"), false); dh.addPage(O3,
             // false);` (test_driver.cc:1060-1061) -- order matters: the other
             // page is added first.
             let mut dh = PageDocumentHelper::new(pdf);
-            dh.add_page(PageInput::foreign(&mut oldpdf, other_page_ref), false)?;
-            dh.add_page(PageInput::foreign(&mut oldpdf, o3_ref), false)?;
+            dh.add_page(PageInput::foreign(&mut oldpdf, other_page), false)?;
+            dh.add_page(PageInput::foreign(&mut oldpdf, o3), false)?;
         }
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 

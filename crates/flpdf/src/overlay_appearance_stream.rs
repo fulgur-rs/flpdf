@@ -669,7 +669,7 @@ mod tests {
             page
         });
         PageDocumentHelper::new(&mut pdf)
-            .add_page(PageInput::direct(page), false)
+            .add_page(PageInput::target(page), false)
             .expect("add a page for linearization");
 
         super::adjust_appearance_stream_handle(

@@ -289,12 +289,13 @@ impl QPDFJob {
             // `--no-warn`.
             output.set_suppress_warnings(source.suppress_warnings());
             for &page_ref in &pages[chunk_start..chunk_end] {
-                let rebuild = PageDocumentHelper::new(&mut output)
-                    .add_page(PageInput::foreign(source, page_ref), false)?;
-                let new_page = rebuild
-                    .new_kids
+                let source_page = source.get_object_handle(page_ref);
+                PageDocumentHelper::new(&mut output)
+                    .add_page(PageInput::foreign(source, source_page), false)?;
+                let new_page = PageDocumentHelper::new(&mut output)
+                    .get_all_pages()?
                     .last()
-                    .copied()
+                    .cloned()
                     .ok_or(Error::Missing("split output page"))?;
 
                 // qpdf's doSplitPages calls fixCopiedAnnotations after every
@@ -303,7 +304,7 @@ impl QPDFJob {
                 // field-tree copy and annotation transform.
                 if has_acro_form {
                     let source_page = source.get_object_handle(page_ref);
-                    PageObjectHelper::new(new_page, &mut output)
+                    PageObjectHelper::from_object_handle(new_page, &mut output)
                         .fix_copied_annotations_from(source_page, source)?; // cov:ignore: malformed foreign annotation errors are covered by the canonical PageObjectHelper tests
                 }
             }

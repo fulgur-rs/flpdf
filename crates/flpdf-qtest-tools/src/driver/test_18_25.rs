@@ -49,10 +49,10 @@ pub(crate) fn run_test_18<R: Read + Seek + 'static>(
     assert_eq!(pages.len(), 10);
     let page5 = pages[5];
     let page5_handle = pdf.get_object_handle(page5);
-    PageDocumentHelper::new(pdf).remove_page(page5_handle)?;
+    PageDocumentHelper::new(pdf).remove_page(page5_handle.clone())?;
     pages = crate::common::checked_page_refs(pdf)?;
     assert_eq!(pages.len(), 9);
-    let page5_input: PageInput<'_, std::io::Cursor<Vec<u8>>> = PageInput::existing(page5);
+    let page5_input: PageInput<'_, std::io::Cursor<Vec<u8>>> = PageInput::target(page5_handle);
     PageDocumentHelper::new(pdf).add_page(page5_input, false)?;
     pages = crate::common::checked_page_refs(pdf)?;
     assert_eq!(pages.len(), 10);
@@ -91,7 +91,8 @@ pub(crate) fn run_test_19<R: Read + Seek + 'static>(
     let pages = crate::common::checked_page_refs(pdf)?;
     let newpage = pages[5];
     let count = pages.len();
-    let newpage_input: PageInput<'_, std::io::Cursor<Vec<u8>>> = PageInput::existing(newpage);
+    let newpage_input: PageInput<'_, std::io::Cursor<Vec<u8>>> =
+        PageInput::target(pdf.get_object_handle(newpage));
     PageDocumentHelper::new(pdf).add_page(newpage_input, false)?;
     let pages = crate::common::checked_page_refs(pdf)?;
     let last = *pages

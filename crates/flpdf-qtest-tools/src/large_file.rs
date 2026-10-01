@@ -232,13 +232,7 @@ fn create_pdf(path: &Path, large: bool, output: &Output) -> flpdf::Result<()> {
             (b"Contents".to_vec(), contents),
             (b"Resources".to_vec(), resources),
         ]))?;
-        let page_ref = page
-            .object_ref()
-            .ok_or_else(|| Error::Internal("new page is not indirect".to_owned()))?;
-        PageDocumentHelper::new(&mut pdf).add_page(
-            PageInput::<'_, std::io::Cursor<Vec<u8>>>::Existing(page_ref),
-            false,
-        )?;
+        PageDocumentHelper::new(&mut pdf).add_page(PageInput::target(page), false)?;
     }
 
     let mut writer = PdfWriter::new(&mut pdf);

@@ -3086,6 +3086,30 @@ duplicate shallow-clone identity, shared child handles, PageLabels, and the
 page-merge writer-order provenance remain unchanged. qtest exceptions and the
 separate merge/drop semantic issue remain outside this bounded row.
 
+### PageDocumentHelper insertion by raw page handles (`flpdf-ihyup.20`, 2026-10-01)
+
+`QPDFPageDocumentHelper::addPage` and `addPageAt` pass each page helper's
+`QPDFObjectHandle` directly to `QPDF::addPage` and `QPDF::addPageAt`
+(`libqpdf/QPDFPageDocumentHelper.cc:37-47`). `QPDF::addPage(false)` reads `/Count`
+before insertion; `QPDF::insertPage` then flattens the tree, promotes a direct
+handle or pushes inherited attributes before copying a foreign page, detects
+an existing page by raw `QPDFObjGen` and shallow-copies its dictionary, and
+updates the same `/Kids`, `/Count`, and cached page vector
+(`libqpdf/QPDF_pages.cc:205-251,287-295`). `addPageAt` finds the reference
+page by raw object/generation identity and raises `qpdf_e_pages` with the
+`page object` description when it is absent
+(`libqpdf/QPDF_pages.cc:278-284,303-319`).
+
+flpdf exposes a direct value or target-owned handle as
+`PageInput::Target(ObjectHandle)` and keeps `PageInput::Foreign { source, page }`
+to carry Rust's mutable source-document borrow; flpdf checks that an indirect
+foreign handle belongs to that source before pushing inherited attributes and
+copying it. Both public add methods mutate the live flattened `/Kids` array and
+return `Result<()>`, matching qpdf's void-returning helper; callers that need
+the inserted page re-enumerate through `PageDocumentHelper::get_all_pages`.
+Raw-generation regressions cover a generation-65535 page, duplicate shallow-
+copy identity, raw reference-page lookup, and qpdf's nonmember error context.
+
 ### QPDFObjectHandle shallowCopy receiver-resolution primitive (`flpdf-3yn9.48.112`, 2026-09-15)
 
 Pinned qpdf 11.9.0 makes `QPDFObjectHandle::shallowCopy` own the receiver

@@ -2688,18 +2688,20 @@ mod tests {
             .expect("source should have one page");
         let source_page = source.get_object_handle(source_page_ref);
         let mut target = Pdf::empty().expect("target should be constructible");
-        let new_page = crate::PageDocumentHelper::new(&mut target)
+        crate::PageDocumentHelper::new(&mut target)
             .add_page(
-                crate::PageInput::foreign(&mut source, source_page_ref),
+                crate::PageInput::foreign(&mut source, source_page.clone()),
                 false,
             )
-            .expect("foreign page should copy")
-            .new_kids
+            .expect("foreign page should copy");
+        let new_page = crate::PageDocumentHelper::new(&mut target)
+            .get_all_pages()
+            .expect("read copied target page")
             .into_iter()
             .next()
             .expect("target should contain the copied page");
 
-        PageObjectHelper::new(new_page, &mut target)
+        PageObjectHelper::from_object_handle(new_page, &mut target)
             .fix_copied_annotations_from(source_page, &mut source)
             .expect("copied annotations should be repaired");
 
@@ -2725,7 +2727,7 @@ mod tests {
         );
     }
 
-    fn target_with_warm_empty_acroform() -> (Pdf<Cursor<Vec<u8>>>, ObjectRef) {
+    fn target_with_warm_empty_acroform() -> (Pdf<Cursor<Vec<u8>>>, ObjectHandle) {
         let mut target = Pdf::empty().expect("target should be constructible");
         let direct_page = ObjectHandle::dictionary(vec![
             (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
@@ -2739,10 +2741,12 @@ mod tests {
                 ]),
             ),
         ]);
+        crate::PageDocumentHelper::new(&mut target)
+            .add_page(crate::PageInput::target(direct_page), false)
+            .expect("direct page should be inserted");
         let new_page = crate::PageDocumentHelper::new(&mut target)
-            .add_page(crate::PageInput::direct(direct_page), false)
-            .expect("direct page should be inserted")
-            .new_kids
+            .get_all_pages()
+            .expect("read inserted page")
             .into_iter()
             .next()
             .expect("target should contain the inserted page");
@@ -2802,7 +2806,7 @@ mod tests {
         let source_page = source.get_object_handle(source_page_ref);
         let (mut target, new_page) = target_with_warm_empty_acroform();
 
-        PageObjectHelper::new(new_page, &mut target)
+        PageObjectHelper::from_object_handle(new_page.clone(), &mut target)
             .copy_annotations_from(source_page, Matrix::default(), &mut source)
             .expect("field-backed annotations should copy");
 
@@ -2811,7 +2815,7 @@ mod tests {
             "field-backed annotation copies must retain the incrementally updated cache"
         );
 
-        let page = target.get_object_handle(new_page);
+        let page = new_page.clone();
         page.try_is_scalar().expect("copied page should resolve");
         let annots = page.try_get_key(b"/Annots").expect("read /Annots");
         annots
@@ -2865,7 +2869,7 @@ mod tests {
         let source_page = source.get_object_handle(source_page_ref);
         let (mut target, new_page) = target_with_warm_empty_acroform();
 
-        PageObjectHelper::new(new_page, &mut target)
+        PageObjectHelper::from_object_handle(new_page.clone(), &mut target)
             .copy_annotations_from(source_page, Matrix::default(), &mut source)
             .expect("non-widget annotations should copy");
 
@@ -2881,7 +2885,7 @@ mod tests {
         let source_page = source.get_object_handle(source_page_ref);
         let (mut target, new_page) = target_with_warm_empty_acroform();
 
-        PageObjectHelper::new(new_page, &mut target)
+        PageObjectHelper::from_object_handle(new_page.clone(), &mut target)
             .copy_annotations_from(source_page, Matrix::default(), &mut source)
             .expect("orphan annotation should copy");
 
@@ -2890,7 +2894,7 @@ mod tests {
             "an unassociated copied Widget must invalidate the orphan-scan cache"
         );
 
-        let page = target.get_object_handle(new_page);
+        let page = new_page.clone();
         page.try_is_scalar().expect("copied page should resolve");
         let annotation = page.try_get_key(b"/Annots").expect("read /Annots");
         annotation

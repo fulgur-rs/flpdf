@@ -323,7 +323,8 @@ pub(crate) fn run_test_69<R: Read + Seek>(
     let pages = qpdf_flush_result_74?;
     for (index, page_ref) in pages.into_iter().enumerate() {
         let mut out = Pdf::empty()?;
-        PageDocumentHelper::new(&mut out).add_page(PageInput::foreign(pdf, page_ref), false)?;
+        let page = pdf.get_object_handle(page_ref);
+        PageDocumentHelper::new(&mut out).add_page(PageInput::foreign(pdf, page), false)?;
         // qpdf: `QUtil::uint_to_string(i)` is a plain unsigned decimal
         // rendering (`libqpdf/QUtil.cc`'s `int_to_string_base`, base 10, no
         // padding), matching `{index}` here.

@@ -481,10 +481,16 @@ fn add_page_at_inserts_a_direct_page_before_its_reference_page() {
             ]),
         ),
     ]);
-    let first_page_ref = PageDocumentHelper::new(&mut pdf)
-        .add_page(PageInput::direct(first_page), false)
-        .expect("initial page should be added")
-        .new_kids[0];
+    PageDocumentHelper::new(&mut pdf)
+        .add_page(PageInput::target(first_page), false)
+        .expect("initial page should be added");
+    let first_page = PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .expect("read initial page")
+        .into_iter()
+        .next()
+        .expect("initial page should be present");
+    let first_page_ref = first_page.object_ref().expect("inserted page is indirect");
 
     let inserted_page = ObjectHandle::dictionary(vec![
         (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
@@ -498,19 +504,276 @@ fn add_page_at_inserts_a_direct_page_before_its_reference_page() {
             ]),
         ),
     ]);
-    let inserted_page_ref = PageDocumentHelper::new(&mut pdf)
-        .add_page_at(PageInput::direct(inserted_page), true, first_page_ref)
-        .expect("page should be inserted before the reference page")
-        .new_kids[0];
+    PageDocumentHelper::new(&mut pdf)
+        .add_page_at(PageInput::target(inserted_page), true, first_page)
+        .expect("page should be inserted before the reference page");
 
     let pages = PageDocumentHelper::new(&mut pdf)
         .get_all_pages()
         .expect("page list should be readable");
+    let inserted_page_ref = pages[0].object_ref().expect("inserted page is indirect");
     assert_eq!(
         pages
             .iter()
             .map(ObjectHandle::object_ref)
             .collect::<Vec<_>>(),
         vec![Some(inserted_page_ref), Some(first_page_ref)]
+    );
+}
+
+fn page_dictionary(parent: Option<ObjectHandle>) -> ObjectHandle {
+    let mut entries = vec![
+        (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+        (
+            b"/MediaBox".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(612),
+                ObjectHandle::integer(792),
+            ]),
+        ),
+    ];
+    if let Some(parent) = parent {
+        entries.push((b"/Parent".to_vec(), parent));
+    }
+    ObjectHandle::dictionary(entries)
+}
+
+#[test]
+fn add_page_accepts_a_raw_generation_handle_and_duplicates_by_raw_identity() {
+    let mut pdf = Pdf::empty().expect("empty document should be constructible");
+    let raw_page_ref = ObjectRef::new(17, 65_535);
+    pdf.replace_object(raw_page_ref, page_dictionary(None))
+        .expect("install raw page in the target object cache");
+    let raw_page = pdf.get_object_handle_by_raw_identity(17, 65_535);
+
+    let first_insert = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PageDocumentHelper::new(&mut pdf).add_page(PageInput::target(raw_page.clone()), false)
+    }));
+    assert!(
+        first_insert.is_ok(),
+        "raw QpdfObjGen insertion must not panic at an ObjectRef projection boundary"
+    );
+    first_insert
+        .expect("raw page insertion should not panic")
+        .expect("raw page insertion should succeed");
+
+    let pages_root = pdf
+        .root_handle()
+        .expect("read target catalog")
+        .try_get_key(b"/Pages")
+        .expect("read target /Pages");
+    let flattened_kids = pages_root
+        .try_get_key(b"/Kids")
+        .expect("read flattened /Kids");
+
+    PageDocumentHelper::new(&mut pdf)
+        .add_page(PageInput::target(raw_page.clone()), false)
+        .expect("inserting an existing raw page should shallow-copy it");
+
+    let pages = PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .expect("read pages after duplicate insertion");
+    assert_eq!(pages.len(), 2);
+    assert_eq!(pages[0].get_obj_gen(), QpdfObjGen::new(17, 65_535));
+    assert_ne!(pages[1].get_obj_gen(), QpdfObjGen::new(17, 65_535));
+    let current_kids = pages_root
+        .try_get_key(b"/Kids")
+        .expect("read current /Kids");
+    assert!(flattened_kids.is_same_object_as(&current_kids));
+    assert_eq!(
+        pages_root
+            .try_get_key(b"/Count")
+            .expect("read /Count")
+            .as_integer(),
+        Some(2)
+    );
+}
+
+#[test]
+fn add_page_at_accepts_a_raw_generation_reference_page_handle() {
+    let mut pdf = Pdf::empty().expect("empty document should be constructible");
+    let pages_root = pdf
+        .root_handle()
+        .expect("read target catalog")
+        .try_get_key(b"/Pages")
+        .expect("read target /Pages");
+    let raw_page_ref = ObjectRef::new(17, 65_535);
+    pdf.replace_object(raw_page_ref, page_dictionary(Some(pages_root.clone())))
+        .expect("install raw page in the target object cache");
+    let raw_page = pdf.get_object_handle_by_raw_identity(17, 65_535);
+    pages_root
+        .try_get_key(b"/Kids")
+        .expect("read target /Kids")
+        .insert_array_item(0, raw_page.clone())
+        .expect("attach raw page to target tree");
+    pages_root
+        .replace_key(b"/Count", ObjectHandle::integer(1))
+        .expect("set target page count");
+
+    let inserted_page = page_dictionary(None);
+    let result = PageDocumentHelper::new(&mut pdf).add_page_at(
+        PageInput::target(inserted_page),
+        true,
+        raw_page.clone(),
+    );
+    assert!(
+        result.is_ok(),
+        "addPageAt must find the reference page by raw QpdfObjGen"
+    );
+    result.expect("raw reference page insertion should succeed");
+
+    let pages = PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .expect("read pages after insertion");
+    assert_eq!(pages.len(), 2);
+    assert_ne!(pages[0].get_obj_gen(), raw_page.get_obj_gen());
+    assert_eq!(pages[1].get_obj_gen(), QpdfObjGen::new(17, 65_535));
+}
+
+#[test]
+fn add_page_at_reports_qpdf_page_context_for_a_raw_nonmember_reference() {
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(one_page_nested_tree_with_unknown_key()),
+        PdfOpenOptions {
+            description: b"page_add_at_raw.pdf".to_vec(),
+            suppress_warnings: true,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("nested one-page PDF should parse");
+    pdf.replace_object(ObjectRef::new(17, 65_535), page_dictionary(None))
+        .expect("install a detached raw-generation page");
+    let reference_page = pdf.get_object_handle_by_raw_identity(17, 65_535);
+
+    let error = PageDocumentHelper::new(&mut pdf)
+        .add_page_at(
+            PageInput::target(page_dictionary(None)),
+            true,
+            reference_page,
+        )
+        .expect_err("a reference page outside /Pages must raise qpdf's page error");
+
+    assert!(matches!(error, Error::QpdfExc(_)));
+    assert_eq!(
+        error.to_string(),
+        "page_add_at_raw.pdf (page object: object 17 65535): page object not referenced in /Pages tree"
+    );
+}
+
+#[test]
+fn foreign_input_rejects_a_page_not_owned_by_its_source_pdf() {
+    let mut actual_source = Pdf::open_mem_owned(
+        include_bytes!("../../../tests/fixtures/compat/three-page.pdf").to_vec(),
+    )
+    .expect("source PDF should parse");
+    let source_page = PageDocumentHelper::new(&mut actual_source)
+        .get_all_pages()
+        .expect("source page list")
+        .into_iter()
+        .next()
+        .expect("source page");
+    let mut wrong_source = Pdf::empty().expect("wrong source PDF");
+    let mut target = Pdf::empty().expect("target PDF");
+
+    let error = PageDocumentHelper::new(&mut target)
+        .add_page(PageInput::foreign(&mut wrong_source, source_page), false)
+        .expect_err("foreign input must be paired with the page's owning source");
+
+    assert!(matches!(
+        error,
+        Error::Unsupported(message) if message == "foreign page handle is not owned by the source PDF"
+    ));
+    assert!(PageDocumentHelper::new(&mut target)
+        .get_all_pages()
+        .expect("read target after rejected input")
+        .is_empty());
+}
+
+#[test]
+fn target_input_rejects_an_indirect_page_owned_by_another_pdf() {
+    let mut source = Pdf::open_mem_owned(
+        include_bytes!("../../../tests/fixtures/compat/three-page.pdf").to_vec(),
+    )
+    .expect("source PDF should parse");
+    let source_page = PageDocumentHelper::new(&mut source)
+        .get_all_pages()
+        .expect("source page list")
+        .into_iter()
+        .next()
+        .expect("source page");
+    let mut target = Pdf::empty().expect("target PDF");
+
+    let error = PageDocumentHelper::new(&mut target)
+        .add_page(PageInput::target(source_page), false)
+        .expect_err("target input must belong to the target PDF");
+
+    assert!(matches!(
+        error,
+        Error::Unsupported(message)
+            if message == "indirect page handle is not owned by the target PDF; use Foreign input"
+    ));
+    assert!(PageDocumentHelper::new(&mut target)
+        .get_all_pages()
+        .expect("read target after rejected input")
+        .is_empty());
+}
+
+#[test]
+fn foreign_direct_page_is_promoted_into_the_target_pdf() {
+    let mut source = Pdf::empty().expect("source PDF");
+    let mut target = Pdf::empty().expect("target PDF");
+
+    PageDocumentHelper::new(&mut target)
+        .add_page(
+            PageInput::foreign(&mut source, page_dictionary(None)),
+            false,
+        )
+        .expect("direct page handles are promoted in the target");
+
+    let target_pages = PageDocumentHelper::new(&mut target)
+        .get_all_pages()
+        .expect("read inserted target page");
+    assert_eq!(target_pages.len(), 1);
+    assert!(target_pages[0].is_indirect());
+    assert_eq!(
+        PageDocumentHelper::new(&mut source)
+            .get_all_pages()
+            .expect("source page list should remain empty")
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn add_page_rejects_an_append_index_out_of_range_after_flattening() {
+    let mut pdf = Pdf::empty().expect("empty target PDF");
+    PageDocumentHelper::new(&mut pdf)
+        .add_page(PageInput::target(page_dictionary(None)), false)
+        .expect("install initial page");
+    let pages_root = pdf
+        .root_handle()
+        .expect("target catalog")
+        .try_get_key(b"/Pages")
+        .expect("target /Pages");
+    pages_root
+        .replace_key(b"/Count", ObjectHandle::integer(-1))
+        .expect("force qpdf's negative append index after flattening");
+
+    let error = PageDocumentHelper::new(&mut pdf)
+        .add_page(PageInput::target(page_dictionary(None)), false)
+        .expect_err("negative append position must fail after page materialization");
+
+    assert!(matches!(
+        error,
+        Error::Internal(message) if message == "QPDF::insertPage called with pos out of range"
+    ));
+    assert_eq!(
+        PageDocumentHelper::new(&mut pdf)
+            .get_all_pages()
+            .expect("read page list after failed insertion")
+            .len(),
+        1
     );
 }
