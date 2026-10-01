@@ -1026,8 +1026,8 @@ impl<'a> Tokenizer<'a> {
     /// candidate scan, `QPDF_linearization.cc:120-122`). The slice readers
     /// that do route through here are: `ByteCursor::read_token`'s classic
     /// xref subsection lookahead and `startxref` value read, the trailer's
-    /// `stream`-keyword lookahead, [`Self::next_object_stream_integer`]'s ObjStm
-    /// header integers, the xref-reconstruction line scan's `int int obj`
+    /// `stream`-keyword lookahead, [`Self::next_object_stream_header_pair`]'s ObjStm
+    /// header pair, the xref-reconstruction line scan's `int int obj`
     /// probe, and the canonical resolve path's `endstream`/`endobj` framing
     /// checks. `QPDFObjectHandle`'s own content-stream tokenization
     /// (`QPDFTokenizer::readToken` called directly, without a `QPDF`) is a
@@ -1037,20 +1037,28 @@ impl<'a> Tokenizer<'a> {
         self.read_token(true, max_len)
     }
 
-    /// Read one integer using qpdf's `QPDF::readToken` contract
-    /// (`QPDF.cc:1800-1814`): one [`Self::read_qpdf_token`] call whose
-    /// returned token the caller type-checks, instead of letting the
-    /// tokenizer throw first. qpdf reads the two ObjStm header integers with
-    /// two such calls; this helper is the single one, invoked twice by its
-    /// caller.
-    pub(crate) fn next_object_stream_integer(&mut self) -> Result<i64> {
-        let token = self.read_qpdf_token(0)?;
-        if !token.is_integer() {
+    /// Read and type-check one ObjStm header pair using qpdf's
+    /// `QPDF::resolveObjectsInStream` order (`QPDF.cc:1799-1807`). qpdf reads
+    /// both tokens before validating either and reports a type error at the
+    /// second token's position, matching `InputSource::getLastOffset` after
+    /// the second `readToken`.
+    pub(crate) fn next_object_stream_header_pair(&mut self) -> Result<(i64, i64)> {
+        let object_number = self.read_qpdf_token(0)?;
+        let object_offset = self.read_qpdf_token(0)?;
+        if !(object_number.is_integer() && object_offset.is_integer()) {
             return Err(Error::parse(
-                token.start,
+                object_offset.start,
                 "expected integer in object stream header",
             ));
         }
+
+        Ok((
+            Self::parse_object_stream_integer(object_number)?,
+            Self::parse_object_stream_integer(object_offset)?,
+        ))
+    }
+
+    fn parse_object_stream_integer(token: Token) -> Result<i64> {
         std::str::from_utf8(&token.value)
             .ok()
             .and_then(|value| value.parse::<i64>().ok())
@@ -1151,16 +1159,38 @@ mod tests {
     use crate::Error;
 
     #[test]
-    fn object_stream_integer_checks_a_bad_token_after_reading_it() {
-        let mut tokenizer = Tokenizer::new(b"(");
+    fn object_stream_header_pair_reads_both_tokens_before_type_checking() {
+        let mut tokenizer = Tokenizer::new(b"2 0 << /Type");
+        assert_eq!(
+            tokenizer
+                .next_object_stream_header_pair()
+                .expect("first header pair is valid"),
+            (2, 0)
+        );
         let error = tokenizer
-            .next_object_stream_integer()
-            .expect_err("a malformed token is not an object-stream integer");
-        assert!(matches!(
-            error,
-            Error::Parse { message, .. }
-                if message == "expected integer in object stream header"
-        ));
+            .next_object_stream_header_pair()
+            .expect_err("both tokens must be read before malformed-pair validation");
+        assert!(
+            matches!(
+                &error,
+                Error::Parse { offset, message }
+                    if *offset == 7 && message == "expected integer in object stream header"
+            ),
+            "error={error:?}"
+        );
+
+        let mut tokenizer = Tokenizer::new(b"<< 0");
+        let error = tokenizer
+            .next_object_stream_header_pair()
+            .expect_err("a malformed first token must not be accepted");
+        assert!(
+            matches!(
+                &error,
+                Error::Parse { offset, message }
+                    if *offset == 3 && message == "expected integer in object stream header"
+            ),
+            "error={error:?}"
+        );
     }
 
     #[test]
