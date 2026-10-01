@@ -259,7 +259,7 @@ fn strip_signature_values_from_field<R: Read + Seek>(
     // null. `try_has_key` intentionally treats null values as absent, so use
     // the resolved dictionary snapshot for this mutation decision.
     let has_signature_value = field
-        .as_dictionary()
+        .try_as_dictionary()?
         .is_some_and(|entries| entries.contains_key(b"/V".as_slice()));
 
     if field_type.as_deref() == Some(b"Sig") && has_signature_value {
@@ -511,7 +511,7 @@ fn text_entry(dict: &BTreeMap<Vec<u8>, ObjectHandle>, key: &[u8]) -> Result<Opti
     match resolve_entry(dict, key)? {
         Some(value) => {
             value.try_dereference()?;
-            Ok(value.as_string().map(|bytes| {
+            Ok(value.try_as_string()?.map(|bytes| {
                 decode_pdf_text_string(&bytes)
                     .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into())
             }))
@@ -524,14 +524,14 @@ fn certificate_entry(dict: &BTreeMap<Vec<u8>, ObjectHandle>) -> Result<Option<Ve
     match resolve_entry(dict, b"/Cert")? {
         Some(value) => {
             value.try_dereference()?;
-            if value.as_string().is_some() {
-                return Ok(value.as_string());
+            if let Some(bytes) = value.try_as_string()? {
+                return Ok(Some(bytes));
             }
             if value.try_is_array()? {
                 let values = value.try_as_array()?.unwrap_or_default();
                 for value in values {
                     value.try_dereference()?;
-                    if let Some(bytes) = value.as_string() {
+                    if let Some(bytes) = value.try_as_string()? {
                         return Ok(Some(bytes));
                     } // cov:ignore: LLVM maps the covered certificate-array branch terminator separately
                 }
