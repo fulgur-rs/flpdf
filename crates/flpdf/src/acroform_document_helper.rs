@@ -837,7 +837,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             // qpdf's removeKey erases raw entries unconditionally, including
             // entries whose stored value is null. Do not use hasKey here,
             // because QPDF_Dictionary::hasKey intentionally collapses null.
-            let entries = field.as_dictionary();
+            let entries = field.try_as_dictionary()?;
             for key in [b"/FT".as_slice(), b"/V", b"/SV", b"/Lock"] {
                 let present = entries
                     .as_ref()
@@ -1361,7 +1361,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         }
         let default_appearance = field.try_get_key(b"/DA")?;
         default_appearance.try_dereference()?;
-        let Some(default_appearance) = default_appearance.as_string() else {
+        let Some(default_appearance) = default_appearance.try_as_string()? else {
             return Ok(());
         };
         if resources.renames.is_empty() {
@@ -1474,7 +1474,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             }
             let appearance = current.try_get_key(b"/DA")?;
             appearance.try_dereference()?;
-            if let Some(value) = appearance.as_string() {
+            if let Some(value) = appearance.try_as_string()? {
                 return Ok(decode_field_name(&value).into_bytes());
             }
             if !appearance.try_is_null()? {
@@ -1587,7 +1587,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 // bytes -- a `/T` stored as UTF-16BE or PDFDocEncoded would
                 // otherwise have the ASCII suffix appended mid-codepoint.
                 current_name.try_dereference()?;
-                let raw = current_name.as_string().unwrap_or_default();
+                let raw = current_name.try_as_string()?.unwrap_or_default();
                 let mut partial = decode_field_name(&raw).into_bytes();
                 partial.extend_from_slice(&append);
                 // cov:ignore-start: LLVM maps this multiline mutation to a defensive continuation edge.
@@ -1747,7 +1747,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         need_appearances.try_dereference()?;
         Ok(AcroFormDefaults {
             default_appearance: appearance
-                .as_string()
+                .try_as_string()?
                 .map(|value| decode_field_name(&value).into_bytes())
                 .unwrap_or_default(),
             quadding: quadding.try_as_integer()?.unwrap_or(0),
@@ -1792,7 +1792,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             }
             let partial = self.get_key_with_qpdf_type_warning(&current, b"/T")?;
             partial.try_dereference()?;
-            if let Some(name) = partial.as_string() {
+            if let Some(name) = partial.try_as_string()? {
                 parts.push(decode_field_name(&name));
             }
             let parent = self.get_key_with_qpdf_type_warning(&current, b"/Parent")?;
@@ -2744,6 +2744,34 @@ mod final_handle_tests {
         Pdf::open(Cursor::new(std::fs::read(path).expect("fixture exists"))).expect("fixture opens")
     }
 
+    fn indirect_default_appearance_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        use std::io::Write;
+        let objects: [&[u8]; 3] = [
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm << /DA 3 0 R /Fields [] >> >>\nendobj\n",
+            b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n",
+            b"3 0 obj\n(/Helv 11 Tf)\nendobj\n",
+        ];
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for object in objects {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(object);
+        }
+        let xref_offset = bytes.len();
+        writeln!(&mut bytes, "xref\n0 {}", objects.len() + 1).unwrap();
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            writeln!(&mut bytes, "{offset:010} 00000 n ").unwrap();
+        }
+        writeln!(
+            &mut bytes,
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF",
+            objects.len() + 1
+        )
+        .unwrap();
+        Pdf::open_mem_owned(bytes).expect("open PDF with indirect /DA string")
+    }
+
     /// A raw indirect Widget is not a direct object. qpdf tests directness
     /// with `QPDFObjGen::isIndirect` (object number only), so such a Widget
     /// must keep its own cached association rather than falling into the
@@ -3369,19 +3397,8 @@ mod final_handle_tests {
 
     #[test]
     fn acroform_defaults_resolve_an_indirect_default_appearance() {
-        let mut pdf = fixture("form-fields-and-annotations-with-defaults.pdf");
+        let mut pdf = indirect_default_appearance_pdf();
         let mut helper = AcroFormDocumentHelper::new(&mut pdf).expect("AcroForm helper");
-        let acroform = helper
-            .canonical_acroform()
-            .expect("canonical AcroForm lookup")
-            .expect("AcroForm dictionary");
-        let appearance = helper
-            .pdf
-            .make_indirect_object_handle(ObjectHandle::string(b"/Helv 11 Tf".to_vec()))
-            .expect("indirect appearance");
-        acroform
-            .replace_key(b"/DA", appearance)
-            .expect("replace AcroForm appearance");
 
         assert_eq!(
             helper
