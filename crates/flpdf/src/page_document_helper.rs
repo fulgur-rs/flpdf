@@ -498,13 +498,12 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// appearance dictionary are removed even if no selected appearance can
     /// be drawn; annotations without one are retained.
     pub fn flatten_annotations(&mut self, required_flags: i64, forbidden_flags: i64) -> Result<()> {
-        // qpdf's document helper obtains `getAllPages()` before flattening.
-        // This repairs a catalog /Pages pointer that lands on a leaf, so the
-        // lower-level document primitive subsequently sees every page.
-        let pages = crate::pages::page_refs(self.pdf)?;
+        // Keep enumeration inside the document-level operation so it can
+        // follow qpdf's order: AcroForm analysis and NeedAppearances warning,
+        // then `getAllPages()`, then per-page flattening. That page list must
+        // stay on raw handles through annotation and resource mutation.
         crate::page_annotation_flatten::flatten_annotations_qpdf(
             self.pdf,
-            &pages,
             required_flags,
             forbidden_flags,
         )
