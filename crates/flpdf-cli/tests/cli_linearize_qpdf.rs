@@ -212,6 +212,43 @@ fn flpdf_check(path: &Path) -> (i32, String) {
     (code, combined)
 }
 
+#[test]
+fn check_linearization_subcommand_matches_qpdf_exact_output() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    for fixture_name in ["linearized-one-page.pdf", "one-page.pdf"] {
+        let input = fixture_path(fixture_name);
+        let qpdf = ShellCommand::new("qpdf")
+            .args(["--check-linearization"])
+            .arg(&input)
+            .output()
+            .expect("run qpdf --check-linearization");
+        let flpdf = CargoCommand::cargo_bin("flpdf")
+            .unwrap()
+            .env("FLPDF_PROGNAME", "qpdf")
+            .args(["check-linearization"])
+            .arg(&input)
+            .output()
+            .expect("run flpdf check-linearization");
+
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "exit status differs for {fixture_name}"
+        );
+        assert_eq!(
+            flpdf.stdout, qpdf.stdout,
+            "stdout differs for {fixture_name}"
+        );
+        assert_eq!(
+            flpdf.stderr, qpdf.stderr,
+            "stderr differs for {fixture_name}"
+        );
+    }
+}
+
 /// Classify flpdf's check-linearization result.
 fn flpdf_verdict(path: &Path) -> Verdict {
     let (code, output) = flpdf_check(path);
