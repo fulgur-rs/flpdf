@@ -8704,60 +8704,10 @@ fn run_show_pages(
 // MEANINGS (not "errors"/"warnings"), documented at each construction site.
 // ---------------------------------------------------------------------------
 
-/// Outcome of attempting to open a possibly-encrypted document for an
-/// inspection subcommand, where (unlike normal processing) a failed
-/// password attempt is informative rather than fatal.
-#[cfg(test)]
-enum EncryptionProbe {
-    /// The document opened and was authenticated, or was not encrypted.
-    Opened,
-    /// The file is encrypted but the supplied/empty password did not
-    /// authenticate (`BadPassword`). qpdf can still report "encrypted" /
-    /// "password required" without authenticating, so this is a normal
-    /// classification here, not an error.
-    EncryptedAuthFailed,
-}
-
 #[derive(Debug, Clone, Copy)]
 enum EncryptionStatusQuery {
     IsEncrypted,
     RequiresPassword,
-}
-
-/// Open `input` for a read-only encryption inspection (`is-encrypted` /
-/// `requires-password`), treating a wrong/empty password (`BadPassword`) as
-/// "the file is encrypted but we could not authenticate" rather than a hard
-/// error. This mirrors qpdf's ability to answer these queries for
-/// password-protected files without the password.
-///
-/// qpdf applies its weak-crypto refusal to write/transform operations, not to
-/// these read-only inspections. Authentication still runs first, so a wrong
-/// password yields `BadPassword` exactly as before.
-#[cfg(test)]
-fn probe_encryption(
-    input: &PathBuf,
-    repair: bool,
-    password: &PasswordArgs,
-    suppress_warnings: bool,
-) -> CliResult<EncryptionProbe> {
-    let file = File::open(input).map_err(|error| open_error_with_file(input, error.into()))?;
-    let options = pdf_open_options(repair, password)?;
-    let mut job = QPDFJob::new();
-    job.set_logger(cli_logger());
-    job.set_message_prefix(progname());
-    job.set_suppress_warnings(suppress_warnings);
-    match job.open_with_description(BufReader::new(file), path_description(input), options) {
-        Ok(mut pdf) => {
-            pdf.root_handle()
-                .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
-            Ok(EncryptionProbe::Opened)
-        }
-        // A wrong/empty password: the document is definitely encrypted, we
-        // just have not authenticated it. qpdf treats this as "encrypted,
-        // password required".
-        Err(error) if is_bad_password_error(&error) => Ok(EncryptionProbe::EncryptedAuthFailed),
-        Err(other) => Err(error_with_file(input, actionable_password_error(other))),
-    }
 }
 
 fn is_bad_password_error(error: &flpdf::Error) -> bool {
@@ -8858,7 +8808,7 @@ fn run_is_encrypted(
 ///
 /// Weak-crypto (RC4 / R=5) files are answered purely on the password, matching
 /// qpdf: a correct password yields 3 and a wrong/absent one yields 0, with no
-/// `--allow-weak-crypto` opt-in required (see `probe_encryption`).
+/// `--allow-weak-crypto` opt-in required.
 fn run_requires_password(
     input: &Path,
     repair: bool,
@@ -10692,52 +10642,6 @@ mod tests {
             String::from_utf8_lossy(entry.what_bytes())
                 .contains("requested value of integer is too big; returning INT_MAX")
         }));
-    }
-
-    #[test]
-    fn probe_encryption_classifies_bad_password_after_repair_warnings() {
-        let mut input =
-            include_bytes!("../../../tests/fixtures/compat/encrypted-r4-three-page.pdf").to_vec();
-        let xref = input
-            .windows(4)
-            .position(|window| window == b"xref")
-            .expect("encrypted fixture should contain an xref keyword");
-        input[xref + 2] = b'X';
-
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("damaged-encrypted.pdf");
-        std::fs::write(&path, input).expect("write damaged encrypted fixture");
-        let outcome = probe_encryption(
-            &path,
-            true,
-            &PasswordArgs {
-                password: Some("wrong".to_owned().into()),
-                ..PasswordArgs::default()
-            },
-            false,
-        );
-
-        assert!(matches!(outcome, Ok(EncryptionProbe::EncryptedAuthFailed)));
-    }
-
-    #[test]
-    fn probe_encryption_prefixes_a_dangling_root_error_with_the_input_path() {
-        let input = b"%PDF-1.4\nxref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 >>\nstartxref\n9\n%%EOF\n";
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("missing-root.pdf");
-        std::fs::write(&path, input).expect("write missing-root fixture");
-
-        let Err(error) = probe_encryption(&path, false, &PasswordArgs::default(), false) else {
-            panic!("a missing /Root must be a hard error");
-        };
-
-        assert!(
-            error.to_string().contains(&path.display().to_string()),
-            "error should carry the input path like other open boundaries: {error}"
-        );
-        assert!(error
-            .to_string()
-            .contains("unable to find /Root dictionary"));
     }
 
     // --- parse_overlay_segment ------------------------------------------

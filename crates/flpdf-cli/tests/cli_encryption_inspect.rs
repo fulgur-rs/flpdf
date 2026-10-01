@@ -190,6 +190,70 @@ fn top_level_requires_password_requires_an_input() {
 }
 
 #[test]
+fn top_level_is_encrypted_missing_root_matches_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("missing-root.pdf");
+    std::fs::write(
+        &input,
+        b"%PDF-1.4\nxref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 >>\nstartxref\n9\n%%EOF\n",
+    )
+    .unwrap();
+
+    let qpdf = ShellCommand::new("qpdf")
+        .arg("--is-encrypted")
+        .arg(&input)
+        .output()
+        .unwrap();
+    let flpdf_output = flpdf()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg("--is-encrypted")
+        .arg(&input)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf_output.status.code(), qpdf.status.code());
+    assert_eq!(flpdf_output.stdout, qpdf.stdout);
+    assert_eq!(flpdf_output.stderr, qpdf.stderr);
+}
+
+#[test]
+fn requires_password_keeps_repair_warnings_before_wrong_password_status() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("damaged-encrypted.pdf");
+    let mut bytes = std::fs::read(R4_EMPTY_PW).unwrap();
+    let xref = bytes
+        .windows(4)
+        .position(|window| window == b"xref")
+        .expect("encrypted fixture has an xref keyword");
+    bytes[xref + 2] = b'X';
+    std::fs::write(&input, bytes).unwrap();
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--requires-password", "--password=wrong"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    let flpdf_output = flpdf()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--requires-password", "--password=wrong"])
+        .arg(&input)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf_output.status.code(), qpdf.status.code());
+    assert_eq!(flpdf_output.stdout, qpdf.stdout);
+    assert_eq!(flpdf_output.stderr, qpdf.stderr);
+}
+
+#[test]
 fn password_file_uses_only_the_first_line() {
     if !ensure_qpdf_or_skip() {
         return;
