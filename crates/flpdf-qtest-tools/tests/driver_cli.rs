@@ -2136,6 +2136,21 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             "test 85 retains the qpdf-less local route {old_route}"
         );
     }
+
+    let test_24 = section(
+        page_source.as_str(),
+        "pub(crate) fn run_test_24",
+        "pub(crate) fn run_test_25",
+    );
+    assert_eq!(
+        test_24.matches("try_is_array()?").count(),
+        3,
+        "test 24 must route all reserved-object array queries through qpdf's resolving predicate"
+    );
+    assert!(
+        !test_24.contains(".as_array()"),
+        "test 24 must not use the non-resolving array snapshot"
+    );
 }
 
 fn token_stream_contains_try_operator(tokens: &proc_macro2::TokenStream) -> bool {
