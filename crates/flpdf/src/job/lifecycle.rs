@@ -6145,7 +6145,7 @@ mod tests {
             (b"/Contents".to_vec(), contents),
         ]);
         PageDocumentHelper::new(&mut pdf)
-            .add_page(PageInput::direct(page), false)
+            .add_page(PageInput::target(page), false)
             .expect("page insertion");
 
         let tempdir = tempfile::tempdir().expect("temporary directory");

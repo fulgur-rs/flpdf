@@ -511,17 +511,19 @@ pub(crate) fn run_test_15<R: Read + Seek>(
 
     // Now insert the pages.
     let new_page0 = new_pages.remove(0);
-    PageDocumentHelper::new(pdf).add_page(PageInput::<'_, R>::Direct(new_page0), true)?;
+    PageDocumentHelper::new(pdf).add_page(PageInput::target(new_page0), true)?;
     pages = crate::common::checked_page_refs(pdf)?;
     check_page_contents(pdf, page_at(&pages, 0)?, "New page 1", stdout)?;
 
     let new_page1_ref = new_page_refs[1]
         .ok_or_else(|| Error::Internal("test 15 new page 1 was not made indirect".to_string()))?;
     let reference0 = page_at(&pages, 0)?;
+    let new_page1 = pdf.get_object_handle(new_page1_ref);
+    let reference0_handle = pdf.get_object_handle(reference0);
     PageDocumentHelper::new(pdf).add_page_at(
-        PageInput::<'_, R>::Existing(new_page1_ref),
+        PageInput::target(new_page1),
         true,
-        reference0,
+        reference0_handle,
     )?;
     pages = crate::common::checked_page_refs(pdf)?;
     assert_eq!(page_at(&pages, 0)?, new_page1_ref);
@@ -529,10 +531,12 @@ pub(crate) fn run_test_15<R: Read + Seek>(
     let new_page2_ref = new_page_refs[2]
         .ok_or_else(|| Error::Internal("test 15 new page 2 was not made indirect".to_string()))?;
     let reference5 = page_at(&pages, 5)?;
+    let new_page2 = pdf.get_object_handle(new_page2_ref);
+    let reference5_handle = pdf.get_object_handle(reference5);
     PageDocumentHelper::new(pdf).add_page_at(
-        PageInput::<'_, R>::Existing(new_page2_ref),
+        PageInput::target(new_page2),
         true,
-        reference5,
+        reference5_handle,
     )?;
     pages = crate::common::checked_page_refs(pdf)?;
     assert_eq!(page_at(&pages, 5)?, new_page2_ref);
@@ -540,10 +544,12 @@ pub(crate) fn run_test_15<R: Read + Seek>(
     let new_page3_ref = new_page_refs[3]
         .ok_or_else(|| Error::Internal("test 15 new page 3 was not made indirect".to_string()))?;
     let reference5_after = page_at(&pages, 5)?;
+    let new_page3 = pdf.get_object_handle(new_page3_ref);
+    let reference5_after_handle = pdf.get_object_handle(reference5_after);
     PageDocumentHelper::new(pdf).add_page_at(
-        PageInput::<'_, R>::Existing(new_page3_ref),
+        PageInput::target(new_page3),
         false,
-        reference5_after,
+        reference5_after_handle,
     )?;
     pages = crate::common::checked_page_refs(pdf)?;
     assert_eq!(page_at(&pages, 6)?, new_page3_ref);
@@ -551,18 +557,17 @@ pub(crate) fn run_test_15<R: Read + Seek>(
 
     let new_page4_ref = new_page_refs[4]
         .ok_or_else(|| Error::Internal("test 15 new page 4 was not made indirect".to_string()))?;
-    PageDocumentHelper::new(pdf).add_page(PageInput::<'_, R>::Existing(new_page4_ref), false)?;
+    let new_page4 = pdf.get_object_handle(new_page4_ref);
+    PageDocumentHelper::new(pdf).add_page(PageInput::target(new_page4), false)?;
     pages = crate::common::checked_page_refs(pdf)?;
     assert_eq!(page_at(&pages, 11)?, new_page4_ref);
 
     let new_page5_ref = new_page_refs[5]
         .ok_or_else(|| Error::Internal("test 15 new page 5 was not made indirect".to_string()))?;
     let back = page_at(&pages, pages.len() - 1)?;
-    PageDocumentHelper::new(pdf).add_page_at(
-        PageInput::<'_, R>::Existing(new_page5_ref),
-        false,
-        back,
-    )?;
+    let new_page5 = pdf.get_object_handle(new_page5_ref);
+    let back_handle = pdf.get_object_handle(back);
+    PageDocumentHelper::new(pdf).add_page_at(PageInput::target(new_page5), false, back_handle)?;
     pages = crate::common::checked_page_refs(pdf)?;
     assert_eq!(pages.len(), 13);
     check_page_contents(pdf, page_at(&pages, 0)?, "New page 0", stdout)?;

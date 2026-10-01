@@ -93,7 +93,7 @@ fn empty_document_accepts_added_page_via_page_document_helper_and_passes_qpdf_ch
         ),
     ]);
     PageDocumentHelper::new(&mut pdf)
-        .add_page(PageInput::direct(direct_page), false)
+        .add_page(PageInput::target(direct_page), false)
         .unwrap();
 
     let pages = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap();

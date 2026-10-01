@@ -8,9 +8,10 @@
 //! flattening. The helper holds no copied page-tree state.
 
 use crate::object_handle::DocumentResolver;
-use crate::pages::tree_rebuild::{page_tree_root_handle, rebuild_page_tree, RebuildResult};
+use crate::pages::tree_rebuild::page_tree_root_handle;
 use crate::{
-    Error, ObjectHandle, ObjectRef, PageObjectHelper, Pdf, QpdfErrorCode, QpdfExc, Result,
+    Error, ObjectHandle, ObjectRef, PageObjectHelper, Pdf, QpdfErrorCode, QpdfExc, QpdfObjGen,
+    Result,
 };
 use std::io::{Read, Seek};
 
@@ -26,36 +27,30 @@ pub struct PageDocumentHelper<'a, R: Read + Seek + 'static> {
 /// An input page for [`PageDocumentHelper::add_page`] and
 /// [`PageDocumentHelper::add_page_at`].
 ///
-/// qpdf accepts a `QPDFObjectHandle`, which can be direct, target-owned, or
-/// owned by another `QPDF`. Rust's handles do not retain an owning-document
-/// borrow, so the foreign case explicitly carries its source document.
+/// qpdf accepts one `QPDFObjectHandle` and determines directness and document
+/// ownership from that handle. Rust calls distinguish a target-owned handle
+/// from a foreign handle because the foreign route also needs a mutable borrow
+/// of its source document.
 pub enum PageInput<'a, R: Read + Seek + 'static> {
-    /// A direct page handle, which qpdf turns into a fresh indirect object.
-    Direct(ObjectHandle),
-    /// An indirect page already owned by the target document.
-    Existing(ObjectRef),
-    /// An indirect page owned by another document.
+    /// A direct value or an indirect page already owned by the target.
+    Target(ObjectHandle),
+    /// A page handle owned by another document.
     Foreign {
         source: &'a mut Pdf<R>,
-        page: ObjectRef,
+        page: ObjectHandle,
     },
 }
 
-impl PageInput<'static, std::io::Cursor<Vec<u8>>> {
-    /// Construct a direct page input.
-    pub fn direct(page: ObjectHandle) -> Self {
-        Self::Direct(page)
-    }
-
-    /// Construct an input for a page already owned by the target document.
-    pub fn existing(page: ObjectRef) -> Self {
-        Self::Existing(page)
+impl<'a> PageInput<'a, std::io::Cursor<Vec<u8>>> {
+    /// Construct a page input for a direct value or target-owned handle.
+    pub fn target(page: ObjectHandle) -> Self {
+        Self::Target(page)
     }
 }
 
-impl<'a, R: Read + Seek> PageInput<'a, R> {
+impl<'a, R: Read + Seek + 'static> PageInput<'a, R> {
     /// Construct an input page from another document.
-    pub fn foreign(source: &'a mut Pdf<R>, page: ObjectRef) -> Self {
+    pub fn foreign(source: &'a mut Pdf<R>, page: ObjectHandle) -> Self {
         Self::Foreign { source, page }
     }
 }
@@ -116,94 +111,170 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         Ok(())
     }
 
+    /// Ensure qpdf's lazy flattened-page-tree boundary has run and return its
+    /// live ordered page list and root handle.
+    fn flatten_pages_tree(
+        &mut self,
+    ) -> Result<(crate::pages::repair::PreparedPages, ObjectHandle)> {
+        let prepared = self.prepare_all_pages()?.ok_or(Error::Missing("/Pages"))?;
+        let pages_root = page_tree_root_handle(self.pdf, &prepared.root)?;
+
+        // QPDF::flattenPagesTree uses its non-empty raw page-position map as
+        // the once-per-cache-lifetime sentinel. Reuse the same live /Kids array
+        // for later insertPage/removePage operations.
+        if !self.pdf.page_tree_flattened {
+            crate::optimization::inherited_attrs::push(self.pdf, &prepared, true, true)?;
+            self.pdf.ever_pushed_inherited_attributes_to_pages = true;
+            for page in &prepared.pages {
+                page.replace_key(b"/Parent", pages_root.clone())?;
+            }
+            pages_root.replace_key(b"/Kids", ObjectHandle::array(prepared.pages.clone()))?;
+            self.pdf.page_tree_flattened = !prepared.pages.is_empty();
+            self.pdf.cache_page_list(&prepared);
+
+            // qpdf checks the pre-existing /Count after replacing /Kids.
+            // getUIntValue warns and returns zero for negative and non-integers.
+            let count_handle = pages_root.try_get_key(b"/Count")?;
+            let declared_count = match count_handle.try_as_integer()? {
+                Some(count) if count >= 0 => count as u64,
+                Some(_) => {
+                    count_handle.warn_if_possible(
+                        "unsigned value request for negative number; returning 0",
+                    )?; // cov:ignore: warning-sink failure is not injectable through qpdf's successful Count conversion
+                    0
+                }
+                None => {
+                    let type_name = count_handle.type_name()?;
+                    let warning = format!(
+                        "operation for integer attempted on object of type {type_name}: returning 0"
+                    );
+                    count_handle.warn_if_possible(&warning)?;
+                    0
+                }
+            };
+            if declared_count != prepared.pages.len() as u64 {
+                return Err(Error::Internal(
+                    "/Count is wrong after flattening pages tree".to_owned(),
+                ));
+            }
+        }
+
+        Ok((prepared, pages_root))
+    }
+
+    fn page_not_in_tree_error(&self, page: QpdfObjGen) -> Error {
+        let description_bytes = self.pdf.resolver.input_description();
+        let object = format!("page object: object {} {}", page.get_obj(), page.get_gen());
+        Error::QpdfExc(QpdfExc::new(
+            QpdfErrorCode::Pages,
+            description_bytes,
+            object,
+            0,
+            b"page object not referenced in /Pages tree",
+        ))
+    }
+
     /// Add `page` at the beginning (`first == true`) or end of the document.
     ///
-    /// Mirrors `QPDFPageDocumentHelper::addPage`. If `page` already occurs in
-    /// the page tree, rebuilding creates a shallow duplicate for its later
-    /// occurrence, retaining shared page sub-objects.
-    pub fn add_page<RS: Read + Seek>(
+    /// Mirrors qpdf's `QPDFPageDocumentHelper::addPage`. If `page` already
+    /// occurs in the page tree, qpdf inserts a shallow copy for the later
+    /// occurrence while preserving shared page sub-objects.
+    pub fn add_page<RS: Read + Seek + 'static>(
         &mut self,
         page: PageInput<'_, RS>,
         first: bool,
-    ) -> Result<RebuildResult> {
+    ) -> Result<()> {
+        // QPDF::addPage reads /Count before insertPage performs the lazy
+        // flattening step (QPDF_pages.cc:287-295).
         let index = if first {
             0
         } else {
-            self.get_all_pages()?.len()
+            let catalog = self.pdf.root_handle()?;
+            catalog
+                .try_get_key(b"/Pages")?
+                .try_get_key(b"/Count")?
+                .try_get_int_value_as_int()?
         };
         self.insert_page(index, page)
     }
 
     /// Add `page` immediately before or after `reference_page`.
     ///
-    /// Mirrors `QPDFPageDocumentHelper::addPageAt`. The reference page must
-    /// be present in the repaired current page list; a non-member is rejected
-    /// before the page tree is mutated.
-    pub fn add_page_at<RS: Read + Seek>(
+    /// Mirrors qpdf's `QPDFPageDocumentHelper::addPageAt`. Membership uses
+    /// the reference handle's raw QpdfObjGen identity.
+    pub fn add_page_at<RS: Read + Seek + 'static>(
         &mut self,
         page: PageInput<'_, RS>,
         before: bool,
-        reference_page: ObjectRef,
-    ) -> Result<RebuildResult> {
-        let pages = crate::pages::page_refs(self.pdf)?;
-        let index = pages
+        reference_page: ObjectHandle,
+    ) -> Result<()> {
+        let (prepared, _) = self.flatten_pages_tree()?;
+        let reference_obj_gen = reference_page.get_obj_gen();
+        let index = prepared
+            .pages
             .iter()
-            .position(|&candidate| candidate == reference_page)
-            .ok_or(Error::Missing("reference page is not in the document"))?;
-        self.insert_page(index + usize::from(!before), page)
+            .position(|candidate| candidate.get_obj_gen() == reference_obj_gen)
+            .ok_or_else(|| self.page_not_in_tree_error(reference_obj_gen))?;
+        let index = index + usize::from(!before);
+        let index = match i32::try_from(index) {
+            Ok(index) => index,
+            Err(_) => {
+                let error = Error::Unsupported("page index exceeds qpdf's signed range".into()); // cov:ignore: a page vector exceeding qpdf's i32 range cannot be allocated in process memory.
+                return Err(error); // cov:ignore: this return is reached only for an impossible oversized page vector.
+            }
+        };
+        self.insert_page(index, page)
     }
 
-    /// Insert `page` at 0-based position `idx`, shifting existing pages to the
-    /// right.
+    /// Insert `page` at qpdf's 0-based array position.
     ///
-    /// `idx == 0` prepends; `idx == page_count` appends.  `page` must already
-    /// exist in the document as a valid `/Page` dictionary — [`rebuild_page_tree`]
-    /// will return an error otherwise.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Unsupported`] when `idx > page_count`.
-    /// - Any error from [`rebuild_page_tree`] (e.g. `page` is not a `/Page` dict).
-    fn insert_page<RS: Read + Seek>(
+    /// Follows QPDF::insertPage order: flatten, materialize direct or foreign
+    /// input, bounds-check, resolve duplicates by raw QpdfObjGen, then mutate
+    /// the live /Kids array.
+    fn insert_page<RS: Read + Seek + 'static>(
         &mut self,
-        idx: usize,
+        index: i32,
         page: PageInput<'_, RS>,
-    ) -> Result<RebuildResult> {
-        let mut refs = crate::pages::page_refs(self.pdf)?;
-        if idx > refs.len() {
-            return Err(Error::Unsupported(format!(
-                "insert index {idx} is out of bounds (page count {})",
-                refs.len()
-            )));
+    ) -> Result<()> {
+        let (mut prepared, pages_root) = self.flatten_pages_tree()?;
+        let mut page = self.materialize_page_input(page)?;
+        let page_count = prepared.pages.len();
+        if index < 0 || usize::try_from(index).map_or(true, |index| index > page_count) {
+            return Err(Error::Internal(
+                "QPDF::insertPage called with pos out of range".to_owned(),
+            ));
         }
-        let page = self.materialize_page_input(page)?;
-        if refs.contains(&page) {
-            // qpdf's QPDF::insertPage uses shallowCopy followed by
-            // makeIndirectObject for a page that is already in the tree
-            // (QPDF_pages.cc:233-237). Keep the duplicate on the canonical
-            // handle graph so its shared indirect children retain identity.
-            let copy = self.pdf.get_object_handle(page).shallow_copy()?;
-            let duplicate = self.pdf.make_indirect_object_handle(copy)?;
-            let duplicate_ref = duplicate
-                .object_ref()
-                .expect("make_indirect_object_handle returns an indirect handle");
-            refs.insert(idx, duplicate_ref);
-        } else {
-            refs.insert(idx, page);
+        let index = index as usize;
+
+        if prepared
+            .pages
+            .iter()
+            .any(|existing| existing.get_obj_gen() == page.get_obj_gen())
+        {
+            // QPDF::insertPage shallow-copies a page already in the target
+            // tree before making the copied page dictionary indirect
+            // (QPDF_pages.cc:233-237).
+            page = self.pdf.make_indirect_object_handle(page.shallow_copy()?)?;
         }
-        let result = rebuild_page_tree(self.pdf, &refs)?;
-        // The inserted page may carry annotations (in particular orphan
-        // Widgets not reachable through `/AcroForm/Fields`) that a shared
-        // `Pdf::acroform_cache` warmed before this call has no knowledge of.
-        // qpdf's own per-step `QPDFAcroFormDocumentHelper` construction
-        // (`QPDFJob.cc:2141-2193`) never observes a page inserted after it
-        // was built either; invalidating here reproduces that "no stale
-        // analysis survives a page-tree mutation" guarantee, matching
-        // `AcroFormDocumentHelper::invalidate_cache`'s own documented
-        // contract ("after manually changing the field tree, AcroForm
-        // dictionary, or page annotations").
+
+        page.replace_key(b"/Parent", pages_root.clone())?;
+        let kids = pages_root.try_get_key(b"/Kids")?;
+        kids.insert_array_item(index, page.clone())?;
+        let count = i64::try_from(kids.try_get_array_n_items()?).map_err(|_| {
+            // cov:ignore-start: an in-memory page tree cannot allocate more than i64::MAX Kids entries.
+            Error::Unsupported("page count exceeds qpdf's signed integer range".into())
+            // cov:ignore-end
+        })?; // cov:ignore: LLVM maps this continuation to the unreachable page-count overflow edge.
+        pages_root.replace_key(b"/Count", ObjectHandle::integer(count))?;
+
+        prepared.pages.insert(index, page);
+        self.pdf.invalidate_page_list_cache();
+        self.pdf.cache_page_list(&prepared);
+        self.pdf.page_tree_flattened = !prepared.pages.is_empty();
+        // An inserted page may carry orphan Widgets not observed by a warm
+        // AcroForm analysis; qpdf's job helper is constructed per step.
         *self.pdf.acroform_cache.borrow_mut() = None;
-        Ok(result)
+        Ok(())
     }
 
     /// Remove one page from a page tree that qpdf has already flattened for
@@ -273,7 +344,10 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         page: PageInput<'_, RS>,
         current_pages: &mut Vec<ObjectRef>,
     ) -> Result<ObjectRef> {
-        let mut page_ref = self.materialize_page_input(page)?;
+        let page = self.materialize_page_input(page)?;
+        let mut page_ref = page.object_ref().ok_or(Error::Missing(
+            "page object has no ObjectRef in page-spec job",
+        ))?;
         if current_pages.contains(&page_ref) {
             let copy = self.pdf.get_object_handle(page_ref).shallow_copy()?;
             let duplicate = self.pdf.make_indirect_object_handle(copy)?;
@@ -312,31 +386,38 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         Ok(page_ref)
     }
 
-    fn materialize_page_input<RS: Read + Seek>(
+    fn materialize_page_input<RS: Read + Seek + 'static>(
         &mut self,
         input: PageInput<'_, RS>,
-    ) -> Result<ObjectRef> {
+    ) -> Result<ObjectHandle> {
         match input {
-            PageInput::Direct(handle) => {
-                let indirect = self.pdf.make_indirect_object_handle(handle)?;
-                Ok(indirect
-                    .object_ref()
-                    .expect("make_indirect_object_handle always returns an indirect handle"))
+            PageInput::Target(handle) => {
+                if handle.is_direct() {
+                    self.pdf.make_indirect_object_handle(handle)
+                } else if handle.owning_pdf_unique_id() == Some(self.pdf.unique_id()) {
+                    Ok(handle)
+                } else {
+                    Err(Error::Unsupported(
+                        "indirect page handle is not owned by the target PDF; use Foreign input"
+                            .into(),
+                    ))
+                }
             }
-            PageInput::Existing(page) => Ok(page),
             PageInput::Foreign { source, page } => {
-                PageDocumentHelper::new(source).push_inherited_attributes_to_pages()?;
-                // qpdf's QPDF::insertPage calls copyForeignObject directly
-                // after materializing inherited attributes
-                // (libqpdf/QPDF.cc:2019-2097, libqpdf/QPDF_pages.cc:213-215).
-                // Keep page insertion on the canonical ObjectHandle graph
-                // route so reservation, /Pages boundaries, null-aware keys,
-                // and per-source identity reuse have one implementation.
-                let source_page = source.get_object_handle(page);
-                let copied = self.pdf.copy_foreign_object(&source_page)?;
-                copied
-                    .object_ref()
-                    .ok_or(Error::Missing("foreign page copy was not indirect"))
+                if page.is_direct() {
+                    // QPDF::insertPage promotes direct handles in the target
+                    // before testing foreign ownership.
+                    self.pdf.make_indirect_object_handle(page)
+                } else if page.owning_pdf_unique_id() == Some(source.unique_id()) {
+                    PageDocumentHelper::new(source).push_inherited_attributes_to_pages()?;
+                    // QPDF::insertPage materializes source inheritance before
+                    // copyForeignObject (QPDF_pages.cc:211-218).
+                    self.pdf.copy_foreign_object(&page)
+                } else {
+                    Err(Error::Unsupported(
+                        "foreign page handle is not owned by the source PDF".into(),
+                    ))
+                }
             }
         }
     }
@@ -356,49 +437,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// - Any error propagated from page-tree repair, inherited-attribute
     ///   materialization, or live page-tree mutation.
     pub fn remove_page(&mut self, page: ObjectHandle) -> Result<()> {
-        let prepared = self.prepare_all_pages()?.ok_or(Error::Missing("/Pages"))?;
-        let pages_root = page_tree_root_handle(self.pdf, &prepared.root)?;
-
-        // qpdf's findPage() first calls flattenPagesTree(). Its
-        // pageobj_to_pages_pos map is the sentinel that makes later removals
-        // erase from the same live /Kids array instead of flattening again.
-        if !self.pdf.page_tree_flattened {
-            crate::optimization::inherited_attrs::push(self.pdf, &prepared, true, true)?;
-            self.pdf.ever_pushed_inherited_attributes_to_pages = true;
-            for page_handle in &prepared.pages {
-                page_handle.replace_key(b"/Parent", pages_root.clone())?;
-            }
-            pages_root.replace_key(b"/Kids", ObjectHandle::array(prepared.pages.clone()))?;
-            self.pdf.page_tree_flattened = !prepared.pages.is_empty();
-            self.pdf.cache_page_list(&prepared);
-
-            // QPDF::flattenPagesTree verifies the pre-existing /Count after it
-            // replaces /Kids (`QPDF_pages.cc:171-183`). getUIntValue warns and
-            // returns zero for non-integers or negative values.
-            let count_handle = pages_root.try_get_key(b"/Count")?;
-            let declared_count = match count_handle.try_as_integer()? {
-                Some(count) if count >= 0 => count as u64,
-                Some(_) => {
-                    count_handle.warn_if_possible(
-                        "unsigned value request for negative number; returning 0",
-                    )?; // cov:ignore: warning-sink failure is not injectable through qpdf's successful Count conversion
-                    0
-                }
-                None => {
-                    let type_name = count_handle.type_name()?;
-                    let warning = format!(
-                        "operation for integer attempted on object of type {type_name}: returning 0"
-                    );
-                    count_handle.warn_if_possible(&warning)?;
-                    0
-                }
-            };
-            if declared_count != prepared.pages.len() as u64 {
-                return Err(Error::Internal(
-                    "/Count is wrong after flattening pages tree".to_owned(),
-                ));
-            }
-        }
+        let (prepared, pages_root) = self.flatten_pages_tree()?;
 
         let page_obj_gen = page.get_obj_gen();
         let Some(index) = prepared
@@ -409,19 +448,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
             // qpdf's findPage sets the last object description to `page
             // object` and throws qpdf_e_pages with the owning input filename
             // (`QPDF_pages.cc:303-319`). Keep its raw object/generation pair.
-            let description_bytes = self.pdf.resolver.input_description();
-            let object = format!(
-                "page object: object {} {}",
-                page_obj_gen.get_obj(),
-                page_obj_gen.get_gen()
-            );
-            return Err(Error::QpdfExc(QpdfExc::new(
-                QpdfErrorCode::Pages,
-                description_bytes,
-                object,
-                0,
-                b"page object not referenced in /Pages tree",
-            )));
+            return Err(self.page_not_in_tree_error(page_obj_gen));
         };
 
         let kids = pages_root.try_get_key(b"/Kids")?;
@@ -541,9 +568,10 @@ mod job_flattened_page_tests {
             .expect("catalog")
             .replace_key(b"/Pages", ObjectHandle::integer(1))
             .expect("replace Pages root");
+        let page = pdf.get_object_handle(page);
         assert!(matches!(
             PageDocumentHelper::new(&mut pdf)
-                .append_flattened_page_for_job(PageInput::existing(page), &mut Vec::new(),),
+                .append_flattened_page_for_job(PageInput::target(page), &mut Vec::new(),),
             Err(Error::Unsupported(_))
         ));
 
@@ -554,9 +582,10 @@ mod job_flattened_page_tests {
             .expect("catalog")
             .replace_key(b"/Pages", pages)
             .expect("replace Pages root");
+        let page = pdf.get_object_handle(page);
         assert!(matches!(
             PageDocumentHelper::new(&mut pdf)
-                .append_flattened_page_for_job(PageInput::existing(page), &mut Vec::new(),),
+                .append_flattened_page_for_job(PageInput::target(page), &mut Vec::new(),),
             Err(Error::Unsupported(_))
         ));
     }

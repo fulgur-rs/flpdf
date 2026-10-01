@@ -537,14 +537,15 @@ fn handle_multi_source_page_specs_in_place<R: Read + Seek + 'static>(
         }
 
         let page_ref = if source_index == 0 {
-            PageDocumentHelper::new(&mut sources[0]).append_flattened_page_for_job(
-                PageInput::<R>::Existing(source_page_ref),
-                &mut current_pages,
-            )? // cov:ignore: LLVM maps this executed append continuation to the call's opening expressions; helper error cases are tested directly.
+            let source_page = sources[0].get_object_handle(source_page_ref);
+            PageDocumentHelper::new(&mut sources[0])
+                .append_flattened_page_for_job(PageInput::target(source_page), &mut current_pages)?
+        // cov:ignore: LLVM maps this executed append continuation to the call's opening expressions; helper error cases are tested directly.
         } else {
             let (primary, secondary) = sources.split_at_mut(1);
+            let source_page = secondary[source_index - 1].get_object_handle(source_page_ref);
             PageDocumentHelper::new(&mut primary[0]).append_flattened_page_for_job(
-                PageInput::foreign(&mut secondary[source_index - 1], source_page_ref),
+                PageInput::foreign(&mut secondary[source_index - 1], source_page),
                 &mut current_pages,
             )? // cov:ignore: LLVM maps this executed append continuation to the call's opening expressions; helper error cases are tested directly.
         };

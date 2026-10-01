@@ -50,10 +50,7 @@ pub fn run_from_scratch(test_number: i32) -> flpdf::Result<()> {
     page.replace_key(b"/Contents", contents)?;
     page.replace_key(b"/Resources", resources)?;
 
-    let page_ref = page
-        .object_ref()
-        .expect("make_indirect_from_object_handle returns an indirect page");
-    PageDocumentHelper::new(&mut pdf).add_page(PageInput::existing(page_ref), true)?;
+    PageDocumentHelper::new(&mut pdf).add_page(PageInput::target(page), true)?;
 
     let mut writer = PdfWriter::new(&mut pdf);
     writer.set_output_file(FROM_SCRATCH_OUTPUT)?;

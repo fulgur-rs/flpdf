@@ -31,7 +31,7 @@ fn linearization_rejects_a_foreign_indirect_descendant_in_a_direct_container() {
         .replace_key(b"/ForeignContainer", direct_container)
         .expect("qpdf's shallow mutation ownership check accepts the direct container");
     PageDocumentHelper::new(&mut destination)
-        .add_page(PageInput::direct(one_page()), false)
+        .add_page(PageInput::target(one_page()), false)
         .expect("destination page");
 
     let mut writer = PdfWriter::new(&mut destination);
