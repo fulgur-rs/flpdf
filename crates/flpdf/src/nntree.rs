@@ -25,7 +25,7 @@
 //! `libqpdf/QPDFObjectHandle.cc:224-227`).
 
 use crate::object_handle::{canonical_dictionary_key, ObjectHandleIdentity};
-use crate::pdf_string::{new_unicode_string, normalized_utf8_value, utf8_value};
+use crate::pdf_string::{new_unicode_string, normalized_utf8_value};
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, QpdfErrorCode, QpdfExc, Result};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
@@ -46,7 +46,18 @@ pub(crate) trait TreeKey {
     type Key: Clone + Debug + Eq + Ord;
     const ITEMS_KEY: &'static str;
 
-    fn from_handle(handle: &ObjectHandle) -> Option<Self::Key>;
+    /// qpdf `NameTreeDetails::keyValid` / `NumberTreeDetails::keyValid`, using
+    /// the resolving `isString` / `isInteger` boundaries
+    /// (`QPDFNameTreeObjectHelper.cc:17-32`,
+    /// `QPDFNumberTreeObjectHelper.cc:17-32`).
+    fn is_valid_key(handle: &ObjectHandle) -> Result<bool>;
+
+    /// qpdf's iterator value read: `getUTF8Value` or `getIntValue`. This is
+    /// intentionally separate from key validity because qpdf's begin adapter
+    /// reads an in-range slot even when keyValid would reject it
+    /// (`QPDFNameTreeObjectHelper.cc:88-98`,
+    /// `QPDFNumberTreeObjectHelper.cc:91-100`).
+    fn value_from_handle(handle: &ObjectHandle) -> Result<Self::Key>;
     fn to_handle(key: &Self::Key) -> ObjectHandle;
 
     fn compare(left: &Self::Key, right: &Self::Key) -> Ordering {
@@ -60,8 +71,12 @@ impl TreeKey for NameKey {
     type Key = Vec<u8>;
     const ITEMS_KEY: &'static str = "Names";
 
-    fn from_handle(handle: &ObjectHandle) -> Option<Self::Key> {
-        handle.as_string().map(|value| utf8_value(&value))
+    fn is_valid_key(handle: &ObjectHandle) -> Result<bool> {
+        handle.try_is_string()
+    }
+
+    fn value_from_handle(handle: &ObjectHandle) -> Result<Self::Key> {
+        handle.try_get_utf8_value()
     }
 
     fn to_handle(key: &Self::Key) -> ObjectHandle {
@@ -76,8 +91,12 @@ impl TreeKey for NumberKey {
     type Key = i64;
     const ITEMS_KEY: &'static str = "Nums";
 
-    fn from_handle(handle: &ObjectHandle) -> Option<Self::Key> {
-        handle.as_integer()
+    fn is_valid_key(handle: &ObjectHandle) -> Result<bool> {
+        handle.try_is_integer()
+    }
+
+    fn value_from_handle(handle: &ObjectHandle) -> Result<Self::Key> {
+        handle.try_get_int_value()
     }
 
     fn to_handle(key: &Self::Key) -> ObjectHandle {
@@ -192,9 +211,13 @@ fn resolved_array(value: Option<&ObjectHandle>) -> Result<Option<ResolvedArray>>
 }
 
 fn resolved_key<K: TreeKey>(value: &ObjectHandle) -> Result<Option<K::Key>> {
-    value.try_dereference()?;
-    let value = value.clone();
-    Ok(K::from_handle(&value))
+    // qpdf compareKeyItem checks keyValid before compareKeys; keep validation
+    // and value decoding on their distinct resolving accessor boundaries.
+    if K::is_valid_key(value)? {
+        Ok(Some(K::value_from_handle(value)?))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Reject a handle-native tree value that does not belong to `pdf`.
@@ -267,7 +290,11 @@ impl LiveDictionary {
         let value = self.handle.try_get_key(&key)?;
         // qpdf dereferences the value before its array/type checks, so a
         // dangling reference has the same null outcome as a literal null.
-        Ok((!value.is_null()).then_some(value))
+        if value.try_is_null()? {
+            Ok(None)
+        } else {
+            Ok(Some(value))
+        }
     }
 
     fn insert(&self, key: &str, value: ObjectHandle) -> Result<()> {
@@ -691,7 +718,7 @@ impl NameTreeCursor {
                 "attempted to remove an invalid name-tree cursor".to_string(),
             ));
         }
-        tree.inner.remove_at(pdf, &mut self.inner).map(|_| ())
+        tree.inner.remove_at(pdf, &mut self.inner, true).map(|_| ())
     }
 
     fn ensure_owner(&self, tree: &NameTree) -> Result<()> {
@@ -1049,7 +1076,7 @@ impl NumberTreeCursor {
                 "attempted to remove an invalid number-tree cursor".to_string(),
             ));
         }
-        tree.inner.remove_at(pdf, &mut self.inner).map(|_| ())
+        tree.inner.remove_at(pdf, &mut self.inner, true).map(|_| ())
     }
 
     fn ensure_owner(&self, tree: &NumberTree) -> Result<()> {
@@ -1085,9 +1112,19 @@ impl<K: TreeKey> NNTree<K> {
     }
 
     pub(crate) fn begin<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<NNTreeCursor<K>> {
+        self.begin_position(pdf, true)
+    }
+
+    // Raw internal consumers pass false to mirror qpdf's low-level iterator;
+    // public cursors pass true to materialize the helper's typed key value.
+    fn begin_position<R: Read + Seek>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        materialize_current: bool,
+    ) -> Result<NNTreeCursor<K>> {
         let mut cursor = NNTreeCursor::for_pdf(pdf.unique_id());
         let root = self.root_node(pdf)?;
-        self.descend(pdf, &mut cursor, root, true, true)?;
+        self.descend(pdf, &mut cursor, root, true, true, materialize_current)?;
         Ok(cursor)
     }
 
@@ -1098,7 +1135,7 @@ impl<K: TreeKey> NNTree<K> {
     pub(crate) fn last<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<NNTreeCursor<K>> {
         let mut cursor = NNTreeCursor::for_pdf(pdf.unique_id());
         let root = self.root_node(pdf)?;
-        self.descend(pdf, &mut cursor, root, false, true)?;
+        self.descend(pdf, &mut cursor, root, false, true, true)?;
         Ok(cursor)
     }
 
@@ -1108,7 +1145,7 @@ impl<K: TreeKey> NNTree<K> {
         cursor: &mut NNTreeCursor<K>,
     ) -> Result<()> {
         cursor.ensure_pdf(pdf)?;
-        self.increment(pdf, cursor, false)
+        self.increment(pdf, cursor, false, true)
     }
 
     pub(crate) fn previous<R: Read + Seek>(
@@ -1117,7 +1154,7 @@ impl<K: TreeKey> NNTree<K> {
         cursor: &mut NNTreeCursor<K>,
     ) -> Result<()> {
         cursor.ensure_pdf(pdf)?;
-        self.increment(pdf, cursor, true)
+        self.increment(pdf, cursor, true, true)
     }
 
     pub(crate) fn find<R: Read + Seek>(
@@ -1175,7 +1212,7 @@ impl<K: TreeKey> NNTree<K> {
     ) -> Result<NNTreeCursor<K>> {
         let mut cursor = self.find(pdf, &key, true)?;
         if !cursor.positioned() {
-            return self.insert_first(pdf, allocator, raw_key, value);
+            return self.insert_first(pdf, allocator, raw_key, value, true);
         }
 
         let is_exact = cursor
@@ -1225,7 +1262,7 @@ impl<K: TreeKey> NNTree<K> {
         value: ObjectHandle,
     ) -> Result<()> {
         if !cursor.positioned() {
-            *cursor = self.insert_first(pdf, allocator, raw_key, value)?;
+            *cursor = self.insert_first(pdf, allocator, raw_key, value, true)?;
             return Ok(());
         }
 
@@ -1270,7 +1307,7 @@ impl<K: TreeKey> NNTree<K> {
         let Some((_, value)) = cursor.cloned_current() else {
             return Ok(None);
         };
-        self.remove_at(pdf, &mut cursor)?;
+        self.remove_at(pdf, &mut cursor, false)?;
         Ok(Some(value))
     }
 
@@ -1278,9 +1315,14 @@ impl<K: TreeKey> NNTree<K> {
         &mut self,
         pdf: &mut Pdf<R>,
         cursor: &mut NNTreeCursor<K>,
+        materialize_current: bool,
     ) -> Result<Option<ObjectHandle>> {
         cursor.ensure_pdf(pdf)?;
-        self.remove_at_inner(pdf, cursor)
+        let removed = self.remove_at_inner(pdf, cursor)?;
+        if materialize_current && cursor.positioned() {
+            self.update_current(pdf, cursor, true)?;
+        }
+        Ok(removed)
     }
 
     fn remove_at_inner<R: Read + Seek>(
@@ -1323,11 +1365,22 @@ impl<K: TreeKey> NNTree<K> {
                 self.reset_limits(pdf, cursor, leaf.clone(), cursor.path.len().checked_sub(1))?;
             }
             if item_number == remaining {
+                // qpdf decrements the raw iterator position and increments it
+                // without reading the previous key (NNTree.cc:440-445).
                 cursor.item_number = item_number.checked_sub(2);
-                self.update_current(pdf, cursor, false)?;
-                self.next(pdf, cursor)?;
+                cursor.current = None;
+                self.increment(pdf, cursor, false, false)?;
             } else {
-                self.update_current(pdf, cursor, false)?;
+                // Low-level qpdf iterator removal still validates that the
+                // raw successor has both key and value slots.
+                if item_number + 1 >= remaining {
+                    return Err(structural_error(
+                        &pdf.input_description(),
+                        leaf.diagnostic_ref(),
+                        "update ivalue: items array is too short",
+                    ));
+                }
+                cursor.current = None;
             }
             return Ok(Some(removed_value));
         }
@@ -1349,8 +1402,11 @@ impl<K: TreeKey> NNTree<K> {
         allocator: &mut ObjectAllocator,
         raw_key: ObjectHandle,
         value: ObjectHandle,
+        materialize_current: bool,
     ) -> Result<NNTreeCursor<K>> {
-        let mut cursor = self.begin(pdf)?;
+        // insertFirst mutates the low-level iterator's raw pair. Repair passes
+        // false when preserving an invalid source key.
+        let mut cursor = self.begin_position(pdf, false)?;
         let leaf = cursor.leaf.clone().ok_or_else(|| {
             structural_error(
                 &pdf.input_description(),
@@ -1373,7 +1429,9 @@ impl<K: TreeKey> NNTree<K> {
         items.values.insert(1, value);
         items.store()?;
         cursor.item_number = Some(0);
-        self.update_current(pdf, &mut cursor, true)?;
+        if materialize_current {
+            self.update_current(pdf, &mut cursor, true)?;
+        }
         let parent_index = cursor.path.len().checked_sub(1);
         self.reset_limits(pdf, &cursor, leaf.clone(), parent_index)?;
         self.split_node_live(pdf, &mut cursor, leaf, parent_index)?;
@@ -1389,7 +1447,9 @@ impl<K: TreeKey> NNTree<K> {
         replacement.root_pdf_id = Some(pdf.unique_id());
 
         let mut allocator = ObjectAllocator::default();
-        let mut cursor = self.begin(pdf)?;
+        // Repair iterates raw QPDFObjectHandle pairs, matching qpdf's range
+        // loop in NNTreeImpl::repair rather than the typed helper iterator.
+        let mut cursor = self.begin_position(pdf, false)?;
         while cursor.positioned() {
             let leaf = cursor
                 .leaf
@@ -1404,7 +1464,7 @@ impl<K: TreeKey> NNTree<K> {
             let key = items.values[item_number].clone();
             let value = items.values[item_number + 1].clone();
             replacement.insert_pair_with_allocator(pdf, &mut allocator, key, value)?;
-            self.increment(pdf, &mut cursor, false)?;
+            self.increment(pdf, &mut cursor, false, false)?;
         }
 
         let replacement = replacement.ensure_root(pdf)?;
@@ -1760,14 +1820,16 @@ impl<K: TreeKey> NNTree<K> {
                     let previous = remaining_kid_values.last().expect("non-empty").clone();
                     let child =
                         self.prepare_kid(pdf, &parent_handle, remaining_kids - 1, previous)?;
-                    self.descend(pdf, cursor, child, false, true)?;
+                    // The previous leaf is a temporary raw position; next()
+                    // selects the successor before a typed value is needed.
+                    self.descend(pdf, cursor, child, false, true, false)?;
                     if cursor.positioned() {
-                        self.next(pdf, cursor)?;
+                        self.increment(pdf, cursor, false, false)?;
                     } // cov:ignore: LLVM maps this covered conditional delimiter to a zero-count region
                 } else {
                     let next = remaining_kid_values[removed_kid].clone();
                     let child = self.prepare_kid(pdf, &parent_handle, removed_kid, next)?;
-                    self.descend(pdf, cursor, child, true, true)?;
+                    self.descend(pdf, cursor, child, true, true, false)?;
                 }
                 return Ok(());
             }
@@ -1790,19 +1852,38 @@ impl<K: TreeKey> NNTree<K> {
         key: &K::Key,
         return_previous_if_missing: bool,
     ) -> Result<NNTreeCursor<K>> {
-        let first = self.begin(pdf)?;
+        let root = self.root_node(pdf)?;
+        let mut first = NNTreeCursor::for_pdf(pdf.unique_id());
+        // qpdf's NNTree::findInternal checks keyValid on the raw iterator key
+        // before comparing it. Do not materialize the helper iterator's typed
+        // value here: malformed keys must reach binary search without an
+        // accessor warning or a default value that changes the lower bound.
+        self.descend(pdf, &mut first, root.clone(), true, true, false)?;
         if !first.positioned() {
             return Ok(self.end());
         }
-        if let Some(first_key) = first.current_key() {
-            if K::compare(key, first_key) == Ordering::Less {
+        let leaf = first
+            .leaf
+            .as_ref()
+            .expect("a positioned cursor retains its leaf");
+        let item_number = first
+            .item_number
+            .expect("a positioned cursor retains its item number");
+        let dictionary = self.load_node(pdf, leaf)?;
+        let items = resolved_array(dictionary.get(K::ITEMS_KEY)?.as_ref())?
+            .expect("a positioned cursor retains its items array");
+        let raw_key = items
+            .values
+            .get(item_number)
+            .expect("a positioned cursor retains its key slot");
+        if let Some(first_key) = resolved_key::<K>(raw_key)? {
+            if K::compare(key, &first_key) == Ordering::Less {
                 return Ok(self.end());
             }
         }
         // qpdf 11.9.0 initializes its `last_item` check with end(), not
         // last(), so after-maximum keys intentionally use the general search.
 
-        let root = self.root_node(pdf)?;
         let root_diagnostic_ref = root.diagnostic_ref();
         let mut node = root;
         // `ObjectHandleIdentity` hashes and compares only its Rc allocation
@@ -2002,6 +2083,7 @@ impl<K: TreeKey> NNTree<K> {
         start: NodeHandle,
         first: bool,
         allow_empty: bool,
+        materialize_current: bool,
     ) -> Result<bool> {
         let original_path = cursor.path.clone();
         let original_leaf = cursor.leaf.clone();
@@ -2065,7 +2147,18 @@ impl<K: TreeKey> NNTree<K> {
                 };
                 cursor.leaf = Some(node);
                 cursor.item_number = Some(item_number);
-                self.update_current(pdf, cursor, true)?;
+                cursor.current = None;
+                if item_number + 1 >= items.values.len() {
+                    let leaf = cursor.leaf.as_ref().expect("positioned leaf is present");
+                    return Err(structural_error(
+                        &pdf.input_description(),
+                        leaf.diagnostic_ref(),
+                        "update ivalue: items array is too short",
+                    ));
+                }
+                if materialize_current {
+                    self.update_current(pdf, cursor, true)?;
+                }
                 return Ok(true);
             }
 
@@ -2110,12 +2203,16 @@ impl<K: TreeKey> NNTree<K> {
         pdf: &mut Pdf<R>,
         cursor: &mut NNTreeCursor<K>,
         backward: bool,
+        materialize_current: bool,
     ) -> Result<()> {
+        if !materialize_current {
+            cursor.current = None;
+        }
         if cursor.item_number.is_none() {
             cursor.path.clear();
             cursor.clear_position();
             let root = self.root_node(pdf)?;
-            self.descend(pdf, cursor, root, !backward, true)?;
+            self.descend(pdf, cursor, root, !backward, true, materialize_current)?;
             return Ok(());
         }
 
@@ -2142,16 +2239,28 @@ impl<K: TreeKey> NNTree<K> {
                     cursor.current = None;
                     continue;
                 }
-                self.update_current(pdf, cursor, true)?;
+                // qpdf NNTreeIterator::increment skips a wrong-typed key after
+                // a resolving keyValid check (NNTree.cc:138-151).
+                if !K::is_valid_key(&items.values[candidate])? {
+                    self.warn(pdf, &leaf, format!("item {candidate} has the wrong type"))?;
+                    cursor.current = None;
+                    continue;
+                }
+                if materialize_current {
+                    self.update_current(pdf, cursor, true)?;
+                } else {
+                    cursor.current = None;
+                    return Ok(());
+                }
                 if cursor.current.is_some() {
                     return Ok(());
                 }
-                self.warn(pdf, &leaf, format!("item {candidate} has the wrong type"))?;
                 continue;
             }
 
             cursor.clear_position();
             let mut descended = false;
+            let mut found_valid_position = false;
             while let Some(last_index) = cursor.path.len().checked_sub(1) {
                 let parent = cursor.path[last_index].node.clone();
                 let dictionary = self.load_node(pdf, &parent)?;
@@ -2183,16 +2292,25 @@ impl<K: TreeKey> NNTree<K> {
                     }
                     cursor.path[last_index].kid_number = kid_number;
                     let kid = self.prepare_kid(pdf, &parent, kid_number, kid_object)?;
-                    if self.descend(pdf, cursor, kid, !backward, false)? {
-                        if cursor.current.is_none() {
-                            let item_number = cursor
-                                .item_number
-                                .expect("descended non-empty leaf has an item number");
-                            self.warn(
-                                pdf,
-                                cursor.leaf.as_ref().expect("descended leaf is present"),
-                                format!("item {item_number} has the wrong type"),
-                            )?;
+                    if self.descend(pdf, cursor, kid, !backward, false, false)? {
+                        let item_number = cursor
+                            .item_number
+                            .expect("descended non-empty leaf has an item number");
+                        let leaf = cursor.leaf.as_ref().expect("descended leaf is present");
+                        let dictionary = self.load_node(pdf, leaf)?;
+                        let items = resolved_array(dictionary.get(K::ITEMS_KEY)?.as_ref())?
+                            .expect("descend selected a leaf with an items array");
+                        let raw_key = items
+                            .values
+                            .get(item_number)
+                            .expect("descend selected an in-range key slot");
+                        if !K::is_valid_key(raw_key)? {
+                            self.warn(pdf, leaf, format!("item {item_number} has the wrong type"))?;
+                        } else {
+                            found_valid_position = true;
+                            if materialize_current {
+                                self.update_current(pdf, cursor, true)?;
+                            }
                         }
                         descended = true;
                         break;
@@ -2207,7 +2325,7 @@ impl<K: TreeKey> NNTree<K> {
             if !descended {
                 return Ok(());
             }
-            if cursor.current.is_some() {
+            if cursor.current.is_some() || found_valid_position {
                 return Ok(());
             }
         }
@@ -2242,18 +2360,24 @@ impl<K: TreeKey> NNTree<K> {
         }
         let raw_key = items.values[item_number].clone();
         let raw_value = items.values[item_number + 1].clone();
-        // cov:ignore-start: malformed item keys are rejected by find before update_current is reached
-        let Some(key) = resolved_key::<K>(&raw_key)? else {
-            if allow_invalid {
-                return Ok(());
+        let key = if allow_invalid {
+            // qpdf's iterator adapter calls getUTF8Value/getIntValue for every
+            // in-range slot, including a key that keyValid would reject.
+            K::value_from_handle(&raw_key)?
+        } else {
+            // cov:ignore-start: malformed item keys are rejected by find before strict update_current is reached
+            match resolved_key::<K>(&raw_key)? {
+                Some(key) => key,
+                None => {
+                    return Err(structural_error(
+                        &pdf.input_description(),
+                        leaf.diagnostic_ref(),
+                        format!("item at index {item_number} is not the right type"),
+                    ));
+                }
             }
-            return Err(structural_error(
-                &pdf.input_description(),
-                leaf.diagnostic_ref(),
-                format!("item at index {item_number} is not the right type"),
-            ));
+            // cov:ignore-end
         };
-        // cov:ignore-end
         cursor.current = Some((key, raw_value));
         Ok(())
     }
@@ -2273,7 +2397,7 @@ impl<K: TreeKey> NNTree<K> {
             // before its next insert observes that the key is invalid. Later
             // malformed keys are skipped by increment and never reach this
             // path.
-            let cursor = self.begin(pdf)?;
+            let cursor = self.begin_position(pdf, false)?;
             if cursor.positioned() {
                 Err(structural_error(
                     &pdf.input_description(),
@@ -2282,7 +2406,7 @@ impl<K: TreeKey> NNTree<K> {
                 ))
                 // cov:ignore-end
             } else {
-                self.insert_first(pdf, allocator, key, value)
+                self.insert_first(pdf, allocator, key, value, false)
             }
         }
     }
