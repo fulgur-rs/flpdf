@@ -14,6 +14,7 @@ use std::process::Command as Shell;
 const QPDF: &str = "/usr/bin/qpdf";
 const EXPECTED_QPDF_VERSION: &str = "11.9.0";
 const FIXTURE: &str = "../../tests/fixtures/compat/acroform-sig-widget.pdf";
+const ORPHAN_WIDGET_FIXTURE: &str = "../../tests/fixtures/compat/acroform-sig-orphan-widget.pdf";
 const PROVENANCE_ORDER_FIXTURES: [&str; 2] = [
     "../../tests/fixtures/compat/acroform-sig-nonterminal-parent.pdf",
     "../../tests/fixtures/compat/acroform-sig-parent-pure-widget-kid.pdf",
@@ -1547,6 +1548,61 @@ fn acroform_with_all_fields_on_unselected_pages_is_removed_in_a_multi_source_mer
     assert_eq!(
         flpdf_json["acroform"]["hasacroform"], qpdf_json["acroform"]["hasacroform"],
         "flpdf must also drop the AcroForm rather than leaving an empty /Fields"
+    );
+}
+
+/// qpdf filters `/AcroForm /Fields` against the fields reached from each
+/// selected page's Widgets, then removes `/AcroForm` when the filtered array
+/// is empty (`QPDFJob.cc:2599-2629`). The fixture has an empty `/Fields` array
+/// and an orphan signature Widget on its only page; selecting that page in
+/// two occurrences must still remove the empty form from the final Catalog.
+#[test]
+fn repeated_page_specs_remove_an_orphan_widget_acroform_like_qpdf() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let input = Path::new(ORPHAN_WIDGET_FIXTURE);
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    Shell::new(QPDF)
+        .args(["--static-id"])
+        .arg(input)
+        .args(["--pages", ".", "1", ".", "1", "--"])
+        .arg(&qpdf_output)
+        .assert()
+        .success();
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--static-id"])
+        .arg(input)
+        .args(["--pages", ".", "1", ".", "1", "--"])
+        .arg(&flpdf_output)
+        .output()
+        .expect("flpdf should spawn");
+    assert!(
+        flpdf.status.success() || flpdf.status.code() == Some(3),
+        "flpdf page selection failed: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+
+    let qpdf_qdf = qdf(&qpdf_output);
+    let flpdf_qdf = qdf(&flpdf_output);
+    assert!(
+        !qpdf_qdf.contains("/AcroForm"),
+        "the qpdf oracle removes the empty AcroForm"
+    );
+    assert!(
+        !flpdf_qdf.contains("/AcroForm"),
+        "flpdf must remove the empty AcroForm from the Catalog"
+    );
+    assert_eq!(
+        std::fs::read(&flpdf_output).expect("read flpdf output"),
+        std::fs::read(&qpdf_output).expect("read qpdf output"),
+        "repeated-page output must remain byte-identical to qpdf"
     );
 }
 
