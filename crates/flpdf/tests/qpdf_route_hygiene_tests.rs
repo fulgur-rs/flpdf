@@ -232,11 +232,17 @@ fn ownerless_xref_api_is_removed_in_favor_of_the_canonical_pdf_route() {
 ///   `_pdf: Pdf<R>` is already reported where that field is *declared*, by the
 ///   same walk. Destructuring only re-binds a carrier the guard has seen.
 /// * **A closure parameter with no type annotation.** `|_pdf| ...` has no type
-///   to read; only the inference engine has one. It is left open because a
-///   closure is not a signature qpdf mirrors -- the carriers this guard exists
-///   to fence out were function parameters and struct fields, which is where
-///   flpdf's shapes answer to qpdf's. An annotated closure parameter is still
-///   checked.
+///   written in its pattern; `syn` only sees the expected type after Rust's
+///   type inference. qpdf 11.9 does use callback signatures that carry a QPDF
+///   owner: private `QPDFJob::doProcess` and `doProcessOnce` accept
+///   `std::function<void(QPDF*, char const*)>` (`QPDFJob.hh:497-510`), and
+///   their callers bind QPDF member functions (`QPDFJob.cc:1801-1815`). So
+///   closures are not categorically outside qpdf's callback surface. This
+///   syntax-only scan has no call-site expected-type propagation; treating
+///   every untyped closure parameter as an unknown PDF carrier would also
+///   conflate unrelated callbacks. Keep untyped closure parameters outside
+///   this guard until a call-site-aware qpdf callback mapping exists. An
+///   annotated closure parameter is still checked.
 /// * **A binding name produced by a macro.** `bind!(_pdf)` is a `Pat::Macro`,
 ///   and the name only exists after expansion.
 ///
