@@ -343,9 +343,8 @@ fn handle_single_source_page_specs<R: Read + Seek>(
     let mut copy_duplicate_annotations =
         |pdf: &mut Pdf<R>, source_page_ref: ObjectRef, new_page: ObjectRef| -> Result<()> {
             let source_page = pdf.get_object_handle(source_page_ref);
-            let destination_page = pdf.get_object_handle(new_page);
-            destination_page.remove_key(b"/Annots");
-            PageObjectHelper::new(new_page, pdf).copy_annotations(source_page, Matrix::default())
+            PageObjectHelper::new(new_page, pdf)
+                .fix_copied_annotations_with_field_tree_only(source_page, &BTreeSet::new())
         };
     let result = crate::pages::tree_rebuild::rebuild_page_tree_with_duplicate_hook(
         source,
