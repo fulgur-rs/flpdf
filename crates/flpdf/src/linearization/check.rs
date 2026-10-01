@@ -35,6 +35,7 @@ use super::show::{
     HPageOffset, HSharedObject, ShowLinearizationError,
 };
 use crate::optimization::{ObjectUser, Optimization};
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::{DecodeLevel, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, Result, XrefEntry};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -420,26 +421,29 @@ fn first_page_source_extent<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<(i64, i6
 struct ComputedHintData {
     optimization: Optimization,
     page_object_counts: Vec<u32>,
-    page_shared_objects: Vec<Vec<ObjectRef>>,
-    part8_objects: Vec<ObjectRef>,
-    outline_root: Option<ObjectRef>,
-    outline_objects: BTreeSet<ObjectRef>,
+    page_shared_objects: Vec<Vec<QpdfObjGen>>,
+    part8_objects: Vec<QpdfObjGen>,
+    outline_root: Option<QpdfObjGen>,
+    outline_objects: BTreeSet<QpdfObjGen>,
 }
 
-fn uncompressed_object_ref(
-    object_ref: ObjectRef,
-    xref: &BTreeMap<ObjectRef, XrefEntry>,
-) -> ObjectRef {
-    match xref.get(&object_ref) {
-        Some(XrefEntry::Compressed { stream, .. }) => ObjectRef::new(*stream, 0),
-        _ => object_ref,
+fn uncompressed_object_gen(
+    object_gen: QpdfObjGen,
+    xref: &BTreeMap<QpdfObjGen, XrefEntry>,
+) -> Result<QpdfObjGen> {
+    match xref.get(&object_gen) {
+        Some(XrefEntry::Compressed { stream, .. }) => {
+            QpdfObjGen::try_from_object_ref(ObjectRef::new(*stream, 0))
+        }
+        _ => Ok(object_gen),
     }
 }
 
-fn root_outlines_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<ObjectRef>> {
+fn root_outlines_gen<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<QpdfObjGen>> {
     let root = pdf.root_handle()?;
     let outlines = root.try_get_key(b"/Outlines")?;
-    Ok(outlines.object_ref())
+    let object_gen = outlines.get_obj_gen();
+    Ok(object_gen.is_indirect().then_some(object_gen))
 }
 
 fn outlines_in_first_page<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
@@ -456,11 +460,12 @@ fn outlines_in_first_page<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
 /// before `checkHPageOffset`, `checkHSharedObject`, and `checkHOutlines`.
 fn compute_hint_data<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    pages: &[ObjectRef],
+    pages: &[QpdfObjGen],
 ) -> Result<ComputedHintData> {
-    let xref = pdf.get_xref_table();
+    let valid_xref = pdf.get_xref_table();
+    let raw_xref = pdf.get_raw_xref_table();
     let mut object_stream_data = BTreeMap::new();
-    for (object_ref, entry) in &xref {
+    for (object_ref, entry) in &valid_xref {
         if let XrefEntry::Compressed { stream, .. } = entry {
             object_stream_data.insert(object_ref.number, *stream);
         }
@@ -473,7 +478,7 @@ fn compute_hint_data<R: Read + Seek>(
     let mut other_page_shared = BTreeSet::new();
     let mut outline_objects = BTreeSet::new();
 
-    for (object_ref, users) in optimization.object_users() {
+    for (object_gen, users) in optimization.raw_object_users() {
         let mut in_first_page = false;
         let mut other_pages = 0_u32;
         let mut thumbs = 0_u32;
@@ -502,28 +507,29 @@ fn compute_hint_data<R: Read + Seek>(
             continue;
         }
         if in_outlines {
-            outline_objects.insert(object_ref);
+            outline_objects.insert(object_gen);
         } else if in_open_document {
             continue;
         } else if in_first_page && others == 0 && other_pages == 0 && thumbs == 0 {
-            first_page_private.insert(object_ref);
+            first_page_private.insert(object_gen);
         } else if in_first_page {
-            first_page_shared.insert(object_ref);
+            first_page_shared.insert(object_gen);
         } else if other_pages == 1 && others == 0 && thumbs == 0 {
-            other_page_private.insert(object_ref);
+            other_page_private.insert(object_gen);
         } else if other_pages > 1 {
-            other_page_shared.insert(object_ref);
+            other_page_shared.insert(object_gen);
         }
     }
 
     let first_page = pages.first().copied().ok_or_else(|| {
         crate::Error::Unsupported("no pages found while calculating hint data".to_owned())
     })?;
-    let first_page = uncompressed_object_ref(first_page, &xref);
+    let first_page = uncompressed_object_gen(first_page, &raw_xref)?;
     first_page_private.remove(&first_page);
 
-    let outline_root =
-        root_outlines_ref(pdf)?.map(|object_ref| uncompressed_object_ref(object_ref, &xref));
+    let outline_root = root_outlines_gen(pdf)?
+        .map(|object_gen| uncompressed_object_gen(object_gen, &raw_xref))
+        .transpose()?;
     let mut ordered_outlines = Vec::with_capacity(outline_objects.len());
     if let Some(outline_root) = outline_root {
         if outline_objects.remove(&outline_root) {
@@ -542,33 +548,36 @@ fn compute_hint_data<R: Read + Seek>(
 
     let mut page_object_counts = Vec::with_capacity(pages.len());
     page_object_counts.push(part6_objects.len() as u32);
-    for (page_number, page_ref) in pages.iter().enumerate().skip(1) {
-        let page_object = uncompressed_object_ref(*page_ref, &xref);
+    for (page_number, page_gen) in pages.iter().enumerate().skip(1) {
+        let page_object = uncompressed_object_gen(*page_gen, &raw_xref)?;
         let private_count = optimization
-            .objects_for(&ObjectUser::Page(page_number as u32))
-            .filter(|object_ref| {
-                *object_ref != page_object && other_page_private.contains(object_ref)
+            .raw_objects_for(&ObjectUser::Page(page_number as u32))
+            .iter()
+            .filter(|object_gen| {
+                **object_gen != page_object && other_page_private.contains(object_gen)
             })
             .count();
         page_object_counts.push((private_count + 1) as u32);
     }
 
-    let part8_objects: Vec<ObjectRef> = other_page_shared.into_iter().collect();
+    let part8_objects: Vec<QpdfObjGen> = other_page_shared.into_iter().collect();
 
-    let shared_object_numbers: BTreeSet<u32> = part6_objects
+    let shared_object_numbers: BTreeSet<i32> = part6_objects
         .iter()
         .chain(&part8_objects)
-        .map(|r| r.number)
+        .map(|object_gen| object_gen.get_obj())
         .collect();
     let mut page_shared_objects = Vec::with_capacity(pages.len());
     page_shared_objects.push(Vec::new());
     for page_number in 1..pages.len() {
         let shared = optimization
-            .objects_for(&ObjectUser::Page(page_number as u32))
-            .filter(|object_ref| {
-                optimization.users_for(*object_ref).len() > 1
-                    && shared_object_numbers.contains(&object_ref.number)
+            .raw_objects_for(&ObjectUser::Page(page_number as u32))
+            .iter()
+            .filter(|object_gen| {
+                optimization.raw_users_for(**object_gen).len() > 1
+                    && shared_object_numbers.contains(&object_gen.get_obj())
             })
+            .copied()
             .collect();
         page_shared_objects.push(shared);
     }
@@ -605,33 +614,53 @@ fn adjusted_hint_offset(offset: u64, h_offset: u64, h_length: u64) -> u64 {
     }
 }
 
+/// Convert a bitstream value the way qpdf's `BitStream::getBitsInt` converts
+/// its unsigned 32-bit result to `int` (`BitStream.cc:46-52`).
+fn qpdf_hint_i32(value: u64) -> i32 {
+    value as u32 as i32
+}
+
+/// qpdf stores `nobjects_minus_one` as a signed `int` and adds one using that
+/// type (`QPDF_linearization.cc:773`). Use wrapping arithmetic to reproduce
+/// the packaged qpdf build's two's-complement result for malformed high-bit
+/// values without relying on Rust debug/release overflow behavior.
+fn qpdf_shared_object_count(nobjects_minus_one: u64) -> i32 {
+    qpdf_hint_i32(nobjects_minus_one).wrapping_add(1)
+}
+
 fn linearization_offset(
-    xref: &BTreeMap<ObjectRef, XrefEntry>,
-    object_ref: ObjectRef,
-    seen: &mut BTreeSet<ObjectRef>,
+    xref: &BTreeMap<QpdfObjGen, XrefEntry>,
+    object_gen: QpdfObjGen,
+    seen: &mut BTreeSet<QpdfObjGen>,
 ) -> std::result::Result<u64, LinearizationCheckError> {
-    if !seen.insert(object_ref) {
+    if !seen.insert(object_gen) {
         return Err(LinearizationCheckError::InvalidParam {
-            message: format!("xref object-stream chain cycles at {object_ref}"),
+            message: format!(
+                "xref object-stream chain cycles at {} {}",
+                object_gen.get_obj(),
+                object_gen.get_gen()
+            ),
         });
     }
-    let result = match xref.get(&object_ref).copied() {
+    let result = match xref.get(&object_gen).copied() {
         Some(XrefEntry::Uncompressed { offset }) => Ok(offset),
         Some(XrefEntry::Compressed { stream, .. }) => {
-            linearization_offset(xref, ObjectRef::new(stream, 0), seen)
+            let stream_gen = QpdfObjGen::try_from_object_ref(ObjectRef::new(stream, 0))
+                .map_err(LinearizationCheckError::from)?;
+            linearization_offset(xref, stream_gen, seen)
         }
         Some(XrefEntry::Free { .. }) | None => Err(LinearizationCheckError::InvalidParam {
-            message: format!("no usable xref table entry for {object_ref}"),
+            message: "getLinearizationOffset called for xref entry not of type 1 or 2".to_owned(),
         }),
     };
-    seen.remove(&object_ref);
+    seen.remove(&object_gen);
     result
 }
 
 fn length_next_n<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    xref: &BTreeMap<ObjectRef, XrefEntry>,
-    first_object: u32,
+    xref: &BTreeMap<QpdfObjGen, XrefEntry>,
+    first_object: i32,
     nobjects: u64,
     file_len: u64,
     collect_soft_warnings: bool,
@@ -660,20 +689,20 @@ fn length_next_n<R: Read + Seek>(
 
     let mut length = 0_i128;
     for index in 0..nobjects {
-        let index = u32::try_from(index).map_err(|_| {
-            // cov:ignore-start: the supported input bound cannot allocate more than u32 object entries
+        let index = i32::try_from(index).map_err(|_| {
+            // cov:ignore-start: qpdf's lengthNextN uses signed int object numbers
             LinearizationCheckError::InvalidParam {
-                message: format!("object sequence starting at {first_object} overflows u32"),
+                message: format!("object sequence starting at {first_object} overflows qpdf int"),
             }
             // cov:ignore-end
         })?; // cov:ignore: LLVM maps this successful conversion continuation to the closure's unhit error region
         let object_number = first_object.checked_add(index).ok_or_else(|| {
             LinearizationCheckError::InvalidParam {
-                message: format!("object sequence starting at {first_object} overflows u32"),
+                message: format!("object sequence starting at {first_object} overflows qpdf int"),
             }
         })?;
-        let object_ref = ObjectRef::new(object_number, 0);
-        if !xref.contains_key(&object_ref) {
+        let object_gen = QpdfObjGen::new(object_number, 0);
+        if !xref.contains_key(&object_gen) {
             hint_warning(
                 collect_soft_warnings,
                 warnings,
@@ -682,17 +711,15 @@ fn length_next_n<R: Read + Seek>(
             continue;
         }
         let mut seen = BTreeSet::new();
-        let offset = linearization_offset(xref, object_ref, &mut seen)?;
-        let object = pdf.get_object_handle(object_ref);
+        let offset = linearization_offset(xref, object_gen, &mut seen)?;
+        let object = pdf.get_object_handle_by_raw_identity(object_number, 0);
         object
             .try_dereference()
             .map_err(LinearizationCheckError::from)?;
         let (_, end_after_space) = object.end_offsets();
-        if end_after_space < 0 {
-            return Err(LinearizationCheckError::InvalidParam {
-                message: format!("object {object_ref} has no source extent"),
-            });
-        }
+        // qpdf still computes the length from its cached -1 end position for
+        // a programmatically replaced object, then reports the mismatch as a
+        // soft linearization warning (`QPDF_linearization.cc:652-661`).
         length += i128::from(end_after_space) - i128::from(offset);
     }
     Ok(length)
@@ -711,7 +738,17 @@ struct HintTableCheckInput<'a> {
 
 fn check_hint_tables<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    pages: &[ObjectRef],
+    pages: &[QpdfObjGen],
+    input: HintTableCheckInput<'_>,
+) -> std::result::Result<(), LinearizationCheckError> {
+    let computed = compute_hint_data(pdf, pages).map_err(LinearizationCheckError::from)?;
+    check_hint_tables_with_computed_data(pdf, pages, computed, input)
+}
+
+fn check_hint_tables_with_computed_data<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    pages: &[QpdfObjGen],
+    computed: ComputedHintData,
     input: HintTableCheckInput<'_>,
 ) -> std::result::Result<(), LinearizationCheckError> {
     let HintTableCheckInput {
@@ -724,8 +761,7 @@ fn check_hint_tables<R: Read + Seek>(
         collect_soft_warnings,
         warnings,
     } = input;
-    let computed = compute_hint_data(pdf, pages).map_err(LinearizationCheckError::from)?;
-    let xref = pdf.get_xref_table();
+    let xref = pdf.get_raw_xref_table();
 
     if page_hints.entries.len() != pages.len() {
         return Err(LinearizationCheckError::InvalidParam {
@@ -748,23 +784,19 @@ fn check_hint_tables<R: Read + Seek>(
             "shared object hint table: ntotal < nfirst_page",
         )?; // cov:ignore: llvm maps the warning closure cleanup to the following page loop
     } else {
-        let mut current_object = first_page.number;
+        let mut current_object = first_page.get_obj();
         for index in 0..shared_hints.nshared_total as usize {
             if index == shared_hints.nshared_first_page as usize {
-                let first_shared_obj =
-                    u32::try_from(shared_hints.first_shared_obj).map_err(|_| {
-                        LinearizationCheckError::InvalidParam {
-                            message: "first shared object number does not fit in u32".to_owned(),
-                        }
-                    })?;
+                let first_shared_obj = qpdf_hint_i32(shared_hints.first_shared_obj);
                 if let Some(first_part8) = computed.part8_objects.first() {
-                    if first_shared_obj != first_part8.number {
+                    if first_shared_obj != first_part8.get_obj() {
                         hint_warning(
                             collect_soft_warnings,
                             warnings,
                             format!(
                                 "first shared object number mismatch: hint table = {}; computed = {}",
-                                shared_hints.first_shared_obj, first_part8.number
+                                first_shared_obj,
+                                first_part8.get_obj()
                             ),
                         )?; // cov:ignore: llvm maps this warning closure cleanup to the enclosing transition
                     }
@@ -776,10 +808,15 @@ fn check_hint_tables<R: Read + Seek>(
                     )?; // cov:ignore: llvm maps this warning closure cleanup to the following object sequence
                 }
                 current_object = first_shared_obj;
-                let object_ref = ObjectRef::new(current_object, 0);
+                let object_gen = QpdfObjGen::new(current_object, 0);
                 let mut seen = BTreeSet::new();
                 if !computed.part8_objects.is_empty() {
-                    let computed_offset = linearization_offset(&xref, object_ref, &mut seen)?;
+                    if !xref.contains_key(&object_gen) {
+                        return Err(LinearizationCheckError::InvalidParam {
+                            message: "unknown object in shared object hint table".to_owned(),
+                        });
+                    }
+                    let computed_offset = linearization_offset(&xref, object_gen, &mut seen)?;
                     let hint_offset =
                         adjusted_hint_offset(shared_hints.first_shared_offset, h_offset, h_length);
                     if computed_offset != hint_offset {
@@ -799,20 +836,15 @@ fn check_hint_tables<R: Read + Seek>(
                     message: format!("shared object hint table is missing entry {index}"),
                 }
             })?;
-            let nobjects = entry.nobjects_minus_one.checked_add(1).ok_or_else(|| {
-                LinearizationCheckError::InvalidParam {
-                    message: format!("shared object {index} object count overflows"),
-                }
-            })?;
-            let nobjects_u32 =
-                u32::try_from(nobjects).map_err(|_| LinearizationCheckError::InvalidParam {
-                    message: format!("shared object {index} object count does not fit in u32"),
-                })?;
+            let nobjects = qpdf_shared_object_count(entry.nobjects_minus_one);
+            // qpdf's `for (int i = 0; i < n; ++i)` contributes no object
+            // extents when a malformed hint decodes to a non-positive count.
+            let nobjects_for_length = u64::try_from(nobjects).unwrap_or(0);
             let computed_length = length_next_n(
                 pdf,
                 &xref,
                 current_object,
-                nobjects,
+                nobjects_for_length,
                 file_len,
                 collect_soft_warnings,
                 warnings,
@@ -829,9 +861,9 @@ fn check_hint_tables<R: Read + Seek>(
                 )?;
             }
             shared_idx_to_obj.insert(index as u64, current_object);
-            current_object = current_object.checked_add(nobjects_u32).ok_or_else(|| {
+            current_object = current_object.checked_add(nobjects).ok_or_else(|| {
                 LinearizationCheckError::InvalidParam {
-                    message: format!("shared object {index} sequence overflows u32"),
+                    message: format!("shared object {index} sequence overflows qpdf int"),
                 }
             })?;
         }
@@ -878,7 +910,7 @@ fn check_hint_tables<R: Read + Seek>(
             )?; // cov:ignore: llvm maps this length-call cleanup to the page-length comparison
         }
 
-        let first_object = pages[page_number].number;
+        let first_object = pages[page_number].get_obj();
         let computed_length = length_next_n(
             pdf,
             &xref,
@@ -913,9 +945,9 @@ fn check_hint_tables<R: Read + Seek>(
             };
             hint_shared.insert(*object_number);
         }
-        let computed_shared: BTreeSet<u32> = computed.page_shared_objects[page_number]
+        let computed_shared: BTreeSet<i32> = computed.page_shared_objects[page_number]
             .iter()
-            .map(|object_ref| object_ref.number)
+            .map(|object_gen| object_gen.get_obj())
             .collect();
 
         if page_number == 0 && entry.nshared_objects > 0 {
@@ -963,13 +995,18 @@ fn check_hint_tables<R: Read + Seek>(
                 });
             };
             // cov:ignore-end
-            if u64::from(computed_outline_root.number) == outline_hint.first_object {
+            if u64::try_from(computed_outline_root.get_obj()).ok()
+                == Some(outline_hint.first_object)
+            {
                 let mut seen = BTreeSet::new();
                 let computed_offset =
                     linearization_offset(&xref, computed_outline_root, &mut seen)?;
                 let mut max_end = 0_i64;
-                for object_ref in computed.optimization.objects_for_root_key(b"Outlines") {
-                    let object = pdf.get_object_handle(object_ref);
+                for object_gen in computed.optimization.raw_objects_for_root_key(b"Outlines") {
+                    let object = pdf.get_object_handle_by_raw_identity(
+                        object_gen.get_obj(),
+                        object_gen.get_gen(),
+                    );
                     object
                         .try_dereference()
                         .map_err(LinearizationCheckError::from)?;
@@ -1462,13 +1499,13 @@ fn check_linearization_inner<R: Read + Seek>(
     // (`QPDF_linearization.cc:539-835`). Keep malformed bitstreams as hard
     // errors, while routing structural mismatches through the same soft-warning
     // channel used by qpdf's `linearizationWarning`.
-    // Hint-table validation still consumes the explicit valid-reference
-    // projection. The page-count and `/O` checks above use the raw qpdf page
-    // handles, so an unprojectable generation is not lost at enumeration.
-    let page_refs = crate::pages::page_refs(pdf).map_err(LinearizationCheckError::from)?;
+    // qpdf passes the same raw page handles from getAllPages() into both
+    // checkHSharedObject and checkHPageOffset (`QPDF_linearization.cc:529-534`);
+    // these consumers identify page xref entries by the full QPDFObjGen.
+    let page_objgens: Vec<QpdfObjGen> = pages.iter().map(ObjectHandle::get_obj_gen).collect();
     check_hint_tables(
         pdf,
-        &page_refs,
+        &page_objgens,
         HintTableCheckInput {
             page_hints: &page_hints,
             shared_hints: &shared_hints,
@@ -1868,12 +1905,78 @@ pub fn check_linearization_path(
 #[cfg(test)]
 mod tests {
     use super::{
-        check_linearization_warnings, length_next_n, load_hint_stream_with_damage,
+        check_hint_tables, check_hint_tables_with_computed_data, check_linearization_warnings,
+        compute_hint_data, length_next_n, load_hint_stream_with_damage, HintTableCheckInput,
         LinearizationCheckError,
     };
-    use crate::Pdf;
-    use std::collections::BTreeMap;
+    use crate::linearization::show::{HPageOffset, HSharedObject};
+    use crate::object_handle::ObjectValue;
+    use crate::{ObjectHandle, PageDocumentHelper, PageInput, Pdf, QpdfObjGen, XrefEntry};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::io::Cursor;
+
+    struct LinearizedTwoPageInputs {
+        file_bytes: Vec<u8>,
+        pdf: Pdf<Cursor<Vec<u8>>>,
+        pages: Vec<QpdfObjGen>,
+        page_hints: HPageOffset,
+        shared_hints: HSharedObject,
+    }
+
+    fn linearized_two_page_inputs() -> LinearizedTwoPageInputs {
+        let file_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/linearized-two-page.pdf"
+        ))
+        .to_vec();
+        let mut pdf = Pdf::open(Cursor::new(file_bytes.clone())).expect("fixture should open");
+        let (hint_dict, hint_bytes) =
+            super::load_hint_stream(&mut pdf, &file_bytes, 601, 128).expect("hint stream loads");
+        let (shared_offset, outline_offset) =
+            crate::linearization::show::read_hint_offsets(&hint_dict).expect("hint offsets decode");
+        let page_hints =
+            crate::linearization::show::read_h_page_offset(&hint_bytes[..shared_offset], 2)
+                .expect("page hints decode");
+        let shared_end = outline_offset.unwrap_or(hint_bytes.len());
+        let shared_hints = crate::linearization::show::read_h_shared_object(
+            &hint_bytes[shared_offset..shared_end],
+        )
+        .expect("shared hints decode");
+        let pages = {
+            let mut helper = PageDocumentHelper::new(&mut pdf);
+            helper
+                .get_all_pages()
+                .expect("enumerate pages")
+                .iter()
+                .map(ObjectHandle::get_obj_gen)
+                .collect()
+        };
+        LinearizedTwoPageInputs {
+            file_bytes,
+            pdf,
+            pages,
+            page_hints,
+            shared_hints,
+        }
+    }
+
+    fn fixture_hint_input<'a>(
+        file_bytes: &'a [u8],
+        page_hints: &'a HPageOffset,
+        shared_hints: &'a HSharedObject,
+        warnings: &'a mut Vec<String>,
+    ) -> HintTableCheckInput<'a> {
+        HintTableCheckInput {
+            page_hints,
+            shared_hints,
+            outline_hints: None,
+            h_offset: 601,
+            h_length: 128,
+            file_len: file_bytes.len() as u64,
+            collect_soft_warnings: true,
+            warnings,
+        }
+    }
 
     #[test]
     fn qpdf_exception_conversion_preserves_structured_display() {
@@ -1907,7 +2010,7 @@ mod tests {
         let error = length_next_n(
             &mut pdf,
             &BTreeMap::new(),
-            u32::MAX - 1,
+            i32::MAX - 1,
             3,
             3,
             true,
@@ -1918,13 +2021,311 @@ mod tests {
         assert!(matches!(
             error,
             LinearizationCheckError::InvalidParam { message }
-                if message == "object sequence starting at 4294967294 overflows u32"
+                if message == "object sequence starting at 2147483646 overflows qpdf int"
         ));
         assert_eq!(
             warnings.len(),
             2,
             "the two missing entries precede the wrap"
         );
+    }
+
+    #[test]
+    fn shared_hint_values_use_qpdf_signed_int_conversion() {
+        assert_eq!(super::qpdf_hint_i32(0x7fff_ffff), i32::MAX);
+        assert_eq!(super::qpdf_hint_i32(0x8000_0000), i32::MIN);
+        assert_eq!(super::qpdf_hint_i32(u64::from(u32::MAX)), -1);
+        assert_eq!(super::qpdf_hint_i32(0xffff), 65_535);
+        assert_eq!(super::qpdf_shared_object_count(u64::from(u32::MAX)), 0);
+        assert!(super::qpdf_shared_object_count(0x8000_0000) < 0);
+    }
+
+    #[test]
+    fn linearization_offset_follows_raw_object_streams_and_detects_cycles() {
+        let object = QpdfObjGen::new(1, 0);
+        let stream = QpdfObjGen::new(2, 0);
+        let xref = BTreeMap::from([
+            (
+                object,
+                XrefEntry::Compressed {
+                    stream: 2,
+                    index: 0,
+                },
+            ),
+            (stream, XrefEntry::Uncompressed { offset: 42 }),
+        ]);
+        assert_eq!(
+            super::linearization_offset(&xref, object, &mut BTreeSet::new())
+                .expect("follow the compressed entry to its object stream"),
+            42
+        );
+
+        let cycle = BTreeMap::from([
+            (
+                object,
+                XrefEntry::Compressed {
+                    stream: 2,
+                    index: 0,
+                },
+            ),
+            (
+                stream,
+                XrefEntry::Compressed {
+                    stream: 1,
+                    index: 0,
+                },
+            ),
+        ]);
+        let error = super::linearization_offset(&cycle, object, &mut BTreeSet::new())
+            .expect_err("a cyclic object-stream chain must terminate");
+        assert!(matches!(
+            error,
+            LinearizationCheckError::InvalidParam { message }
+                if message == "xref object-stream chain cycles at 1 0"
+        ));
+    }
+
+    #[test]
+    fn length_next_n_rejects_a_hint_count_larger_than_the_file_bound() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let mut warnings = Vec::new();
+        let error = length_next_n(&mut pdf, &BTreeMap::new(), 1, 1, 0, true, &mut warnings)
+            .expect_err("a positive object count cannot fit a zero-length input");
+        assert!(matches!(
+            error,
+            LinearizationCheckError::InvalidParam { message }
+                if message == "hint table object count 1 exceeds bound 0"
+        ));
+    }
+
+    #[test]
+    fn check_linearization_accepts_the_two_page_hint_fixture_cleanly() {
+        let file_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/linearized-two-page.pdf"
+        ));
+        let mut pdf = Pdf::open(Cursor::new(file_bytes.to_vec())).expect("fixture should open");
+        let warnings = check_linearization_warnings(&mut pdf, file_bytes, false)
+            .expect("the two-page fixture should pass all hint checks");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn check_hint_tables_warns_when_shared_total_is_below_first_page_count() {
+        let LinearizedTwoPageInputs {
+            file_bytes,
+            mut pdf,
+            pages,
+            mut page_hints,
+            mut shared_hints,
+        } = linearized_two_page_inputs();
+        shared_hints.nshared_total = 0;
+        for entry in &mut page_hints.entries {
+            entry.nshared_objects = 0;
+            entry.shared_identifiers.clear();
+            entry.shared_numerators.clear();
+        }
+
+        let mut warnings = Vec::new();
+        check_hint_tables(
+            &mut pdf,
+            &pages,
+            fixture_hint_input(&file_bytes, &page_hints, &shared_hints, &mut warnings),
+        )
+        .expect("the malformed count is a soft qpdf warning");
+        assert_eq!(
+            warnings[0],
+            "shared object hint table: ntotal < nfirst_page"
+        );
+    }
+
+    #[test]
+    fn check_hint_tables_warns_for_a_mismatched_first_shared_object_number() {
+        let LinearizedTwoPageInputs {
+            file_bytes,
+            mut pdf,
+            pages,
+            mut page_hints,
+            mut shared_hints,
+        } = linearized_two_page_inputs();
+        let mut computed = compute_hint_data(&mut pdf, &pages).expect("compute page users");
+        // Exercise the Part-8 verifier boundary with an object that has a real
+        // raw xref row; the production classifier is covered separately.
+        computed.part8_objects = vec![pages[1]];
+        for entry in &mut page_hints.entries {
+            entry.nshared_objects = 0;
+            entry.shared_identifiers.clear();
+            entry.shared_numerators.clear();
+        }
+        shared_hints.nshared_first_page = 0;
+        shared_hints.nshared_total = 1;
+        shared_hints.first_shared_obj = u64::try_from(pages[0].get_obj()).unwrap();
+        shared_hints.entries.truncate(1);
+
+        let mut warnings = Vec::new();
+        check_hint_tables_with_computed_data(
+            &mut pdf,
+            &pages,
+            computed,
+            fixture_hint_input(&file_bytes, &page_hints, &shared_hints, &mut warnings),
+        )
+        .expect("a wrong shared object number is a soft qpdf warning");
+        assert!(warnings.iter().any(|warning| {
+            warning == "first shared object number mismatch: hint table = 8; computed = 1"
+        }));
+    }
+
+    #[test]
+    fn check_hint_tables_casts_high_bit_shared_object_number_like_qpdf() {
+        let LinearizedTwoPageInputs {
+            file_bytes,
+            mut pdf,
+            pages,
+            mut page_hints,
+            mut shared_hints,
+        } = linearized_two_page_inputs();
+        let mut computed = compute_hint_data(&mut pdf, &pages).expect("compute page users");
+        computed.part8_objects = vec![pages[1]];
+        for entry in &mut page_hints.entries {
+            entry.nshared_objects = 0;
+            entry.shared_identifiers.clear();
+            entry.shared_numerators.clear();
+        }
+        shared_hints.nshared_first_page = 0;
+        shared_hints.nshared_total = 1;
+        shared_hints.first_shared_obj = u64::from(u32::MAX);
+        shared_hints.entries.truncate(1);
+
+        let mut warnings = Vec::new();
+        let error = check_hint_tables_with_computed_data(
+            &mut pdf,
+            &pages,
+            computed,
+            fixture_hint_input(&file_bytes, &page_hints, &shared_hints, &mut warnings),
+        )
+        .expect_err("qpdf treats an unknown first shared object as a hard error");
+        assert!(matches!(
+            error,
+            LinearizationCheckError::InvalidParam { message }
+                if message == "unknown object in shared object hint table"
+        ));
+        assert!(warnings.iter().any(|warning| {
+            warning == "first shared object number mismatch: hint table = -1; computed = 1"
+        }));
+    }
+
+    #[test]
+    fn check_hint_tables_treats_negative_shared_group_count_as_empty_like_qpdf() {
+        let LinearizedTwoPageInputs {
+            file_bytes,
+            mut pdf,
+            pages,
+            mut page_hints,
+            mut shared_hints,
+        } = linearized_two_page_inputs();
+        for entry in &mut page_hints.entries {
+            entry.nshared_objects = 0;
+            entry.shared_identifiers.clear();
+            entry.shared_numerators.clear();
+        }
+        shared_hints.nshared_first_page = 1;
+        shared_hints.nshared_total = 1;
+        shared_hints.entries.truncate(1);
+        shared_hints.entries[0].nobjects_minus_one = 0x8000_0000;
+
+        let mut warnings = Vec::new();
+        check_hint_tables(
+            &mut pdf,
+            &pages,
+            fixture_hint_input(&file_bytes, &page_hints, &shared_hints, &mut warnings),
+        )
+        .expect("a negative malformed count contributes no object extents");
+        assert!(
+            warnings.iter().any(|warning| {
+                warning == "shared object 0 length mismatch: hint table = 190; computed = 0"
+            }),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn check_hint_tables_rejects_shared_object_sequence_integer_overflow() {
+        let LinearizedTwoPageInputs {
+            file_bytes,
+            mut pdf,
+            pages,
+            page_hints,
+            mut shared_hints,
+        } = linearized_two_page_inputs();
+        let mut computed = compute_hint_data(&mut pdf, &pages).expect("compute page users");
+        computed.part8_objects.clear();
+        shared_hints.nshared_total = shared_hints.nshared_first_page + 1;
+        shared_hints.first_shared_obj = i32::MAX as u32 as u64;
+        shared_hints.entries.push(Default::default());
+
+        let mut warnings = Vec::new();
+        let error = check_hint_tables_with_computed_data(
+            &mut pdf,
+            &pages,
+            computed,
+            fixture_hint_input(&file_bytes, &page_hints, &shared_hints, &mut warnings),
+        )
+        .expect_err("the last object number cannot wrap the signed qpdf identity");
+        assert!(matches!(
+            error,
+            LinearizationCheckError::InvalidParam { message }
+                if message == "shared object 4 sequence overflows qpdf int"
+        ));
+    }
+
+    #[test]
+    fn check_hint_tables_reports_a_page_shared_identifier_missing_from_shared_table() {
+        let LinearizedTwoPageInputs {
+            file_bytes,
+            mut pdf,
+            pages,
+            page_hints,
+            mut shared_hints,
+        } = linearized_two_page_inputs();
+        shared_hints.nshared_total = 0;
+        shared_hints.nshared_first_page = 0;
+        shared_hints.entries.clear();
+
+        let mut warnings = Vec::new();
+        let error = check_hint_tables(
+            &mut pdf,
+            &pages,
+            fixture_hint_input(&file_bytes, &page_hints, &shared_hints, &mut warnings),
+        )
+        .expect_err("page hint identifiers must resolve through the shared table");
+        assert!(matches!(
+            error,
+            LinearizationCheckError::InvalidParam { message }
+                if message == "unable to get object for item 2 in shared objects hint table"
+        ));
+    }
+
+    #[test]
+    fn check_hint_tables_warns_for_page_object_count_mismatch() {
+        let LinearizedTwoPageInputs {
+            file_bytes,
+            mut pdf,
+            pages,
+            mut page_hints,
+            shared_hints,
+        } = linearized_two_page_inputs();
+        page_hints.min_nobjects += 1;
+
+        let mut warnings = Vec::new();
+        check_hint_tables(
+            &mut pdf,
+            &pages,
+            fixture_hint_input(&file_bytes, &page_hints, &shared_hints, &mut warnings),
+        )
+        .expect("page object-count mismatches are soft qpdf warnings");
+        assert!(warnings.iter().any(|warning| {
+            warning.starts_with("object count mismatch for page 0: hint table = 5;")
+        }));
     }
 
     #[test]
@@ -2041,5 +2442,136 @@ mod tests {
 
         super::check_linearization_bytes(&bytes)
             .expect("the checker should load and merge a four-item /H fixture");
+    }
+
+    #[test]
+    fn check_linearization_keeps_raw_page_identity_through_hint_validation() {
+        let file_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/linearized-one-page.pdf"
+        ));
+        let mut pdf = Pdf::open(Cursor::new(file_bytes.to_vec())).expect("fixture should open");
+        let catalog = pdf.root_handle().expect("fixture has a Catalog");
+        let pages = catalog
+            .try_get_key(b"/Pages")
+            .expect("Catalog has a /Pages entry");
+        let kids = pages.try_get_key(b"/Kids").expect("page tree has /Kids");
+        let original_page = kids
+            .try_get_array_item(0)
+            .expect("page tree child resolves");
+        let object_number = original_page.get_obj_gen().get_obj();
+        original_page
+            .try_dereference()
+            .expect("first page resolves to its dictionary");
+        let page_dictionary = original_page
+            .as_dictionary()
+            .expect("first page is a dictionary");
+
+        let raw_page = pdf.get_object_handle_by_raw_identity(object_number, 65_535);
+        raw_page.set_resolved(ObjectValue::Dictionary(page_dictionary));
+        pages
+            .replace_key(b"/Kids", ObjectHandle::array(vec![raw_page]))
+            .expect("replace the first page with its raw-generation identity");
+
+        let error = check_linearization_warnings(&mut pdf, file_bytes, false)
+            .expect_err("qpdf's missing raw xref row is a linearization warning");
+        assert!(
+            matches!(
+                &error,
+                LinearizationCheckError::InvalidParam { message }
+                    if message == "getLinearizationOffset called for xref entry not of type 1 or 2"
+            ),
+            "expected qpdf's raw xref failure boundary; got {error:?}"
+        );
+    }
+
+    #[test]
+    fn check_linearization_warns_for_replaced_page_without_source_extent_like_qpdf() {
+        let file_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/linearized-one-page.pdf"
+        ));
+        let mut pdf = Pdf::open(Cursor::new(file_bytes.to_vec())).expect("fixture should open");
+        let catalog = pdf.root_handle().expect("fixture has a Catalog");
+        let pages = catalog
+            .try_get_key(b"/Pages")
+            .expect("Catalog has a /Pages entry");
+        let kids = pages.try_get_key(b"/Kids").expect("page tree has /Kids");
+        let page = kids
+            .try_get_array_item(0)
+            .expect("page tree child resolves");
+        let page_ref = page
+            .object_ref()
+            .expect("fixture page has a valid reference");
+        page.try_dereference()
+            .expect("first page resolves to its dictionary");
+        let page_dictionary = page.as_dictionary().expect("first page is a dictionary");
+        pdf.replace_object(
+            page_ref,
+            ObjectHandle::dictionary(page_dictionary.into_iter().collect()),
+        )
+        .expect("replace the page as qpdf replaceObject does");
+
+        let warnings = check_linearization_warnings(&mut pdf, file_bytes, false)
+            .expect("qpdf warns about hint lengths for an in-memory replaced page");
+        assert_eq!(
+            warnings,
+            [
+                "shared object 0 length mismatch: hint table = 189; computed = -720",
+                "page length mismatch for page 0: hint table = 479; computed length = -430 (offset = 719)",
+            ]
+        );
+    }
+
+    #[test]
+    fn compute_hint_data_keeps_objects_shared_by_later_pages_as_raw_identities() {
+        fn page(resources: ObjectHandle) -> ObjectHandle {
+            ObjectHandle::dictionary(vec![
+                (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+                (
+                    b"/MediaBox".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(612),
+                        ObjectHandle::integer(792),
+                    ]),
+                ),
+                (b"/Resources".to_vec(), resources),
+            ])
+        }
+
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let shared_resources = pdf
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![]))
+            .expect("install shared resources");
+        let pages = {
+            let mut helper = PageDocumentHelper::new(&mut pdf);
+            helper
+                .add_page(
+                    PageInput::target(page(ObjectHandle::dictionary(vec![]))),
+                    false,
+                )
+                .expect("add first page with private resources");
+            helper
+                .add_page(PageInput::target(page(shared_resources.clone())), false)
+                .expect("add second page with shared resources");
+            helper
+                .add_page(PageInput::target(page(shared_resources.clone())), false)
+                .expect("add third page with shared resources");
+            helper
+                .get_all_pages()
+                .expect("enumerate the three pages")
+                .iter()
+                .map(ObjectHandle::get_obj_gen)
+                .collect::<Vec<_>>()
+        };
+
+        let computed =
+            super::compute_hint_data(&mut pdf, &pages).expect("classify objects by raw page users");
+
+        assert!(computed
+            .part8_objects
+            .contains(&shared_resources.get_obj_gen()));
     }
 }
