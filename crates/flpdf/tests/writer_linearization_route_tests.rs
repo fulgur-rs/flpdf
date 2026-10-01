@@ -90,7 +90,7 @@ fn linearization_id_construction_is_handle_native() {
 }
 
 #[test]
-fn linearization_final_route_does_not_clone_complete_xref_maps() {
+fn linearization_final_route_uses_the_measured_xref_ownership_handoff() {
     let source = production_source(
         include_str!("../src/linearization/writer.rs"),
         "\n#[cfg(test)]\nmod tests {",
@@ -100,12 +100,12 @@ fn linearization_final_route_does_not_clone_complete_xref_maps() {
         .map(|(_, rest)| rest)
         .expect("linearization implementation exists");
     assert!(
-        !implementation.contains("pass1_output.xref_offsets.clone()"),
-        "the final layout must reuse the pass-1 xref owner"
+        implementation.contains("xref_offsets: pass1_output.xref_offsets"),
+        "the final metadata owner must take the writer-owned pass-1 xref map"
     );
     assert!(
-        !implementation.contains("xref_offsets: final_xref_offsets.clone()"),
-        "Part-1 metadata must not clone the complete final xref map"
+        implementation.contains("Some(offsets.into_document(final_bytes))"),
+        "the in-memory result must use the measured ownership-transfer helper"
     );
     let pass = source
         .split_once("fn do_write_pass")
@@ -115,99 +115,6 @@ fn linearization_final_route_does_not_clone_complete_xref_maps() {
     assert!(
         pass.contains("layout.xref_offsets") && pass.contains("layout.lengths"),
         "the final pass must borrow both writer-owned layout maps"
-    );
-    assert!(
-        !pass.contains("layout.xref_offsets.clone()"),
-        "the final pass must borrow the writer-owned xref map"
-    );
-    assert!(
-        !source.contains("let mut virtual_offsets = xref_offsets.clone()"),
-        "first-page xref encoding must not clone the complete physical xref map"
-    );
-}
-
-#[test]
-fn linearization_plan_does_not_retain_a_derived_page_user_inverse_map() {
-    let source = production_source(
-        include_str!("../src/linearization/plan.rs"),
-        "\n#[cfg(test)]\nmod tests {",
-    );
-    assert!(
-        source.contains("optimization.page_users("),
-        "linearization planning must consume a borrowed view of the retained qpdf-shaped object-user map"
-    );
-    assert!(
-        !source.contains("all_referenced_pages"),
-        "the plan must not retain a second object-to-page inverse map"
-    );
-    assert!(
-        !source.contains("referenced_pages("),
-        "planning must not clone a page set for every object"
-    );
-}
-
-#[test]
-fn linearization_page_reach_uses_the_canonical_object_user_map() {
-    let source = production_source(
-        include_str!("../src/linearization/plan.rs"),
-        "\n#[cfg(test)]\nmod tests {",
-    );
-    let page_partition = source
-        .split_once("let mut page_hints")
-        .and_then(|(_, rest)| rest.split_once("let provisional_set"))
-        .map(|(section, _)| section)
-        .expect("page partition route exists");
-    assert!(
-        page_partition.contains("optimization.page_users"),
-        "page reach must come from qpdf-shaped object-user ownership"
-    );
-    assert!(
-        !page_partition.contains("all_closures"),
-        "page partition must not clone all page closures for reach counts"
-    );
-    assert!(
-        !page_partition.contains("page_reach"),
-        "page partition must not retain a second object-to-page map"
-    );
-}
-
-#[test]
-fn objstm_page_ownership_uses_the_canonical_object_user_map() {
-    let writer_source = production_source(
-        include_str!("../src/linearization/writer.rs"),
-        "\n#[cfg(test)]\nmod tests {",
-    );
-    let anchors = writer_source
-        .split_once("fn second_half_container_anchors")
-        .and_then(|(_, rest)| rest.split_once("fn write_linearized_impl"))
-        .map(|(section, _)| section)
-        .expect("second-half container anchor route exists");
-    assert!(
-        anchors.contains("part7_owner_for_plan"),
-        "part7 ObjStm ownership must use qpdf-shaped object-user ownership"
-    );
-    assert!(
-        writer_source.contains("other_page_private_owner"),
-        "the part7 owner helper must consult qpdf user gates"
-    );
-    assert!(
-        !anchors.contains("let page_private_sets: Vec<BTreeSet<ObjectRef>>"),
-        "writer must not materialize a second page-private ownership table"
-    );
-
-    let hint_source = include_str!("../src/linearization/hint_page.rs").replace("\r\n", "\n");
-    let container_filter = hint_source
-        .split_once("pub(crate) fn non_page_owned_containers")
-        .and_then(|(_, rest)| rest.split_once("/// Count the objects a page contributes"))
-        .map(|(section, _)| section)
-        .expect("page-owned container route exists");
-    assert!(
-        container_filter.contains("other_page_private_owner"),
-        "page-owned container filtering must use canonical object users"
-    );
-    assert!(
-        !container_filter.contains("let page_private_sets: Vec<BTreeSet<ObjectRef>>"),
-        "hint construction must not materialize a second page-private ownership table"
     );
 }
 

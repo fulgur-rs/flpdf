@@ -636,6 +636,16 @@ pub struct LinearizedDocument {
     pub offsets: LinearizedOffsets,
 }
 
+impl LinearizedOffsets {
+    /// Transfer the writer-owned metadata map into its in-memory document.
+    fn into_document(self, bytes: Vec<u8>) -> LinearizedDocument {
+        LinearizedDocument {
+            bytes,
+            offsets: self,
+        }
+    }
+}
+
 /// Result shared by the memory-backed inspection helper and the canonical
 /// sink-backed writer route. The latter deliberately does not retain a
 /// document-sized byte vector after it has reached the configured sink.
@@ -5055,10 +5065,7 @@ fn write_linearized_impl<R: Read + Seek>(
     let document = if streaming_output {
         None
     } else {
-        Some(LinearizedDocument {
-            bytes: final_bytes,
-            offsets: offsets.clone(),
-        })
+        Some(offsets.into_document(final_bytes))
     };
     Ok(LinearizedWriteResult {
         document,
@@ -6294,6 +6301,131 @@ mod tests {
                 (b"/Direct".to_vec(), b"<< /Name /Value >>".to_vec()),
                 (b"/Indirect".to_vec(), b"21 0 R".to_vec()),
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(unsafe_code)]
+mod xref_map_handoff_allocation_tests {
+    use super::{LinearizedOffsets, Part1Placeholders};
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+
+    std::thread_local! {
+        static TRACK_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+        static ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    struct AllocationCounter;
+
+    fn record_allocation() {
+        let _ = TRACK_ALLOCATIONS.try_with(|tracking| {
+            if tracking.get() {
+                ALLOCATION_COUNT.with(|count| count.set(count.get() + 1));
+            }
+        });
+    }
+
+    unsafe impl GlobalAlloc for AllocationCounter {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc(layout) };
+            if !pointer.is_null() {
+                record_allocation();
+            }
+            pointer
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc_zeroed(layout) };
+            if !pointer.is_null() {
+                record_allocation();
+            }
+            pointer
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            let pointer = unsafe { System.realloc(pointer, layout, size) };
+            if !pointer.is_null() {
+                record_allocation();
+            }
+            pointer
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(pointer, layout) };
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: AllocationCounter = AllocationCounter;
+
+    fn start_measurement() {
+        ALLOCATION_COUNT.with(|count| count.set(0));
+        TRACK_ALLOCATIONS.with(|tracking| tracking.set(true));
+    }
+
+    fn finish_measurement() -> usize {
+        TRACK_ALLOCATIONS.with(|tracking| tracking.set(false));
+        ALLOCATION_COUNT.with(Cell::get)
+    }
+
+    #[test]
+    fn allocation_counter_observes_an_allocation_during_the_window() {
+        start_measurement();
+        let mut bytes = Vec::with_capacity(64);
+        bytes.push(1);
+        std::hint::black_box(&bytes);
+        let allocations = finish_measurement();
+        assert!(
+            allocations > 0,
+            "the measurement window must count allocations"
+        );
+    }
+
+    fn offsets_with_xref_map(xref_offsets: BTreeMap<u32, usize>) -> LinearizedOffsets {
+        let empty_range = 0..0;
+        LinearizedOffsets {
+            file_length: 0,
+            hint_stream_offset: 0,
+            hint_stream_length: 0,
+            first_page_object_new_num: 2,
+            end_of_first_page_offset: 0,
+            last_xref_keyword_offset: 0,
+            last_xref_offset: 0,
+            page_count: 0,
+            part1_placeholders: Part1Placeholders {
+                l: empty_range.clone(),
+                h_offset: empty_range.clone(),
+                h_length: empty_range.clone(),
+                o: empty_range.clone(),
+                e: empty_range.clone(),
+                t: empty_range.clone(),
+                n: empty_range,
+            },
+            xref_offsets,
+            first_trailer_prev_range: 0..0,
+            dict_writable_region: 0..0,
+        }
+    }
+
+    #[test]
+    fn linearized_document_takes_the_xref_map_without_cloning_it() {
+        let xref_offsets = (0..4096)
+            .map(|number| (number, number as usize * 16))
+            .collect();
+        let offsets = offsets_with_xref_map(xref_offsets);
+
+        start_measurement();
+        let document = offsets.into_document(Vec::new());
+        std::hint::black_box(&document);
+        let allocations = finish_measurement();
+
+        assert_eq!(document.offsets.xref_offsets.len(), 4096);
+        assert_eq!(
+            allocations, 0,
+            "document construction must move xref offsets"
         );
     }
 }
