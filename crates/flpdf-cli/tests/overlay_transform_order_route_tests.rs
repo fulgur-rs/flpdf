@@ -233,6 +233,40 @@ fn pages_subcommands_use_job_run() {
 }
 
 #[test]
+fn show_encryption_subcommand_uses_job_run() {
+    let source = production_main_source();
+    let route = source
+        .split_once("fn run_show_encryption(")
+        .and_then(|(_, tail)| tail.split_once("fn hex_lower("))
+        .map(|(body, _)| body)
+        .expect("show-encryption subcommand route");
+
+    assert!(
+        route.contains("configuration.show_encryption()"),
+        "show-encryption must configure the canonical Job flag"
+    );
+    assert!(
+        route.contains("job.set_input_file("),
+        "show-encryption input must be owned by QPDFJob"
+    );
+    assert!(
+        route.contains("job.run()"),
+        "show-encryption must use QPDFJob::run"
+    );
+    for forbidden in [
+        "job.show_encryption(",
+        "job.complete_report(",
+        "finish_show_encryption(",
+        "open_for_encryption_inspection_with_description(",
+    ] {
+        assert!(
+            !route.contains(forbidden),
+            "show-encryption subcommand retains a direct route: {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn page_selection_overlay_uses_the_canonical_job_owner() {
     let source = production_main_source();
     let after_plan = source

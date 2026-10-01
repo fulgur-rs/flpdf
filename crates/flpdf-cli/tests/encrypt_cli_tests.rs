@@ -133,6 +133,33 @@ fn ensure_qpdf_or_skip() -> bool {
     false
 }
 
+fn assert_cli_output_matches_qpdf(
+    label: &str,
+    flpdf: &std::process::Output,
+    qpdf: &std::process::Output,
+) {
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "{label}: exit status differs"
+    );
+    if cfg!(windows) {
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stdout),
+            normalize_text_newlines(&qpdf.stdout),
+            "{label}: stdout differs"
+        );
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stderr),
+            normalize_text_newlines(&qpdf.stderr),
+            "{label}: stderr differs"
+        );
+    } else {
+        assert_eq!(flpdf.stdout, qpdf.stdout, "{label}: stdout differs");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "{label}: stderr differs");
+    }
+}
+
 fn assert_unencrypted_output(output: &Path) {
     let show = ShellCommand::new("qpdf")
         .arg("--show-encryption")
@@ -649,6 +676,86 @@ fn encrypt_v5_r6_aes256_flpdf_show_encryption_reports_scheme() {
         assert_eq!(show.get_output().stdout, qpdf.stdout);
         assert_eq!(show.get_output().stderr, qpdf.stderr);
     }
+}
+
+#[test]
+fn show_encryption_subcommand_wrong_password_matches_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let input = fixture("../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf");
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-encryption", "--password=wrong"])
+        .arg(&input)
+        .output()
+        .expect("run qpdf --show-encryption with a wrong password");
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["show-encryption", "--password=wrong"])
+        .arg(&input)
+        .output()
+        .expect("run flpdf show-encryption with a wrong password");
+
+    assert_cli_output_matches_qpdf("show-encryption wrong password", &flpdf, &qpdf);
+}
+
+#[test]
+fn show_encryption_subcommand_repair_warnings_match_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let input = fixture("../../tests/fixtures/test_driver/repairable_input.pdf");
+
+    let qpdf = ShellCommand::new("qpdf")
+        .arg("--show-encryption")
+        .arg(&input)
+        .output()
+        .expect("run qpdf --show-encryption on a repairable input");
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg("show-encryption")
+        .arg(&input)
+        .output()
+        .expect("run flpdf show-encryption on a repairable input");
+
+    assert_eq!(
+        qpdf.status.code(),
+        Some(3),
+        "qpdf warning report should retain its warning exit"
+    );
+    assert_cli_output_matches_qpdf("show-encryption repair warnings", &flpdf, &qpdf);
+}
+
+#[test]
+fn show_encryption_subcommand_password_file_matches_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let input = fixture("../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf");
+    let temporary = tempfile::tempdir().unwrap();
+    let password_file = temporary.path().join("password.txt");
+    std::fs::write(&password_file, b"user-v2\n").unwrap();
+    let password_file_option = format!("--password-file={}", password_file.display());
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-encryption"])
+        .arg(&password_file_option)
+        .arg(&input)
+        .output()
+        .expect("run qpdf --show-encryption with a password file");
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg("show-encryption")
+        .arg(&password_file_option)
+        .arg(&input)
+        .output()
+        .expect("run flpdf show-encryption with a password file");
+
+    assert_cli_output_matches_qpdf("show-encryption password file", &flpdf, &qpdf);
 }
 
 /// The qtest shim forwards qpdf's option-shaped inspection command unchanged.

@@ -416,19 +416,6 @@ fn image_optimization_options(
     Ok(options)
 }
 
-/// Apply qpdf's canonical create-stage transformations before a top-level
-/// inspection or attachment consumer. The job owns the ordering: image
-/// transforms run before `generateAppearancesIfNeeded`, matching
-/// `QPDFJob::handleTransformations` (`QPDFJob.cc:2138-2194`).
-fn apply_inspection_transformations<R: Read + Seek + 'static>(
-    job: &mut QPDFJob,
-    pdf: &mut Pdf<R>,
-    options: InspectionTransformOptions<'_>,
-    verbose: bool,
-) -> CliResult<()> {
-    apply_top_level_inspection_transformations(job, pdf, options, verbose, false, false)
-}
-
 /// Report donor authentication failures at the CLI boundary while preserving
 /// the typed error returned by the library's public job API. qpdf's copy
 /// attachment loop lets the donor `processFile` exception escape
@@ -451,29 +438,6 @@ fn apply_transformations_for_cli<R: Read + Seek + 'static>(
         }
         Err(error) => Err(Box::new(error)),
     }
-}
-
-/// Apply every create-stage transformation that can accompany a top-level
-/// inspection. qpdf performs these mutations before `doInspection`, even
-/// though the inspection branch creates no output (`QPDFJob.cc:459-489,
-/// 2138-2248`).
-fn apply_top_level_inspection_transformations<R: Read + Seek + 'static>(
-    job: &mut QPDFJob,
-    pdf: &mut Pdf<R>,
-    options: InspectionTransformOptions<'_>,
-    verbose: bool,
-    remove_restrictions: bool,
-    coalesce_contents: bool,
-) -> CliResult<()> {
-    configure_top_level_inspection_transformations(
-        job,
-        options,
-        verbose,
-        remove_restrictions,
-        coalesce_contents,
-    )?;
-    apply_transformations_for_cli(job, pdf)?;
-    Ok(())
 }
 
 /// Configure the create-stage transformations that qpdf applies before a
@@ -4626,16 +4590,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             // own (the dedicated `show-encryption-key` subcommand covers that
             // need); only the qpdf-argv-compatible top-level `--show-encryption`
             // flag combines with `--show-encryption-key`.
-            run_show_encryption(
-                Some(cmd.input),
-                cmd.repair,
-                &cmd.password,
-                false,
-                false,
-                false,
-                InspectionTransformOptions::new(ImageTransformOptions::default(), false, None),
-                false,
-            )
+            run_show_encryption(cmd.input, cmd.repair, &cmd.password)
         }
         Commands::IsEncrypted(cmd) => {
             let password = PasswordArgs {
@@ -8814,84 +8769,23 @@ fn run_show_encryption_key(
     }
 }
 
-/// `flpdf show-encryption FILE`: the flpdf-native subcommand form. No qpdf
-/// argv counterpart, so it keeps its own standalone document-open/report
-/// sequence rather than routing through [`run_combined_top_level_inspection`].
-///
-/// Opens through its own job (rather than the shared
-/// [`open_pdf_for_inspection`] helper) so `--no-warn` reaches
-/// `QPDFJob::set_suppress_warnings`, matching `run_check`/
-/// `run_check_linearization`'s pattern.
-#[allow(clippy::too_many_arguments)]
-fn run_show_encryption(
-    input: Option<PathBuf>,
-    repair: bool,
-    password: &PasswordArgs,
-    no_warn: bool,
-    show_encryption_key: bool,
-    empty: bool,
-    transform_options: InspectionTransformOptions<'_>,
-    verbose: bool,
-) -> CliResult<()> {
-    if empty {
-        reject_empty_inspection_output(input.as_deref())?;
-        let mut job = new_cli_job(no_warn);
-        job.set_show_encryption_key(show_encryption_key);
-        let mut pdf = create_empty_primary_document(&mut job, None)?;
-        apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-        return finish_show_encryption(&mut job, &mut pdf, password.password_is_hex_key);
+/// `flpdf show-encryption FILE`: the flpdf-native spelling for qpdf's
+/// `--show-encryption` inspection, dispatched through the configured Job.
+fn run_show_encryption(input: PathBuf, repair: bool, password: &PasswordArgs) -> CliResult<()> {
+    let mut job = new_cli_job(false);
+    {
+        let mut configuration = job.config();
+        configuration.show_encryption();
     }
-    let input = input.ok_or_else(missing_input_usage_error)?;
-    let file = File::open(&input).map_err(|error| open_error_with_file(&input, error.into()))?;
-    let mut job = new_cli_job(no_warn);
-    job.set_show_encryption_key(show_encryption_key);
-    let mut options = pdf_open_options(repair, password)?;
-    // qpdf's `--no-warn` drops open-time repair diagnostics entirely for
-    // `--show-encryption` (no deferred replay, unlike `--check`'s report
-    // body); verified against `qpdf --no-warn --show-encryption` on a
-    // damaged fixture, which prints no WARNING lines at all. Without this,
-    // `job.set_suppress_warnings(no_warn)` above only gates the trailing
-    // "operation succeeded with warnings" summary while the live
-    // `WARNING: ...` lines from `Pdf::open_for_encryption_inspection` still
-    // print unconditionally.
-    options.suppress_warnings = no_warn;
-    let mut pdf = job
-        .open_for_encryption_inspection_with_description(
-            BufReader::new(file),
-            path_description(&input),
-            options,
-        )
-        .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
-    // qpdf's password-error catch returns from `createQPDF` before it reaches
-    // `handleTransformations` (`QPDFJob.cc:437-448,473`), so `--show-encryption`
-    // on a file whose password did not authenticate prints the report and stops
-    // -- it never walks the still-encrypted streams. Running the image phase
-    // here instead would raise decode warnings qpdf does not raise and turn the
-    // exit status into 3.
-    if !(pdf.is_encrypted() && pdf.encryption_file_key().is_none()) {
-        apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-    }
-    finish_show_encryption(&mut job, &mut pdf, password.password_is_hex_key)
-}
-
-/// Emit the qpdf-verbatim encryption report through the job-owned renderer,
-/// then complete the same warning/exit-status boundary as other inspections.
-/// The document may have come from either a file-backed input or a JSON update,
-/// so the already-open document must be passed through unchanged. qpdf's
-/// wrong-password `createQPDF` path returns before `writeQPDF` transfers the
-/// partially opened document's warnings to the job, so this path retains their
-/// live output without using them to select the exit code.
-fn finish_show_encryption<R: Read + Seek>(
-    job: &mut QPDFJob,
-    pdf: &mut Pdf<R>,
-    password_is_hex_key: bool,
-) -> CliResult<()> {
-    let authentication_failed = pdf.is_encrypted() && pdf.encryption_file_key().is_none();
-    job.show_encryption(pdf, password_is_hex_key)?;
-    if !authentication_failed {
-        job.record_document_warnings(pdf);
-    }
-    finish_job_exit_status(job.complete_report()?)
+    let input_options = pdf_open_options(repair, password)?;
+    job.set_password(input_options.password);
+    job.set_password_mode(password.password_mode.into());
+    job.set_password_is_hex_key(password.password_is_hex_key);
+    job.set_suppress_password_recovery(password.suppress_password_recovery);
+    job.set_suppress_recovery(password.recovery.suppress_recovery);
+    job.set_ignore_xref_streams(password.recovery.ignore_xref_streams);
+    job.set_input_file(input)?;
+    finish_job_exit_status(job.run()?)
 }
 
 /// Lowercase hex encoding (qpdf `--show-encryption-key` format).
