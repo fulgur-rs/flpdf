@@ -8,8 +8,10 @@
 # per-crate version fields are needed.
 #
 # Version bumps use release-plz's conventional-commit default. At 0.x, SemVer 0.x
-# rules apply: `feat` and `fix` both bump patch, only breaking changes bump minor
-# — so flpdf stays on its 0.1.x cadence until an intentional breaking release.
+# rules apply: `feat` and `fix` both bump patch, only breaking changes bump minor.
+# Contributors must mark published CLI/API removals or incompatible changes with
+# `!` or a `BREAKING CHANGE:` footer; see CONTRIBUTING.md. Historical unmarked
+# removals from 0.1.0 are tracked for the next intentional breaking release.
 
 # A lockstep workspace wants ONE canonical `v{{version}}` tag/release, not
 # release-plz's default per-package tags (flpdf-v* / flpdf-cli-v*), which for a
