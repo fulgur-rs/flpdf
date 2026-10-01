@@ -163,8 +163,8 @@ struct InlineStreamDataProvider<R: Read + Seek + 'static> {
 impl<R: Read + Seek + 'static> StreamDataProvider for InlineStreamDataProvider<R> {
     fn provide_stream_data_by_id(
         &self,
-        _object_number: u32,
-        _generation: u16,
+        _object_number: i32,
+        _generation: i32,
         pipeline: &mut dyn Pipeline,
     ) -> Result<()> {
         let mut decode = PlBase64::new("base64-decode", pipeline, Base64Action::Decode);
@@ -239,8 +239,8 @@ struct DatafileStreamDataProvider {
 impl StreamDataProvider for DatafileStreamDataProvider {
     fn provide_stream_data_by_id(
         &self,
-        _object_number: u32,
-        _generation: u16,
+        _object_number: i32,
+        _generation: i32,
         pipeline: &mut dyn Pipeline,
     ) -> Result<()> {
         let mut file = File::open(&self.filename)

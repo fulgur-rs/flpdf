@@ -114,8 +114,8 @@ mod tests {
 
         fn provide_stream_data_with_retry_by_id(
             &self,
-            _object_number: u32,
-            _generation: u16,
+            _object_number: i32,
+            _generation: i32,
             pipeline: &mut dyn Pipeline,
             suppress_warnings: bool,
             will_retry: bool,
@@ -134,8 +134,8 @@ mod tests {
     impl StreamDataProvider for EventProvider {
         fn provide_stream_data_by_id(
             &self,
-            _object_number: u32,
-            _generation: u16,
+            _object_number: i32,
+            _generation: i32,
             pipeline: &mut dyn Pipeline,
         ) -> crate::Result<()> {
             self.events.record(self.event);
@@ -171,8 +171,8 @@ mod tests {
     impl StreamDataProvider for SegmentFailureProvider {
         fn provide_stream_data_by_id(
             &self,
-            _object_number: u32,
-            _generation: u16,
+            _object_number: i32,
+            _generation: i32,
             pipeline: &mut dyn Pipeline,
         ) -> crate::Result<()> {
             self.events.record("provider:A");

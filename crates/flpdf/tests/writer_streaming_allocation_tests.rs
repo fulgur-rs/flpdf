@@ -130,8 +130,8 @@ struct PayloadProvider {
 impl StreamDataProvider for PayloadProvider {
     fn provide_stream_data_by_id(
         &self,
-        _object_number: u32,
-        _generation: u16,
+        _object_number: i32,
+        _generation: i32,
         pipeline: &mut dyn Pipeline,
     ) -> flpdf::Result<()> {
         if let Some(events) = &self.events {
@@ -149,8 +149,8 @@ struct TerminalFailureProvider {
 impl StreamDataProvider for TerminalFailureProvider {
     fn provide_stream_data_by_id(
         &self,
-        _object_number: u32,
-        _generation: u16,
+        _object_number: i32,
+        _generation: i32,
         _pipeline: &mut dyn Pipeline,
     ) -> flpdf::Result<()> {
         self.events.record("provider:A");
@@ -184,8 +184,8 @@ impl Pipeline for FailingSegmentFinish<'_> {
 impl StreamDataProvider for SegmentFinishFailureProvider {
     fn provide_stream_data_by_id(
         &self,
-        _object_number: u32,
-        _generation: u16,
+        _object_number: i32,
+        _generation: i32,
         pipeline: &mut dyn Pipeline,
     ) -> flpdf::Result<()> {
         self.events.record("provider:A");
@@ -207,8 +207,8 @@ impl StreamDataProvider for RetryOnceProvider {
 
     fn provide_stream_data_with_retry_by_id(
         &self,
-        _object_number: u32,
-        _generation: u16,
+        _object_number: i32,
+        _generation: i32,
         pipeline: &mut dyn Pipeline,
         suppress_warnings: bool,
         will_retry: bool,
@@ -321,8 +321,8 @@ struct ArmOnProvider {
 impl StreamDataProvider for ArmOnProvider {
     fn provide_stream_data_by_id(
         &self,
-        _object_number: u32,
-        _generation: u16,
+        _object_number: i32,
+        _generation: i32,
         pipeline: &mut dyn Pipeline,
     ) -> flpdf::Result<()> {
         self.events.record(format!("provider:{}", self.name));

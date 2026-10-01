@@ -833,8 +833,8 @@ impl<R: Read + Seek + 'static> StreamDataProvider for OriginalStreamDataProvider
 
     fn provide_stream_data_with_retry_by_id(
         &self,
-        _object_number: u32,
-        _generation: u16,
+        _object_number: i32,
+        _generation: i32,
         pipeline: &mut dyn Pipeline,
         suppress_warnings: bool,
         will_retry: bool,
@@ -10270,9 +10270,10 @@ mod tests {
         struct FailingProvider;
 
         impl crate::StreamDataProvider for FailingProvider {
-            fn provide_stream_data(
+            fn provide_stream_data_by_id(
                 &self,
-                _object_ref: ObjectRef,
+                _object_number: i32,
+                _generation: i32,
                 _pipeline: &mut dyn crate::pipeline::Pipeline,
             ) -> crate::Result<()> {
                 Err(Error::System("provider codec failure".to_owned()))

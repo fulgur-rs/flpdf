@@ -345,8 +345,8 @@ impl ImageOptimizer {
 impl StreamDataProvider for ImageOptimizer {
     fn provide_stream_data_by_id(
         &self,
-        _object_number: u32,
-        _generation: u16,
+        _object_number: i32,
+        _generation: i32,
         pipeline: &mut dyn Pipeline,
     ) -> Result<()> {
         let mut encoder = self.encoder(pipeline);

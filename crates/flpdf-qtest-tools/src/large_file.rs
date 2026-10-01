@@ -60,9 +60,10 @@ struct ImageProvider {
 }
 
 impl StreamDataProvider for ImageProvider {
-    fn provide_stream_data(
+    fn provide_stream_data_by_id(
         &self,
-        _object_ref: flpdf::ObjectRef,
+        _object_number: i32,
+        _generation: i32,
         pipeline: &mut dyn Pipeline,
     ) -> flpdf::Result<()> {
         let mut stripe = self.stripe.borrow_mut();

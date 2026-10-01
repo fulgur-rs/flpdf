@@ -244,29 +244,21 @@ const FOREIGN_OBJECT_OWNERSHIP_ERROR: &str =
 /// linearized write.
 ///
 /// Rust uses distinct method names for qpdf's overloaded forms. The
-/// `ObjectRef` methods delegate to the numeric identity methods by default,
-/// matching qpdf's `QPDFObjGen` overload delegation. A provider that supports
-/// the retry-aware form must return `true` from [`Self::supports_retry`].
+/// `QpdfObjGen` methods delegate directly to the signed `i32` identity
+/// callbacks, matching qpdf's overload delegation without narrowing the raw
+/// object/generation pair. A provider that supports the retry-aware form must
+/// return `true` from [`Self::supports_retry`].
 pub trait StreamDataProvider {
     /// Whether the retry-aware success-returning callback should be used.
     fn supports_retry(&self) -> bool {
         false
     }
 
-    /// Legacy provider form receiving the complete stream identity.
-    fn provide_stream_data(
-        &self,
-        object_ref: ObjectRef,
-        pipeline: &mut dyn Pipeline,
-    ) -> Result<()> {
-        self.provide_stream_data_by_id(object_ref.number, object_ref.generation, pipeline)
-    }
-
-    /// Legacy provider form receiving numeric object identity.
+    /// qpdf's `int object_id, int generation` provider overload.
     fn provide_stream_data_by_id(
         &self,
-        _object_number: u32,
-        _generation: u16,
+        _object_number: i32,
+        _generation: i32,
         _pipeline: &mut dyn Pipeline,
     ) -> Result<()> {
         Err(Error::Internal(
@@ -274,46 +266,21 @@ pub trait StreamDataProvider {
         ))
     }
 
-    /// Raw qpdf object/generation form of the provider callback. Existing
-    /// providers that only implement the narrower numeric form retain their
-    /// behavior for projectable identities; providers that need the full qpdf
-    /// range can override this method directly.
+    /// qpdf's raw `QPDFObjGen` overload. Delegates to the signed numeric
+    /// callback like `StreamDataProvider::provideStreamData(QPDFObjGen, ...)`.
     fn provide_stream_data_by_qpdf_obj_gen(
         &self,
-        object_number: i64,
-        generation: i64,
+        object_gen: QpdfObjGen,
         pipeline: &mut dyn Pipeline,
     ) -> Result<()> {
-        if let (Ok(number), Ok(generation)) =
-            (u32::try_from(object_number), u16::try_from(generation))
-        {
-            return self.provide_stream_data(ObjectRef::new(number, generation), pipeline);
-        }
-        self.provide_stream_data_by_id(object_number as u32, generation as u16, pipeline)
+        self.provide_stream_data_by_id(object_gen.get_obj(), object_gen.get_gen(), pipeline)
     }
 
-    /// Retry-aware provider form receiving the complete stream identity.
-    fn provide_stream_data_with_retry(
-        &self,
-        object_ref: ObjectRef,
-        pipeline: &mut dyn Pipeline,
-        suppress_warnings: bool,
-        will_retry: bool,
-    ) -> Result<bool> {
-        self.provide_stream_data_with_retry_by_id(
-            object_ref.number,
-            object_ref.generation,
-            pipeline,
-            suppress_warnings,
-            will_retry,
-        )
-    }
-
-    /// Retry-aware provider form receiving numeric object identity.
+    /// qpdf's retry-aware `int object_id, int generation` provider overload.
     fn provide_stream_data_with_retry_by_id(
         &self,
-        _object_number: u32,
-        _generation: u16,
+        _object_number: i32,
+        _generation: i32,
         _pipeline: &mut dyn Pipeline,
         _suppress_warnings: bool,
         _will_retry: bool,
@@ -323,28 +290,18 @@ pub trait StreamDataProvider {
         ))
     }
 
-    /// Retry-aware raw qpdf object/generation form of the provider callback.
+    /// qpdf's retry-aware raw `QPDFObjGen` overload. Delegates to the signed
+    /// retry-aware numeric callback without changing identity or flags.
     fn provide_stream_data_with_retry_by_qpdf_obj_gen(
         &self,
-        object_number: i64,
-        generation: i64,
+        object_gen: QpdfObjGen,
         pipeline: &mut dyn Pipeline,
         suppress_warnings: bool,
         will_retry: bool,
     ) -> Result<bool> {
-        if let (Ok(number), Ok(generation)) =
-            (u32::try_from(object_number), u16::try_from(generation))
-        {
-            return self.provide_stream_data_with_retry(
-                ObjectRef::new(number, generation),
-                pipeline,
-                suppress_warnings,
-                will_retry,
-            );
-        }
         self.provide_stream_data_with_retry_by_id(
-            object_number as u32,
-            generation as u16,
+            object_gen.get_obj(),
+            object_gen.get_gen(),
             pipeline,
             suppress_warnings,
             will_retry,
@@ -368,8 +325,8 @@ where
 {
     fn provide_stream_data_by_id(
         &self,
-        _object_number: u32,
-        _generation: u16,
+        _object_number: i32,
+        _generation: i32,
         pipeline: &mut dyn Pipeline,
     ) -> Result<()> {
         (self.callback)(pipeline)
@@ -390,8 +347,8 @@ where
 
     fn provide_stream_data_with_retry_by_id(
         &self,
-        _object_number: u32,
-        _generation: u16,
+        _object_number: i32,
+        _generation: i32,
         pipeline: &mut dyn Pipeline,
         suppress_warnings: bool,
         will_retry: bool,
@@ -414,8 +371,8 @@ impl StreamDataProvider for CopiedStreamDataProvider {
 
     fn provide_stream_data_with_retry_by_id(
         &self,
-        _object_number: u32,
-        _generation: u16,
+        _object_number: i32,
+        _generation: i32,
         pipeline: &mut dyn Pipeline,
         suppress_warnings: bool,
         will_retry: bool,
@@ -448,8 +405,8 @@ struct CoalesceContentProvider {
 impl StreamDataProvider for CoalesceContentProvider {
     fn provide_stream_data_by_id(
         &self,
-        _object_number: u32,
-        _generation: u16,
+        _object_number: i32,
+        _generation: i32,
         pipeline: &mut dyn Pipeline,
     ) -> Result<()> {
         let description = format!(
@@ -6451,10 +6408,10 @@ impl ObjectHandle {
     /// [`ObjectHandle::null`] removes them through the canonical dictionary
     /// mutation path. A non-stream handle returns qpdf's `asStreamWithAssert`
     /// runtime classification as [`Error::System`]. Provider registration is
-    /// restricted to indirect streams because the provider callback requires
-    /// the stream's stable `ObjectRef`; a direct stream is rejected here at
-    /// registration time rather than being accepted and failing later at the
-    /// pipe boundary.
+    /// restricted to indirect streams so the provider callback receives the
+    /// stream's raw [`QpdfObjGen`] identity; a direct stream is rejected here
+    /// at registration time rather than being accepted and failing later at
+    /// the pipe boundary.
     ///
     /// This mutates the live stream and dictionary in place; the canonical
     /// writer observes the same live allocation before writing the document.
@@ -7522,18 +7479,13 @@ impl ObjectHandle {
             let mut count = Count::new("stream provider count", pipeline);
             let success = if provider.supports_retry() {
                 provider.provide_stream_data_with_retry_by_qpdf_obj_gen(
-                    i64::from(object_gen.get_obj()),
-                    i64::from(object_gen.get_gen()),
+                    object_gen,
                     &mut count,
                     suppress_warnings,
                     will_retry,
                 )?
             } else {
-                provider.provide_stream_data_by_qpdf_obj_gen(
-                    i64::from(object_gen.get_obj()),
-                    i64::from(object_gen.get_gen()),
-                    &mut count,
-                )?;
+                provider.provide_stream_data_by_qpdf_obj_gen(object_gen, &mut count)?;
                 true
             };
             if !success {
@@ -17273,14 +17225,14 @@ mod stream_provider_contract_tests {
     #[derive(Default)]
     struct LegacyProvider {
         calls: Cell<usize>,
-        identities: RefCell<Vec<(u32, u16)>>,
+        identities: RefCell<Vec<(i32, i32)>>,
     }
 
     impl StreamDataProvider for LegacyProvider {
         fn provide_stream_data_by_id(
             &self,
-            object_number: u32,
-            generation: u16,
+            object_number: i32,
+            generation: i32,
             _pipeline: &mut dyn Pipeline,
         ) -> Result<()> {
             self.calls.set(self.calls.get() + 1);
@@ -17295,6 +17247,7 @@ mod stream_provider_contract_tests {
     struct RetryProvider {
         calls: Cell<usize>,
         flags: RefCell<Vec<(bool, bool)>>,
+        identities: RefCell<Vec<(i32, i32)>>,
     }
 
     impl StreamDataProvider for RetryProvider {
@@ -17304,8 +17257,8 @@ mod stream_provider_contract_tests {
 
         fn provide_stream_data_with_retry_by_id(
             &self,
-            _object_number: u32,
-            _generation: u16,
+            object_number: i32,
+            generation: i32,
             _pipeline: &mut dyn Pipeline,
             suppress_warnings: bool,
             will_retry: bool,
@@ -17314,6 +17267,9 @@ mod stream_provider_contract_tests {
             self.flags
                 .borrow_mut()
                 .push((suppress_warnings, will_retry));
+            self.identities
+                .borrow_mut()
+                .push((object_number, generation));
             Ok(true)
         }
     }
@@ -17323,8 +17279,8 @@ mod stream_provider_contract_tests {
     impl StreamDataProvider for RetryOnlyProvider {
         fn provide_stream_data_with_retry_by_id(
             &self,
-            _object_number: u32,
-            _generation: u16,
+            _object_number: i32,
+            _generation: i32,
             _pipeline: &mut dyn Pipeline,
             _suppress_warnings: bool,
             _will_retry: bool,
@@ -17342,8 +17298,8 @@ mod stream_provider_contract_tests {
 
         fn provide_stream_data_by_id(
             &self,
-            _object_number: u32,
-            _generation: u16,
+            _object_number: i32,
+            _generation: i32,
             _pipeline: &mut dyn Pipeline,
         ) -> Result<()> {
             Ok(())
@@ -17375,7 +17331,7 @@ mod stream_provider_contract_tests {
     struct PipeProvider {
         bytes: Rc<Vec<u8>>,
         calls: Cell<usize>,
-        identities: RefCell<Vec<(u32, u16)>>,
+        identities: RefCell<Vec<(i32, i32)>>,
     }
 
     impl PipeProvider {
@@ -17391,8 +17347,8 @@ mod stream_provider_contract_tests {
     impl StreamDataProvider for PipeProvider {
         fn provide_stream_data_by_id(
             &self,
-            object_number: u32,
-            generation: u16,
+            object_number: i32,
+            generation: i32,
             pipeline: &mut dyn Pipeline,
         ) -> Result<()> {
             self.calls.set(self.calls.get() + 1);
@@ -17417,8 +17373,8 @@ mod stream_provider_contract_tests {
 
         fn provide_stream_data_with_retry_by_id(
             &self,
-            _object_number: u32,
-            _generation: u16,
+            _object_number: i32,
+            _generation: i32,
             pipeline: &mut dyn Pipeline,
             suppress_warnings: bool,
             will_retry: bool,
@@ -17506,7 +17462,13 @@ mod stream_provider_contract_tests {
         assert_eq!(provider.calls.get(), 2);
         assert_eq!(
             *provider.identities.borrow(),
-            vec![(object_ref.number, object_ref.generation); 2]
+            vec![
+                (
+                    i32::try_from(object_ref.number).expect("qpdf object id fits i32"),
+                    i32::from(object_ref.generation)
+                );
+                2
+            ]
         );
         assert_eq!(
             stream
@@ -17737,7 +17699,7 @@ mod stream_provider_contract_tests {
         };
         assert!(matches!(
             write_provider
-                .provide_stream_data(ObjectRef::new(47, 0), &mut write_pipeline)
+                .provide_stream_data_by_id(47, 0, &mut write_pipeline)
                 .expect_err("callback write failure must propagate"),
             Error::System(message) if message == "callback write failure"
         ));
@@ -17750,7 +17712,7 @@ mod stream_provider_contract_tests {
         };
         assert!(matches!(
             finish_provider
-                .provide_stream_data(ObjectRef::new(47, 0), &mut finish_pipeline)
+                .provide_stream_data_by_id(47, 0, &mut finish_pipeline)
                 .expect_err("callback finish failure must propagate"),
             Error::System(message) if message == "callback finish failure"
         ));
@@ -17881,52 +17843,77 @@ mod stream_provider_contract_tests {
     }
 
     #[test]
-    fn legacy_object_identity_form_delegates_to_the_numeric_form() {
+    fn legacy_qpdf_obj_gen_overload_preserves_signed_numeric_identity() {
         let provider = LegacyProvider::default();
         let mut sink = crate::pipeline::buffer::Buffer::new("provider", None);
 
         provider
-            .provide_stream_data(ObjectRef::new(17, 4), &mut sink)
+            .provide_stream_data_by_id(17, 4, &mut sink)
             .expect("legacy provider");
 
         assert_eq!(provider.calls.get(), 1);
         assert_eq!(*provider.identities.borrow(), vec![(17, 4)]);
 
         provider
-            .provide_stream_data_by_qpdf_obj_gen(17, 4, &mut sink)
+            .provide_stream_data_by_qpdf_obj_gen(QpdfObjGen::new(17, 4), &mut sink)
             .expect("projectable raw provider");
         provider
-            .provide_stream_data_by_qpdf_obj_gen(17, 65_536, &mut sink)
+            .provide_stream_data_by_qpdf_obj_gen(QpdfObjGen::new(17, 65_535), &mut sink)
+            .expect("raw provider preserves the parser generation boundary");
+        provider
+            .provide_stream_data_by_qpdf_obj_gen(QpdfObjGen::new(17, 65_536), &mut sink)
             .expect("unprojectable raw provider fallback");
-        assert_eq!(provider.calls.get(), 3);
+        assert_eq!(provider.calls.get(), 4);
         assert_eq!(
             *provider.identities.borrow(),
-            vec![(17, 4), (17, 4), (17, 0)]
+            vec![(17, 4), (17, 4), (17, 65_535), (17, 65_536)]
         );
     }
 
     #[test]
-    fn retry_object_identity_form_delegates_flags_to_the_numeric_form() {
+    fn retry_qpdf_obj_gen_overload_preserves_identity_and_flags() {
         let provider = RetryProvider::default();
         let mut sink = crate::pipeline::buffer::Buffer::new("provider", None);
 
         assert!(provider
-            .provide_stream_data_with_retry(ObjectRef::new(23, 2), &mut sink, true, false,)
+            .provide_stream_data_with_retry_by_id(23, 2, &mut sink, true, false)
             .expect("retry provider"));
         assert!(provider.supports_retry());
         assert_eq!(provider.calls.get(), 1);
         assert_eq!(*provider.flags.borrow(), vec![(true, false)]);
 
         assert!(provider
-            .provide_stream_data_with_retry_by_qpdf_obj_gen(23, 2, &mut sink, true, false)
+            .provide_stream_data_with_retry_by_qpdf_obj_gen(
+                QpdfObjGen::new(23, 2),
+                &mut sink,
+                true,
+                false
+            )
             .expect("projectable raw retry provider"));
         assert!(provider
-            .provide_stream_data_with_retry_by_qpdf_obj_gen(23, 65_536, &mut sink, false, true)
+            .provide_stream_data_with_retry_by_qpdf_obj_gen(
+                QpdfObjGen::new(23, 65_535),
+                &mut sink,
+                false,
+                true
+            )
+            .expect("raw retry provider preserves the parser generation boundary"));
+        assert!(provider
+            .provide_stream_data_with_retry_by_qpdf_obj_gen(
+                QpdfObjGen::new(23, 65_536),
+                &mut sink,
+                false,
+                true
+            )
             .expect("unprojectable raw retry provider fallback"));
-        assert_eq!(provider.calls.get(), 3);
+        assert_eq!(provider.calls.get(), 4);
         assert_eq!(
             *provider.flags.borrow(),
-            vec![(true, false), (true, false), (false, true)]
+            vec![(true, false), (true, false), (false, true), (false, true)]
+        );
+        assert_eq!(
+            *provider.identities.borrow(),
+            vec![(23, 2), (23, 2), (23, 65_535), (23, 65_536)]
         );
     }
 
@@ -17938,7 +17925,7 @@ mod stream_provider_contract_tests {
         assert!(!provider.supports_retry());
 
         let error = provider
-            .provide_stream_data(ObjectRef::new(1, 0), &mut sink)
+            .provide_stream_data_by_id(1, 0, &mut sink)
             .expect_err("default provider must reject missing implementation");
         assert!(matches!(
             error,
@@ -17947,8 +17934,31 @@ mod stream_provider_contract_tests {
         ));
 
         let error = provider
-            .provide_stream_data_with_retry(ObjectRef::new(1, 0), &mut sink, false, true)
+            .provide_stream_data_by_qpdf_obj_gen(QpdfObjGen::new(1, 65_536), &mut sink)
+            .expect_err("QpdfObjGen overload delegates to the default numeric error");
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "you must override provideStreamData -- see QPDFObjectHandle.hh"
+        ));
+
+        let error = provider
+            .provide_stream_data_with_retry_by_id(1, 0, &mut sink, false, true)
             .expect_err("default retry provider must reject missing implementation");
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "you must override provideStreamData -- see QPDFObjectHandle.hh"
+        ));
+
+        let error = provider
+            .provide_stream_data_with_retry_by_qpdf_obj_gen(
+                QpdfObjGen::new(1, 65_536),
+                &mut sink,
+                false,
+                true,
+            )
+            .expect_err("retry QpdfObjGen overload delegates to the default numeric error");
         assert!(matches!(
             error,
             Error::Internal(message)
@@ -18055,7 +18065,7 @@ mod stream_provider_contract_tests {
             },
         };
         void_provider
-            .provide_stream_data(ObjectRef::new(41, 2), &mut void_sink)
+            .provide_stream_data_by_id(41, 2, &mut void_sink)
             .expect("void callback provider");
         assert_eq!(
             void_sink.take_buffer().expect("void callback output"),
@@ -18076,7 +18086,7 @@ mod stream_provider_contract_tests {
         };
         assert!(retry_provider.supports_retry());
         assert!(retry_provider
-            .provide_stream_data_with_retry(ObjectRef::new(43, 1), &mut retry_sink, true, false,)
+            .provide_stream_data_with_retry_by_id(43, 1, &mut retry_sink, true, false)
             .expect("retry callback provider"));
         assert_eq!(
             retry_sink.take_buffer().expect("retry callback output"),
@@ -18104,7 +18114,7 @@ mod stream_provider_contract_tests {
         let mut void_sink = crate::pipeline::buffer::Buffer::new("void callback", None);
         stream
             .with_value(registered_provider)
-            .provide_stream_data(ObjectRef::new(41, 2), &mut void_sink)
+            .provide_stream_data_by_id(41, 2, &mut void_sink)
             .expect("void callback provider");
         assert_eq!(void_calls.get(), 1, "void callback runs only when piped");
 
@@ -18128,7 +18138,7 @@ mod stream_provider_contract_tests {
         let mut retry_sink = crate::pipeline::buffer::Buffer::new("retry callback", None);
         assert!(stream
             .with_value(registered_provider)
-            .provide_stream_data_with_retry(ObjectRef::new(43, 1), &mut retry_sink, true, false)
+            .provide_stream_data_with_retry_by_id(43, 1, &mut retry_sink, true, false)
             .expect("retry callback provider"));
         assert_eq!(retry_calls.get(), 1, "retry callback runs only when piped");
 
