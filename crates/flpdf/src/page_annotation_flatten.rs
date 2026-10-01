@@ -265,7 +265,7 @@ fn flatten_annotations_on_page_handle<R: Read + Seek>(
         if qpdf_flag_contract {
             // qpdf wraps the page whenever the annotation array changed, even
             // if every selected appearance produced empty drawing content.
-            add_qpdf_flatten_contents(pdf, &page, Vec::new())?; // cov:ignore: covered structurally by indirect-contents public fixture
+            add_qpdf_flatten_contents(pdf, &page, &[])?; // cov:ignore: covered structurally by indirect-contents public fixture
         } // cov:ignore: llvm-cov maps the tested qpdf wrapper branch to this synthetic closing brace
         return Ok(0);
     }
@@ -276,7 +276,9 @@ fn flatten_annotations_on_page_handle<R: Read + Seek>(
     // below and does not need this compatibility-only branch.
     #[cfg(test)]
     if !qpdf_flag_contract {
-        let page_ref = test_page_ref(&page)?;
+        let page_ref = page
+            .object_ref()
+            .expect("test-only legacy mode starts from an ObjectRef page");
         PageObjectHelper::new(page_ref, pdf).coalesce_content_streams()?;
     }
 
@@ -390,36 +392,28 @@ fn flatten_annotations_on_page_handle<R: Read + Seek>(
         }
         replace_pruned_annots(pdf, &page, &to_remove, qpdf_flag_contract)?; // cov:ignore: llvm-cov maps this covered multiline call terminator to a zero-hit line
         if qpdf_flag_contract {
-            add_qpdf_flatten_contents(pdf, &page, Vec::new())?; // cov:ignore: covered structurally by indirect-contents public fixture
+            add_qpdf_flatten_contents(pdf, &page, &[])?; // cov:ignore: covered structurally by indirect-contents public fixture
         } // cov:ignore: llvm-cov maps the tested qpdf wrapper branch to this synthetic closing brace
         return Ok(0);
     }
 
     // ── Step 6: Add qpdf-shaped page-content wrappers ─────────────────────
-    if !page.try_is_dictionary()? {
-        let object_gen = page.get_obj_gen();
-        return Err(Error::Unsupported(format!(
-            "object {} {} is not a dictionary after flatten",
-            object_gen.get_obj(),
-            object_gen.get_gen()
-        )));
-    }
-
     if qpdf_flag_contract {
-        add_qpdf_flatten_contents(pdf, &page, append_bytes)?;
-    } else {
-        #[cfg(test)]
-        {
-            let page_ref = test_page_ref(&page)?;
-            let existing_content = page_content_bytes(pdf, page_ref)?;
-            let mut new_content = existing_content;
-            if !new_content.is_empty() && new_content.last() != Some(&b'\n') {
-                new_content.push(b'\n');
-            }
-            new_content.extend_from_slice(&append_bytes);
-            let stream = add_content_stream(pdf, new_content)?;
-            page.replace_key(b"/Contents", stream)?;
+        add_qpdf_flatten_contents(pdf, &page, &append_bytes)?;
+    }
+    #[cfg(test)]
+    if !qpdf_flag_contract {
+        let page_ref = page
+            .object_ref()
+            .expect("test-only legacy mode starts from an ObjectRef page");
+        let existing_content = page_content_bytes(pdf, page_ref)?;
+        let mut new_content = existing_content;
+        if !new_content.is_empty() && new_content.last() != Some(&b'\n') {
+            new_content.push(b'\n');
         }
+        new_content.extend_from_slice(&append_bytes);
+        let stream = add_content_stream(pdf, new_content)?;
+        page.replace_key(b"/Contents", stream)?;
     }
 
     // ── Step 8: Remove flattened annotations from /Annots ─────────────────
@@ -456,11 +450,11 @@ fn replace_pruned_annots<R: Read + Seek>(
 fn add_qpdf_flatten_contents<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page: &ObjectHandle,
-    append_bytes: Vec<u8>,
+    append_bytes: &[u8],
 ) -> Result<()> {
     let before = add_content_stream(pdf, b"q\n".to_vec())?;
     let mut after = b"\nQ\n".to_vec();
-    after.extend_from_slice(&append_bytes);
+    after.extend_from_slice(append_bytes);
     let after = add_content_stream(pdf, after)?;
     let old = page.try_get_key(b"/Contents")?;
     let old_items = old.try_as_array()?;
@@ -580,13 +574,6 @@ fn direct_page_rotate(page: &ObjectHandle) -> Result<i32> {
         .try_as_integer()?
         .and_then(|value| i32::try_from(value).ok())
         .unwrap_or(0))
-}
-
-#[cfg(test)]
-fn test_page_ref(page: &ObjectHandle) -> Result<ObjectRef> {
-    page.object_ref().ok_or_else(|| {
-        Error::Unsupported("test-only flatten modes require a valid ObjectRef".to_owned())
-    })
 }
 
 fn materialize_page_resources<R: Read + Seek>(pdf: &mut Pdf<R>, page: &ObjectHandle) -> Result<()> {
