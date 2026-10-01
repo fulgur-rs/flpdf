@@ -741,6 +741,23 @@ it is not routed through `job.open_with_description`. The qtest exception
 routes and the separate page-operation replace-input issue remain outside this
 slice.
 
+### E-7 / E-29 encryption-status CLI dispatch (2026-10-01, `flpdf-3yn9.48.180`)
+
+The top-level `--is-encrypted` / `--requires-password` options and their
+subcommands now select `QPDFJob::Config::isEncrypted` /
+`requiresPassword` and call `QPDFJob::run`. This uses qpdf's
+`createQPDF` → encryption-status early return → `getExitCode` order
+(`QPDFJob.cc:428-456,535-557`) instead of opening a document in the CLI and
+reconstructing the status there. The compatibility tests retain the 0/2/3
+exit-code contract for plaintext, encrypted, correct-password, wrong-password,
+weak-crypto, empty-input, and password-file cases.
+
+The earlier E-29 note naming a production `Pdf::open_with_options` caller in
+`flpdf-cli/src/main.rs` is stale on current main: the CLI has no such call, and
+`qpdf-route-callers.py --symbol open_with_options` reports its current callers
+in qtest tools and Job-owned lifecycle code. This slice does not reclassify E-7
+or E-29; other standalone inspection/open consumers remain to be audited.
+
 ### E-9 / E-29 JSON donor input-policy propagation (`flpdf-rer4k`, 2026-09-15)
 
 The JSON output route now sets the same global donor-open policies as the
