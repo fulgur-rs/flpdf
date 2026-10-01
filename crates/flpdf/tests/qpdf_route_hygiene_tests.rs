@@ -281,8 +281,8 @@ fn no_underscore_bound_pdf_carriers_remain_outside_marked_exceptions() {
 /// `QPDF::readToken(input, max_len = 0)` (`libqpdf/QPDF.cc:1535-1539`) is one
 /// function; every flpdf realization that used to construct its own
 /// `Tokenizer` and call `.read_token(true, ...)` -- `ByteCursor::read_token`,
-/// the trailer's `stream`-keyword lookahead, `next_object_stream_integer`'s
-/// ObjStm header integers, the xref-reconstruction line scan, and the
+/// the trailer's `stream`-keyword lookahead, `next_object_stream_header_pair`'s
+/// ObjStm header pair, the xref-reconstruction line scan, and the
 /// canonical resolve path's `endstream`/`endobj` framing checks -- now routes
 /// through `Tokenizer::read_qpdf_token`. The only direct `.read_token(true,`
 /// calls left in the crate are that method's own definition and

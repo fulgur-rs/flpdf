@@ -3025,6 +3025,72 @@ fn resolves_compressed_entry_from_xref_stream() {
 }
 
 #[test]
+fn malformed_objstm_header_pair_matches_qpdf_token_read_order_and_offset() {
+    if !qpdf_available() {
+        eprintln!("skipping: qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let fixture =
+        include_bytes!("../../../tests/fixtures/compat/objstm-header-token-underflow.pdf");
+    let directory = tempfile::tempdir().expect("create malformed ObjStm fixture directory");
+    let input = directory.path().join("input.pdf");
+    std::fs::write(&input, fixture).expect("write malformed ObjStm fixture");
+
+    for suppress_recovery in [false, true] {
+        let mut command = Command::new("qpdf");
+        if suppress_recovery {
+            command.arg("--suppress-recovery");
+        }
+        let output = command
+            .arg("--check")
+            .arg(&input)
+            .output()
+            .expect("run qpdf --check");
+        assert_eq!(output.status.code(), Some(3));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(
+                "object stream 3 (object 3 0, offset 7): expected integer in object stream header"
+            ),
+            "qpdf stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    for repair in [true, false] {
+        let mut pdf = Pdf::open_with_options(
+            std::io::Cursor::new(fixture.to_vec()),
+            PdfOpenOptions {
+                description: b"input.pdf".to_vec(),
+                repair,
+                suppress_warnings: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("the malformed ObjStm fixture should open");
+        let member = pdf.get_object_handle(ObjectRef::new(2, 0));
+        assert!(
+            member
+                .try_is_null()
+                .expect("resolve malformed compressed member"),
+            "qpdf resolves the malformed compressed member to null"
+        );
+
+        let diagnostics = pdf.repair_diagnostics();
+        let warning = diagnostics
+            .entries()
+            .iter()
+            .find(|warning| {
+                warning.get_message_detail() == b"expected integer in object stream header"
+            })
+            .expect("ObjStm header warning should be retained");
+        assert_eq!(warning.get_error_code(), QpdfErrorCode::DamagedPdf);
+        assert_eq!(warning.get_object(), b"object 3 0");
+        assert_eq!(warning.get_file_position(), 7);
+    }
+}
+
+#[test]
 fn resolves_compressed_entry_with_flate_decode_from_xref_stream() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let obj1_offset = bytes.len();
