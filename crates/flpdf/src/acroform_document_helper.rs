@@ -2363,7 +2363,7 @@ fn transform_appearance_stream_matrix(stream: &ObjectHandle, cm: Matrix) -> Resu
     matrix.try_dereference()?;
     let had_matrix = matrix.try_is_array()?;
     let mut transformed = if had_matrix {
-        matrix_from_handle(&matrix).unwrap_or_default()
+        matrix_from_handle(&matrix)?.unwrap_or_default()
     } else {
         Matrix::default()
     };
@@ -2385,19 +2385,105 @@ fn transform_appearance_stream_matrix(stream: &ObjectHandle, cm: Matrix) -> Resu
     Ok(())
 }
 
-fn matrix_from_handle(handle: &ObjectHandle) -> Option<Matrix> {
-    let items = handle.as_array()?;
+fn matrix_from_handle(handle: &ObjectHandle) -> Result<Option<Matrix>> {
+    // qpdf's getArrayAsMatrix resolves both the array receiver and each
+    // numeric child (`QPDFObjectHandle.cc:839-853`). The caller has already
+    // established that `/Matrix` is an array, but its six number handles may
+    // still be indirect.
+    let Some(items) = handle.try_as_array()? else {
+        return Ok(None);
+    };
     if items.len() != 6 {
-        return None;
+        return Ok(None);
     }
     let mut numbers = [0.0; 6];
     for (index, item) in items.iter().enumerate() {
-        numbers[index] = item
-            .as_integer()
-            .map(|value| value as f64)
-            .or_else(|| item.as_real())?;
+        let Some(value) = item.try_get_value_as_number()? else {
+            return Ok(None);
+        };
+        numbers[index] = value;
     }
-    Some(Matrix::from(numbers))
+    Ok(Some(Matrix::from(numbers)))
+}
+
+#[cfg(test)]
+mod appearance_matrix_accessor_tests {
+    use super::*;
+    use std::io::{Cursor, Write};
+
+    fn pdf_with_indirect_matrix_components() -> Pdf<Cursor<Vec<u8>>> {
+        let objects: [&[u8]; 7] = [
+            b"1 0 obj\n<< /Type /Catalog /Matrix [2 0 R 3 0 R 4 0 R 5 0 R 6 0 R 7 0 R] >>\nendobj\n",
+            b"2 0 obj\n2\nendobj\n",
+            b"3 0 obj\n0.5\nendobj\n",
+            b"4 0 obj\n0\nendobj\n",
+            b"5 0 obj\n3\nendobj\n",
+            b"6 0 obj\n10\nendobj\n",
+            b"7 0 obj\n11\nendobj\n",
+        ];
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for object in objects {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(object);
+        }
+        let xref_offset = bytes.len();
+        writeln!(&mut bytes, "xref\n0 {}", objects.len() + 1).unwrap();
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            writeln!(&mut bytes, "{offset:010} 00000 n ").unwrap();
+        }
+        writeln!(
+            &mut bytes,
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF",
+            objects.len() + 1
+        )
+        .unwrap();
+        Pdf::open_mem_owned(bytes).expect("open PDF with indirect matrix components")
+    }
+
+    #[test]
+    fn matrix_from_handle_resolves_indirect_numeric_components_like_qpdf() {
+        let mut pdf = pdf_with_indirect_matrix_components();
+        let matrix = pdf
+            .root_handle()
+            .expect("catalog")
+            .try_get_key(b"/Matrix")
+            .expect("matrix handle");
+        assert!(matrix.as_array().expect("direct matrix array")[0]
+            .as_integer()
+            .is_none());
+
+        assert_eq!(
+            matrix_from_handle(&matrix).expect("resolve matrix components"),
+            Some(Matrix::from([2.0, 0.5, 0.0, 3.0, 10.0, 11.0]))
+        );
+    }
+
+    #[test]
+    fn matrix_from_handle_keeps_default_for_invalid_shapes_like_qpdf() {
+        assert_eq!(
+            matrix_from_handle(&ObjectHandle::integer(42)).expect("non-array matrix"),
+            None
+        );
+        assert_eq!(
+            matrix_from_handle(&ObjectHandle::array(vec![ObjectHandle::integer(1)]))
+                .expect("short matrix"),
+            None
+        );
+        assert_eq!(
+            matrix_from_handle(&ObjectHandle::array(vec![
+                ObjectHandle::integer(1),
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(1),
+                ObjectHandle::integer(0),
+                ObjectHandle::name(b"not-a-number".to_vec()),
+            ]))
+            .expect("nonnumeric matrix component"),
+            None
+        );
+    }
 }
 
 fn ensure_foreign_indirect<R: Read + Seek>(
