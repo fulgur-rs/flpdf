@@ -19,8 +19,8 @@ impl StreamDataProvider for RetryThenFail {
 
     fn provide_stream_data_with_retry_by_id(
         &self,
-        _object_number: u32,
-        _generation: u16,
+        _object_number: i32,
+        _generation: i32,
         pipeline: &mut dyn Pipeline,
         _suppress_warnings: bool,
         _will_retry: bool,
@@ -50,8 +50,8 @@ impl StreamDataProvider for LogicFailureOnBlob {
 
     fn provide_stream_data_with_retry_by_id(
         &self,
-        _object_number: u32,
-        _generation: u16,
+        _object_number: i32,
+        _generation: i32,
         pipeline: &mut dyn Pipeline,
         _suppress_warnings: bool,
         _will_retry: bool,
@@ -81,8 +81,8 @@ impl StreamDataProvider for RuntimeFailureOnBlob {
 
     fn provide_stream_data_with_retry_by_id(
         &self,
-        _object_number: u32,
-        _generation: u16,
+        _object_number: i32,
+        _generation: i32,
         pipeline: &mut dyn Pipeline,
         _suppress_warnings: bool,
         _will_retry: bool,
@@ -126,8 +126,8 @@ impl StreamDataProvider for CountingSuccessProvider {
 
     fn provide_stream_data_with_retry_by_id(
         &self,
-        _object_number: u32,
-        _generation: u16,
+        _object_number: i32,
+        _generation: i32,
         pipeline: &mut dyn Pipeline,
         _suppress_warnings: bool,
         _will_retry: bool,

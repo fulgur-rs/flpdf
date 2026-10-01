@@ -58,19 +58,21 @@ qpdf_source="$(scripts/fetch-qpdf-source.sh --print-path)"
 
 `object_handle.rs` に qpdf の nested class に対応する公開
 `StreamDataProvider` trait を置く。Rust では overload を分けた名前にするが、次の
-4 つの責務と委譲関係を保持する。
+qpdf の `QPDFObjGen` と signed `int,int` overload の責務と委譲関係を保持する。
 
 trait は `Rc<dyn StreamDataProvider>` として stream value に保持できる object-safe
 な形にし、provider の所有権は登録した stream が持つ。
 
-- `provide_stream_data(ObjectRef, &mut dyn Pipeline) -> Result<()>`
-- `(u32, u16, &mut dyn Pipeline) -> Result<()>` の legacy identity form
-- retry-aware の `ObjectRef` form
-- retry-aware の `(u32, u16, &mut dyn Pipeline, bool, bool) -> Result<bool>`
+- `provide_stream_data_by_qpdf_obj_gen(QpdfObjGen, &mut dyn Pipeline) -> Result<()>`
+- `(i32, i32, &mut dyn Pipeline) -> Result<()>` の legacy identity form
+- retry-aware の `QpdfObjGen` form
+- retry-aware の `(i32, i32, &mut dyn Pipeline, bool, bool) -> Result<bool>`
 
-`ObjectRef` form は番号・generation formへ委譲する。少なくとも一方の form を
-overrideしなければ qpdf と同じ object-layer `Error::Internal` の契約エラーに
-する。provider から downstream `PipelineError` を返す場合は既存の
+`QpdfObjGen` form は生の signed pair を保持したまま numeric identity form へ
+委譲する。`ObjectRef` callback overload は qpdf に対応物が無いため公開しない。
+少なくとも一方の qpdf callback family を overrideしなければ qpdf と同じ
+object-layer `Error::Internal` の契約エラーにする。provider から downstream
+`PipelineError` を返す場合は既存の
 `Error::Internal` / `Error::System` 変換を使い、provider API 自体を
 `PipelineResult` にしない。
 
@@ -125,8 +127,8 @@ source failure に置き換えず、qpdf の provider branch のエラー分類�
 - provider 登録の途中で callbackを呼ばない。
 - providerを設定したstreamの `as_stream_data()` は `None` を返し、buffer replacement
   後は provider が見えない。
-- provider invocation は同じ `ObjectRef` を受け、同じ stream に対して再度呼ばれても
-  同じ bytes を出す。
+- provider invocation は同じ raw `QpdfObjGen` を受け（generation 65535 以上も
+  narrow しない）、同じ stream に対して再度呼ばれても同じ bytes を出す。
 - provider は `stream_dict` や他の PDF object を mutation しない。
 - provider の unknown length は `/Length` の sentinel にしない。count が実測値を
   設定するまで zero length と混同しない。
