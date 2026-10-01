@@ -6371,6 +6371,19 @@ mod xref_map_handoff_allocation_tests {
         ALLOCATION_COUNT.with(Cell::get)
     }
 
+    #[test]
+    fn allocation_counter_observes_an_allocation_during_the_window() {
+        start_measurement();
+        let mut bytes = Vec::with_capacity(64);
+        bytes.push(1);
+        std::hint::black_box(&bytes);
+        let allocations = finish_measurement();
+        assert!(
+            allocations > 0,
+            "the measurement window must count allocations"
+        );
+    }
+
     fn offsets_with_xref_map(xref_offsets: BTreeMap<u32, usize>) -> LinearizedOffsets {
         let empty_range = 0..0;
         LinearizedOffsets {
