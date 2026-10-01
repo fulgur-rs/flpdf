@@ -4,10 +4,15 @@
 //! the measuring thread only, so libtest's concurrent tests cannot sample each
 //! other's windows.
 
-use flpdf::{EncryptParams, ObjectHandle, ObjectStreamMode, Pdf, PdfWriter};
+use flpdf::{
+    EncryptParams, ObjectHandle, ObjectRef, ObjectStreamMode, PageDocumentHelper, PageInput, Pdf,
+    PdfWriter,
+};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::io::{self, Cursor, Write};
+use std::rc::Rc;
 
 std::thread_local! {
     static ALLOCATION_TRACKING: Cell<bool> = const { Cell::new(false) };
@@ -171,6 +176,21 @@ fn encrypted_linearized_allocation_stats_for_object_count(object_count: usize) -
     finish_allocation_measurement()
 }
 
+fn linearized_allocation_stats_for_stream_count(stream_count: usize) -> AllocationStats {
+    let mut pdf = one_page_fixture();
+    let root = pdf.root_handle().expect("resolve the live Catalog");
+    for index in 0..stream_count {
+        let stream = pdf
+            .new_stream_with_data(Rc::new(b"q\nQ\n".to_vec()))
+            .expect("create a per-stream linearization input");
+        root.replace_key(format!("/LinearizedStream{index:04}").as_bytes(), stream)
+            .expect("attach the stream for linearization");
+    }
+    start_allocation_measurement_after_fixture_baseline();
+    write_linearized(&mut pdf, false);
+    finish_allocation_measurement()
+}
+
 fn attach_small_objects(object_count: usize) -> Pdf<Cursor<Vec<u8>>> {
     let mut pdf = one_page_fixture();
     let root = pdf.root_handle().expect("resolve the live Catalog");
@@ -185,6 +205,210 @@ fn attach_small_objects(object_count: usize) -> Pdf<Cursor<Vec<u8>>> {
             .expect("attach the object to the Catalog");
     }
     pdf
+}
+
+/// A page-scaled workload: every page owns a resource dictionary with
+/// `objects_per_page` distinct indirect children. This makes page ownership
+/// grow on both axes instead of attaching every synthetic object to the
+/// Catalog, which exercises only object-count scaling.
+fn page_private_object_fixture(page_count: usize, objects_per_page: usize) -> Pdf<Cursor<Vec<u8>>> {
+    assert!(page_count > 0, "the fixture needs at least one page");
+    let mut pdf = one_page_fixture();
+    let template_page = PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .expect("read the template page")
+        .into_iter()
+        .next()
+        .expect("one-page fixture has a page");
+    for _ in 1..page_count {
+        PageDocumentHelper::new(&mut pdf)
+            .add_page(PageInput::target(template_page.clone()), false)
+            .expect("duplicate the template page");
+    }
+
+    let pages = PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .expect("read duplicated pages");
+    assert_eq!(pages.len(), page_count);
+    for (page_index, page) in pages.into_iter().enumerate() {
+        let mut xobjects = Vec::with_capacity(objects_per_page);
+        for object_index in 0..objects_per_page {
+            let value = page_index
+                .saturating_mul(objects_per_page)
+                .saturating_add(object_index);
+            let object = pdf
+                .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                    b"/Value".to_vec(),
+                    ObjectHandle::integer(value as i64),
+                )]))
+                .expect("create page-private resource object");
+            xobjects.push((format!("/Private{object_index:04}").into_bytes(), object));
+        }
+        let resources = ObjectHandle::dictionary(vec![(
+            b"/XObject".to_vec(),
+            ObjectHandle::dictionary(xobjects),
+        )]);
+        page.replace_key(b"/Resources", resources)
+            .expect("attach page-private resources");
+    }
+    pdf
+}
+
+fn linearized_allocated_bytes_for_page_private_objects(
+    page_count: usize,
+    objects_per_page: usize,
+) -> usize {
+    let mut pdf = page_private_object_fixture(page_count, objects_per_page);
+    start_allocation_measurement_after_fixture_baseline();
+    write_linearized(&mut pdf, false);
+    finish_allocation_measurement().total_allocated_bytes
+}
+
+fn linearized_allocated_bytes_for_page_private_objects_with_duplicate_page_sets(
+    page_count: usize,
+    objects_per_page: usize,
+) -> usize {
+    let mut pdf = page_private_object_fixture(page_count, objects_per_page);
+    start_allocation_measurement_after_fixture_baseline();
+    // Calibration for the retired `Vec<BTreeSet<ObjectRef>>` route: all
+    // non-first pages own one set containing their page-private resources.
+    // Keep it live across the write so the measurement proves this workload
+    // and bound expose the extra page-by-object container.
+    let page_private_sets: Vec<BTreeSet<ObjectRef>> = (1..page_count)
+        .map(|page| {
+            // The old per-page list includes the page object itself as well
+            // as its private resource children.
+            (0..=objects_per_page)
+                .map(|object| ObjectRef::new((page * objects_per_page + object) as u32 + 10_000, 0))
+                .collect()
+        })
+        .collect();
+    write_linearized(&mut pdf, false);
+    std::hint::black_box(&page_private_sets);
+    finish_allocation_measurement().total_allocated_bytes
+}
+
+const SMALL_PAGE_COUNT: usize = 2;
+const LARGE_PAGE_COUNT: usize = 8;
+const SMALL_PAGE_OBJECT_COUNT: usize = 2;
+const LARGE_PAGE_OBJECT_COUNT: usize = 16;
+// The clean route measured 2,174 allocated bytes per added page-private
+// object and 2,176 bytes per page/object edge on the page-count axis. A
+// synthetic duplicate `Vec<BTreeSet<ObjectRef>>` measured 2,200 and 2,211,
+// respectively. Each bound sits between the current route and that retired
+// ownership table, with the allocation sizes taken from `Layout`.
+const PAGE_PRIVATE_OBJECT_ALLOCATED_BYTES_BOUND: usize = 2_187;
+const PAGE_PRIVATE_PAGE_ALLOCATED_BYTES_BOUND: usize = 2_193;
+
+#[test]
+fn linearization_page_private_cost_scales_with_pages_and_objects() {
+    let small_object_bytes = linearized_allocated_bytes_for_page_private_objects(
+        LARGE_PAGE_COUNT,
+        SMALL_PAGE_OBJECT_COUNT,
+    );
+    let large_object_bytes = linearized_allocated_bytes_for_page_private_objects(
+        LARGE_PAGE_COUNT,
+        LARGE_PAGE_OBJECT_COUNT,
+    );
+    let object_edges = LARGE_PAGE_COUNT * (LARGE_PAGE_OBJECT_COUNT - SMALL_PAGE_OBJECT_COUNT);
+    let object_slope = large_object_bytes.saturating_sub(small_object_bytes) / object_edges;
+
+    let small_page_bytes = linearized_allocated_bytes_for_page_private_objects(
+        SMALL_PAGE_COUNT,
+        LARGE_PAGE_OBJECT_COUNT,
+    );
+    let large_page_bytes = linearized_allocated_bytes_for_page_private_objects(
+        LARGE_PAGE_COUNT,
+        LARGE_PAGE_OBJECT_COUNT,
+    );
+    let page_edges = (LARGE_PAGE_COUNT - SMALL_PAGE_COUNT) * LARGE_PAGE_OBJECT_COUNT;
+    let page_slope = large_page_bytes.saturating_sub(small_page_bytes) / page_edges;
+
+    let duplicate_object_slope =
+        (linearized_allocated_bytes_for_page_private_objects_with_duplicate_page_sets(
+            LARGE_PAGE_COUNT,
+            LARGE_PAGE_OBJECT_COUNT,
+        ) - linearized_allocated_bytes_for_page_private_objects_with_duplicate_page_sets(
+            LARGE_PAGE_COUNT,
+            SMALL_PAGE_OBJECT_COUNT,
+        )) / object_edges;
+    let duplicate_page_slope =
+        (linearized_allocated_bytes_for_page_private_objects_with_duplicate_page_sets(
+            LARGE_PAGE_COUNT,
+            LARGE_PAGE_OBJECT_COUNT,
+        ) - linearized_allocated_bytes_for_page_private_objects_with_duplicate_page_sets(
+            SMALL_PAGE_COUNT,
+            LARGE_PAGE_OBJECT_COUNT,
+        )) / page_edges;
+    assert!(
+        object_slope <= PAGE_PRIVATE_OBJECT_ALLOCATED_BYTES_BOUND,
+        "linearized page-private object cost grew beyond the measured per-edge bound: \
+         object_slope={object_slope}, bound={PAGE_PRIVATE_OBJECT_ALLOCATED_BYTES_BOUND}"
+    );
+    assert!(
+        page_slope <= PAGE_PRIVATE_PAGE_ALLOCATED_BYTES_BOUND,
+        "linearized page-count growth exceeded the measured per-edge bound: \
+         page_slope={page_slope}, bound={PAGE_PRIVATE_PAGE_ALLOCATED_BYTES_BOUND}"
+    );
+    assert!(
+        duplicate_object_slope > PAGE_PRIVATE_OBJECT_ALLOCATED_BYTES_BOUND,
+        "the page/object measurement must reject a duplicate page-private set: \
+         duplicate_object_slope={duplicate_object_slope}, \
+         bound={PAGE_PRIVATE_OBJECT_ALLOCATED_BYTES_BOUND}"
+    );
+    assert!(
+        duplicate_page_slope > PAGE_PRIVATE_PAGE_ALLOCATED_BYTES_BOUND,
+        "the page-count measurement must reject a duplicate page-private set: \
+         duplicate_page_slope={duplicate_page_slope}, \
+         bound={PAGE_PRIVATE_PAGE_ALLOCATED_BYTES_BOUND}"
+    );
+}
+
+const SMALL_LINEARIZED_STREAM_COUNT: usize = 2;
+const LARGE_LINEARIZED_STREAM_COUNT: usize = 64;
+const LINEARIZED_STREAM_EXTRA_BYTES_PER_STREAM_BOUND: usize = 4_450;
+const LINEARIZED_STREAM_EXTRA_ALLOCS_PER_STREAM_BOUND: usize = 90;
+
+/// Linearized stream emission scales with the number of streams, not with a
+/// reconstructed copy of every source dictionary. The same-count ordinary
+/// object workload is subtracted to remove the writer's per-object baseline.
+#[test]
+fn linearized_stream_dictionary_cost_scales_with_stream_count() {
+    let stream_small = linearized_allocation_stats_for_stream_count(SMALL_LINEARIZED_STREAM_COUNT);
+    let stream_large = linearized_allocation_stats_for_stream_count(LARGE_LINEARIZED_STREAM_COUNT);
+    let object_small = linearized_allocation_stats_for_object_count(SMALL_LINEARIZED_STREAM_COUNT);
+    let object_large = linearized_allocation_stats_for_object_count(LARGE_LINEARIZED_STREAM_COUNT);
+    let additional_streams = LARGE_LINEARIZED_STREAM_COUNT - SMALL_LINEARIZED_STREAM_COUNT;
+    let stream_only_bytes = stream_large
+        .total_allocated_bytes
+        .saturating_sub(stream_small.total_allocated_bytes)
+        .saturating_sub(
+            object_large
+                .total_allocated_bytes
+                .saturating_sub(object_small.total_allocated_bytes),
+        );
+    let stream_only_allocations = stream_large
+        .total_allocation_count
+        .saturating_sub(stream_small.total_allocation_count)
+        .saturating_sub(
+            object_large
+                .total_allocation_count
+                .saturating_sub(object_small.total_allocation_count),
+        );
+    let bytes_per_stream = stream_only_bytes / additional_streams;
+    let allocations_per_stream = stream_only_allocations / additional_streams;
+
+    assert!(
+        bytes_per_stream <= LINEARIZED_STREAM_EXTRA_BYTES_PER_STREAM_BOUND,
+        "linearized stream emission retained a per-stream dictionary copy: \
+         bytes_per_stream={bytes_per_stream}, bound={LINEARIZED_STREAM_EXTRA_BYTES_PER_STREAM_BOUND}"
+    );
+    assert!(
+        allocations_per_stream <= LINEARIZED_STREAM_EXTRA_ALLOCS_PER_STREAM_BOUND,
+        "linearized stream emission allocated a per-stream dictionary copy: \
+         allocations_per_stream={allocations_per_stream}, \
+         bound={LINEARIZED_STREAM_EXTRA_ALLOCS_PER_STREAM_BOUND}"
+    );
 }
 
 fn linearized_peak_for_padding(padding: usize) -> usize {
