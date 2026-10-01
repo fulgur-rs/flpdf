@@ -86,13 +86,13 @@ pub(crate) fn run_test_42<R: Read + Seek>(
     qpdf_flush_result_20?;
     let negative_array_item = array.try_get_array_item(-1);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    assert!(negative_array_item?.is_null());
+    assert!(negative_array_item?.try_is_null()?);
     let out_of_bounds_array_item = array.try_get_array_item(16_059);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    assert!(out_of_bounds_array_item?.is_null());
+    assert!(out_of_bounds_array_item?.try_is_null()?);
     let non_array_item = integer.try_get_array_item(0);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    assert!(non_array_item?.is_null());
+    assert!(non_array_item?.try_is_null()?);
     let qpdf_flush_result_21 = integer.try_append_array_item(ObjectHandle::null());
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     qpdf_flush_result_21?;
@@ -152,7 +152,7 @@ pub(crate) fn run_test_42<R: Read + Seek>(
     assert!(ObjectHandle::null()
         .try_get_key_if_dict(b"/Integer")?
         .try_get_key_if_dict(b"/Potato")?
-        .is_null());
+        .try_is_null()?);
 
     let integer_from_qtest = qtest.try_get_key(b"/Integer")?;
     let qpdf_flush_result_33 = integer_from_qtest.try_get_key_if_dict(b"/Potato");
@@ -333,12 +333,12 @@ pub(crate) fn run_test_43<R: Read + Seek>(
         writeln!(stdout)?;
 
         let mut node = field.clone();
-        while !node.is_null() {
+        while !node.try_is_null()? {
             let qpdf_flush_result_36 =
                 FormFieldObjectHelper::from_object_handle(node, pdf).get_parent();
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             let parent = qpdf_flush_result_36?;
-            if parent.is_null() {
+            if parent.try_is_null()? {
                 writeln!(stdout, "  Parent: none")?;
                 break;
             }
@@ -1255,6 +1255,17 @@ mod tests {
     }
 
     fn pdf_with_non_dictionary_field_parent() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        pdf_with_field_parent_value(b"42", b"form-parent-error.pdf")
+    }
+
+    fn pdf_with_indirect_null_field_parent() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        pdf_with_field_parent_value(b"null", b"form-indirect-null-parent.pdf")
+    }
+
+    fn pdf_with_field_parent_value(
+        parent_value: &[u8],
+        description: &[u8],
+    ) -> Pdf<std::io::Cursor<Vec<u8>>> {
         let objects: &[(u32, &[u8])] = &[
             (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
             (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
@@ -1263,7 +1274,7 @@ mod tests {
                 b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [6 0 R] >>",
             ),
             (4, b"<< /Fields [6 0 R] >>"),
-            (5, b"42"),
+            (5, parent_value),
             (
                 6,
                 b"<< /Parent 5 0 R /FT /Tx /T (child) /Subtype /Widget /Rect [1 2 3 4] >>",
@@ -1297,11 +1308,11 @@ mod tests {
             bytes,
             PdfOpenOptions {
                 suppress_warnings: true,
-                description: b"form-parent-error.pdf".to_vec(),
+                description: description.to_vec(),
                 ..PdfOpenOptions::default()
             },
         )
-        .expect("open non-dictionary parent fixture")
+        .expect("open form parent fixture")
     }
 
     fn pdf_with_direct_orphan_widget() -> Pdf<std::io::Cursor<Vec<u8>>> {
@@ -1706,6 +1717,48 @@ mod tests {
         ).any(|window| {
             window
                 == b"operation for dictionary attempted on object of type integer: returning null for attempted key retrieval\n"
+        }));
+    }
+
+    #[test]
+    fn test_43_stops_parent_walk_when_parent_reference_resolves_to_null() {
+        let mut pdf = pdf_with_indirect_null_field_parent();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_43(
+            &mut pdf,
+            b"form-indirect-null-parent.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 43");
+
+        assert!(
+            stdout
+                .windows(b"Field: 6 0 R\n".len())
+                .any(|window| window == b"Field: 6 0 R\n"),
+            "fixture must reach the field-parent walk; output: {}",
+            String::from_utf8_lossy(&stdout)
+        );
+        assert!(
+            stdout
+                .windows(b"  Parent: 5 0 R\n".len())
+                .all(|window| window != b"  Parent: 5 0 R\n"),
+            "an indirect null parent is absent to qpdf's isNull()"
+        );
+        assert!(stdout
+            .windows(b"  Parent: none\n".len())
+            .any(|window| window == b"  Parent: none\n"));
+        assert!(!stderr.windows(
+            b"operation for dictionary attempted on object of type null: returning null for attempted key retrieval\n"
+                .len()
+        ).any(|window| {
+            window
+                == b"operation for dictionary attempted on object of type null: returning null for attempted key retrieval\n"
         }));
     }
 
