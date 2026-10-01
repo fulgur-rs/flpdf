@@ -587,6 +587,36 @@ fn object_handle_api_test_88_emits_qpdf_warning_output() {
 }
 
 #[test]
+fn object_handle_api_tests_88_and_94_use_resolving_null_queries() {
+    let source = include_str!("../src/driver/test_88_98.rs").replace("\r\n", "\n");
+
+    fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start = source.find(start).expect("source section start");
+        let end = source[start..]
+            .find(end)
+            .map(|offset| start + offset)
+            .expect("source section end");
+        &source[start..end]
+    }
+
+    let test_88 = section(
+        &source,
+        "pub(crate) fn run_test_88",
+        "pub(crate) fn run_test_89",
+    );
+    let test_94 = section(
+        &source,
+        "pub(crate) fn run_test_94",
+        "pub(crate) fn run_test_95",
+    );
+
+    assert_eq!(test_88.matches(".try_is_null()?").count(), 4);
+    assert!(!test_88.contains(".is_null()"));
+    assert_eq!(test_94.matches(".try_is_null()?").count(), 1);
+    assert!(!test_94.contains(".is_null()"));
+}
+
+#[test]
 fn object_handle_api_test_93_uses_canonical_promotion_route() {
     let source = include_str!("../src/driver/test_88_98.rs");
 

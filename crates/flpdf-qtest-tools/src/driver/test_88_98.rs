@@ -72,7 +72,7 @@ pub(crate) fn run_test_88<R: Read + Seek>(
     let quack = dict.replace_key_and_get_old(b"/Quack", ObjectHandle::parse(b"/Moo")?)?;
     assert_eq!(quack.unparse(), b"[ 1 2 3 ]");
     let nothing = dict.replace_key_and_get_old(b"/NotThere", ObjectHandle::null())?;
-    assert!(nothing.is_null());
+    assert!(nothing.try_is_null()?);
     assert_eq!(
         dict.unparse(),
         ObjectHandle::parse(
@@ -113,7 +113,7 @@ pub(crate) fn run_test_88<R: Read + Seek>(
         ObjectHandle::parse(b"[ << /P /Q /T /U >> (b) << /Z /Y /X /W >> ]")?.unparse()
     );
 
-    assert!(new_dict.remove_key_and_get_old(b"/M")?.is_null());
+    assert!(new_dict.remove_key_and_get_old(b"/M")?.try_is_null()?);
     assert_eq!(new_dict.remove_key_and_get_old(b"/P")?.unparse(), b"/Q");
     assert_eq!(
         new_dict.unparse(),
@@ -128,10 +128,10 @@ pub(crate) fn run_test_88<R: Read + Seek>(
     arr2.set_object_description(pdf, "test array")?;
     let arr2_removed_item = arr2.erase_array_item_and_get_old(50);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    assert!(arr2_removed_item?.is_null());
+    assert!(arr2_removed_item?.try_is_null()?);
     let root_removed_item = root.erase_array_item_and_get_old(0);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    assert!(root_removed_item?.is_null());
+    assert!(root_removed_item?.try_is_null()?);
     Ok(())
 }
 
@@ -497,7 +497,7 @@ pub(crate) fn run_test_94<R: Read + Seek>(
     let pages = crate::common::raw_page_handles(pdf)?;
     assert_eq!(pages.len(), 5);
     let p1 = pages[0].clone();
-    assert!(p1.try_get_key(b"/MediaBox")?.is_null());
+    assert!(p1.try_get_key(b"/MediaBox")?.try_is_null()?);
     {
         let mut page = PageObjectHelper::from_object_handle(p1.clone(), pdf);
         assert!(page.get_media_box(false)?.is_same_object_as(&root_media));
