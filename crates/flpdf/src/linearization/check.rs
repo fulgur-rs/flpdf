@@ -2221,6 +2221,31 @@ mod tests {
     }
 
     #[test]
+    fn check_hint_tables_rejects_shared_object_sequence_integer_overflow() {
+        let (file_bytes, mut pdf, pages, page_hints, mut shared_hints) =
+            linearized_two_page_inputs();
+        let mut computed = compute_hint_data(&mut pdf, &pages).expect("compute page users");
+        computed.part8_objects.clear();
+        shared_hints.nshared_total = shared_hints.nshared_first_page + 1;
+        shared_hints.first_shared_obj = i32::MAX as u32 as u64;
+        shared_hints.entries.push(Default::default());
+
+        let mut warnings = Vec::new();
+        let error = check_hint_tables_with_computed_data(
+            &mut pdf,
+            &pages,
+            computed,
+            fixture_hint_input(&file_bytes, &page_hints, &shared_hints, &mut warnings),
+        )
+        .expect_err("the last object number cannot wrap the signed qpdf identity");
+        assert!(matches!(
+            error,
+            LinearizationCheckError::InvalidParam { message }
+                if message == "shared object 4 sequence overflows qpdf int"
+        ));
+    }
+
+    #[test]
     fn check_hint_tables_reports_a_page_shared_identifier_missing_from_shared_table() {
         let (file_bytes, mut pdf, pages, page_hints, mut shared_hints) =
             linearized_two_page_inputs();
