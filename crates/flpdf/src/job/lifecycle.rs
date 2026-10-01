@@ -5485,6 +5485,30 @@ impl QPDFJobConfig<'_> {
         self
     }
 
+    /// Select qpdf's `--is-encrypted` encryption-status query.
+    ///
+    /// This is `QPDFJob::Config::isEncrypted`
+    /// (`libqpdf/QPDFJob_config.cc:239-244`). `QPDFJob::run` opens the input,
+    /// records encryption state, and returns qpdf's 0/2 status without
+    /// entering the writer path (`libqpdf/QPDFJob.cc:428-456,535-545`).
+    pub fn is_encrypted(&mut self) -> &mut Self {
+        self.job.configuration.is_encrypted = true;
+        self.job.configuration.require_output = false;
+        self
+    }
+
+    /// Select qpdf's `--requires-password` encryption-status query.
+    ///
+    /// This is `QPDFJob::Config::requiresPassword`
+    /// (`libqpdf/QPDFJob_config.cc:528-533`). `QPDFJob::run` opens the input
+    /// and returns qpdf's 0/2/3 authentication status without entering the
+    /// writer path (`libqpdf/QPDFJob.cc:428-456,545-557`).
+    pub fn requires_password(&mut self) -> &mut Self {
+        self.job.configuration.requires_password = true;
+        self.job.configuration.require_output = false;
+        self
+    }
+
     /// Select qpdf's embedded-file listing inspection branch.
     pub fn list_attachments(&mut self) -> &mut Self {
         self.job.configuration.list_attachments = true;

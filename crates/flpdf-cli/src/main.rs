@@ -3255,7 +3255,11 @@ fn main() {
         run_command(command, &overlay_specs)
     } else if args.is_encrypted {
         if args.page_ops.empty {
-            run_empty_document_encryption_status()
+            run_empty_document_encryption_status(
+                EncryptionStatusQuery::IsEncrypted,
+                &args.password,
+                args.no_warn,
+            )
         } else {
             match args.input.as_ref() {
                 Some(input) => run_is_encrypted(input, args.repair, &args.password, args.no_warn),
@@ -3264,7 +3268,11 @@ fn main() {
         }
     } else if args.requires_password {
         if args.page_ops.empty {
-            run_empty_document_encryption_status()
+            run_empty_document_encryption_status(
+                EncryptionStatusQuery::RequiresPassword,
+                &args.password,
+                args.no_warn,
+            )
         } else {
             match args.input.as_ref() {
                 Some(input) => {
@@ -8699,14 +8707,21 @@ fn run_show_pages(
 /// Outcome of attempting to open a possibly-encrypted document for an
 /// inspection subcommand, where (unlike normal processing) a failed
 /// password attempt is informative rather than fatal.
+#[cfg(test)]
 enum EncryptionProbe {
-    /// Opened successfully. The bool is `Pdf::is_encrypted()`.
-    Opened { encrypted: bool },
+    /// The document opened and was authenticated, or was not encrypted.
+    Opened,
     /// The file is encrypted but the supplied/empty password did not
     /// authenticate (`BadPassword`). qpdf can still report "encrypted" /
     /// "password required" without authenticating, so this is a normal
     /// classification here, not an error.
     EncryptedAuthFailed,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EncryptionStatusQuery {
+    IsEncrypted,
+    RequiresPassword,
 }
 
 /// Open `input` for a read-only encryption inspection (`is-encrypted` /
@@ -8718,6 +8733,7 @@ enum EncryptionProbe {
 /// qpdf applies its weak-crypto refusal to write/transform operations, not to
 /// these read-only inspections. Authentication still runs first, so a wrong
 /// password yields `BadPassword` exactly as before.
+#[cfg(test)]
 fn probe_encryption(
     input: &PathBuf,
     repair: bool,
@@ -8734,9 +8750,7 @@ fn probe_encryption(
         Ok(mut pdf) => {
             pdf.root_handle()
                 .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
-            Ok(EncryptionProbe::Opened {
-                encrypted: pdf.is_encrypted(),
-            })
+            Ok(EncryptionProbe::Opened)
         }
         // A wrong/empty password: the document is definitely encrypted, we
         // just have not authenticated it. qpdf treats this as "encrypted,
@@ -8754,17 +8768,61 @@ fn is_bad_password_error(error: &flpdf::Error) -> bool {
     )
 }
 
-/// `--empty --is-encrypted`/`--empty --requires-password`: silently exit 2.
+/// Run qpdf's `QPDFJob::createQPDF` → encryption-status early-return route.
 ///
-/// qpdf's `createQPDF` still builds an empty document for `--empty` before
-/// the encryption-status early return (`QPDFJob.cc:429-456,535-557`); an
-/// empty document is necessarily unencrypted, so both flags exit 2 without
-/// opening any file.
-fn run_empty_document_encryption_status() -> CliResult<()> {
-    Err(Box::new(CliExitError {
-        code: ExitCode::Errors,
-        message: String::new(),
-    }))
+/// `QPDFJob::run` owns this dispatch in qpdf (`QPDFJob.cc:428-456,535-557`):
+/// it opens the primary with job recovery/password policy, records the raw
+/// encryption status, and returns qpdf's status code without entering the
+/// ordinary writer path.
+fn run_encryption_status_query(
+    input: Option<&Path>,
+    empty_input: bool,
+    query: EncryptionStatusQuery,
+    repair: bool,
+    password: &PasswordArgs,
+    suppress_warnings: bool,
+) -> CliResult<()> {
+    let mut job = new_cli_job(suppress_warnings);
+    job.set_suppress_recovery(password.recovery.suppress_recovery);
+    job.set_ignore_xref_streams(password.recovery.ignore_xref_streams);
+    job.set_password_mode(password.password_mode.into());
+    job.set_password_is_hex_key(password.password_is_hex_key);
+    job.set_suppress_password_recovery(password.suppress_password_recovery);
+
+    if empty_input {
+        job.config().empty_input()?;
+    } else {
+        let input = input.ok_or_else(missing_input_usage_error)?;
+        job.set_input_file(input.to_path_buf())?;
+        // Reuse the CLI parser for raw password bytes and first-line file
+        // semantics. The Job then owns the open using its configured recovery
+        // policy, as qpdf's processFile boundary does.
+        let input_options = pdf_open_options(repair, password)?;
+        job.set_password(input_options.password);
+    }
+
+    {
+        let mut configuration = job.config();
+        match query {
+            EncryptionStatusQuery::IsEncrypted => {
+                configuration.is_encrypted();
+            }
+            EncryptionStatusQuery::RequiresPassword => {
+                configuration.requires_password();
+            }
+        }
+    }
+    finish_job_exit_status(job.run()?)
+}
+
+/// `--empty --is-encrypted`/`--empty --requires-password` use the same Job
+/// status dispatch as ordinary input, with qpdf's empty-input setup.
+fn run_empty_document_encryption_status(
+    query: EncryptionStatusQuery,
+    password: &PasswordArgs,
+    suppress_warnings: bool,
+) -> CliResult<()> {
+    run_encryption_status_query(None, true, query, false, password, suppress_warnings)
 }
 
 /// `is-encrypted FILE`: exit 0 if encrypted, exit 2 if not.
@@ -8775,25 +8833,19 @@ fn run_empty_document_encryption_status() -> CliResult<()> {
 /// password to `processFile`; it does not change the classification of an
 /// encrypted input, but password-file parsing and diagnostics remain visible.
 fn run_is_encrypted(
-    input: &PathBuf,
+    input: &Path,
     repair: bool,
     password: &PasswordArgs,
     suppress_warnings: bool,
 ) -> CliResult<()> {
-    let encrypted = match probe_encryption(input, repair, password, suppress_warnings)? {
-        EncryptionProbe::Opened { encrypted } => encrypted,
-        EncryptionProbe::EncryptedAuthFailed => true,
-    };
-    if encrypted {
-        Ok(()) // exit 0 — file is encrypted.
-    } else {
-        // Exit 2 — NOT an error here: qpdf_exit_is_not_encrypted = 2 means
-        // "file is not encrypted" for --is-encrypted specifically.
-        Err(Box::new(CliExitError {
-            code: ExitCode::Errors,
-            message: String::new(),
-        }))
-    }
+    run_encryption_status_query(
+        Some(input),
+        false,
+        EncryptionStatusQuery::IsEncrypted,
+        repair,
+        password,
+        suppress_warnings,
+    )
 }
 
 /// `requires-password FILE [--password ...]`: qpdf `--requires-password`.
@@ -8808,36 +8860,19 @@ fn run_is_encrypted(
 /// qpdf: a correct password yields 3 and a wrong/absent one yields 0, with no
 /// `--allow-weak-crypto` opt-in required (see `probe_encryption`).
 fn run_requires_password(
-    input: &PathBuf,
+    input: &Path,
     repair: bool,
     password: &PasswordArgs,
     suppress_warnings: bool,
 ) -> CliResult<()> {
-    match probe_encryption(input, repair, password, suppress_warnings)? {
-        EncryptionProbe::Opened { encrypted: false } => {
-            // Exit 2 — qpdf_exit_is_not_encrypted: file is not encrypted.
-            Err(Box::new(CliExitError {
-                code: ExitCode::Errors,
-                message: String::new(),
-            }))
-        }
-        EncryptionProbe::Opened { encrypted: true } => {
-            // Exit 3 — qpdf_exit_correct_password: encrypted, but the
-            // supplied/empty password opened it, so no other password is
-            // required. Reuses ExitCode::Warnings's numeric 3 with this
-            // subcommand-specific meaning.
-            Err(Box::new(CliExitError {
-                code: ExitCode::Warnings,
-                message: String::new(),
-            }))
-        }
-        EncryptionProbe::EncryptedAuthFailed => {
-            // Exit 0 — encrypted and a password OTHER than the one supplied
-            // is required (qpdf manual: "a password, other than as
-            // supplied, is required").
-            Ok(())
-        }
-    }
+    run_encryption_status_query(
+        Some(input),
+        false,
+        EncryptionStatusQuery::RequiresPassword,
+        repair,
+        password,
+        suppress_warnings,
+    )
 }
 
 /// `show-encryption-key FILE [--password ...]`: qpdf `--show-encryption-key`.
