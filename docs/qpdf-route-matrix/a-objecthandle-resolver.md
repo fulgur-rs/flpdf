@@ -947,18 +947,48 @@ separate. `TreeKey::is_valid_key` uses resolving `try_is_string`/
 `try_is_integer`, while `value_from_handle` uses qpdf-shaped
 `try_get_utf8_value`/`try_get_int_value`; `resolved_key` composes those
 operations. `update_current` uses the value accessor for every in-range
-iterator slot, matching qpdf `updateIValue`; `increment` calls key validity
-before advancing and skips malformed keys with qpdf's warning. The optional
-`LiveDictionary` lookup uses `try_is_null` on the returned child handle.
+iterator slot, matching qpdf `updateIValue`
+(`QPDFNameTreeObjectHelper.cc:88-98`,
+`QPDFNumberTreeObjectHelper.cc:90-100`). `increment` checks key validity after
+crossing into a `/Kids` leaf and skips malformed keys with qpdf's warning, as
+`NNTreeIterator::increment` does after `deepen` (`NNTree.cc:114-151`). The
+internal `find` lower-bound check keeps the raw cursor position and validates
+the key before comparison; malformed keys therefore reach binary search
+without conversion to a default iterator value (`NNTree.cc:840-852,781-792`).
+Repair traverses the raw iterator and inserts its raw handles, and removal
+advances a raw position before `increment` when deleting the last item or leaf
+(`NNTree.cc:807-816,903-919,440-445,483-489`). The Rust repair and removal
+paths keep that position unmaterialized until a typed cursor value is needed.
+Keyed removal returns directly from the raw `NNTreeImpl::remove`, while the
+public cursor helper calls `updateIValue` after removal
+(`NNTree.cc:942-953`, `QPDFNameTreeObjectHelper.cc:127-132`,
+`QPDFNumberTreeObjectHelper.cc:129-134`). The Rust keyed path therefore leaves
+the successor raw, and `NameTreeCursor::remove`/`NumberTreeCursor::remove`
+materialize it only after raw mutation completes. Raw removal still checks that
+the successor has both key and value slots (`NNTree.cc:53-60,446-450`). The
+optional `LiveDictionary` lookup uses `try_is_null` on the returned child
+handle.
 
 The RED/GREEN route contract covers all three former non-resolving production
 calls. Behavior tests cover indirect string/integer keys, qpdf's empty-string
 and zero defaults on wrong-typed iterator keys, malformed-key skip and warning
-order, structural find errors, and indirect-null `/Kids`. A pinned qpdf 11.9.0
-C++ probe confirms a direct unowned wrong-typed key raises `QPDFExc` from
-`typeWarning`; appending an uninitialized handle to a qpdf array throws before
-an NNTree exists, so it is excluded as an NNTree input. Focused name/number-tree,
-logger-failure, page-label, and embedded-files tests pass.
+order both within a leaf and across leaves, structural find errors, automatic
+repair warning order, keyed and cursor removal around malformed successors,
+short-pair errors after removal, deletion after malformed neighboring keys,
+and indirect-null `/Kids`. `find`
+tests assert that internal search emits no iterator-value type warnings.
+Pinned qpdf 11.9.0 C++ probes confirm that both tree helpers skip malformed
+keys across `next` and `previous` leaf transitions with one tree warning, that
+auto-repair leaves a wrong-first-key tree with its structural error and one
+repair warning, and that deleting the last leaf does not read a malformed key
+in the previous leaf. Keyed removal succeeds without a type warning for a
+malformed successor, while cursor removal exposes qpdf's direct typeWarning
+exception or indirect default value plus warning. The probes also confirm that
+a NumberTree search below an invalid first key raises the structural tree error
+and that a NameTree query can bypass an invalid first key when binary search
+reaches a later matching key. Appending an uninitialized handle to a qpdf array
+throws before an NNTree exists, so it is excluded as an NNTree input. Focused
+name/number-tree, logger-failure, page-label, and embedded-files tests pass.
 
 The post-cutover `qpdf-route-callers.py` inventory in this worktree based on
 main `810bd8d7` is 234 production calls across the nine symbols, down from
