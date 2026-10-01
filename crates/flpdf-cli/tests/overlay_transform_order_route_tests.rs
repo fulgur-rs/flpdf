@@ -159,6 +159,36 @@ fn standalone_check_uses_the_canonical_job_lifecycle() {
 }
 
 #[test]
+fn check_linearization_subcommand_uses_job_run() {
+    let source = production_main_source();
+    let route = source
+        .split_once("fn run_check_linearization(")
+        .and_then(|(_, tail)| tail.split_once("struct EncryptionCliOptions"))
+        .map(|(body, _)| body)
+        .expect("check-linearization subcommand route");
+
+    assert!(
+        route.contains("configuration.check_linearization()"),
+        "check-linearization subcommand must configure the canonical Job flag"
+    );
+    assert!(
+        route.contains("job.run()"),
+        "check-linearization subcommand must use QPDFJob::run"
+    );
+    for forbidden in [
+        "job.check_linearization(",
+        "job.show_linearization(",
+        "open_with_description(",
+        "File::open(",
+    ] {
+        assert!(
+            !route.contains(forbidden),
+            "check-linearization subcommand retains a direct route: {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn page_selection_overlay_uses_the_canonical_job_owner() {
     let source = production_main_source();
     let after_plan = source

@@ -4598,15 +4598,9 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             InspectionTransformOptions::new(ImageTransformOptions::default(), false, None),
             false,
         ),
-        Commands::CheckLinearization(cmd) => run_check_linearization(
-            Some(cmd.input),
-            false,
-            &PasswordArgs::default(),
-            false,
-            false,
-            InspectionTransformOptions::new(ImageTransformOptions::default(), false, None),
-            false,
-        ),
+        Commands::CheckLinearization(cmd) => {
+            run_check_linearization(cmd.input, false, &PasswordArgs::default(), false)
+        }
         Commands::Pages(cmd) => {
             if cmd.show_npages {
                 run_show_npages(
@@ -4959,30 +4953,25 @@ fn run_check(
 /// `flpdf check-linearization FILE`: the flpdf-native subcommand
 /// counterpart of `run_check` above -- same qpdf-grammar-free scope.
 fn run_check_linearization(
-    input: Option<PathBuf>,
+    input: PathBuf,
     repair: bool,
     password: &PasswordArgs,
     no_warn: bool,
-    empty: bool,
-    transform_options: InspectionTransformOptions<'_>,
-    verbose: bool,
 ) -> CliResult<()> {
-    if empty {
-        reject_empty_inspection_output(input.as_deref())?;
-        let mut job = new_cli_job(no_warn);
-        let mut pdf = create_empty_primary_document(&mut job, None)?;
-        apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-        return finish_job_exit_status(job.show_linearization(&mut pdf)?);
-    }
-    let input = input.ok_or_else(missing_input_usage_error)?;
-    let file = File::open(&input).map_err(|error| open_error_with_file(&input, error.into()))?;
     let mut job = new_cli_job(no_warn);
-    let options = pdf_open_options(repair, password)?;
-    let mut pdf = job
-        .open_with_description(BufReader::new(file), path_description(&input), options)
-        .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
-    apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-    finish_job_exit_status(job.check_linearization(&mut pdf)?)
+    {
+        let mut configuration = job.config();
+        configuration.check_linearization();
+    }
+    let input_options = pdf_open_options(repair, password)?;
+    job.set_password(input_options.password);
+    job.set_password_mode(password.password_mode.into());
+    job.set_password_is_hex_key(password.password_is_hex_key);
+    job.set_suppress_password_recovery(password.suppress_password_recovery);
+    job.set_suppress_recovery(password.recovery.suppress_recovery);
+    job.set_ignore_xref_streams(password.recovery.ignore_xref_streams);
+    job.set_input_file(input)?;
+    finish_job_exit_status(job.run()?)
 }
 
 struct EncryptionCliOptions<'a> {
