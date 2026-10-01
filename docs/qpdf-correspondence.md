@@ -4668,6 +4668,27 @@ caller-side `Pdf::resolve` はゼロになり、既存の indirect/direct assert
 と parse error の検証は保持される。case 42/98 の stream dictionary
 `getDict` 相当はこの bounded slice の対象外である。
 
+### qtest A6 test 24 reserved array type checks `flpdf-3yn9.48.208.11` (2026-10-02)
+
+qpdf test 24 asks `res1.isArray()` while the object is still reserved, then
+uses `assertArray()` after each `replaceReserved()` (`qpdf/test_driver.cc:882-945`).
+Both type-check paths resolve the handle: `isArray()` calls `dereference()`
+(`libqpdf/QPDFObjectHandle.cc:425-429`), and `assertArray()` delegates to `isArray()`
+(`libqpdf/QPDFObjectHandle.cc:2272-2276`). A fresh reserved value has type
+`ot_reserved` (`libqpdf/QPDF.cc:1900-1903`; `libqpdf/QPDF_Reserved.cc:5-7`), while the default
+`QPDFObject::resolve()` only invokes the resolver for `ot_unresolved`
+(`libqpdf/QPDFObjectHandle.cc:2375-2383`; `libqpdf/qpdf/QPDFObject_private.hh:155-167`). Thus
+the pre-replacement query returns false without disturbing the reservation;
+`replaceReserved()` installs the replacement at that same identity
+(`libqpdf/QPDF.cc:2008-2015`), and later type checks see the array.
+
+flpdf's `run_test_24` now routes its three reserved-array type observations
+through public `ObjectHandle::try_is_array()`. The existing
+`reserved_object_driver_matches_qpdf_output_and_writes_a_pdf` regression
+keeps the exact stdout, empty stderr, and written-file checks; the driver
+source contract also requires all three calls to use the resolving predicate.
+The workspace A6 row remains mixed because unrelated callers remain.
+
 ### Linearized root ADBE output ownership (`flpdf-3yn9.48.60`)
 
 `linearization/writer.rs::do_write_pass` emits each pass's Catalog through
