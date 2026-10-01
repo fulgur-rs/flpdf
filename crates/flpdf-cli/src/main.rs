@@ -8283,7 +8283,7 @@ fn apply_normalize_content(
             streams.push((stream_ref, contents));
         }
     } else if contents.try_is_array()? {
-        let items = contents.as_array().unwrap_or_default();
+        let items = contents.try_get_array_as_vector()?;
         for item in items {
             let item_ref = item.object_ref();
             if item.try_is_stream_of_type(b"", b"")? {

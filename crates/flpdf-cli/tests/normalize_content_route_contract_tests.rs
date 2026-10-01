@@ -30,10 +30,10 @@ fn normalize_content_uses_canonical_handle_accessors() {
         .find(".try_is_array()?")
         .expect("normalize-content must resolve the Contents array predicate");
     let array_view = source
-        .find(".as_array()")
-        .expect("normalize-content must retain a child view after the array predicate");
+        .find(".try_get_array_as_vector()?")
+        .expect("normalize-content must read array children through the resolving accessor");
     assert!(
         array_guard < array_view,
-        "the non-resolving array view must follow the resolving array predicate"
+        "the public array-vector access must follow the resolving array predicate"
     );
 }
