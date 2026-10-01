@@ -1386,6 +1386,51 @@ fn unrelated<R>((_first, _second): (usize, R)) {}
     );
 }
 
+/// A destructuring parameter does not create an unobserved carrier when its
+/// field belongs to a local struct: the field declaration itself is scanned
+/// and reports the `Pdf` type. The parameter pattern's outer `Holder` type is
+/// not treated as a `Pdf` merely because one field contains one.
+#[test]
+fn struct_destructuring_keeps_the_pdf_field_visible_at_its_declaration() {
+    let source = "\
+struct Holder<R> {
+    _pdf: Pdf<R>,
+}
+fn consume<R>(Holder { _pdf }: Holder<R>) {}
+";
+    let found: Vec<(usize, String, String)> = dead_pdf_carriers(source)
+        .into_iter()
+        .map(|carrier| (carrier.line, carrier.binding, carrier.owner))
+        .collect();
+    assert_eq!(
+        found,
+        vec![(2, "_pdf".to_owned(), "struct Holder".to_owned())]
+    );
+}
+
+/// An untyped closure parameter has no type node in the syntax tree. Inferring
+/// its expected type needs the call site, so the syntax-only guard leaves it
+/// open rather than treating every callback parameter as a PDF carrier.
+#[test]
+fn untyped_closure_parameter_waits_for_callsite_type_information() {
+    let source = "\
+fn accepts_callback<F: FnOnce(Pdf<()>)>(_callback: F) {}
+fn caller() {
+    accepts_callback(|_pdf| ());
+}
+";
+    assert!(dead_pdf_carriers(source).is_empty());
+}
+
+/// A macro pattern is not expanded by `syn`; its binding name is unavailable
+/// to this guard. The current production tree has no such carrier, and a
+/// fail-closed rule for this shape needs a macro-expansion-aware route map.
+#[test]
+fn macro_pattern_binding_waits_for_macro_expansion_aware_analysis() {
+    let source = "fn f<R>(bind!(_pdf): &mut Pdf<R>) {}\n";
+    assert!(dead_pdf_carriers(source).is_empty());
+}
+
 /// Two markers resolving to one declaration used to collapse into a single
 /// map entry, so a stale marker could ride along behind a valid one.
 #[test]
