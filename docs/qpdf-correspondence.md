@@ -4705,6 +4705,22 @@ keeps the exact stdout, empty stderr, and written-file checks; the driver
 source contract also requires all three calls to use the resolving predicate.
 The workspace A6 row remains mixed because unrelated callers remain.
 
+### qtest A6 test 24 trailer map assertion `flpdf-3yn9.48.208.14` (2026-10-02)
+
+qpdf's public `QPDFObjectHandle::getDictAsMap()` resolves its receiver through
+`asDictionary()`, returns the dictionary's literal key/value map, and warns
+while treating a non-dictionary as empty (`QPDFObjectHandle.hh:778-780`,
+`QPDFObjectHandle.cc:265-268,1012-1022`, `QPDF_Dictionary.cc:130-133`). The
+qpdf test 24 body does not inspect the trailer keys after `replaceReserved()`;
+the four key-spelling checks in flpdf's `run_test_24` are driver-local
+assertions. They now use public `ObjectHandle::try_get_dict_as_map()` so the
+receiver follows qpdf's lazy resolution boundary while the exact slashless
+key spellings remain checked. The existing
+`reserved_object_driver_matches_qpdf_output_and_writes_a_pdf` test keeps its
+stdout, stderr, and written-file assertions, and the route contract rejects
+the non-resolving dictionary accessor. A6 remains mixed for unrelated
+production callers.
+
 ### Linearized root ADBE output ownership (`flpdf-3yn9.48.60`)
 
 `linearization/writer.rs::do_write_pass` emits each pass's Catalog through

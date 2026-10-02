@@ -337,9 +337,12 @@ pub(crate) fn run_test_24<R: Read + Seek + 'static>(
         writeln!(stdout, "circular access and lazy resolution worked")?;
     }
 
-    let trailer_entries = trailer
-        .as_dictionary()
-        .expect("test 24 trailer remains a dictionary");
+    // These trailer key-spelling checks are flpdf-driver assertions; qpdf
+    // test 24 does not query these keys after replaceReserved. Use qpdf's
+    // resolving getDictAsMap boundary and retain the dictionary's literal keys
+    // (QPDFObjectHandle.hh:778-780; QPDFObjectHandle.cc:1012-1022;
+    // QPDF_Dictionary.cc:130-133).
+    let trailer_entries = trailer.try_get_dict_as_map()?;
     assert!(trailer_entries.contains_key(b"Array1".as_slice()));
     assert!(trailer_entries.contains_key(b"Array2".as_slice()));
     assert!(!trailer_entries.contains_key(b"/Array1".as_slice()));

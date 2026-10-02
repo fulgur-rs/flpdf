@@ -2170,6 +2170,15 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         !test_24.contains(".as_array()"),
         "test 24 must not use the non-resolving array snapshot"
     );
+    assert_eq!(
+        test_24.matches("try_get_dict_as_map()?").count(),
+        1,
+        "test 24 must inspect the trailer through qpdf's resolving dictionary-map accessor"
+    );
+    assert!(
+        !test_24.contains(".as_dictionary()"),
+        "test 24 must not snapshot the trailer through the non-resolving dictionary accessor"
+    );
 }
 
 fn token_stream_contains_try_operator(tokens: &proc_macro2::TokenStream) -> bool {
