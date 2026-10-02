@@ -206,11 +206,36 @@ fn compare_objects(
 
     match source_type {
         2 => Ok(true),
-        3 => compare_value(source.as_boolean(), emitted.as_boolean(), "boolean", stderr),
-        4 => compare_value(source.as_integer(), emitted.as_integer(), "integer", stderr),
-        5 => compare_value(source.as_real(), emitted.as_real(), "real", stderr),
-        6 => compare_value(source.as_string(), emitted.as_string(), "string", stderr),
-        7 => compare_value(source.as_name(), emitted.as_name(), "name", stderr),
+        3 => compare_value(
+            source.try_get_bool_value()?,
+            emitted.try_get_bool_value()?,
+            "boolean",
+            stderr,
+        ),
+        4 => compare_value(
+            source.try_get_int_value()?,
+            emitted.try_get_int_value()?,
+            "integer",
+            stderr,
+        ),
+        5 => compare_value(
+            source.try_get_real_value()?,
+            emitted.try_get_real_value()?,
+            "real",
+            stderr,
+        ),
+        6 => compare_value(
+            source.try_get_string_value()?,
+            emitted.try_get_string_value()?,
+            "string",
+            stderr,
+        ),
+        7 => compare_value(
+            source.try_get_name()?,
+            emitted.try_get_name()?,
+            "name",
+            stderr,
+        ),
         8 => compare_arrays(source, emitted, visited, stdout, stderr),
         9 => compare_dictionaries(source, emitted, visited, stdout, stderr),
         10 => {
@@ -225,8 +250,8 @@ fn compare_objects(
 }
 
 fn compare_value<T: PartialEq>(
-    source: Option<T>,
-    emitted: Option<T>,
+    source: T,
+    emitted: T,
     label: &str,
     stderr: &mut dyn Write,
 ) -> Result<bool> {
@@ -245,18 +270,18 @@ fn compare_arrays(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<bool> {
-    let source_items = source.as_array().ok_or_else(|| {
-        Error::Internal("test_renumber source array type has no array value".into())
-    })?;
-    let emitted_items = emitted.as_array().ok_or_else(|| {
-        Error::Internal("test_renumber emitted array type has no array value".into())
-    })?;
-    if source_items.len() != emitted_items.len() {
+    let source_items = source.try_get_array_n_items()?;
+    let emitted_items = emitted.try_get_array_n_items()?;
+    if source_items != emitted_items {
         writeln!(stderr, "different array size")?;
         return Ok(false);
     }
-    for (source_item, emitted_item) in source_items.iter().zip(emitted_items.iter()) {
-        if !compare_objects(source_item, emitted_item, visited, stdout, stderr)? {
+    for index in 0..source_items {
+        let index = i64::try_from(index)
+            .map_err(|_| Error::Internal("test_renumber array index exceeds i64".into()))?;
+        let source_item = source.try_get_array_item(index)?;
+        let emitted_item = emitted.try_get_array_item(index)?;
+        if !compare_objects(&source_item, &emitted_item, visited, stdout, stderr)? {
             writeln!(stderr, "different array item")?;
             return Ok(false);
         }
@@ -271,14 +296,8 @@ fn compare_dictionaries(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<bool> {
-    let source_entries = source.as_dictionary().ok_or_else(|| {
-        Error::Internal("test_renumber source dictionary type has no dictionary value".into())
-    })?;
-    let emitted_entries = emitted.as_dictionary().ok_or_else(|| {
-        Error::Internal("test_renumber emitted dictionary type has no dictionary value".into())
-    })?;
-    let source_keys: BTreeSet<_> = source_entries.keys().cloned().collect();
-    let emitted_keys: BTreeSet<_> = emitted_entries.keys().cloned().collect();
+    let source_keys = source.try_get_keys()?;
+    let emitted_keys = emitted.try_get_keys()?;
     if source_keys != emitted_keys {
         writeln!(stderr, "different dictionary keys")?;
         return Ok(false);
@@ -371,6 +390,73 @@ mod tests {
             !compare_objects(&source, &emitted, &mut visited, &mut stdout, &mut stderr,).unwrap()
         );
         assert_eq!(stderr, b"different integer\n");
+    }
+
+    #[test]
+    fn object_comparison_resolves_each_value_family() {
+        let scalar_pairs = [
+            (ObjectHandle::boolean(true), ObjectHandle::boolean(true)),
+            (ObjectHandle::integer(42), ObjectHandle::integer(42)),
+            (
+                ObjectHandle::parse(b"1.25").unwrap(),
+                ObjectHandle::parse(b"1.25").unwrap(),
+            ),
+            (
+                ObjectHandle::string(b"text".to_vec()),
+                ObjectHandle::string(b"text".to_vec()),
+            ),
+            (
+                ObjectHandle::name(b"Name".to_vec()),
+                ObjectHandle::name(b"Name".to_vec()),
+            ),
+        ];
+        for (source, emitted) in scalar_pairs {
+            let mut visited = BTreeSet::new();
+            assert!(compare_objects(
+                &source,
+                &emitted,
+                &mut visited,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap());
+        }
+
+        let source = ObjectHandle::array(vec![
+            ObjectHandle::integer(1),
+            ObjectHandle::parse(b"2.5").unwrap(),
+        ]);
+        let emitted = ObjectHandle::array(vec![
+            ObjectHandle::integer(1),
+            ObjectHandle::parse(b"2.5").unwrap(),
+        ]);
+        let mut visited = BTreeSet::new();
+        assert!(compare_objects(
+            &source,
+            &emitted,
+            &mut visited,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap());
+
+        let source = ObjectHandle::dictionary(vec![(
+            b"/Value".to_vec(),
+            ObjectHandle::name(b"same".to_vec()),
+        )]);
+        let emitted = ObjectHandle::dictionary(vec![(
+            b"/Value".to_vec(),
+            ObjectHandle::name(b"same".to_vec()),
+        )]);
+        let mut visited = BTreeSet::new();
+        assert!(compare_objects(
+            &source,
+            &emitted,
+            &mut visited,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap());
     }
 
     #[test]
