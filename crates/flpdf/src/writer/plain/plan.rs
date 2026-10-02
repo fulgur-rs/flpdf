@@ -1580,7 +1580,7 @@ mod tests {
         ))
         .unwrap();
         let trailer = pdf.trailer();
-        trailer.remove_key(b"/Info");
+        trailer.remove_key(b"/Info").expect("remove dictionary key");
         trailer
             .replace_key(b"/ A", ObjectHandle::integer(1))
             .unwrap();

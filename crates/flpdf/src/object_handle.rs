@@ -1,6 +1,8 @@
 //! The core object-handle graph: shared, cloneable identity for direct and
 //! indirect PDF objects, with parsed-offset tracking and document-owned
 //! reserved-object construction.
+//! Stream data replacement still uses unchecked dictionary removal and does
+//! not yet match qpdf's resolution behavior for an indirect stream dictionary.
 //!
 //! qpdf correspondence: `QPDFObjectHandle`, `QPDFObject`, and `QPDFValue` identity and payload ownership, `QPDF::newReserved`/`QPDF_Reserved`, `QPDFObjectHandle::copyStream`/`QPDF::copyStreamData` stream-copy primitives, and `QPDF::setImmediateCopyFrom`.
 //!
@@ -4762,13 +4764,13 @@ impl ObjectHandle {
             self.type_warning("dictionary", "ignoring key removal request")?;
             return Ok(ObjectHandle::null());
         }
-        self.remove_key(key);
+        self.remove_key(key)?;
         Ok(old.unwrap_or_else(ObjectHandle::null))
     }
 
     fn replace_key_unchecked(&self, key: &[u8], value: ObjectHandle) {
         if value.is_direct() && value.is_null() {
-            self.remove_key(key);
+            self.remove_key_unchecked(key);
             return;
         }
         if self.is_direct_value_alias(&value) {
@@ -5412,17 +5414,27 @@ impl ObjectHandle {
         roots
     }
 
-    /// Remove `key` from this handle's dictionary if present, mutating the
-    /// live value every other clone of this handle also observes — mirrors
-    /// `QPDFObjectHandle::removeKey` (`libqpdf/QPDFObjectHandle.cc:1226-1234`).
-    /// A no-op if `key` is absent, this handle is not a dictionary, or the
-    /// indirect handle is unresolved/destroyed. `key` must be qpdf's
-    /// decoded, canonical dictionary key including its leading `/`; this API
-    /// does not normalize slashless input. Never performs resolution itself.
+    /// Resolve this handle and remove `key` from its dictionary, mutating the
+    /// live value observed by every alias. This mirrors
+    /// `QPDFObjectHandle::removeKey` (`libqpdf/QPDFObjectHandle.cc:1228-1237`).
+    /// A missing key is a no-op. A non-dictionary receiver emits a type
+    /// warning. `key` is qpdf's decoded key including its leading `/`.
     ///
-    /// See [`Self::replace_key`]'s doc comment for the same canonical
-    /// resolution behavior.
-    pub fn remove_key(&self, key: &[u8]) {
+    /// # Errors
+    ///
+    /// Propagates resolution and warning-delivery failures. A type mismatch
+    /// without an owning document returns [`Error::QpdfExc`], matching qpdf's
+    /// exception instead of silently ignoring the operation.
+    pub fn remove_key(&self, key: &[u8]) -> Result<()> {
+        if self.prepare_dictionary_mutation("ignoring key removal request")? {
+            self.remove_key_unchecked(key);
+        }
+        Ok(())
+    }
+
+    // The storage operation corresponding to QPDF_Dictionary::removeKey.
+    // Resolution and type diagnostics belong to the public handle boundary.
+    fn remove_key_unchecked(&self, key: &[u8]) {
         let _removed = self.with_value_mut(|v| {
             if let Some(ObjectValue::Dictionary(entries)) = v {
                 return entries.remove(key);
@@ -6526,7 +6538,8 @@ impl ObjectHandle {
             dict.replace_key_unchecked(b"/DecodeParms", decode_parms);
         }
         if length == 0 {
-            dict.remove_key(b"/Length");
+            // qpdf-deviation: legacy stream setup still uses unchecked dictionary storage; qpdf QPDF_Stream::replaceFilterData calls resolving removeKey. The stream-model cutover removes this remaining consumer.
+            dict.remove_key_unchecked(b"/Length");
         } else {
             dict.replace_key_unchecked(
                 b"/Length",
@@ -6958,10 +6971,13 @@ impl ObjectHandle {
         let dict = stream_dict
             .shallow_copy()
             .map_err(|error| ObjectJsonError::Pdf(error.to_string()))?;
-        dict.remove_key(b"/Length");
+        dict.remove_key(b"/Length")
+            .map_err(|error| ObjectJsonError::Pdf(error.to_string()))?;
         if filter && filtered {
-            dict.remove_key(b"/Filter");
-            dict.remove_key(b"/DecodeParms");
+            dict.remove_key(b"/Filter")
+                .map_err(|error| ObjectJsonError::Pdf(error.to_string()))?;
+            dict.remove_key(b"/DecodeParms")
+                .map_err(|error| ObjectJsonError::Pdf(error.to_string()))?;
         }
 
         match json_data {
@@ -10407,7 +10423,7 @@ pub(crate) mod identity_tests {
         let child = ObjectHandle::dictionary(vec![]);
         parent.replace_key(b"/Child", child.clone()).unwrap();
 
-        parent.remove_key(b"/Child");
+        parent.remove_key(b"/Child").expect("remove dictionary key");
 
         assert!(child.belongs_to_pdf(41));
         assert!(child.belongs_to_pdf(42));
@@ -11590,7 +11606,7 @@ mod uniform_identity_tests {
         );
 
         child.promote_to_indirect(ObjectRef::new(83, 0), 112, Rc::downgrade(&resolver));
-        outer.remove_key(b"/Child");
+        outer.remove_key(b"/Child").expect("remove dictionary key");
         child.disconnect();
         assert!(child.containing_object_refs_for_pdf(111).is_empty());
     }
@@ -15619,21 +15635,25 @@ mod mutation_tests {
     #[test]
     fn remove_key_deletes_a_present_key() {
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
-        dict.remove_key(b"/A");
+        dict.remove_key(b"/A").expect("remove dictionary key");
         assert!(dict.try_get_key(b"/A").unwrap().is_null());
     }
 
     #[test]
     fn remove_key_on_a_missing_key_is_a_no_op() {
         let dict = ObjectHandle::dictionary(vec![]);
-        dict.remove_key(b"/Missing");
+        dict.remove_key(b"/Missing").expect("remove dictionary key");
         assert!(dict.try_get_key(b"/Missing").unwrap().is_null());
     }
 
     #[test]
-    fn remove_key_on_a_non_dictionary_handle_is_a_no_op() {
+    fn remove_key_on_a_contextless_non_dictionary_reports_the_type_error() {
         let scalar = ObjectHandle::integer(1);
-        scalar.remove_key(b"/A");
+        let error = scalar
+            .remove_key(b"/A")
+            .expect_err("no document to receive the warning");
+        assert!(matches!(error, Error::QpdfExc(error)
+            if error.get_message_detail() == b"operation for dictionary attempted on object of type integer: ignoring key removal request"));
         assert_eq!(scalar.as_integer(), Some(1));
     }
 
@@ -15651,9 +15671,9 @@ mod mutation_tests {
             .collect(),
         ));
 
-        owner.remove_key(b"/A");
+        owner.remove_key(b"/A").expect("remove dictionary key");
         assert_eq!(child.containing_object_refs(), vec![owner_ref]);
-        owner.remove_key(b"/B");
+        owner.remove_key(b"/B").expect("remove dictionary key");
         assert!(child.containing_object_refs().is_empty());
     }
 
@@ -15784,7 +15804,7 @@ mod mutation_tests {
             [(b"Shared".to_vec(), shared.clone())].into_iter().collect(),
         ));
 
-        first.remove_key(b"/Shared");
+        first.remove_key(b"/Shared").expect("remove dictionary key");
 
         assert_eq!(shared.containing_object_refs(), vec![second_ref]);
     }
@@ -16868,7 +16888,7 @@ mod mutation_tests {
             .replace_key(b"/A", ObjectHandle::integer(1))
             .unwrap();
         assert_eq!(indirect.try_get_key(b"/A").unwrap().as_integer(), Some(1));
-        indirect.remove_key(b"/A");
+        indirect.remove_key(b"/A").expect("remove dictionary key");
         assert!(indirect.try_get_key(b"/A").unwrap().is_null());
     }
 
@@ -16948,7 +16968,11 @@ mod mutation_tests {
             error,
             Error::Internal(message) if message == "object 1 0 belongs to a dropped PDF"
         ));
-        indirect.remove_key(b"/A"); // legacy no-resolution helper remains safe
+        let error = indirect
+            .remove_key(b"/A")
+            .expect_err("resolve before removal");
+        assert!(matches!(error, Error::Internal(message)
+            if message == "object 1 0 belongs to a dropped PDF"));
         assert!(indirect.try_get_key(b"/A").is_err());
     }
 
@@ -18571,7 +18595,7 @@ pub(crate) mod warning_emission_tests {
             .value
             .is_same_object_as(&dictionary.try_get_key(b"/A").unwrap()));
 
-        dictionary.remove_key(b"/A");
+        dictionary.remove_key(b"/A").expect("remove dictionary key");
         let removed = cursor.current();
         assert_eq!(removed.key, b"/A");
         assert!(!cursor.is_end());

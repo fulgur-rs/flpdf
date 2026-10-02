@@ -4421,7 +4421,7 @@ impl QPDFJob {
     {
         if configuration.remove_page_labels {
             let root = pdf.root_handle()?;
-            root.remove_key(b"/PageLabels"); // cov:ignore: the validated Catalog mutation has no qpdf failure branch
+            root.remove_key(b"/PageLabels")?; // cov:ignore: the validated Catalog mutation has no qpdf failure branch
         }
         let Some(specs) = configuration.set_page_labels.as_deref() else {
             return Ok(());

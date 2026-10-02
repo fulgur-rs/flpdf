@@ -1914,7 +1914,11 @@ inline の `no_data_key`、`pipeStreamData` の最大二回試行と raw fallbac
 `datafile`/`dict` の出力、実効 `DecodeLevel` の返却を一つの責務として持つ。
 ストリーム source は `ObjectHandle::pipe_stream_data` (`object_handle.rs`:
 4393-) を通り、辞書の shallow copy は `ObjectHandle::shallow_copy` と
-`remove_key` を使う。
+`remove_key` を使う。公開 `remove_key` はqpdfの`removeKey`
+（`libqpdf/QPDFObjectHandle.cc:1228-1237`）と同じく辞書を解決し、型警告・例外を伝播する。
+一方、streamデータ置換の `replace_filter_data` は `/Length` のunchecked削除が残る。
+qpdfの `libqpdf/QPDF_Stream.cc:678-680` との差は、任意の辞書handleを受け入れる
+直接stream factoryと併せて `flpdf-6ik2q.8` で解消する。
 
 `document_json.rs` は `QPDF_json.cc:917-925` 相当の object-map framing と、
 `writeJSONStreamFile` (`QPDF_json.cc:834-849`) 相当の side-file 作成・明示 finish

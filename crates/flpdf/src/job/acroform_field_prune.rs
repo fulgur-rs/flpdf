@@ -242,7 +242,7 @@ pub(crate) fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
         // matching qpdf's observed behaviour. `reserved_indirect_fields`
         // (if any) is intentionally left allocated but unlinked here,
         // matching qpdf's own orphaned `new_fields` object in this case.
-        catalog.remove_key(b"/AcroForm");
+        catalog.remove_key(b"/AcroForm")?;
     } else {
         // qpdf creates a fresh array for an indirect /Fields holder and
         // replaces the key on the live AcroForm handle. A direct holder
@@ -324,25 +324,13 @@ fn field_has_retained_widget_with_depth_limit(
     Ok(false)
 }
 
-/// Preserve a valid widget `/P` and remove only a dangling (nulled) page ref.
+/// Remove a widget `/P` whose target belongs to the removed-page set.
 ///
-/// qpdf establishes `/P` during copied-annotation graph remapping, not through
-/// a generic page-owner repair pass. In the production route, this runs after
-/// [`crate::job::remap_outline_and_dests`], which already
-/// replaces every genuinely removed original page-tree leaf with `null` in
-/// place (`null_removed_pages`, page-driven, independent of how it is
-/// referenced) — so a `/P` pointing at a removed page already resolves to
-/// a null object by the time this runs there. This function is also a public
-/// API entry point that a caller may invoke directly after
-/// [`crate::pages::tree_rebuild::rebuild_page_tree`] without that null-out
-/// step, so `removed_pages` (the same original-leaf drop set the null-out
-/// pass keys on) is checked independently of the target's current null
-/// state — a widget's `/P` pointing at a genuinely dropped page is always
-/// removed, whether or not it has been nulled yet. A live off-tree object
-/// that merely carries `/Type /Page` but was never in the removed-page set
-/// must therefore be preserved verbatim, matching qpdf's untouched
-/// first-primary-occurrence path. Only dictionaries are inspected — widget
-/// annotations should not be streams, but we guard defensively.
+/// The public pruning caller can run before removed pages are replaced with
+/// null, so it also supplies the original page removal set. A target already
+/// resolving to null is invisible to `hasKey`; its raw entry remains for
+/// writer dictionary null suppression, as in qpdf. References outside the
+/// removal set are preserved without inferring ownership from `/Type`.
 fn remove_stale_widget_page_ref(
     widget: &ObjectHandle,
     retained_page_objgens: &BTreeSet<QpdfObjGen>,
@@ -359,13 +347,11 @@ fn remove_stale_widget_page_ref(
         return Ok(());
     }
     if removed_pages.contains(&existing_gen) {
-        widget.remove_key(b"/P");
+        widget.remove_key(b"/P")?;
         return Ok(());
     }
-    if !existing.try_is_null()? {
-        return Ok(());
-    }
-    widget.remove_key(b"/P");
+    // try_has_key above has already resolved /P and rejected null values.
+    // Any remaining reference is neither retained nor explicitly removed.
     Ok(())
 }
 
@@ -416,7 +402,7 @@ fn strip_dropped_widget_p_refs(
         if is_widget {
             if !widget_to_page.contains_key(&kid.identity_key()) {
                 // Widget on a dropped page — remove stale /P.
-                kid.remove_key(b"/P");
+                kid.remove_key(b"/P")?;
             }
             // Pure widget kids do not have /Kids of their own (spec: a widget
             // annotation is a leaf); no need to recurse.
@@ -662,6 +648,24 @@ mod tests {
 
         let retained = BTreeSet::from([QpdfObjGen::new(3, 0)]);
         remove_stale_widget_page_ref(&widget, &retained, &BTreeSet::new()).unwrap();
+    }
+
+    #[test]
+    fn nulled_page_reference_is_left_for_writer_null_suppression() {
+        let mut pdf = Pdf::empty().unwrap();
+        let null_page = pdf
+            .make_indirect_object_handle(ObjectHandle::null())
+            .unwrap();
+        let widget = ObjectHandle::dictionary(vec![(b"/P".to_vec(), null_page)]);
+
+        remove_stale_widget_page_ref(&widget, &BTreeSet::new(), &BTreeSet::new()).unwrap();
+
+        assert!(!widget.try_has_key(b"/P").unwrap());
+        assert!(widget
+            .as_dictionary()
+            .unwrap()
+            .contains_key(b"/P".as_slice()));
+        assert_eq!(widget.try_unparse_resolved().unwrap(), b"<< >>");
     }
 
     #[test]
@@ -1043,7 +1047,7 @@ mod tests {
         for &r in &[ObjectRef::new(7, 0), ObjectRef::new(9, 0)] {
             let widget = pdf.get_object_handle(r);
             widget.try_is_scalar().unwrap();
-            widget.remove_key(b"/P");
+            widget.remove_key(b"/P").expect("remove dictionary key");
         }
 
         // Extract pages 1 and 2 (objects 3 and 4).

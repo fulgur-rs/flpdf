@@ -662,7 +662,7 @@ impl<R: Read + Seek> Pdf<R> {
         // qpdf calls removeKey unconditionally. A present null-valued key is
         // still removed even though QPDF_Dictionary::hasKey treats it as
         // absent (`libqpdf/QPDF_Dictionary.cc:98-101,150-153`).
-        catalog.remove_key(b"/Perms");
+        catalog.remove_key(b"/Perms")?;
 
         let acroform = catalog.try_get_key(b"/AcroForm")?;
         if acroform.try_is_dictionary()? && acroform.try_has_key(b"/SigFlags")? {
@@ -1968,7 +1968,7 @@ mod compressible_owner_tests {
         let mut pdf = pdf();
         let root = pdf.root_handle().unwrap();
         for key in root.try_get_keys().unwrap() {
-            root.remove_key(&key);
+            root.remove_key(&key).expect("remove dictionary key");
         }
         let a = pdf
             .make_indirect_from_object_handle(ObjectHandle::integer(1))
@@ -2055,7 +2055,8 @@ mod compressible_owner_tests {
             0,
             "document traversal must not pipe stream providers"
         );
-        root.remove_key(b"/ZLengthElsewhere");
+        root.remove_key(b"/ZLengthElsewhere")
+            .expect("remove dictionary key");
         let without_length = pdf.get_compressible_objgens().unwrap();
         assert!(!without_length.contains(&length.object_ref().unwrap()));
         assert!(!without_length.contains(&sig.object_ref().unwrap()));

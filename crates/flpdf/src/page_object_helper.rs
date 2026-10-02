@@ -973,7 +973,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let suffix = self.pdf.new_stream_with_data(Rc::new(b"\nQ\n".to_vec()))?;
         self.add_page_contents(suffix, false)?;
 
-        page.remove_key(b"/Rotate");
+        page.remove_key(b"/Rotate")?;
         // `getAttribute(..., false)` is qpdf's inherited lookup after the
         // direct key is removed. If an ancestor supplied rotation, materialize
         // the zero that masks it on this page.

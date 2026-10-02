@@ -396,7 +396,7 @@ fn remove_inheritable_keys_from_page_tree<R: Read + Seek>(
         }
 
         for key in inheritable_keys {
-            node.remove_key(key);
+            node.remove_key(key)?;
         }
     }
     Ok(())
@@ -653,7 +653,7 @@ fn rebuild_page_tree_canonical<R: Read + Seek>(
     // retained rebuilt root and the now-orphaned intermediate nodes are all
     // subject to that same cleanup.
     remove_inheritable_keys_from_page_tree(pdf, &page_tree_nodes)?;
-    root.remove_key(b"/Parent");
+    root.remove_key(b"/Parent")?;
 
     // Reparent every retained page through the same live root handle. This is
     // qpdf's `flattenPagesTree` `replaceKey("/Parent", pages)` operation, and

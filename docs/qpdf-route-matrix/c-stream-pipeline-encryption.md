@@ -269,6 +269,12 @@ decode level / compress の設定源: `setStreamDataMode`（`libqpdf/QPDFWriter.
 
 ### C-8. `replaceStreamData` / `replaceFilterData` の `/Length` 契約と public 面
 
+残件: `ObjectHandle::remove_key` は解決・型警告・例外伝播を行うが、
+`ObjectHandle::replace_filter_data` の `/Length` 削除は既存のunchecked storage経路に残る。
+qpdf は `libqpdf/QPDF_Stream.cc:678-680` で resolving `removeKey` を呼ぶ。
+任意の未解決辞書を受け入れる直接stream factoryの撤去と合わせて
+`flpdf-6ik2q.8`で移行する（公開primitiveの前提は`flpdf-6ik2q.2`）。
+
 - `replaceFilterData(filter, decode_parms, length)`（`libqpdf/QPDF_Stream.cc:668-685`）: `filter` /
   `decode_parms` は `isInitialized()` のときだけ `replaceKey`（**未初期化 handle = 現状維持**、null =
   削除。`include/qpdf/QPDFObjectHandle.hh:1080-1084`）。`length == 0` → `/Length` 削除、それ以外 →

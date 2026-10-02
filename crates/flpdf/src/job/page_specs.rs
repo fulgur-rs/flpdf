@@ -210,7 +210,7 @@ pub fn copy_duplicate_page_annotations<R: Read + Seek>(
         };
         let source_page = pdf.get_object_handle(source_page_ref);
         let destination_page = pdf.get_object_handle(new_page);
-        destination_page.remove_key(b"/Annots");
+        destination_page.remove_key(b"/Annots")?;
         PageObjectHelper::new(new_page, pdf).copy_annotations(source_page, Matrix::default())?;
     }
     Ok(())
@@ -657,7 +657,7 @@ fn prune_page_spec_acroform_fields<R: Read + Seek>(
     let fields = collect_primary_fields(primary, selected_pages)?;
     replacement.try_set_array_items(fields)?;
     if replacement.try_array_len()?.unwrap_or_default() == 0 {
-        catalog.remove_key(b"/AcroForm");
+        catalog.remove_key(b"/AcroForm")?;
     } else {
         acroform.replace_key(b"/Fields", replacement)?;
     }
@@ -937,7 +937,7 @@ fn remove_empty_acroform_after_replay<T: Read + Seek>(
     let fields = acroform.try_get_key(b"/Fields")?;
     fields.try_dereference()?;
     if fields.try_array_len()?.is_some_and(|length| length == 0) {
-        root.remove_key(b"/AcroForm");
+        root.remove_key(b"/AcroForm")?;
     }
     Ok(())
 }
@@ -1107,7 +1107,7 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static, T: Read + Seek
         }
 
         let destination_page = merged.get_object_handle(final_refs[output_index]);
-        destination_page.remove_key(b"/Annots");
+        destination_page.remove_key(b"/Annots")?;
         let allocation_checkpoint = merged.allocation_checkpoint();
 
         if source_index == 0 {
@@ -1968,7 +1968,9 @@ mod tests {
 
     fn pdf_without_root() -> Pdf<Cursor<Vec<u8>>> {
         let mut pdf = Pdf::empty().expect("empty PDF");
-        pdf.trailer().remove_key(b"/Root");
+        pdf.trailer()
+            .remove_key(b"/Root")
+            .expect("remove dictionary key");
         assert!(pdf.root_ref().is_none());
         pdf
     }

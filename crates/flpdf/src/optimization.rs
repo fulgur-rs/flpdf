@@ -944,7 +944,8 @@ mod tests {
         let mut pdf = Pdf::empty().expect("empty PDF");
         pdf.root_handle()
             .expect("empty catalog")
-            .remove_key(b"/Pages");
+            .remove_key(b"/Pages")
+            .expect("remove dictionary key");
 
         Optimization::optimize(&mut pdf, &BTreeMap::new(), true, no_stream_parameter_skip)
             .expect("qpdf tolerates a missing page tree while optimizing");

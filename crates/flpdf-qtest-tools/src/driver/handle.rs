@@ -361,7 +361,7 @@ fn remove_identity_crypt_stages_handle(
         .as_name()
         .is_some_and(|name| normalized_filter_name(&name) == b"Crypt")
     {
-        dictionary.remove_key(b"/Filter");
+        dictionary.remove_key(b"/Filter")?;
     } else if let Some(values) = filter.as_array() {
         dictionary.replace_key(
             b"/Filter",
