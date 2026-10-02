@@ -13,6 +13,32 @@ fn function_body<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 }
 
 #[test]
+fn attachment_output_uses_one_qpdfjob_run() {
+    let cli = include_str!("../../flpdf-cli/src/main.rs");
+    let route = function_body(
+        cli,
+        "fn run_configured_attachment_job(",
+        "\nfn cli_copy_encryption(",
+    );
+
+    assert_eq!(
+        route.matches("job.run()?").count(),
+        1,
+        "attachment output must finish through one QPDFJob::run()"
+    );
+    for staged_route in [
+        "job.create_qpdf()",
+        "job.write_qpdf(",
+        "job.get_exit_code()",
+    ] {
+        assert!(
+            !route.contains(staged_route),
+            "attachment output must not own a staged call to {staged_route}"
+        );
+    }
+}
+
+#[test]
 fn attachment_consumers_use_canonical_handle_routes() {
     let src = source_root();
     let attachment_list = fs::read_to_string(src.join("job/attachment_list.rs"))
