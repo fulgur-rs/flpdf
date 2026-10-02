@@ -6,8 +6,8 @@ mod qpdf_help;
 use clap::{Args as ClapArgs, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use flpdf::fix_qdf;
 use flpdf::job::{
-    AttachmentAddOptions, CheckError, FlattenAnnotationsMode, ImageOptimizationOptions,
-    JobExitCode, JsonStreamData, QPDFJob, RemoveUnreferencedResources,
+    AttachmentAddOptions, FlattenAnnotationsMode, ImageOptimizationOptions, JobExitCode,
+    JsonStreamData, QPDFJob, RemoveUnreferencedResources,
 };
 use flpdf::pipeline::{FlateAction, Pipeline, PipelineHandle, PlFlate, PlStdioFile};
 use flpdf::qutil::parse_numrange;
@@ -3909,15 +3909,6 @@ fn run_combined_top_level_inspection(
     finish_job_exit_status(job.run()?)
 }
 
-fn create_empty_primary_document(
-    job: &mut QPDFJob,
-    update_from_json: Option<&Path>,
-) -> CliResult<flpdf::job::JobDocument> {
-    let mut pdf = job.create_empty_document()?;
-    apply_json_update_with_job(job, &mut pdf, update_from_json)?;
-    Ok(pdf)
-}
-
 struct QpdfCliPreflight {
     job: QPDFJob,
 }
@@ -4340,34 +4331,9 @@ fn run_json_input_inspection(
 ) -> CliResult<()> {
     if cli.page_ops.empty {
         reject_empty_inspection_output(cli.input.as_deref())?;
-        let mut job = new_cli_job(cli.no_warn);
-        configure_top_level_inspection_job(&mut job, cli)?;
-        configure_cli_overlay_specs(&mut job, overlay_specs)?;
-        configure_top_level_inspection_transformations(
-            &mut job,
-            transform_options,
-            cli.verbose,
-            cli.remove_restrictions,
-            cli.coalesce_contents,
-        )?;
-        if cli.show_attachment.is_some() {
-            job.logger().save_to_standard_output(true)?;
-        }
-        configure_top_level_attachment_mutations(&mut job, cli, attachment_segments)?;
-        let mut pdf = create_empty_primary_document(&mut job, cli.update_from_json.as_deref())?;
-        job.apply_transformations(&mut pdf)?;
-        return run_job_inspection_on_pdf(cli, &mut job, &mut pdf);
     }
-    let input = cli.input.as_ref().ok_or_else(missing_input_usage_error)?;
-    let mut job = QPDFJob::new();
-    job.set_warnings_exit_zero(cli_warning_exit_zero());
-    // This route builds its job directly rather than through `new_cli_job`,
-    // so it needs the same carry (`QPDFJob.cc:505-509` prints from whichever
-    // job finished the run, and `--json` finishes one like any other route).
-    job.set_report_memory_usage(cli_report_memory_usage());
-    job.set_logger(cli_logger());
-    job.set_message_prefix(progname());
-    job.set_suppress_warnings(cli.no_warn);
+
+    let mut job = new_cli_job(cli.no_warn);
     configure_top_level_inspection_job(&mut job, cli)?;
     configure_cli_overlay_specs(&mut job, overlay_specs)?;
     configure_top_level_inspection_transformations(
@@ -4382,64 +4348,37 @@ fn run_json_input_inspection(
     }
     configure_top_level_attachment_mutations(&mut job, cli, attachment_segments)?;
 
-    let file = File::open(input).map_err(|error| {
+    if cli.page_ops.empty {
+        job.config().empty_input()?;
+    } else {
+        let input = cli.input.as_ref().ok_or_else(missing_input_usage_error)?;
+        job.set_input_file(input.clone())?;
+    }
+
+    // qpdf's argv callback reads --password-file even for JSON/empty input,
+    // before createQPDF starts. Resolve it before run and carry the resulting
+    // bytes plus the remaining open policy onto this Job.
+    let input_options = pdf_open_options(cli.repair, &cli.password)?;
+    job.set_password(input_options.password);
+    job.set_password_mode(cli.password.password_mode.into());
+    job.set_password_is_hex_key(cli.password.password_is_hex_key);
+    job.set_suppress_password_recovery(cli.password.suppress_password_recovery);
+    job.set_suppress_recovery(cli.password.recovery.suppress_recovery);
+    job.set_ignore_xref_streams(cli.password.recovery.ignore_xref_streams);
+    {
+        let mut configuration = job.config();
         if cli.json_input {
-            qpdf_json_input_open_error(input, error)
-        } else {
-            open_error_with_file(input, error.into())
+            configuration.json_input();
         }
-    })?;
-
-    if cli.json_input {
-        let mut pdf = job
-            .create_from_json_document(file, path_description(input))
-            .map_err(|error| json_error_with_file(input, Box::new(error)))?;
-        apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
-        job.apply_transformations(&mut pdf)?;
-        return run_job_inspection_on_pdf(cli, &mut job, &mut pdf);
+        if let Some(update_from_json) = cli.update_from_json.as_deref() {
+            configuration.update_from_json(update_from_json.to_path_buf());
+        }
     }
 
-    let mut options = pdf_open_options(cli.repair, &cli.password)?;
-    if cli.check {
-        // `--check` is a read-only inspection and re-emits collected
-        // diagnostics once in its check report rather than delivering them
-        // during input creation.
-        options.suppress_warnings = true;
-    } else if cli.show_encryption {
-        // `--show-encryption` has no deferred-replay report body (unlike
-        // `--check`): open-time diagnostics are either delivered live
-        // (matching qpdf's un-suppressed `--show-encryption` output) or, with
-        // `--no-warn`, dropped entirely (matching qpdf, which prints no
-        // WARNING lines at all in that case; see `run_show_encryption`).
-        options.suppress_warnings = cli.no_warn;
-    }
-    let mut pdf =
-        match job.open_with_description(BufReader::new(file), path_description(input), options) {
-            Ok(pdf) => pdf,
-            Err(error) => {
-                job.report_open_failure(&error)?;
-                return Err(error_with_file(input, actionable_password_error(error)));
-            }
-        };
-    apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
-    job.apply_transformations(&mut pdf)?;
-    run_job_inspection_on_pdf(cli, &mut job, &mut pdf)
-}
-
-fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
-    cli: &Cli,
-    job: &mut QPDFJob,
-    pdf: &mut Pdf<R>,
-) -> CliResult<()> {
-    configure_top_level_inspection_job(job, cli)?;
-    match job.inspect_configured(pdf) {
-        Ok(status) => finish_job_exit_status(status),
-        Err(CheckError::ErrorsDetected) => Err(Box::new(CliExitError {
-            code: ExitCode::Errors,
-            message: String::new(),
-        })),
-        Err(CheckError::Operation(error)) => Err(Box::new(error)),
-    }
+    // The Job owns JSON/file/empty input creation, JSON updates, create-stage
+    // transformations, configured inspection, warning completion, and status
+    // in qpdf's `run` order (`QPDFJob.cc:429-520,1645-1714`).
+    finish_job_exit_status(job.run()?)
 }
 
 fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()> {
@@ -7494,20 +7433,6 @@ fn reject_same_file(
     Ok(())
 }
 
-fn qpdf_json_input_open_error(input: &Path, error: std::io::Error) -> Box<dyn std::error::Error> {
-    // qpdf-deviation: for a directory job-JSON path, qpdf 11.9.0 leaks
-    // libstdc++'s basic_string::_M_create; that toolchain artifact has no
-    // qpdf semantic contract to reproduce in Rust, so this shares
-    // qpdf_open_io_error_message's own portable "Is a directory" wording
-    // instead like every other kind here.
-    let message = qpdf_open_io_error_message(&error);
-    let mut raw_message = b"open ".to_vec();
-    raw_message.extend_from_slice(&path_description(input));
-    raw_message.extend_from_slice(b": ");
-    raw_message.extend_from_slice(message.as_bytes());
-    Box::new(flpdf::Error::SystemBytes(raw_message))
-}
-
 /// qpdf's `QUtil::string_to_int` uses `strtoll`: it accepts a signed decimal
 /// prefix and returns zero when no digits are present. Used by
 /// `--compress=N`/`-compress=N` (`run_zlib_flate`) and `--compression-level`
@@ -7785,19 +7710,6 @@ fn hex_lower(bytes: &[u8]) -> String {
         out.push_str(&format!("{b:02x}"));
     }
     out
-}
-
-fn apply_json_update_with_job<R: Read + Seek + 'static>(
-    job: &mut QPDFJob,
-    pdf: &mut Pdf<R>,
-    update_from_json: Option<&Path>,
-) -> CliResult<()> {
-    if let Some(path) = update_from_json {
-        let source = File::open(path).map_err(|error| qpdf_json_input_open_error(path, error))?;
-        job.update_from_json(pdf, source, path_description(path))
-            .map_err(|error| json_error_with_file(path, Box::new(error)))?;
-    }
-    Ok(())
 }
 
 /// Open for the read-only encryption inspections (`show-encryption`,
@@ -8206,24 +8118,6 @@ fn strerror_from_display(error: &std::io::Error) -> String {
         .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
         .unwrap_or(&rendered)
         .to_owned()
-}
-
-fn json_error_with_file(
-    input: &Path,
-    error: Box<dyn std::error::Error>,
-) -> Box<dyn std::error::Error> {
-    let path = path_description(input);
-    let lossy_path = String::from_utf8_lossy(&path);
-    let message = error
-        .to_string()
-        .strip_prefix(&format!("{lossy_path}: "))
-        .map_or_else(|| error.to_string(), str::to_owned);
-    Box::new(CliPathError {
-        path,
-        operation: None,
-        message,
-        source: error,
-    })
 }
 
 fn actionable_password_error(error: flpdf::Error) -> Box<dyn std::error::Error> {
@@ -9168,42 +9062,6 @@ mod tests {
             error.to_string(),
             "QPDFLogger: called setSave on standard output after standard output has already been used"
         );
-    }
-
-    #[test]
-    fn json_input_open_error_uses_qpdf_not_found_wording() {
-        let error = qpdf_json_input_open_error(
-            Path::new("missing.json"),
-            std::io::Error::from(std::io::ErrorKind::NotFound),
-        );
-
-        assert_eq!(
-            error.to_string(),
-            "open missing.json: No such file or directory"
-        );
-    }
-
-    /// The four kinds this helper previously fell through on. It now shares
-    /// `qpdf_open_io_error_message`'s table, which renders qpdf's portable
-    /// `strerror` wording on every host rather than Rust's native text.
-    /// A synthetic error carries no `errno`, so this exercises the table
-    /// itself rather than the raw-code path a real syscall failure takes.
-    #[test]
-    fn json_input_open_error_uses_qpdf_wording_for_every_kind() {
-        for (kind, expected) in [
-            (std::io::ErrorKind::PermissionDenied, "Permission denied"),
-            (std::io::ErrorKind::AlreadyExists, "File exists"),
-            (std::io::ErrorKind::InvalidInput, "Invalid argument"),
-            (std::io::ErrorKind::NotADirectory, "Not a directory"),
-        ] {
-            let error =
-                qpdf_json_input_open_error(Path::new("in.json"), std::io::Error::from(kind));
-            assert_eq!(
-                error.to_string(),
-                format!("open in.json: {expected}"),
-                "{kind:?}"
-            );
-        }
     }
 
     #[test]
