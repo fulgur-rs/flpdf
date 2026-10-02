@@ -4349,23 +4349,11 @@ fn run_json(
         cli.coalesce_contents,
     )?;
     job.set_show_encryption_key(cli.show_encryption_key);
-    // `QPDFJob::createQPDF` runs `checkConfiguration` before it opens the
-    // primary input (`libqpdf/QPDFJob.cc:428-431`). It assigns the implicit
-    // JSON destination `-` when no output file was given and reserves standard
-    // output for the JSON document, so warnings and later info cannot claim
-    // the stream the document itself needs (`:582-586,613-625`).
-    job.check_configuration()?;
-
-    let mut pdf = match job.create_qpdf()? {
-        Some(pdf) => pdf,
-        None => {
-            return Err(Box::new(CliExitError {
-                code: ExitCode::Errors,
-                message: String::new(),
-            }))
-        }
-    };
-    run_json_document(&mut job, &mut pdf)
+    // `QPDFJob::run` enters `create_qpdf`, which owns configuration checks,
+    // implicit JSON destination selection, and stdout reservation before the
+    // primary input opens. It then writes JSON and completes warnings on the
+    // same job (`QPDFJob.cc:428-431,484-503,582-586,613-625`).
+    finish_job_exit_status(job.run()?)
 }
 
 fn run_json_input_inspection(
@@ -4475,31 +4463,6 @@ fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
             message: String::new(),
         })),
         Err(CheckError::Operation(error)) => Err(Box::new(error)),
-    }
-}
-
-/// Write one already-created job document through the job's own write stage.
-///
-/// `QPDFJob::writeQPDF` dispatches on `createsOutput()` and, for a JSON job,
-/// reaches `writeJSON` through `writeOutfile`, which picks the destination
-/// from the job's own output name (`libqpdf/QPDFJob.cc:484-489,3031-3042,
-/// 3093-3115`). The CLI therefore configures the destination and hands the
-/// document over rather than selecting an output itself.
-fn run_json_document<R: Read + Seek + 'static>(
-    job: &mut QPDFJob,
-    pdf: &mut Pdf<R>,
-) -> CliResult<()> {
-    match job.write_qpdf(pdf) {
-        Ok(()) => finish_job_exit_status(job.get_exit_code()),
-        // qpdf's `QPDFUsage` escapes `writeQPDF` uncaught and is rendered by
-        // `usageExit` (`qpdf/qpdf.cc:37-38`); `writeJSON` raises one for a
-        // stdout destination that cannot name its stream side files.
-        Err(Error::Usage(error)) => Err(Box::new(error)),
-        // Every other write failure has already been reported by the job.
-        Err(_) => Err(Box::new(CliExitError {
-            code: ExitCode::Errors,
-            message: String::new(),
-        })),
     }
 }
 

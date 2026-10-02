@@ -415,6 +415,38 @@ fn json_flag_outputs_json_to_stdout() {
 }
 
 #[test]
+fn top_level_json_output_uses_one_qpdfjob_run() {
+    let source = include_str!("../src/main.rs");
+    let route = source
+        .split_once("fn run_json(")
+        .expect("top-level JSON output route should remain named")
+        .1
+        .split_once("\nfn run_json_input_inspection")
+        .expect("JSON input inspection route should follow top-level JSON output")
+        .0;
+
+    assert!(
+        route.contains("finish_job_exit_status(job.run()?)"),
+        "top-level JSON output must complete through one QPDFJob::run()"
+    );
+    for staged_route in [
+        "job.create_qpdf()",
+        "run_json_document(",
+        "job.write_qpdf(",
+        "job.get_exit_code()",
+    ] {
+        assert!(
+            !route.contains(staged_route),
+            "top-level JSON output must not own the staged call {staged_route}"
+        );
+    }
+    assert!(
+        !source.contains("fn run_json_document<"),
+        "the staged JSON document writer should be removed when unused"
+    );
+}
+
+#[test]
 fn json_output_file_verbose_reports_wrote_file_like_qpdf() {
     if skip_unless_qpdf_11_9() {
         return;
