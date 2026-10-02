@@ -635,6 +635,16 @@ fn object_handle_api_test_93_uses_canonical_promotion_route() {
 }
 
 #[test]
+fn object_handle_api_test_93_resolves_both_trailer_keys() {
+    driver()
+        .args(["93", minimal_pdf(), "-"])
+        .assert()
+        .code(0)
+        .stdout("test 93 done\n")
+        .stderr("");
+}
+
+#[test]
 fn test_93_reports_a_non_dictionary_root_like_qpdf() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let input = directory.path().join("bad-root.pdf");
