@@ -837,6 +837,39 @@ mod tests {
     }
 
     #[test]
+    fn page_merge_copy_turns_a_superseded_missing_array_generation_into_direct_null() {
+        let mut source = minimal_pdf();
+        let stale_ref = ObjectRef::new(42, 0);
+        let stale = source.get_object_handle(stale_ref);
+        source
+            .replace_object(ObjectRef::new(42, 1), ObjectHandle::integer(99))
+            .expect("register a newer cached generation");
+        assert!(stale
+            .try_is_null()
+            .expect("resolve missing stale generation"));
+        assert!(stale.has_newer_cached_generation());
+
+        let root = source
+            .make_indirect_object_handle(ObjectHandle::array(vec![stale]))
+            .expect("root array");
+        let mut target = minimal_pdf();
+
+        let copied = copy_foreign_object_with_stale_generation_policy(&mut target, &root, true)
+            .expect("copy with the primary page-merge stale-generation policy");
+        let copied_stale = copied
+            .try_get_array_item(0)
+            .expect("read copied stale-generation array item");
+
+        assert!(copied_stale.is_null());
+        assert!(copied_stale.is_direct());
+        assert_eq!(
+            target.foreign_object_map_snapshot(source.unique_id()).len(),
+            1,
+            "only the root should be reserved; qpdf removes the superseded child"
+        );
+    }
+
+    #[test]
     fn copy_foreign_stream_preserves_a_raw_generation_identity() {
         let raw_ref = ObjectRef::new(5, 65_535);
         let mut source = minimal_pdf();
