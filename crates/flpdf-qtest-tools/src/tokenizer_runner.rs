@@ -343,7 +343,7 @@ fn canonical_page_content_bytes<R: Read + Seek>(
         return Ok(Vec::new());
     }
 
-    let contents = page.get_key(b"/Contents");
+    let contents = page.try_get_key(b"/Contents")?;
     let contents_was_indirect = contents.object_ref().is_some();
     pdf.resolve(&contents)?;
     let contents = contents.clone();
@@ -414,7 +414,10 @@ fn collect_canonical_content_streams<R: Read + Seek>(
 }
 
 fn resolve_objstm_type(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>, dict: &ObjectHandle) -> bool {
-    let type_handle = dict.get_key(b"/Type");
+    let type_handle = match dict.try_get_key(b"/Type") {
+        Ok(handle) => handle,
+        Err(_) => return false,
+    };
     // qpdf's getKey()/isName() dereference through the canonical object
     // handle. Resolve the parsed child once, while keeping the decode
     // boundary below in its existing Dictionary-shaped form.
