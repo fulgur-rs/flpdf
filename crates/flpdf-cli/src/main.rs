@@ -6008,9 +6008,10 @@ fn run_rewrite_with_qpdf_job(
     split_pages: Option<&str>,
     remove_unreferenced_resources: RemoveUnreferencedResources,
 ) -> CliResult<()> {
-    // qpdf's createQPDF owns input creation and all document transformations;
-    // QPDFJob::write_qpdf owns the pre-write normalization pass for linearized
-    // output after this function installs the same writer configuration.
+    // qpdf's run lifecycle owns input creation, document transformations, and
+    // output. Storing the writer options before run is a configuration
+    // assignment only; write_qpdf still validates and applies them at its
+    // writer boundary after create_qpdf (`QPDFJob.cc:429-520,522-564`).
     let job_options = options.clone();
 
     let mut job = configure_rewrite_job(
@@ -6054,18 +6055,6 @@ fn run_rewrite_with_qpdf_job(
         }
     }
 
-    let mut pdf = match job.create_qpdf()? {
-        Some(pdf) => pdf,
-        None => {
-            return Err(Box::new(CliExitError {
-                code: ExitCode::Errors,
-                message: String::new(),
-            }))
-        }
-    };
-    // qpdf constructs writer options inside writeOutfile, after createQPDF;
-    // keep password normalization and weak-crypto validation at that same
-    // boundary rather than exposing them during input creation.
     let mut writer_options = job_options;
     if decrypt {
         writer_options.preserve_encryption = false;
@@ -6075,13 +6064,7 @@ fn run_rewrite_with_qpdf_job(
         linearize,
         linearize_pass1,
     )?);
-    match job.write_qpdf(&mut pdf) {
-        Ok(()) => finish_job_exit_status(job.get_exit_code()),
-        Err(_) => Err(Box::new(CliExitError {
-            code: ExitCode::Errors,
-            message: String::new(),
-        })),
-    }
+    finish_job_exit_status(job.run()?)
 }
 
 #[allow(clippy::too_many_arguments)]
