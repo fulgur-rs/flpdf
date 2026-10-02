@@ -4653,16 +4653,8 @@ impl ObjectHandle {
     /// from a file carries the parser's QPDF context. In either case,
     /// containment alone never confers ownership. A direct null removes the
     /// key, while an indirect null or dangling indirect reference is retained
-    /// as the dictionary value. Also a no-op if `value` is a direct handle
-    /// sharing `self`'s value state — inserting it into the dictionary would
-    /// otherwise create a direct cycle, which this crate's recursive walkers
-    /// would meet as unbounded recursion because they stop only at an
-    /// indirect-handle boundary. This check does not detect a multi-hop
-    /// reciprocal cycle built from two or more `replace_key` calls across
-    /// distinct direct dictionaries. Those walkers survive such a cycle
-    /// anyway: [`Self::shallow_copy`] and [`Self::unparse_resolved`] stop at
-    /// the parser's container-nesting limit and report
-    /// [`Error::Unsupported`] rather than recursing without end.
+    /// as the dictionary value. Direct self references and aliases of the
+    /// dictionary's shared value are inserted with their original identity.
     /// `key` must be qpdf's decoded, canonical dictionary key including its
     /// leading `/`; this API does not normalize slashless input.
     ///
@@ -4680,14 +4672,14 @@ impl ObjectHandle {
     ///
     /// Returns [`Error::Internal`] when the value belongs to a different
     /// document than the dictionary receiver, matching qpdf's
-    /// `checkOwnership` failure boundary.
+    /// `checkOwnership` failure boundary. Receiver/value resolution and
+    /// type-warning delivery failures are propagated.
     pub fn replace_key(&self, key: &[u8], value: ObjectHandle) -> Result<()> {
         if !self.prepare_dictionary_mutation("ignoring key replacement request")? {
             return Ok(());
         }
         self.check_key_value_ownership(&value)?;
-        self.replace_key_unchecked(key, value);
-        Ok(())
+        self.replace_dictionary_key(key, value)
     }
 
     /// Replace `key` and return the supplied value, mirroring
@@ -4731,12 +4723,25 @@ impl ObjectHandle {
         Ok(old.unwrap_or_else(ObjectHandle::null))
     }
 
+    // QPDF_Dictionary::replaceKey resolves isNull before inspecting indirectness.
+    fn replace_dictionary_key(&self, key: &[u8], value: ObjectHandle) -> Result<()> {
+        if value.try_is_null()? && !value.is_indirect() {
+            self.remove_key_unchecked(key);
+        } else {
+            self.with_value_mut(|current| {
+                if let Some(ObjectValue::Dictionary(entries)) = current {
+                    entries.insert(key.to_vec(), value);
+                }
+            });
+        }
+        Ok(())
+    }
+
+    // qpdf-deviation: stream construction/mutation still uses non-resolving
+    // replacement; canonical dictionary mutation uses replace_dictionary_key.
     fn replace_key_unchecked(&self, key: &[u8], value: ObjectHandle) {
         if value.is_direct() && value.is_null() {
             self.remove_key_unchecked(key);
-            return;
-        }
-        if self.is_direct_value_alias(&value) {
             return;
         }
         self.with_value_mut(|v| {
@@ -4767,10 +4772,7 @@ impl ObjectHandle {
     /// a logic error for a foreign or destroyed item. `Error::Internal` is the
     /// crate's logic-error boundary. A contextless qpdf warning is likewise
     /// returned as the existing `type_warning`/`object_warning` error.
-    /// For process safety, flpdf rejects a direct item whose direct-child graph
-    /// already reaches this array with [`Error::Internal`]. qpdf's `setAt`
-    /// does not detect that cycle, but qpdf's later `makeDirect` traversal does
-    /// reject loops with a visited set (`libqpdf/QPDFObjectHandle.cc:2091-2133`).
+    /// Direct self references are accepted, as in qpdf's `setAt`.
     /// This remains public because qpdf exposes the same live mutation on
     /// `QPDFObjectHandle`; external canonical consumers must not replace an
     /// indirect array through its parent dictionary or copy it into a separate
@@ -4790,10 +4792,6 @@ impl ObjectHandle {
             return self.object_warning("ignoring attempt to set out of bounds array item");
         }
 
-        if self.would_create_direct_cycle(&value) {
-            return Err(Self::direct_cycle_error());
-        }
-
         self.check_array_item_ownership(&value)?;
         let _old_value = self.with_value_mut(|current| {
             let Some(ObjectValue::Array(items)) = current else {
@@ -4810,19 +4808,11 @@ impl ObjectHandle {
     /// are then checked and inserted one at a time, so an ownership error at
     /// item `n` intentionally leaves the accepted prefix in place, matching
     /// qpdf's non-transactional `resize(0)` plus `push_back` loop.
-    /// A direct replacement that would make the array graph cyclic returns
-    /// [`Error::Internal`] as the flpdf process-safety boundary; qpdf's
-    /// `setFromVector` itself checks ownership only.
+    /// Self references are accepted; each item is checked for ownership only.
     /// The canonical writer observes this live mutation directly.
     pub fn set_array_items(&self, items: Vec<ObjectHandle>) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to replace items")? {
             return Ok(());
-        }
-        if items
-            .iter()
-            .any(|item| self.would_create_direct_cycle(item))
-        {
-            return Err(Self::direct_cycle_error());
         }
 
         let expected_len = items.len();
@@ -4854,10 +4844,7 @@ impl ObjectHandle {
     /// Insert one item at an inclusive array position, porting qpdf's
     /// `insertItem` (`libqpdf/QPDFObjectHandle.cc:895-907`). Position `size`
     /// is the append position; larger positions warn without checking item
-    /// ownership or changing the array. A direct item whose descendants
-    /// already reach this array returns [`Error::Internal`] to keep recursive
-    /// live-handle walkers terminating; qpdf's `insert` does not perform this
-    /// cycle check.
+    /// ownership or changing the array. Direct self references are accepted.
     /// The canonical writer observes this live mutation directly.
     pub fn insert_array_item(&self, index: usize, value: ObjectHandle) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to insert item")? {
@@ -4869,10 +4856,6 @@ impl ObjectHandle {
         );
         if !in_bounds {
             return self.object_warning("ignoring attempt to insert out of bounds array item");
-        }
-
-        if self.would_create_direct_cycle(&value) {
-            return Err(Self::direct_cycle_error());
         }
 
         self.check_array_item_ownership(&value)?;
@@ -4897,9 +4880,7 @@ impl ObjectHandle {
     /// length, warns and leaves the receiver untouched.
     ///
     /// Follows the same insertion/warning/ownership path as
-    /// [`Self::insert_array_item`]. A direct-cycle rejection is propagated
-    /// as [`Error::Internal`], so no handle is returned for a mutation that
-    /// was not inserted.
+    /// [`Self::insert_array_item`], including resolution and ownership errors.
     ///
     /// qpdf correspondence: `insertItemAndGetNew`.
     pub fn insert_array_item_and_get_new(
@@ -4913,17 +4894,11 @@ impl ObjectHandle {
 
     /// Append one item to the live array, porting qpdf's `appendItem`
     /// (`libqpdf/QPDFObjectHandle.cc:916-925`, `libqpdf/QPDF_Array.cc:300-313`).
-    /// A direct item whose descendants already reach this array returns
-    /// [`Error::Internal`] to keep recursive live-handle walkers terminating;
-    /// qpdf's `push_back` checks ownership but does not perform this cycle
-    /// check.
+    /// Direct self references are accepted; qpdf's `push_back` checks ownership.
     /// The canonical writer observes this live mutation directly.
     pub fn append_array_item(&self, value: ObjectHandle) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to append item")? {
             return Ok(());
-        }
-        if self.would_create_direct_cycle(&value) {
-            return Err(Self::direct_cycle_error());
         }
 
         self.check_array_item_ownership(&value)?;
@@ -4944,9 +4919,7 @@ impl ObjectHandle {
     /// untouched.
     ///
     /// Follows the same append/warning/ownership path as
-    /// [`Self::append_array_item`]. A direct-cycle rejection is propagated
-    /// as [`Error::Internal`], so no handle is returned for a mutation that
-    /// was not appended.
+    /// [`Self::append_array_item`], including resolution and ownership errors.
     ///
     /// qpdf correspondence: `appendItemAndGetNew`.
     pub fn append_array_item_and_get_new(&self, value: ObjectHandle) -> Result<ObjectHandle> {
@@ -5155,9 +5128,6 @@ impl ObjectHandle {
     /// array or `index` is out of bounds.
     #[cfg(test)]
     pub(crate) fn replace_array_item(&self, index: usize, value: ObjectHandle) -> bool {
-        if self.would_create_direct_cycle(&value) {
-            return false; // cov:ignore: exercised by replace_array_item_preserves_identity_and_rejects_invalid_slots but attributed to closure setup
-        }
         let old_value = self.with_value_mut(|current| {
             let Some(ObjectValue::Array(items)) = current else {
                 return None; // cov:ignore: exercised by replace_array_item_preserves_identity_and_rejects_invalid_slots but attributed to closure setup
@@ -5171,16 +5141,9 @@ impl ObjectHandle {
     }
 
     /// Replace every item in this live array while preserving the array
-    /// handle itself. Returns `false` for a non-array handle or when the
-    /// replacement would create a direct value-alias cycle.
+    /// handle itself. Returns `false` for a non-array handle.
     #[cfg(test)]
     pub(crate) fn replace_array_items(&self, items: Vec<ObjectHandle>) -> bool {
-        if items
-            .iter()
-            .any(|item| self.would_create_direct_cycle(item))
-        {
-            return false;
-        }
         let old_items = self.with_value_mut(|current| {
             let Some(ObjectValue::Array(current_items)) = current else {
                 return None;
@@ -5191,55 +5154,6 @@ impl ObjectHandle {
             return false;
         };
         true
-    }
-
-    /// True if `other` is a direct handle sharing this handle's value state.
-    /// A direct alias of an indirect container is still a direct cycle when
-    /// inserted into that container, while an indirect child remains a legal
-    /// PDF reference boundary for recursive walks.
-    fn is_direct_value_alias(&self, other: &Self) -> bool {
-        if !other.is_direct() {
-            return false;
-        }
-        let self_shared = self.0.borrow().shared.clone();
-        let other_shared = other.0.borrow().shared.clone();
-        Rc::ptr_eq(&self_shared, &other_shared)
-    }
-
-    fn direct_cycle_error() -> Error {
-        Error::Internal("attempted to create a direct object cycle".to_owned())
-    }
-
-    /// Return whether inserting `candidate` as a direct child would make a
-    /// direct-child path reach `self`. Indirect handles are recursion
-    /// boundaries in the same way they are for materialization and unparse,
-    /// so an indirect candidate or an indirect descendant is not traversed.
-    /// The visited set also makes this guard total if a pre-existing direct
-    /// cycle came from a dictionary path or an internal caller.
-    fn would_create_direct_cycle(&self, candidate: &Self) -> bool {
-        if !candidate.is_direct() {
-            return false;
-        }
-
-        let target_shared = self.0.borrow().shared.clone();
-        let target_id = Rc::as_ptr(&target_shared) as usize;
-        let mut pending = vec![candidate.clone()];
-        let mut visited = BTreeSet::new();
-
-        while let Some(handle) = pending.pop() {
-            let shared = handle.0.borrow().shared.clone();
-            let identity = Rc::as_ptr(&shared) as usize;
-            if identity == target_id {
-                return true;
-            }
-            if !visited.insert(identity) {
-                continue;
-            }
-            let children = Self::direct_children(&shared.borrow().value);
-            pending.extend(children.into_iter().filter(|child| child.is_direct()));
-        }
-
-        false
     }
 
     fn direct_children(value: &ObjectValue) -> Vec<ObjectHandle> {
@@ -5537,6 +5451,9 @@ impl ObjectHandle {
     ) -> Result<Self> {
         self.try_dereference()?;
         let identity = self.identity_key();
+        // qpdf-deviation: this visited set includes direct handles, whereas
+        // qpdf's QPDFObjGen::set ignores them; traversal parity remains separate
+        // from the dictionary/array mutation contract.
         if !visited.insert(identity.clone()) {
             return Err(Error::System(
                 "loop detected while converting object from indirect to direct".to_owned(),
@@ -7961,15 +7878,10 @@ const UNPARSE_STACK_GROWTH_SIZE: usize = 1024 * 1024;
 // recurses until the process runs out of memory. Parsed input cannot reach
 // that shape -- `parser.rs` caps direct container nesting at
 // `MAX_PARSE_DEPTH` and the direct containers it builds are trees -- but
-// [`ObjectHandle::replace_key`] accepts it from a library caller, since it
-// refuses only the single-hop self-insert and not the two-hop pair
-// `a.replace_key(b"/B", b)` plus `b.replace_key(b"/A", a)`. The array
-// mutators reject it already ([`ObjectHandle::set_array_item`] and its
-// siblings gate on `would_create_direct_cycle`, a full reachability walk),
-// so the dictionary path is the only way in. Bounding both walkers at the
-// parser's own limit turns such a graph into a diagnostic instead of
-// resource exhaustion, and leaves every graph the parser can produce
-// untouched.
+// the public dictionary and array mutators accept such graphs, matching
+// qpdf's mutation contract. The depth cap below is a separate traversal
+// deviation; it also rejects finite programmatically constructed graphs
+// beyond the parser limit and remains tracked independently.
 //
 // `ObjectHandle::make_direct` deliberately stays outside this hub even
 // though it shares the stack constants above. It is the one walker here
@@ -12668,16 +12580,8 @@ mod resolution_state_tests {
         // test `is_indirect`, and a direct container that holds itself makes
         // that read re-enter the node the walk is already positioned on. The
         // walk must not be holding a mutable borrow of that node by then.
-        // `replace_key` privatizes the value it stores, so the cycle is
-        // installed on the map directly to keep the entry the very same
-        // allocation as its container.
         let owner = ObjectHandle::dictionary(vec![]);
-        let self_reference = owner.clone();
-        owner.with_value_mut(|value| {
-            if let Some(ObjectValue::Dictionary(entries)) = value {
-                entries.insert(b"/Self".to_vec(), self_reference);
-            }
-        });
+        owner.replace_key(b"/Self", owner.clone()).unwrap();
 
         owner.disconnect();
 
@@ -12688,6 +12592,7 @@ mod resolution_state_tests {
             .next()
             .expect("its single entry")
             .is_same_object_as(&owner));
+        owner.remove_key(b"/Self").unwrap();
     }
 
     #[test]
@@ -14900,7 +14805,9 @@ mod mutation_tests {
 
         assert!(!array.replace_array_item(1, ObjectHandle::integer(2)));
         assert!(!ObjectHandle::integer(1).replace_array_item(0, ObjectHandle::integer(2)));
-        assert!(!array.replace_array_item(0, array.clone()));
+        assert!(array.replace_array_item(0, array.clone()));
+        assert!(array.as_array().unwrap()[0].is_same_object_as(&array));
+        assert!(array.replace_array_items(Vec::new()));
     }
 
     #[test]
@@ -14983,180 +14890,55 @@ mod mutation_tests {
     }
 
     #[test]
-    fn public_array_mutators_report_direct_self_aliases() {
+    fn public_array_mutators_accept_self_and_preserve_bounds_warning_order() {
         let array = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
-
-        let set_error = array
-            .set_array_item(0, array.clone())
-            .expect_err("direct self replacement is rejected");
-        assert!(matches!(
-            set_error,
-            Error::Internal(message) if message == "attempted to create a direct object cycle"
-        ));
-        let bulk_set_error = array
-            .set_array_items(vec![array.clone()])
-            .expect_err("direct self replacement list is rejected");
-        assert!(matches!(
-            bulk_set_error,
-            Error::Internal(message) if message == "attempted to create a direct object cycle"
-        ));
-        let insert_error = array
-            .insert_array_item(0, array.clone())
-            .expect_err("direct self insertion is rejected");
-        assert!(matches!(
-            insert_error,
-            Error::Internal(message) if message == "attempted to create a direct object cycle"
-        ));
-        let append_error = array
-            .append_array_item(array.clone())
-            .expect_err("direct self append is rejected");
-        assert!(matches!(
-            append_error,
-            Error::Internal(message) if message == "attempted to create a direct object cycle"
-        ));
-
-        let set_error = array
-            .set_array_item(usize::MAX, array.clone())
-            .expect_err("bounds warning must run before the self-alias guard");
-        assert!(matches!(
-            set_error,
-            Error::QpdfExc(warning)
-                if warning.get_message_detail() == b"ignoring attempt to set out of bounds array item"
-        ));
-        let insert_error = array
+        array.set_array_item(0, array.clone()).unwrap();
+        assert!(array
+            .try_get_array_item(0)
+            .unwrap()
+            .is_same_object_as(&array));
+        array
+            .set_array_items(vec![ObjectHandle::integer(1)])
+            .unwrap();
+        let error = array.set_array_item(usize::MAX, array.clone()).unwrap_err();
+        assert!(matches!(error, Error::QpdfExc(warning)
+            if warning.get_message_detail() == b"ignoring attempt to set out of bounds array item"));
+        let error = array
             .insert_array_item(usize::MAX, array.clone())
-            .expect_err("bounds warning must run before the self-alias guard");
-        assert!(matches!(
-            insert_error,
-            Error::QpdfExc(warning)
-                if warning.get_message_detail() == b"ignoring attempt to insert out of bounds array item"
-        ));
-
-        assert_eq!(array.try_array_len().unwrap(), Some(1));
-        assert_eq!(
-            array.try_array_item(0).unwrap().unwrap().as_integer(),
-            Some(1)
-        );
+            .unwrap_err();
+        assert!(matches!(error, Error::QpdfExc(warning)
+            if warning.get_message_detail() == b"ignoring attempt to insert out of bounds array item"));
+        assert_eq!(array.try_get_array_n_items().unwrap(), 1);
+        assert_eq!(array.try_get_array_item(0).unwrap().as_integer(), Some(1));
     }
 
     #[test]
-    fn public_array_mutators_report_multi_hop_direct_cycles() {
-        let first = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
-        let second = ObjectHandle::array(vec![ObjectHandle::integer(2)]);
-        first
-            .set_array_item(0, second.clone())
-            .expect("first direct array accepts second");
-        let set_error = second
-            .set_array_item(0, first.clone())
-            .expect_err("reciprocal set is rejected");
-        assert!(matches!(
-            set_error,
-            Error::Internal(message) if message == "attempted to create a direct object cycle"
-        ));
-        assert_eq!(
-            second.try_array_item(0).unwrap().unwrap().as_integer(),
-            Some(2)
-        );
-
-        let first = ObjectHandle::array(vec![]);
-        let second = ObjectHandle::array(vec![ObjectHandle::integer(3)]);
-        first
-            .insert_array_item(0, second.clone())
-            .expect("first direct array accepts second");
-        let insert_error = second
-            .insert_array_item(0, first.clone())
-            .expect_err("reciprocal insert is rejected");
-        assert!(matches!(
-            insert_error,
-            Error::Internal(message) if message == "attempted to create a direct object cycle"
-        ));
-        assert_eq!(second.try_array_len().unwrap(), Some(1));
-        assert_eq!(
-            second.try_array_item(0).unwrap().unwrap().as_integer(),
-            Some(3)
-        );
-
-        let first = ObjectHandle::array(vec![]);
-        let second = ObjectHandle::array(vec![ObjectHandle::integer(4)]);
-        first
-            .append_array_item(second.clone())
-            .expect("first direct array accepts second");
-        let append_error = second
-            .append_array_item(first.clone())
-            .expect_err("reciprocal append is rejected");
-        assert!(matches!(
-            append_error,
-            Error::Internal(message) if message == "attempted to create a direct object cycle"
-        ));
-        assert_eq!(second.try_array_len().unwrap(), Some(1));
-        assert_eq!(
-            second.try_array_item(0).unwrap().unwrap().as_integer(),
-            Some(4)
-        );
-
-        let repeated = ObjectHandle::integer(5);
-        let candidate = ObjectHandle::array(vec![repeated.clone(), repeated]);
-        let target = ObjectHandle::array(vec![]);
-        target
-            .append_array_item(candidate)
-            .expect("repeated direct children do not form a cycle");
-    }
-
-    #[test]
-    fn public_array_mutators_report_rejected_direct_cycles() {
-        let array = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
-        let error = array
-            .set_array_item(0, array.clone())
-            .expect_err("self set must report the rejected mutation");
-        assert!(matches!(
-            error,
-            Error::Internal(message) if message == "attempted to create a direct object cycle"
-        ));
-
-        let array = ObjectHandle::array(vec![ObjectHandle::integer(2)]);
-        let error = array
-            .set_array_items(vec![array.clone()])
-            .expect_err("self bulk-set must report the rejected mutation");
-        assert!(matches!(
-            error,
-            Error::Internal(message) if message == "attempted to create a direct object cycle"
-        ));
-
-        let array = ObjectHandle::array(vec![ObjectHandle::integer(3)]);
-        let error = array
-            .insert_array_item(0, array.clone())
-            .expect_err("self insert must report the rejected mutation");
-        assert!(matches!(
-            error,
-            Error::Internal(message) if message == "attempted to create a direct object cycle"
-        ));
-
-        let array = ObjectHandle::array(vec![ObjectHandle::integer(4)]);
-        let error = array
-            .insert_array_item_and_get_new(0, array.clone())
-            .expect_err("self insert-and-get must report the rejected mutation");
-        assert!(matches!(
-            error,
-            Error::Internal(message) if message == "attempted to create a direct object cycle"
-        ));
-
-        let array = ObjectHandle::array(vec![ObjectHandle::integer(5)]);
-        let error = array
-            .append_array_item(array.clone())
-            .expect_err("self append must report the rejected mutation");
-        assert!(matches!(
-            error,
-            Error::Internal(message) if message == "attempted to create a direct object cycle"
-        ));
-
-        let array = ObjectHandle::array(vec![ObjectHandle::integer(6)]);
-        let error = array
-            .append_array_item_and_get_new(array.clone())
-            .expect_err("self append-and-get must report the rejected mutation");
-        assert!(matches!(
-            error,
-            Error::Internal(message) if message == "attempted to create a direct object cycle"
-        ));
+    fn public_array_mutators_accept_multi_hop_direct_cycles() {
+        for operation in 0..3 {
+            let first = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
+            let second = ObjectHandle::array(vec![ObjectHandle::integer(2)]);
+            first.set_array_item(0, second.clone()).unwrap();
+            let index = match operation {
+                0 => {
+                    second.set_array_item(0, first.clone()).unwrap();
+                    0
+                }
+                1 => {
+                    second.insert_array_item(0, first.clone()).unwrap();
+                    0
+                }
+                _ => {
+                    second.append_array_item(first.clone()).unwrap();
+                    1
+                }
+            };
+            assert!(second
+                .try_get_array_item(index)
+                .unwrap()
+                .is_same_object_as(&first));
+            first.set_array_items(Vec::new()).unwrap();
+            second.set_array_items(Vec::new()).unwrap();
+        }
     }
 
     #[test]
@@ -15493,44 +15275,45 @@ mod mutation_tests {
     }
 
     #[test]
-    fn replace_key_rejects_inserting_a_direct_dictionary_into_itself() {
+    fn replace_key_inserts_a_direct_dictionary_into_itself() {
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
-        let self_clone = dict.clone();
-        dict.replace_key(b"/Self", self_clone).unwrap();
-        assert!(dict.try_get_key(b"/Self").unwrap().is_null());
-        // The rest of the dictionary is untouched by the rejected insert.
+        dict.replace_key(b"/Self", dict.clone()).unwrap();
+        assert!(dict.try_get_key(b"/Self").unwrap().is_same_object_as(&dict));
         assert_eq!(dict.try_get_key(b"/A").unwrap().as_integer(), Some(1));
+        dict.remove_key(b"/Self").unwrap();
     }
 
     #[test]
-    fn replace_key_rejects_a_direct_alias_of_a_shared_payload() {
+    fn replace_key_accepts_a_direct_alias_of_a_shared_payload() {
         let target = ObjectHandle::new_indirect_unresolved(ObjectRef::new(39, 0), -1);
         let replacement = ObjectHandle::dictionary(vec![]);
         target.assign_value_state(&replacement);
-
         target.replace_key(b"/Self", replacement.clone()).unwrap();
-
-        assert!(!target.try_has_key(b"Self").unwrap());
+        assert!(target
+            .try_get_key(b"/Self")
+            .unwrap()
+            .is_same_object_as(&replacement));
+        target.remove_key(b"/Self").unwrap();
     }
 
     #[test]
-    fn replace_array_item_rejects_a_direct_alias_of_a_shared_payload() {
+    fn replace_array_item_accepts_a_direct_alias_of_a_shared_payload() {
         let target = ObjectHandle::new_indirect_unresolved(ObjectRef::new(40, 0), -1);
         let replacement = ObjectHandle::array(vec![ObjectHandle::integer(2)]);
         target.assign_value_state(&replacement);
-
-        assert!(!target.replace_array_item(0, replacement.clone()));
-        assert_eq!(target.as_array().unwrap()[0].as_integer(), Some(2));
+        assert!(target.replace_array_item(0, replacement.clone()));
+        assert!(target.as_array().unwrap()[0].is_same_object_as(&replacement));
+        assert!(target.replace_array_items(Vec::new()));
     }
 
     #[test]
-    fn replace_array_items_rejects_a_direct_alias_of_a_shared_payload() {
+    fn replace_array_items_accepts_a_direct_alias_of_a_shared_payload() {
         let target = ObjectHandle::new_indirect_unresolved(ObjectRef::new(41, 0), -1);
         let replacement = ObjectHandle::array(vec![ObjectHandle::integer(3)]);
         target.assign_value_state(&replacement);
-
-        assert!(!target.replace_array_items(vec![replacement.clone()]));
-        assert_eq!(target.as_array().unwrap()[0].as_integer(), Some(3));
+        assert!(target.replace_array_items(vec![replacement.clone()]));
+        assert!(target.as_array().unwrap()[0].is_same_object_as(&replacement));
+        assert!(target.replace_array_items(Vec::new()));
     }
 
     #[test]
@@ -15540,10 +15323,7 @@ mod mutation_tests {
 
     #[test]
     fn replace_key_allows_an_indirect_handle_to_reference_itself() {
-        // Unlike a direct self-insertion, an indirect handle referencing
-        // itself is not a direct cycle -- every recursive walker already
-        // stops at the indirect boundary, so this must remain a normal
-        // insert rather than being rejected as a no-op.
+        // An indirect self reference remains an ordinary PDF reference.
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(7, 0), -1);
         indirect.set_resolved(ObjectValue::Dictionary(Default::default()));
         indirect.replace_key(b"/Self", indirect.clone()).unwrap();
@@ -16865,6 +16645,8 @@ mod mutation_tests {
             (b"Direct".to_vec(), direct.clone()),
         ])));
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), -1);
+        // This containment fixture has no input source for lazy resolution.
+        indirect.set_resolved(ObjectValue::Integer(9));
 
         direct.replace_key(b"/Indirect", indirect.clone()).unwrap();
 
@@ -20228,7 +20010,7 @@ mod direct_graph_walk_bound_tests {
     // Two direct dictionaries holding each other: `a` under `/B` holds `b`,
     // and `b` under `/A` holds `a`. Neither handle is indirect, so no walk
     // ever meets the indirect boundary that normally terminates a descent.
-    // `replace_key` refuses only the single-hop self-insert, so this two-hop
+    // `replace_key` accepts cycles; this two-hop
     // shape does close into a real cycle -- asserted here so the walk
     // assertions below cannot pass against an unaliased pair.
     fn reciprocal_direct_dictionary_cycle() -> Result<ObjectHandle> {
