@@ -3474,7 +3474,14 @@ impl QPDFJob {
         }
 
         if self.configuration.linearize && self.configuration.normalize_content == Some(true) {
-            self.normalize_page_contents(pdf)?;
+            match self.normalize_page_contents(pdf) {
+                Ok(()) => {}
+                Err(error @ Error::Usage(_)) => return Err(error),
+                Err(error) => {
+                    self.report_job_error(&error)?;
+                    return Err(error);
+                }
+            }
         }
 
         // Reserving again here is a no-op once `apply_transformations` has

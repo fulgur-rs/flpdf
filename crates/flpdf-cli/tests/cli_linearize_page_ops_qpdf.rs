@@ -69,6 +69,40 @@ fn assert_linearized(path: &Path, label: &str) {
     );
 }
 
+fn single_page_pdf_with_content_filter(filter_name: &str, payload: &[u8]) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let off1 = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let off2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let off3 = pdf.len();
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /Contents 4 0 R >>\nendobj\n",
+    );
+    let off4 = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "4 0 obj\n<< /Filter /{filter_name} /Length {} >>\nstream\n",
+            payload.len(),
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(payload);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
 #[test]
 fn top_level_pages_linearize_matches_qpdf() {
     if skip_if_qpdf_missing() {
@@ -111,6 +145,189 @@ fn top_level_pages_linearize_matches_qpdf() {
         std::fs::read(&flpdf_output).unwrap(),
         std::fs::read(&qpdf_output).unwrap(),
         "linearized --pages output must match qpdf"
+    );
+}
+
+#[test]
+fn top_level_pages_linearize_preserves_unknown_content_filter_like_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("unknown-content-filter.pdf");
+    std::fs::write(
+        &input,
+        single_page_pdf_with_content_filter(
+            "PlateDecode",
+            b"012345678901234567890123456789012345678901234567",
+        ),
+    )
+    .unwrap();
+    let qpdf_output = temp.path().join("qpdf-pages.pdf");
+    let flpdf_output = temp.path().join("flpdf-pages.pdf");
+    let input = input.to_str().unwrap();
+
+    let qpdf = run_qpdf(&[
+        "--static-id",
+        "--stream-data=uncompress",
+        "--linearize",
+        "--normalize-content=y",
+        input,
+        "--pages",
+        input,
+        "1",
+        "--",
+        qpdf_output.to_str().unwrap(),
+    ]);
+    assert_success(
+        &qpdf,
+        "qpdf --linearize --pages with unknown content filter",
+    );
+
+    let flpdf = run_flpdf(&[
+        "--static-id",
+        "--stream-data=uncompress",
+        "--linearize",
+        "--normalize-content=y",
+        input,
+        "--pages",
+        input,
+        "1",
+        "--",
+        flpdf_output.to_str().unwrap(),
+    ]);
+    assert_success(
+        &flpdf,
+        "flpdf --linearize --pages with unknown content filter",
+    );
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "linearized page extraction must preserve unfilterable content exactly like qpdf"
+    );
+}
+
+#[test]
+fn top_level_pages_linearize_retries_invalid_flate_content_like_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("invalid-flate-content.pdf");
+    std::fs::write(
+        &input,
+        single_page_pdf_with_content_filter("FlateDecode", b"this is not valid zlib data at all"),
+    )
+    .unwrap();
+    let qpdf_output = temp.path().join("qpdf-pages.pdf");
+    let flpdf_output = temp.path().join("flpdf-pages.pdf");
+    let input = input.to_str().unwrap();
+
+    let qpdf = run_qpdf(&[
+        "--static-id",
+        "--stream-data=uncompress",
+        "--linearize",
+        "--normalize-content=y",
+        input,
+        "--pages",
+        input,
+        "1",
+        "--",
+        qpdf_output.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        qpdf.status.code(),
+        Some(3),
+        "qpdf should write with warnings: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let flpdf = run_flpdf(&[
+        "--static-id",
+        "--stream-data=uncompress",
+        "--linearize",
+        "--normalize-content=y",
+        input,
+        "--pages",
+        input,
+        "1",
+        "--",
+        flpdf_output.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "flpdf stderr: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    let qpdf_stderr = String::from_utf8_lossy(&qpdf.stderr).replace("qpdf:", "flpdf:");
+    assert_eq!(String::from_utf8_lossy(&flpdf.stderr), qpdf_stderr);
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "linearized page extraction must retry invalid stream decoding exactly like qpdf"
+    );
+}
+
+#[test]
+fn top_level_pages_linearize_retries_truncated_flate_content_like_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("truncated-flate-content.pdf");
+    std::fs::write(
+        &input,
+        single_page_pdf_with_content_filter("FlateDecode", &[0x78]),
+    )
+    .unwrap();
+    let qpdf_output = temp.path().join("qpdf-pages.pdf");
+    let flpdf_output = temp.path().join("flpdf-pages.pdf");
+    let input = input.to_str().unwrap();
+
+    let qpdf = run_qpdf(&[
+        "--static-id",
+        "--stream-data=uncompress",
+        "--linearize",
+        "--normalize-content=y",
+        input,
+        "--pages",
+        input,
+        "1",
+        "--",
+        qpdf_output.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        qpdf.status.code(),
+        Some(3),
+        "qpdf should write with warnings: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let flpdf = run_flpdf(&[
+        "--static-id",
+        "--stream-data=uncompress",
+        "--linearize",
+        "--normalize-content=y",
+        input,
+        "--pages",
+        input,
+        "1",
+        "--",
+        flpdf_output.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "flpdf stderr: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    let qpdf_stderr = String::from_utf8_lossy(&qpdf.stderr).replace("qpdf:", "flpdf:");
+    assert_eq!(String::from_utf8_lossy(&flpdf.stderr), qpdf_stderr);
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "linearized page extraction must retry truncated stream decoding exactly like qpdf"
     );
 }
 
@@ -190,6 +407,57 @@ fn rewrite_flatten_rotation_linearize_matches_qpdf() {
         std::fs::read(&flpdf_output).unwrap(),
         std::fs::read(&qpdf_output).unwrap(),
         "linearized --flatten-rotation output must match qpdf"
+    );
+}
+
+#[test]
+fn rewrite_pages_linearize_normalize_content_matches_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let input = fixture("three-page.pdf");
+    let qpdf_output = temp.path().join("qpdf-rewrite-pages.pdf");
+    let flpdf_output = temp.path().join("flpdf-rewrite-pages.pdf");
+    let input = input.to_str().unwrap();
+
+    let qpdf = run_qpdf(&[
+        "--static-id",
+        "--stream-data=uncompress",
+        "--linearize",
+        "--normalize-content=y",
+        input,
+        "--pages",
+        input,
+        "1-2",
+        "--",
+        qpdf_output.to_str().unwrap(),
+    ]);
+    assert_success(&qpdf, "qpdf --linearize --normalize-content --pages");
+
+    let flpdf = run_flpdf(&[
+        "rewrite",
+        "--static-id",
+        "--stream-data=uncompress",
+        "--linearize",
+        "--normalize-content=y",
+        input,
+        "--pages",
+        input,
+        "1-2",
+        "--",
+        flpdf_output.to_str().unwrap(),
+    ]);
+    assert_success(
+        &flpdf,
+        "flpdf rewrite --linearize --normalize-content --pages",
+    );
+    assert_linearized(&qpdf_output, "qpdf rewrite --pages output");
+    assert_linearized(&flpdf_output, "flpdf rewrite --pages output");
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "rewrite page extraction with linearized normalization must match qpdf"
     );
 }
 

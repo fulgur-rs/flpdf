@@ -2,12 +2,14 @@
 //!
 //! qpdf correspondence: `QPDFJob` stores `normalizeContent` separately and
 //! reapplies it while setting writer options (`QPDFJob.cc:2847-2863`). The
-//! pre-write stream mutation keeps flpdf's linearization planner aligned with
-//! that selected normalization policy.
+//! pre-write mutation keeps flpdf's linearization planner aligned with that
+//! policy for cleanly decodable streams. Unsupported filters and streams whose
+//! decoders warn or fail stay untouched so the writer can apply qpdf's raw
+//! retry behavior.
 
 use crate::content_normalizer::normalize_content_stream;
 use crate::writer::DecodeLevel as StreamDecodeLevel;
-use crate::{ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, Result};
+use crate::{Error, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, QpdfErrorCode, Result};
 use std::collections::HashSet;
 use std::io::{Read, Seek};
 
@@ -30,13 +32,14 @@ pub(super) fn normalize_page_contents<R: Read + Seek>(
     let mut seen = HashSet::new();
     let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
     for page in pages {
-        warnings.extend(apply_normalize_content(page, &mut seen)?);
+        warnings.extend(apply_normalize_content(pdf, page, &mut seen)?);
     }
     Ok(warnings)
 }
 
 /// Normalize the content stream(s) for a single page.
-fn apply_normalize_content(
+fn apply_normalize_content<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
     page: ObjectHandle,
     seen: &mut HashSet<ObjectRef>,
 ) -> Result<Vec<ContentNormalizationWarning>> {
@@ -62,7 +65,7 @@ fn apply_normalize_content(
     } // cov:ignore: LLVM maps the covered Contents-array branch to its array guard
 
     for (stream_ref, stream) in streams {
-        if let Some(last_bad) = normalize_and_store_stream_handle(stream_ref, stream, seen)? {
+        if let Some(last_bad) = normalize_and_store_stream_handle(pdf, stream_ref, stream, seen)? {
             warnings.push(last_bad);
         }
     }
@@ -71,7 +74,8 @@ fn apply_normalize_content(
 
 /// Normalize a stream through its live ObjectHandle pipeline and mutate the
 /// same stream so the writer observes the canonical decoded bytes and length.
-fn normalize_and_store_stream_handle(
+fn normalize_and_store_stream_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
     stream_ref: ObjectRef,
     stream: ObjectHandle,
     seen: &mut HashSet<ObjectRef>,
@@ -80,7 +84,45 @@ fn normalize_and_store_stream_handle(
         return Ok(None);
     }
 
-    let decoded = stream.get_stream_data(StreamDecodeLevel::All)?;
+    // qpdf's writer checks filterability before applying content normalization
+    // (`QPDF_Stream.cc:379-435,488-512; QPDFWriter.cc:1272-1305`). If any
+    // filter is unsupported, it preserves the raw stream and its filter dictionary.
+    // Probe with warning delivery suppressed here; the writer will perform
+    // the observable probe later and emit any malformed-filter warning once.
+    let suppress_warnings = pdf.suppress_warnings();
+    pdf.set_suppress_warnings(true);
+    let filterable = match stream.stream_data_filterable(StreamDecodeLevel::All) {
+        Ok(filterable) => filterable,
+        Err(error) => {
+            pdf.set_suppress_warnings(suppress_warnings);
+            return Err(error);
+        }
+    };
+    if !filterable {
+        pdf.set_suppress_warnings(suppress_warnings);
+        return Ok(None);
+    }
+
+    // Decode errors and decoder warnings must be left to the writer's retry
+    // loop. qpdf pipes the original stream there and may retry without
+    // filtering; doing that work here would either abort early or duplicate
+    // its pass-specific warnings (`QPDFWriter.cc:1272-1305`).
+    let warnings_before_decode = pdf.num_warnings();
+    let decoded = stream.get_stream_data(StreamDecodeLevel::All);
+    let decode_warned = pdf.num_warnings() != warnings_before_decode;
+    pdf.set_suppress_warnings(suppress_warnings);
+    let decoded = match decoded {
+        Ok(_) if decode_warned => return Ok(None),
+        Ok(decoded) => decoded,
+        Err(Error::Unsupported(_)) => return Ok(None),
+        Err(Error::QpdfExc(error))
+            if error.get_error_code() == QpdfErrorCode::Unsupported
+                && error.get_message_detail() == b"getStreamData called on unfilterable stream" =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
     let normalized = normalize_content_stream(decoded.as_ref());
     let warning = normalized
         .any_bad_tokens()
