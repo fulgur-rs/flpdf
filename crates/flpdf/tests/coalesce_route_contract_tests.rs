@@ -14,9 +14,19 @@ fn production_consumers_call_the_canonical_coalesce_owner() {
 
     assert!(!cli.contains("coalesce_page_contents"));
     assert!(!flatten.contains("coalesce_page_contents"));
-    assert!(cli.contains("apply_transformations_for_cli(job, pdf)?"));
+    let page_extraction = cli
+        .split_once("fn run_page_extraction(")
+        .expect("rewrite page extraction route should remain named")
+        .1
+        .split_once("\nfn run_rewrite_with_page_ops")
+        .expect("plain rewrite page-operation route should follow extraction")
+        .0;
+    assert!(page_extraction.contains("run_page_extraction_job(job, page_ops, remove_unref)"));
+    assert!(!page_extraction.contains("apply_transformations_for_cli("));
+    assert!(cli.contains("configuration.coalesce_contents();"));
     assert!(cli.contains("match job.apply_transformations(pdf)"));
     assert!(cli.contains("job.write_qpdf(&mut pdf)"));
+    assert!(cli.contains("finish_job_exit_status(job.run()?)"));
     assert!(lifecycle
         .contains("PageObjectHelper::from_object_handle(page, pdf).coalesce_content_streams()?"));
     assert!(flatten.contains("PageObjectHelper::new(page_ref, pdf).coalesce_content_streams()?"));
