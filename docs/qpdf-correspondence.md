@@ -16,6 +16,27 @@ pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の�
 どこまで対応しているかのスナップショット。`flpdf-qxba` の work-list であり、Phase 1
 完了後に再測する。
 
+### Direct graph mutation (`flpdf-6ik2q.5`, 2026-10-03)
+
+Dictionary replacement and array set/insert/append operations accept direct
+self references, including aliases of a shared value. This follows
+`libqpdf/QPDF_Dictionary.cc:135-146` and `libqpdf/QPDF_Array.cc:220-243,277-313`.
+Array bulk replacement clears the old contents and checks ownership while
+inserting each item; a later failure retains an already accepted self prefix.
+The direct-alias no-op and recursive cycle preflight were removed, including
+from test storage helpers. Public dictionary replacement also resolves the
+value's `isNull` check before testing indirectness, following
+`libqpdf/QPDF_Dictionary.cc:137-138`; the update emits lazy-value warnings at
+that point. The old non-resolving stream replacement helper remains a marked
+stream-migration consumer under `flpdf-6ik2q.8`. Public regressions cover promotion to an indirect
+self reference and all six mutation/return-value variants.
+
+Traversal remains a separate responsibility: shallow-copy/unparse/JSON depth
+caps are tracked by `flpdf-6ik2q.6`/`.17`. The current `make_direct_copy` visited
+set also includes direct identities, while qpdf's `QPDFObjGen::set`
+(`include/qpdf/QPDFObjGen.hh:112-120`) records only indirect identities. That
+existing broader traversal guard is marked and remains part of traversal work.
+
 ### Real value storage (`flpdf-6ik2q.1`, 2026-10-03)
 
 `QPDF_Real::val` (`libqpdf/QPDF_Real.cc:6-40`) maps to the single
@@ -3854,7 +3875,7 @@ bound されないため、十分に長い参照チェーンを持つ実在の P
 | flpdf | qpdf 11.9.0 との照合 | 記録範囲 |
 |---|---|---|
 | `MAX_PARSE_DEPTH` guards outside `parser.rs::push_frame` (12 production sites: `writer/object.rs::UnparseWalkDepthGuard::enter`; `writer/rewrite_renumber.rs::collect_canonical_children_with_linearized_omission` / `walk_resurrectable_handle`; `writer/plain/body.rs::collect_live_seed_handles` / `collect_live_child_handles` / `ContentEmitWalkDepthGuard::enter`; `optimization.rs::Optimization::update_object_maps`; `linearization/plan.rs::collect_direct_handle_refs` / `collect_direct_handle_refs_with_context` / `collect_direct_handle_refs_with_stream_parameters_context`; `object_handle.rs::DirectGraphWalkDepthGuard::enter` / `ObjectJsonWriter::write_handle`) | qpdf has one matching PDF-object parser bound: `QPDFParser::parseRemainder` checks its explicit frame stack and rejects the 501st container (`QPDFParser.cc:288-300`); `parser.rs::push_frame` keeps that behavior and is not marked. Other responsibilities have no matching `MAX_PARSE_DEPTH`: `QPDFWriter::enqueueObject` recursively follows direct arrays/dictionaries without an upper bound (`QPDFWriter.cc:1072-1157`); `QPDFWriter::unparseObject` recurses through direct children and checks only for negative indentation (`QPDFWriter.cc:1318-1354`); `QPDF::getCompressibleObjGens` uses a visited set and explicit work queue without a depth cap (`QPDF.cc:2393-2465`); `QPDFObjectHandle::writeJSON` and JSON value output pass depth for indentation only (`QPDFObjectHandle.cc:1630-1646`, `JSON.cc:100-118`). `JSON.cc:1335-1338` limits parsing JSON input, not writing PDF object JSON. qpdf's `/AcroForm` depth100 and outline depth50 limits are specialized walks, not these generic traversals. | The 12 extra upper bounds reject deeply nested direct values beyond qpdf's contract and are class C safety deviations. Inline checks use `// qpdf-deviation`; the three isolated `*DepthGuard::enter` helpers use `#[deprecated(note = "no qpdf counterpart; ...")]` with local caller allows. No runtime guard or limit is changed. |
-| `object_copy.rs` の `ForeignObjectCopier::direct_visiting` | `reserveObjects` / `replaceForeignIndirectObjects`（`QPDF.cc:2101-2213`）に direct dictionary/array cycle 用 visited set はない。これは `ObjectHandle::replace_key` でのみ作れる direct graph の防御である。フィールド単位で切り離せるため `#[deprecated]`（アクセスする関数群に `#[allow(deprecated)]`）で記録し、comment block マーカーは使わない。 | reservation と replacement の各 direct-cycle guard |
+| `object_copy.rs` の `ForeignObjectCopier::direct_visiting` | `reserveObjects` / `replaceForeignIndirectObjects`（`QPDF.cc:2101-2213`）に direct dictionary/array cycle 用 visited set はない。これはdictionary/array mutationで構成できる direct graph の防御である。フィールド単位で切り離せるため `#[deprecated]`（アクセスする関数群に `#[allow(deprecated)]`）で記録し、comment block マーカーは使わない。 | reservation と replacement の各 direct-cycle guard |
 | ~~`xref.rs::load_xref_state_with_options` の `startxref` offset-0 経路~~（2026-09-18、`flpdf-3yn9.48.151` で解消） | qpdf の `xref_offset == 0` チェック（`QPDF.cc:450-452`）は、`startxref` が解析できない場合と、構文的に正しい `startxref` が明示的に offset 0 を指す場合の両方で、即座に `damagedPDF("can't find startxref")` を投げ `read_xref` を一切呼ばない。flpdf の retry-at-offset-0 detour は owner-less loader 専用で、canonical owner を必須化した時点で `startxref == 0` が無条件に line-scan recovery へ抜けるようになり、detour と `qpdf-deviation` マーカーごと削除した。`push_repair_diagnostics` 自体は qpdf の `reconstruct_xref` 3行警告シーケンスを忠実に再現するだけで、対応物のない挙動は detour 側にあった。 | 解消済み。現行の `load_xref_state_from_window` は `startxref == 0` を repair 時に直接 `recover_xref_from_linear_scan` へ渡す |
 | `object_handle.rs::ObjectSlot::pdf_unique_ids`（`flpdf-ymuj.3.2` で削除） | qpdf は document-level `unique_id`（`QPDF.hh:1454`, `QPDF.cc:2294-2296`）と各 value の `QPDF*` back-pointer（`QPDFValue.hh:60-80,149-152`）を持つが、別の per-object numeric id set は持たない。`active_pdf_unique_id`（単一値）は qpdf の `QPDF*` back-pointer への container 表現代替（CLAUDE.md 分類 (B)）であり、direct value のownership判定もこの単一値または未所有状態に揃えた。 | 旧history setと `attach_child_to_parent` のsubtree stampingを撤去し、`flpdf-ymuj.6.3` で production の reverse containment edge も撤去した。現在の ownership は `active_pdf_unique_id` の単一 value 表現と forward child graph だけで決まり、unit-test の root assertion は test-only scan から導出する。 |
 | `reader/resolver.rs::ResolverHandle::read_window` / `read_to_owned` | qpdf の `InputSource` は live `seek`/`tell`/`read`（`InputSource.hh:71-74`）で、`readStream` もその source を保存・復元して読む（`QPDF.cc:1360-1398`）。bounded owned-window helper は qpdf にない。関数単位で切り離せるため `#[deprecated]`（呼び出し元は `#[allow(deprecated)]`）で記録し、comment block マーカーは使わない。 | `read_window` / `read_to_owned` の legacy owned-buffer seam **2026-09-08（`flpdf-3yn9.48.25`）に解消**: helper 2 本と `MAX_RESOLUTION_FALLBACKS` / `resolution_fallbacks_remaining` を削除し、`qpdf_route_hygiene_tests.rs` が不在を検査する。live `seek`/`tell`/`read` のみが残る。 |
