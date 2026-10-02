@@ -149,15 +149,15 @@ fn resolve_compare_children<R: Read + Seek>(
     {
         return Ok(());
     }
-    if let Some(items) = handle.as_array() {
+    if handle.try_is_array()? {
         seen.push(handle.clone());
-        for child in items {
+        for child in handle.try_get_array_as_vector()? {
             if !child.is_direct() {
                 continue;
             }
             pdf.resolve(&child)?;
             let terminal = child.clone();
-            if terminal.as_dictionary().is_some() || terminal.as_array().is_some() {
+            if terminal.try_is_dictionary()? || terminal.try_is_array()? {
                 resolve_compare_children(&terminal, pdf, seen, depth + 1)?;
             }
         }
@@ -165,16 +165,16 @@ fn resolve_compare_children<R: Read + Seek>(
         return Ok(());
     }
 
-    let Some(entries) = handle.as_dictionary() else {
+    if !handle.try_is_dictionary()? {
         return Ok(());
-    };
+    }
+    let entries = handle.try_get_dict_as_map()?;
     seen.push(handle.clone());
     for child in entries.into_values() {
         let child_is_direct = child.is_direct();
         pdf.resolve(&child)?;
         let terminal = child.clone();
-        if child_is_direct && (terminal.as_dictionary().is_some() || terminal.as_array().is_some())
-        {
+        if child_is_direct && (terminal.try_is_dictionary()? || terminal.try_is_array()?) {
             resolve_compare_children(&terminal, pdf, seen, depth + 1)?;
         }
     }
