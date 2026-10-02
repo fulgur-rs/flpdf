@@ -449,7 +449,7 @@ pub(crate) fn run_test_85<R: Read + Seek>(
     let oh_i_umaxplus = ObjectHandle::integer(i64::from(u32::MAX) + 1);
     let oh_i_minminus = ObjectHandle::integer(i64::from(i32::MIN) - 1);
     let oh_i_neg = ObjectHandle::integer(-1);
-    let oh_r = ObjectHandle::real_literal(42.0, b"42.0".to_vec());
+    let oh_r = ObjectHandle::real_from_string(b"42.0");
     let oh_n = ObjectHandle::name(b"Test".to_vec());
     let oh_s = ObjectHandle::string(b"/Test".to_vec());
     let oh_o = ObjectHandle::operator(b"/Test".to_vec());

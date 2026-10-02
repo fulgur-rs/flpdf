@@ -16,6 +16,29 @@ pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の�
 どこまで対応しているかのスナップショット。`flpdf-qxba` の work-list であり、Phase 1
 完了後に再測する。
 
+### Real value storage (`flpdf-6ik2q.1`, 2026-10-03)
+
+`QPDF_Real::val` (`libqpdf/QPDF_Real.cc:6-40`) maps to the single
+`ObjectValue::Real(Vec<u8>)` payload. `ObjectHandle::real_from_string` retains
+bytes without validation; `real` / `real_with_precision` format doubles through
+`qutil::double_to_string` (`libqpdf/QUtil.cc:349-370`). Parser tokens, object
+unparse, writer emission and numeric access use this same text. The independent
+numeric/literal pair and the unsafe-literal rewrite have been removed.
+`QPDF_Real::writeJSON` (`libqpdf/QPDF_Real.cc:43-55`) changes only empty and
+leading-dot spellings; invalid JSON text reaches the parser error in `get_json`.
+
+⚪ Output-neutral standard-library substitution: `qutil/real.rs` implements
+qpdf's C `atof` boundary (`libqpdf/QPDFObjectHandle.cc:377-385`) with Rust numeric
+prefix parsing, including hexadecimal rounding and non-finite values. The
+runtime oracle checks 6,035 numeric-access inputs and 4,000 double-format inputs;
+JSON scientific conversion additionally checks 13,055 `std::stod` cases,
+including exact subnormals and the normal-precision tininess threshold
+(`libqpdf/QPDF_json.cc:750-764`).
+`real_value_tests.rs` preserves boundary vectors and raw spelling assertions.
+`real_value_parity.rs` compares complete `--flatten-rotation --qdf` output bytes
+against qpdf 11.9.0. Arithmetic consumers now call the canonical real factory
+without their old pre-rounding adapter.
+
 ### 2026-08-02 の再測（`flpdf-1e5g` / Phase 2 着手時）
 
 分類と対応先モジュールは「維持する」対象であり、行数と違って追随義務がある。

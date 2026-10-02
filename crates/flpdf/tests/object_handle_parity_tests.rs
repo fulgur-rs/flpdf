@@ -954,8 +954,8 @@ fn resolve_lifts_every_scalar_object_value_variant() {
     );
     assert_eq!(
         dict.get(b"/RL".as_slice())
-            .and_then(ObjectHandle::as_real_literal),
-        Some((0.5, b".5".to_vec()))
+            .map(|h| h.try_get_real_value().unwrap()),
+        Some(b".5".to_vec())
     );
     assert!(dict.contains_key(b"/B".as_slice()));
     assert!(dict.contains_key(b"/R".as_slice()));
@@ -1171,7 +1171,10 @@ fn real_literal_round_trips_through_native_parsing() {
     let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
     handle.try_is_scalar().expect("resolve real literal");
 
-    assert_eq!(handle.as_real_literal(), Some((0.4, b".4".to_vec())));
+    assert_eq!(
+        handle.try_get_value_as_real().unwrap(),
+        Some(b".4".to_vec())
+    );
 }
 
 // ---------------------------------------------------------------------

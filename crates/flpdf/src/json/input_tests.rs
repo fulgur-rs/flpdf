@@ -222,8 +222,9 @@ fn qpdf_json_value_factory_preserves_real_literals_and_never_rejects_non_finite_
     assert_eq!(
         json_value_to_handle(&mut pdf, &Json::make_number("1.5"))
             .expect("real")
-            .as_real_literal(),
-        Some((1.5, b"1.5".to_vec()))
+            .try_get_real_value()
+            .unwrap(),
+        b"1.5"
     );
     assert_eq!(
         json_value_to_handle(&mut pdf, &Json::make_number("1e+2"))
@@ -241,8 +242,9 @@ fn qpdf_json_value_factory_preserves_real_literals_and_never_rejects_non_finite_
     assert_eq!(
         json_value_to_handle(&mut pdf, &Json::make_number("1e9999"))
             .expect("overflowing scientific real is preserved, not rejected")
-            .as_real_literal(),
-        Some((f64::INFINITY, b"1e9999".to_vec()))
+            .try_get_real_value()
+            .unwrap(),
+        b"1e9999"
     );
 }
 
@@ -308,20 +310,17 @@ fn qpdf_json_value_factory_builds_nested_canonical_handles() {
 }
 
 #[test]
-fn qpdf_json_value_factory_preserves_unparseable_scientific_notation_literals() {
+fn qpdf_json_value_factory_uses_stod_numeric_prefix() {
     let mut pdf = Pdf::empty().expect("empty PDF");
 
-    // "1e+" is not a valid `f64` literal (`std::stod` would also fail on
-    // it), but per the same oracle evidence as Finding C
-    // (`QPDF_json.cc:750-764`, `QPDF_Real.cc:17-20`) a `stod` failure is
-    // caught and the original text is kept unchanged: qpdf never rejects a
-    // syntactically-present JSON number as a Real, however malformed its
-    // scientific notation.
+    // std::stod accepts the numeric prefix even when an incomplete exponent
+    // follows it. QPDF_json.cc then formats that number, rather than retaining
+    // the malformed exponent.
     let handle =
         json_value_to_handle(&mut pdf, &Json::make_number("1e+")).expect("preserved, not rejected");
-    let (value, literal) = handle.as_real_literal().expect("real literal");
-    assert!(value.is_nan());
-    assert_eq!(literal, b"1e+");
+    let literal = handle.try_get_real_value().expect("real literal");
+    assert_eq!(handle.try_get_numeric_value().unwrap(), 1.0);
+    assert_eq!(literal, b"1");
 }
 
 #[test]

@@ -7,6 +7,10 @@
 //!
 //!
 
+mod real;
+pub use real::double_to_string;
+pub(crate) use real::{atof, stod_decimal};
+
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 

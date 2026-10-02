@@ -31,7 +31,7 @@ use crate::default_appearance::parse_default_appearance;
 use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::object_handle::ObjectHandle;
 use crate::page_object_helper::PageBox;
-use crate::pdf_syntax::{qpdf_real_value, write_string_value};
+use crate::pdf_syntax::write_string_value;
 use crate::pipeline::PipelineResult;
 use crate::token_filter::{TokenFilter, TokenFilterOutput};
 use crate::tokenizer::{Token, TokenType};
@@ -399,8 +399,8 @@ fn install_normal_appearance_canonical_handles<R: Read + Seek>(
     let bbox = ObjectHandle::array(vec![
         ObjectHandle::real(0.0),
         ObjectHandle::real(0.0),
-        ObjectHandle::real(qpdf_real_value(bbox_w)),
-        ObjectHandle::real(qpdf_real_value(bbox_h)),
+        ObjectHandle::real(bbox_w),
+        ObjectHandle::real(bbox_h),
     ]);
 
     let resources = ObjectHandle::dictionary(vec![(

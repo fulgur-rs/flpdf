@@ -41,7 +41,7 @@
 ///
 /// # Errors
 ///
-/// Returns [`ConvertError::NonFiniteFloat`] when a real value is non-finite
+/// Returns [`ConvertError::JsonError`] when real value text is invalid JSON
 /// (NaN or infinity), or a [`ConvertError::PdfError`] when `handle` exceeds the
 /// maximum nesting depth. Direct `ObjectHandle` graphs can be cyclic, so the
 /// serializer bounds recursion rather than assuming acyclic input.
@@ -61,7 +61,6 @@ pub(crate) fn pdf_object_to_json_with_version(
 
 fn convert_object_json_error(error: ObjectJsonError) -> ConvertError {
     match error {
-        ObjectJsonError::NonFiniteFloat => ConvertError::NonFiniteFloat,
         ObjectJsonError::Json(message) => ConvertError::JsonError(message),
         ObjectJsonError::Pipeline(error) => ConvertError::PdfError(error.to_string()),
         ObjectJsonError::Pdf(message) => ConvertError::PdfError(message),
@@ -295,8 +294,6 @@ pub(crate) const QPDF_JSON_VERSION: i32 = 2;
 /// Errors that can occur while constructing or serializing qpdf JSON output.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConvertError {
-    /// A non-finite float (NaN or infinity) was encountered.
-    NonFiniteFloat,
     /// A qpdf exception that the command boundary renders without a JSON or
     /// PDF conversion prefix.
     QpdfExc(crate::QpdfExc),
@@ -309,9 +306,6 @@ pub enum ConvertError {
 impl std::fmt::Display for ConvertError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConvertError::NonFiniteFloat => {
-                write!(f, "non-finite float cannot be serialized as JSON")
-            }
             ConvertError::QpdfExc(error) => std::fmt::Display::fmt(error, f),
             ConvertError::PdfError(msg) => write!(f, "PDF error: {msg}"),
             ConvertError::JsonError(msg) => write!(f, "JSON error: {msg}"),
@@ -334,7 +328,6 @@ impl From<ObjectJsonError> for JsonOutputError {
     fn from(error: ObjectJsonError) -> Self {
         match error {
             ObjectJsonError::Pipeline(error) => Self::Pipeline(error),
-            ObjectJsonError::NonFiniteFloat => Self::Convert(ConvertError::NonFiniteFloat),
             ObjectJsonError::Json(message) => Self::Convert(ConvertError::JsonError(message)),
             ObjectJsonError::Pdf(message) => Self::Convert(ConvertError::PdfError(message)),
             other => Self::Convert(ConvertError::PdfError(other.to_string())),
@@ -499,10 +492,6 @@ mod tests {
     #[test]
     fn conversion_errors_keep_their_public_text_and_categories() {
         assert_eq!(
-            ConvertError::NonFiniteFloat.to_string(),
-            "non-finite float cannot be serialized as JSON"
-        );
-        assert_eq!(
             ConvertError::PdfError("broken PDF".to_owned()).to_string(),
             "PDF error: broken PDF"
         );
@@ -514,10 +503,6 @@ mod tests {
         assert!(matches!(
             JsonOutputError::from(ObjectJsonError::Pipeline(PipelineError::logic("pipeline"))),
             JsonOutputError::Pipeline(_)
-        ));
-        assert!(matches!(
-            JsonOutputError::from(ObjectJsonError::NonFiniteFloat),
-            JsonOutputError::Convert(ConvertError::NonFiniteFloat)
         ));
         assert!(matches!(
             JsonOutputError::from(ObjectJsonError::Json("json".to_owned())),
@@ -611,7 +596,7 @@ mod tests {
         );
         assert!(matches!(
             pdf_object_to_json(&ObjectHandle::real(f64::NAN)),
-            Err(ConvertError::NonFiniteFloat)
+            Err(ConvertError::JsonError(_))
         ));
 
         let mut pdf = stream_pdf();
@@ -710,10 +695,6 @@ mod tests {
             })
         );
 
-        assert!(matches!(
-            convert_object_json_error(ObjectJsonError::NonFiniteFloat),
-            ConvertError::NonFiniteFloat
-        ));
         assert!(matches!(
             convert_object_json_error(ObjectJsonError::Json("json".to_owned())),
             ConvertError::JsonError(message) if message == "json"

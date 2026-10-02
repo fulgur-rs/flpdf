@@ -494,7 +494,7 @@ mod tests {
             (ObjectHandle::boolean(false), "boolean"),
             (ObjectHandle::integer(1), "integer"),
             (ObjectHandle::real(1.5), "real"),
-            (ObjectHandle::real_literal(0.4, b".4".to_vec()), "real"),
+            (ObjectHandle::real_from_string(b".4"), "real"),
             (ObjectHandle::string(b"s".to_vec()), "string"),
             (ObjectHandle::name(b"N".to_vec()), "name"),
             (ObjectHandle::array(Vec::new()), "array"),

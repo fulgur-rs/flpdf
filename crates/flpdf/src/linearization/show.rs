@@ -1870,7 +1870,7 @@ mod tests {
     fn param_u64_rejects_real_literal_whole_number() {
         let d = ObjectHandle::dictionary(vec![(
             b"/N".to_vec(),
-            ObjectHandle::real_literal(5.0, b"5.0".to_vec()),
+            ObjectHandle::real_from_string(b"5.0"),
         )]);
         assert!(matches!(
             param_u64(&d, "N"),
@@ -1878,13 +1878,13 @@ mod tests {
         ));
     }
 
-    /// A fractional `RealLiteral` (e.g. `1.5`) is rejected as a non-integer
+    /// A fractional real string (e.g. `1.5`) is rejected as a non-integer
     /// qpdf parameter.
     #[test]
     fn param_u64_rejects_fractional_real_literal() {
         let d = ObjectHandle::dictionary(vec![(
             b"/N".to_vec(),
-            ObjectHandle::real_literal(1.5, b"1.5".to_vec()),
+            ObjectHandle::real_from_string(b"1.5"),
         )]);
         assert!(matches!(
             param_u64(&d, "N"),

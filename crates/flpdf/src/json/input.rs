@@ -25,7 +25,6 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use super::value::format_qpdf_real;
 use super::{Json, Reactor};
 use crate::filespec_helper::qpdf_style_open_error;
 use crate::object_handle::{DocumentResolver, ObjectValue, StreamDataProvider, StreamValue};
@@ -340,18 +339,16 @@ fn json_number_to_handle<R: Read + Seek + 'static>(
     // non-scientific literal is never even attempted: its original text
     // becomes the Real's value verbatim, regardless of magnitude.
     let literal = if text.contains(['e', 'E']) {
-        match text.parse::<f64>() {
-            Ok(value) if value.is_finite() => format_qpdf_real(value),
+        match crate::qutil::stod_decimal(text) {
+            Some(value) => crate::qutil::double_to_string(value, 0, true),
             _ => text.to_owned(),
         }
     } else {
         text.to_owned()
     };
-    let value = text.parse::<f64>().unwrap_or(f64::NAN);
-    Ok(pdf.resolver.direct_object_handle(ObjectValue::RealLiteral {
-        value,
-        literal: literal.into_bytes(),
-    }))
+    Ok(pdf
+        .resolver
+        .direct_object_handle(ObjectValue::Real(literal.into_bytes())))
 }
 
 fn json_string_to_handle<R: Read + Seek + 'static>(

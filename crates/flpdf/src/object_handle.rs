@@ -1451,14 +1451,7 @@ pub(crate) enum ObjectValue {
     Destroyed,
     Boolean(bool),
     Integer(i64),
-    Real(f64),
-    /// Preserves a non-canonical source spelling (e.g. `.4`) alongside its
-    /// parsed value, so that a real number written in the source PDF unparses
-    /// byte-identically.
-    RealLiteral {
-        value: f64,
-        literal: Vec<u8>,
-    },
+    Real(Vec<u8>),
     Name(Vec<u8>),
     String(Vec<u8>),
     /// A content-stream operator token (e.g. `q`, `Do`). Only meaningful inside a content stream
@@ -1501,7 +1494,7 @@ impl ObjectValue {
             Self::Destroyed => 14,
             Self::Boolean(_) => 3,
             Self::Integer(_) => 4,
-            Self::Real(_) | Self::RealLiteral { .. } => 5,
+            Self::Real(_) => 5,
             Self::String(_) => 6,
             Self::Name(_) => 7,
             Self::Array(_) => 8,
@@ -1525,7 +1518,7 @@ impl ObjectValue {
             Self::Destroyed => "destroyed",
             Self::Boolean(_) => "boolean",
             Self::Integer(_) => "integer",
-            Self::Real(_) | Self::RealLiteral { .. } => "real",
+            Self::Real(_) => "real",
             Self::String(_) => "string",
             Self::Name(_) => "name",
             Self::Array(_) => "array",
@@ -3669,8 +3662,7 @@ impl ObjectHandle {
         }
         self.try_dereference()?;
         Ok(self.with_value(|value| match value {
-            Some(ObjectValue::RealLiteral { literal, .. }) => Some(literal.clone()),
-            Some(ObjectValue::Real(value)) => Some(value.to_string().into_bytes()),
+            Some(ObjectValue::Real(value)) => Some(value.clone()),
             _ => None,
         }))
     }
@@ -3684,8 +3676,7 @@ impl ObjectHandle {
         self.try_dereference()?;
         Ok(self.with_value(|value| match value {
             Some(ObjectValue::Integer(value)) => Some(*value as f64),
-            Some(ObjectValue::Real(value)) => Some(*value),
-            Some(ObjectValue::RealLiteral { value, .. }) => Some(*value),
+            Some(ObjectValue::Real(value)) => Some(crate::qutil::atof(value)),
             _ => None,
         }))
     }
@@ -4057,8 +4048,7 @@ impl ObjectHandle {
     pub fn try_get_real_value(&self) -> Result<Vec<u8>> {
         self.try_dereference()?;
         let value = self.with_value(|value| match value {
-            Some(ObjectValue::RealLiteral { literal, .. }) => Some(literal.clone()),
-            Some(ObjectValue::Real(value)) => Some(value.to_string().into_bytes()),
+            Some(ObjectValue::Real(value)) => Some(value.clone()),
             _ => None,
         });
         match value {
@@ -4076,8 +4066,7 @@ impl ObjectHandle {
         self.try_dereference()?;
         let value = self.with_value(|value| match value {
             Some(ObjectValue::Integer(value)) => Some(*value as f64),
-            Some(ObjectValue::Real(value)) => Some(*value),
-            Some(ObjectValue::RealLiteral { value, .. }) => Some(*value),
+            Some(ObjectValue::Real(value)) => Some(crate::qutil::atof(value)),
             _ => None,
         });
         match value {
@@ -4440,9 +4429,10 @@ impl ObjectHandle {
         Self::new_direct(ObjectValue::Boolean(value), NO_PARSED_OFFSET)
     }
 
-    /// Construct a direct real (floating-point) value.
+    /// Construct qpdf's `newReal(double)` value, rounded to six decimal places
+    /// with trailing zeroes removed. Numeric access reads that stored text.
     pub fn real(value: f64) -> Self {
-        Self::new_direct(ObjectValue::Real(value), NO_PARSED_OFFSET)
+        Self::real_with_precision(value, 0, true)
     }
 
     /// Construct a direct name value.
@@ -4514,29 +4504,27 @@ impl ObjectHandle {
         )
     }
 
-    /// Construct a direct real value that preserves a non-canonical source
-    /// literal (e.g. `.4`) alongside its parsed value, mirroring
-    /// the parser's preserved-literal value, so that a real number written in
-    /// the source PDF unparses byte-identically. `literal` is expected to parse
-    /// back to `value` and to differ from `value`'s canonical string form.
-    pub fn real_literal(value: f64, literal: Vec<u8>) -> Self {
+    /// Construct qpdf's `newReal(string)` value without validating or rewriting
+    /// its bytes. Numeric access reads this same spelling.
+    pub fn real_from_string(literal: impl AsRef<[u8]>) -> Self {
         Self::new_direct(
-            ObjectValue::RealLiteral { value, literal },
+            ObjectValue::Real(literal.as_ref().to_vec()),
             NO_PARSED_OFFSET,
         )
     }
 
-    /// The value as an `f64`/literal-bytes pair if this handle's value — its
-    /// own if direct, or its already-resolved value if indirect — is a real
-    /// value with a preserved source literal, or `None` otherwise. This
-    /// never performs resolution itself: an indirect handle that has not
-    /// yet been resolved returns `None` too, the same as a resolved value
-    /// of a different type.
-    pub fn as_real_literal(&self) -> Option<(f64, Vec<u8>)> {
-        self.with_value(|value| match value {
-            Some(ObjectValue::RealLiteral { value, literal }) => Some((*value, literal.clone())),
-            _ => None,
-        })
+    /// Construct qpdf's `newReal(double, decimal_places, trim_trailing_zeroes)`.
+    /// Nonpositive precision selects six decimal places.
+    pub fn real_with_precision(
+        value: f64,
+        decimal_places: i32,
+        trim_trailing_zeroes: bool,
+    ) -> Self {
+        Self::real_from_string(crate::qutil::double_to_string(
+            value,
+            decimal_places,
+            trim_trailing_zeroes,
+        ))
     }
 
     /// The value as `bool` if this handle's value — its own if direct, or
@@ -4552,11 +4540,11 @@ impl ObjectHandle {
     /// The value as `f64` if this handle's value — its own if direct, or
     /// its already-resolved value if indirect — is a real number (including
     /// one with a preserved non-canonical source literal), or `None`
-    /// otherwise. The real-or-real-literal distinction is collapsed by this
-    /// accessor. It never performs resolution itself.
+    /// otherwise. Conversion reads the stored real text, without resolving
+    /// an indirect handle.
     pub fn as_real(&self) -> Option<f64> {
         self.with_value(|value| match value {
-            Some(ObjectValue::Real(v) | ObjectValue::RealLiteral { value: v, .. }) => Some(*v),
+            Some(ObjectValue::Real(v)) => Some(crate::qutil::atof(v)),
             _ => None,
         })
     }
@@ -5607,7 +5595,6 @@ impl ObjectHandle {
             | ObjectValue::Name(_)
             | ObjectValue::Null
             | ObjectValue::Real(_)
-            | ObjectValue::RealLiteral { .. }
             | ObjectValue::String(_) => Ok(Self::from_value(value)),
             ObjectValue::Array(items) => {
                 let mut copied = Vec::with_capacity(items.len());
@@ -7905,14 +7892,7 @@ fn unparse_resolved_value(
             out.extend_from_slice(if value { b"true" } else { b"false" });
         }
         ObjectValue::Integer(value) => out.extend_from_slice(value.to_string().as_bytes()),
-        ObjectValue::Real(value) => out.extend_from_slice(value.to_string().as_bytes()),
-        ObjectValue::RealLiteral { value, literal } => {
-            if crate::pdf_syntax::real_literal_is_safe(&literal, value) {
-                out.extend_from_slice(&literal);
-            } else {
-                out.extend_from_slice(value.to_string().as_bytes());
-            }
-        }
+        ObjectValue::Real(value) => out.extend_from_slice(&value),
         ObjectValue::Name(value) => {
             out.push(b'/');
             crate::writer::output::with_buffer_sink(out, |sink| {
@@ -8134,8 +8114,6 @@ pub enum QpdfStreamJsonData {
 pub enum ObjectJsonError {
     #[error(transparent)]
     Pipeline(#[from] PipelineError),
-    #[error("non-finite float cannot be serialized as JSON")]
-    NonFiniteFloat,
     #[error("PDF error: {0}")]
     Pdf(String),
     #[error("JSON error: {0}")]
@@ -8340,7 +8318,7 @@ impl<'a> ObjectJsonWriter<'a> {
                 self.write_integer(*value)?;
                 Ok(None)
             }
-            Some(value @ (ObjectValue::Real(_) | ObjectValue::RealLiteral { .. })) => {
+            Some(ObjectValue::Real(value)) => {
                 self.write_real_value(value)?;
                 Ok(None)
             }
@@ -8456,32 +8434,18 @@ impl<'a> ObjectJsonWriter<'a> {
         }
     }
 
-    fn write_real_value(
-        &mut self,
-        value: &ObjectValue,
-    ) -> std::result::Result<(), ObjectJsonError> {
-        let (number, literal) = match value {
-            ObjectValue::Real(number) => (*number, None),
-            ObjectValue::RealLiteral { value, literal } => (*value, Some(literal.as_slice())),
-            // cov:ignore-start: the caller's match dispatches only real
-            // variants before this helper is entered.
-            _ => unreachable!("real value dispatch must select a real variant"),
-            // cov:ignore-end
-        };
-        if !number.is_finite() {
-            return Err(ObjectJsonError::NonFiniteFloat);
+    fn write_real_value(&mut self, encoded: &[u8]) -> std::result::Result<(), ObjectJsonError> {
+        if encoded.is_empty() {
+            return self.write(b"0");
         }
-        let encoded = literal
-            .filter(|literal| crate::pdf_syntax::real_literal_is_safe(literal, number))
-            .map_or_else(|| number.to_string().into_bytes(), ToOwned::to_owned);
         if encoded.starts_with(b"-.") {
             self.write(b"-0.")?;
             self.write(&encoded[2..])
         } else if encoded.starts_with(b".") {
             self.write(b"0")?;
-            self.write(&encoded)
+            self.write(encoded)
         } else {
-            self.write(&encoded)
+            self.write(encoded)
         }
     }
 
@@ -9330,13 +9294,10 @@ mod object_json_writer_tests {
         }
 
         for (handle, expected) in [
+            (ObjectHandle::real_from_string(b"1.2"), b"1.2".as_slice()),
             (
-                ObjectHandle::real_literal(1.2, b"1.2".to_vec()),
-                b"1.2".as_slice(),
-            ),
-            (
-                ObjectHandle::real_literal(0.4, b"not-a-real".to_vec()),
-                b"0.4".as_slice(),
+                ObjectHandle::real_from_string(b"not-a-real"),
+                b"not-a-real".as_slice(),
             ),
         ] {
             let mut bytes = Vec::new();
@@ -9348,14 +9309,8 @@ mod object_json_writer_tests {
         }
 
         for (handle, expected) in [
-            (
-                ObjectHandle::real_literal(-0.4, b"-.4".to_vec()),
-                b"-0.4".as_slice(),
-            ),
-            (
-                ObjectHandle::real_literal(0.4, b".4".to_vec()),
-                b"0.4".as_slice(),
-            ),
+            (ObjectHandle::real_from_string(b"-.4"), b"-0.4".as_slice()),
+            (ObjectHandle::real_from_string(b".4"), b"0.4".as_slice()),
         ] {
             let mut bytes = Vec::new();
             let mut output = PlString::new("object-handle-json", None, &mut bytes);
@@ -11045,7 +11000,7 @@ pub(crate) mod identity_tests {
 
     #[test]
     fn try_as_real_resolves_an_indirect_real_through_its_document() {
-        let (handle, _resolver) = resolver_bearing_handle(ObjectValue::Real(3.5));
+        let (handle, _resolver) = resolver_bearing_handle(ObjectValue::Real(b"3.5".to_vec()));
 
         assert_eq!(handle.as_real(), None);
         assert!(!handle.is_resolved());
@@ -11956,17 +11911,17 @@ mod object_value_tests {
 
     #[test]
     fn real_literal_handle_preserves_the_non_canonical_source_literal() {
-        // The preserved-literal value exists so a non-canonical source spelling
-        // (e.g. ".4") survives unparse byte-identically. The handle payload
-        // must carry the same two fields, or byte-identical output breaks
-        // the moment a real-literal round-trips through this layer.
-        let handle = ObjectHandle::real_literal(0.4, b".4".to_vec());
-        assert_eq!(handle.as_real_literal(), Some((0.4, b".4".to_vec())));
+        // QPDF_Real stores the source spelling, including a leading dot.
+        let handle = ObjectHandle::real_from_string(b".4");
+        assert_eq!(
+            handle.try_get_value_as_real().unwrap(),
+            Some(b".4".to_vec())
+        );
     }
 
     #[test]
     fn accessors_return_none_for_a_mismatched_direct_value() {
-        // `as_integer`/`as_array`/`as_dictionary`/`as_real_literal`/
+        // `as_integer`/`as_array`/`as_dictionary`/`as_real`/
         // `as_stream_dict`/`as_stream_data` must reject a direct value of
         // the wrong variant, not just a missing one — the same `_ => None`
         // arm handles both cases.
@@ -11974,7 +11929,7 @@ mod object_value_tests {
         assert_eq!(handle.as_integer(), None);
         assert!(handle.as_array().is_none());
         assert!(handle.as_dictionary().is_none());
-        assert_eq!(handle.as_real_literal(), None);
+        assert_eq!(handle.as_real(), None);
         assert!(handle.as_stream_dict().is_none());
         assert!(handle.as_stream_data().is_none());
     }
@@ -11991,7 +11946,7 @@ mod object_value_tests {
         assert_eq!(handle.as_integer(), None);
         assert!(handle.as_array().is_none());
         assert!(handle.as_dictionary().is_none());
-        assert_eq!(handle.as_real_literal(), None);
+        assert_eq!(handle.as_real(), None);
         assert!(handle.as_stream_dict().is_none());
         assert!(handle.as_stream_data().is_none());
     }
@@ -12926,15 +12881,10 @@ mod rounded_accessor_tests {
     }
 
     #[test]
-    fn as_real_accepts_both_real_and_real_literal_like_object_does() {
-        // Mirrors the handle's own `Real(v) | RealLiteral { value: v, .. }`
-        // arm — a real-literal value is still "a real"
-        // for callers that don't care about the source spelling.
+    fn as_real_reads_values_created_from_doubles_and_strings() {
+        // Both constructors use the same QPDF_Real text representation.
         assert_eq!(ObjectHandle::real(1.5).as_real(), Some(1.5));
-        assert_eq!(
-            ObjectHandle::real_literal(0.4, b".4".to_vec()).as_real(),
-            Some(0.4)
-        );
+        assert_eq!(ObjectHandle::real_from_string(b".4").as_real(), Some(0.4));
         assert_eq!(ObjectHandle::integer(1).as_real(), None);
     }
 
@@ -13030,7 +12980,7 @@ mod type_code_tests {
             (ObjectHandle::boolean(true), 3, "boolean"),
             (ObjectHandle::integer(1), 4, "integer"),
             (ObjectHandle::real(1.5), 5, "real"),
-            (ObjectHandle::real_literal(0.4, b".4".to_vec()), 5, "real"),
+            (ObjectHandle::real_from_string(b".4"), 5, "real"),
             (ObjectHandle::string(b"s".to_vec()), 6, "string"),
             (ObjectHandle::name(b"N".to_vec()), 7, "name"),
             (ObjectHandle::array(vec![]), 8, "array"),
@@ -13423,10 +13373,10 @@ mod type_code_tests {
     }
 
     #[test]
-    fn unparse_resolved_uses_the_canonical_form_for_an_unsafe_real_literal() {
-        let handle = ObjectHandle::real_literal(0.4, b"not-a-real".to_vec());
+    fn unparse_resolved_preserves_an_unvalidated_real_string() {
+        let handle = ObjectHandle::real_from_string(b"not-a-real");
 
-        assert_eq!(handle.unparse_resolved(), b"0.4");
+        assert_eq!(handle.unparse_resolved(), b"not-a-real");
     }
 
     #[test]
@@ -18456,10 +18406,10 @@ pub(crate) mod warning_emission_tests {
             Rectangle::new(1.0, 2.0, 3.0, 4.0)
         );
         let literal_rectangle = ObjectHandle::array(vec![
-            ObjectHandle::real_literal(1.2, b"1.2".to_vec()),
-            ObjectHandle::real_literal(3.4, b"3.4".to_vec()),
-            ObjectHandle::real_literal(5.6, b"5.6".to_vec()),
-            ObjectHandle::real_literal(7.8, b"7.8".to_vec()),
+            ObjectHandle::real_from_string(b"1.2"),
+            ObjectHandle::real_from_string(b"3.4"),
+            ObjectHandle::real_from_string(b"5.6"),
+            ObjectHandle::real_from_string(b"7.8"),
         ]);
         assert_eq!(
             literal_rectangle.try_get_array_as_rectangle().unwrap(),
@@ -18618,7 +18568,7 @@ pub(crate) mod warning_emission_tests {
             b"1.25"
         );
         assert_eq!(
-            ObjectHandle::real_literal(0.4, b".4".to_vec())
+            ObjectHandle::real_from_string(b".4")
                 .try_get_real_value()
                 .unwrap(),
             b".4"
@@ -18632,7 +18582,7 @@ pub(crate) mod warning_emission_tests {
             1.25
         );
         assert_eq!(
-            ObjectHandle::real_literal(0.4, b".4".to_vec())
+            ObjectHandle::real_from_string(b".4")
                 .try_get_numeric_value()
                 .unwrap(),
             0.4
@@ -18775,7 +18725,7 @@ pub(crate) mod warning_emission_tests {
             Some(1)
         );
         assert_eq!(
-            ObjectHandle::real_literal(42.0, b"42.0".to_vec())
+            ObjectHandle::real_from_string(b"42.0")
                 .try_get_value_as_real()
                 .unwrap(),
             Some(b"42.0".to_vec())
