@@ -707,13 +707,13 @@ fn filespec_handle_to_json<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filespec: ObjectHandle,
 ) -> Result<Json, ConvertError> {
-    let filespec_value = Json::make_string(filespec.unparse());
+    let filespec_value = Json::make_string(filespec.unparse()?);
     let (description, filenames, preferred_name, preferred_contents, streams) = {
         let mut file_spec = FileSpec::new(filespec, pdf)?;
         let description = file_spec.get_description()?;
         let filenames = file_spec.get_filenames()?;
         let preferred_name = file_spec.get_filename()?;
-        let preferred_contents = file_spec.get_embedded_file_stream("")?.unparse();
+        let preferred_contents = file_spec.get_embedded_file_stream("")?.unparse()?;
         let stream_entries = file_spec.get_embedded_file_stream_entries()?;
         (
             description,

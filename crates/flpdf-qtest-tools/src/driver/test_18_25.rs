@@ -302,7 +302,7 @@ pub(crate) fn run_test_24<R: Read + Seek + 'static>(
     // (`libqpdf/QPDF_Reserved.cc:22-26`). Use the handle's fallible
     // qpdf-shaped unparse entry point so this is the object-model operation,
     // not a writer-only surrogate.
-    match res2.try_unparse_resolved() {
+    match res2.unparse_resolved() {
         Ok(_) => writeln!(stdout, "oops -- didn't throw")?,
         Err(error) => writeln!(stdout, "logic error: {error}")?,
     }

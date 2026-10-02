@@ -20,7 +20,7 @@ pub(crate) fn clean_trailer_handle(trailer: &ObjectHandle) -> flpdf::Result<()> 
     }
     let first = id.try_get_array_item(0)?;
     let second = id.try_get_array_item(1)?;
-    let both_equal = first.unparse() == second.unparse();
+    let both_equal = first.unparse()? == second.unparse()?;
     id.try_set_array_item_at(1, ObjectHandle::string(Vec::new()))?;
     if both_equal {
         id.try_set_array_item_at(0, ObjectHandle::string(Vec::new()))?;
@@ -173,8 +173,10 @@ mod tests {
         clean_encryption_handle(&trailer).expect("non-dictionary cleanup succeeds");
 
         assert_eq!(
-            encrypt.unparse(),
-            ObjectHandle::string(b"not a dictionary".to_vec()).unparse()
+            encrypt.unparse().unwrap(),
+            ObjectHandle::string(b"not a dictionary".to_vec())
+                .unparse()
+                .unwrap()
         );
     }
 

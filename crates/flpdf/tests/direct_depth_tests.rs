@@ -42,12 +42,10 @@ fn shallow_copy_and_unparse_accept_programmatic_graphs_beyond_parser_depth() {
     let copied = original.shallow_copy().unwrap();
     let expected = qpdf_nested_array_unparse(DIRECT_DEPTH);
 
-    assert_eq!(original.unparse(), expected);
-    assert_eq!(original.unparse_resolved(), expected);
-    assert_eq!(original.try_unparse_resolved().unwrap(), expected);
-    assert_eq!(copied.unparse(), expected);
-    assert_eq!(copied.unparse_resolved(), expected);
-    assert_eq!(copied.try_unparse_resolved().unwrap(), expected);
+    assert_eq!(original.unparse().unwrap(), expected);
+    assert_eq!(original.unparse_resolved().unwrap(), expected);
+    assert_eq!(copied.unparse().unwrap(), expected);
+    assert_eq!(copied.unparse_resolved().unwrap(), expected);
 }
 
 #[test]
@@ -55,7 +53,7 @@ fn make_direct_uses_qpdf_object_generations_and_accepts_deep_direct_graphs() {
     let mut value = deeply_nested_array(DIRECT_DEPTH);
     value.make_direct(false).unwrap();
     assert_eq!(
-        value.try_unparse_resolved().unwrap(),
+        value.unparse_resolved().unwrap(),
         qpdf_nested_array_unparse(DIRECT_DEPTH)
     );
 }

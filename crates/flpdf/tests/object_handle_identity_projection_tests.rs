@@ -184,12 +184,12 @@ fn object_number_zero_resolves_to_null_through_a_real_pdf() {
 
     // Assert serialization through the fallible twin: `unparse_resolved` maps
     // a failed serialization onto a literal `null`, so only
-    // `try_unparse_resolved` distinguishes real null resolution from that
+    // `unparse_resolved` distinguishes real null resolution from that
     // fallback.
     let mut pdf = open();
     let handle = pdf.get_object_handle(object_zero());
     assert_eq!(
-        handle.try_unparse_resolved().expect("unparse"),
+        handle.unparse_resolved().expect("unparse"),
         b"null".to_vec()
     );
 
@@ -198,7 +198,7 @@ fn object_number_zero_resolves_to_null_through_a_real_pdf() {
     // (`libqpdf/QPDFObjectHandle.cc:1574-1584`).
     let mut pdf = open();
     let handle = pdf.get_object_handle(object_zero());
-    assert_eq!(handle.unparse(), b"null".to_vec());
+    assert_eq!(handle.unparse().unwrap(), b"null".to_vec());
 
     // `QPDFObjectHandle::writeJSON` gates only the reference form on
     // `isIndirect()` and otherwise falls through to an unconditional

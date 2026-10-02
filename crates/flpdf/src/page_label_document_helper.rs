@@ -130,8 +130,10 @@ fn raw_page_labels_are_redundant(
     Ok(match (expected_start, current_st) {
         (Some(expected_start), Some(current_st)) => {
             current_st == expected_start
-                && previous.try_get_key(b"/S")?.unparse() == current.try_get_key(b"/S")?.unparse()
-                && previous.try_get_key(b"/P")?.unparse() == current.try_get_key(b"/P")?.unparse()
+                && previous.try_get_key(b"/S")?.unparse()?
+                    == current.try_get_key(b"/S")?.unparse()?
+                && previous.try_get_key(b"/P")?.unparse()?
+                    == current.try_get_key(b"/P")?.unparse()?
         }
         _ => false,
     })
@@ -421,11 +423,13 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
                 let idx_delta = new_start_idx.checked_sub(*last_index);
                 let st_delta = first_st
                     .and_then(|first_st| last_st.and_then(|last_st| first_st.checked_sub(last_st)));
-                idx_delta.zip(st_delta).is_some_and(|(idx, st)| {
-                    idx == st
-                        && last_s.unparse() == first_s.unparse()
-                        && last_p.unparse() == first_p.unparse()
-                })
+                match idx_delta.zip(st_delta) {
+                    Some((idx, st)) if idx == st => {
+                        last_s.unparse()? == first_s.unparse()?
+                            && last_p.unparse()? == first_p.unparse()?
+                    }
+                    _ => false,
+                }
             } else {
                 false
             }

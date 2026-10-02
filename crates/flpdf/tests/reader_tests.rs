@@ -3138,12 +3138,22 @@ fn resolves_compressed_entry_with_flate_decode_from_xref_stream() {
 
     let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).unwrap();
     assert_eq!(
-        resolved_handle(&mut pdf, ObjectRef::new(2, 0)).unparse_resolved(),
-        ObjectHandle::parse(&member1).unwrap().unparse_resolved()
+        resolved_handle(&mut pdf, ObjectRef::new(2, 0))
+            .unparse_resolved()
+            .unwrap(),
+        ObjectHandle::parse(&member1)
+            .unwrap()
+            .unparse_resolved()
+            .unwrap()
     );
     assert_eq!(
-        resolved_handle(&mut pdf, ObjectRef::new(3, 0)).unparse_resolved(),
-        ObjectHandle::parse(&member2).unwrap().unparse_resolved()
+        resolved_handle(&mut pdf, ObjectRef::new(3, 0))
+            .unparse_resolved()
+            .unwrap(),
+        ObjectHandle::parse(&member2)
+            .unwrap()
+            .unparse_resolved()
+            .unwrap()
     );
 }
 
@@ -3181,22 +3191,31 @@ fn objstm_direct_container_qpdf_contract() {
         "a header object number, not the xref field2, controls resolution"
     );
     assert_eq!(
-        resolved_handle(&mut pdf, ObjectRef::new(10, 0)).unparse_resolved(),
+        resolved_handle(&mut pdf, ObjectRef::new(10, 0))
+            .unparse_resolved()
+            .unwrap(),
         ObjectHandle::parse(b"<< /V 100 >>")
             .unwrap()
             .unparse_resolved()
+            .unwrap()
     );
     assert_eq!(
-        resolved_handle(&mut pdf, ObjectRef::new(11, 0)).unparse_resolved(),
+        resolved_handle(&mut pdf, ObjectRef::new(11, 0))
+            .unparse_resolved()
+            .unwrap(),
         ObjectHandle::parse(b"<< /V 200 >>")
             .unwrap()
             .unparse_resolved()
+            .unwrap()
     );
     assert_eq!(
-        resolved_handle(&mut pdf, ObjectRef::new(12, 0)).unparse_resolved(),
+        resolved_handle(&mut pdf, ObjectRef::new(12, 0))
+            .unparse_resolved()
+            .unwrap(),
         ObjectHandle::parse(b"<< /V 300 >>")
             .unwrap()
-            .unparse_resolved(),
+            .unparse_resolved()
+            .unwrap(),
         "a child xref entry must resolve against the child container directly"
     );
 }

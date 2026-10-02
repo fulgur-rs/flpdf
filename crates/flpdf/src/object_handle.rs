@@ -7609,17 +7609,19 @@ impl ObjectHandle {
     /// `libqpdf/QPDFObjectHandle.cc:1574-1584`): an indirect handle always
     /// unparses to its own `"N G R"`, regardless of resolution state; a
     /// direct handle delegates to [`Self::unparse_resolved`].
-    pub fn unparse(&self) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::unparse_resolved`]'s error for a direct handle whose
+    /// qpdf value cannot be unparsed.
+    pub fn unparse(&self) -> Result<Vec<u8>> {
         if let Some(object_gen) = self
             .qpdf_obj_gen()
             .filter(|object_gen| object_gen.is_indirect())
         {
-            return format!("{} {} R", object_gen.get_obj(), object_gen.get_gen()).into_bytes();
+            return Ok(format!("{} {} R", object_gen.get_obj(), object_gen.get_gen()).into_bytes());
         }
-        match self.object_ref() {
-            Some(object_ref) => object_ref.to_string().into_bytes(),
-            None => self.unparse_resolved(),
-        }
+        self.unparse_resolved()
     }
 
     /// This handle's resolved qpdf-syntax form
@@ -7633,41 +7635,14 @@ impl ObjectHandle {
     /// own reference because `QPDF_Stream::unparse` returns that form
     /// (`libqpdf/QPDF_Stream.cc:173-178`).
     ///
-    /// This non-fallible convenience method retains the existing null fallback
-    /// when the qpdf operation would throw. Call [`Self::try_unparse_resolved`]
-    /// at production error boundaries that need the qpdf error classification.
-    pub fn unparse_resolved(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        if unparse_resolved_into(self, &mut out, false).is_err() {
-            out.clear();
-            out.extend_from_slice(b"null");
-        }
-        out
-    }
-
-    /// This handle's resolved qpdf-syntax form through a fallible error
-    /// boundary, porting `QPDFObjectHandle::unparseResolved`
-    /// (`libqpdf/QPDFObjectHandle.cc:1586-1593`). Unlike
-    /// [`Self::unparse_resolved`], this variant first resolves an unresolved
-    /// indirect handle and preserves qpdf's logic errors for reserved and
-    /// destroyed values (`QPDF_Reserved::unparse`,
-    /// `libqpdf/QPDF_Reserved.cc:22-26`; `QPDF_Destroyed::unparse`,
-    /// `libqpdf/QPDF_Destroyed.cc:24-29`).
+    /// # Errors
     ///
-    /// The fallible qpdf-shaped error boundary for resolved serialization.
-    ///
-    /// `QPDFObjectHandle::unparseResolved` first dereferences the receiver and
-    /// then delegates to `QPDFObject::unparse`; the value implementations throw
-    /// for unresolved, reserved, and destroyed values
-    /// (`libqpdf/QPDFObjectHandle.cc:1586-1593`,
-    /// `libqpdf/QPDF_Unresolved.cc:23-27`,
-    /// `libqpdf/QPDF_Reserved.cc:22-26`,
-    /// `libqpdf/QPDF_Destroyed.cc:24-28`). This method preserves those errors
-    /// while the non-fallible [`Self::unparse_resolved`] facade maps them to its
-    /// established `null` fallback.
-    pub fn try_unparse_resolved(&self) -> Result<Vec<u8>> {
+    /// Returns the corresponding qpdf logic error for an uninitialized,
+    /// unresolved, reserved, or destroyed value, and propagates recursive
+    /// child and stream-data errors.
+    pub fn unparse_resolved(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
-        unparse_resolved_into(self, &mut out, true)?;
+        unparse_resolved_into(self, &mut out)?;
         Ok(out)
     }
 
@@ -7705,7 +7680,7 @@ impl ObjectHandle {
 // `Object` projection is created. Dictionary null suppression follows
 // `QPDF_Dictionary::unparse` (`libqpdf/QPDF_Dictionary.cc:58-68`), while array
 // elements retain nulls (`libqpdf/QPDF_Array.cc:122-149`).
-fn unparse_resolved_into(handle: &ObjectHandle, out: &mut Vec<u8>, strict: bool) -> Result<()> {
+fn unparse_resolved_into(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
     direct_graph_walk_hub(|| {
         handle.try_dereference()?;
         let value = handle
@@ -7723,7 +7698,7 @@ fn unparse_resolved_into(handle: &ObjectHandle, out: &mut Vec<u8>, strict: bool)
             return Ok(());
         }
 
-        unparse_resolved_value(handle, value, out, strict)
+        unparse_resolved_value(handle, value, out)
     })
 }
 
@@ -7735,7 +7710,7 @@ fn unparse_resolved_into(handle: &ObjectHandle, out: &mut Vec<u8>, strict: bool)
 // resolution ever runs. Read the raw qpdf identity first, so a dangling or
 // malformed indirect child still emits its own `N G R` form without requiring
 // resolution to succeed.
-fn unparse_resolved_child(handle: &ObjectHandle, out: &mut Vec<u8>, strict: bool) -> Result<()> {
+fn unparse_resolved_child(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
     if let Some(object_gen) = handle
         .qpdf_obj_gen()
         .filter(|object_gen| object_gen.is_indirect())
@@ -7745,7 +7720,7 @@ fn unparse_resolved_child(handle: &ObjectHandle, out: &mut Vec<u8>, strict: bool
         );
         Ok(())
     } else {
-        unparse_resolved_into(handle, out, strict)
+        unparse_resolved_into(handle, out)
     }
 }
 
@@ -7753,28 +7728,12 @@ fn unparse_resolved_value(
     handle: &ObjectHandle,
     value: ObjectValue,
     out: &mut Vec<u8>,
-    strict: bool,
 ) -> Result<()> {
     match value {
         ObjectValue::Null => out.extend_from_slice(b"null"),
-        ObjectValue::Unresolved => {
-            if strict {
-                return Err(unresolved_unparse_error());
-            }
-            out.extend_from_slice(b"null");
-        }
-        ObjectValue::Reserved => {
-            if strict {
-                return Err(reserved_unparse_error());
-            }
-            out.extend_from_slice(b"null");
-        }
-        ObjectValue::Destroyed => {
-            if strict {
-                return Err(destroyed_unparse_error());
-            }
-            out.extend_from_slice(b"null");
-        }
+        ObjectValue::Unresolved => return Err(unresolved_unparse_error()),
+        ObjectValue::Reserved => return Err(reserved_unparse_error()),
+        ObjectValue::Destroyed => return Err(destroyed_unparse_error()),
         ObjectValue::Boolean(value) => {
             out.extend_from_slice(if value { b"true" } else { b"false" });
         }
@@ -7797,7 +7756,7 @@ fn unparse_resolved_value(
         ObjectValue::Array(children) => {
             out.extend_from_slice(b"[ ");
             for child in children {
-                unparse_resolved_child(&child, out, strict)?;
+                unparse_resolved_child(&child, out)?;
                 out.push(b' ');
             }
             out.push(b']');
@@ -7810,7 +7769,7 @@ fn unparse_resolved_value(
                 }
                 write_unparse_dictionary_key(out, &key)?;
                 out.push(b' ');
-                unparse_resolved_child(&child, out, strict)?;
+                unparse_resolved_child(&child, out)?;
                 out.push(b' ');
             }
             out.extend_from_slice(b">>");
@@ -7819,7 +7778,7 @@ fn unparse_resolved_value(
             // qpdf owns streams as indirect objects. This direct-stream arm
             // retains the existing Rust-only factory behavior for a value
             // without an object number.
-            unparse_resolved_into(&stream.stream_dict, out, strict)?;
+            unparse_resolved_into(&stream.stream_dict, out)?;
             out.extend_from_slice(b"\nstream\n");
             let data = match &stream.stream_data {
                 Some(data) => data.clone(),
@@ -9326,14 +9285,14 @@ fn merge_resource_array(this_val: &ObjectHandle, other_val: &ObjectHandle) -> Re
     let mut scalars = std::collections::BTreeSet::new();
     for item in this_val.as_array().into_iter().flatten() {
         if is_scalar(&item)? {
-            scalars.insert(item.unparse());
+            scalars.insert(item.unparse()?);
         }
     }
     for item in other_items {
         if !is_scalar(&item)? {
             continue;
         }
-        let text = item.unparse();
+        let text = item.unparse()?;
         if scalars.insert(text) {
             append_array_item(this_val, item);
         }
@@ -12635,7 +12594,7 @@ mod internal_state_value_tests {
         let unresolved = ObjectHandle::from_value(ObjectValue::Unresolved);
         assert_eq!(
             unresolved
-                .try_unparse_resolved()
+                .unparse_resolved()
                 .expect_err("an unresolved value cannot be unparsed")
                 .to_string(),
             "attempted to unparse an unresolved QPDFObjectHandle"
@@ -12906,39 +12865,39 @@ mod type_code_tests {
         ]);
 
         assert_eq!(
-            array.unparse_resolved(),
+            array.unparse_resolved().unwrap(),
             b"[ 1 << /B 2 >> 9 0 R [ /Nested ] ]"
         );
     }
 
     #[test]
     fn direct_scalar_unparses_like_object_write_pdf() {
-        assert_eq!(ObjectHandle::integer(7).unparse(), b"7");
-        assert_eq!(ObjectHandle::boolean(true).unparse(), b"true");
-        assert_eq!(ObjectHandle::name(b"Type".to_vec()).unparse(), b"/Type");
+        assert_eq!(ObjectHandle::integer(7).unparse().unwrap(), b"7");
+        assert_eq!(ObjectHandle::boolean(true).unparse().unwrap(), b"true");
+        assert_eq!(
+            ObjectHandle::name(b"Type".to_vec()).unparse().unwrap(),
+            b"/Type"
+        );
     }
 
     #[test]
     fn indirect_handle_unparse_is_always_the_reference_form_even_before_resolution() {
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(7, 2), 0);
-        assert_eq!(handle.unparse(), b"7 2 R");
+        assert_eq!(handle.unparse().unwrap(), b"7 2 R");
     }
 
     #[test]
-    fn indirect_handle_unparse_resolved_falls_back_to_null_before_resolution() {
-        // No hidden I/O: an unresolved indirect handle's value is not
-        // known, so unparse_resolved reports the same as materialize()'s
-        // own documented null fallback rather than triggering resolution.
+    fn indirect_unparse_does_not_resolve_a_dangling_handle() {
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(7, 2), 0);
-        assert_eq!(handle.unparse_resolved(), b"null");
+        assert_eq!(handle.unparse().unwrap(), b"7 2 R");
     }
 
     #[test]
     fn resolved_indirect_handle_unparse_resolved_shows_the_real_value() {
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(7, 2), 0);
         handle.set_resolved(ObjectValue::Integer(42));
-        assert_eq!(handle.unparse(), b"7 2 R");
-        assert_eq!(handle.unparse_resolved(), b"42");
+        assert_eq!(handle.unparse().unwrap(), b"7 2 R");
+        assert_eq!(handle.unparse_resolved().unwrap(), b"42");
     }
 
     #[test]
@@ -12957,15 +12916,15 @@ mod type_code_tests {
             content_normalization_applied: false,
             stream_length: 0,
         })));
-        assert_eq!(handle.unparse(), b"9 0 R");
-        assert_eq!(handle.unparse_resolved(), b"9 0 R");
+        assert_eq!(handle.unparse().unwrap(), b"9 0 R");
+        assert_eq!(handle.unparse_resolved().unwrap(), b"9 0 R");
     }
 
     #[test]
     fn direct_array_unparse_writes_indirect_children_as_references_not_recursed() {
         let (child, _resolver) = identity_tests::resolver_bearing_handle(ObjectValue::Integer(5));
         let array = ObjectHandle::array(vec![ObjectHandle::integer(1), child]);
-        assert_eq!(array.unparse(), b"[ 1 20 0 R ]");
+        assert_eq!(array.unparse().unwrap(), b"[ 1 20 0 R ]");
     }
 
     #[test]
@@ -12985,7 +12944,7 @@ mod type_code_tests {
 
         assert_eq!(
             array
-                .try_unparse_resolved()
+                .unparse_resolved()
                 .expect("an unresolvable indirect child must not fail the whole array"),
             b"[ 1 20 0 R ]"
         );
@@ -13004,7 +12963,7 @@ mod type_code_tests {
         let array = ObjectHandle::array(vec![raw]);
         assert_eq!(
             array
-                .try_unparse_resolved()
+                .unparse_resolved()
                 .expect("raw qpdf identity is sufficient for a reference form"),
             b"[ 9 65535 R ]"
         );
@@ -13028,24 +12987,33 @@ mod type_code_tests {
             stream_length: 0,
         })));
         assert_eq!(
-            handle.unparse_resolved(),
+            handle.unparse_resolved().unwrap(),
             b"<< /Length 2 >>\nstream\nab\nendstream"
         );
     }
 
     #[test]
-    fn destroyed_direct_handle_unparse_and_unparse_resolved_fall_back_to_null() {
-        // Disconnect clears the shared slot's indirect metadata, so both
-        // entry points reach the existing infallible fallback for the
-        // `Destroyed` value. qpdf's `QPDF_Destroyed::unparse()`
-        // (`libqpdf/QPDF_Destroyed.cc:24-29`) throws `std::logic_error`, but
-        // neither method has an exception channel to mirror that with.
+    fn destroyed_direct_handle_unparse_and_unparse_resolved_return_qpdf_errors() {
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
         handle.set_resolved(ObjectValue::Integer(7));
         handle.disconnect_and_destroy();
 
-        assert_eq!(handle.unparse(), b"null");
-        assert_eq!(handle.unparse_resolved(), b"null");
+        let unparse_error = handle
+            .unparse()
+            .expect_err("qpdf throws for a destroyed value");
+        assert!(matches!(
+            unparse_error,
+            Error::Internal(message)
+                if message == "attempted to unparse a QPDFObjectHandle from a destroyed QPDF"
+        ));
+        let unparse_resolved_error = handle
+            .unparse_resolved()
+            .expect_err("qpdf unparseResolved throws for a destroyed value");
+        assert!(matches!(
+            unparse_resolved_error,
+            Error::Internal(message)
+                if message == "attempted to unparse a QPDFObjectHandle from a destroyed QPDF"
+        ));
     }
 
     #[test]
@@ -13057,7 +13025,7 @@ mod type_code_tests {
             (b"A".to_vec(), ObjectHandle::null()),
             (b"B".to_vec(), ObjectHandle::integer(1)),
         ]);
-        assert_eq!(dict.unparse_resolved(), b"<< /B 1 >>");
+        assert_eq!(dict.unparse_resolved().unwrap(), b"<< /B 1 >>");
     }
 
     #[test]
@@ -13072,7 +13040,7 @@ mod type_code_tests {
             (b"A".to_vec(), missing),
             (b"B".to_vec(), ObjectHandle::integer(1)),
         ]);
-        assert_eq!(dict.unparse_resolved(), b"<< /B 1 >>");
+        assert_eq!(dict.unparse_resolved().unwrap(), b"<< /B 1 >>");
     }
 
     #[test]
@@ -13082,7 +13050,7 @@ mod type_code_tests {
         let (unresolved, _resolver) =
             identity_tests::resolver_bearing_handle(ObjectValue::Integer(9));
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), unresolved)]);
-        assert_eq!(dict.unparse_resolved(), b"<< /A 20 0 R >>");
+        assert_eq!(dict.unparse_resolved().unwrap(), b"<< /A 20 0 R >>");
     }
 
     #[test]
@@ -13093,7 +13061,7 @@ mod type_code_tests {
             (b"B".to_vec(), ObjectHandle::integer(1)),
         ]);
 
-        assert_eq!(dict.unparse_resolved(), b"<< /B 1 >>");
+        assert_eq!(dict.unparse_resolved().unwrap(), b"<< /B 1 >>");
         assert!(null_child.is_resolved());
     }
 
@@ -13101,7 +13069,7 @@ mod type_code_tests {
     fn unparse_resolved_resolves_an_unresolved_top_level_handle() {
         let (handle, _resolver) = identity_tests::resolver_bearing_handle(ObjectValue::Integer(42));
 
-        assert_eq!(handle.unparse_resolved(), b"42");
+        assert_eq!(handle.unparse_resolved().unwrap(), b"42");
         assert!(handle.is_resolved());
     }
 
@@ -13109,7 +13077,7 @@ mod type_code_tests {
     fn unparse_resolved_omits_nulls_in_a_nested_dictionary_inside_an_array() {
         let inner = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::null())]);
         let array = ObjectHandle::array(vec![inner]);
-        assert_eq!(array.unparse_resolved(), b"[ << >> ]");
+        assert_eq!(array.unparse_resolved().unwrap(), b"[ << >> ]");
     }
 
     #[test]
@@ -13119,7 +13087,7 @@ mod type_code_tests {
         // libqpdf/QPDF_Array.cc:123-140, explicitly fills gaps with the
         // literal "null" token rather than skipping them).
         let array = ObjectHandle::array(vec![ObjectHandle::integer(1), ObjectHandle::null()]);
-        assert_eq!(array.unparse_resolved(), b"[ 1 null ]");
+        assert_eq!(array.unparse_resolved().unwrap(), b"[ 1 null ]");
     }
 
     #[test]
@@ -13129,17 +13097,16 @@ mod type_code_tests {
             .replace_key(b"#A", ObjectHandle::integer(1))
             .expect("programmatic dictionary mutation");
 
-        assert_eq!(dictionary.unparse_resolved(), b"<< #A 1 >>");
+        assert_eq!(dictionary.unparse_resolved().unwrap(), b"<< #A 1 >>");
     }
 
     #[test]
-    fn unparse_resolved_falls_back_but_try_unparse_resolved_reports_unresolved_values() {
+    fn unparse_resolved_reports_unresolved_values() {
         let handle = ObjectHandle::from_value(ObjectValue::Unresolved);
 
-        assert_eq!(handle.unparse_resolved(), b"null");
         assert_eq!(
             handle
-                .try_unparse_resolved()
+                .unparse_resolved()
                 .expect_err("strict qpdf unparse must reject unresolved values")
                 .to_string(),
             "attempted to unparse an unresolved QPDFObjectHandle"
@@ -13150,11 +13117,11 @@ mod type_code_tests {
     fn unparse_resolved_preserves_an_unvalidated_real_string() {
         let handle = ObjectHandle::real_from_string(b"not-a-real");
 
-        assert_eq!(handle.unparse_resolved(), b"not-a-real");
+        assert_eq!(handle.unparse_resolved().unwrap(), b"not-a-real");
     }
 
     #[test]
-    fn try_unparse_resolved_reports_missing_original_data_for_a_direct_stream() {
+    fn unparse_resolved_reports_missing_original_data_for_a_direct_stream() {
         let handle = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: ObjectHandle::dictionary(Vec::new()),
             stream_data: None,
@@ -13166,7 +13133,7 @@ mod type_code_tests {
         })));
 
         assert!(handle
-            .try_unparse_resolved()
+            .unparse_resolved()
             .expect_err("a direct original stream has no source")
             .to_string()
             .contains("pipeStreamData called for original direct stream"));
@@ -13195,7 +13162,7 @@ mod unparse_handle_identity_tests {
             stream_length: 0,
         })));
 
-        assert_eq!(handle.try_unparse_resolved().unwrap(), b"5 65536 R");
+        assert_eq!(handle.unparse_resolved().unwrap(), b"5 65536 R");
     }
 
     #[test]
@@ -13208,7 +13175,7 @@ mod unparse_handle_identity_tests {
         );
         handle.set_resolved(ObjectValue::Integer(45));
 
-        assert_eq!(handle.unparse(), b"5 65536 R");
+        assert_eq!(handle.unparse().unwrap(), b"5 65536 R");
     }
 }
 

@@ -109,7 +109,7 @@ pub(crate) fn run_test_34<R: Read + Seek>(
     let extensions = root.try_get_key(b"/Extensions");
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let extensions = extensions?;
-    write_bytes(stdout, &extensions.unparse())?;
+    write_bytes(stdout, &extensions.unparse()?)?;
     writeln!(stdout)?;
 
     // `getVersionAsPDFVersion` calls getExtensionLevel again, as qpdf does;
@@ -450,7 +450,7 @@ pub(crate) fn run_test_36<R: Read + Seek>(
         let dict_handle = after_qpdf_call(pdf, filename, diagnostics_written, stdout, stderr)(
             ef_f.try_get_stream_dict(),
         )?;
-        write_bytes(stdout, &dict_handle.unparse())?;
+        write_bytes(stdout, &dict_handle.unparse()?)?;
         write_bytes(stdout, &attachment_name)?;
         stdout.write_all(b":\n")?;
         write_bytes(stdout, &data)?;
@@ -503,7 +503,7 @@ impl<'a, R: Read + Seek + 'static> flpdf::ObjectHandleParserCallbacks
             let value = object.as_inline_image().unwrap_or_default();
             writeln!(self.stdout, "{}", hex_encode(&value))?;
         } else {
-            write_bytes(self.stdout, &object.unparse())?;
+            write_bytes(self.stdout, &object.unparse()?)?;
             writeln!(self.stdout)?;
         }
         Ok(flpdf::ParseControl::Continue)
@@ -578,7 +578,7 @@ pub(crate) fn run_test_38<R: Read + Seek>(
         let qpdf_flush_result_18 = qtest.try_get_array_item(index as i64);
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         let item = qpdf_flush_result_18?;
-        let qpdf_flush_result_19 = item.try_unparse_resolved();
+        let qpdf_flush_result_19 = item.unparse_resolved();
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         let rendered = qpdf_flush_result_19?;
         write_bytes(stdout, &rendered)?;
@@ -612,8 +612,8 @@ pub(crate) fn run_test_39<R: Read + Seek>(
         let images = PageObjectHelper::from_object_handle(page, pdf).get_images()?;
         for (_key, image) in images {
             let dict = image.try_get_stream_dict()?;
-            let filter = dict.try_get_key(b"/Filter")?.try_unparse_resolved()?;
-            let color_space = dict.try_get_key(b"/ColorSpace")?.try_unparse_resolved()?;
+            let filter = dict.try_get_key(b"/Filter")?.unparse_resolved()?;
+            let color_space = dict.try_get_key(b"/ColorSpace")?.unparse_resolved()?;
             write!(stdout, "filter: ")?;
             write_bytes(stdout, &filter)?;
             write!(stdout, ", color space: ")?;

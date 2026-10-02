@@ -665,7 +665,7 @@ mod tests {
             .as_dictionary()
             .unwrap()
             .contains_key(b"/P".as_slice()));
-        assert_eq!(widget.try_unparse_resolved().unwrap(), b"<< >>");
+        assert_eq!(widget.unparse_resolved().unwrap(), b"<< >>");
     }
 
     #[test]

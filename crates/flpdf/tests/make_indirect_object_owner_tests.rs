@@ -21,7 +21,10 @@ fn public_factory_promotes_the_retained_direct_alias_in_place() {
         .unwrap()
         .try_is_integer()
         .unwrap());
-    assert_eq!(result.try_get_key(b"/Value").unwrap().unparse(), b"7");
+    assert_eq!(
+        result.try_get_key(b"/Value").unwrap().unparse().unwrap(),
+        b"7"
+    );
 }
 
 #[test]
@@ -110,7 +113,7 @@ fn promotion_updates_distinct_handles_sharing_the_replacement_value() {
     let new_ref = promoted.object_ref();
     assert!(promoted.is_same_object_as(&replacement));
     assert_eq!(target.object_ref(), new_ref);
-    assert_eq!(target.unparse_resolved(), b"99");
+    assert_eq!(target.unparse_resolved().unwrap(), b"99");
     pdf.get_object_handle(target_ref);
     assert_eq!(replacement.object_ref(), Some(target_ref));
 }
@@ -133,7 +136,7 @@ fn promotion_can_change_the_owning_document_and_lookup_restores_it() {
     assert!(first_pdf
         .get_object_handle(first_ref)
         .is_same_object_as(&source));
-    assert_eq!(source.unparse_resolved(), b"8");
+    assert_eq!(source.unparse_resolved().unwrap(), b"8");
 }
 
 #[test]
@@ -158,7 +161,8 @@ fn retained_alias_mutation_is_visible_in_written_output() {
             .trailer()
             .try_get_key(b"/Promoted")
             .unwrap()
-            .unparse_resolved(),
+            .unparse_resolved()
+            .unwrap(),
         b"[ 1 42 ]"
     );
 }
@@ -171,7 +175,7 @@ fn unresolved_input_is_not_dereferenced_by_promotion() {
     assert!(promoted.is_same_object_as(&source));
     assert_eq!(promoted.object_ref(), Some(flpdf::ObjectRef::new(100, 0)));
     assert!(!source.is_resolved());
-    assert_eq!(promoted.unparse_resolved(), b"null");
+    assert_eq!(promoted.unparse_resolved().unwrap(), b"null");
 }
 
 #[test]
@@ -247,9 +251,9 @@ fn replacing_a_repromoted_value_preserves_the_departing_alias_identity() {
     pdf.replace_object(target_ref, ObjectHandle::integer(3))
         .unwrap();
     assert_eq!(shared.object_ref(), shared_ref);
-    assert_eq!(shared.unparse_resolved(), b"2");
+    assert_eq!(shared.unparse_resolved().unwrap(), b"2");
     assert_eq!(target.object_ref(), Some(target_ref));
-    assert_eq!(target.unparse_resolved(), b"3");
+    assert_eq!(target.unparse_resolved().unwrap(), b"3");
 }
 
 #[test]
@@ -287,8 +291,8 @@ fn swapping_repromoted_objects_keeps_active_numbers_and_moves_the_value_owner() 
     assert_eq!(second.object_ref(), Some(second_ref));
     assert_eq!(first.owning_pdf_unique_id(), second_owner);
     assert_eq!(second.owning_pdf_unique_id(), first_owner);
-    assert_eq!(first.unparse_resolved(), b"2");
-    assert_eq!(second.unparse_resolved(), b"1");
+    assert_eq!(first.unparse_resolved().unwrap(), b"2");
+    assert_eq!(second.unparse_resolved().unwrap(), b"1");
 }
 
 #[test]
@@ -305,7 +309,7 @@ fn document_drop_clears_shared_value_identity_before_detaching_cached_objects() 
     }
     assert!(source.is_direct());
     assert_eq!(source.owning_pdf_unique_id(), None);
-    assert_eq!(source.unparse_resolved(), b"99");
+    assert_eq!(source.unparse_resolved().unwrap(), b"99");
 }
 
 #[test]
@@ -321,9 +325,9 @@ fn swapping_an_unresolved_repromoted_object_uses_the_requested_resolution_identi
     assert!(!source.is_resolved());
     pdf.swap_objects(old_ref, second_ref).unwrap();
     assert_eq!(source.object_ref(), Some(flpdf::ObjectRef::new(100, 0)));
-    assert_eq!(source.unparse_resolved(), b"7");
+    assert_eq!(source.unparse_resolved().unwrap(), b"7");
     assert_eq!(second.object_ref(), Some(second_ref));
-    assert_eq!(second.unparse_resolved(), b"null");
+    assert_eq!(second.unparse_resolved().unwrap(), b"null");
 }
 
 #[test]

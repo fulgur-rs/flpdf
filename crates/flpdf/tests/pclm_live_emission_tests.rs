@@ -224,11 +224,15 @@ fn pclm_preserves_external_file_trailer_keys() {
     file_object.try_is_scalar().unwrap();
     assert!(file_object.is_null());
     assert_eq!(
-        trailer.try_get_key(b"/FFilter").unwrap().unparse(),
+        trailer.try_get_key(b"/FFilter").unwrap().unparse().unwrap(),
         b"/ASCIIHexDecode"
     );
     assert_eq!(
-        trailer.try_get_key(b"/FDecodeParms").unwrap().unparse(),
+        trailer
+            .try_get_key(b"/FDecodeParms")
+            .unwrap()
+            .unparse()
+            .unwrap(),
         b"<< /Columns 1 >>"
     );
 }
@@ -286,7 +290,10 @@ fn pclm_indirect_root_reconciles_adbe_to_the_forced_extension_level() {
         .try_get_key(b"/ADBE")
         .unwrap();
     assert_eq!(
-        adbe.try_get_key(b"/BaseVersion").unwrap().unparse(),
+        adbe.try_get_key(b"/BaseVersion")
+            .unwrap()
+            .unparse()
+            .unwrap(),
         b"/1.7"
     );
     assert_eq!(
@@ -361,7 +368,10 @@ fn pclm_direct_root_does_not_reconcile_adbe() {
         .try_get_key(b"/ADBE")
         .unwrap();
     assert_eq!(
-        adbe.try_get_key(b"/BaseVersion").unwrap().unparse(),
+        adbe.try_get_key(b"/BaseVersion")
+            .unwrap()
+            .unparse()
+            .unwrap(),
         b"/1.4"
     );
     assert_eq!(

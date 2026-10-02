@@ -201,12 +201,12 @@ fn emit_show_object<R: Read + Seek>(
                 .as_stream_dict()
                 .expect("stream type code guarantees a stream dictionary");
             let mut output = b"Object is stream.  Dictionary:\n".to_vec();
-            output.extend_from_slice(&dictionary.unparse_resolved());
+            output.extend_from_slice(&dictionary.unparse_resolved()?);
             output.push(b'\n');
             logger.info(output)
         }
     } else {
-        let mut output = object.unparse_resolved();
+        let mut output = object.unparse_resolved()?;
         output.push(b'\n');
         logger.info(output)
     }
@@ -238,7 +238,7 @@ fn emit_show_pages<R: Read + Seek>(
 ) -> Result<()> {
     let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
     for (index, page_handle) in pages.into_iter().enumerate() {
-        let page_reference = String::from_utf8_lossy(&page_handle.unparse()).into_owned();
+        let page_reference = String::from_utf8_lossy(&page_handle.unparse()?).into_owned();
         logger.info(format!("page {}: {}\n", index + 1, page_reference))?;
 
         if show_page_images {
@@ -263,7 +263,7 @@ fn emit_show_pages<R: Read + Seek>(
                     let mut line = b"    ".to_vec();
                     line.extend_from_slice(&name);
                     line.extend_from_slice(b": ");
-                    line.extend_from_slice(&image.unparse());
+                    line.extend_from_slice(&image.unparse()?);
                     line.extend_from_slice(b", ");
                     line.extend_from_slice(width.to_string().as_bytes());
                     line.extend_from_slice(b" x ");
@@ -282,7 +282,7 @@ fn emit_show_pages<R: Read + Seek>(
             PageObjectHelper::from_object_handle(page_handle, pdf).get_page_contents()?;
         for content in contents {
             let mut line = b"    ".to_vec();
-            line.extend_from_slice(&content.unparse());
+            line.extend_from_slice(&content.unparse()?);
             line.push(b'\n');
             logger.info(line)?;
         }

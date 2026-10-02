@@ -160,7 +160,7 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
     // second value model.
     let (resolved, _, _) = resolve_handle(pdf, &original)?;
     let unparse_bytes = if original.is_indirect() {
-        original.unparse()
+        original.unparse()?
     } else {
         write_qpdf_object_handle(pdf, &original)?
     };
@@ -263,7 +263,7 @@ fn write_object_details<R: Read + Seek>(
         }
         5 => {
             write!(stdout, "/QTest is a real number with value ")?;
-            write_bytes(stdout, &chased.unparse_resolved())?;
+            write_bytes(stdout, &chased.unparse_resolved()?)?;
             writeln!(stdout)?;
         }
         7 => {

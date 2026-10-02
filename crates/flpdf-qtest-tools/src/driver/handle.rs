@@ -72,7 +72,7 @@ fn write_qpdf_handle_into<R: Read + Seek>(
 ) -> flpdf::Result<()> {
     if preserve_indirect && value.object_ref().is_some() {
         pdf.resolve(value)?;
-        bytes.extend_from_slice(&value.unparse());
+        bytes.extend_from_slice(&value.unparse()?);
         return Ok(());
     }
 
@@ -95,7 +95,7 @@ fn write_qpdf_handle_into<R: Read + Seek>(
                 continue;
             }
             let name = key.strip_prefix(b"/").unwrap_or(&key);
-            bytes.extend_from_slice(&ObjectHandle::name(name.to_vec()).unparse_resolved());
+            bytes.extend_from_slice(&ObjectHandle::name(name.to_vec()).unparse_resolved()?);
             bytes.push(b' ');
             write_qpdf_handle_into(pdf, &child, true, bytes)?;
             bytes.push(b' ');
@@ -106,7 +106,7 @@ fn write_qpdf_handle_into<R: Read + Seek>(
     if let Some(stream_dict) = value.as_stream_dict() {
         return write_qpdf_handle_into(pdf, &stream_dict, false, bytes);
     }
-    bytes.extend_from_slice(&value.unparse_resolved());
+    bytes.extend_from_slice(&value.unparse_resolved()?);
     Ok(())
 }
 
