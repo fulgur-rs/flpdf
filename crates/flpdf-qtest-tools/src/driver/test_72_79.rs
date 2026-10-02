@@ -93,7 +93,7 @@ impl<'a> ObjectHandleParserCallbacks for DriverParserCallbacks<'a> {
             let value = object.as_inline_image().unwrap_or_default();
             writeln!(self.stdout, "{}", hex_encode(&value))?;
         } else {
-            write_bytes(self.stdout, &object.unparse())?;
+            write_bytes(self.stdout, &object.unparse()?)?;
             writeln!(self.stdout)?;
         }
         Ok(ParseControl::Continue)
@@ -253,7 +253,7 @@ pub(crate) fn run_test_73<R: Read + Seek>(
     // is the arm
     // `test_73_propagates_a_warn_pipeline_failure_from_pages_resolution`
     // exercises.
-    let qpdf_flush_result_75 = pages_seed.try_unparse_resolved();
+    let qpdf_flush_result_75 = pages_seed.unparse_resolved();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let _ = qpdf_flush_result_75?;
     Ok(())
@@ -341,7 +341,7 @@ pub(crate) fn run_test_74<R: Read + Seek>(
     while let Some((key, value)) = cursor.current() {
         write_bytes(stdout, &key)?;
         write!(stdout, " ")?;
-        write_bytes(stdout, &value.unparse())?;
+        write_bytes(stdout, &value.unparse()?)?;
         writeln!(stdout)?;
         cursor.next(&mut split3, pdf)?;
     }
@@ -904,7 +904,7 @@ WARNING: closed input source: object 1/0: error reading object: QPDF operation a
             .try_get_key(b"/Pages")
             .expect("get /Pages before closing input");
         pages
-            .try_unparse_resolved()
+            .unparse_resolved()
             .expect("resolve /Pages before closing input");
         pdf.close_input_source();
 
@@ -966,7 +966,7 @@ WARNING: closed input source: object 1/0: error reading object: QPDF operation a
 
         // Cache the root without caching /Pages: with both uncached the
         // driver's own `root_handle` lookup fails first and the
-        // `try_unparse_resolved` call is never reached.
+        // `unparse_resolved` call is never reached.
         let root = pdf
             .root_handle()
             .expect("resolve root before closing input");

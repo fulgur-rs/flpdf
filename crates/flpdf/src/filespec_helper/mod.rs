@@ -298,7 +298,7 @@ mod tests {
         let ef = filespec.try_get_key(b"/EF").unwrap();
         let embedded = ef.try_get_key(b"/F").unwrap();
 
-        assert_eq!(embedded.unparse(), b"5 65535 R");
+        assert_eq!(embedded.unparse().unwrap(), b"5 65535 R");
     }
 
     #[test]

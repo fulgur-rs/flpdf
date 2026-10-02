@@ -462,7 +462,7 @@ fn raw_generation_page_tree_leaf_is_returned_as_a_qpdf_page_handle() {
     let raw_page = &pages[0];
     assert_eq!(raw_page.get_obj_gen(), QpdfObjGen::new(17, 65_535));
     assert!(raw_page.is_indirect());
-    assert_eq!(raw_page.unparse(), b"17 65535 R");
+    assert_eq!(raw_page.unparse().unwrap(), b"17 65535 R");
     assert_eq!(raw_page.object_ref(), None);
 }
 

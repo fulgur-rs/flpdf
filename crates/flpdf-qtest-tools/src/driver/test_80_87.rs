@@ -581,18 +581,18 @@ pub(crate) fn run_test_87<R: Read + Seek>(
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let dict = ObjectHandle::parse(b"<< /A 1 /B null >>")?;
-    assert_eq!(dict.unparse(), b"<< /A 1 >>");
+    assert_eq!(dict.unparse()?, b"<< /A 1 >>");
     assert_eq!(dict.try_get_keys()?, BTreeSet::from([b"/A".to_vec()]));
 
     dict.replace_key(b"/A", ObjectHandle::null())?;
-    assert_eq!(dict.unparse(), b"<< >>");
+    assert_eq!(dict.unparse()?, b"<< >>");
     assert_eq!(dict.try_get_keys()?, BTreeSet::new());
 
     let dict = ObjectHandle::dictionary(vec![
         (b"A".to_vec(), ObjectHandle::parse(b"2")?),
         (b"B".to_vec(), ObjectHandle::null()),
     ]);
-    assert_eq!(dict.unparse(), b"<< /A 2 >>");
+    assert_eq!(dict.unparse()?, b"<< /A 2 >>");
     assert_eq!(dict.try_get_keys()?, BTreeSet::from([b"/A".to_vec()]));
 
     // `dict.getJSON(JSON::LATEST)` (qpdf 11.9.0's latest schema is v2,

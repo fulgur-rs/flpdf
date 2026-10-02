@@ -286,7 +286,10 @@ fn page_attribute_values(path: &Path, key: &[u8]) -> Vec<String> {
             let value = page
                 .get_attribute(key, false)
                 .expect("read effective page attribute");
-            (!value.is_null()).then(|| String::from_utf8_lossy(&value.unparse()).into_owned())
+            (!value.is_null()).then(|| {
+                String::from_utf8_lossy(&value.unparse().expect("unparse page attribute"))
+                    .into_owned()
+            })
         })
         .collect()
 }

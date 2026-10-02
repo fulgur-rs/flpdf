@@ -70,31 +70,31 @@ pub(crate) fn run_test_88<R: Read + Seek>(
     newdict.replace_key(b"/X", ObjectHandle::parse(b"/W")?)?;
     dict.replace_key(b"/Quack", ObjectHandle::parse(b"[1 2 3]")?)?;
     let quack = dict.replace_key_and_get_old(b"/Quack", ObjectHandle::parse(b"/Moo")?)?;
-    assert_eq!(quack.unparse(), b"[ 1 2 3 ]");
+    assert_eq!(quack.unparse()?, b"[ 1 2 3 ]");
     let nothing = dict.replace_key_and_get_old(b"/NotThere", ObjectHandle::null())?;
     assert!(nothing.try_is_null()?);
     assert_eq!(
-        dict.unparse(),
+        dict.unparse()?,
         ObjectHandle::parse(
             b"<< /One 1 /Quack /Moo /Two 2 /Three [ (a) (b) << /Z /Y /X /W >> ] >>"
         )?
-        .unparse()
+        .unparse()?
     );
 
     let arr = dict.try_get_key(b"/Three")?;
     arr.insert_array_item(0, ObjectHandle::string(b"0".to_vec()))?;
     arr.insert_array_item(0, ObjectHandle::string(b"00".to_vec()))?;
     assert_eq!(
-        arr.unparse(),
-        ObjectHandle::parse(b"[ (00) (0) (a) (b) << /Z /Y /X /W >> ]")?.unparse()
+        arr.unparse()?,
+        ObjectHandle::parse(b"[ (00) (0) (a) (b) << /Z /Y /X /W >> ]")?.unparse()?
     );
     let new_dict =
         arr.insert_array_item_and_get_new(1, ObjectHandle::parse(b"<< /P /Q /R /S >>")?)?;
     arr.erase_array_item(2)?;
     arr.erase_array_item(0)?;
     assert_eq!(
-        arr.unparse(),
-        ObjectHandle::parse(b"[ << /P /Q /R /S >> (a) (b) << /Z /Y /X /W >> ]")?.unparse()
+        arr.unparse()?,
+        ObjectHandle::parse(b"[ << /P /Q /R /S >> (a) (b) << /Z /Y /X /W >> ]")?.unparse()?
     );
 
     // `new_dict` shares internals with the same element in `arr` --
@@ -103,21 +103,21 @@ pub(crate) fn run_test_88<R: Read + Seek>(
     new_dict.remove_key(b"/R")?;
     new_dict.replace_key(b"/T", ObjectHandle::parse(b"/U")?)?;
     assert_eq!(
-        arr.unparse(),
-        ObjectHandle::parse(b"[ << /P /Q /T /U >> (a) (b) << /Z /Y /X /W >> ]")?.unparse()
+        arr.unparse()?,
+        ObjectHandle::parse(b"[ << /P /Q /T /U >> (a) (b) << /Z /Y /X /W >> ]")?.unparse()?
     );
     let s = arr.erase_array_item_and_get_old(1)?;
-    assert_eq!(s.unparse(), b"(a)");
+    assert_eq!(s.unparse()?, b"(a)");
     assert_eq!(
-        arr.unparse(),
-        ObjectHandle::parse(b"[ << /P /Q /T /U >> (b) << /Z /Y /X /W >> ]")?.unparse()
+        arr.unparse()?,
+        ObjectHandle::parse(b"[ << /P /Q /T /U >> (b) << /Z /Y /X /W >> ]")?.unparse()?
     );
 
     assert!(new_dict.remove_key_and_get_old(b"/M")?.try_is_null()?);
-    assert_eq!(new_dict.remove_key_and_get_old(b"/P")?.unparse(), b"/Q");
+    assert_eq!(new_dict.remove_key_and_get_old(b"/P")?.unparse()?, b"/Q");
     assert_eq!(
-        new_dict.unparse(),
-        ObjectHandle::parse(b"<< /T /U >>")?.unparse()
+        new_dict.unparse()?,
+        ObjectHandle::parse(b"<< /T /U >>")?.unparse()?
     );
 
     // Test errors (test_driver.cc:3155-3159).
@@ -411,7 +411,7 @@ pub(crate) fn run_test_92<R: Read + Seek>(
     // `QPDF_Destroyed.cc:24-29`). The fallible Rust accessor preserves that
     // qpdf error boundary rather than the non-fallible null fallback.
     let error = root
-        .try_unparse_resolved()
+        .unparse_resolved()
         .expect_err("destroyed qpdf object must reject unparse");
     assert!(matches!(
         error,
@@ -455,7 +455,7 @@ pub(crate) fn run_test_93<R: Read + Seek>(
     assert!(!oh1.is_same_object_as(&oh3));
     oh2.replace_key(b"/One", ObjectHandle::parse(b"/Three")?)?;
     assert!(oh1.is_same_object_as(&oh2));
-    assert_eq!(oh2.unparse(), b"<< /One /Three >>");
+    assert_eq!(oh2.unparse()?, b"<< /One /Three >>");
     assert!(!oh1.is_indirect());
 
     let oh4 = pdf.make_indirect_from_object_handle(oh1.clone())?;
@@ -496,7 +496,7 @@ pub(crate) fn run_test_94<R: Read + Seek>(
     let root_media_result = pages_root.try_get_key(b"/MediaBox");
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let root_media = root_media_result?;
-    let root_media_unparse = root_media.unparse();
+    let root_media_unparse = root_media.unparse()?;
 
     let pages = crate::common::raw_page_handles(pdf)?;
     assert_eq!(pages.len(), 5);
@@ -519,13 +519,13 @@ pub(crate) fn run_test_94<R: Read + Seek>(
             .is_same_object_as(&root_media));
 
         let p1_new_art = page.get_art_box(false, true)?;
-        assert_eq!(p1_new_art.unparse(), root_media_unparse);
+        assert_eq!(p1_new_art.unparse()?, root_media_unparse);
         assert!(!p1_new_art.is_same_object_as(&root_media));
 
         let p1_new_crop = page.get_crop_box(false, false)?;
         assert!(!p1_new_crop.is_same_object_as(&root_media));
         assert!(!p1_new_crop.is_same_object_as(&p1_new_art));
-        assert_eq!(p1_new_crop.unparse(), root_media_unparse);
+        assert_eq!(p1_new_crop.unparse()?, root_media_unparse);
 
         assert!(page.get_media_box(false)?.is_same_object_as(&root_media));
         assert!(page
@@ -533,7 +533,7 @@ pub(crate) fn run_test_94<R: Read + Seek>(
             .is_same_object_as(&p1_new_crop));
 
         let p1_effective_media = page.get_media_box(true)?;
-        assert_eq!(p1_effective_media.unparse(), root_media_unparse);
+        assert_eq!(p1_effective_media.unparse()?, root_media_unparse);
         assert!(!p1_effective_media.is_same_object_as(&root_media));
     }
 
@@ -542,7 +542,7 @@ pub(crate) fn run_test_94<R: Read + Seek>(
         assert!(page.get_media_box(false)?.is_same_object_as(&root_media));
         let p2_crop = page.get_crop_box(false, false)?;
         let p2_new_trim = page.get_trim_box(false, true)?;
-        assert_eq!(p2_new_trim.unparse(), p2_crop.unparse());
+        assert_eq!(p2_new_trim.unparse()?, p2_crop.unparse()?);
         assert!(!p2_new_trim.is_same_object_as(&p2_crop));
         assert!(page.get_media_box(false)?.is_same_object_as(&root_media));
     }
@@ -573,7 +573,7 @@ pub(crate) fn run_test_94<R: Read + Seek>(
         assert!(!p4_new_crop.is_same_object_as(&p4_orig_crop));
         assert!(p4_orig_crop.is_indirect());
         assert!(!p4_new_crop.is_indirect());
-        assert_eq!(p4_new_crop.unparse(), p4_orig_crop.unparse_resolved());
+        assert_eq!(p4_new_crop.unparse()?, p4_orig_crop.unparse_resolved()?);
     }
 
     {
@@ -594,9 +594,9 @@ pub(crate) fn run_test_94<R: Read + Seek>(
         assert!(!p5_new_bleed.is_same_object_as(&root_media));
         assert!(!p5_new_bleed.is_same_object_as(&p5_new_media));
         assert!(!p5_new_bleed.is_same_object_as(&p5_new_crop));
-        assert_eq!(p5_new_media.unparse(), root_media_unparse);
-        assert_eq!(p5_new_crop.unparse(), root_media_unparse);
-        assert_eq!(p5_new_bleed.unparse(), root_media_unparse);
+        assert_eq!(p5_new_media.unparse()?, root_media_unparse);
+        assert_eq!(p5_new_crop.unparse()?, root_media_unparse);
+        assert_eq!(p5_new_bleed.unparse()?, root_media_unparse);
     }
 
     Ok(())
@@ -736,7 +736,7 @@ pub(crate) fn run_test_97<R: Read + Seek>(
     // 758-768`). This preserves qpdf's no-warning path for a non-array item.
     assert!(first_item.try_is_array()? && first_item.try_get_array_n_items()? > 10000);
     let nulls2 = first_item.shallow_copy()?;
-    assert_eq!(first_item.unparse(), nulls2.unparse());
+    assert_eq!(first_item.unparse()?, nulls2.unparse()?);
     Ok(())
 }
 

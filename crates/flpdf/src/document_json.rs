@@ -78,7 +78,7 @@ pub(crate) fn write_json_v1_objects_key<R: Read + Seek>(
         if !object_selected(&wanted_objects, object_gen, false) {
             continue;
         }
-        let key = handle.unparse();
+        let key = handle.unparse().map_err(ConvertError::from)?;
         Json::write_dictionary_key(out, &mut object_first, &key, 2)?;
         handle.write_json(1, out, true, 2)?;
     }
@@ -129,7 +129,7 @@ pub(crate) fn write_json_v1_objectinfo_key<R: Read + Seek>(
             (false, ObjectHandle::null(), ObjectHandle::null())
         };
 
-        let key = handle.unparse();
+        let key = handle.unparse().map_err(ConvertError::from)?;
         Json::write_dictionary_key(out, &mut object_first, &key, 2)?;
         let mut details_first = true;
         Json::write_dictionary_open(out, &mut details_first, 2)?;

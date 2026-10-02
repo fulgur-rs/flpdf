@@ -14,10 +14,7 @@ fn direct_self_dictionary_can_be_promoted_to_an_indirect_self_reference() {
     let mut pdf = Pdf::empty().unwrap();
     let indirect = pdf.make_indirect_object_handle(dictionary.clone()).unwrap();
     let expected = format!("<< /Self {} >>", indirect.object_ref().unwrap());
-    assert_eq!(
-        indirect.try_unparse_resolved().unwrap(),
-        expected.as_bytes()
-    );
+    assert_eq!(indirect.unparse_resolved().unwrap(), expected.as_bytes());
     let mut direct = indirect.clone();
     let error = direct.make_direct(false).unwrap_err();
     assert!(matches!(error, flpdf::Error::System(message)

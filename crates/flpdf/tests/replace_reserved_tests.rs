@@ -35,12 +35,12 @@ fn replace_reserved_rejects_a_non_reserved_handle_before_mutation() {
 }
 
 #[test]
-fn try_unparse_resolved_preserves_qpdf_reserved_error() {
+fn unparse_resolved_preserves_qpdf_reserved_error() {
     let pdf = Pdf::empty().expect("create empty PDF");
     let reserved = pdf.new_reserved().expect("create reserved object");
 
     let error = reserved
-        .try_unparse_resolved()
+        .unparse_resolved()
         .expect_err("qpdf unparseResolved rejects a reserved object");
 
     assert_eq!(
@@ -50,24 +50,21 @@ fn try_unparse_resolved_preserves_qpdf_reserved_error() {
 }
 
 #[test]
-fn try_unparse_resolved_returns_the_normal_value_for_a_direct_handle() {
+fn unparse_resolved_returns_the_normal_value_for_a_direct_handle() {
     let value = ObjectHandle::integer(42);
 
-    assert_eq!(
-        value.try_unparse_resolved().expect("unparse integer"),
-        b"42"
-    );
+    assert_eq!(value.unparse_resolved().expect("unparse integer"), b"42");
 }
 
 #[test]
-fn try_unparse_resolved_preserves_qpdf_destroyed_error() {
+fn unparse_resolved_preserves_qpdf_destroyed_error() {
     let destroyed = {
         let pdf = Pdf::empty().expect("create empty PDF");
         pdf.new_reserved().expect("create reserved object")
     };
 
     let error = destroyed
-        .try_unparse_resolved()
+        .unparse_resolved()
         .expect_err("qpdf unparseResolved rejects a destroyed object");
 
     assert_eq!(

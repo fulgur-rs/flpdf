@@ -3872,7 +3872,7 @@ mod object_emitter_tests {
         )
         .expect("prepare surviving stream children");
         assert_eq!(surviving.len(), 1);
-        assert_eq!(surviving[0].unparse(), b"42");
+        assert_eq!(surviving[0].unparse().unwrap(), b"42");
     }
 
     #[test]

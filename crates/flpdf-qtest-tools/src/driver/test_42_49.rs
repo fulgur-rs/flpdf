@@ -329,7 +329,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
     writeln!(stdout, "iterating over form fields")?;
     for field in fields {
         write!(stdout, "Field: ")?;
-        write_bytes(stdout, &field.unparse())?;
+        write_bytes(stdout, &field.unparse()?)?;
         writeln!(stdout)?;
 
         let mut node = field.clone();
@@ -343,7 +343,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
                 break;
             }
             write!(stdout, "  Parent: ")?;
-            write_bytes(stdout, &parent.unparse())?;
+            write_bytes(stdout, &parent.unparse()?)?;
             writeln!(stdout)?;
             node = parent;
         }
@@ -391,7 +391,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
         };
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         write!(stdout, "  Value: ")?;
-        write_bytes(stdout, &value.unparse())?;
+        write_bytes(stdout, &value.unparse()?)?;
         writeln!(stdout)?;
 
         let value_as_string = {
@@ -409,7 +409,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
         };
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         write!(stdout, "  Default value: ")?;
-        write_bytes(stdout, &default_value.unparse())?;
+        write_bytes(stdout, &default_value.unparse()?)?;
         writeln!(stdout)?;
 
         let default_value_as_string = {
@@ -444,7 +444,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
 
         for annotation in annotations {
             write!(stdout, "  Annotation: ")?;
-            write_bytes(stdout, &annotation.unparse())?;
+            write_bytes(stdout, &annotation.unparse()?)?;
             writeln!(stdout)?;
         }
     }
@@ -455,7 +455,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
     let pages = qpdf_flush_result_37?;
     for page in pages {
         write!(stdout, "Page: ")?;
-        write_bytes(stdout, &page.unparse())?;
+        write_bytes(stdout, &page.unparse()?)?;
         writeln!(stdout)?;
 
         let annotations = {
@@ -465,7 +465,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         for annotation in annotations {
             write!(stdout, "  Annotation: ")?;
-            write_bytes(stdout, &annotation.unparse())?;
+            write_bytes(stdout, &annotation.unparse()?)?;
             writeln!(stdout)?;
 
             let field = {
@@ -474,7 +474,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
             };
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             write!(stdout, "    Field: ")?;
-            write_bytes(stdout, &field.unparse())?;
+            write_bytes(stdout, &field.unparse()?)?;
             writeln!(stdout)?;
 
             let subtype = {
@@ -514,7 +514,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
             };
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             write!(stdout, "    Appearance stream (/N): ")?;
-            write_bytes(stdout, &normal_appearance.unparse())?;
+            write_bytes(stdout, &normal_appearance.unparse()?)?;
             writeln!(stdout)?;
 
             let state_appearance = {
@@ -523,7 +523,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
             };
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             write!(stdout, "    Appearance stream (/N, /3): ")?;
-            write_bytes(stdout, &state_appearance.unparse())?;
+            write_bytes(stdout, &state_appearance.unparse()?)?;
             writeln!(stdout)?;
         }
     }
@@ -689,7 +689,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     let mut cursor = new2.begin(pdf)?;
     while let Some((key, value)) = cursor.current() {
         write!(stdout, "{key} ")?;
-        write_bytes(stdout, &value.unparse())?;
+        write_bytes(stdout, &value.unparse()?)?;
         writeln!(stdout)?;
         cursor.next(&mut new2, pdf)?;
     }
@@ -710,7 +710,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     let mut cursor = qpdf_flush_result_42?;
     while let Some((key, value)) = cursor.current() {
         write!(stdout, "{key} ")?;
-        write_bytes(stdout, &value.unparse())?;
+        write_bytes(stdout, &value.unparse()?)?;
         writeln!(stdout)?;
         let qpdf_flush_result_43 = cursor.next(&mut bad2, pdf);
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -772,7 +772,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     let mut cursor = qpdf_flush_result_45?;
     while let Some((key, value)) = cursor.current() {
         write!(stdout, "{key} ")?;
-        write_bytes(stdout, &value.unparse())?;
+        write_bytes(stdout, &value.unparse()?)?;
         writeln!(stdout)?;
         let qpdf_flush_result_46 = cursor.next(&mut bad3, pdf);
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -787,7 +787,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     let mut cursor = qpdf_flush_result_47?;
     while let Some((key, value)) = cursor.current() {
         write!(stdout, "{key} ")?;
-        write_bytes(stdout, &value.unparse())?;
+        write_bytes(stdout, &value.unparse()?)?;
         writeln!(stdout)?;
         let qpdf_flush_result_48 = cursor.next(&mut bad3, pdf);
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -803,7 +803,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     let mut cursor = qpdf_flush_result_49?;
     while let Some((key, value)) = cursor.current() {
         write!(stdout, "{key} ")?;
-        write_bytes(stdout, &value.unparse())?;
+        write_bytes(stdout, &value.unparse()?)?;
         writeln!(stdout)?;
         let qpdf_flush_result_50 = cursor.next(&mut bad4, pdf);
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -867,7 +867,7 @@ pub(crate) fn run_test_47<R: Read + Seek>(
     // analogue to port -- it is tautologically true of the pair type.
     for (index, label) in &labels {
         write!(stdout, "{index} ")?;
-        write_bytes(stdout, &label.unparse())?;
+        write_bytes(stdout, &label.unparse()?)?;
         writeln!(stdout)?;
     }
     Ok(())
@@ -970,7 +970,7 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     while let Some((key, value)) = cursor.current() {
         write_bytes(stdout, &key)?;
         write!(stdout, " ")?;
-        write_bytes(stdout, &value.unparse())?;
+        write_bytes(stdout, &value.unparse()?)?;
         writeln!(stdout)?;
         cursor.next(&mut new2, pdf)?;
     }
@@ -1117,7 +1117,7 @@ pub(crate) fn run_test_49<R: Read + Seek>(
         let mut lines: Vec<(String, Vec<u8>)> = Vec::new();
         for (_, item) in tree.get_outlines_for_page(&mut helper, page.get_obj_gen())? {
             let title = item.get_title(&mut helper)?;
-            let dest = item.get_dest(&mut helper)?.unparse_resolved();
+            let dest = item.get_dest(&mut helper)?.unparse_resolved()?;
             lines.push((title, dest));
         }
         for (title, dest) in lines {

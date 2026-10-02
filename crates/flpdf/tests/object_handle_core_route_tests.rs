@@ -8,7 +8,7 @@ fn object_handle_unparse_production_has_no_raw_materialization_helper() {
     let unparse_resolved = source
         .split("pub fn unparse_resolved")
         .nth(1)
-        .and_then(|tail| tail.split("pub fn try_unparse_resolved").next())
+        .and_then(|tail| tail.split("pub fn unparse_resolved").next())
         .expect("ObjectHandle has an unparse_resolved method");
     let body = unparse_resolved
         .split_once('{')

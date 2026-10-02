@@ -64,7 +64,23 @@ pub(crate) fn write_qpdf_object_handle<R: Read + Seek>(
     Ok(bytes)
 }
 
+const QTEST_OBJECT_STACK_RED_ZONE: usize = 32 * 1024;
+const QTEST_OBJECT_STACK_GROWTH_SIZE: usize = 1024 * 1024;
+
 fn write_qpdf_handle_into<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    value: &ObjectHandle,
+    preserve_indirect: bool,
+    bytes: &mut Vec<u8>,
+) -> flpdf::Result<()> {
+    stacker::maybe_grow(
+        QTEST_OBJECT_STACK_RED_ZONE,
+        QTEST_OBJECT_STACK_GROWTH_SIZE,
+        || write_qpdf_handle_into_inner(pdf, value, preserve_indirect, bytes),
+    )
+}
+
+fn write_qpdf_handle_into_inner<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     value: &ObjectHandle,
     preserve_indirect: bool,
@@ -72,7 +88,7 @@ fn write_qpdf_handle_into<R: Read + Seek>(
 ) -> flpdf::Result<()> {
     if preserve_indirect && value.object_ref().is_some() {
         pdf.resolve(value)?;
-        bytes.extend_from_slice(&value.unparse());
+        bytes.extend_from_slice(&value.unparse()?);
         return Ok(());
     }
 
@@ -95,7 +111,7 @@ fn write_qpdf_handle_into<R: Read + Seek>(
                 continue;
             }
             let name = key.strip_prefix(b"/").unwrap_or(&key);
-            bytes.extend_from_slice(&ObjectHandle::name(name.to_vec()).unparse_resolved());
+            bytes.extend_from_slice(&ObjectHandle::name(name.to_vec()).unparse_resolved()?);
             bytes.push(b' ');
             write_qpdf_handle_into(pdf, &child, true, bytes)?;
             bytes.push(b' ');
@@ -106,7 +122,7 @@ fn write_qpdf_handle_into<R: Read + Seek>(
     if let Some(stream_dict) = value.as_stream_dict() {
         return write_qpdf_handle_into(pdf, &stream_dict, false, bytes);
     }
-    bytes.extend_from_slice(&value.unparse_resolved());
+    bytes.extend_from_slice(&value.unparse_resolved()?);
     Ok(())
 }
 
