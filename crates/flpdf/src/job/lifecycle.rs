@@ -6002,9 +6002,9 @@ mod tests {
     impl crate::StreamFilter for JobNormalizationFilter {
         fn get_decode_pipeline<'a>(
             &mut self,
-            next: crate::pipeline::PipelineRef<'a>,
+            _next: crate::pipeline::PipelineRef<'a>,
         ) -> Result<crate::OwnedDecodePipeline<'a>> {
-            Ok(crate::OwnedDecodePipeline::NoStage(next))
+            Err(Error::System("content filter decode failed".to_owned()))
         }
     }
 
@@ -6019,12 +6019,9 @@ mod tests {
 
     #[test]
     fn write_qpdf_reports_non_usage_content_normalization_errors() {
-        crate::register_stream_filter(
-            b"/FlpdfJobContentNormalizationSystemError",
-            || -> Result<JobNormalizationFilter> {
-                Err(Error::System("content filter factory failed".to_owned()))
-            },
-        );
+        crate::register_stream_filter(b"/FlpdfJobContentNormalizationSystemError", || {
+            Ok(JobNormalizationFilter)
+        });
         let tempdir = tempfile::tempdir().expect("temporary output directory");
         let output = tempdir.path().join("output.pdf");
         let mut pdf = empty_pdf_with_page_content(b"encoded");
@@ -6043,11 +6040,11 @@ mod tests {
             .expect_err("normalization failure must return to the caller");
 
         assert!(
-            matches!(error, Error::System(message) if message == "content filter factory failed")
+            matches!(error, Error::System(message) if message == "content filter decode failed")
         );
         assert!(
             String::from_utf8_lossy(&bytes.lock().unwrap())
-                .contains("content filter factory failed"),
+                .contains("content filter decode failed"),
             "the Job must report pre-write failures through its logger"
         );
         assert!(
