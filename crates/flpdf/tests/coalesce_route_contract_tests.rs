@@ -21,7 +21,7 @@ fn production_consumers_call_the_canonical_coalesce_owner() {
         .split_once("\nfn run_rewrite_with_page_ops")
         .expect("plain rewrite page-operation route should follow extraction")
         .0;
-    assert!(page_extraction.contains("run_page_extraction_job(job, page_ops, remove_unref)"));
+    assert!(page_extraction.contains("run_page_operation_job(job, page_ops, remove_unref)"));
     assert!(!page_extraction.contains("apply_transformations_for_cli("));
     assert!(cli.contains("configuration.coalesce_contents();"));
     assert!(cli.contains("match job.apply_transformations(pdf)"));
