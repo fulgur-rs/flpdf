@@ -79,7 +79,7 @@ where
     if stream_is_xref(&act_dict)? {
         return Ok(String::new());
     }
-    if stream_uses_flatedecode(&act_dict, actual_pdf)? {
+    if stream_uses_flatedecode(&act_dict)? {
         let decoded_act = act.get_stream_data(DecodeLevel::Generalized)?;
         let decoded_exp = exp.get_stream_data(DecodeLevel::Generalized)?;
         return Ok(compare_stream_bytes(label, &decoded_act, &decoded_exp));
@@ -115,38 +115,25 @@ fn stream_is_xref(stream_dict: &ObjectHandle) -> flpdf::Result<bool> {
     type_handle.try_is_name_and_equals(b"XRef")
 }
 
-fn stream_uses_flatedecode<R: Read + Seek>(
-    stream_dict: &ObjectHandle,
-    pdf: &mut Pdf<R>,
-) -> flpdf::Result<bool> {
-    Ok(resolved_filter_names_exact(stream_dict, pdf)?
-        .names
-        .iter()
-        .any(|name| name == b"FlateDecode"))
-}
-
-struct ResolvedFilterNames {
-    names: Vec<Vec<u8>>,
-}
-
-fn resolved_filter_names_exact<R: Read + Seek>(
-    stream_dict: &ObjectHandle,
-    pdf: &mut Pdf<R>,
-) -> flpdf::Result<ResolvedFilterNames> {
+fn stream_uses_flatedecode(stream_dict: &ObjectHandle) -> flpdf::Result<bool> {
     let filter = stream_dict.try_get_key(b"/Filter")?;
-    pdf.resolve(&filter)?;
-    if let Some(name) = filter.as_name() {
-        return Ok(ResolvedFilterNames { names: vec![name] });
+    if filter.try_is_name_and_equals(b"FlateDecode")? {
+        return Ok(true);
     }
-    let Some(items) = filter.as_array() else {
-        return Ok(ResolvedFilterNames { names: Vec::new() });
-    };
-    let mut names = Vec::with_capacity(items.len());
-    for item in items {
-        pdf.resolve(&item)?;
-        names.push(item.as_name().unwrap_or_default());
+    if !filter.try_is_array()? {
+        return Ok(false);
     }
-    Ok(ResolvedFilterNames { names })
+    for index in 0..filter.try_get_array_n_items()? {
+        let index = i64::try_from(index)
+            .map_err(|_| flpdf::Error::Internal("filter array exceeds qpdf index range".into()))?;
+        if filter
+            .try_get_array_item(index)?
+            .try_is_name_and_equals(b"FlateDecode")?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn resolve_compare_children<R: Read + Seek>(
@@ -447,24 +434,37 @@ mod tests {
     }
 
     #[test]
-    fn filter_name_resolution_preserves_array_positions_and_rejects_scalars() {
-        let mut pdf = dummy_pdf();
-        let array = ObjectHandle::dictionary(vec![(
+    fn stream_filter_detection_matches_qpdf_name_and_array_order() {
+        let direct_name = ObjectHandle::dictionary(vec![(
             b"/Filter".to_vec(),
-            ObjectHandle::array(vec![
-                ObjectHandle::name(b"FlateDecode".to_vec()),
-                ObjectHandle::integer(7),
-            ]),
+            ObjectHandle::name(b"FlateDecode".to_vec()),
         )]);
-        let names = resolved_filter_names_exact(&array, &mut pdf).expect("resolve filter array");
-
-        assert_eq!(names.names, vec![b"FlateDecode".to_vec(), Vec::new()]);
+        assert!(stream_uses_flatedecode(&direct_name).expect("check direct name filter"));
 
         let scalar =
             ObjectHandle::dictionary(vec![(b"/Filter".to_vec(), ObjectHandle::integer(7))]);
-        assert!(resolved_filter_names_exact(&scalar, &mut pdf)
-            .expect("inspect scalar filter")
-            .names
-            .is_empty());
+        assert!(!stream_uses_flatedecode(&scalar).expect("check scalar filter"));
+
+        let array_with_non_name = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::name(b"ASCII85Decode".to_vec()),
+                ObjectHandle::integer(7),
+            ]),
+        )]);
+        assert!(!stream_uses_flatedecode(&array_with_non_name).expect("check filter array"));
+
+        let pdf = dummy_pdf();
+        let indirect_name = pdf
+            .make_indirect_from_object_handle(ObjectHandle::name(b"FlateDecode".to_vec()))
+            .expect("make the filter name indirect");
+        let array_with_indirect_name = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::name(b"ASCII85Decode".to_vec()),
+                indirect_name,
+            ]),
+        )]);
+        assert!(stream_uses_flatedecode(&array_with_indirect_name).expect("resolve array filter"));
     }
 }

@@ -5,7 +5,7 @@ fn compare_xref_stream_type_uses_the_resolving_name_predicate() {
         .find("fn stream_is_xref(")
         .expect("stream_is_xref source section start");
     let end = source[start..]
-        .find("fn stream_uses_flatedecode<")
+        .find("fn stream_uses_flatedecode(")
         .map(|offset| start + offset)
         .expect("stream_is_xref source section end");
     let section = &source[start..end];
