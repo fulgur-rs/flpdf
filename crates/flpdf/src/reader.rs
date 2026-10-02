@@ -1340,6 +1340,12 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// qpdf records the shared value transition in the canonical object cache;
     /// the writer observes that same live value without a separate dirty bit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] for an indirect or uninitialized replacement,
+    /// matching qpdf's `std::logic_error`. Foreign descendants are retained;
+    /// this operation does not copy or validate their ownership.
     pub fn replace_object(
         &mut self,
         object_ref: ObjectRef,
