@@ -167,6 +167,32 @@ fn linearization_production_consumers_use_resolving_accessor_routes() {
 }
 
 #[test]
+fn linearization_plan_page_preflight_uses_raw_page_handles() {
+    let source = production_source("src/linearization/plan.rs");
+    let preflight_start = source
+        .find("// Keep qpdf's raw page identity through this writer preflight")
+        .expect("raw page preflight marker");
+    let after_preflight = &source[preflight_start..];
+    let preflight_end = after_preflight
+        .find("let use_optimization_page_user_map")
+        .expect("raw page preflight end");
+    let preflight = &after_preflight[..preflight_end];
+    let reads_raw_pages = preflight.contains("PageDocumentHelper::new(pdf).get_all_pages()?");
+    let classifies_raw_page = preflight.contains("first_page_gen");
+    let walks_page_handles = preflight.contains("page_handles") && preflight.contains(".iter()");
+    let uses_raw_users = preflight.contains("raw_users_for");
+    assert!(
+        reads_raw_pages && classifies_raw_page && walks_page_handles && uses_raw_users,
+        "linearization plan page checks must retain qpdf raw page identities: get_all_pages={reads_raw_pages}, raw_page={classifies_raw_page}, handles={walks_page_handles}, raw_users={uses_raw_users}"
+    );
+    assert!(
+        !preflight.contains("pages::page_refs"),
+        "linearization plan page preflight must not project qpdf pages to ObjectRef"
+    );
+    assert!(source.contains("first_page_gen: QpdfObjGen"));
+}
+
+#[test]
 fn linearization_writer_target_consumers_use_resolving_accessor_routes() {
     let source = production_source("src/linearization/writer.rs");
     let target_functions = [

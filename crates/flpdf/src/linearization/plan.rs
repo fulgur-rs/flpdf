@@ -1699,6 +1699,16 @@ impl LinearizationPlan {
                 .iter()
                 .map(|(&member, &source)| (ObjectRef::new(member, 0), ObjectRef::new(source, 0)))
                 .collect();
+        let preserve_source_container_by_member_raw: BTreeMap<QpdfObjGen, QpdfObjGen> =
+            preserve_source_container_by_member
+                .iter()
+                .map(|(&member, &source)| {
+                    Ok((
+                        QpdfObjGen::try_from_object_ref(member)?,
+                        QpdfObjGen::try_from_object_ref(source)?,
+                    ))
+                })
+                .collect::<Result<_>>()?;
         let generate_objstm_eligible = generate_compressible_plan
             .as_ref()
             .map(|plan| plan.eligible.clone());
@@ -1833,16 +1843,20 @@ impl LinearizationPlan {
         // dangling reference — so a stream's indirect `/Length` edge is dead in the
         // output regardless of object-stream mode. Not following it drops a holder
         // reachable only through it, matching qpdf's reachability GC.
-        // Collect page references before choosing the fast universe route. A
-        // malformed or detached page /Parent is deliberately ignored by
+        // Keep qpdf's raw page identity through this writer preflight. qpdf's
+        // linearization writer obtains page handles from getAllPages() and
+        // keys its page/user maps by QPDFObjGen; a checked ObjectRef
+        // projection can lose a raw page generation before these decisions.
+        // A malformed or detached page /Parent is deliberately ignored by
         // qpdf's object-user map but remains reachable for the writer's
         // Part-9 universe, so that shape must retain the exact fallback walk.
-        let page_refs: Vec<ObjectRef> = crate::pages::page_refs(pdf)?;
-        if let Some(first_page_ref) = page_refs.first().copied() {
+        let page_handles = crate::PageDocumentHelper::new(pdf).get_all_pages()?;
+        if let Some(first_page) = page_handles.first() {
+            let first_page_gen = first_page.get_obj_gen();
             if !first_page_is_private(
                 &optimization,
-                first_page_ref,
-                &preserve_source_container_by_member,
+                first_page_gen,
+                &preserve_source_container_by_member_raw,
             ) {
                 return Err(qpdf_stop_on_error(
                     pdf,
@@ -1851,13 +1865,12 @@ impl LinearizationPlan {
             }
         } // cov:ignore: LLVM maps the successful first-page-private continuation to this cleanup brace
         let page_parent_users_are_complete =
-            page_refs
+            page_handles
                 .iter()
-                .try_fold(true, |complete, page_ref| -> Result<bool> {
+                .try_fold(true, |complete, page| -> Result<bool> {
                     if !complete {
                         return Ok(false);
                     }
-                    let page = pdf.get_object_handle(*page_ref);
                     let parent = page.try_get_key(b"/Parent")?;
                     if parent.try_is_null()? {
                         return Ok(true);
@@ -1881,6 +1894,10 @@ impl LinearizationPlan {
         // identities required by the writer universe.
         let use_optimization_page_user_map =
             preserve_object_stream_data.is_empty() && page_parent_users_are_complete;
+        // The remainder of the plan's writer-facing ObjectRef partitions
+        // require valid N G R references. Keep that checked view after the
+        // qpdf-shaped raw page/user preflight above.
+        let page_refs: Vec<ObjectRef> = crate::pages::page_refs(pdf)?;
         let reachable: BTreeSet<ObjectRef> = if use_optimization_page_user_map {
             optimization.linearization_reachable_object_refs().collect()
         } else {
@@ -3994,13 +4011,13 @@ fn is_document_other_user(user: &crate::optimization::ObjectUser) -> bool {
 /// into Part 6.
 fn first_page_is_private(
     optimization: &crate::optimization::Optimization,
-    first_page_ref: ObjectRef,
-    source_container_by_member: &BTreeMap<ObjectRef, ObjectRef>,
+    first_page_gen: QpdfObjGen,
+    source_container_by_member: &BTreeMap<QpdfObjGen, QpdfObjGen>,
 ) -> bool {
-    let first_page_ref = canonical_preserve_ref(source_container_by_member, first_page_ref);
-    let Ok(first_page_gen) = QpdfObjGen::try_from_object_ref(first_page_ref) else {
-        return false;
-    };
+    let first_page_gen = source_container_by_member
+        .get(&first_page_gen)
+        .copied()
+        .unwrap_or(first_page_gen);
     let users = optimization.raw_users_for(first_page_gen);
     let mut has_first_page = false;
     let mut has_later_page = false;
@@ -4267,9 +4284,9 @@ mod tests {
 
     #[test]
     fn first_page_private_matches_qpdf_object_user_classification() {
-        let page = ObjectRef::new(3, 0);
+        let page = QpdfObjGen::new(3, 0);
         let mut private = Optimization::default();
-        private.record_for_test(ObjectUser::Page(0), page);
+        private.record_raw_for_test(ObjectUser::Page(0), page);
         assert!(first_page_is_private(&private, page, &BTreeMap::new()));
 
         for extra_user in [
@@ -4283,15 +4300,39 @@ mod tests {
             ObjectUser::Root,
         ] {
             let mut shared = Optimization::default();
-            shared.record_for_test(ObjectUser::Page(0), page);
-            shared.record_for_test(extra_user, page);
+            shared.record_raw_for_test(ObjectUser::Page(0), page);
+            shared.record_raw_for_test(extra_user, page);
             assert!(!first_page_is_private(&shared, page, &BTreeMap::new()));
         }
 
         assert!(!first_page_is_private(
             &Optimization::default(),
-            ObjectRef::new(u32::MAX, 0),
+            QpdfObjGen::new(i32::MAX, 0),
             &BTreeMap::new()
+        ));
+    }
+
+    #[test]
+    fn first_page_privacy_keeps_raw_generation_65535() {
+        let page = QpdfObjGen::new(3, 65_535);
+        let mut optimization = Optimization::default();
+        optimization.record_raw_for_test(ObjectUser::Page(0), page);
+
+        assert!(first_page_is_private(&optimization, page, &BTreeMap::new()));
+    }
+
+    #[test]
+    fn first_page_privacy_maps_source_objstm_members_by_raw_identity() {
+        let page = QpdfObjGen::new(3, 0);
+        let container = QpdfObjGen::new(10, 0);
+        let mut optimization = Optimization::default();
+        optimization.record_raw_for_test(ObjectUser::Page(0), container);
+        let source_container_by_member = [(page, container)].into_iter().collect();
+
+        assert!(first_page_is_private(
+            &optimization,
+            page,
+            &source_container_by_member
         ));
     }
 
