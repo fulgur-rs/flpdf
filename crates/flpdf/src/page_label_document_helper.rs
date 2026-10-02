@@ -1108,6 +1108,29 @@ mod tests {
     }
 
     #[test]
+    fn get_labels_for_page_range_keeps_a_leading_entry_when_start_deltas_differ() {
+        let mut pdf = pdf_with_pagelabels(vec![
+            ObjectHandle::integer(0),
+            label_dict("D", Some(10), None),
+        ]);
+        let mut helper = pdf.page_labels();
+        let prior =
+            PageLabelDocumentHelper::<Cursor<Vec<u8>>>::page_label_dict(LabelStyle::Decimal, 1, "");
+        prior.replace_key(b"/St", ObjectHandle::integer(1)).unwrap();
+        let mut labels = vec![(0, prior)];
+
+        helper
+            .get_labels_for_page_range(1, 1, 1, &mut labels)
+            .unwrap();
+
+        assert_eq!(
+            labels.len(),
+            2,
+            "different /St and page-index deltas are not redundant"
+        );
+    }
+
+    #[test]
     fn get_labels_for_page_range_handles_missing_tree_and_non_dictionary_prior() {
         let mut pdf = bare_one_page_pdf();
         let mut h = pdf.page_labels();
