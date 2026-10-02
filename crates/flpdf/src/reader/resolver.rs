@@ -5,23 +5,11 @@
 //!
 //! # qpdf deviations recorded here
 //!
-//! Two behaviours in `replace_object`/`swap_objects` have no qpdf
-//! counterpart. Both carry an inline deviation marker at their sites, and
-//! `docs/qpdf-correspondence.md` carries the full rationale.
-//!
-//! 1. **xref-less-generation provenance** (CLAUDE.md category (C)): qpdf's
-//!    `updateCache` (`QPDF.cc:1842-1858`) stores whatever object it is handed
-//!    with no record of the caller, so `m->obj_cache` cannot distinguish a
-//!    replacement from a dangling `resolve`. flpdf records the provenance only
-//!    because `ResolverCore`'s split complete/live object-ref views need it
-//!    (`flpdf-uwn0`). Output bytes are unchanged.
-//! 2. **Foreign-owner guard** — *not* category (C), because it does change
-//!    output. `QPDF::replaceObject` (`QPDF.cc:1986-1993`) rejects only an
-//!    indirect or uninitialized handle and never calls `checkOwnership`, so a
-//!    direct value holding a foreign indirect child succeeds there and is
-//!    written; here it returns `Unsupported` and nothing is written. It stays
-//!    marked as an unresolved behavioral divergence, tracked by route matrix
-//!    A17, rather than being recorded as sanctioned scaffolding.
+//! Xref-less-generation provenance in `replace_object`/`swap_objects` has no
+//! qpdf counterpart (CLAUDE.md category (C)). qpdf's `updateCache`
+//! (`QPDF.cc:1842-1858`) records no caller provenance; flpdf retains it for
+//! the split complete/live object-ref views. The inline markers and
+//! `docs/qpdf-correspondence.md` record this remaining distinction.
 //!
 //! # Why this exists as its own owner
 //!
@@ -1887,43 +1875,18 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// `QPDFObject_private.hh:117-120`), which is represented by
     /// [`ObjectHandle::assign_value_state`].
     ///
-    /// The foreign-owner guard and the trailing xref-less-generation
-    /// provenance recording below both have no qpdf counterpart; the body
-    /// marks each one.
+    /// The trailing xref-less-generation provenance recording remains a
+    /// marked deviation from qpdf. Replacement performs no ownership walk.
     pub(crate) fn replace_object(
         &self,
         object_ref: ObjectRef,
         replacement: ObjectHandle,
     ) -> Result<ObjectHandle> {
-        if !replacement.is_direct() {
-            return Err(Error::Unsupported(
-                "QPDF::replaceObject called with indirect object handle".to_string(),
+        if replacement.is_indirect() || !replacement.is_initialized() {
+            return Err(Error::Internal(
+                "QPDF::replaceObject called with indirect object handle".to_owned(),
             ));
         }
-        // qpdf-deviation: qpdf's own `QPDF::replaceObject` (`QPDF.cc:1986-1993`)
-        // never calls `checkOwnership` -- it rejects only an indirect or
-        // uninitialized handle, then calls `updateCache`. This
-        // descendant-graph walk is flpdf's own defense against a foreign
-        // indirect object nested below the replacement value; see
-        // `ObjectHandle::belongs_exclusively_to_pdf`.
-        //
-        // This is NOT CLAUDE.md category (C): (C) covers deviations that do
-        // not change output bytes, and this one does. Passing a direct
-        // dictionary holding a foreign indirect child succeeds in qpdf and
-        // writes that value; here it returns `Unsupported` and writes
-        // nothing. It is an unresolved behavioral divergence, kept marked so
-        // a later audit finds it rather than mistaking it for sanctioned
-        // scaffolding. Route matrix A16 tracks it (A17 is `swap_objects`,
-        // which has no such guard).
-        if !replacement.belongs_exclusively_to_pdf(self.pdf_unique_id.get()) {
-            return Err(Error::Unsupported(
-                "Attempting to add an object from a different QPDF. Use QPDF::copyForeignObject to add objects from another file.".to_string(),
-            ));
-        }
-        // Preflight must run before preparing the replacement identity or
-        // `get_object_handle`: a failed replacement
-        // must not leave an absent target in the canonical object cache.
-        replacement.validate_replacement_source()?;
         let object_gen = QpdfObjGen::try_from_object_ref(object_ref)?;
 
         replacement.promote_to_indirect(

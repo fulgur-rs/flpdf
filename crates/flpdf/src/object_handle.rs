@@ -2309,29 +2309,6 @@ impl ObjectHandle {
         }
     }
 
-    /// Validate the source-state contract for qpdf-shaped replacement.
-    ///
-    /// flpdf currently accepts only a direct handle with a resolved value at
-    /// this boundary. Keeping this check separate lets the resolver run it
-    /// before minting an absent target cache entry. qpdf's
-    /// `QPDF::replaceObject` rejects both an indirect and an uninitialized
-    /// handle with the same message
-    /// (`libqpdf/QPDF.cc:1986-1989`: `if (oh.isIndirect() ||
-    /// !oh.isInitialized())`).
-    pub(crate) fn validate_replacement_source(&self) -> Result<()> {
-        if !self.is_direct() {
-            return Err(crate::Error::Unsupported(
-                "replacement ObjectHandle must be direct".to_string(),
-            ));
-        }
-        if !self.is_initialized() {
-            return Err(crate::Error::Unsupported(
-                "QPDF::replaceObject called with indirect object handle".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
     /// Rebind this QObject slot to the source's shared QPDFValue allocation.
     /// qpdf's `QPDFObject::assign` accepts the prepared value without checking
     /// indirectness (`libqpdf/qpdf/QPDFObject_private.hh:117-120`). Validation
@@ -2620,10 +2597,8 @@ impl ObjectHandle {
     /// (`libqpdf/QPDFObjectHandle.cc:2355-2365`, `QPDF_Array.cc:10-26`),
     /// which is a shallow, O(1) comparison of only the top-level handle's
     /// own owning document, this walks the complete direct-value descendant
-    /// graph. It exists for resolver-side replacement validation as a
-    /// flpdf-specific defense against a foreign indirect object nested several
-    /// direct hops below a replacement value -- a shape qpdf's own shallow
-    /// check does not catch. [`Self::check_key_value_ownership`] (the
+    /// graph. It remains in the name/number-tree ownership checks; canonical
+    /// document replacement does not call it. [`Self::check_key_value_ownership`] (the
     /// `replace_key` and array mutator ownership boundary) intentionally does
     /// not call this: qpdf's real `checkOwnership` never does either.
     pub(crate) fn belongs_exclusively_to_pdf(&self, pdf_unique_id: u64) -> bool {
@@ -10148,17 +10123,10 @@ pub(crate) mod identity_tests {
     }
 
     #[test]
-    fn replacement_validation_and_value_assignment_have_separate_contracts() {
+    fn value_assignment_shares_initialized_terminal_states() {
         let target = ObjectHandle::new_indirect_unresolved(ObjectRef::new(30, 0), -1);
         let direct = ObjectHandle::integer(1);
         direct.assign_value_state(&direct);
-
-        let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(31, 0), -1);
-        let error = indirect.validate_replacement_source().unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "unsupported PDF feature: replacement ObjectHandle must be direct"
-        );
 
         let destroyed = ObjectHandle::integer(2);
         let destroyed_resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
