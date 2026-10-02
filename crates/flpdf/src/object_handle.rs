@@ -3029,15 +3029,6 @@ impl ObjectHandle {
         }
     }
 
-    /// Clear source-description metadata when the handle's value is replaced
-    /// by caller-supplied data. The replacement no longer belongs to the
-    /// source location that produced the old description, so the indirect
-    /// object fallback (`object N G`) must be used instead.
-    pub(crate) fn clear_description(&self) {
-        let shared = self.0.borrow().shared.clone();
-        shared.borrow_mut().description = None;
-    }
-
     pub(crate) fn set_child_description(
         &self,
         parent: &ObjectHandle,
@@ -7811,9 +7802,8 @@ impl ObjectHandle {
     /// overriding the set-once contract [`Self::set_parsed_offset_if_unset`]
     /// normally enforces.
     ///
-    /// Used by canonical replacement code: once it replaces an indirect handle's
-    /// value with a caller-supplied one, any previously recorded source
-    /// position no longer describes that value.
+    /// Used only to arrange stream-source states in tests.
+    #[cfg(test)]
     pub(crate) fn reset_parsed_offset(&self) {
         let shared = self.0.borrow().shared.clone();
         shared.borrow_mut().parsed_offset = NO_PARSED_OFFSET;
