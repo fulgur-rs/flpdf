@@ -1,11 +1,12 @@
 //! Normalize page content streams for qpdf's linearized writer path.
 //!
-//! qpdf correspondence: `QPDFJob` stores `normalizeContent` separately and
-//! reapplies it while setting writer options (`QPDFJob.cc:2847-2863`). The
-//! pre-write mutation keeps flpdf's linearization planner aligned with that
-//! policy for cleanly decodable streams. Unsupported filters and streams whose
-//! decoders warn or fail stay untouched so the writer can apply qpdf's raw
-//! retry behavior.
+//! qpdf correspondence: `QPDFJob::setWriterOptions` (`QPDFJob.cc:2847-2863`).
+//!
+//! `QPDFJob` reapplies its `normalizeContent` setting while setting writer
+//! options. The pre-write mutation keeps flpdf's linearization planner aligned
+//! with that policy for cleanly decodable streams. Unsupported filters and
+//! streams whose decoders warn or fail stay untouched so the writer can apply
+//! qpdf's raw retry behavior.
 
 use crate::content_normalizer::normalize_content_stream;
 use crate::writer::DecodeLevel as StreamDecodeLevel;
