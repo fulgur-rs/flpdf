@@ -643,7 +643,12 @@ mod tests {
             deep = [b"[ ".as_slice(), &deep, b" ]".as_slice()].concat();
         }
 
-        let stdout = output(&deep, &[]);
+        let stdout = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || output(&deep, &[]))
+            .expect("spawn a small-stack qtest case")
+            .join()
+            .expect("qtest direct serializer must grow its stack");
 
         assert!(
             stdout.starts_with(b"/QTest is direct and has type array (8)\n"),

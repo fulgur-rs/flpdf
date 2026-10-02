@@ -64,7 +64,23 @@ pub(crate) fn write_qpdf_object_handle<R: Read + Seek>(
     Ok(bytes)
 }
 
+const QTEST_OBJECT_STACK_RED_ZONE: usize = 32 * 1024;
+const QTEST_OBJECT_STACK_GROWTH_SIZE: usize = 1024 * 1024;
+
 fn write_qpdf_handle_into<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    value: &ObjectHandle,
+    preserve_indirect: bool,
+    bytes: &mut Vec<u8>,
+) -> flpdf::Result<()> {
+    stacker::maybe_grow(
+        QTEST_OBJECT_STACK_RED_ZONE,
+        QTEST_OBJECT_STACK_GROWTH_SIZE,
+        || write_qpdf_handle_into_inner(pdf, value, preserve_indirect, bytes),
+    )
+}
+
+fn write_qpdf_handle_into_inner<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     value: &ObjectHandle,
     preserve_indirect: bool,
