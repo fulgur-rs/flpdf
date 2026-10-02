@@ -347,11 +347,10 @@ fn canonical_page_content_bytes<R: Read + Seek>(
     let contents_was_indirect = contents.object_ref().is_some();
     pdf.resolve(&contents)?;
     let contents = contents.clone();
-    if contents.is_null() {
+    if contents.try_is_null()? {
         return Ok(Vec::new());
     }
-    if contents_was_indirect && contents.as_array().is_none() && contents.as_stream_dict().is_none()
-    {
+    if contents_was_indirect && !contents.try_is_array()? && contents.as_stream_dict().is_none() {
         // qpdf's page helper warns and continues when a repaired indirect
         // /Contents holder resolves to a non-stream scalar. Keep this narrow
         // recovery boundary; a direct malformed scalar remains an error so
@@ -388,7 +387,7 @@ fn collect_canonical_content_streams<R: Read + Seek>(
         return Ok(());
     }
 
-    if let Some(items) = value.as_array() {
+    if value.try_is_array()? {
         // qpdf's arrayOrStreamToStreamArray accepts only the top-level array
         // and ignores every array element that is not a stream
         // (`QPDFObjectHandle.cc:1428-1469`). In particular, do not recurse
@@ -397,7 +396,7 @@ fn collect_canonical_content_streams<R: Read + Seek>(
         if !allow_array {
             return Ok(());
         }
-        for item in items {
+        for item in value.try_get_array_as_vector()? {
             collect_canonical_content_streams(pdf, &item, page_description, streams, false)?;
         }
         return Ok(());
