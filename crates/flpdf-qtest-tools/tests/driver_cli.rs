@@ -2179,6 +2179,27 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         !test_24.contains(".as_dictionary()"),
         "test 24 must not snapshot the trailer through the non-resolving dictionary accessor"
     );
+
+    let page_source_crlf = page_source.replace("\r\n", "\n").replace('\n', "\r\n");
+    let test_25 = section(
+        page_source_crlf.as_str(),
+        "pub(crate) fn run_test_25",
+        "mod test_24_tests",
+    );
+    assert_eq!(
+        test_25.matches("copied_pages.try_is_null()").count(),
+        1,
+        "test 25 must use qpdf's resolving null predicate for the copied /Pages result"
+    );
+    assert!(
+        test_25.contains("let copied_pages_is_null =")
+            && test_25.contains("assert!(copied_pages_is_null?);"),
+        "test 25 must flush copied-object diagnostics before propagating the null query"
+    );
+    assert!(
+        !test_25.contains(".is_null()"),
+        "test 25 must not use the non-resolving null predicate"
+    );
 }
 
 fn token_stream_contains_try_operator(tokens: &proc_macro2::TokenStream) -> bool {
