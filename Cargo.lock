@@ -388,6 +388,7 @@ dependencies = [
  "libc",
  "predicates",
  "proc-macro2",
+ "stacker",
  "syn 2.0.117",
  "tempfile",
  "windows-sys",
