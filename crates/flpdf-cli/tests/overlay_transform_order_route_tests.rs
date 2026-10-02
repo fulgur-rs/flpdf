@@ -297,7 +297,7 @@ fn page_selection_overlay_uses_the_canonical_job_owner() {
     }
     assert!(
         page_route.contains("configure_rewrite_job(")
-            && page_route.contains("run_page_extraction_job(job, page_ops, remove_unref)"),
+            && page_route.contains("run_page_operation_job(job, page_ops, remove_unref)"),
         "rewrite page route must configure overlays and finish on its one QPDFJob"
     );
     let rewrite_configuration = production_function_body(
@@ -330,7 +330,7 @@ fn page_selection_post_plan_rotation_and_images_use_the_canonical_job_owner() {
     let page_configuration = production_function_body(
         &source,
         "fn configure_page_selection_job(",
-        "\nfn run_page_extraction_job",
+        "\nfn run_page_operation_job",
     );
     assert!(
         page_configuration.contains("configuration.rotate("),
@@ -362,7 +362,7 @@ fn empty_page_selection_uses_the_shared_job_run() {
         "empty-primary page selection must configure QPDFJob's empty input"
     );
     assert!(
-        empty_pages.contains("run_page_extraction_job(job, page_ops, remove_unref)"),
+        empty_pages.contains("run_page_operation_job(job, page_ops, remove_unref)"),
         "empty-primary page selection must use the shared QPDFJob runner"
     );
     for forbidden in [

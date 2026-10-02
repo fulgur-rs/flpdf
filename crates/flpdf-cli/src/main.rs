@@ -5969,28 +5969,7 @@ fn run_page_operations_with_qpdf_job(
     )?;
     job.set_writer_configuration(writer_configuration);
 
-    if !args.page_ops.pages.is_empty() {
-        return run_page_extraction_job(job, &args.page_ops, args.remove_unreferenced_resources);
-    }
-
-    configure_page_selection_job(&mut job, &args.page_ops, args.remove_unreferenced_resources)?;
-
-    let mut pdf = match job.create_qpdf()? {
-        Some(pdf) => pdf,
-        None => {
-            return Err(Box::new(CliExitError {
-                code: ExitCode::Errors,
-                message: String::new(),
-            }))
-        }
-    };
-    match job.write_qpdf(&mut pdf) {
-        Ok(()) => finish_job_exit_status(job.get_exit_code()),
-        Err(_) => Err(Box::new(CliExitError {
-            code: ExitCode::Errors,
-            message: String::new(),
-        })),
-    }
+    run_page_operation_job(job, &args.page_ops, args.remove_unreferenced_resources)
 }
 
 /// Configure the page-selection controls shared by both CLI surfaces.
@@ -6027,9 +6006,9 @@ fn configure_page_selection_job(
     Ok(())
 }
 
-/// Complete page extraction through the same configured QPDFJob used to open
-/// sources, select pages, transform, write, and report warnings.
-fn run_page_extraction_job(
+/// Complete top-level page operations through the configured QPDFJob used to
+/// open sources, select pages, rotate and collate, split output, and report warnings.
+fn run_page_operation_job(
     mut job: QPDFJob,
     page_ops: &PageOpArgs,
     remove_unref: CliRemoveUnreferencedResources,
@@ -7249,7 +7228,7 @@ fn run_page_extraction(
         linearize_pass1,
     )?);
 
-    run_page_extraction_job(job, page_ops, remove_unref)
+    run_page_operation_job(job, page_ops, remove_unref)
 }
 
 /// Run qpdf's `--empty --pages` route with the empty primary and the same Job
@@ -7327,7 +7306,7 @@ fn run_empty_page_extraction(
         linearize_pass1,
     )?);
 
-    run_page_extraction_job(job, page_ops, remove_unref)
+    run_page_operation_job(job, page_ops, remove_unref)
 }
 
 /// Whether `--split-pages` selects qpdf's chunk-writing path.
