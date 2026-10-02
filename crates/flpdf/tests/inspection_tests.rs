@@ -1,4 +1,4 @@
-use flpdf::{pages, Error, ObjectRef, PageDocumentHelper, Pdf};
+use flpdf::{pages, Error, ObjectRef, PageDocumentHelper, Pdf, QpdfObjGen};
 use std::io::Cursor;
 use std::io::Write;
 use std::process::Command;
@@ -91,7 +91,7 @@ fn outline_tree_returns_titles_in_pre_order() {
     assert_eq!(tree.roots().len(), 1);
     assert_eq!(depth, 1);
     assert_eq!(item.get_title(&mut helper).unwrap(), "Chapter One");
-    assert_eq!(item.source_ref, Some(ObjectRef::new(10, 0)));
+    assert_eq!(item.object.get_obj_gen(), QpdfObjGen::new(10, 0));
     assert!(tree
         .get(id)
         .is_some_and(|candidate| std::ptr::eq(candidate, item)));
@@ -118,7 +118,7 @@ fn outline_tree_resolves_indirect_title() {
     let item = &tree[tree.roots()[0]];
     assert_eq!(tree.roots().len(), 1);
     assert_eq!(item.get_title(&mut helper).unwrap(), "Chapter One");
-    assert_eq!(item.source_ref, Some(ObjectRef::new(4, 0)));
+    assert_eq!(item.object.get_obj_gen(), QpdfObjGen::new(4, 0));
 }
 
 #[test]

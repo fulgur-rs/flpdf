@@ -412,20 +412,18 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     ) -> Result<Option<OutlineId>> {
         // Both callers (`get_tree`'s loop and `build_item`'s frame loop)
         // already resolve `cursor` through `chase_and_mark_seen` before
-        // calling here. Resolve once more so this function's own `source_ref`
-        // capture remains correct when it is called independently. The
+        // calling here. Resolve once more so the retained `object` is the
+        // canonical handle when this function is called independently. The
         // canonical handle identity is captured AFTER resolution so cycle
         // detection (`ObjectHandle::qpdf_obj_gen`, used by `build_item`'s
         // `constructor_seen`) keys off the terminal identity, not the
         // pre-chase holder.
         let cursor = self.resolve_value_handle(cursor)?;
-        let source_ref = cursor.object_ref();
         if cursor.try_is_null()? {
             return Ok(None);
         }
         let id = OutlineId(tree.items.len());
         tree.items.push(OutlineItem {
-            source_ref,
             parent,
             kids: Vec::new(),
             object: cursor,

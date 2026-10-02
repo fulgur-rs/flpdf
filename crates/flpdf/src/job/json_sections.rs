@@ -171,10 +171,7 @@ pub(crate) fn build_pages_section_with_options<R: Read + Seek>(
             let mut page_entries = Vec::with_capacity(ids.len());
             for id in ids {
                 let item = &tree[id];
-                let object = match item.source_ref {
-                    Some(reference) => Json::make_string(reference.to_string()),
-                    None => pdf_object_to_json_with_version(&item.object, version)?,
-                };
+                let object = pdf_object_to_json_with_version(&item.object, version)?;
                 let title = item.get_title(&mut helper).map_err(ConvertError::from)?;
                 let dest = pdf_dest_to_json_with_version(
                     &item.get_dest(&mut helper).map_err(ConvertError::from)?,
@@ -491,10 +488,7 @@ fn outline_item_to_json<R: Read + Seek>(
     // fields in this order (`QPDFJob.cc:1119-1138`). The accessors emit
     // warnings at computation time, so this is observable even though the
     // JSON dictionary serializer later sorts the keys.
-    let object = match item.source_ref {
-        Some(reference) => Json::make_string(reference.to_string()),
-        None => pdf_object_to_json_with_version(&item.object, version)?,
-    };
+    let object = pdf_object_to_json_with_version(&item.object, version)?;
     let title = item.get_title(helper)?;
     let dest = pdf_dest_to_json_with_version(&item.get_dest(helper)?, version)?;
     let count = item.get_count(helper)?;
