@@ -416,7 +416,7 @@ fn collect_canonical_content_streams<R: Read + Seek>(
 fn resolve_objstm_type(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>, dict: &ObjectHandle) -> bool {
     let type_handle = match dict.try_get_key(b"/Type") {
         Ok(handle) => handle,
-        Err(_) => return false,
+        Err(_) => return false, // cov:ignore: getAllObjects + as_stream_dict guarantee a live direct receiver.
     };
     // qpdf's getKey()/isName() dereference through the canonical object
     // handle. Resolve the parsed child once, while keeping the decode
