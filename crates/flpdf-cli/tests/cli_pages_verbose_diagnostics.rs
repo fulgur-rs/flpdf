@@ -483,8 +483,8 @@ fn linearized_content_normalization_is_job_owned() {
         .split_once("fn configure_rewrite_job")
         .expect("rewrite Job configuration should remain named")
         .1
-        .split_once("\nfn run_rewrite_opened")
-        .expect("opened rewrite route should follow its Job configuration")
+        .split_once("\nfn segment_option_name")
+        .expect("the next parser helper should follow rewrite Job configuration")
         .0;
     assert!(
         rewrite_config.contains("if options.content_normalization_set")

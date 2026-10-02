@@ -370,30 +370,6 @@ fn image_optimization_options(
     Ok(options)
 }
 
-/// Report donor authentication failures at the CLI boundary while preserving
-/// the typed error returned by the library's public job API. qpdf's copy
-/// attachment loop lets the donor `processFile` exception escape
-/// (`libqpdf/QPDFJob.cc:2089-2100`); `open_job_source` has already retained the
-/// failed donor path on the job, so `report_job_error` can render qpdf's
-/// path-qualified message without changing `Error::Encrypted` into a byte
-/// string for library callers.
-fn apply_transformations_for_cli<R: Read + Seek + 'static>(
-    job: &mut QPDFJob,
-    pdf: &mut Pdf<R>,
-) -> CliResult<()> {
-    match job.apply_transformations(pdf) {
-        Ok(()) => Ok(()),
-        Err(error) if is_bad_password_error(&error) => {
-            job.report_job_error(&error)?;
-            Err(Box::new(CliExitError {
-                code: ExitCode::Errors,
-                message: String::new(),
-            }))
-        }
-        Err(error) => Err(Box::new(error)),
-    }
-}
-
 /// Configure the create-stage transformations that qpdf applies before a
 /// top-level inspection. Keeping this separate from the application step lets
 /// the full `QPDFJob::create_qpdf` lifecycle own page-selection inspections as
@@ -5690,22 +5666,20 @@ fn run_rewrite(
             }
             (None, None) => return Err(missing_output_usage_error().into()),
         };
-        let mut job = new_cli_job(no_warn);
-        let pdf = create_empty_primary_document(&mut job, update_from_json)?;
-        return run_rewrite_opened(
-            pdf,
-            Path::new("empty PDF"),
+        return run_rewrite_with_qpdf_job(
+            None,
             &output,
             false,
             repair,
             password,
+            json_input,
+            update_from_json,
             linearize,
             linearize_pass1,
             remove_restrictions,
             decrypt,
             normalize_content,
             coalesce_contents,
-            _remove_unref,
             generate_appearances,
             image_options,
             flatten_annotations_mode,
@@ -5715,6 +5689,9 @@ fn run_rewrite(
             verbose,
             no_warn,
             options,
+            &[],
+            None,
+            _remove_unref.into(),
         );
     }
     let input = input.ok_or_else(missing_input_usage_error)?;
@@ -5733,7 +5710,7 @@ fn run_rewrite(
         reject_same_job_output(&input, &output)?;
     }
     run_rewrite_with_qpdf_job(
-        &input,
+        Some(&input),
         &output,
         replace_input,
         repair,
@@ -5982,7 +5959,7 @@ fn run_page_operation_job(
 
 #[allow(clippy::too_many_arguments)]
 fn run_rewrite_with_qpdf_job(
-    input: &Path,
+    input: Option<&Path>,
     output: &Path,
     replace_input: bool,
     repair: bool,
@@ -6015,7 +5992,7 @@ fn run_rewrite_with_qpdf_job(
     let job_options = options.clone();
 
     let mut job = configure_rewrite_job(
-        Some(input),
+        input,
         output,
         replace_input,
         password,
@@ -6033,11 +6010,15 @@ fn run_rewrite_with_qpdf_job(
         no_warn,
         &job_options,
     )?;
-    if !replace_input {
-        job.set_input_file(input.to_path_buf())?;
+    if let Some(input) = input {
+        if !replace_input {
+            job.set_input_file(input.to_path_buf())?;
+        }
+        let input_options = pdf_open_options(repair, password)?;
+        job.set_password(input_options.password);
+    } else {
+        job.config().empty_input()?;
     }
-    let input_options = pdf_open_options(repair, password)?;
-    job.set_password(input_options.password);
     {
         let mut configuration = job.config();
         if json_input {
@@ -6186,76 +6167,6 @@ fn configure_rewrite_job(
         }
     }
     Ok(job)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_rewrite_opened<R: Read + Seek + 'static>(
-    mut pdf: Pdf<R>,
-    input: &Path,
-    output: &Path,
-    replace_input: bool,
-    _repair: bool,
-    _password: &PasswordArgs,
-    linearize: bool,
-    linearize_pass1: Option<&Path>,
-    remove_restrictions: bool,
-    _decrypt: bool,
-    _normalize_content: bool,
-    coalesce_contents: bool,
-    _remove_unref: CliRemoveUnreferencedResources,
-    generate_appearances: bool,
-    image_options: ImageTransformOptions,
-    flatten_annotations_mode: Option<CliFlattenMode>,
-    flatten_rotation: bool,
-    page_labels: PageLabelOptions,
-    overlay_specs: &[OverlaySpec],
-    verbose: bool,
-    no_warn: bool,
-    options: WriterOptions,
-) -> CliResult<()> {
-    let job_options = options.clone();
-    let mut job = configure_rewrite_job(
-        Some(input),
-        output,
-        replace_input,
-        _password,
-        linearize,
-        linearize_pass1,
-        remove_restrictions,
-        image_options,
-        generate_appearances,
-        flatten_annotations_mode,
-        coalesce_contents,
-        flatten_rotation,
-        &page_labels,
-        overlay_specs,
-        verbose,
-        no_warn,
-        &job_options,
-    )?;
-    apply_transformations_for_cli(&mut job, &mut pdf)?;
-    // qpdf builds the writer only inside writeQPDF -> writeOutfile ->
-    // setWriterOptions (`QPDFJob.cc:484-495,2752-2761`), so its write-time
-    // validation - the auto-password notices and the RC4 refusal - runs after
-    // the create stage, never before it. write_qpdf's own write stage
-    // performs that validation, so this configuration must stay unnormalized
-    // here or the password bytes get normalized twice.
-    let mut writer_options = job_options;
-    if _decrypt {
-        writer_options.preserve_encryption = false;
-    }
-    job.set_writer_configuration(writer_configuration_unnormalized(
-        &writer_options,
-        linearize,
-        linearize_pass1,
-    )?);
-    match job.write_qpdf(&mut pdf) {
-        Ok(()) => finish_job_exit_status(job.get_exit_code()),
-        Err(_) => Err(Box::new(CliExitError {
-            code: ExitCode::Errors,
-            message: String::new(),
-        })),
-    }
 }
 
 // ===========================================================================
@@ -7319,7 +7230,7 @@ fn run_rewrite_with_page_ops(
     // (`QPDFJob.cc:466-491`). Queue the raw page-operation parameters on that
     // canonical job instead of reopening a second direct PdfWriter route.
     run_rewrite_with_qpdf_job(
-        input,
+        Some(input),
         output,
         false,
         repair,
