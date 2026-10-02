@@ -31,7 +31,7 @@
 //! ```
 
 use crate::outline_document_helper::OutlineDocumentHelper;
-use crate::{ObjectHandle, ObjectRef, QpdfObjGen, Result};
+use crate::{ObjectHandle, QpdfObjGen, Result};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Seek};
 use std::ops::Index;
@@ -106,8 +106,6 @@ pub struct OutlineId(pub(crate) usize);
 /// One materialized outline item.
 #[derive(Debug, Clone)]
 pub struct OutlineItem {
-    /// Indirect source identity, or `None` for a direct outline value.
-    pub source_ref: Option<ObjectRef>,
     /// Parent item in the arena; top-level items have no parent.
     pub parent: Option<OutlineId>,
     /// Child items in raw `/First` then `/Next` order.
@@ -382,7 +380,6 @@ mod tests {
             .replace_key(b"/A", ObjectHandle::integer(1))
             .unwrap();
         let item = OutlineItem {
-            source_ref: None,
             parent: None,
             kids: Vec::new(),
             object: catalog,
