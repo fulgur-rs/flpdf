@@ -638,6 +638,13 @@ fn matrix_pages_materializes_inherited_own_keys_like_qpdf() {
 /// identifies each source page, so a reordering op's output page sequence
 /// can be compared element-by-element against qpdf's.
 fn distinct_pages_pdf(n: usize) -> tempfile::NamedTempFile {
+    distinct_pages_pdf_with_catalog_entry(n, None)
+}
+
+fn distinct_pages_pdf_with_catalog_entry(
+    n: usize,
+    catalog_entry: Option<&str>,
+) -> tempfile::NamedTempFile {
     use std::io::Write;
     let mut buf: Vec<u8> = b"%PDF-1.5\n".to_vec();
     let mut offsets: Vec<usize> = Vec::new();
@@ -647,7 +654,11 @@ fn distinct_pages_pdf(n: usize) -> tempfile::NamedTempFile {
         .join(" ");
 
     offsets.push(buf.len());
-    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let catalog = catalog_entry.map_or_else(
+        || "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_owned(),
+        |entry| format!("1 0 obj\n<< /Type /Catalog /Pages 2 0 R {entry} >>\nendobj\n"),
+    );
+    buf.extend_from_slice(catalog.as_bytes());
     offsets.push(buf.len());
     buf.extend_from_slice(
         format!("2 0 obj\n<< /Type /Pages /Kids [{kids}] /Count {n} >>\nendobj\n").as_bytes(),
@@ -1164,6 +1175,96 @@ fn pages_cross_document_merge_matches_qpdf() {
 
     assert_eq!(media_boxes_of(&f), media_boxes_of(&q));
     assert_own_page_attributes_match(&q, &f);
+}
+
+#[test]
+fn rewrite_pages_cross_document_merge_matches_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let primary_file =
+        distinct_pages_pdf_with_catalog_entry(2, Some("/PrimaryMarker (primary-catalog)"));
+    let secondary_file = distinct_pages_pdf(3);
+    let primary = primary_file.path();
+    let secondary = secondary_file.path();
+    let qpdf_output = temp.path().join("qpdf-rewrite-pages.pdf");
+    let flpdf_output = temp.path().join("flpdf-rewrite-pages.pdf");
+
+    let shared_args = [
+        "--qdf".to_owned(),
+        "--static-id".to_owned(),
+        "--no-original-object-ids".to_owned(),
+        "--stream-data=uncompress".to_owned(),
+        primary.display().to_string(),
+        "--pages".to_owned(),
+        ".".to_owned(),
+        "2".to_owned(),
+        secondary.display().to_string(),
+        "3".to_owned(),
+        ".".to_owned(),
+        "1".to_owned(),
+        "--".to_owned(),
+    ];
+    let mut qpdf_args = shared_args.to_vec();
+    qpdf_args.push(qpdf_output.display().to_string());
+    let qpdf = Shell::new(QPDF).args(&qpdf_args).output().unwrap();
+
+    let mut flpdf_args = vec!["rewrite".to_owned()];
+    flpdf_args.extend(shared_args);
+    flpdf_args.push(flpdf_output.display().to_string());
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(&flpdf_args)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert!(
+        qpdf.status.success(),
+        "qpdf rewrite page merge failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    assert!(
+        flpdf.status.success(),
+        "flpdf rewrite page merge failed: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+
+    let qpdf_boxes = media_boxes_of(&qpdf_output);
+    let flpdf_boxes = media_boxes_of(&flpdf_output);
+    assert_eq!(
+        qpdf_boxes,
+        vec![
+            "[ 0 0 200 200 ]".to_owned(),
+            "[ 0 0 300 200 ]".to_owned(),
+            "[ 0 0 100 200 ]".to_owned(),
+        ],
+        "rewrite extraction must keep the requested primary/secondary order"
+    );
+    assert_eq!(flpdf_boxes, qpdf_boxes);
+
+    let qpdf_trailer = show_qpdf_object(&qpdf_output, "trailer");
+    let flpdf_trailer = show_qpdf_object(&flpdf_output, "trailer");
+    let qpdf_root = object_selector_after_key(&qpdf_trailer, "/Root");
+    let flpdf_root = object_selector_after_key(&flpdf_trailer, "/Root");
+    let qpdf_catalog = show_qpdf_object(&qpdf_output, &qpdf_root);
+    let flpdf_catalog = show_qpdf_object(&flpdf_output, &flpdf_root);
+    assert!(qpdf_catalog.contains("/PrimaryMarker (primary-catalog)"));
+    assert!(flpdf_catalog.contains("/PrimaryMarker (primary-catalog)"));
+    assert_eq!(
+        top_level_dict_keys(&flpdf_catalog),
+        top_level_dict_keys(&qpdf_catalog),
+        "rewrite merge must preserve the primary Catalog key set"
+    );
+
+    #[cfg(feature = "qpdf-zlib-compat")]
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "deterministic rewrite page merge output must be byte-identical"
+    );
 }
 
 #[test]

@@ -3512,7 +3512,7 @@ impl QPDFJob {
         // writer here, in the write stage (`QPDFJob.cc:2913`), so a source
         // opened during the create stage still raises the output version.
         if let Some((version, extension_level)) = self.configuration.max_input_version.clone() {
-            writer_configuration.set_minimum_pdf_version(version, extension_level);
+            writer_configuration.set_minimum_pdf_version_floor(version, extension_level);
         }
         let writer_donor = self
             .configuration
