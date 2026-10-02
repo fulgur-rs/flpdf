@@ -78,7 +78,7 @@ impl<'a> ObjectHandleParserCallbacks for DriverParserCallbacks<'a> {
         offset: usize,
         length: usize,
     ) -> flpdf::Result<ParseControl> {
-        if object.as_name().as_deref() == Some(b"Abort".as_slice()) {
+        if object.try_is_name_and_equals(b"Abort")? {
             writeln!(self.stdout, "test suite: terminating parsing")?;
             return Ok(ParseControl::Stop);
         }

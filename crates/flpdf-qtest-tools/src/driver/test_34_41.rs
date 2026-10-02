@@ -485,7 +485,7 @@ impl<'a, R: Read + Seek + 'static> flpdf::ObjectHandleParserCallbacks
         offset: usize,
         length: usize,
     ) -> flpdf::Result<flpdf::ParseControl> {
-        if object.as_name().as_deref() == Some(b"Abort".as_slice()) {
+        if object.try_is_name_and_equals(b"Abort")? {
             writeln!(self.stdout, "test suite: terminating parsing")?;
             // `terminateParsing()` throws immediately
             // (`test_driver.cc:116-119`), so the type/offset/length line
