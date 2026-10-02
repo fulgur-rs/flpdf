@@ -8681,22 +8681,7 @@ fn run_configured_attachment_job(
         linearize,
         linearize_pass1,
     )?);
-    let mut pdf = match job.create_qpdf()? {
-        Some(pdf) => pdf,
-        None => {
-            return Err(Box::new(CliExitError {
-                code: ExitCode::Errors,
-                message: String::new(),
-            }))
-        }
-    };
-    match job.write_qpdf(&mut pdf) {
-        Ok(()) => finish_job_exit_status(job.get_exit_code()),
-        Err(_) => Err(Box::new(CliExitError {
-            code: ExitCode::Errors,
-            message: String::new(),
-        })),
-    }
+    finish_job_exit_status(job.run()?)
 }
 
 /// `--add-attachment FILE [sub-flags] -- output.pdf`
