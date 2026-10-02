@@ -135,6 +135,7 @@
 | `crates/flpdf/src/qpdf_obj_gen.rs` | correspondence | QPDFObjGen.hh/QPDF.cc raw xref identity and valid indirect-reference boundary |
 | `crates/flpdf/src/qpdf_time.rs` | correspondence | \`QUtil::QPDFTime\`, \`get_current_qpdf_time\`, and \`qpdf_time_to_pdf_time\` |
 | `crates/flpdf/src/qutil.rs` | correspondence | \`QUtil.cc\` integer conversion, filesystem identity, and UTF-8 single-byte encoding primitives, used by form appearance generation per \`libqpdf/QPDFFormFieldObjectHelper.cc:811-849\` |
+| `crates/flpdf/src/qutil/real.rs` | correspondence | QUtil real formatting and QPDFObjectHandle numeric conversion |
 | `crates/flpdf/src/reader.rs` | correspondence | QPDF.cc object resolution, recovery, diagnostics, and authentication responsibilities |
 | `crates/flpdf/src/reader/resolver.rs` | correspondence | \`QPDF::resolve\` (\`libqpdf/QPDF.cc:1700-1753\`) and the \`QPDF::Members\` fields it touches |
 | `crates/flpdf/src/resource_finder.rs` | correspondence | \`ResourceFinder.cc\` |

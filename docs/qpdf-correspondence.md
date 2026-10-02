@@ -24,7 +24,7 @@ bytes without validation; `real` / `real_with_precision` format doubles through
 `qutil::double_to_string` (`libqpdf/QUtil.cc:349-370`). Parser tokens, object
 unparse, writer emission and numeric access use this same text. The independent
 numeric/literal pair and the unsafe-literal rewrite have been removed.
-`QPDF_Real::writeJSON` (`libqpdf/QPDF_Real.cc:43-57`) changes only empty and
+`QPDF_Real::writeJSON` (`libqpdf/QPDF_Real.cc:43-55`) changes only empty and
 leading-dot spellings; invalid JSON text reaches the parser error in `get_json`.
 
 ⚪ Output-neutral standard-library substitution: `qutil/real.rs` implements

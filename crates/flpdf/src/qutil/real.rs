@@ -1,6 +1,6 @@
 //! Floating-point text boundaries used by qpdf real values.
 //!
-//! qpdf correspondence: `QUtil::double_to_string` (`libqpdf/QUtil.cc:349-370`)
+//! qpdf correspondence: QUtil real formatting and QPDFObjectHandle numeric conversion.
 //! and the C `atof` conversion in `QPDFObjectHandle::getNumericValue`
 //! (`libqpdf/QPDFObjectHandle.cc:377-385`). Rust formatting/parsing replaces
 //! the C++/C library machinery while preserving the stored text contract.
