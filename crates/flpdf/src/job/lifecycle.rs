@@ -5929,6 +5929,37 @@ mod tests {
     use crate::{Error, ObjectHandle, ObjectRef, PageDocumentHelper, PageInput, PdfOpenOptions};
     use std::io::Cursor;
 
+    fn one_page_pdf_with_content(content: &[u8]) -> Vec<u8> {
+        let stream = [
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).into_bytes(),
+            content.to_vec(),
+            b"\nendstream\nendobj\n".to_vec(),
+        ]
+        .concat();
+        let objects = [
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << >> /Contents 4 0 R >>\nendobj\n".to_vec(),
+            stream,
+        ];
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for object in objects {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(&object);
+        }
+        let xref_start = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        for offset in offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        bytes
+    }
+
     #[test]
     fn flatten_rotation_lifecycle_accepts_raw_page_and_widget_handles() {
         let mut pdf = Pdf::empty().expect("empty PDF should open");
@@ -6171,6 +6202,34 @@ mod tests {
         job.config().normalize_content(true);
 
         assert!(job.content_normalization_enabled());
+    }
+
+    #[test]
+    fn linearized_normalization_reports_empty_input_and_unknown_offset() {
+        let mut pdf = Pdf::open_mem_owned(one_page_pdf_with_content(b"\r<0g"))
+            .expect("synthetic page PDF opens");
+        let pages = PageDocumentHelper::new(&mut pdf)
+            .get_all_pages()
+            .expect("page tree resolves");
+        let stream_ref = pages[0]
+            .try_get_key(b"/Contents")
+            .expect("page Contents stream")
+            .object_ref()
+            .expect("indirect content stream");
+        let stream = pdf.get_object_handle(stream_ref);
+        stream.reset_parsed_offset();
+        assert!(stream.get_parsed_offset() < 0);
+
+        let logger = QPDFLogger::create();
+        logger.set_warn(Some(PipelineHandle::new(crate::pipeline::Discard)));
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.empty_primary_created = true;
+
+        job.normalize_page_contents(&mut pdf)
+            .expect("bad content is normalized with a warning");
+
+        assert_eq!(job.get_exit_code(), JobExitCode::Warning);
     }
 
     #[test]

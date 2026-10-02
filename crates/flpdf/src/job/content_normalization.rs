@@ -106,3 +106,96 @@ fn normalize_and_store_stream_handle(
     stream.mark_content_normalization_applied();
     Ok(warning)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page_pdf_with_contents_array(streams: &[&[u8]], members: &[usize]) -> Vec<u8> {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let size = 4 + streams.len();
+        let mut offsets = vec![0usize; size];
+        offsets[1] = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        offsets[2] = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let contents = members
+            .iter()
+            .map(|index| format!("{} 0 R", 4 + index))
+            .collect::<Vec<_>>()
+            .join(" ");
+        offsets[3] = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] \
+                 /Resources << >> /Contents [{contents}] >>\nendobj\n"
+            )
+            .as_bytes(),
+        );
+        for (index, content) in streams.iter().enumerate() {
+            let object = 4 + index;
+            offsets[object] = bytes.len();
+            bytes.extend_from_slice(
+                format!("{object} 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+            );
+            bytes.extend_from_slice(content);
+            bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        }
+        let xref_start = bytes.len();
+        bytes.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+        for offset in offsets.iter().skip(1) {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn linearized_normalization_walks_contents_arrays_and_updates_each_length() {
+        let bytes = page_pdf_with_contents_array(&[b"q\r\nQ", b"q\rQ"], &[0, 1]);
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("synthetic page PDF opens");
+        let pages = PageDocumentHelper::new(&mut pdf)
+            .get_all_pages()
+            .expect("page tree resolves");
+
+        assert!(normalize_page_contents(&mut pdf)
+            .expect("array content streams normalize")
+            .is_empty());
+
+        let contents = pages[0]
+            .try_get_key(b"/Contents")
+            .expect("page Contents array");
+        let items = contents
+            .try_get_array_as_vector()
+            .expect("array members resolve");
+        assert_eq!(items.len(), 2);
+        for item in items {
+            assert_eq!(
+                item.get_stream_data(StreamDecodeLevel::All)
+                    .expect("normalized stream bytes")
+                    .as_slice(),
+                b"q\nQ"
+            );
+            let dictionary = item.as_stream_dict().expect("stream dictionary");
+            assert_eq!(
+                dictionary
+                    .try_get_key(b"/Length")
+                    .expect("stream length")
+                    .try_as_integer()
+                    .expect("integer length"),
+                Some(3)
+            );
+        }
+    }
+
+    #[test]
+    fn linearized_normalization_deduplicates_repeated_array_streams() {
+        let bytes = page_pdf_with_contents_array(&[b"\r<0g"], &[0, 0]);
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("synthetic page PDF opens");
+        let warnings = normalize_page_contents(&mut pdf).expect("array streams normalize");
+        assert_eq!(warnings.len(), 1, "one aliased stream warns only once");
+    }
+}
