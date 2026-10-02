@@ -442,7 +442,7 @@ pub(crate) fn write_encryption_dictionary_handle(
 ) -> crate::Result<()> {
     const HEX_ENCRYPT_KEYS: [&[u8]; 5] = [b"/O", b"/U", b"/OE", b"/UE", b"/Perms"];
 
-    let Some(entries) = handle.as_dictionary() else {
+    let Some(entries) = handle.try_as_dictionary()? else {
         return Err(crate::Error::System(
             "encryption handle does not contain a dictionary".to_string(),
         ));
@@ -455,7 +455,7 @@ pub(crate) fn write_encryption_dictionary_handle(
         write_name_escaped(out, key_without_slash)?;
         out.write_bytes(b" ")?;
         if HEX_ENCRYPT_KEYS.contains(&key.as_slice()) {
-            if let Some(bytes) = value.as_string() {
+            if let Some(bytes) = value.try_as_string()? {
                 write_hex_string(out, &bytes)?;
                 continue;
             } // cov:ignore: LLVM attributes the covered hex-key string branch to its continue terminator.
