@@ -1941,8 +1941,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 .insert(object_gen, ObjectCacheEntry::new(replacement.clone()));
             replacement
         };
-        target.clear_description();
-        target.reset_parsed_offset();
         target.set_end_offsets(NO_PARSED_OFFSET, NO_PARSED_OFFSET);
         // qpdf-deviation: qpdf's `updateCache` (`QPDF.cc:1842-1858`) is
         // caller-blind -- it stores whatever object it is handed under `og`,
