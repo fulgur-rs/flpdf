@@ -598,15 +598,11 @@ fn render_encryption_report<R: Read + Seek>(
     if !pdf.is_encrypted() {
         return Ok(b"File is not encrypted\n".to_vec());
     }
-    let revision = pdf
-        .encryption_revision()
-        .ok_or_else(|| crate::Error::Internal("encrypted PDF has no encryption revision".into()))?;
-    let version = pdf
-        .encryption_version()
-        .ok_or_else(|| crate::Error::Internal("encrypted PDF has no encryption version".into()))?;
-    let permissions = pdf
-        .permissions()
-        .ok_or_else(|| crate::Error::Internal("encrypted PDF has no permissions".into()))?;
+    // qpdf keeps the authenticated encryption flag/key on QPDF, but
+    // `isEncrypted(R, P, V, ...)` reads /P, /R, and /V from the live trailer
+    // for each report. An earlier updateFromJSON may have replaced /Encrypt,
+    // so do not render these fields from the pre-update inspection snapshot.
+    let (permissions, revision, version) = current_encryption_parameters(pdf)?;
     let user_password = pdf.trimmed_user_password().unwrap_or_default();
     let user_password_matched = pdf.user_password_matched();
     let owner_password_matched = pdf.owner_password_matched();
@@ -634,18 +630,37 @@ fn render_encryption_report<R: Read + Seek>(
         output.extend_from_slice(b"Supplied password is user password\n");
     }
 
-    let permissions = permission_report(revision, permissions);
-    for (label, allowed) in [
-        ("extract for accessibility", permissions.accessibility),
-        ("extract for any purpose", permissions.extract_all),
-        ("print low resolution", permissions.print_low),
-        ("print high resolution", permissions.print_high),
-        ("modify document assembly", permissions.modify_assembly),
-        ("modify forms", permissions.modify_form),
-        ("modify annotations", permissions.modify_annotation),
-        ("modify other", permissions.modify_other),
-        ("modify anything", permissions.modify_all),
-    ] {
+    for (index, label) in [
+        "extract for accessibility",
+        "extract for any purpose",
+        "print low resolution",
+        "print high resolution",
+        "modify document assembly",
+        "modify forms",
+        "modify annotations",
+        "modify other",
+        "modify anything",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // Each qpdf allow* permission query calls isEncrypted(R, P), which
+        // delegates to the full overload and rereads /P, /R, and /V. Preserve
+        // that read and warning order against the live trailer each time.
+        let (permissions, revision, _) = current_encryption_parameters(pdf)?;
+        let permission = permission_report(revision, permissions);
+        let allowed = match index {
+            0 => permission.accessibility,
+            1 => permission.extract_all,
+            2 => permission.print_low,
+            3 => permission.print_high,
+            4 => permission.modify_assembly,
+            5 => permission.modify_form,
+            6 => permission.modify_annotation,
+            7 => permission.modify_other,
+            8 => permission.modify_all,
+            _ => unreachable!("permission labels and accessors have the same length"),
+        };
         output.extend_from_slice(format!("{label}: {}\n", show_bool(allowed)).as_bytes());
     }
 
@@ -658,6 +673,27 @@ fn render_encryption_report<R: Read + Seek>(
         output.extend_from_slice(format!("file encryption method: {file_method}\n").as_bytes());
     }
     Ok(output)
+}
+
+fn current_encryption_parameters<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+) -> Result<(Permissions, i64, i64)> {
+    let encrypt = pdf.trailer().try_get_key(b"/Encrypt")?;
+    // QPDF::isEncrypted(R, P, V, ...) reads /P first, then /R and /V
+    // (`QPDF_encryption.cc:1241-1264`). It fetches all three child handles
+    // before reading their values; that matters because a null /Encrypt emits
+    // one type warning per getKey before any integer-value warnings. The int
+    // cast for /P is qpdf's signed permission projection; /R and /V use
+    // getIntValueAsInt.
+    let p_value = encrypt.try_get_key(b"/P")?;
+    let r_value = encrypt.try_get_key(b"/R")?;
+    let v_value = encrypt.try_get_key(b"/V")?;
+    let permissions = Permissions::new(crate::encryption::qpdf_permission_i32(
+        p_value.try_get_int_value()?,
+    ));
+    let revision = i64::from(r_value.try_get_int_value_as_int()?);
+    let version = i64::from(v_value.try_get_int_value_as_int()?);
+    Ok((permissions, revision, version))
 }
 
 struct PermissionReport {

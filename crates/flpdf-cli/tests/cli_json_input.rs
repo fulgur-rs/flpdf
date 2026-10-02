@@ -325,6 +325,69 @@ fn update_from_json_check_matches_qpdf_11_9() {
     assert_eq!(flpdf.stderr, qpdf.stderr);
 }
 
+#[test]
+fn update_from_json_show_encryption_reads_the_updated_trailer_like_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let encrypted = temp.path().join("encrypted.pdf");
+    let update = temp.path().join("unencrypted-update.json");
+    let password_file = temp.path().join("password.txt");
+    fs::write(&password_file, b"user\n").unwrap();
+
+    let encrypted_input = ShellCommand::new("qpdf")
+        .args(["--encrypt", "user", "owner", "256", "--", MINIMAL_PDF])
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        encrypted_input.status.success(),
+        "qpdf encryption fixture failed: {encrypted_input:?}"
+    );
+
+    let update_json = ShellCommand::new("qpdf")
+        .args(["--json=2", MINIMAL_PDF])
+        .output()
+        .unwrap();
+    assert!(
+        update_json.status.success(),
+        "qpdf JSON update fixture failed: {update_json:?}"
+    );
+    fs::write(&update, update_json.stdout).unwrap();
+
+    let update_arg = format!("--update-from-json={}", update.display());
+    let password_file_arg = format!("--password-file={}", password_file.display());
+    let cases = [
+        vec![
+            encrypted.display().to_string(),
+            "--password=user".to_owned(),
+            update_arg.clone(),
+            "--show-encryption".to_owned(),
+        ],
+        vec![
+            encrypted.display().to_string(),
+            password_file_arg,
+            update_arg,
+            "--show-encryption".to_owned(),
+        ],
+    ];
+
+    for args in cases {
+        let qpdf = ShellCommand::new("qpdf").args(&args).output().unwrap();
+        let flpdf = ShellCommand::new(assert_cmd::cargo_bin!("flpdf"))
+            .env("FLPDF_PROGNAME", "qpdf")
+            .args(&args)
+            .output()
+            .unwrap();
+
+        assert_eq!(flpdf.status.code(), qpdf.status.code(), "{args:?} status");
+        assert_eq!(flpdf.stdout, qpdf.stdout, "{args:?} stdout");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "{args:?} stderr");
+    }
+}
+
 /// qpdf's `QPDF::updateFromJSON(std::string const&)` opens the update file
 /// through `FileInputSource`, whose constructor calls `QUtil::safe_fopen`
 /// directly with no extra operation-word context

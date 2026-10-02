@@ -185,6 +185,30 @@ fn empty_primary_inspections_match_qpdf() {
 }
 
 #[test]
+fn empty_primary_inspections_read_password_file_like_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let missing_password = temp.path().join("missing-password.txt");
+    let password_arg = format!("--password-file={}", missing_password.display());
+
+    for inspection in [
+        "--check",
+        "--show-npages",
+        "--show-pages",
+        "--show-xref",
+        "--show-linearization",
+        "--check-linearization",
+        "--show-encryption",
+        "--show-object=1",
+        "--list-attachments",
+    ] {
+        assert_same_process_result(&["--empty", password_arg.as_str(), inspection]);
+    }
+}
+
+#[test]
 fn empty_primary_inspection_rejects_an_output_like_qpdf() {
     if !qpdf_available() {
         return;
