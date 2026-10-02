@@ -382,7 +382,7 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
         foreign.try_dereference()?;
         if self.remove_stale_generations
             && !top
-            && foreign.is_null()
+            && foreign.try_is_null()?
             && foreign.has_newer_cached_generation()
         {
             // qpdf's xref-chain cleanup removes a lower generation's cached
@@ -434,7 +434,7 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
 
             if let Some(&existing_target_ref) = self.object_map.get(&source_object_gen) {
                 let mapped = self.target.get_object_handle(existing_target_ref);
-                if !(top && is_page && mapped.is_null()) {
+                if !(top && is_page && mapped.try_is_null()?) {
                     return Ok(());
                 }
             } else {
@@ -487,11 +487,11 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
     }
 
     fn reserve_children(&mut self, foreign: &ObjectHandle) -> Result<()> {
-        if let Some(items) = foreign.as_array() {
+        if let Some(items) = foreign.try_as_array()? {
             for item in items {
                 self.reserve_objects(item, false)?;
             }
-        } else if let Some(entries) = foreign.as_dictionary() {
+        } else if let Some(entries) = foreign.try_as_dictionary()? {
             // qpdf's `QPDF_Dictionary::getKeys()` omits values for which
             // `isNull()` is true (`libqpdf/QPDF_Dictionary.cc:118-125`).
             // This includes indirect references that resolve to null, so
@@ -615,7 +615,7 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
             let destination_dictionary = destination.as_stream_dict().ok_or_else(|| {
                 Error::Internal("foreign stream reservation is not a stream".to_owned())
             })?;
-            for (key, value) in source_dictionary.as_dictionary().unwrap_or_default() {
+            for (key, value) in source_dictionary.try_as_dictionary()?.unwrap_or_default() {
                 // qpdf obtains stream-dictionary keys through the same
                 // `QPDF_Dictionary::getKeys()` filter, so direct and indirect
                 // null values are not copied (`libqpdf/QPDF.cc:2200-2213`,
@@ -632,7 +632,7 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
             return Ok(destination);
         }
 
-        if let Some(items) = foreign.as_array() {
+        if let Some(items) = foreign.try_as_array()? {
             let mut copied = Vec::with_capacity(items.len());
             for item in items {
                 copied.push(self.replace_foreign_indirect_objects(item, false)?);
@@ -643,7 +643,7 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
                 .direct_object_handle(ObjectValue::Array(copied)));
         }
 
-        if let Some(entries) = foreign.as_dictionary() {
+        if let Some(entries) = foreign.try_as_dictionary()? {
             // qpdf's own dictionary branch builds the copy through
             // `result.replaceKey` (`libqpdf/QPDF.cc:2192-2196`), not a raw
             // map insert, so a direct-null replacement -- the /Pages
@@ -834,6 +834,39 @@ mod tests {
         assert!(copied.is_indirect());
         assert!(copied.is_same_object_as(&copied_again));
         assert_eq!(copied.try_as_integer().unwrap(), Some(45));
+    }
+
+    #[test]
+    fn page_merge_copy_turns_a_superseded_missing_array_generation_into_direct_null() {
+        let mut source = minimal_pdf();
+        let stale_ref = ObjectRef::new(42, 0);
+        let stale = source.get_object_handle(stale_ref);
+        source
+            .replace_object(ObjectRef::new(42, 1), ObjectHandle::integer(99))
+            .expect("register a newer cached generation");
+        assert!(stale
+            .try_is_null()
+            .expect("resolve missing stale generation"));
+        assert!(stale.has_newer_cached_generation());
+
+        let root = source
+            .make_indirect_object_handle(ObjectHandle::array(vec![stale]))
+            .expect("root array");
+        let mut target = minimal_pdf();
+
+        let copied = copy_foreign_object_with_stale_generation_policy(&mut target, &root, true)
+            .expect("copy with the primary page-merge stale-generation policy");
+        let copied_stale = copied
+            .try_get_array_item(0)
+            .expect("read copied stale-generation array item");
+
+        assert!(copied_stale.is_null());
+        assert!(copied_stale.is_direct());
+        assert_eq!(
+            target.foreign_object_map_snapshot(source.unique_id()).len(),
+            1,
+            "only the root should be reserved; qpdf removes the superseded child"
+        );
     }
 
     #[test]
