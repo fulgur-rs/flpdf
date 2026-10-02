@@ -1,6 +1,8 @@
 //! The core object-handle graph: shared, cloneable identity for direct and
 //! indirect PDF objects, with parsed-offset tracking and document-owned
 //! reserved-object construction.
+//! Stream data replacement still uses unchecked dictionary removal and does
+//! not yet match qpdf's resolution behavior for an indirect stream dictionary.
 //!
 //! qpdf correspondence: `QPDFObjectHandle`, `QPDFObject`, and `QPDFValue` identity and payload ownership, `QPDF::newReserved`/`QPDF_Reserved`, `QPDFObjectHandle::copyStream`/`QPDF::copyStreamData` stream-copy primitives, and `QPDF::setImmediateCopyFrom`.
 //!
@@ -6536,6 +6538,7 @@ impl ObjectHandle {
             dict.replace_key_unchecked(b"/DecodeParms", decode_parms);
         }
         if length == 0 {
+            // qpdf-deviation: legacy stream setup still uses unchecked dictionary storage; qpdf QPDF_Stream::replaceFilterData calls resolving removeKey. The stream-model cutover removes this remaining consumer.
             dict.remove_key_unchecked(b"/Length");
         } else {
             dict.replace_key_unchecked(

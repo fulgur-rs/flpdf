@@ -1810,6 +1810,40 @@ mod tests {
         names.iter().map(|n| n.to_vec()).collect()
     }
 
+    #[test]
+    fn public_merge_removes_acroform_when_no_field_page_is_selected() {
+        let bytes = build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>"),
+                (2, "<< /Type /Pages /Count 2 /Kids [3 0 R 4 0 R] >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>"),
+                (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Annots [5 0 R] >>"),
+                (5, "<< /Type /Annot /Subtype /Widget /FT /Tx /T (field) /Rect [0 0 10 10] /P 4 0 R >>"),
+                (6, "<< /Fields [5 0 R] >>"),
+            ],
+            1,
+        );
+        let mut source = Pdf::open_mem_owned(bytes).expect("source document");
+        assert!(source
+            .root_handle()
+            .unwrap()
+            .try_has_key(b"/AcroForm")
+            .unwrap());
+
+        let mut merged = super::merge_documents(&mut [super::MergeInput {
+            source: &mut source,
+            pages: vec![0],
+        }])
+        .expect("merge only the page without fields");
+
+        assert!(!merged
+            .root_handle()
+            .unwrap()
+            .try_has_key(b"/AcroForm")
+            .unwrap());
+        assert_eq!(crate::pages::page_refs(&mut merged).unwrap().len(), 1);
+    }
+
     fn decode_hex_fixture(hex: &str) -> Vec<u8> {
         let digits: Vec<u8> = hex.bytes().filter(u8::is_ascii_hexdigit).collect();
         digits
