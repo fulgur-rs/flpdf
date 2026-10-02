@@ -15,8 +15,8 @@ fn function_body<'a>(source: &'a str, signature: &str, next_signature: &str) -> 
 
 fn assert_shared_job_runner(route: &str, label: &str) {
     assert!(
-        route.contains("run_page_extraction_job("),
-        "{label} must use the shared page-extraction Job runner"
+        route.contains("run_page_operation_job("),
+        "{label} must use the shared page-operation Job runner"
     );
     for legacy_route in [
         "job.create_qpdf()",
@@ -57,7 +57,7 @@ fn in_place_page_specs_share_the_qpdf_completion_boundary() {
     let cli_source = include_str!("../../flpdf-cli/src/main.rs");
     let runner = function_body(
         cli_source,
-        "fn run_page_extraction_job(",
+        "fn run_page_operation_job(",
         "\nfn run_rewrite_with_qpdf_job",
     );
     assert_eq!(

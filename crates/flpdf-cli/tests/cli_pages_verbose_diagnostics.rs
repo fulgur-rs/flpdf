@@ -427,7 +427,7 @@ fn rewrite_pages_ordinary_output_uses_the_canonical_job_writer_route() {
         .0;
 
     assert!(
-        body.contains("run_page_extraction_job("),
+        body.contains("run_page_operation_job("),
         "rewrite page extraction must use the shared Job runner"
     );
     for legacy_route in [
@@ -443,7 +443,7 @@ fn rewrite_pages_ordinary_output_uses_the_canonical_job_writer_route() {
     }
 
     let runner = source
-        .split_once("fn run_page_extraction_job")
+        .split_once("fn run_page_operation_job")
         .expect("shared page extraction Job runner should remain named")
         .1
         .split_once("\nfn ")
@@ -495,7 +495,7 @@ fn linearized_content_normalization_is_job_owned() {
 }
 
 #[test]
-fn top_level_page_extraction_uses_one_job_run() {
+fn top_level_page_operations_use_one_job_run() {
     let source = include_str!("../src/main.rs");
     let route = source
         .split_once("fn run_page_operations_with_qpdf_job")
@@ -506,42 +506,31 @@ fn top_level_page_extraction_uses_one_job_run() {
         .0;
 
     assert!(
-        route.contains("run_page_extraction_job("),
-        "top-level --pages must dispatch through the shared Job runner"
-    );
-    let page_dispatch_tail = route
-        .split_once("if !args.page_ops.pages.is_empty()")
-        .expect("top-level route should separate --pages from no-pages operations")
-        .1;
-    let no_pages_configuration = page_dispatch_tail
-        .find("configure_page_selection_job(")
-        .expect("the no-pages route should configure its rotation/split options");
-    let page_dispatch = &page_dispatch_tail[..no_pages_configuration];
-    assert!(
-        page_dispatch.contains("run_page_extraction_job(")
-            && page_dispatch.contains("&args.page_ops"),
-        "the page branch must pass its configured Job to the shared runner"
+        route.contains("run_page_operation_job(job, &args.page_ops, args.remove_unreferenced_resources)"),
+        "top-level page operations, with or without --pages, must dispatch through the shared Job runner"
     );
     assert!(
-        !page_dispatch.contains("create_qpdf()") && !page_dispatch.contains("write_qpdf("),
-        "the top-level page branch must not call create/write separately"
+        !route.contains("create_qpdf()")
+            && !route.contains("write_qpdf(")
+            && !route.contains("get_exit_code()"),
+        "the top-level page-operation route must not split create/write/status across CLI"
     );
 
     let runner = source
-        .split_once("fn run_page_extraction_job")
-        .expect("shared page-extraction Job runner should remain named")
+        .split_once("fn run_page_operation_job")
+        .expect("shared page-operation Job runner should remain named")
         .1
         .split_once("\nfn ")
         .expect("a later function should follow the shared Job runner")
         .0;
     assert!(
         runner.contains("configure_page_selection_job(&mut job, page_ops, remove_unref)"),
-        "the shared runner should apply page settings before run()"
+        "the shared runner should apply page, rotation, and split settings before run()"
     );
     assert_eq!(
         runner.matches("job.run()?").count(),
         1,
-        "one QPDFJob::run() call must complete the extraction"
+        "one QPDFJob::run() call must complete page operations"
     );
 }
 
