@@ -24,9 +24,17 @@ fn production_consumers_call_the_canonical_coalesce_owner() {
     assert!(page_extraction.contains("run_page_operation_job(job, page_ops, remove_unref)"));
     assert!(!page_extraction.contains("apply_transformations_for_cli("));
     assert!(cli.contains("configuration.coalesce_contents();"));
-    assert!(cli.contains("match job.apply_transformations(pdf)"));
-    assert!(cli.contains("job.write_qpdf(&mut pdf)"));
+    assert!(!cli.contains("match job.apply_transformations(pdf)"));
+    assert!(!cli.contains("job.write_qpdf(&mut pdf)"));
     assert!(cli.contains("finish_job_exit_status(job.run()?)"));
+    assert!(!cli.contains("fn run_rewrite_opened<"));
+    let empty_rewrite = cli
+        .split_once("fn run_rewrite(")
+        .and_then(|(_, tail)| tail.split_once("fn run_page_operations_with_qpdf_job("))
+        .map(|(body, _)| body)
+        .expect("empty rewrite route remains on run_rewrite");
+    let empty_rewrite = empty_rewrite.split_whitespace().collect::<String>();
+    assert!(empty_rewrite.contains("run_rewrite_with_qpdf_job(None,"));
     assert!(lifecycle
         .contains("PageObjectHelper::from_object_handle(page, pdf).coalesce_content_streams()?"));
     assert!(flatten.contains("PageObjectHelper::new(page_ref, pdf).coalesce_content_streams()?"));

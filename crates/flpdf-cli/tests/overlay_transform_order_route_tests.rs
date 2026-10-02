@@ -23,6 +23,64 @@ fn production_function_body<'a>(source: &'a str, signature: &str, next_signature
         .0
 }
 
+fn item_body_end(body: &str) -> Option<usize> {
+    #[derive(PartialEq)]
+    enum State {
+        Code,
+        LineComment,
+        StringLiteral,
+    }
+
+    let mut state = State::Code;
+    let mut depth = 0usize;
+    let mut chars = body.char_indices().peekable();
+    while let Some((index, character)) = chars.next() {
+        match state {
+            State::Code => match character {
+                '/' if chars.peek().map(|&(_, next)| next) == Some('/') => {
+                    state = State::LineComment;
+                }
+                '"' => state = State::StringLiteral,
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(index + character.len_utf8());
+                    }
+                }
+                _ => {}
+            },
+            State::LineComment => {
+                if character == '\n' {
+                    state = State::Code;
+                }
+            }
+            State::StringLiteral => match character {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => state = State::Code,
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
+fn production_function_body_exact<'a>(source: &'a str, signature: &str) -> &'a str {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("production function {signature:?} must exist"));
+    let after_signature = &source[start..];
+    let brace = after_signature
+        .find('{')
+        .unwrap_or_else(|| panic!("production function {signature:?} must have a body"));
+    let body = &after_signature[brace..];
+    let end = item_body_end(body)
+        .unwrap_or_else(|| panic!("production function {signature:?} must balance braces"));
+    &body[..end]
+}
+
 fn assemble_pdf(objects: &[(u32, Vec<u8>)]) -> Vec<u8> {
     let mut bytes = b"%PDF-1.4\n".to_vec();
     let mut offsets = vec![0usize; objects.len() + 1];
@@ -304,11 +362,8 @@ fn page_selection_overlay_uses_the_canonical_job_owner() {
             && page_route.contains("run_page_operation_job(job, page_ops, remove_unref)"),
         "rewrite page route must configure overlays and finish on its one QPDFJob"
     );
-    let rewrite_configuration = production_function_body(
-        &source,
-        "fn configure_rewrite_job(",
-        "\nfn run_rewrite_opened",
-    );
+    let rewrite_configuration =
+        production_function_body_exact(&source, "fn configure_rewrite_job(");
     assert!(
         rewrite_configuration.contains("configuration.overlay(")
             && rewrite_configuration.contains("configuration.underlay("),
@@ -340,11 +395,8 @@ fn page_selection_post_plan_rotation_and_images_use_the_canonical_job_owner() {
         page_configuration.contains("configuration.rotate("),
         "page-selection settings must queue rotations on QPDFJob"
     );
-    let rewrite_configuration = production_function_body(
-        &source,
-        "fn configure_rewrite_job(",
-        "\nfn run_rewrite_opened",
-    );
+    let rewrite_configuration =
+        production_function_body_exact(&source, "fn configure_rewrite_job(");
     assert!(
         rewrite_configuration.contains("configuration.optimize_images(")
             || rewrite_configuration.contains("configuration.externalize_inline_images("),
