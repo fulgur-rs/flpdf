@@ -508,13 +508,14 @@ fn top_level_page_extraction_uses_one_job_run() {
         route.contains("run_page_extraction_job("),
         "top-level --pages must dispatch through the shared Job runner"
     );
-    let page_dispatch = route
+    let page_dispatch_tail = route
         .split_once("if !args.page_ops.pages.is_empty()")
         .expect("top-level route should separate --pages from no-pages operations")
-        .1
-        .split_once("\n    configure_page_selection_job(\n        &mut job")
-        .expect("the no-pages route should configure its rotation/split options")
-        .0;
+        .1;
+    let no_pages_configuration = page_dispatch_tail
+        .find("configure_page_selection_job(")
+        .expect("the no-pages route should configure its rotation/split options");
+    let page_dispatch = &page_dispatch_tail[..no_pages_configuration];
     assert!(
         page_dispatch.contains("run_page_extraction_job(")
             && page_dispatch.contains("&args.page_ops"),

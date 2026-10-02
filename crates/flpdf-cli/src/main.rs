@@ -5970,18 +5970,10 @@ fn run_page_operations_with_qpdf_job(
     job.set_writer_configuration(writer_configuration);
 
     if !args.page_ops.pages.is_empty() {
-        return run_page_extraction_job(
-            job,
-            &args.page_ops,
-            args.remove_unreferenced_resources.into(),
-        );
+        return run_page_extraction_job(job, &args.page_ops, args.remove_unreferenced_resources);
     }
 
-    configure_page_selection_job(
-        &mut job,
-        &args.page_ops,
-        args.remove_unreferenced_resources.into(),
-    )?;
+    configure_page_selection_job(&mut job, &args.page_ops, args.remove_unreferenced_resources)?;
 
     let mut pdf = match job.create_qpdf()? {
         Some(pdf) => pdf,
