@@ -153,6 +153,40 @@ fn normalize_and_store_stream_handle<R: Read + Seek>(
 mod tests {
     use super::*;
 
+    #[derive(Clone, Copy)]
+    enum DecodeFailure {
+        Unsupported,
+        System,
+    }
+
+    struct DecodeFailureFilter(DecodeFailure);
+
+    impl crate::StreamFilter for DecodeFailureFilter {
+        fn get_decode_pipeline<'a>(
+            &mut self,
+            _next: crate::pipeline::PipelineRef<'a>,
+        ) -> Result<crate::OwnedDecodePipeline<'a>> {
+            match self.0 {
+                DecodeFailure::Unsupported => Err(Error::Unsupported(
+                    "normalization decode unsupported".to_owned(),
+                )),
+                DecodeFailure::System => {
+                    Err(Error::System("normalization decode failed".to_owned()))
+                }
+            }
+        }
+    }
+
+    fn filtered_stream(filter: &[u8]) -> ObjectHandle {
+        ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(
+                b"Filter".to_vec(),
+                ObjectHandle::name(filter.to_vec()),
+            )]),
+            std::rc::Rc::new(b"encoded".to_vec()),
+        )
+    }
+
     fn page_pdf_with_contents_array(streams: &[&[u8]], members: &[usize]) -> Vec<u8> {
         let mut bytes = b"%PDF-1.4\n".to_vec();
         let size = 4 + streams.len();
@@ -239,5 +273,89 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).expect("synthetic page PDF opens");
         let warnings = normalize_page_contents(&mut pdf).expect("array streams normalize");
         assert_eq!(warnings.len(), 1, "one aliased stream warns only once");
+    }
+
+    #[test]
+    fn unsupported_registered_filter_is_left_for_the_writer_retry_path() {
+        crate::register_stream_filter(b"/FlpdfContentNormalizationUnsupported", || {
+            Ok(DecodeFailureFilter(DecodeFailure::Unsupported))
+        });
+        let mut pdf = Pdf::empty().expect("empty PDF opens");
+        pdf.set_suppress_warnings(false);
+        let stream = filtered_stream(b"FlpdfContentNormalizationUnsupported");
+
+        let result = normalize_and_store_stream_handle(
+            &mut pdf,
+            ObjectRef::new(90, 0),
+            stream.clone(),
+            &mut HashSet::new(),
+        )
+        .expect("unsupported decoding belongs to the writer retry path");
+
+        assert!(result.is_none());
+        assert!(!pdf.suppress_warnings(), "warning policy must be restored");
+        assert_eq!(
+            stream
+                .get_raw_stream_data()
+                .expect("raw stream remains readable")
+                .as_slice(),
+            b"encoded"
+        );
+        assert!(stream
+            .as_stream_dict()
+            .unwrap()
+            .try_get_key(b"/Filter")
+            .unwrap()
+            .try_is_name_and_equals(b"FlpdfContentNormalizationUnsupported")
+            .unwrap());
+    }
+
+    #[test]
+    fn decode_system_error_propagates_after_restoring_warning_policy() {
+        crate::register_stream_filter(b"/FlpdfContentNormalizationSystemDecode", || {
+            Ok(DecodeFailureFilter(DecodeFailure::System))
+        });
+        let mut pdf = Pdf::empty().expect("empty PDF opens");
+        pdf.set_suppress_warnings(false);
+        let error = normalize_and_store_stream_handle(
+            &mut pdf,
+            ObjectRef::new(91, 0),
+            filtered_stream(b"FlpdfContentNormalizationSystemDecode"),
+            &mut HashSet::new(),
+        )
+        .expect_err("non-retryable decode errors must reach the Job boundary");
+
+        assert!(matches!(
+            error,
+            Error::System(message) if message == "normalization decode failed"
+        ));
+        assert!(!pdf.suppress_warnings(), "warning policy must be restored");
+    }
+
+    #[test]
+    fn filterability_error_propagates_after_restoring_warning_policy() {
+        crate::register_stream_filter(
+            b"/FlpdfContentNormalizationFactoryError",
+            || -> Result<DecodeFailureFilter> {
+                Err(Error::System(
+                    "normalization filter factory failed".to_owned(),
+                ))
+            },
+        );
+        let mut pdf = Pdf::empty().expect("empty PDF opens");
+        pdf.set_suppress_warnings(false);
+        let error = normalize_and_store_stream_handle(
+            &mut pdf,
+            ObjectRef::new(92, 0),
+            filtered_stream(b"FlpdfContentNormalizationFactoryError"),
+            &mut HashSet::new(),
+        )
+        .expect_err("filterability errors must reach the Job boundary");
+
+        assert!(matches!(
+            error,
+            Error::System(message) if message == "normalization filter factory failed"
+        ));
+        assert!(!pdf.suppress_warnings(), "warning policy must be restored");
     }
 }

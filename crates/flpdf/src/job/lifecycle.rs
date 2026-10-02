@@ -5982,6 +5982,116 @@ mod tests {
         pdf
     }
 
+    fn set_page_content_filter(pdf: &mut Pdf<Cursor<Vec<u8>>>, filter_name: &[u8]) {
+        let page = PageDocumentHelper::new(pdf)
+            .get_all_pages()
+            .expect("synthetic page tree resolves")
+            .remove(0);
+        let stream = page
+            .try_get_key(b"/Contents")
+            .expect("synthetic page has a content stream");
+        stream
+            .as_stream_dict()
+            .expect("content stream has a dictionary")
+            .replace_key(b"/Filter", ObjectHandle::name(filter_name.to_vec()))
+            .expect("install custom content filter");
+    }
+
+    struct JobNormalizationFilter;
+
+    impl crate::StreamFilter for JobNormalizationFilter {
+        fn get_decode_pipeline<'a>(
+            &mut self,
+            next: crate::pipeline::PipelineRef<'a>,
+        ) -> Result<crate::OwnedDecodePipeline<'a>> {
+            Ok(crate::OwnedDecodePipeline::NoStage(next))
+        }
+    }
+
+    fn job_for_linearized_content_normalization(output: &std::path::Path) -> QPDFJob {
+        let mut job = QPDFJob::new();
+        job.set_output_file(output)
+            .expect("output path is accepted");
+        job.set_linearization(true, None);
+        job.set_content_normalization(true);
+        job
+    }
+
+    #[test]
+    fn write_qpdf_reports_non_usage_content_normalization_errors() {
+        crate::register_stream_filter(
+            b"/FlpdfJobContentNormalizationSystemError",
+            || -> Result<JobNormalizationFilter> {
+                Err(Error::System("content filter factory failed".to_owned()))
+            },
+        );
+        let tempdir = tempfile::tempdir().expect("temporary output directory");
+        let output = tempdir.path().join("output.pdf");
+        let mut pdf = empty_pdf_with_page_content(b"encoded");
+        set_page_content_filter(&mut pdf, b"FlpdfJobContentNormalizationSystemError");
+
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let logger = QPDFLogger::create();
+        logger.set_error(Some(PipelineHandle::new(RecordingInfoSink {
+            bytes: std::sync::Arc::clone(&bytes),
+        })));
+        let mut job = job_for_linearized_content_normalization(&output);
+        job.set_logger(logger);
+
+        let error = job
+            .write_qpdf(&mut pdf)
+            .expect_err("normalization failure must return to the caller");
+
+        assert!(
+            matches!(error, Error::System(message) if message == "content filter factory failed")
+        );
+        assert!(
+            String::from_utf8_lossy(&bytes.lock().unwrap())
+                .contains("content filter factory failed"),
+            "the Job must report pre-write failures through its logger"
+        );
+        assert!(
+            !output.exists(),
+            "writer must not run after the pre-write failure"
+        );
+    }
+
+    #[test]
+    fn write_qpdf_preserves_usage_errors_from_content_normalization() {
+        crate::register_stream_filter(
+            b"/FlpdfJobContentNormalizationUsageError",
+            || -> Result<JobNormalizationFilter> {
+                Err(Error::Usage(UsageError::new("content filter usage error")))
+            },
+        );
+        let tempdir = tempfile::tempdir().expect("temporary output directory");
+        let output = tempdir.path().join("output.pdf");
+        let mut pdf = empty_pdf_with_page_content(b"encoded");
+        set_page_content_filter(&mut pdf, b"FlpdfJobContentNormalizationUsageError");
+
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let logger = QPDFLogger::create();
+        logger.set_error(Some(PipelineHandle::new(RecordingInfoSink {
+            bytes: std::sync::Arc::clone(&bytes),
+        })));
+        let mut job = job_for_linearized_content_normalization(&output);
+        job.set_logger(logger);
+
+        let error = job
+            .write_qpdf(&mut pdf)
+            .expect_err("usage failures must propagate to the caller");
+
+        assert!(matches!(error, Error::Usage(_)));
+        assert!(
+            bytes.lock().unwrap().is_empty(),
+            "usage errors stay unreported"
+        );
+        assert!(
+            !output.exists(),
+            "writer must not run after the usage failure"
+        );
+    }
+
     #[test]
     fn flatten_rotation_lifecycle_accepts_raw_page_and_widget_handles() {
         let mut pdf = Pdf::empty().expect("empty PDF should open");
