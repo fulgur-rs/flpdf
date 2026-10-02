@@ -172,22 +172,26 @@ fn swap_replace_fixture_with_qdict_body(qdict_body: &[u8]) -> Vec<u8> {
         ),
         (
             3,
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /OrigPage 1 >>".as_slice(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /OrigPage 9 0 R >>".as_slice(),
         ),
         (
             4,
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /OrigPage 2 >>".as_slice(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /OrigPage 10 0 R >>".as_slice(),
         ),
         (
             5,
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /OrigPage 3 >>".as_slice(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /OrigPage 11 0 R >>".as_slice(),
         ),
         (
             6,
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /OrigPage 4 >>".as_slice(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /OrigPage 12 0 R >>".as_slice(),
         ),
         (7, qdict_body),
         (8, b"[ /Array ]".as_slice()),
+        (9, b"1".as_slice()),
+        (10, b"2".as_slice()),
+        (11, b"3".as_slice()),
+        (12, b"4".as_slice()),
     ];
     let mut bytes = b"%PDF-1.3\n".to_vec();
     let mut offsets = vec![0usize; objects.len() + 1];
@@ -198,13 +202,13 @@ fn swap_replace_fixture_with_qdict_body(qdict_body: &[u8]) -> Vec<u8> {
         bytes.extend_from_slice(b"\nendobj\n");
     }
     let xref = bytes.len();
-    bytes.extend_from_slice(b"xref\n0 9\n0000000000 65535 f \n");
+    bytes.extend_from_slice(b"xref\n0 13\n0000000000 65535 f \n");
     for offset in offsets.into_iter().skip(1) {
         bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
     }
     bytes.extend_from_slice(
         format!(
-            "trailer\n<< /Size 9 /Root 1 0 R /QDict 7 0 R /QArray 8 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+            "trailer\n<< /Size 13 /Root 1 0 R /QDict 7 0 R /QArray 8 0 R >>\nstartxref\n{xref}\n%%EOF\n"
         )
         .as_bytes(),
     );
@@ -876,7 +880,7 @@ fn test_14_drains_the_repair_warning_from_resolving_qdict() {
             "array and dictionary contents are correct\ntest 14 done\n",
         ))
         .stderr(predicates::str::contains(
-            "(object 7 0, offset 479): expected endobj",
+            "(object 7 0, offset 498): expected endobj",
         ));
 }
 
@@ -2136,6 +2140,21 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             "test 85 retains the qpdf-less local route {old_route}"
         );
     }
+
+    let test_14 = section(
+        middle_source.as_str(),
+        "pub(crate) fn run_test_14",
+        "pub(crate) fn run_test_15",
+    );
+    assert_eq!(
+        test_14.matches("try_get_int_value()").count(),
+        7,
+        "test 14 must route all integer value reads through qpdf's resolving getIntValue accessor"
+    );
+    assert!(
+        !test_14.contains(".as_integer()"),
+        "test 14 must not inspect unresolved integer handles"
+    );
 
     let test_24 = section(
         page_source.as_str(),
