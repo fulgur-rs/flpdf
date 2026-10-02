@@ -81,7 +81,7 @@ pub(crate) fn run_test_88<R: Read + Seek>(
         .unparse()
     );
 
-    let arr = dict.get_key(b"/Three");
+    let arr = dict.try_get_key(b"/Three")?;
     arr.insert_array_item(0, ObjectHandle::string(b"0".to_vec()))?;
     arr.insert_array_item(0, ObjectHandle::string(b"00".to_vec()))?;
     assert_eq!(
@@ -440,7 +440,9 @@ pub(crate) fn run_test_93<R: Read + Seek>(
     // below and `root_handle`'s own reference share the same underlying
     // `Rc` -- `is_same_object_as` needs no resolution to observe that.
     let trailer = pdf.trailer();
-    let root1 = trailer.get_key(b"/Root");
+    let root1_result = trailer.try_get_key(b"/Root");
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let root1 = root1_result?;
     let root2_result = pdf.root_handle();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let root2 = root2_result?;
@@ -461,7 +463,9 @@ pub(crate) fn run_test_93<R: Read + Seek>(
     assert!(oh1.is_indirect());
     assert!(oh4.is_indirect());
     trailer.replace_key(b"/Potato", oh1.clone())?;
-    let potato = trailer.get_key(b"/Potato");
+    let potato_result = trailer.try_get_key(b"/Potato");
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let potato = potato_result?;
     assert!(potato.is_same_object_as(&oh2));
     Ok(())
 }
