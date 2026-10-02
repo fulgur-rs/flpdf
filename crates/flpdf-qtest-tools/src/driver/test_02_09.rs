@@ -89,13 +89,13 @@ pub(crate) fn run_test_2<R: Read + Seek>(
     // rather than after both encrypted-string lines.
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
         .map_err(Error::from)?;
-    write_bytes(stdout, &o.unparse())?;
+    write_bytes(stdout, &o.unparse()?)?;
     writeln!(stdout)?;
     let qpdf_flush_result_2 = encrypt.try_get_key(b"/U");
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
         .map_err(Error::from)?;
     let u = qpdf_flush_result_2?;
-    write_bytes(stdout, &u.unparse())?;
+    write_bytes(stdout, &u.unparse()?)?;
     writeln!(stdout)?;
 
     let root = trailer.try_get_key(b"/Root")?;
@@ -331,7 +331,7 @@ pub(crate) fn run_test_5<R: Read + Seek>(
         let content = page_helper.get_page_contents()?;
         for item in &content {
             write!(stdout, "    ")?;
-            write_bytes(stdout, &item.unparse())?;
+            write_bytes(stdout, &item.unparse()?)?;
             writeln!(stdout)?;
         }
         writeln!(stdout, "end page {pageno}")?;

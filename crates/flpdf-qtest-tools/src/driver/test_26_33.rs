@@ -449,7 +449,7 @@ pub(crate) fn run_test_31<R: Read + Seek>(
     let o1 = ObjectHandle::parse(
         b"[/name 16059 3.14159 false\n << /key true /other [ (string1) (string2) ] >> null]",
     )?;
-    write_bytes(stdout, &o1.unparse())?;
+    write_bytes(stdout, &o1.unparse()?)?;
     writeln!(stdout)?;
 
     // qpdf: `QPDFObjectHandle o2 = QPDFObjectHandle::parse("   12345 \f
@@ -501,12 +501,14 @@ pub(crate) fn run_test_31<R: Read + Seek>(
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
     let mixed = ObjectHandle::parse_with_context(pdf, b"[5 0 R 0 R /X]", "")?;
-    assert_eq!(mixed.unparse(), b"[ 5 0 R 0 (R) /X ]");
+    let mixed_unparse = mixed.unparse();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert_eq!(mixed_unparse?, b"[ 5 0 R 0 (R) /X ]");
 
     let described = ObjectHandle::parse_with_context(pdf, b"[1 0 R]", "indirect test")?;
-    assert_eq!(described.unparse(), b"[ 1 0 R ]");
+    let described_unparse = described.unparse();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert_eq!(described_unparse?, b"[ 1 0 R ]");
 
     for input in [b"}".as_slice(), b"{".as_slice(), b">>".as_slice()] {
         let recovered = ObjectHandle::parse_with_context(pdf, input, "")?;
@@ -531,8 +533,9 @@ pub(crate) fn run_test_31<R: Read + Seek>(
 
     let invalid_objgen =
         ObjectHandle::parse_with_context(pdf, b"[0 0 R -1 0 R 1 65535 R 1 100000 R 1 -1 R]", "")?;
-    assert_eq!(invalid_objgen.unparse(), b"[ null null null null null ]");
+    let invalid_objgen_unparse = invalid_objgen.unparse();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert_eq!(invalid_objgen_unparse?, b"[ null null null null null ]");
     Ok(())
 }
 

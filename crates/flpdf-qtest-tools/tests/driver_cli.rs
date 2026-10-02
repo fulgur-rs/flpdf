@@ -1827,9 +1827,9 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "pub(crate) fn run_test_74",
     );
     assert!(
-        test_73.contains("pages_seed.try_unparse_resolved()")
+        test_73.contains("pages_seed.unparse_resolved()")
             && !test_73.contains("resolve_once(")
-            && !test_73.contains(".unparse_resolved()"),
+            && !test_73.contains("pdf.resolve("),
         "test 73 must let unparseResolved own /Pages resolution without a Pdf::resolve bridge"
     );
     let test_79 = section(
@@ -1892,12 +1892,12 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         test_39.contains("get_images()")
             && test_39.contains("try_get_stream_dict()")
             && test_39.contains("try_get_key(")
-            && test_39.contains("try_unparse_resolved()")
+            && test_39.contains("unparse_resolved()")
             && !test_39.contains("get_resources(false)")
             && !test_39.contains("resolve_once(")
             && !test_39.contains("as_stream_dict()")
             && !test_39.contains(".get_key(")
-            && !test_39.contains(".unparse_resolved()"),
+            && !test_39.contains("try_unparse_resolved"),
         "test 39 must use the canonical image and stream accessors"
     );
     let test_38 = section(
@@ -1910,13 +1910,13 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             && test_38.contains("try_get_key(b\"/QTest\")")
             && test_38.contains("try_get_array_n_items()")
             && test_38.contains("try_get_array_item(")
-            && test_38.contains("try_unparse_resolved()")
+            && test_38.contains("unparse_resolved()")
             && test_38.matches("emit_new_diagnostics(").count() >= 5
             && !test_38.contains("root_handle(pdf")
             && !test_38.contains("resolved_key(")
             && !test_38.contains("resolved_terminal(")
             && !test_38.contains(".as_array()")
-            && !test_38.contains(".unparse_resolved()"),
+            && !test_38.contains("try_unparse_resolved"),
         "test 38 must use canonical resolving root, array, and unparse accessors"
     );
     let test_34 = section(
@@ -2163,7 +2163,7 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             && test_92.contains("root.try_get_key(")
             && test_92.contains("try_get_array_item(")
             && test_92.contains("try_get_stream_dict()")
-            && test_92.contains("try_unparse_resolved()")
+            && test_92.contains("unparse_resolved()")
             && !test_92.contains("resolved_key(")
             && !test_92.contains("qpdf.resolve(")
             && !test_92.contains(".as_array()")

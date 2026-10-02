@@ -5,7 +5,7 @@ fn double_factory_rounds_the_stored_value_like_qpdf() {
     let real = ObjectHandle::real(1.123456789);
     assert_eq!(real.try_get_real_value().unwrap(), b"1.123457");
     assert_eq!(real.try_get_numeric_value().unwrap(), 1.123457);
-    assert_eq!(real.try_unparse_resolved().unwrap(), b"1.123457");
+    assert_eq!(real.unparse_resolved().unwrap(), b"1.123457");
     assert_eq!(
         real.shallow_copy().unwrap().try_get_real_value().unwrap(),
         b"1.123457"
@@ -16,7 +16,7 @@ fn double_factory_rounds_the_stored_value_like_qpdf() {
 fn string_factory_keeps_the_literal_as_the_only_value() {
     let real = ObjectHandle::real_from_string(b"  +1.25tail");
     assert_eq!(real.try_get_numeric_value().unwrap(), 1.25);
-    assert_eq!(real.try_unparse_resolved().unwrap(), b"  +1.25tail");
+    assert_eq!(real.unparse_resolved().unwrap(), b"  +1.25tail");
 }
 
 #[test]
@@ -57,7 +57,7 @@ fn real_numeric_access_matches_qpdf_atof_vectors() {
             bits,
             "{text}"
         );
-        assert_eq!(real.try_unparse_resolved().unwrap(), text.as_bytes());
+        assert_eq!(real.unparse_resolved().unwrap(), text.as_bytes());
     }
 }
 
@@ -147,6 +147,6 @@ fn real_string_numeric_conversion_uses_c_string_boundaries() {
     ] {
         let real = ObjectHandle::real_from_string(bytes);
         assert_eq!(real.try_get_numeric_value().unwrap().to_bits(), bits);
-        assert_eq!(real.try_unparse_resolved().unwrap(), bytes);
+        assert_eq!(real.unparse_resolved().unwrap(), bytes);
     }
 }

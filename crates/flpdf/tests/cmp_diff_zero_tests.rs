@@ -72,7 +72,8 @@ fn catalog_metadata_observation(bytes: &[u8]) -> (Option<ObjectRef>, Vec<u8>, Ve
     let filter = dictionary
         .try_get_key(b"/Filter")
         .expect("metadata Filter lookup")
-        .unparse();
+        .unparse()
+        .unwrap();
     let packet = metadata
         .get_stream_data(flpdf::writer::DecodeLevel::All)
         .expect("decode XMP metadata packet");
@@ -142,11 +143,13 @@ fn pdfa_snapshot(bytes: &[u8]) -> PdfaSnapshot {
     let language = catalog
         .try_get_key(b"/Lang")
         .expect("catalog Lang")
-        .unparse();
+        .unparse()
+        .unwrap();
     let mark_info = catalog
         .try_get_key(b"/MarkInfo")
         .expect("catalog MarkInfo")
-        .unparse();
+        .unparse()
+        .unwrap();
 
     let metadata = catalog.try_get_key(b"/Metadata").expect("catalog Metadata");
     let metadata_ref_valid = metadata.object_ref().is_some();
@@ -156,7 +159,8 @@ fn pdfa_snapshot(bytes: &[u8]) -> PdfaSnapshot {
     let metadata_filter = metadata_dict
         .try_get_key(b"/Filter")
         .expect("Metadata Filter")
-        .unparse();
+        .unparse()
+        .unwrap();
     let metadata_packet = metadata
         .get_stream_data(flpdf::writer::DecodeLevel::All)
         .expect("decode XMP packet")
@@ -172,7 +176,8 @@ fn pdfa_snapshot(bytes: &[u8]) -> PdfaSnapshot {
     let output_intent_subtype = output_intent
         .try_get_key(b"/S")
         .expect("OutputIntent subtype")
-        .unparse();
+        .unparse()
+        .unwrap();
     let profile = output_intent
         .try_get_key(b"/DestOutputProfile")
         .expect("DestOutputProfile stream");
@@ -183,11 +188,13 @@ fn pdfa_snapshot(bytes: &[u8]) -> PdfaSnapshot {
     let profile_n = profile_dict
         .try_get_key(b"/N")
         .expect("ICC component count")
-        .unparse();
+        .unparse()
+        .unwrap();
     let profile_filter = profile_dict
         .try_get_key(b"/Filter")
         .expect("ICC profile Filter")
-        .unparse();
+        .unparse()
+        .unwrap();
     let icc_payload = profile
         .get_stream_data(flpdf::writer::DecodeLevel::All)
         .expect("decode ICC profile")
@@ -219,7 +226,8 @@ fn pdfa_snapshot(bytes: &[u8]) -> PdfaSnapshot {
         let relationship = filespec
             .try_get_key(b"/AFRelationship")
             .expect("Filespec AFRelationship")
-            .unparse();
+            .unparse()
+            .unwrap();
         let embedded_file = filespec
             .try_get_key(b"/EF")
             .expect("Filespec EF")
@@ -774,13 +782,20 @@ fn trailer_external_file_keys_match_qpdf_11_9() {
 
     let mut output = Pdf::open(Cursor::new(actual)).expect("open rewritten output");
     let trailer = output.trailer();
-    assert_eq!(trailer.try_get_key(b"/F").unwrap().unparse(), b"2 0 R");
     assert_eq!(
-        trailer.try_get_key(b"/FFilter").unwrap().unparse(),
+        trailer.try_get_key(b"/F").unwrap().unparse().unwrap(),
+        b"2 0 R"
+    );
+    assert_eq!(
+        trailer.try_get_key(b"/FFilter").unwrap().unparse().unwrap(),
         b"/ASCIIHexDecode"
     );
     assert_eq!(
-        trailer.try_get_key(b"/FDecodeParms").unwrap().unparse(),
+        trailer
+            .try_get_key(b"/FDecodeParms")
+            .unwrap()
+            .unparse()
+            .unwrap(),
         b"<< /Columns 1 >>"
     );
 }

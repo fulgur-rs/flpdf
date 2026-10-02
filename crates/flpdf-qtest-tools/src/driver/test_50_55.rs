@@ -273,14 +273,14 @@ pub(crate) fn run_test_53<R: Read + Seek>(
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let new_object = qpdf_flush_result_67?;
     stdout.write_all(b"new object: ")?;
-    stdout.write_all(&new_object.unparse())?;
+    stdout.write_all(&new_object.unparse()?)?;
     stdout.write_all(b"\n")?;
 
     root.replace_key(b"/Q1", new_object)?;
 
     writeln!(stdout, "all objects")?;
     for object in pdf.get_all_objects()? {
-        stdout.write_all(&object.unparse())?;
+        stdout.write_all(&object.unparse()?)?;
         stdout.write_all(b"\n")?;
     }
 

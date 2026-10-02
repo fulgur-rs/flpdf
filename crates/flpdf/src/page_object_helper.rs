@@ -3144,7 +3144,8 @@ mod tests {
         assert_eq!(
             page.try_get_key(b"/MediaBox")
                 .expect("page box should resolve")
-                .unparse_resolved(),
+                .unparse_resolved()
+                .unwrap(),
             b"[ 0 0 200 100 ]",
             "the source page box must remain unchanged"
         );

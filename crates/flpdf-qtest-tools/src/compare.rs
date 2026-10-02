@@ -38,7 +38,7 @@ where
     resolve_compare_children(&act, actual_pdf, &mut actual_seen, 0)?;
     let mut expected_seen = Vec::new();
     resolve_compare_children(&exp, expected_pdf, &mut expected_seen, 0)?;
-    if act.try_unparse_resolved()? != exp.try_unparse_resolved()? {
+    if act.unparse_resolved()? != exp.unparse_resolved()? {
         return Ok(format!("{label}: object contents differ"));
     }
     Ok(String::new())
@@ -72,7 +72,7 @@ where
     resolve_compare_children(&act_dict, actual_pdf, &mut actual_seen, 0)?;
     let mut expected_seen = Vec::new();
     resolve_compare_children(&exp_dict, expected_pdf, &mut expected_seen, 0)?;
-    if act_dict.try_unparse_resolved()? != exp_dict.try_unparse_resolved()? {
+    if act_dict.unparse_resolved()? != exp_dict.unparse_resolved()? {
         return Ok(format!("{label}: stream dictionaries differ"));
     }
 
@@ -321,8 +321,8 @@ mod tests {
         // resolve() call to succeed only to read the element's own
         // object/generation identity, not to serialize it.
         assert!(!actual_missing.is_resolved() && !expected_missing.is_resolved());
-        assert_eq!(actual_missing.unparse(), b"99 0 R");
-        assert_eq!(expected_missing.unparse(), b"100 0 R");
+        assert_eq!(actual_missing.unparse().unwrap(), b"99 0 R");
+        assert_eq!(expected_missing.unparse().unwrap(), b"100 0 R");
     }
 
     #[test]

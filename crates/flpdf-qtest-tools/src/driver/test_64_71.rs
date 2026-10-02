@@ -375,11 +375,11 @@ fn write_xobject_line(
     xobject_dict: ObjectHandle,
     key: Vec<u8>,
 ) -> flpdf::Result<()> {
-    write_bytes(output, &xobject_dict.unparse())?;
+    write_bytes(output, &xobject_dict.unparse()?)?;
     write!(output, " -> ")?;
     write_bytes(output, &key)?;
     write!(output, " -> ")?;
-    write_bytes(output, &object.unparse())?;
+    write_bytes(output, &object.unparse()?)?;
     writeln!(output)?;
     Ok(())
 }
@@ -391,7 +391,7 @@ fn write_xobject_map_line(
 ) -> flpdf::Result<()> {
     write_bytes(output, &key)?;
     write!(output, " -> ")?;
-    write_bytes(output, &object.unparse())?;
+    write_bytes(output, &object.unparse()?)?;
     writeln!(output)?;
     Ok(())
 }

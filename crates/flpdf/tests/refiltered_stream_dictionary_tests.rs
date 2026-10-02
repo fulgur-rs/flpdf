@@ -36,19 +36,23 @@ fn refiltered_stream_retains_external_file_dictionary_keys() {
     extra.type_code().unwrap();
     let actual = extra.as_stream_dict().unwrap();
     assert_eq!(
-        actual.try_get_key(b"/F").unwrap().unparse(),
+        actual.try_get_key(b"/F").unwrap().unparse().unwrap(),
         b"(external.bin)"
     );
     assert_eq!(
-        actual.try_get_key(b"/FFilter").unwrap().unparse(),
+        actual.try_get_key(b"/FFilter").unwrap().unparse().unwrap(),
         b"/ASCIIHexDecode"
     );
     assert_eq!(
-        actual.try_get_key(b"/FDecodeParms").unwrap().unparse(),
+        actual
+            .try_get_key(b"/FDecodeParms")
+            .unwrap()
+            .unparse()
+            .unwrap(),
         b"<< /Marker 42 >>"
     );
     assert_eq!(
-        actual.try_get_key(b"/Filter").unwrap().unparse(),
+        actual.try_get_key(b"/Filter").unwrap().unparse().unwrap(),
         b"/FlateDecode"
     );
 }
@@ -143,23 +147,39 @@ fn decoding_without_compression_removes_only_the_source_filter_keys() {
     );
     let dictionary = emitted_stream_dict(bytes);
     assert_eq!(
-        dictionary.try_get_key(b"/Filter").unwrap().unparse(),
+        dictionary
+            .try_get_key(b"/Filter")
+            .unwrap()
+            .unparse()
+            .unwrap(),
         b"null"
     );
     assert_eq!(
-        dictionary.try_get_key(b"/DecodeParms").unwrap().unparse(),
+        dictionary
+            .try_get_key(b"/DecodeParms")
+            .unwrap()
+            .unparse()
+            .unwrap(),
         b"null"
     );
     assert_eq!(
-        dictionary.try_get_key(b"/F").unwrap().unparse(),
+        dictionary.try_get_key(b"/F").unwrap().unparse().unwrap(),
         b"(external.bin)"
     );
     assert_eq!(
-        dictionary.try_get_key(b"/FFilter").unwrap().unparse(),
+        dictionary
+            .try_get_key(b"/FFilter")
+            .unwrap()
+            .unparse()
+            .unwrap(),
         b"/ASCIIHexDecode"
     );
     assert_eq!(
-        dictionary.try_get_key(b"/FDecodeParms").unwrap().unparse(),
+        dictionary
+            .try_get_key(b"/FDecodeParms")
+            .unwrap()
+            .unparse()
+            .unwrap(),
         b"<< /Marker 42 >>"
     );
 }
@@ -188,15 +208,23 @@ fn filter_on_write_false_preserves_filter_and_external_file_keys() {
     );
     let dictionary = emitted_stream_dict(bytes);
     assert_eq!(
-        dictionary.try_get_key(b"/Filter").unwrap().unparse(),
+        dictionary
+            .try_get_key(b"/Filter")
+            .unwrap()
+            .unparse()
+            .unwrap(),
         b"/ASCIIHexDecode"
     );
     assert_eq!(
-        dictionary.try_get_key(b"/DecodeParms").unwrap().unparse(),
+        dictionary
+            .try_get_key(b"/DecodeParms")
+            .unwrap()
+            .unparse()
+            .unwrap(),
         b"<< /Columns 1 >>"
     );
     assert_eq!(
-        dictionary.try_get_key(b"/F").unwrap().unparse(),
+        dictionary.try_get_key(b"/F").unwrap().unparse().unwrap(),
         b"(external.bin)"
     );
 }
@@ -218,15 +246,19 @@ fn metadata_filter_veto_removes_source_parameters_without_adding_flate() {
     );
     let dictionary = emitted_stream_dict(bytes);
     assert_eq!(
-        dictionary.try_get_key(b"/Filter").unwrap().unparse(),
+        dictionary
+            .try_get_key(b"/Filter")
+            .unwrap()
+            .unparse()
+            .unwrap(),
         b"null"
     );
     assert_eq!(
-        dictionary.try_get_key(b"/F").unwrap().unparse(),
+        dictionary.try_get_key(b"/F").unwrap().unparse().unwrap(),
         b"(external.bin)"
     );
     assert_eq!(
-        dictionary.try_get_key(b"/Type").unwrap().unparse(),
+        dictionary.try_get_key(b"/Type").unwrap().unparse().unwrap(),
         b"/Metadata"
     );
 }
@@ -267,11 +299,15 @@ fn token_filter_rewrite_keeps_external_keys_and_runs_once_per_pipe() {
     );
     let dictionary = emitted_stream_dict(bytes);
     assert_eq!(
-        dictionary.try_get_key(b"/F").unwrap().unparse(),
+        dictionary.try_get_key(b"/F").unwrap().unparse().unwrap(),
         b"(external.bin)"
     );
     assert_eq!(
-        dictionary.try_get_key(b"/Filter").unwrap().unparse(),
+        dictionary
+            .try_get_key(b"/Filter")
+            .unwrap()
+            .unparse()
+            .unwrap(),
         b"/FlateDecode"
     );
     assert_eq!(eof_calls.get(), 1);
@@ -301,7 +337,7 @@ fn retrying_provider_preserves_external_keys_and_records_qpdf_retry_flags() {
     );
     let dictionary = emitted_stream_dict(bytes);
     assert_eq!(
-        dictionary.try_get_key(b"/F").unwrap().unparse(),
+        dictionary.try_get_key(b"/F").unwrap().unparse().unwrap(),
         b"(external.bin)"
     );
     assert_eq!(calls.borrow().as_slice(), &[(false, true), (false, false)]);
@@ -337,15 +373,23 @@ fn unfiltered_stream_drops_only_an_empty_decode_parms_array_and_strips_crypt() {
     );
     let dictionary = emitted_stream_dict(bytes);
     assert_eq!(
-        dictionary.try_get_key(b"/Filter").unwrap().unparse(),
+        dictionary
+            .try_get_key(b"/Filter")
+            .unwrap()
+            .unparse()
+            .unwrap(),
         b"[ /ASCIIHexDecode ]"
     );
     assert_eq!(
-        dictionary.try_get_key(b"/DecodeParms").unwrap().unparse(),
+        dictionary
+            .try_get_key(b"/DecodeParms")
+            .unwrap()
+            .unparse()
+            .unwrap(),
         b"[ << >> ]"
     );
     assert_eq!(
-        dictionary.try_get_key(b"/F").unwrap().unparse(),
+        dictionary.try_get_key(b"/F").unwrap().unparse().unwrap(),
         b"(external.bin)"
     );
 }
@@ -429,8 +473,8 @@ fn crypt_filter_cleanup_mutates_the_shared_source_array_like_qpdf() {
     writer.set_compress_streams(true);
     writer.set_output_memory().unwrap();
     writer.write().unwrap();
-    assert_eq!(filters.unparse(), b"[ /ASCIIHexDecode ]");
-    assert_eq!(decode_parms.unparse(), b"[ << >> ]");
+    assert_eq!(filters.unparse().unwrap(), b"[ /ASCIIHexDecode ]");
+    assert_eq!(decode_parms.unparse().unwrap(), b"[ << >> ]");
 }
 
 #[test]

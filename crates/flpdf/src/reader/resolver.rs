@@ -15150,7 +15150,7 @@ mod tests {
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
         handle.try_is_scalar().expect("resolved after recovery");
         assert_eq!(
-            handle.unparse_resolved(),
+            handle.unparse_resolved().unwrap(),
             b"(recovered)",
             "object 1 0 must resolve to the reconstructed value"
         );
@@ -16352,7 +16352,7 @@ mod tests {
             .try_is_scalar()
             .expect("an unindexed packed member must resolve to null");
         assert_eq!(
-            handle.unparse_resolved(),
+            handle.unparse_resolved().unwrap(),
             b"null",
             "reconstruction must not manufacture a type-2 entry for the packed member"
         );

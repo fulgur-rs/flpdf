@@ -1637,17 +1637,25 @@ mod tests {
         )
         .unwrap();
 
-        let before_root = handle_of(&mut pdf, ObjectRef::new(2, 0)).unparse_resolved();
-        let before_second = handle_of(&mut pdf, ObjectRef::new(11, 0)).unparse_resolved();
+        let before_root = handle_of(&mut pdf, ObjectRef::new(2, 0))
+            .unparse_resolved()
+            .unwrap();
+        let before_second = handle_of(&mut pdf, ObjectRef::new(11, 0))
+            .unparse_resolved()
+            .unwrap();
         let error = rebuild_page_tree_with_max_depth(&mut pdf, &[ObjectRef::new(4, 0)], 2)
             .expect_err("repair must use the caller-supplied depth limit");
         assert!(matches!(error, Error::Unsupported(_)), "got {error:?}");
         assert_eq!(
-            handle_of(&mut pdf, ObjectRef::new(2, 0)).unparse_resolved(),
+            handle_of(&mut pdf, ObjectRef::new(2, 0))
+                .unparse_resolved()
+                .unwrap(),
             before_root
         );
         assert_eq!(
-            handle_of(&mut pdf, ObjectRef::new(11, 0)).unparse_resolved(),
+            handle_of(&mut pdf, ObjectRef::new(11, 0))
+                .unparse_resolved()
+                .unwrap(),
             before_second
         );
     }

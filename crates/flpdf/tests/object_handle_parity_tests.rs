@@ -483,7 +483,7 @@ fn dictionary_handle_lookup_and_writer_use_one_canonical_slash() {
     );
     assert!(dictionary.try_has_key(b"/A B").unwrap());
     assert!(!dictionary.try_has_key(b"A B").unwrap());
-    assert_eq!(dictionary.unparse_resolved(), b"<< /A#20B 7 >>");
+    assert_eq!(dictionary.unparse_resolved().unwrap(), b"<< /A#20B 7 >>");
 }
 
 #[test]

@@ -369,7 +369,7 @@ fn matching_out_of_range_object_header_is_not_damaged() {
 
     assert!(objects
         .iter()
-        .any(|object| object.unparse() == b"5 65536 R"));
+        .any(|object| object.unparse().unwrap() == b"5 65536 R"));
 
     assert!(
         pdf.repair_diagnostics().entries().is_empty(),

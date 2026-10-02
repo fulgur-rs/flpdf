@@ -216,7 +216,7 @@ fn top_level_field_preserves_an_unprojectable_raw_parent_identity() {
 
     assert!(is_different);
     assert!(top_level.object_ref().is_none());
-    assert_eq!(top_level.unparse(), b"11 65535 R");
+    assert_eq!(top_level.unparse().unwrap(), b"11 65535 R");
 }
 
 #[test]
@@ -1110,13 +1110,13 @@ fn set_value_turns_an_existing_checkbox_off_and_leaves_pushbuttons_unchanged() {
     )]);
     let mut pdf = open(bytes);
     let before = resolved_handle(&mut pdf, ObjectRef::new(10, 0));
-    let before_snapshot = before.unparse_resolved();
+    let before_snapshot = before.unparse_resolved().unwrap();
     FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
         .set_value(ObjectHandle::name(b"New".to_vec()), true)
         .expect("pushbutton value is ignored");
     let after = resolved_handle(&mut pdf, ObjectRef::new(10, 0));
     assert!(before.is_same_object_as(&after));
-    assert_eq!(after.unparse_resolved(), before_snapshot);
+    assert_eq!(after.unparse_resolved().unwrap(), before_snapshot);
 }
 
 #[test]
@@ -1550,13 +1550,13 @@ fn button_values_ignore_non_names_and_malformed_widget_containers() {
     ]);
     let mut pdf = open(bytes);
     let before = resolved_handle(&mut pdf, ObjectRef::new(10, 0));
-    let before_snapshot = before.unparse_resolved();
+    let before_snapshot = before.unparse_resolved().unwrap();
     FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
         .set_value(ObjectHandle::string(b"not-a-name".to_vec()), true)
         .unwrap();
     let after = resolved_handle(&mut pdf, ObjectRef::new(10, 0));
     assert!(before.is_same_object_as(&after));
-    assert_eq!(after.unparse_resolved(), before_snapshot);
+    assert_eq!(after.unparse_resolved().unwrap(), before_snapshot);
     let acroform = resolved_handle(&mut pdf, ObjectRef::new(20, 0));
     assert!(!has_entry(&acroform, b"/NeedAppearances"));
 
@@ -1722,11 +1722,11 @@ fn clear_need_appearances_leaves_non_true_and_malformed_acroforms_unchanged() {
         let bytes = doc_with_acroform(vec![(10, "<< /FT /Tx >>".into()), (20, acroform.into())]);
         let mut pdf = open(bytes);
         let before = resolved_handle(&mut pdf, ObjectRef::new(20, 0));
-        let before_snapshot = before.unparse_resolved();
+        let before_snapshot = before.unparse_resolved().unwrap();
         FormFieldObjectHelper::clear_need_appearances_after_generation(&mut pdf).unwrap();
         let after = resolved_handle(&mut pdf, ObjectRef::new(20, 0));
         assert!(before.is_same_object_as(&after));
-        assert_eq!(after.unparse_resolved(), before_snapshot);
+        assert_eq!(after.unparse_resolved().unwrap(), before_snapshot);
     }
 
     let bytes = doc(vec![(10, "<< /FT /Tx >>".into())]);
