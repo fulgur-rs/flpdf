@@ -457,7 +457,7 @@ pub(crate) fn run_test_31<R: Read + Seek>(
     // (test_driver.cc:1179-1180). This also succeeds, so it needs no
     // description either.
     let o2 = ObjectHandle::parse(b"   12345 \x0c  ")?;
-    assert_eq!(o2.as_integer(), Some(12345));
+    assert!(o2.try_is_integer()? && o2.try_get_int_value()? == 12345);
 
     // qpdf's context-free overload throws a logic error for a nested indirect
     // reference. Its context-free description overload throws the trailing
@@ -510,8 +510,9 @@ pub(crate) fn run_test_31<R: Read + Seek>(
 
     for input in [b"}".as_slice(), b"{".as_slice(), b">>".as_slice()] {
         let recovered = ObjectHandle::parse_with_context(pdf, input, "")?;
-        assert!(recovered.is_null());
+        let is_null = recovered.try_is_null();
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        assert!(is_null?);
     }
 
     let null_reference = ObjectHandle::parse_with_context(pdf, b"[7 0 R]", "")?;
@@ -521,9 +522,15 @@ pub(crate) fn run_test_31<R: Read + Seek>(
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
     let direct_null = ObjectHandle::parse_with_context(pdf, b"null", "")?;
-    assert!(direct_null.is_null());
-    assert!(direct_null.is_direct());
+    // qpdf uses `isDirectNull` here; preserve its identity short-circuit before
+    // using the resolving null predicate (`libqpdf/QPDFObjectHandle.cc:344-350`).
+    let is_direct_null = if direct_null.is_direct() {
+        direct_null.try_is_null()
+    } else {
+        Ok(false)
+    };
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert!(is_direct_null?);
 
     let invalid_objgen =
         ObjectHandle::parse_with_context(pdf, b"[0 0 R -1 0 R 1 65535 R 1 100000 R 1 -1 R]", "")?;
