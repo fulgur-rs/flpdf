@@ -382,7 +382,7 @@ pub(crate) fn run_test_25<R: Read + Seek + 'static>(
     // `pdf` itself (`test_driver.cc:3491-3493`), never for a separately
     // constructed `QPDF` like `oldpdf` here. This opens with repair enabled
     // unconditionally, independent of whatever test number dispatched here.
-    {
+    let copied_pages_is_null = {
         let bytes = std::fs::read(arg2)?;
         let options = PdfOpenOptions {
             repair: true,
@@ -407,10 +407,15 @@ pub(crate) fn run_test_25<R: Read + Seek + 'static>(
         let oldpdf_root = oldpdf.root_handle()?;
         let pages = oldpdf_root.try_get_key(b"/Pages")?;
         let copied_pages = pdf.copy_foreign_object(&pages)?;
-        assert!(copied_pages.is_null());
-    }
+        // qpdf calls isNull() on copyForeignObject's direct null result at the
+        // page-tree boundary (`QPDFObjectHandle.cc:353-356`). Preserve that
+        // resolving predicate at the public ObjectHandle boundary. Hold its
+        // result so the queued copy warning is flushed before errors propagate.
+        copied_pages.try_is_null()
+    };
 
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert!(copied_pages_is_null?);
 
     // qpdf/test_driver.cc:970-973 writes only after the old document leaves
     // scope, with static identifiers and preserved stream data.

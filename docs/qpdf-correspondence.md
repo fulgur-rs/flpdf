@@ -4721,6 +4721,22 @@ stdout, stderr, and written-file assertions, and the route contract rejects
 the non-resolving dictionary accessor. A6 remains mixed for unrelated
 production callers.
 
+### qtest A6 test 25 copied `/Pages` null predicate `flpdf-3yn9.48.208.15` (2026-10-02)
+
+qpdf test 25 calls `isNull()` on the result of copying a foreign `/Pages`
+object (`qpdf/test_driver.cc:967-968`). `QPDF::copyForeignObject()` stops at
+page-tree boundaries and returns a direct null with the documented warning
+(`QPDF.cc:2085-2089,2124-2134`); `QPDFObjectHandle::isNull()` dereferences
+before checking the type (`QPDFObjectHandle.cc:353-356`). flpdf's
+`run_test_25` now uses `ObjectHandle::try_is_null()` for the copied result.
+The existing `foreign_copy_driver_replaces_qtest_and_writes_pages_boundary`
+test preserves the driver warning/output and written-file checks, while the
+route contract requires the resolving predicate and rejects `.is_null()`.
+Because the accessor is fallible, the driver stores its result, flushes the
+pending copy warning, then propagates the result, preserving qtest's diagnostic
+ordering.
+A6 remains mixed for unrelated production callers.
+
 ### Linearized root ADBE output ownership (`flpdf-3yn9.48.60`)
 
 `linearization/writer.rs::do_write_pass` emits each pass's Catalog through
