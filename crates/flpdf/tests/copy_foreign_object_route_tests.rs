@@ -28,6 +28,35 @@ fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
 }
 
 #[test]
+fn foreign_object_copy_uses_resolving_accessors_for_graph_observations() {
+    let source = include_str!("../src/object_copy.rs");
+    let production = source
+        .split_once("impl<R: Read + Seek + 'static> ForeignObjectCopier")
+        .expect("foreign copier implementation should remain present")
+        .1
+        .split_once("#[cfg(test)]\nmod tests")
+        .expect("test-only implementation should follow production methods")
+        .0;
+
+    for raw_accessor in [".is_null(", ".as_array(", ".as_dictionary("] {
+        assert!(
+            !production.contains(raw_accessor),
+            "ForeignObjectCopier must not bypass resolving accessors with {raw_accessor}"
+        );
+    }
+    for resolving_accessor in [
+        ".try_is_null()?",
+        ".try_as_array()?",
+        ".try_as_dictionary()?",
+    ] {
+        assert!(
+            production.contains(resolving_accessor),
+            "ForeignObjectCopier must use {resolving_accessor} for qpdf-resolving observations"
+        );
+    }
+}
+
+#[test]
 fn public_copy_foreign_object_preserves_shared_child_identity() {
     let source_bytes = build_pdf(
         &[
