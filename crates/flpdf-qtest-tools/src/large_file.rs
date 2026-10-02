@@ -250,7 +250,7 @@ fn check_page_contents(
     output: &Output,
 ) -> flpdf::Result<()> {
     let contents = page
-        .get_key(b"/Contents")
+        .try_get_key(b"/Contents")?
         .get_stream_data(DecodeLevel::Generalized)?;
     let expected = generate_page_contents(page_number);
     if contents.as_slice() != expected.as_slice() {
@@ -270,9 +270,9 @@ fn check_image(
     output: &Output,
 ) -> flpdf::Result<()> {
     let image = page
-        .get_key(b"/Resources")
-        .get_key(b"/XObject")
-        .get_key(b"/Im1");
+        .try_get_key(b"/Resources")?
+        .try_get_key(b"/XObject")?
+        .try_get_key(b"/Im1")?;
     let mut checker = ImageChecker {
         page: page_number,
         width: NSTRIPES * stripesize,
