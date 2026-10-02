@@ -630,7 +630,7 @@ fn render_encryption_report<R: Read + Seek>(
         output.extend_from_slice(b"Supplied password is user password\n");
     }
 
-    let permission_checks: [(&str, fn(&PermissionReport) -> bool); 9] = [
+    let permission_checks: [PermissionCheck; 9] = [
         ("extract for accessibility", |p| p.accessibility),
         ("extract for any purpose", |p| p.extract_all),
         ("print low resolution", |p| p.print_low),
@@ -694,6 +694,8 @@ struct PermissionReport {
     modify_other: bool,
     modify_all: bool,
 }
+
+type PermissionCheck = (&'static str, fn(&PermissionReport) -> bool);
 
 fn permission_report(revision: i64, permissions: Permissions) -> PermissionReport {
     let raw = permissions.raw() as u32;
