@@ -119,6 +119,32 @@ fn linearization_final_route_uses_the_measured_xref_ownership_handoff() {
 }
 
 #[test]
+fn linearized_objstm_page_filter_uses_raw_generation_identity() {
+    let source = production_source(
+        include_str!("../src/linearization/writer.rs"),
+        "\n#[cfg(test)]\nmod tests {",
+    );
+    let resolve_batches = source
+        .split_once("fn resolve_batches")
+        .and_then(|(_, rest)| {
+            rest.split_once("/// Build the layout from an already-resolved batch plan")
+        })
+        .map(|(function, _)| function)
+        .expect("linearized ObjStm batch resolver exists");
+    let resolve_batches = resolve_batches
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    assert!(resolve_batches.contains("PageDocumentHelper::new(pdf) .get_all_pages()?"));
+    assert!(resolve_batches.contains("filter_page_dictionary_batches("));
+    assert!(
+        !resolve_batches.contains("pages::page_refs(pdf)"),
+        "linearized ObjStm page filtering must not project raw qpdf page identities"
+    );
+}
+
+#[test]
 fn prepare_file_for_write_is_owned_by_the_common_writer_boundary() {
     let writer_source = include_str!("../src/writer.rs").replace("\r\n", "\n");
     let write = writer_source
