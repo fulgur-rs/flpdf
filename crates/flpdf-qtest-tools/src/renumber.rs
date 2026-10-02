@@ -393,6 +393,73 @@ mod tests {
     }
 
     #[test]
+    fn object_comparison_resolves_each_value_family() {
+        let scalar_pairs = [
+            (ObjectHandle::boolean(true), ObjectHandle::boolean(true)),
+            (ObjectHandle::integer(42), ObjectHandle::integer(42)),
+            (
+                ObjectHandle::parse(b"1.25").unwrap(),
+                ObjectHandle::parse(b"1.25").unwrap(),
+            ),
+            (
+                ObjectHandle::string(b"text".to_vec()),
+                ObjectHandle::string(b"text".to_vec()),
+            ),
+            (
+                ObjectHandle::name(b"Name".to_vec()),
+                ObjectHandle::name(b"Name".to_vec()),
+            ),
+        ];
+        for (source, emitted) in scalar_pairs {
+            let mut visited = BTreeSet::new();
+            assert!(compare_objects(
+                &source,
+                &emitted,
+                &mut visited,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap());
+        }
+
+        let source = ObjectHandle::array(vec![
+            ObjectHandle::integer(1),
+            ObjectHandle::parse(b"2.5").unwrap(),
+        ]);
+        let emitted = ObjectHandle::array(vec![
+            ObjectHandle::integer(1),
+            ObjectHandle::parse(b"2.5").unwrap(),
+        ]);
+        let mut visited = BTreeSet::new();
+        assert!(compare_objects(
+            &source,
+            &emitted,
+            &mut visited,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap());
+
+        let source = ObjectHandle::dictionary(vec![(
+            b"/Value".to_vec(),
+            ObjectHandle::name(b"same".to_vec()),
+        )]);
+        let emitted = ObjectHandle::dictionary(vec![(
+            b"/Value".to_vec(),
+            ObjectHandle::name(b"same".to_vec()),
+        )]);
+        let mut visited = BTreeSet::new();
+        assert!(compare_objects(
+            &source,
+            &emitted,
+            &mut visited,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap());
+    }
+
+    #[test]
     fn object_comparison_reports_array_and_dictionary_mismatches() {
         let mut visited = BTreeSet::new();
         let mut stdout = Vec::new();
