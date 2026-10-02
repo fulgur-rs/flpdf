@@ -266,7 +266,7 @@ fn process(
         let Some(stream_dict) = stream_handle.as_stream_dict() else {
             continue;
         };
-        if !resolve_objstm_type(&mut pdf, &stream_dict) {
+        if !resolve_objstm_type(&stream_dict) {
             continue;
         }
         // qpdf's test_tokenizer.cc:211 calls `getStreamData(qpdf_dl_specialized)`,
@@ -413,18 +413,17 @@ fn collect_canonical_content_streams<R: Read + Seek>(
     )))
 }
 
-fn resolve_objstm_type(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>, dict: &ObjectHandle) -> bool {
+fn resolve_objstm_type(dict: &ObjectHandle) -> bool {
     let type_handle = match dict.try_get_key(b"/Type") {
         Ok(handle) => handle,
         Err(_) => return false, // cov:ignore: getAllObjects + as_stream_dict guarantee a live direct receiver.
     };
-    // qpdf's getKey()/isName() dereference through the canonical object
-    // handle. Resolve the parsed child once, while keeping the decode
-    // boundary below in its existing Dictionary-shaped form.
-    if pdf.resolve(&type_handle).is_err() {
-        return false;
-    }
-    matches!(type_handle.as_name(), Some(name) if name.as_slice() == b"ObjStm")
+    // qpdf's getKey()/isName()/getName() dereference through the canonical
+    // handle. The warning-free accessor matches the isName/getName short-circuit.
+    matches!(
+        type_handle.try_get_value_as_name(),
+        Ok(Some(name)) if name.as_slice() == b"/ObjStm"
+    )
 }
 
 fn dump_tokens(
@@ -563,36 +562,31 @@ mod tests {
 
     #[test]
     fn resolve_objstm_type_true_for_direct_name() {
-        let mut pdf = open_minimal_pdf();
         let dict = ObjectHandle::dictionary(vec![(
             b"Type".to_vec(),
             ObjectHandle::name(b"ObjStm".to_vec()),
         )]);
-        assert!(resolve_objstm_type(&mut pdf, &dict));
+        assert!(resolve_objstm_type(&dict));
     }
 
     #[test]
     fn resolve_objstm_type_true_for_single_hop_reference() {
-        let mut pdf = open_minimal_pdf();
+        let pdf = open_minimal_pdf();
         let object = pdf
             .make_indirect_from_object_handle(ObjectHandle::name(b"ObjStm".to_vec()))
             .expect("allocate an indirect type name");
         let dict = ObjectHandle::dictionary(vec![(b"Type".to_vec(), object)]);
-        assert!(resolve_objstm_type(&mut pdf, &dict));
+        assert!(resolve_objstm_type(&dict));
     }
 
     #[test]
     fn resolve_objstm_type_false_for_other_name_or_missing_type() {
-        let mut pdf = open_minimal_pdf();
         let other = ObjectHandle::dictionary(vec![(
             b"Type".to_vec(),
             ObjectHandle::name(b"XRef".to_vec()),
         )]);
-        assert!(!resolve_objstm_type(&mut pdf, &other));
-        assert!(!resolve_objstm_type(
-            &mut pdf,
-            &ObjectHandle::dictionary(Vec::new())
-        ));
+        assert!(!resolve_objstm_type(&other));
+        assert!(!resolve_objstm_type(&ObjectHandle::dictionary(Vec::new())));
     }
 
     #[test]

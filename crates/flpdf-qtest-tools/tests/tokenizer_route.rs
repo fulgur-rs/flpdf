@@ -25,7 +25,10 @@ fn tokenizer_helper_uses_resolving_dictionary_key_accessors() {
     let object_stream_type = section(&source, "fn resolve_objstm_type(", "fn dump_tokens(");
     assert!(
         object_stream_type.contains("dict.try_get_key(b\"/Type\")")
-            && !object_stream_type.contains(".get_key("),
+            && object_stream_type.contains("type_handle.try_get_value_as_name()")
+            && !object_stream_type.contains(".get_key(")
+            && !object_stream_type.contains(".as_name()")
+            && !object_stream_type.contains("pdf.resolve("),
         "tokenizer object-stream type lookup must use qpdf's resolving getKey route"
     );
 }
