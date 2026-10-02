@@ -635,6 +635,16 @@ fn object_handle_api_test_93_uses_canonical_promotion_route() {
 }
 
 #[test]
+fn object_handle_api_test_93_resolves_both_trailer_keys() {
+    driver()
+        .args(["93", minimal_pdf(), "-"])
+        .assert()
+        .code(0)
+        .stdout("test 93 done\n")
+        .stderr("");
+}
+
+#[test]
 fn test_93_reports_a_non_dictionary_root_like_qpdf() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let input = directory.path().join("bad-root.pdf");
@@ -1525,6 +1535,52 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             && !test_94.contains("resolved_key("),
         "test 94 must use qpdf-shaped chained dictionary accessors"
     );
+    let test_88 = section(
+        mutation_source.as_str(),
+        "pub(crate) fn run_test_88",
+        "pub(crate) fn run_test_89",
+    );
+    assert!(
+        test_88.contains("dict.try_get_key(b\"/Three\")?") && !test_88.contains(".get_key("),
+        "test 88 must use qpdf's resolving getKey accessor"
+    );
+    let test_93 = section(
+        mutation_source.as_str(),
+        "pub(crate) fn run_test_93",
+        "pub(crate) fn run_test_94",
+    );
+    assert!(
+        test_93.contains("let root1_result = trailer.try_get_key(b\"/Root\");")
+            && test_93.contains("let potato_result = trailer.try_get_key(b\"/Potato\");")
+            && test_93.contains("let root1 = root1_result?;")
+            && test_93.contains("let potato = potato_result?;")
+            && !test_93.contains(".get_key("),
+        "test 93 must use qpdf's resolving getKey accessor"
+    );
+    for (call, propagation) in [
+        (
+            "let root1_result = trailer.try_get_key(b\"/Root\");",
+            "let root1 = root1_result?;",
+        ),
+        (
+            "let potato_result = trailer.try_get_key(b\"/Potato\");",
+            "let potato = potato_result?;",
+        ),
+    ] {
+        let call_at = test_93.find(call).expect("test 93 resolving key call");
+        let flush_at = test_93[call_at..]
+            .find("emit_new_diagnostics(")
+            .map(|offset| call_at + offset)
+            .expect("test 93 must flush accessor diagnostics");
+        let propagation_at = test_93[flush_at..]
+            .find(propagation)
+            .map(|offset| flush_at + offset)
+            .expect("test 93 must propagate the accessor result");
+        assert!(
+            call_at < flush_at && flush_at < propagation_at,
+            "test 93 must flush diagnostics between `{call}` and `{propagation}`"
+        );
+    }
 
     assert!(tree_source.contains("value.try_get_string_value()"));
 
