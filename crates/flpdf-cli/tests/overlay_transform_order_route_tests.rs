@@ -109,22 +109,26 @@ fn image_count(path: &Path) -> usize {
 #[test]
 fn ordinary_rewrite_uses_the_canonical_job_transform_and_output_routes() {
     let source = production_main_source();
-    let ordinary_rewrite = source
-        .split_once("fn run_rewrite_with_qpdf_job")
-        .and_then(|(_, tail)| {
-            tail.split_once("// Page operations: ")
-                .map(|(body, _)| body)
-        })
-        .expect("ordinary rewrite route");
+    let ordinary_rewrite = production_function_body(
+        &source,
+        "fn run_rewrite_with_qpdf_job(",
+        "\nfn configure_rewrite_job(",
+    );
 
     assert!(
-        ordinary_rewrite.contains("job.create_qpdf()"),
-        "ordinary rewrite input creation and transformations must be owned by QPDFJob"
+        ordinary_rewrite.contains("finish_job_exit_status(job.run()?)"),
+        "ordinary rewrite must complete through one QPDFJob::run()"
     );
-    assert!(
-        ordinary_rewrite.contains("job.write_qpdf("),
-        "ordinary rewrite output must be owned by QPDFJob"
-    );
+    for staged_route in [
+        "job.create_qpdf()",
+        "job.write_qpdf(",
+        "job.get_exit_code()",
+    ] {
+        assert!(
+            !ordinary_rewrite.contains(staged_route),
+            "ordinary rewrite must not split its Job lifecycle at {staged_route}"
+        );
+    }
     for forbidden in [
         "apply_image_transformations(",
         "flpdf::handle_under_overlay(",
