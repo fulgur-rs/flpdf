@@ -473,6 +473,56 @@ fn linearized_content_normalization_is_job_owned() {
     );
 }
 
+#[test]
+fn top_level_page_extraction_uses_one_job_run() {
+    let source = include_str!("../src/main.rs");
+    let route = source
+        .split_once("fn run_page_operations_with_qpdf_job")
+        .expect("top-level page-operation route should remain named")
+        .1
+        .split_once("\nfn run_rewrite_with_qpdf_job")
+        .expect("rewrite Job route should follow top-level page operations")
+        .0;
+
+    assert!(
+        route.contains("run_page_extraction_job("),
+        "top-level --pages must dispatch through the shared Job runner"
+    );
+    let page_dispatch = route
+        .split_once("if !args.page_ops.pages.is_empty()")
+        .expect("top-level route should separate --pages from no-pages operations")
+        .1
+        .split_once("\n    configure_page_selection_job(\n        &mut job")
+        .expect("the no-pages route should configure its rotation/split options")
+        .0;
+    assert!(
+        page_dispatch.contains("run_page_extraction_job(")
+            && page_dispatch.contains("&args.page_ops"),
+        "the page branch must pass its configured Job to the shared runner"
+    );
+    assert!(
+        !page_dispatch.contains("create_qpdf()") && !page_dispatch.contains("write_qpdf("),
+        "the top-level page branch must not call create/write separately"
+    );
+
+    let runner = source
+        .split_once("fn run_page_extraction_job")
+        .expect("shared page-extraction Job runner should remain named")
+        .1
+        .split_once("\nfn ")
+        .expect("a later function should follow the shared Job runner")
+        .0;
+    assert!(
+        runner.contains("configure_page_selection_job(&mut job, page_ops, remove_unref)"),
+        "the shared runner should apply page settings before run()"
+    );
+    assert_eq!(
+        runner.matches("job.run()?").count(),
+        1,
+        "one QPDFJob::run() call must complete the extraction"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn verbose_pages_preserves_non_utf8_source_and_output_path_bytes() {

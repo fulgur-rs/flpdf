@@ -5926,7 +5926,6 @@ fn run_page_operations_with_qpdf_job(
 
     let input_options = pdf_open_options(args.repair, &args.password)?;
     job.set_password(input_options.password);
-    configure_keep_files_open(&mut job, &args.page_ops)?;
 
     let raw_specs = if args.page_ops.pages.is_empty() {
         Vec::new()
@@ -5983,27 +5982,9 @@ fn run_page_operations_with_qpdf_job(
                 .unwrap_or_default();
             configuration.copy_encryption(path.clone(), password);
         }
-        for spec in raw_specs {
-            let password = spec.raw_password.or_else(|| {
-                spec.password
-                    .as_ref()
-                    .map(|password| arg_parser::os_bytes(password))
-            });
-            configuration.add_page_spec(PathBuf::from(spec.file_token), &spec.range, password)?;
-        }
-        for parameter in &args.page_ops.rotate {
-            configuration.rotate(arg_parser::os_bytes(parameter.as_os_str()))?;
-        }
-        for parameter in &args.page_ops.collate {
-            configuration.collate(parameter.as_bytes())?;
-        }
-        if let Some(parameter) = args.page_ops.split_pages.as_deref() {
-            configuration.split_pages(parameter.as_bytes())?;
-        }
         if args.coalesce_contents {
             configuration.coalesce_contents();
         }
-        configuration.remove_unreferenced_resources(args.remove_unreferenced_resources.into());
     }
 
     let writer_configuration = writer_configuration_unnormalized(
@@ -6012,6 +5993,20 @@ fn run_page_operations_with_qpdf_job(
         args.linearize_pass1.as_deref(),
     )?;
     job.set_writer_configuration(writer_configuration);
+
+    if !args.page_ops.pages.is_empty() {
+        return run_page_extraction_job(
+            job,
+            &args.page_ops,
+            args.remove_unreferenced_resources.into(),
+        );
+    }
+
+    configure_page_selection_job(
+        &mut job,
+        &args.page_ops,
+        args.remove_unreferenced_resources.into(),
+    )?;
 
     let mut pdf = match job.create_qpdf()? {
         Some(pdf) => pdf,
@@ -6029,6 +6024,51 @@ fn run_page_operations_with_qpdf_job(
             message: String::new(),
         })),
     }
+}
+
+/// Configure the page-selection controls shared by both CLI surfaces.
+fn configure_page_selection_job(
+    job: &mut QPDFJob,
+    page_ops: &PageOpArgs,
+    remove_unref: CliRemoveUnreferencedResources,
+) -> CliResult<()> {
+    configure_keep_files_open(job, page_ops)?;
+    let raw_specs = if page_ops.pages.is_empty() {
+        Vec::new()
+    } else {
+        configured_page_specs(page_ops)?
+    };
+    let mut configuration = job.config();
+    for spec in raw_specs {
+        let password = spec.raw_password.or_else(|| {
+            spec.password
+                .as_ref()
+                .map(|password| arg_parser::os_bytes(password))
+        });
+        configuration.add_page_spec(PathBuf::from(spec.file_token), &spec.range, password)?;
+    }
+    for parameter in &page_ops.rotate {
+        configuration.rotate(arg_parser::os_bytes(parameter.as_os_str()))?;
+    }
+    for parameter in &page_ops.collate {
+        configuration.collate(parameter.as_bytes())?;
+    }
+    if let Some(parameter) = page_ops.split_pages.as_deref() {
+        configuration.split_pages(parameter.as_bytes())?;
+    }
+    configuration.remove_unreferenced_resources(remove_unref.into());
+    Ok(())
+}
+
+/// Complete page extraction through the same configured QPDFJob used to open
+/// sources, select pages, transform, write, and report warnings.
+fn run_page_extraction_job(
+    mut job: QPDFJob,
+    page_ops: &PageOpArgs,
+    remove_unref: CliRemoveUnreferencedResources,
+) -> CliResult<()> {
+    configure_page_selection_job(&mut job, page_ops, remove_unref)?;
+    finish_job_exit_status(job.run()?)
 }
 
 #[allow(clippy::too_many_arguments)]
