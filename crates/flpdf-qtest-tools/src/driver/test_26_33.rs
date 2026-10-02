@@ -524,13 +524,10 @@ pub(crate) fn run_test_31<R: Read + Seek>(
     let direct_null = ObjectHandle::parse_with_context(pdf, b"null", "")?;
     // qpdf uses `isDirectNull` here; preserve its identity short-circuit before
     // using the resolving null predicate (`libqpdf/QPDFObjectHandle.cc:344-350`).
-    let is_direct_null = if direct_null.is_direct() {
-        direct_null.try_is_null()
-    } else {
-        Ok(false)
-    };
+    assert!(direct_null.is_direct());
+    let is_null = direct_null.try_is_null();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    assert!(is_direct_null?);
+    assert!(is_null?);
 
     let invalid_objgen =
         ObjectHandle::parse_with_context(pdf, b"[0 0 R -1 0 R 1 65535 R 1 100000 R 1 -1 R]", "")?;

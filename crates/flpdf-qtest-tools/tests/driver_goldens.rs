@@ -146,8 +146,8 @@ fn test_31_uses_the_canonical_lazy_null_accessor() {
         test_31.contains("o2.try_is_integer()?")
             && test_31.contains("o2.try_get_int_value()?")
             && test_31.contains("recovered.try_is_null()")
-            && test_31.contains("let is_direct_null = if direct_null.is_direct()")
-            && test_31.contains("direct_null.try_is_null()"),
+            && test_31.contains("assert!(direct_null.is_direct());")
+            && test_31.contains("let is_null = direct_null.try_is_null();"),
         "test_31 must use qpdf-resolving integer/null accessors and the direct-null predicate"
     );
     assert!(
