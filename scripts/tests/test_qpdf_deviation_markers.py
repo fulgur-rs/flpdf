@@ -308,11 +308,6 @@ class MaxParseDepthDeviationInventoryTests(unittest.TestCase):
                 "fn collect_direct_handle_refs_with_stream_parameters_context(",
                 "if depth > MAX_PARSE_DEPTH",
             ),
-            (
-                "crates/flpdf/src/object_handle.rs",
-                "fn write_handle(\n        &mut self,",
-                "if depth > crate::parser::MAX_PARSE_DEPTH",
-            ),
         ]
         for path, signature, guard in guards:
             with self.subTest(path=path, signature=signature):
@@ -334,7 +329,6 @@ class MaxParseDepthDeviationInventoryTests(unittest.TestCase):
         helpers = [
             ("crates/flpdf/src/writer/object.rs", "UnparseWalkDepthGuard"),
             ("crates/flpdf/src/writer/plain/body.rs", "ContentEmitWalkDepthGuard"),
-            ("crates/flpdf/src/object_handle.rs", "DirectGraphWalkDepthGuard"),
         ]
         for path, helper in helpers:
             with self.subTest(path=path, helper=helper):
