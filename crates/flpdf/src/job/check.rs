@@ -630,37 +630,24 @@ fn render_encryption_report<R: Read + Seek>(
         output.extend_from_slice(b"Supplied password is user password\n");
     }
 
-    for (index, label) in [
-        "extract for accessibility",
-        "extract for any purpose",
-        "print low resolution",
-        "print high resolution",
-        "modify document assembly",
-        "modify forms",
-        "modify annotations",
-        "modify other",
-        "modify anything",
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    let permission_checks: [(&str, fn(&PermissionReport) -> bool); 9] = [
+        ("extract for accessibility", |p| p.accessibility),
+        ("extract for any purpose", |p| p.extract_all),
+        ("print low resolution", |p| p.print_low),
+        ("print high resolution", |p| p.print_high),
+        ("modify document assembly", |p| p.modify_assembly),
+        ("modify forms", |p| p.modify_form),
+        ("modify annotations", |p| p.modify_annotation),
+        ("modify other", |p| p.modify_other),
+        ("modify anything", |p| p.modify_all),
+    ];
+    for (label, permission_check) in permission_checks {
         // Each qpdf allow* permission query calls isEncrypted(R, P), which
         // delegates to the full overload and rereads /P, /R, and /V. Preserve
         // that read and warning order against the live trailer each time.
         let (permissions, revision, _) = current_encryption_parameters(pdf)?;
         let permission = permission_report(revision, permissions);
-        let allowed = match index {
-            0 => permission.accessibility,
-            1 => permission.extract_all,
-            2 => permission.print_low,
-            3 => permission.print_high,
-            4 => permission.modify_assembly,
-            5 => permission.modify_form,
-            6 => permission.modify_annotation,
-            7 => permission.modify_other,
-            8 => permission.modify_all,
-            _ => unreachable!("permission labels and accessors have the same length"),
-        };
+        let allowed = permission_check(&permission);
         output.extend_from_slice(format!("{label}: {}\n", show_bool(allowed)).as_bytes());
     }
 
