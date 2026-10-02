@@ -603,6 +603,39 @@ fn build_pdf_with_duplicate_page_leaf() -> Vec<u8> {
     out
 }
 
+fn build_pdf_with_non_dictionary_page_leaf() -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+    let mut offsets: Vec<u64> = vec![0];
+    let push_obj = |out: &mut Vec<u8>, offsets: &mut Vec<u64>, body: &[u8]| {
+        let n = offsets.len();
+        offsets.push(out.len() as u64);
+        out.extend_from_slice(format!("{n} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    };
+    push_obj(&mut out, &mut offsets, b"<< /Type /Catalog /Pages 2 0 R >>");
+    push_obj(
+        &mut out,
+        &mut offsets,
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    // qpdf still retains this leaf in getAllPages() and calls getKey("/Contents")
+    // when its test tokenizer pipes the page content.
+    push_obj(&mut out, &mut offsets, b"42");
+
+    let xref_start = out.len() as u64;
+    let total = offsets.len();
+    out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+    for offset in &offsets[1..] {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+            .as_bytes(),
+    );
+    out
+}
+
 #[test]
 fn tokenizer_repairs_page_tree_and_clones_duplicate_leaf() {
     // Regression test: qpdf's test_tokenizer.cc enumerates pages via
@@ -633,6 +666,43 @@ fn tokenizer_repairs_page_tree_and_clones_duplicate_leaf() {
     assert!(
         stdout.contains("--- BEGIN PAGE 2 ---"),
         "expected PAGE 2 for the cloned duplicate leaf, got: {stdout}"
+    );
+}
+
+#[test]
+fn tokenizer_reads_contents_for_non_dictionary_page_leaf() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    fs::write(
+        dir.path().join("non_dictionary_page.pdf"),
+        build_pdf_with_non_dictionary_page_leaf(),
+    )
+    .expect("write non_dictionary_page.pdf into tempdir");
+
+    let output = run(&["non_dictionary_page.pdf"], dir.path());
+
+    assert!(
+        output.status.success(),
+        "qpdf retains the repaired page leaf: status={:?}; stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--- BEGIN PAGE 1 ---"),
+        "page output: {stdout}"
+    );
+    assert!(
+        stdout.contains("--- END PAGE 1 ---"),
+        "page output: {stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let key_lookup_warning =
+        "operation for dictionary attempted on object of type integer: returning null for attempted key retrieval";
+    assert_eq!(
+        stderr.matches(key_lookup_warning).count(),
+        2,
+        "qpdf 11.9.0 warns for the malformed page's /MediaBox and unconditional /Contents getKey: {stderr}"
     );
 }
 

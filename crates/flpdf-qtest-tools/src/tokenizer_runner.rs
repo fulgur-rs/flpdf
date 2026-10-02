@@ -334,15 +334,10 @@ fn canonical_page_content_bytes<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page: ObjectHandle,
 ) -> FlpdfResult<Vec<u8>> {
-    pdf.resolve(&page)?;
     let page_description = page.object_ref().map_or_else(
         || "raw page object".to_owned(),
         |page_ref| page_ref.to_string(),
     );
-    if !page.has_key(b"/Contents") {
-        return Ok(Vec::new());
-    }
-
     let contents = page.try_get_key(b"/Contents")?;
     let contents_was_indirect = contents.object_ref().is_some();
     pdf.resolve(&contents)?;
