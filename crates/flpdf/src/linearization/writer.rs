@@ -241,6 +241,30 @@ struct ObjStmLayout {
     source_container_numbers: BTreeSet<u32>,
 }
 
+fn filter_page_dictionary_batches(
+    batches: Vec<RoutedObjStmBatch>,
+    page_dicts: &BTreeSet<QpdfObjGen>,
+) -> Result<Vec<RoutedObjStmBatch>> {
+    let mut filtered = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let mut members = Vec::with_capacity(batch.members.len());
+        for member in batch.members {
+            let object_gen = QpdfObjGen::try_from_object_ref(member)?;
+            if !page_dicts.contains(&object_gen) {
+                members.push(member);
+            }
+        }
+        if !members.is_empty() {
+            filtered.push(RoutedObjStmBatch {
+                members,
+                route: batch.route,
+                source_container_number: batch.source_container_number,
+            });
+        }
+    }
+    Ok(filtered)
+}
+
 impl ObjStmLayout {
     /// `true` when no ObjStm containers are scheduled — the writer then keeps
     /// its classic-xref-table path verbatim (no regression).
@@ -270,29 +294,18 @@ impl ObjStmLayout {
         // The Generate membership already erases them (QPDFWriter.cc:2141), so
         // this is a no-op there; it guards a Preserve source whose ObjStm somehow
         // carried a page dict.
-        let page_dicts: std::collections::BTreeSet<ObjectRef> =
-            crate::pages::page_refs(pdf)?.into_iter().collect();
-        let filter_batches = |batches: Vec<RoutedObjStmBatch>| -> Vec<RoutedObjStmBatch> {
-            batches
-                .into_iter()
-                .filter_map(|batch| {
-                    let members: Vec<ObjectRef> = batch
-                        .members
-                        .into_iter()
-                        .filter(|r| !page_dicts.contains(r))
-                        .collect();
-                    (!members.is_empty()).then_some(RoutedObjStmBatch {
-                        members,
-                        route: batch.route,
-                        source_container_number: batch.source_container_number,
-                    })
-                })
-                .collect()
-        };
+        let page_dicts: BTreeSet<QpdfObjGen> = crate::PageDocumentHelper::new(pdf)
+            .get_all_pages()?
+            .into_iter()
+            .map(|page| page.get_obj_gen())
+            .collect();
         Ok(crate::linearization::plan::ObjStmBatchPlan {
-            open_document_batches: filter_batches(batch_plan.open_document_batches),
-            part3_batches: filter_batches(batch_plan.part3_batches),
-            part4_batches: filter_batches(batch_plan.part4_batches),
+            open_document_batches: filter_page_dictionary_batches(
+                batch_plan.open_document_batches,
+                &page_dicts,
+            )?, // cov:ignore: LLVM assigns the successful open-document filter continuation to this error-propagation terminator; the OpenAction ObjStm integration test covers the route.
+            part3_batches: filter_page_dictionary_batches(batch_plan.part3_batches, &page_dicts)?,
+            part4_batches: filter_page_dictionary_batches(batch_plan.part4_batches, &page_dicts)?,
         })
     }
 
@@ -5548,6 +5561,56 @@ mod tests {
             encrypt_metadata: true,
             metadata_ref: None,
         }
+    }
+
+    #[test]
+    fn objstm_page_filter_matches_raw_object_and_generation() {
+        let batches = vec![
+            RoutedObjStmBatch {
+                members: vec![
+                    ObjectRef::new(3, 0),
+                    ObjectRef::new(7, 0),
+                    ObjectRef::new(8, 0),
+                ],
+                route: ContainerPart::Rest,
+                source_container_number: Some(99),
+            },
+            RoutedObjStmBatch {
+                members: vec![ObjectRef::new(4, 0)],
+                route: ContainerPart::OtherPagePrivate,
+                source_container_number: None,
+            },
+        ];
+        let page_dicts: BTreeSet<QpdfObjGen> = [
+            QpdfObjGen::new(3, 65_535),
+            QpdfObjGen::new(7, 0),
+            QpdfObjGen::new(4, 0),
+        ]
+        .into_iter()
+        .collect();
+
+        let filtered = filter_page_dictionary_batches(batches, &page_dicts).unwrap();
+
+        assert_eq!(filtered.len(), 1, "an all-page batch is removed");
+        assert_eq!(
+            filtered[0].members,
+            vec![ObjectRef::new(3, 0), ObjectRef::new(8, 0)],
+            "same object number with another generation remains; exact raw identities are removed"
+        );
+        assert_eq!(filtered[0].route, ContainerPart::Rest);
+        assert_eq!(filtered[0].source_container_number, Some(99));
+    }
+
+    #[test]
+    fn objstm_page_filter_propagates_qpdf_object_number_range_errors() {
+        let member_number = u32::try_from(i64::from(i32::MAX) + 1).unwrap();
+        let batches = vec![RoutedObjStmBatch {
+            members: vec![ObjectRef::new(member_number, 0)],
+            route: ContainerPart::Rest,
+            source_container_number: None,
+        }];
+
+        assert!(filter_page_dictionary_batches(batches, &BTreeSet::new()).is_err());
     }
 
     #[test]
