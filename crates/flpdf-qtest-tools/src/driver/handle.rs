@@ -78,20 +78,20 @@ fn write_qpdf_handle_into<R: Read + Seek>(
 
     pdf.resolve(value)?;
     let value = value.clone();
-    if let Some(items) = value.as_array() {
+    if value.try_is_array()? {
         bytes.extend_from_slice(b"[ ");
-        for item in items {
+        for item in value.try_get_array_as_vector()? {
             write_qpdf_handle_into(pdf, &item, true, bytes)?;
             bytes.push(b' ');
         }
         bytes.push(b']');
         return Ok(());
     }
-    if let Some(entries) = value.as_dictionary() {
+    if value.try_is_dictionary()? {
         bytes.extend_from_slice(b"<< ");
-        for (key, child) in entries {
+        for (key, child) in value.try_get_dict_as_map()? {
             pdf.resolve(&child)?;
-            if child.is_null() {
+            if child.try_is_null()? {
                 continue;
             }
             let name = key.strip_prefix(b"/").unwrap_or(&key);
