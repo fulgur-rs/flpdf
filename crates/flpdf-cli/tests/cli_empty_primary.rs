@@ -75,6 +75,44 @@ fn empty_primary_plain_write_matches_qpdf() {
 }
 
 #[test]
+fn empty_primary_update_from_json_write_matches_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let update = temp.path().join("update.json");
+    fs::write(
+        &update,
+        r#"{"qpdf":[{"jsonversion":2},{"obj:1 0 R":{"value":{"/Type":"/Catalog","/Pages":"2 0 R","/Custom":"/UPDATED"}},"obj:2 0 R":{"value":{"/Type":"/Pages","/Kids":[],"/Count":0}}}]}"#,
+    )
+    .expect("write JSON update");
+    let update_arg = format!("--update-from-json={}", update.display());
+    let qpdf_output = temp.path().join("qpdf-empty-updated.pdf");
+    let flpdf_output = temp.path().join("flpdf-empty-updated.pdf");
+
+    let qpdf = run_qpdf(&[
+        "--empty",
+        "--static-id",
+        update_arg.as_str(),
+        qpdf_output.to_str().expect("UTF-8 path"),
+    ]);
+    let flpdf = run_flpdf(&[
+        "--empty",
+        "--static-id",
+        update_arg.as_str(),
+        flpdf_output.to_str().expect("UTF-8 path"),
+    ]);
+
+    assert!(qpdf.status.success(), "qpdf stderr: {:?}", qpdf.stderr);
+    assert!(flpdf.status.success(), "flpdf stderr: {:?}", flpdf.stderr);
+    assert_eq!(
+        fs::read(&flpdf_output).expect("flpdf updated output"),
+        fs::read(&qpdf_output).expect("qpdf updated output"),
+        "empty update-from-JSON rewrite must remain byte-identical",
+    );
+}
+
+#[test]
 fn empty_primary_check_matches_qpdf() {
     if !qpdf_available() {
         return;
