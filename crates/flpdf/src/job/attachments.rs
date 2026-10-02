@@ -1046,7 +1046,7 @@ mod tests {
         let filespec_ref = crate::ObjectRef::new(5, 0);
         let filespec = pdf.get_object_handle(filespec_ref);
         filespec.try_is_scalar().expect("resolve filespec");
-        filespec.remove_key(b"/EF");
+        filespec.remove_key(b"/EF").expect("remove embedded stream");
 
         let error = job
             .show_attachment(&mut pdf, b"attachment.txt")

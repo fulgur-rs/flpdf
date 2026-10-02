@@ -549,7 +549,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         if need_appearances.as_boolean() != Some(true) {
             return Ok(());
         }
-        acroform.remove_key(b"/NeedAppearances");
+        acroform.remove_key(b"/NeedAppearances")?;
         Ok(())
     }
 

@@ -162,7 +162,7 @@ fn remap_or_drop_annot_p<R: Read + Seek>(
             Ok(false)
         }
         None => {
-            annot.remove_key(b"/P");
+            annot.remove_key(b"/P")?;
             Ok(true)
         }
     }

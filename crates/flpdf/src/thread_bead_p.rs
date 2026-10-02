@@ -261,7 +261,7 @@ fn remap_or_drop_bead_p<R: Read + Seek>(
         }
         Some(_) => Ok(()), // Surviving under the same ref: nothing to change.
         None => {
-            bead.remove_key(b"/P");
+            bead.remove_key(b"/P")?;
             Ok(())
         }
     }

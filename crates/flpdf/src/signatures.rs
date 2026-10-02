@@ -263,7 +263,7 @@ fn strip_signature_values_from_field<R: Read + Seek>(
         .is_some_and(|entries| entries.contains_key(b"/V".as_slice()));
 
     if field_type.as_deref() == Some(b"Sig") && has_signature_value {
-        field.remove_key(b"/V");
+        field.remove_key(b"/V")?;
         *changed = true;
         if depth == DEFAULT_MAX_SIGNATURE_FIELD_DEPTH {
             return Ok(());

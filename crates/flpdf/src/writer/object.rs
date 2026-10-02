@@ -3015,7 +3015,7 @@ fn root_output_copy_with_adbe(
             extensions = Some(created);
         }
     } else if !have_other && have_adbe {
-        root.remove_key(b"/Extensions");
+        root.remove_key(b"/Extensions")?;
         extensions = None;
     }
 
@@ -3041,7 +3041,7 @@ fn root_output_copy_with_adbe(
                 ]);
                 extensions.replace_key(b"/ADBE", replacement)?;
             } else {
-                extensions.remove_key(b"/ADBE");
+                extensions.remove_key(b"/ADBE")?;
             }
         }
     }

@@ -564,7 +564,7 @@ fn remove_target_acroform<R: Read + Seek>(target: &mut Pdf<R>) -> Result<()> {
     if !catalog.try_is_dictionary()? {
         return Ok(()); // cov:ignore: the seed catalog is always a dict
     }
-    catalog.remove_key(b"/AcroForm");
+    catalog.remove_key(b"/AcroForm")?;
     Ok(())
 }
 
@@ -1975,7 +1975,10 @@ mod tests {
         );
         let mut primary = Pdf::open_mem_owned(primary).expect("open primary");
         let mut secondary = Pdf::empty().expect("open unused secondary");
-        secondary.trailer().remove_key(b"/Root");
+        secondary
+            .trailer()
+            .remove_key(b"/Root")
+            .expect("remove dictionary key");
         let mut inputs = [
             MergeInput {
                 source: &mut primary,

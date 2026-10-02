@@ -132,7 +132,7 @@ pub(crate) fn remove_unreferenced_resources_on_page<R: Read + Seek>(
             })
             .collect::<Vec<_>>();
         for name in remove {
-            dictionary.remove_key(&name);
+            dictionary.remove_key(&name)?;
         }
     }
 
@@ -256,7 +256,7 @@ fn prune_canonical_resource_target<R: Read + Seek>(
             })
             .collect::<Vec<_>>();
         for key in remove {
-            dictionary.remove_key(&key);
+            dictionary.remove_key(&key)?;
         }
     }
 
@@ -478,7 +478,7 @@ fn prune_font_and_xobject_dictionaries(resources: &ObjectHandle, used: &UsedName
             .filter(|name| !names.contains(name.strip_prefix(b"/").unwrap_or(name.as_slice())))
             .collect::<Vec<_>>();
         for name in remove {
-            dictionary.remove_key(&name);
+            dictionary.remove_key(&name)?;
         }
     }
     Ok(())

@@ -3193,7 +3193,7 @@ fn apply_encrypt_trailer_handle_entries<R: Read + Seek>(
         }
     } else {
         if pdf.is_encrypted() {
-            trailer.remove_key(b"/Encrypt");
+            trailer.remove_key(b"/Encrypt")?;
         }
         if deterministic_id {
             trailer.replace_key(
@@ -3239,7 +3239,7 @@ fn build_writer_trailer_handle<R: Read + Seek>(
     // preserve. `linearization::writer::canonical_linearization_trailer_entries`
     // shares this same removal set for the linearized route.
     for key in crate::writer::object::TRIMMED_TRAILER_KEYS {
-        trailer.remove_key(key);
+        trailer.remove_key(key)?;
     }
     // qpdf's writeTrailer substitutes the computed size only for a literal
     // `/Size` key already present in the trimmed trailer. It does not repair a
@@ -4180,7 +4180,7 @@ mod final_handle_writer_tests {
     #[test]
     fn linearized_second_trailer_synthesizes_a_missing_size_like_qpdf() {
         let (_pdf, trailer, _root_ref, _encrypt_ref) = shared_trailer_contract_fixture();
-        trailer.remove_key(b"/Size");
+        trailer.remove_key(b"/Size").expect("remove dictionary key");
 
         let mut output = Vec::new();
         output::with_buffer_sink(&mut output, |out| {
@@ -5478,7 +5478,9 @@ mod final_handle_writer_tests {
     #[test]
     fn direct_canonical_writer_propagates_special_stream_setup_failure() {
         let mut pdf = Pdf::empty().expect("empty PDF");
-        pdf.trailer().remove_key(b"/Root");
+        pdf.trailer()
+            .remove_key(b"/Root")
+            .expect("remove dictionary key");
         let options = WriterOptions {
             qdf: true,
             ..WriterOptions::default()

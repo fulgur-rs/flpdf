@@ -302,9 +302,9 @@ impl LiveDictionary {
         self.handle.replace_key(&key, value)
     }
 
-    fn remove(&self, key: &str) {
+    fn remove(&self, key: &str) -> Result<()> {
         let key = self.actual_key(key);
-        self.handle.remove_key(&key);
+        self.handle.remove_key(&key)
     }
 
     fn contains(&self, key: &str) -> Result<bool> {
@@ -1525,8 +1525,8 @@ impl<K: TreeKey> NNTree<K> {
         let root = self.root_node(pdf)?;
         let current = self.load_node(pdf, &root)?;
         let replacement = self.load_node(pdf, &NodeHandle::root(replacement))?;
-        current.remove("Kids");
-        current.remove(K::ITEMS_KEY);
+        current.remove("Kids")?;
+        current.remove(K::ITEMS_KEY)?;
         if let Some(kids) = replacement.get("Kids")? {
             current.insert("Kids", kids)?;
         }
@@ -1582,8 +1582,8 @@ impl<K: TreeKey> NNTree<K> {
             let first_handle = NodeHandle::indirect(first_ref, first_object);
 
             let root = self.load_node(pdf, &node)?;
-            root.remove("Limits");
-            root.remove(K::ITEMS_KEY);
+            root.remove("Limits")?;
+            root.remove(K::ITEMS_KEY)?;
             root.insert("Kids", ObjectHandle::array(vec![first_handle.handle()]))?; // cov:ignore: split allocates the replacement node in this same PDF
             if is_leaf {
                 cursor.leaf = Some(first_handle.clone());
@@ -1685,7 +1685,7 @@ impl<K: TreeKey> NNTree<K> {
         loop {
             let dictionary = self.load_node(pdf, &node)?;
             let Some(index) = parent_index else {
-                dictionary.remove("Limits");
+                dictionary.remove("Limits")?;
                 return Ok(());
             };
 
@@ -1836,7 +1836,7 @@ impl<K: TreeKey> NNTree<K> {
 
             if path_index == 0 {
                 let root = self.load_node(pdf, &parent_handle)?;
-                root.remove("Kids");
+                root.remove("Kids")?;
                 root.insert(K::ITEMS_KEY, ObjectHandle::array(Vec::new()))?;
                 cursor.path.clear();
                 cursor.clear_position();

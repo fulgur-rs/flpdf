@@ -242,7 +242,7 @@ pub(crate) fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
         // matching qpdf's observed behaviour. `reserved_indirect_fields`
         // (if any) is intentionally left allocated but unlinked here,
         // matching qpdf's own orphaned `new_fields` object in this case.
-        catalog.remove_key(b"/AcroForm");
+        catalog.remove_key(b"/AcroForm")?;
     } else {
         // qpdf creates a fresh array for an indirect /Fields holder and
         // replaces the key on the live AcroForm handle. A direct holder
@@ -359,13 +359,13 @@ fn remove_stale_widget_page_ref(
         return Ok(());
     }
     if removed_pages.contains(&existing_gen) {
-        widget.remove_key(b"/P");
+        widget.remove_key(b"/P")?;
         return Ok(());
     }
     if !existing.try_is_null()? {
         return Ok(());
     }
-    widget.remove_key(b"/P");
+    widget.remove_key(b"/P")?;
     Ok(())
 }
 
@@ -416,7 +416,7 @@ fn strip_dropped_widget_p_refs(
         if is_widget {
             if !widget_to_page.contains_key(&kid.identity_key()) {
                 // Widget on a dropped page — remove stale /P.
-                kid.remove_key(b"/P");
+                kid.remove_key(b"/P")?;
             }
             // Pure widget kids do not have /Kids of their own (spec: a widget
             // annotation is a leaf); no need to recurse.
@@ -1043,7 +1043,7 @@ mod tests {
         for &r in &[ObjectRef::new(7, 0), ObjectRef::new(9, 0)] {
             let widget = pdf.get_object_handle(r);
             widget.try_is_scalar().unwrap();
-            widget.remove_key(b"/P");
+            widget.remove_key(b"/P").expect("remove dictionary key");
         }
 
         // Extract pages 1 and 2 (objects 3 and 4).

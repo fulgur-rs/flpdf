@@ -63,8 +63,8 @@ where
         .as_stream_dict()
         .ok_or_else(|| flpdf::Error::Internal("expected object lost its stream dictionary".into()))?
         .shallow_copy()?;
-    act_dict.remove_key(b"/Length");
-    exp_dict.remove_key(b"/Length");
+    act_dict.remove_key(b"/Length")?;
+    exp_dict.remove_key(b"/Length")?;
 
     // qpdf's dictionary unparse resolves direct children for null visibility,
     // while indirect children remain opaque reference tokens.

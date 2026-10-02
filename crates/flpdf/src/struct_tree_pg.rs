@@ -245,7 +245,7 @@ fn process_elem_dict<R: Read + Seek>(
                     dict.replace_key(b"/Pg", pdf.get_object_handle(new))?;
                 }
                 None if removed_pages.contains(&pg_gen) => {
-                    dict.remove_key(b"/Pg");
+                    dict.remove_key(b"/Pg")?;
                 }
                 _ => {}
             }

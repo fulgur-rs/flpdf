@@ -436,7 +436,9 @@ mod tests {
             .expect("empty catalog")
             .try_get_key(b"/Pages")
             .expect("empty /Pages");
-        pages.remove_key(b"/MediaBox");
+        pages
+            .remove_key(b"/MediaBox")
+            .expect("remove dictionary key");
         let leaf = pdf
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("indirect dictionary leaf");

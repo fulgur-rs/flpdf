@@ -178,7 +178,7 @@ fn qdf_and_normalize_progress_id_deletion_does_not_restore_the_setup_id() {
         writer.set_output_memory().unwrap();
         writer.register_progress_reporter(Box::new(move |percent| {
             if percent == 0 {
-                trailer.remove_key(b"/ID");
+                trailer.remove_key(b"/ID").expect("remove dictionary key");
             }
             Ok(())
         }));
@@ -1149,7 +1149,8 @@ fn qdf_objstm_pair_offsets_reuse_first_pass_positions_after_member_mutation() {
             // pass's first member in this fixture. Remove the mutation there
             // so first- and second-pass body positions intentionally differ.
             2 => {
-                root.remove_key(b"/FirstPassOnlyLongMutation");
+                root.remove_key(b"/FirstPassOnlyLongMutation")
+                    .expect("remove dictionary key");
             }
             _ => {}
         }

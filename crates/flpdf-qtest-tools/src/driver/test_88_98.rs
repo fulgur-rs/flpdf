@@ -100,7 +100,7 @@ pub(crate) fn run_test_88<R: Read + Seek>(
     // `new_dict` shares internals with the same element in `arr` --
     // qpdf's own comment at test_driver.cc:3140-3143 -- so mutating
     // `new_dict` below is observable through `arr.unparse()`.
-    new_dict.remove_key(b"/R");
+    new_dict.remove_key(b"/R")?;
     new_dict.replace_key(b"/T", ObjectHandle::parse(b"/U")?)?;
     assert_eq!(
         arr.unparse(),

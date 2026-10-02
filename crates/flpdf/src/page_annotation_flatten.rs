@@ -434,7 +434,7 @@ fn replace_pruned_annots<R: Read + Seek>(
         .try_array_len()?
         .is_some_and(|length| length == 0)
     {
-        page.remove_key(b"/Annots");
+        page.remove_key(b"/Annots")?;
     } else if preserve_indirect_holder {
         if let Some(array_ref) = old_annots.object_ref() {
             pdf.replace_object(array_ref, new_annots)?;
@@ -867,7 +867,7 @@ fn remove_acroform<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
     // on `m->all_pages.empty()`), so this tail is the boundary that reports a
     // catalog invalidated after the walk.
     let root = pdf.root_handle()?;
-    root.remove_key(b"/AcroForm");
+    root.remove_key(b"/AcroForm")?;
     // qpdf's own `flattenAnnotations` (`QPDFPageDocumentHelper.cc:56-77`)
     // analyzes through a scope-local `QPDFAcroFormDocumentHelper` that goes
     // out of scope on return, so a later step (e.g. `flattenRotation`'s

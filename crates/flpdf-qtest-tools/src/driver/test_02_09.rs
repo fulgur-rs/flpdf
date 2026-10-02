@@ -207,7 +207,7 @@ pub(crate) fn run_test_4<R: Read + Seek>(
     let trailer = pdf.trailer();
     let mut qtest = trailer.try_get_key(b"/QTest")?;
     qtest.make_direct(false)?;
-    qtest.remove_key(b"/Subject");
+    qtest.remove_key(b"/Subject")?;
     qtest.replace_key(
         b"/Author",
         ObjectHandle::string(b"Mr. Potato Head".to_vec()),

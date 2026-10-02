@@ -174,7 +174,7 @@ fn push_node_attributes<R: Read + Seek>(
                     .to_owned(),
             ));
         }
-        dict.remove_key(key);
+        dict.remove_key(key)?;
         let value = if value.is_indirect() {
             value
         } else if !is_scalar(&value)? {

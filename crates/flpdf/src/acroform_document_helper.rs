@@ -843,7 +843,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                     .as_ref()
                     .is_some_and(|entries| entries.keys().any(|entry| entry.as_slice() == key));
                 if present {
-                    field.remove_key(key);
+                    field.remove_key(key)?;
                 }
             }
         }
@@ -2019,7 +2019,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             acroform.replace_key(b"/NeedAppearances", ObjectHandle::boolean(true))?;
             Ok(())
         } else {
-            acroform.remove_key(b"/NeedAppearances");
+            acroform.remove_key(b"/NeedAppearances")?;
             Ok(())
         }
     }

@@ -153,7 +153,7 @@ pub(crate) fn adjust_appearance_stream_handle<R: Read + Seek>(
             let existing_old = subdict.try_get_key(&old_key)?;
             if !existing_old.try_is_null()? {
                 subdict.replace_key(&new_key, existing_old)?;
-                subdict.remove_key(&old_key);
+                subdict.remove_key(&old_key)?;
             }
         }
     }
@@ -167,7 +167,7 @@ pub(crate) fn adjust_appearance_stream_handle<R: Read + Seek>(
         let category = private_resources.try_get_key(&category_key)?;
         category.try_dereference()?;
         if category.try_is_dictionary()? && category.try_get_keys()?.is_empty() {
-            private_resources.remove_key(&category_key);
+            private_resources.remove_key(&category_key)?;
         }
     }
 

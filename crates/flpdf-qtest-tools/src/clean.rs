@@ -10,7 +10,7 @@ use flpdf::ObjectHandle;
 /// comparing objects. The `/ID` shape guard and byte-based equality follow
 /// `compare-for-test/qpdf-test-compare.cc:111-126`.
 pub(crate) fn clean_trailer_handle(trailer: &ObjectHandle) -> flpdf::Result<()> {
-    trailer.remove_key(b"/Length");
+    trailer.remove_key(b"/Length")?;
     let id = trailer.try_get_key(b"/ID")?;
     if !id.try_is_array()? {
         return Ok(());
@@ -37,7 +37,7 @@ pub(crate) fn clean_encryption_handle(trailer: &ObjectHandle) -> flpdf::Result<(
         return Ok(());
     }
     for key in [b"/O".as_ref(), b"/OE", b"/U", b"/UE", b"/Perms"] {
-        encrypt.remove_key(key);
+        encrypt.remove_key(key)?;
     }
     Ok(())
 }
