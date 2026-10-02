@@ -76,7 +76,7 @@ where
         return Ok(format!("{label}: stream dictionaries differ"));
     }
 
-    if stream_is_xref(&act_dict, actual_pdf)? {
+    if stream_is_xref(&act_dict)? {
         return Ok(String::new());
     }
     if stream_uses_flatedecode(&act_dict, actual_pdf)? {
@@ -110,13 +110,9 @@ fn raw_stream_data(handle: &ObjectHandle) -> flpdf::Result<Rc<Vec<u8>>> {
         .map_or_else(|| handle.get_raw_stream_data(), Ok)
 }
 
-fn stream_is_xref<R: Read + Seek>(
-    stream_dict: &ObjectHandle,
-    pdf: &mut Pdf<R>,
-) -> flpdf::Result<bool> {
+fn stream_is_xref(stream_dict: &ObjectHandle) -> flpdf::Result<bool> {
     let type_handle = stream_dict.try_get_key(b"/Type")?;
-    pdf.resolve(&type_handle)?;
-    Ok(type_handle.as_name().is_some_and(|name| name == b"XRef"))
+    type_handle.try_is_name_and_equals(b"XRef")
 }
 
 fn stream_uses_flatedecode<R: Read + Seek>(
@@ -218,6 +214,22 @@ mod tests {
         let mut encoder = ZlibEncoder::new(Vec::new(), level);
         encoder.write_all(bytes).unwrap();
         encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn xref_stream_classification_resolves_the_type_name() {
+        let pdf = dummy_pdf();
+        let xref_type = pdf
+            .make_indirect_from_object_handle(ObjectHandle::name(b"XRef".to_vec()))
+            .expect("allocate an indirect /XRef name");
+        let xref_dictionary = ObjectHandle::dictionary(vec![(b"/Type".to_vec(), xref_type)]);
+        let other_dictionary = ObjectHandle::dictionary(vec![(
+            b"/Type".to_vec(),
+            ObjectHandle::name(b"Page".to_vec()),
+        )]);
+
+        assert!(stream_is_xref(&xref_dictionary).unwrap());
+        assert!(!stream_is_xref(&other_dictionary).unwrap());
     }
 
     #[test]
