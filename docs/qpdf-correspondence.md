@@ -4668,6 +4668,22 @@ caller-side `Pdf::resolve` はゼロになり、既存の indirect/direct assert
 と parse error の検証は保持される。case 42/98 の stream dictionary
 `getDict` 相当はこの bounded slice の対象外である。
 
+### qtest A6 test 31 residual integer/null accessor cutover `flpdf-3yn9.48.208.13` (2026-10-02)
+
+qpdf test 31 checks the parsed integer with `isInteger()` then `getIntValue()`,
+checks an indirect array item with `isNull()`, and checks a parsed direct null
+with `isDirectNull()` (`qpdf/test_driver.cc:1179-1207`). The first three accessors
+resolve their receivers; `isDirectNull()` explicitly does not
+(`libqpdf/QPDFObjectHandle.cc:344-361,502-513`).
+
+The test 31 port now uses `try_is_integer()`/`try_get_int_value()` for the
+integer assertion and `try_is_null()` for parser-result null observations.
+The direct-null assertion combines `is_direct()` with `try_is_null()`, matching
+qpdf's direct identity plus null-type test. The earlier `.48.104` slice already
+migrated the indirect `null_item` check; this child removes the remaining
+non-resolving integer/null calls. A source route guard protects the full test 31
+sequence. The broader A6 row remains mixed because other caller families remain.
+
 ### qtest A6 test 24 reserved array type checks `flpdf-3yn9.48.208.11` (2026-10-02)
 
 qpdf test 24 asks `res1.isArray()` while the object is still reserved, then
