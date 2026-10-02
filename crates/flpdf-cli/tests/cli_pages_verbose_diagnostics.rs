@@ -436,6 +436,43 @@ fn rewrite_pages_ordinary_output_uses_the_canonical_job_writer_route() {
     );
 }
 
+#[test]
+fn linearized_content_normalization_is_job_owned() {
+    let cli_source = include_str!("../src/main.rs");
+    let job_source = include_str!("../../flpdf/src/job/lifecycle.rs");
+
+    assert!(
+        !cli_source.contains("normalize_page_contents("),
+        "the CLI must not normalize a prepared Pdf between Job stages"
+    );
+
+    let writer = job_source
+        .split_once("pub fn write_qpdf")
+        .expect("QPDFJob writer boundary should remain named")
+        .1
+        .split_once("\n    pub fn ")
+        .expect("another public Job method should follow write_qpdf")
+        .0;
+    assert!(
+        writer.contains("self.normalize_page_contents(pdf)?"),
+        "linearized content normalization must run inside QPDFJob::write_qpdf"
+    );
+
+    let rewrite_config = cli_source
+        .split_once("fn configure_rewrite_job")
+        .expect("rewrite Job configuration should remain named")
+        .1
+        .split_once("\nfn run_rewrite_opened")
+        .expect("opened rewrite route should follow its Job configuration")
+        .0;
+    assert!(
+        rewrite_config.contains("if options.content_normalization_set")
+            && rewrite_config
+                .contains("job.set_content_normalization(options.content_normalization)"),
+        "explicit normalize-content=y and normalize-content=n must reach Job state"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn verbose_pages_preserves_non_utf8_source_and_output_path_bytes() {

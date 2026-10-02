@@ -6,6 +6,7 @@
 
 use super::attachments::AttachmentAddOptions;
 use super::attachments::AttachmentCopyOptions;
+use super::content_normalization;
 use super::flatten_rotation_on_document;
 use super::image_optimization::{optimize_images, ImageOptimizationOptions};
 use super::json::{JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData};
@@ -3472,6 +3473,10 @@ impl QPDFJob {
             return Ok(());
         }
 
+        if self.configuration.linearize && self.configuration.normalize_content == Some(true) {
+            self.normalize_page_contents(pdf)?;
+        }
+
         // Reserving again here is a no-op once `apply_transformations` has
         // done it, matching qpdf's own second call, which its comment calls
         // "defensive and harmless" (`QPDFJob.cc:3051-3053`). It still matters
@@ -3693,6 +3698,47 @@ impl QPDFJob {
                 Err(error)
             }
         }
+    }
+
+    fn normalize_page_contents<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<()> {
+        let warnings = content_normalization::normalize_page_contents(pdf)?;
+        if warnings.is_empty() {
+            return Ok(());
+        }
+
+        self.record_warnings();
+        if self.suppress_warnings || pdf.suppress_warnings() {
+            return Ok(());
+        }
+
+        let input_name = if self.empty_primary_created {
+            "empty PDF".to_owned()
+        } else {
+            String::from_utf8_lossy(self.input_name_bytes()).into_owned()
+        };
+        for warning in warnings {
+            let location = match warning.parsed_offset {
+                Some(offset) => format!("{input_name} (offset {offset})"),
+                None => input_name.clone(),
+            };
+            let mut message =
+                format!("WARNING: {location}: content normalization encountered bad tokens\n");
+            if warning.last_token_was_bad {
+                message.push_str(&format!(
+                    "WARNING: {location}: normalized content ended with a bad token; \
+                     you may be able to resolve this by coalescing content streams in \
+                     combination with normalizing content. From the command line, \
+                     specify --coalesce-contents\n"
+                ));
+            }
+            message.push_str(&format!(
+                "WARNING: {location}: Resulting stream data may be corrupted but is may \
+                 still useful for manual inspection. For more information on this \
+                 warning, search for content normalization in the manual.\n"
+            ));
+            self.logger.warn(message)?;
+        }
+        Ok(())
     }
 
     /// Apply the configured qpdf document transformations to an already-open

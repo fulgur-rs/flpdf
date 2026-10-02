@@ -18,6 +18,7 @@ mod acroform_field_prune;
 mod attachment_list;
 mod attachments;
 mod check;
+mod content_normalization;
 mod image_optimization;
 mod inspection;
 mod json;

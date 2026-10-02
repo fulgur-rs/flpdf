@@ -16,18 +16,17 @@ use flpdf::writer::DecodeLevel as StreamDecodeLevel;
 use flpdf::PasswordWriteNotice;
 use flpdf::{
     json_inspect::{DecodeLevel, JsonKey},
-    normalize_content_stream, parse_pdf_version, CompressStreams, CopyEncryptionSource,
-    EncryptMethod, EncryptParams, Error, Matrix, NewlineBeforeEndstream, ObjectHandle,
-    ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, PageObjectHelper, PasswordMode,
-    Pdf, PdfOpenOptions, PdfVersion, PermissionsConfig, PrintPermission, QPDFLogger,
-    R2PermissionsConfig, StreamDataMode, UsageError, WriterConfiguration,
+    parse_pdf_version, CompressStreams, CopyEncryptionSource, EncryptMethod, EncryptParams, Error,
+    Matrix, NewlineBeforeEndstream, ObjectHandle, ObjectKeyAlg, ObjectRef, ObjectStreamMode,
+    PageDocumentHelper, PageObjectHelper, PasswordMode, Pdf, PdfOpenOptions, PdfVersion,
+    PermissionsConfig, PrintPermission, QPDFLogger, R2PermissionsConfig, StreamDataMode,
+    UsageError, WriterConfiguration,
 };
 use flpdf::{
     pages::tree_rebuild::{rebuild_page_tree_with_duplicate_hook, RebuildResult},
     qutil::parse_numrange,
     PageRange,
 };
-use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, Write};
@@ -5885,12 +5884,6 @@ fn run_page_operations_with_qpdf_job(
 
     let input_name = input.clone().unwrap_or_else(|| PathBuf::from("empty PDF"));
     let page_labels = page_label_options(args.set_page_labels.as_deref(), args.remove_page_labels);
-    let linearize_normalization =
-        args.linearize && options.content_normalization_set && options.content_normalization;
-    // Keep the writer-side normalization state enabled after the explicit
-    // create-stage pass. The live stream marker makes the canonical writer
-    // skip a second tokenizer pass while still selecting qpdf's
-    // normalization-before-compression policy for linearization.
     let job_options = options;
 
     let mut job = configure_rewrite_job(
@@ -6029,18 +6022,6 @@ fn run_page_operations_with_qpdf_job(
             }))
         }
     };
-    if linearize_normalization {
-        let warnings = normalize_page_contents(&mut pdf)?;
-        if !warnings.is_empty() {
-            job.record_warnings();
-            if !args.no_warn {
-                for warning in warnings {
-                    emit_content_normalization_warnings(&input_name, warning)?;
-                }
-            }
-        }
-    }
-
     match job.write_qpdf(&mut pdf) {
         Ok(()) => finish_job_exit_status(job.get_exit_code()),
         Err(_) => Err(Box::new(CliExitError {
@@ -6063,7 +6044,7 @@ fn run_rewrite_with_qpdf_job(
     linearize_pass1: Option<&Path>,
     remove_restrictions: bool,
     decrypt: bool,
-    normalize_content: bool,
+    _normalize_content: bool,
     coalesce_contents: bool,
     generate_appearances: bool,
     image_options: ImageTransformOptions,
@@ -6079,12 +6060,8 @@ fn run_rewrite_with_qpdf_job(
     remove_unreferenced_resources: RemoveUnreferencedResources,
 ) -> CliResult<()> {
     // qpdf's createQPDF owns input creation and all document transformations;
-    // only writer configuration is deferred until writeQPDF. The explicit
-    // normalization pass remains after createQPDF and before writeQPDF, while
-    // its writer-side option stays enabled so linearization can consume the
-    // normalized-stream membership.
-    let linearize_normalization =
-        linearize && normalize_content && options.content_normalization_set;
+    // QPDFJob::write_qpdf owns the pre-write normalization pass for linearized
+    // output after this function installs the same writer configuration.
     let job_options = options.clone();
 
     let mut job = configure_rewrite_job(
@@ -6137,18 +6114,6 @@ fn run_rewrite_with_qpdf_job(
             }))
         }
     };
-    if linearize_normalization {
-        let warnings = normalize_page_contents(&mut pdf)?;
-        if !warnings.is_empty() {
-            job.record_warnings();
-            if !no_warn {
-                for warning in warnings {
-                    emit_content_normalization_warnings(input, warning)?;
-                }
-            }
-        }
-    }
-
     // qpdf constructs writer options inside writeOutfile, after createQPDF;
     // keep password normalization and weak-crypto validation at that same
     // boundary rather than exposing them during input creation.
@@ -6213,6 +6178,12 @@ fn configure_rewrite_job(
     job.set_progress(options.progress);
     job.set_report_memory_usage(options.report_memory_usage);
     job.set_linearization(linearize, linearize_pass1.map(Path::to_path_buf));
+    if options.content_normalization_set {
+        // qpdf keeps normalizeContent on QPDFJob and reapplies it when
+        // setWriterOptions builds the writer. Preserve explicit `n` as well
+        // as `y` so the Job owns both the pre-write decision and writer state.
+        job.set_content_normalization(options.content_normalization);
+    }
 
     {
         let mut configuration = job.config();
@@ -6295,7 +6266,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
     linearize_pass1: Option<&Path>,
     remove_restrictions: bool,
     _decrypt: bool,
-    normalize_content: bool,
+    _normalize_content: bool,
     coalesce_contents: bool,
     _remove_unref: CliRemoveUnreferencedResources,
     generate_appearances: bool,
@@ -6308,12 +6279,6 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
     no_warn: bool,
     options: WriterOptions,
 ) -> CliResult<()> {
-    // The linearized writer has pass-one and final emission phases. Perform
-    // the explicit canonical content pass once before those phases, but keep
-    // the writer-side normalization state enabled: the stream marker avoids a
-    // second tokenizer pass and preserves qpdf's compression precedence.
-    let linearize_normalization =
-        linearize && normalize_content && options.content_normalization_set;
     let job_options = options.clone();
     let mut job = configure_rewrite_job(
         input,
@@ -6335,17 +6300,6 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         &job_options,
     )?;
     apply_transformations_for_cli(&mut job, &mut pdf)?;
-    if linearize_normalization {
-        let warnings = normalize_page_contents(&mut pdf)?;
-        if !warnings.is_empty() {
-            job.record_warnings();
-            if !no_warn {
-                for warning in warnings {
-                    emit_content_normalization_warnings(input, warning)?;
-                }
-            }
-        }
-    }
     // qpdf builds the writer only inside writeQPDF -> writeOutfile ->
     // setWriterOptions (`QPDFJob.cc:484-495,2752-2761`), so its write-time
     // validation - the auto-password notices and the RC4 refusal - runs after
@@ -8163,120 +8117,6 @@ fn page_ops_active(p: &PageOpArgs) -> bool {
         || p.empty
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ContentNormalizationWarning {
-    parsed_offset: Option<u64>,
-    last_token_was_bad: bool,
-}
-
-/// Normalize all page content streams in an in-memory PDF graph.
-///
-/// Shared by the plain and linearized rewrite paths so both use the same page
-/// traversal, indirect `/Contents` handling, alias deduplication, and warning
-/// order.
-fn normalize_page_contents<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-) -> CliResult<Vec<ContentNormalizationWarning>> {
-    let mut warnings = Vec::new();
-    let mut seen = HashSet::new();
-    let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
-    for page in pages {
-        warnings.extend(apply_normalize_content(page, &mut seen)?);
-    }
-    Ok(warnings)
-}
-
-/// Normalize the content stream(s) for a single page.
-///
-/// Reads each `/Contents` stream referenced by the page, applies
-/// [`normalize_content_stream`] to the decoded bytes, and writes the result
-/// back into the in-memory [`Pdf`] model through live `ObjectHandle` mutation.
-///
-/// The `/Length` entry in each stream's dictionary is updated to the new
-/// (normalized) byte count. No filter is applied here — the canonical writer
-/// emits the already-normalized bytes through qpdf's normalization branch,
-/// which takes precedence over ordinary stream compression.
-fn apply_normalize_content(
-    page: ObjectHandle,
-    seen: &mut HashSet<ObjectRef>,
-) -> CliResult<Vec<ContentNormalizationWarning>> {
-    let mut warnings = Vec::new();
-    let contents = page.try_get_key(b"/Contents")?;
-    let contents_ref = contents.object_ref();
-
-    let mut streams = Vec::new();
-    if contents.try_is_stream_of_type(b"", b"")? {
-        if let Some(stream_ref) = contents_ref {
-            streams.push((stream_ref, contents));
-        }
-    } else if contents.try_is_array()? {
-        let items = contents.try_get_array_as_vector()?;
-        for item in items {
-            let item_ref = item.object_ref();
-            if item.try_is_stream_of_type(b"", b"")? {
-                if let Some(item_ref) = item_ref {
-                    streams.push((item_ref, item));
-                }
-            }
-        }
-    }
-
-    for (stream_ref, stream) in streams {
-        if let Some(last_bad) = normalize_and_store_stream_handle(stream_ref, stream, seen)? {
-            warnings.push(last_bad);
-        }
-    }
-    Ok(warnings)
-}
-
-/// Normalize the decoded bytes of the indirect stream at `stream_ref` through
-/// the live ObjectHandle stream pipeline and mutate that same qpdf-style
-/// stream in place. Keeping the stream handle live is important for malformed
-/// content holders: the writer must observe one canonical resolution and not
-/// parse the legacy raw Object a second time.
-fn normalize_and_store_stream_handle(
-    stream_ref: ObjectRef,
-    stream: ObjectHandle,
-    seen: &mut HashSet<ObjectRef>,
-) -> CliResult<Option<ContentNormalizationWarning>> {
-    if !seen.insert(stream_ref) {
-        return Ok(None);
-    }
-
-    // Decode the stored bytes through qpdf's canonical stream pipeline. This
-    // resolves indirect filters/parameters and preserves source recovery
-    // diagnostics on the owning document.
-    let decoded = stream.get_stream_data(StreamDecodeLevel::All)?;
-
-    // Normalize the decoded content stream bytes.
-    let normalized = normalize_content_stream(decoded.as_ref());
-    let warning = normalized
-        .any_bad_tokens()
-        .then(|| ContentNormalizationWarning {
-            parsed_offset: u64::try_from(stream.get_parsed_offset()).ok(),
-            last_token_was_bad: normalized.last_token_was_bad(),
-        });
-    let normalized = normalized.into_bytes();
-
-    // Remove filter / encode-form keys and install the fresh direct length;
-    // the normalized payload is raw. This is qpdf's in-place stream mutation
-    // boundary, so the canonical live writer observes the updated stream.
-    let normalized = std::rc::Rc::new(normalized);
-    stream.replace_stream_data(
-        std::rc::Rc::clone(&normalized),
-        Some(ObjectHandle::null()),
-        Some(ObjectHandle::null()),
-    );
-    if let Some(dict) = stream.as_stream_dict() {
-        dict.replace_key(
-            b"/Length",
-            ObjectHandle::integer(i64::try_from(normalized.len())?),
-        )?;
-    }
-    stream.mark_content_normalization_applied();
-    Ok(warning)
-}
-
 fn run_qdf(
     input: Option<PathBuf>,
     output: Option<PathBuf>,
@@ -9017,11 +8857,6 @@ fn logger_info(data: impl AsRef<[u8]>) -> CliResult<()> {
     Ok(())
 }
 
-fn logger_warn(data: impl AsRef<[u8]>) -> CliResult<()> {
-    cli_logger().warn(data)?;
-    Ok(())
-}
-
 fn emit_logger_info(data: impl AsRef<[u8]>) {
     let _ = logger_info(data);
 }
@@ -9053,16 +8888,6 @@ fn progname() -> String {
         .ok()
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "flpdf".to_string())
-}
-
-/// Render the `<file>` / `<file> (offset N)` location part shared by the
-/// qpdf-shaped diagnostic lines (qpdf 11.9.0 observed format; qpdf
-/// suppresses the offset display when it is unknown).
-fn diagnostic_location(input: &Path, offset: Option<u64>) -> String {
-    match offset {
-        Some(offset) => format!("{} (offset {offset})", input.display()),
-        None => input.display().to_string(),
-    }
 }
 
 /// Finish a successful operation after all requested output has been emitted.
@@ -9121,29 +8946,6 @@ fn finish_warning_state(has_warnings: bool, no_warn: bool) -> CliResult<()> {
     }
 
     finish_job_exit_status(job.complete_report()?)
-}
-
-fn emit_content_normalization_warnings(
-    input: &Path,
-    warning: ContentNormalizationWarning,
-) -> CliResult<()> {
-    let location = diagnostic_location(input, warning.parsed_offset);
-    let mut message =
-        format!("WARNING: {location}: content normalization encountered bad tokens\n");
-    if warning.last_token_was_bad {
-        message.push_str(&format!(
-            "WARNING: {location}: normalized content ended with a bad token; \
-             you may be able to resolve this by coalescing content streams in \
-             combination with normalizing content. From the command line, \
-             specify --coalesce-contents\n"
-        ));
-    }
-    message.push_str(&format!(
-        "WARNING: {location}: Resulting stream data may be corrupted but is may \
-         still useful for manual inspection. For more information on this \
-         warning, search for content normalization in the manual.\n"
-    ));
-    logger_warn(message)
 }
 
 /// Prefix a fatal post-open error with the input path so main() renders the

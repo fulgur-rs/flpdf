@@ -177,6 +177,51 @@ fn pages_object_output(catalog: &str, trailer: &str, path: &Path) -> String {
     show_qpdf_object(path, &pages)
 }
 
+fn one_page_pdf_with_content(content: &[u8]) -> Vec<u8> {
+    let stream = [
+        format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).into_bytes(),
+        content.to_vec(),
+        b"\nendstream\nendobj\n".to_vec(),
+    ]
+    .concat();
+    let objects: [&[u8]; 4] = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>\nendobj\n",
+        &stream,
+    ];
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for object in objects {
+        offsets.push(bytes.len());
+        // Each object body already carries its object header to keep the
+        // content stream's declared length easy to inspect in this fixture.
+        bytes.extend_from_slice(object);
+    }
+    let xref_start = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
+fn first_page_content(path: &Path) -> Vec<u8> {
+    let bytes = std::fs::read(path).expect("read output PDF");
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("open output PDF");
+    let pages = PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .expect("read output pages");
+    let page_ref = pages
+        .first()
+        .and_then(|page| page.object_ref())
+        .expect("output has an indirect first page");
+    flpdf::pages::page_content_bytes(&mut pdf, page_ref).expect("read page content")
+}
+
 fn first_id_hex(trailer: &str) -> Option<&str> {
     trailer.split("/ID [ <").nth(1)?.split('>').next()
 }
@@ -730,6 +775,79 @@ fn assert_qpdf_rejects_password(path: &Path, password: &str) {
 // ===========================================================================
 // --pages : page-selection parity
 // ===========================================================================
+
+#[test]
+fn pages_linearize_normalize_content_matches_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("crlf-content.pdf");
+    let qpdf_output = temp.path().join("qpdf-linearized.pdf");
+    let flpdf_output = temp.path().join("flpdf-linearized.pdf");
+    std::fs::write(&source, one_page_pdf_with_content(b"q\r\nQ")).unwrap();
+
+    let args = [
+        "--linearize".to_owned(),
+        "--normalize-content=y".to_owned(),
+        "--static-id".to_owned(),
+        "--stream-data=uncompress".to_owned(),
+        "--pages".to_owned(),
+        source.display().to_string(),
+        "1".to_owned(),
+        "--".to_owned(),
+        source.display().to_string(),
+    ];
+    let mut qpdf_args = args.to_vec();
+    qpdf_args.push(qpdf_output.display().to_string());
+    let qpdf = Shell::new(QPDF).args(&qpdf_args).output().unwrap();
+
+    let mut flpdf_args = args.to_vec();
+    flpdf_args.push(flpdf_output.display().to_string());
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(&flpdf_args)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert!(
+        qpdf.status.success(),
+        "qpdf normalization failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    assert!(
+        flpdf.status.success(),
+        "flpdf normalization failed: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    let qpdf_content = first_page_content(&qpdf_output);
+    let flpdf_content = first_page_content(&flpdf_output);
+    assert_eq!(qpdf_content, b"q\nQ");
+    assert_eq!(flpdf_content, qpdf_content);
+
+    for output in [&qpdf_output, &flpdf_output] {
+        let check = Shell::new(QPDF)
+            .args(["--check-linearization", output.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            check.status.success(),
+            "{} is not validly linearized: {}",
+            output.display(),
+            String::from_utf8_lossy(&check.stderr)
+        );
+    }
+
+    #[cfg(feature = "qpdf-zlib-compat")]
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "linearized --pages output should be deterministic and qpdf-byte-identical"
+    );
+}
 
 #[test]
 fn pages_single_range_matches_qpdf_count() {
