@@ -2178,6 +2178,38 @@ fn top_level_linearize_normalize_content_preserves_warning_exit() {
 }
 
 #[test]
+fn top_level_linearize_normalize_content_no_warn_suppresses_diagnostics_but_keeps_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("bad-content.pdf");
+    let output = temp.path().join("normalized-linearized.pdf");
+    std::fs::write(&input, one_page_pdf_with_content(b"\r<0g")).unwrap();
+
+    let result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--no-warn", "--linearize", "--normalize-content=y"])
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .unwrap();
+
+    assert_eq!(result.status.code(), Some(3));
+    assert!(
+        output.exists(),
+        "warnings must not discard normalized output"
+    );
+    assert!(
+        result.stderr.is_empty(),
+        "--no-warn must suppress normalization warnings and the summary"
+    );
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("check-linearization")
+        .arg(&output)
+        .assert()
+        .success();
+}
+
+#[test]
 fn top_level_linearize_normalize_content_warning_writes_independent_pass1() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("bad-content.pdf");

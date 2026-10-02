@@ -358,6 +358,33 @@ impl WriterConfiguration {
         );
     }
 
+    /// Apply the Job's accumulated input-version floor before the explicit
+    /// minimum already carried by this writer configuration.
+    ///
+    /// qpdf's `QPDFJob::setWriterOptions` first applies `max_input_version`
+    /// and then the explicit `min_version` (`QPDFJob.cc:2913-2918`). Preserve
+    /// that order even though the portable writer configuration is assembled
+    /// before the Job has opened every page source.
+    pub(crate) fn set_minimum_pdf_version_floor(
+        &mut self,
+        version: impl Into<String>,
+        extension_level: i64,
+    ) {
+        let explicit_minimum = self.settings.minimum_pdf_version.take();
+        update_minimum_pdf_version(
+            &mut self.settings.minimum_pdf_version,
+            version.into(),
+            extension_level,
+        );
+        if let Some((version, extension_level)) = explicit_minimum {
+            update_minimum_pdf_version(
+                &mut self.settings.minimum_pdf_version,
+                version,
+                extension_level,
+            );
+        }
+    }
+
     /// Force qpdf's output PDF version and extension level.
     pub fn force_pdf_version(&mut self, version: impl Into<String>, extension_level: i64) {
         self.settings.forced_pdf_version = Some((version.into(), extension_level));

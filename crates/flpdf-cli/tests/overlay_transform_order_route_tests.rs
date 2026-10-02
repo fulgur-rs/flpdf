@@ -13,6 +13,16 @@ fn production_main_source() -> String {
     .expect("read flpdf-cli main source")
 }
 
+fn production_function_body<'a>(source: &'a str, signature: &str, next_signature: &str) -> &'a str {
+    source
+        .split_once(signature)
+        .expect("named production function")
+        .1
+        .split_once(next_signature)
+        .expect("following production function")
+        .0
+}
+
 fn assemble_pdf(objects: &[(u32, Vec<u8>)]) -> Vec<u8> {
     let mut bytes = b"%PDF-1.4\n".to_vec();
     let mut offsets = vec![0usize; objects.len() + 1];
@@ -269,11 +279,11 @@ fn show_encryption_subcommand_uses_job_run() {
 #[test]
 fn page_selection_overlay_uses_the_canonical_job_owner() {
     let source = production_main_source();
-    let after_plan = source
-        .split_once("fn run_page_extraction_after_plan")
-        .and_then(|(_, tail)| tail.split_once("/// Parse `--split-pages[=n]`"))
-        .map(|(body, _)| body)
-        .expect("page-selection post-plan route");
+    let page_route = production_function_body(
+        &source,
+        "fn run_page_extraction(",
+        "\nfn run_empty_page_extraction",
+    );
 
     for forbidden in [
         "flpdf::handle_under_overlay(",
@@ -281,69 +291,89 @@ fn page_selection_overlay_uses_the_canonical_job_owner() {
         "build_overlay_specs_with_suppression(",
     ] {
         assert!(
-            !after_plan.contains(forbidden),
-            "page-selection post-plan route retains a direct overlay helper: {forbidden}"
+            !page_route.contains(forbidden),
+            "rewrite page route retains a direct overlay helper: {forbidden}"
         );
     }
     assert!(
-        after_plan.contains("configure_cli_overlay_specs("),
-        "page-selection post-plan route must configure overlays on QPDFJob"
+        page_route.contains("configure_rewrite_job(")
+            && page_route.contains("run_page_extraction_job(job, page_ops, remove_unref)"),
+        "rewrite page route must configure overlays and finish on its one QPDFJob"
+    );
+    let rewrite_configuration = production_function_body(
+        &source,
+        "fn configure_rewrite_job(",
+        "\nfn run_rewrite_opened",
     );
     assert!(
-        after_plan.contains("input_version_floor()"),
-        "page-selection post-plan route must carry the canonical job's version floor"
+        rewrite_configuration.contains("configuration.overlay(")
+            && rewrite_configuration.contains("configuration.underlay("),
+        "the canonical rewrite Job must own overlay and underlay sources"
     );
 }
 
 #[test]
 fn page_selection_post_plan_rotation_and_images_use_the_canonical_job_owner() {
     let source = production_main_source();
-    let after_plan = source
-        .split_once("fn run_page_extraction_after_plan")
-        .and_then(|(_, tail)| tail.split_once("/// Parse `--split-pages[=n]`"))
-        .map(|(body, _)| body)
-        .expect("page-selection post-plan route");
+    let page_route = production_function_body(
+        &source,
+        "fn run_page_extraction(",
+        "\nfn run_empty_page_extraction",
+    );
 
     for forbidden in ["apply_rotate_specs(", "apply_image_transformations("] {
         assert!(
-            !after_plan.contains(forbidden),
-            "page-selection post-plan route retains a direct transform helper: {forbidden}"
+            !page_route.contains(forbidden),
+            "rewrite page route retains a direct transform helper: {forbidden}"
         );
     }
-    assert!(
-        after_plan.contains("configuration.rotate("),
-        "page-selection post-plan route must queue rotations on QPDFJob"
+    let page_configuration = production_function_body(
+        &source,
+        "fn configure_page_selection_job(",
+        "\nfn run_page_extraction_job",
     );
     assert!(
-        after_plan.contains("configuration.optimize_images(")
-            || after_plan.contains("configuration.externalize_inline_images("),
-        "page-selection post-plan route must queue image transformations on QPDFJob"
+        page_configuration.contains("configuration.rotate("),
+        "page-selection settings must queue rotations on QPDFJob"
+    );
+    let rewrite_configuration = production_function_body(
+        &source,
+        "fn configure_rewrite_job(",
+        "\nfn run_rewrite_opened",
+    );
+    assert!(
+        rewrite_configuration.contains("configuration.optimize_images(")
+            || rewrite_configuration.contains("configuration.externalize_inline_images("),
+        "rewrite Job configuration must queue image transformations on QPDFJob"
     );
 }
 
 #[test]
-fn empty_page_selection_uses_the_canonical_job_create_stage() {
+fn empty_page_selection_uses_the_shared_job_run() {
     let source = production_main_source();
-    let empty_pages = source
-        .split_once("fn run_empty_page_extraction")
-        .and_then(|(_, tail)| {
-            tail.split_once("/// Run qpdf's ordinary multi-source page-spec path")
-        })
-        .map(|(body, _)| body)
-        .expect("empty-primary page-selection route");
+    let empty_pages = production_function_body(
+        &source,
+        "fn run_empty_page_extraction(",
+        "\nfn split_pages_active",
+    );
 
     assert!(
         empty_pages.contains("configuration.empty_input()"),
         "empty-primary page selection must configure QPDFJob's empty input"
     );
     assert!(
-        empty_pages.contains("job.create_qpdf()"),
-        "empty-primary page selection must receive its merged document from QPDFJob"
+        empty_pages.contains("run_page_extraction_job(job, page_ops, remove_unref)"),
+        "empty-primary page selection must use the shared QPDFJob runner"
     );
-    for forbidden in ["open_page_source(", "job.handle_page_specs("] {
+    for forbidden in [
+        "open_page_source(",
+        "job.handle_page_specs(",
+        "job.create_qpdf()",
+        "job.write_qpdf(",
+    ] {
         assert!(
             !empty_pages.contains(forbidden),
-            "empty-primary page selection retains a CLI-owned page-source route: {forbidden}"
+            "empty-primary page selection retains a CLI-owned page/lifecycle route: {forbidden}"
         );
     }
 }

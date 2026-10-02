@@ -1,5 +1,5 @@
 fn apply_normalize_content_source() -> String {
-    let source = include_str!("../src/main.rs").replace("\r\n", "\n");
+    let source = include_str!("../../flpdf/src/job/content_normalization.rs").replace("\r\n", "\n");
     let start = source
         .find("fn apply_normalize_content")
         .expect("apply_normalize_content must exist");

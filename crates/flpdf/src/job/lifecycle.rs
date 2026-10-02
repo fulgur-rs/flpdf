@@ -6,6 +6,7 @@
 
 use super::attachments::AttachmentAddOptions;
 use super::attachments::AttachmentCopyOptions;
+use super::content_normalization;
 use super::flatten_rotation_on_document;
 use super::image_optimization::{optimize_images, ImageOptimizationOptions};
 use super::json::{JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData};
@@ -3472,6 +3473,17 @@ impl QPDFJob {
             return Ok(());
         }
 
+        if self.configuration.linearize && self.configuration.normalize_content == Some(true) {
+            match self.normalize_page_contents(pdf) {
+                Ok(()) => {}
+                Err(error @ Error::Usage(_)) => return Err(error),
+                Err(error) => {
+                    self.report_job_error(&error)?;
+                    return Err(error);
+                }
+            }
+        }
+
         // Reserving again here is a no-op once `apply_transformations` has
         // done it, matching qpdf's own second call, which its comment calls
         // "defensive and harmless" (`QPDFJob.cc:3051-3053`). It still matters
@@ -3507,7 +3519,7 @@ impl QPDFJob {
         // writer here, in the write stage (`QPDFJob.cc:2913`), so a source
         // opened during the create stage still raises the output version.
         if let Some((version, extension_level)) = self.configuration.max_input_version.clone() {
-            writer_configuration.set_minimum_pdf_version(version, extension_level);
+            writer_configuration.set_minimum_pdf_version_floor(version, extension_level);
         }
         let writer_donor = self
             .configuration
@@ -3693,6 +3705,47 @@ impl QPDFJob {
                 Err(error)
             }
         }
+    }
+
+    fn normalize_page_contents<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<()> {
+        let warnings = content_normalization::normalize_page_contents(pdf)?;
+        if warnings.is_empty() {
+            return Ok(());
+        }
+
+        self.record_warnings();
+        if self.suppress_warnings || pdf.suppress_warnings() {
+            return Ok(());
+        }
+
+        let input_name = if self.empty_primary_created {
+            "empty PDF".to_owned()
+        } else {
+            String::from_utf8_lossy(self.input_name_bytes()).into_owned()
+        };
+        for warning in warnings {
+            let location = match warning.parsed_offset {
+                Some(offset) => format!("{input_name} (offset {offset})"),
+                None => input_name.clone(),
+            };
+            let mut message =
+                format!("WARNING: {location}: content normalization encountered bad tokens\n");
+            if warning.last_token_was_bad {
+                message.push_str(&format!(
+                    "WARNING: {location}: normalized content ended with a bad token; \
+                     you may be able to resolve this by coalescing content streams in \
+                     combination with normalizing content. From the command line, \
+                     specify --coalesce-contents\n"
+                ));
+            }
+            message.push_str(&format!(
+                "WARNING: {location}: Resulting stream data may be corrupted but is may \
+                 still useful for manual inspection. For more information on this \
+                 warning, search for content normalization in the manual.\n"
+            ));
+            self.logger.warn(message)?;
+        }
+        Ok(())
     }
 
     /// Apply the configured qpdf document transformations to an already-open
@@ -5879,9 +5932,162 @@ fn parse_object_stream_mode(value: &str) -> Result<ObjectStreamMode> {
 mod tests {
     use super::*;
     use crate::job::overlay::OverlayVerboseSource;
-    use crate::object_handle::ObjectValue;
+    use crate::object_handle::{ObjectValue, StreamValue};
     use crate::{Error, ObjectHandle, ObjectRef, PageDocumentHelper, PageInput, PdfOpenOptions};
     use std::io::Cursor;
+
+    fn empty_pdf_with_page_content(content: &[u8]) -> Pdf<Cursor<Vec<u8>>> {
+        let mut pdf = Pdf::empty().expect("canonical empty PDF opens");
+        let catalog = pdf.root_handle().expect("empty PDF Catalog");
+        let pages = catalog.try_get_key(b"/Pages").expect("empty Pages tree");
+        let stream = pdf.get_object_handle_by_raw_identity(6, 0);
+        stream.set_resolved(ObjectValue::Stream(Box::new(StreamValue {
+            stream_dict: ObjectHandle::dictionary(vec![(
+                b"/Length".to_vec(),
+                ObjectHandle::integer(i64::try_from(content.len()).unwrap()),
+            )]),
+            stream_data: Some(Rc::new(content.to_vec())),
+            stream_provider: None,
+            filter_on_write: true,
+            stream_length: content.len(),
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
+        })));
+        let page = pdf.get_object_handle_by_raw_identity(5, 0);
+        page.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+                (b"/Parent".to_vec(), pages.clone()),
+                (
+                    b"/MediaBox".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(10),
+                        ObjectHandle::integer(10),
+                    ]),
+                ),
+                (b"/Resources".to_vec(), ObjectHandle::dictionary(Vec::new())),
+                (b"/Contents".to_vec(), stream),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        pages
+            .replace_key(b"/Kids", ObjectHandle::array(vec![page]))
+            .expect("install synthetic page");
+        pages
+            .replace_key(b"/Count", ObjectHandle::integer(1))
+            .expect("set synthetic page count");
+        pdf
+    }
+
+    fn set_page_content_filter(pdf: &mut Pdf<Cursor<Vec<u8>>>, filter_name: &[u8]) {
+        let page = PageDocumentHelper::new(pdf)
+            .get_all_pages()
+            .expect("synthetic page tree resolves")
+            .remove(0);
+        let stream = page
+            .try_get_key(b"/Contents")
+            .expect("synthetic page has a content stream");
+        stream
+            .as_stream_dict()
+            .expect("content stream has a dictionary")
+            .replace_key(b"/Filter", ObjectHandle::name(filter_name.to_vec()))
+            .expect("install custom content filter");
+    }
+
+    struct JobNormalizationFilter;
+
+    impl crate::StreamFilter for JobNormalizationFilter {
+        fn get_decode_pipeline<'a>(
+            &mut self,
+            _next: crate::pipeline::PipelineRef<'a>,
+        ) -> Result<crate::OwnedDecodePipeline<'a>> {
+            Err(Error::System("content filter decode failed".to_owned()))
+        }
+    }
+
+    fn job_for_linearized_content_normalization(output: &std::path::Path) -> QPDFJob {
+        let mut job = QPDFJob::new();
+        job.set_output_file(output)
+            .expect("output path is accepted");
+        job.set_linearization(true, None);
+        job.set_content_normalization(true);
+        job
+    }
+
+    #[test]
+    fn write_qpdf_reports_non_usage_content_normalization_errors() {
+        crate::register_stream_filter(b"/FlpdfJobContentNormalizationSystemError", || {
+            Ok(JobNormalizationFilter)
+        });
+        let tempdir = tempfile::tempdir().expect("temporary output directory");
+        let output = tempdir.path().join("output.pdf");
+        let mut pdf = empty_pdf_with_page_content(b"encoded");
+        set_page_content_filter(&mut pdf, b"FlpdfJobContentNormalizationSystemError");
+
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let logger = QPDFLogger::create();
+        logger.set_error(Some(PipelineHandle::new(RecordingInfoSink {
+            bytes: std::sync::Arc::clone(&bytes),
+        })));
+        let mut job = job_for_linearized_content_normalization(&output);
+        job.set_logger(logger);
+
+        let error = job
+            .write_qpdf(&mut pdf)
+            .expect_err("normalization failure must return to the caller");
+
+        assert!(
+            matches!(error, Error::System(message) if message == "content filter decode failed")
+        );
+        assert!(
+            String::from_utf8_lossy(&bytes.lock().unwrap())
+                .contains("content filter decode failed"),
+            "the Job must report pre-write failures through its logger"
+        );
+        assert!(
+            !output.exists(),
+            "writer must not run after the pre-write failure"
+        );
+    }
+
+    #[test]
+    fn write_qpdf_preserves_usage_errors_from_content_normalization() {
+        crate::register_stream_filter(
+            b"/FlpdfJobContentNormalizationUsageError",
+            || -> Result<JobNormalizationFilter> {
+                Err(Error::Usage(UsageError::new("content filter usage error")))
+            },
+        );
+        let tempdir = tempfile::tempdir().expect("temporary output directory");
+        let output = tempdir.path().join("output.pdf");
+        let mut pdf = empty_pdf_with_page_content(b"encoded");
+        set_page_content_filter(&mut pdf, b"FlpdfJobContentNormalizationUsageError");
+
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let logger = QPDFLogger::create();
+        logger.set_error(Some(PipelineHandle::new(RecordingInfoSink {
+            bytes: std::sync::Arc::clone(&bytes),
+        })));
+        let mut job = job_for_linearized_content_normalization(&output);
+        job.set_logger(logger);
+
+        let error = job
+            .write_qpdf(&mut pdf)
+            .expect_err("usage failures must propagate to the caller");
+
+        assert!(matches!(error, Error::Usage(_)));
+        assert!(
+            bytes.lock().unwrap().is_empty(),
+            "usage errors stay unreported"
+        );
+        assert!(
+            !output.exists(),
+            "writer must not run after the usage failure"
+        );
+    }
 
     #[test]
     fn flatten_rotation_lifecycle_accepts_raw_page_and_widget_handles() {
@@ -6125,6 +6331,29 @@ mod tests {
         job.config().normalize_content(true);
 
         assert!(job.content_normalization_enabled());
+    }
+
+    #[test]
+    fn linearized_normalization_reports_empty_input_and_unknown_offset() {
+        let mut pdf = empty_pdf_with_page_content(b"\r<0g");
+        let page = PageDocumentHelper::new(&mut pdf)
+            .get_all_pages()
+            .expect("synthetic page tree resolves");
+        let stream = page[0]
+            .try_get_key(b"/Contents")
+            .expect("page Contents stream");
+        assert!(stream.get_parsed_offset() < 0);
+
+        let logger = QPDFLogger::create();
+        logger.set_warn(Some(PipelineHandle::new(crate::pipeline::Discard)));
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.empty_primary_created = true;
+
+        job.normalize_page_contents(&mut pdf)
+            .expect("bad content is normalized with a warning");
+
+        assert_eq!(job.get_exit_code(), JobExitCode::Warning);
     }
 
     #[test]
