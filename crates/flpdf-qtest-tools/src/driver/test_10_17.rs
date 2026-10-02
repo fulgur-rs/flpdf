@@ -294,12 +294,24 @@ pub(crate) fn run_test_14<R: Read + Seek>(
     let orig_page3_ref = pages[2];
     let orig_page2 = pdf.get_object_handle(orig_page2_ref);
     let orig_page3 = pdf.get_object_handle(orig_page3_ref);
-    assert_eq!(orig_page2.try_get_key(b"/OrigPage")?.as_integer(), Some(2));
-    assert_eq!(orig_page3.try_get_key(b"/OrigPage")?.as_integer(), Some(3));
+    assert_eq!(
+        orig_page2.try_get_key(b"/OrigPage")?.try_get_int_value()?,
+        2
+    );
+    assert_eq!(
+        orig_page3.try_get_key(b"/OrigPage")?.try_get_int_value()?,
+        3
+    );
 
     pdf.swap_objects(orig_page2_ref, orig_page3_ref)?;
-    assert_eq!(orig_page2.try_get_key(b"/OrigPage")?.as_integer(), Some(3));
-    assert_eq!(orig_page3.try_get_key(b"/OrigPage")?.as_integer(), Some(2));
+    assert_eq!(
+        orig_page2.try_get_key(b"/OrigPage")?.try_get_int_value()?,
+        3
+    );
+    assert_eq!(
+        orig_page3.try_get_key(b"/OrigPage")?.try_get_int_value()?,
+        2
+    );
 
     let trailer = pdf.trailer();
     let qdict = trailer.try_get_key(b"/QDict")?;
@@ -352,7 +364,9 @@ pub(crate) fn run_test_14<R: Read + Seek>(
         && dict_items.len() == 1
         && dict_items
             .get(b"/NewDict".as_slice())
-            .is_some_and(|value| value.as_integer() == Some(2))
+            .map(|value| value.try_get_int_value())
+            .transpose()?
+            == Some(2)
     {
         writeln!(stdout, "array and dictionary contents are correct")?;
     }

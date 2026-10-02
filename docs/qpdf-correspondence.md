@@ -5257,3 +5257,21 @@ on their direct string-value boundaries. The selected encryption and page-label
 consumers likewise use `try_as_string` instead of repeating
 `try_dereference` plus `as_string`; `pdf_string::unparse_binary` is a separate
 byte-serialization responsibility and is not part of this correspondence.
+
+### qtest A6 test 14 integer value accessors `flpdf-3yn9.48.208.12` (2026-10-02)
+
+qpdf test 14 reads page `/OrigPage` children using `getKey(...).getIntValue()`
+after the page-object swap, and reads `/NewDict` through `getIntValue()` in
+both the output and map checks (`qpdf/test_driver.cc:600-640`). qpdf's
+`getIntValue()` delegates to resolving `asInteger()` before applying its
+type-warning/default-zero behavior (`libqpdf/QPDFObjectHandle.cc:276-280,
+502-513`).
+
+flpdf's five corresponding production `as_integer()` reads in
+`driver/test_10_17.rs::run_test_14` now use `try_get_int_value()`. The test 14
+fixture stores the four `/OrigPage` values as indirect integer references, so
+the prior non-resolving route failed its first expected value (`None` instead
+of `Some(2)`). `test_14_matches_qpdf_swap_and_replace_sequence` now passes with
+the same stdout/stderr and both writer outputs; the A6 route guard covers all
+seven resolving `getIntValue` reads in the function. The workspace A6 row
+remains mixed because unrelated callers remain.
