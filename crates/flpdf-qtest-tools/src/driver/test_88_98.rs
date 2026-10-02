@@ -652,7 +652,7 @@ pub(crate) fn run_test_96<R: Read + Seek>(
 ) -> flpdf::Result<()> {
     let s = ObjectHandle::parse(b"(\\48\\418\\121\\4)")?;
     let stored = s
-        .as_string()
+        .try_get_value_as_string()?
         .expect("qpdf string-literal syntax parses to a String value");
     assert_eq!(
         flpdf::pdf_string::unparse_binary(&stored),
@@ -661,7 +661,7 @@ pub(crate) fn run_test_96<R: Read + Seek>(
 
     let s = ObjectHandle::parse(b"(\\48\\418\\121\\41)")?;
     let stored = s
-        .as_string()
+        .try_get_value_as_string()?
         .expect("qpdf string-literal syntax parses to a String value");
     assert_eq!(
         flpdf::pdf_string::unparse_binary(&stored),
@@ -670,16 +670,44 @@ pub(crate) fn run_test_96<R: Read + Seek>(
 
     let s = ObjectHandle::parse(b"<a>")?;
     let stored = s
-        .as_string()
+        .try_get_value_as_string()?
         .expect("qpdf hex-string syntax parses to a String value");
     assert_eq!(flpdf::pdf_string::unparse_binary(&stored), b"<a0>");
 
     let s = ObjectHandle::parse(b"<abc>")?;
     let stored = s
-        .as_string()
+        .try_get_value_as_string()?
         .expect("qpdf hex-string syntax parses to a String value");
     assert_eq!(flpdf::pdf_string::unparse_binary(&stored), b"<abc0>");
     Ok(())
+}
+
+#[cfg(test)]
+mod test_96_tests {
+    use flpdf::ObjectHandle;
+
+    #[test]
+    fn parsed_strings_unparse_to_qpdf_binary_spellings() {
+        for (source, expected) in [
+            (
+                b"(\\48\\418\\121\\4)".as_slice(),
+                b"<043821385104>".as_slice(),
+            ),
+            (
+                b"(\\48\\418\\121\\41)".as_slice(),
+                b"<043821385121>".as_slice(),
+            ),
+            (b"<a>".as_slice(), b"<a0>".as_slice()),
+            (b"<abc>".as_slice(), b"<abc0>".as_slice()),
+        ] {
+            let parsed = ObjectHandle::parse(source).expect("parse qpdf string syntax");
+            let stored = parsed
+                .try_get_value_as_string()
+                .expect("resolve parsed string")
+                .expect("parsed string has a string value");
+            assert_eq!(flpdf::pdf_string::unparse_binary(&stored), expected);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

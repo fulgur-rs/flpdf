@@ -621,6 +621,32 @@ fn object_handle_api_tests_88_and_94_use_resolving_null_queries() {
 }
 
 #[test]
+fn object_handle_api_test_96_uses_resolving_string_value_accessors() {
+    let source = include_str!("../src/driver/test_88_98.rs").replace("\r\n", "\n");
+    let start = source
+        .find("pub(crate) fn run_test_96")
+        .expect("test 96 source section start");
+    let end = source[start..]
+        .find("pub(crate) fn run_test_97")
+        .map(|offset| start + offset)
+        .expect("test 96 source section end");
+    let test_96 = &source[start..end];
+
+    assert_eq!(test_96.matches(".try_get_value_as_string()?").count(), 4);
+    assert!(!test_96.contains(".as_string()"));
+}
+
+#[test]
+fn qtest_driver_96_preserves_qpdf_binary_string_spellings() {
+    driver()
+        .args(["96", "-", "-"])
+        .assert()
+        .code(0)
+        .stdout("test 96 done\n")
+        .stderr("");
+}
+
+#[test]
 fn object_handle_api_test_93_uses_canonical_promotion_route() {
     let source = include_str!("../src/driver/test_88_98.rs");
 
