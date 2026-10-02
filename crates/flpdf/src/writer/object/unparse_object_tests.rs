@@ -537,19 +537,19 @@ fn unparse_object_writes_a_name_escaped() {
 #[test]
 fn unparse_object_writes_a_real_literal_when_safe() {
     let mut out = Vec::new();
-    ObjectHandle::real_literal(0.4, b".4".to_vec())
+    ObjectHandle::real_from_string(b".4")
         .unparse_object(&mut out)
         .unwrap();
     assert_eq!(out, b".4");
 }
 
 #[test]
-fn unparse_object_falls_back_to_canonical_when_literal_is_unsafe() {
+fn unparse_object_preserves_an_unvalidated_real_string() {
     let mut out = Vec::new();
-    ObjectHandle::real_literal(0.4, b"nope".to_vec())
+    ObjectHandle::real_from_string(b"nope")
         .unparse_object(&mut out)
         .unwrap();
-    assert_eq!(out, b"0.4");
+    assert_eq!(out, b"nope");
 }
 
 #[test]

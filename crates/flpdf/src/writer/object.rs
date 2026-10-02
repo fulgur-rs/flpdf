@@ -3094,7 +3094,6 @@ fn is_direct_scalar_value(value: &ObjectValue) -> bool {
             | ObjectValue::Boolean(_)
             | ObjectValue::Integer(_)
             | ObjectValue::Real(_)
-            | ObjectValue::RealLiteral { .. }
             | ObjectValue::Name(_)
             | ObjectValue::String(_)
             | ObjectValue::Operator(_)
@@ -3255,14 +3254,7 @@ pub(crate) fn unparse_object_value(value: &ObjectValue, out: &mut OutputSink<'_>
         ObjectValue::Destroyed => return Err(destroyed_unparse_error()),
         ObjectValue::Boolean(v) => out.write_bytes(if *v { b"true" } else { b"false" })?,
         ObjectValue::Integer(v) => write_decimal_i64(out, *v)?,
-        ObjectValue::Real(v) => out.write_bytes(v.to_string().as_bytes())?,
-        ObjectValue::RealLiteral { value, literal } => {
-            if crate::pdf_syntax::real_literal_is_safe(literal, *value) {
-                out.write_bytes(literal)?;
-            } else {
-                out.write_bytes(value.to_string().as_bytes())?;
-            }
-        }
+        ObjectValue::Real(v) => out.write_bytes(v)?,
         ObjectValue::Name(name) => {
             out.write_bytes(b"/")?;
             crate::pdf_syntax::write_name_escaped(out, name)?;
@@ -4573,7 +4565,6 @@ fn unparse_object_value_qdf(
         | ObjectValue::Boolean(_)
         | ObjectValue::Integer(_)
         | ObjectValue::Real(_)
-        | ObjectValue::RealLiteral { .. }
         | ObjectValue::Name(_)
         | ObjectValue::String(_)
         | ObjectValue::Operator(_)

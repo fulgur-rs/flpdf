@@ -3,40 +3,6 @@
 //! qpdf correspondence: shared PDF token serialization helpers used by canonical handle writers.
 //!
 
-/// Return whether a parsed real literal is safe to emit verbatim.
-pub(crate) fn real_literal_is_safe(literal: &[u8], value: f64) -> bool {
-    if literal.is_empty()
-        || !literal
-            .iter()
-            .all(|byte| matches!(*byte, b'0'..=b'9' | b'.' | b'+' | b'-'))
-    {
-        return false;
-    }
-    // cov:ignore-start: the preceding PDF-number byte grammar rejects every
-    // non-UTF-8 byte before this defensive conversion boundary.
-    let Ok(text) = std::str::from_utf8(literal) else {
-        return false;
-    };
-    // cov:ignore-end
-    text.parse::<f64>()
-        .map(|parsed| parsed.to_bits() == value.to_bits())
-        .unwrap_or(false)
-}
-
-/// Return the numeric value represented by qpdf's default `newReal(double)`
-/// serializer.
-///
-/// qpdf formats newly-created real values with six fixed decimal places and
-/// trims trailing zeroes (`QUtil::double_to_string`, `libqpdf/QUtil.cc:349-369`).
-/// The canonical Rust object serializer uses shortest-roundtrip formatting, so
-/// callers that create a qpdf-owned real from arithmetic must round through the
-/// same six-place representation before constructing [`crate::ObjectHandle::real`].
-pub(crate) fn qpdf_real_value(value: f64) -> f64 {
-    let formatted = format!("{value:.6}");
-    let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
-    trimmed.parse().unwrap_or(0.0)
-}
-
 /// Escape decoded PDF name bytes into a single PDF name token.
 ///
 /// `QPDFTokenizer` uses a raw NUL byte as a sentinel for a recoverable stray
@@ -166,7 +132,7 @@ pub(crate) type ReborrowableIdWriter<'r, 'd> =
 
 #[cfg(test)]
 mod tests {
-    use super::{real_literal_is_safe, write_name_escaped};
+    use super::write_name_escaped;
     use crate::writer::output::{OutputSink, OutputTarget};
     use std::io;
 
@@ -187,11 +153,6 @@ mod tests {
         fn finish_document(&mut self) -> crate::Result<()> {
             Ok(())
         }
-    }
-
-    #[test]
-    fn real_literal_rejects_non_utf8_source_bytes() {
-        assert!(!real_literal_is_safe(&[0xff], 0.0));
     }
 
     #[test]

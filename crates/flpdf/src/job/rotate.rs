@@ -158,7 +158,7 @@ mod tests {
         assert!(handle_to_pagebox(&ObjectHandle::array(vec![ObjectHandle::integer(1)])).is_none());
         assert_eq!(
             handle_to_pagebox(&ObjectHandle::array(vec![
-                ObjectHandle::real_literal(1.5, b"1.5".to_vec()),
+                ObjectHandle::real_from_string(b"1.5"),
                 ObjectHandle::integer(2),
                 ObjectHandle::real(11.5),
                 ObjectHandle::integer(22),

@@ -161,7 +161,7 @@ impl Json {
     }
 
     pub fn make_real(value: f64) -> Self {
-        Self::make_number(format_qpdf_real(value))
+        Self::make_number(crate::qutil::double_to_string(value, 0, true))
     }
 
     pub fn make_number(encoded: impl AsRef<[u8]>) -> Self {
@@ -369,31 +369,6 @@ impl Json {
             Value::Blob(writer) => ValueSnapshot::Blob(writer.clone()),
         })
     }
-}
-
-pub(crate) fn format_qpdf_real(value: f64) -> String {
-    if value.is_nan() {
-        return if value.is_sign_negative() {
-            "-nan".into()
-        } else {
-            "nan".into()
-        };
-    }
-    if value == f64::INFINITY {
-        return "inf".into();
-    }
-    if value == f64::NEG_INFINITY {
-        return "-inf".into();
-    }
-
-    let mut encoded = format!("{value:.6}");
-    while encoded.ends_with('0') && encoded.len() > 1 {
-        encoded.pop();
-    }
-    if encoded.ends_with('.') && encoded.len() > 1 {
-        encoded.pop();
-    }
-    encoded
 }
 
 pub(super) fn encode_string(value: &[u8]) -> Vec<u8> {

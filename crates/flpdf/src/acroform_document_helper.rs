@@ -2376,7 +2376,7 @@ fn transform_appearance_stream_matrix(stream: &ObjectHandle, cm: Matrix) -> Resu
                 transformed
                     .get_as_matrix()
                     .into_iter()
-                    .map(qpdf_real)
+                    .map(ObjectHandle::real)
                     .collect(),
             ),
         )?;
@@ -2563,7 +2563,7 @@ fn transformed_annotation_rectangle(annotation: &ObjectHandle, cm: Matrix) -> Re
             transformed.ury,
         ]
         .into_iter()
-        .map(qpdf_real)
+        .map(ObjectHandle::real)
         .collect(),
     ))
 }
@@ -2603,17 +2603,6 @@ fn decode_field_name(name: &[u8]) -> String {
     // intentionally returns None for such bytes, so it is not the right
     // fallback for field names.
     String::from_utf8_lossy(&utf8_value(name)).into_owned()
-}
-
-/// Pre-round `v` so `ObjectHandle::real(rounded)`'s writer output (Rust's
-/// shortest-roundtrip `f64::to_string`) matches qpdf's
-/// `QUtil::double_to_string(v, 6, trim=true)` -- the default `newReal(double)`
-/// precision used by every `newFromRectangle`/`newFromMatrix` array element
-/// (`libqpdf/QUtil.cc:349-369`). Same round-trip trick as
-/// the qpdf `double_to_string` rounding contract, adapted to return an
-/// [`ObjectHandle`] instead of an independent raw value snapshot.
-fn qpdf_real(v: f64) -> ObjectHandle {
-    ObjectHandle::real(crate::pdf_syntax::qpdf_real_value(v))
 }
 
 impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {

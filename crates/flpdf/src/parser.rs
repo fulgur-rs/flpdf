@@ -1164,13 +1164,7 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
     }
 
     fn real(&mut self, token: Token, offset: i64) -> Result<ObjectHandle> {
-        let value = match classify_real(token)? {
-            RealClassification::Canonical(value) => ObjectValue::Real(value),
-            RealClassification::Literal { value, literal } => {
-                ObjectValue::RealLiteral { value, literal }
-            }
-        };
-        Ok(self.direct_at(value, offset))
+        Ok(self.direct_at(ObjectValue::Real(token.value), offset))
     }
 
     fn direct(&mut self, value: ObjectValue, offset: usize) -> ObjectHandle {
@@ -2769,35 +2763,6 @@ impl HandleResolver for ContentHandleResolver {
             }
             None => ObjectHandle::from_value(value),
         }
-    }
-}
-
-enum RealClassification {
-    Canonical(f64),
-    Literal { value: f64, literal: Vec<u8> },
-}
-
-// Shared leaf decision (must never be reimplemented a second time): whether
-// a real-number token's source literal must be preserved verbatim for
-// byte-identical unparse. Both the legacy `Object`-producing path
-// (`real_object`) and the canonical live parser call this instead of
-// recomputing the comparison themselves.
-fn classify_real(token: Token) -> Result<RealClassification> {
-    let literal = token.value;
-    let text = std::str::from_utf8(&literal)
-        .map_err(|_| Error::parse(token.start, "real is not utf-8"))?;
-    let value = text
-        .parse::<f64>()
-        .map_err(|_| Error::parse(token.start, "invalid real"))?;
-    // Preserve the source literal when `value.to_string()` cannot reproduce
-    // it byte-for-byte (e.g. `.4`, `0.400`, `1.0`) — required for
-    // byte-identical parity with qpdf's QPDF_Real (which re-emits the parsed
-    // string verbatim). When the literal already matches Rust's shortest
-    // round-trip, the plain canonical value is smaller and equivalent.
-    if value.to_string().as_bytes() == literal {
-        Ok(RealClassification::Canonical(value))
-    } else {
-        Ok(RealClassification::Literal { value, literal })
     }
 }
 
