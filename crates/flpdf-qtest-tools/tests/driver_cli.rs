@@ -2180,10 +2180,11 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "test 24 must not snapshot the trailer through the non-resolving dictionary accessor"
     );
 
+    let page_source_crlf = page_source.replace("\r\n", "\n").replace('\n', "\r\n");
     let test_25 = section(
-        page_source.as_str(),
+        page_source_crlf.as_str(),
         "pub(crate) fn run_test_25",
-        "#[cfg(test)]\nmod test_24_tests",
+        "mod test_24_tests",
     );
     assert_eq!(
         test_25.matches("copied_pages.try_is_null()").count(),
