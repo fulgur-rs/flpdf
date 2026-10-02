@@ -29,7 +29,7 @@ fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
 
 #[test]
 fn foreign_object_copy_uses_resolving_accessors_for_graph_observations() {
-    let source = include_str!("../src/object_copy.rs");
+    let source = include_str!("../src/object_copy.rs").replace("\r\n", "\n");
     let production = source
         .split_once("impl<R: Read + Seek + 'static> ForeignObjectCopier")
         .expect("foreign copier implementation should remain present")
