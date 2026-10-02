@@ -803,9 +803,30 @@ pub(crate) fn run_test_79<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{run_test_73, run_test_78, run_test_79};
+    use super::{run_test_73, run_test_78, run_test_79, DriverParserCallbacks};
     use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
-    use flpdf::{Error, ObjectHandle, Pdf, PdfOpenOptions, QPDFLogger};
+    use flpdf::{
+        Error, ObjectHandle, ObjectHandleParserCallbacks, ParseControl, Pdf, PdfOpenOptions,
+        QPDFLogger,
+    };
+
+    #[test]
+    fn parser_callback_stops_on_abort_name_like_qpdf() {
+        let mut stdout = Vec::new();
+        let mut callbacks = DriverParserCallbacks {
+            stdout: &mut stdout,
+        };
+        let outcome = ObjectHandleParserCallbacks::handle_object(
+            &mut callbacks,
+            ObjectHandle::name(b"Abort".to_vec()),
+            0,
+            6,
+        )
+        .expect("Abort marker terminates parsing");
+
+        assert!(matches!(outcome, ParseControl::Stop));
+        assert_eq!(stdout, b"test suite: terminating parsing\n");
+    }
 
     fn minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
         let options = PdfOpenOptions {

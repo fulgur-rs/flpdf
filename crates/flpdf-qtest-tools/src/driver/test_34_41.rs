@@ -714,8 +714,35 @@ pub(crate) fn run_test_41<R: Read + Seek>(
 mod tests {
     use super::{
         inflate_with_pipeline, qpdf_get_key, run_test_34, run_test_37, run_test_38, run_test_39,
+        ContentParserCallbacks,
     };
-    use flpdf::{Pdf, PdfOpenOptions};
+    use flpdf::{ObjectHandle, ObjectHandleParserCallbacks, ParseControl, Pdf, PdfOpenOptions};
+
+    #[test]
+    fn parser_callback_stops_on_abort_name_like_qpdf() {
+        let pdf = Pdf::empty().expect("construct callback Pdf");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+        let mut callbacks = ContentParserCallbacks {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+            pdf: &pdf,
+            filename: b"abort.pdf",
+            diagnostics_written: &mut diagnostics_written,
+        };
+
+        let outcome = ObjectHandleParserCallbacks::handle_object(
+            &mut callbacks,
+            ObjectHandle::name(b"Abort".to_vec()),
+            0,
+            6,
+        )
+        .expect("Abort marker terminates parsing");
+        assert!(matches!(outcome, ParseControl::Stop));
+        assert_eq!(stdout, b"test suite: terminating parsing\n");
+        assert!(stderr.is_empty());
+    }
 
     #[test]
     fn test_36_inflate_stage_matches_qpdf_pipeline_output() {
