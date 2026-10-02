@@ -287,15 +287,18 @@ fn walk(
         description: object_description(object)?,
     });
 
-    if let Some(items) = object.as_array() {
-        for item in items {
+    if object.try_is_array()? {
+        for item in object.try_get_array_as_vector()? {
             if !item.is_indirect() {
                 walk(&item, group, groups)?;
             }
         }
-    } else if let Some(entries) = object.as_dictionary() {
-        for item in entries.into_values() {
-            if !item.is_indirect() && !item.is_null() {
+    } else if object.try_is_dictionary()? {
+        // qpdf's getKeys resolves dictionary values and omits null values;
+        // getKey then returns each visible child without resolving it.
+        for key in object.try_get_keys()? {
+            let item = object.try_get_key(&key)?;
+            if !item.is_indirect() {
                 walk(&item, group, groups)?;
             }
         }
@@ -597,6 +600,46 @@ mod tests {
         assert!(descriptions
             .iter()
             .all(|description| !description.ends_with(", null")));
+    }
+
+    fn pdf_with_indirect_null_dictionary_value() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let root_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Child 2 0 R >>\nendobj\n");
+        let null_offset = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\nnull\nendobj\n");
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        bytes.extend_from_slice(format!("{root_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(format!("{null_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        Pdf::open_mem_owned(bytes).expect("open indirect-null dictionary fixture")
+    }
+
+    #[test]
+    fn parsedoffset_walk_resolves_and_filters_indirect_null_dictionary_values() {
+        let mut pdf = pdf_with_indirect_null_dictionary_value();
+        let root = pdf.get_object_handle(ObjectRef::new(1, 0));
+        let child = root
+            .try_get_key(b"/Child")
+            .expect("read indirect null child handle");
+        assert!(!child.is_resolved(), "fixture child starts unresolved");
+
+        let mut groups = BTreeMap::new();
+        walk(&root, 0, &mut groups).expect("walk metadata dictionary");
+
+        assert!(child.is_resolved(), "qpdf getKeys resolves null values");
+        assert_eq!(
+            groups[&0].len(),
+            2,
+            "root and its direct /Type value are walked"
+        );
+        assert!(groups[&0]
+            .iter()
+            .all(|object| !object.description.contains("indirect 2/0")));
     }
 
     #[cfg(unix)]
