@@ -144,6 +144,46 @@ fn json_input_inspection_modes_match_qpdf_11_9() {
 }
 
 #[test]
+fn json_and_empty_input_inspections_read_password_file_like_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let missing_password = temp.path().join("missing-password.txt");
+    let password_arg = format!("--password-file={}", missing_password.display());
+    let update_arg = format!("--update-from-json={UPDATE_JSON}");
+    let cases = [
+        (
+            "JSON input",
+            vec!["--json-input", "--show-npages", COMPLETE_JSON],
+        ),
+        (
+            "empty input with update",
+            vec!["--empty", update_arg.as_str(), "--show-npages"],
+        ),
+    ];
+
+    for (label, args) in cases {
+        let qpdf = ShellCommand::new("qpdf")
+            .arg(&password_arg)
+            .args(&args)
+            .output()
+            .unwrap();
+        let flpdf = ShellCommand::new(assert_cmd::cargo_bin!("flpdf"))
+            .env("FLPDF_PROGNAME", "qpdf")
+            .arg(&password_arg)
+            .args(&args)
+            .output()
+            .unwrap();
+
+        assert_eq!(flpdf.status.code(), qpdf.status.code(), "{label} status");
+        assert_eq!(flpdf.stdout, qpdf.stdout, "{label} stdout");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "{label} stderr");
+    }
+}
+
+#[test]
 fn json_input_show_pages_applies_coalesce_contents_like_qpdf() {
     if skip_if_qpdf_missing() {
         return;
@@ -321,13 +361,10 @@ fn update_from_json_missing_file_write_matches_qpdf_11_9() {
     assert_eq!(flpdf.stderr, qpdf.stderr);
 }
 
-/// The `--check` dispatch opens the update-from-json file through a
-/// different flpdf-cli call site (`apply_json_update_with_job` ->
-/// `qpdf_json_input_open_error`) than the plain-write dispatch pinned above
-/// (`QPDFJob::create_qpdf`'s internal update handling). It already rendered
-/// qpdf's plain `open <path>: <strerror>` wording before flpdf-43qyq's fix,
-/// but had no regression test pinning that -- this locks it in so a future
-/// consolidation of the two call sites cannot silently regress either one.
+/// The `--check` dispatch now configures `update-from-json` on the same Job
+/// that creates the input and runs inspection, matching qpdf's create-stage
+/// update order. This test pins the plain `open <path>: <strerror>` wording
+/// across that Job-owned path so future changes cannot regress the diagnostic.
 #[test]
 fn update_from_json_missing_file_check_matches_qpdf_11_9() {
     if skip_if_qpdf_missing() {
