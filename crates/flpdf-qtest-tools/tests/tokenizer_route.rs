@@ -18,8 +18,10 @@ fn tokenizer_helper_uses_resolving_dictionary_key_accessors() {
     );
     assert!(
         page_contents.contains("page.try_get_key(b\"/Contents\")?")
-            && !page_contents.contains(".get_key("),
-        "tokenizer page content lookup must use qpdf's resolving getKey route"
+            && !page_contents.contains(".get_key(")
+            && !page_contents.contains("page.has_key(b\"/Contents\")")
+            && !page_contents.contains("pdf.resolve(&page)"),
+        "tokenizer page content lookup must unconditionally use qpdf's resolving getKey route"
     );
 
     let object_stream_type = section(&source, "fn resolve_objstm_type(", "fn dump_tokens(");
