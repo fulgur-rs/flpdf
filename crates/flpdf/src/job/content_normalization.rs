@@ -57,9 +57,9 @@ fn apply_normalize_content(
                 if let Some(item_ref) = item_ref {
                     streams.push((item_ref, item));
                 }
-            }
+            } // cov:ignore: LLVM maps the covered array-member stream branch to its condition line
         }
-    }
+    } // cov:ignore: LLVM maps the covered Contents-array branch to its array guard
 
     for (stream_ref, stream) in streams {
         if let Some(last_bad) = normalize_and_store_stream_handle(stream_ref, stream, seen)? {
@@ -102,7 +102,7 @@ fn normalize_and_store_stream_handle(
     );
     if let Some(dict) = stream.as_stream_dict() {
         dict.replace_key(b"/Length", ObjectHandle::integer(length))?;
-    }
+    } // cov:ignore: LLVM maps the covered stream-dictionary replacement to the if-let line
     stream.mark_content_normalization_applied();
     Ok(warning)
 }
