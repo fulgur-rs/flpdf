@@ -1573,6 +1573,13 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
                 None,
             )
         });
+        if let Some(warning) = &whitespace_warning {
+            // QPDF::read_xref emits this before entering read_xrefTable
+            // (`QPDF.cc:659-676`). Deliver it at the same point so warnings
+            // from accepted entries retain their source order if a later row
+            // fails.
+            canonical_trailer_owner.push_warning(warning.clone())?;
+        }
         let base = usize::try_from(source_base).unwrap_or(usize::MAX);
         let mut cursor = ByteCursor::with_base(
             bytes,
@@ -1585,23 +1592,12 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
             registration,
             first_xref_item_offset_sink,
             &options.description,
+            canonical_trailer_owner,
         );
-        let (entries, trailer_start, mut table_diagnostics, first_xref_item_offset) = match table {
+        let (entries, trailer_start, first_xref_item_offset) = match table {
             Ok(table) => table,
-            Err(error) => {
-                // The canonical owner keeps its diagnostics through
-                // `push_warning`, not through the caller's sink.
-                if let Some(warning) = whitespace_warning {
-                    let mut pending = Diagnostics::default();
-                    pending.push(warning);
-                    deliver_canonical_diagnostics(canonical_trailer_owner, &mut pending)?;
-                }
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
-        if let Some(warning) = whitespace_warning {
-            table_diagnostics.insert(0, warning);
-        }
         let mut deferred_free = Vec::new();
         for entry in entries {
             match entry {
@@ -1624,8 +1620,7 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
                 &mut trailer_parser,
             )?
         };
-        let mut trailer_diags = table_diagnostics;
-        trailer_diags.extend(trailer_parser_diagnostics);
+        let trailer_diags = trailer_parser_diagnostics;
         if !trailer.try_is_dictionary()? {
             // qpdf delivers parser warnings even when readTrailer returns a
             // non-dictionary, then throws the terminal exception
@@ -3754,10 +3749,10 @@ fn parse_xref_table(
     registration: &XrefRegistration,
     mut first_xref_item_offset_sink: Option<&mut Option<u64>>,
     filename: &[u8],
-) -> Result<(Vec<ParsedXrefEntry>, usize, Vec<QpdfExc>, u64)> {
+    warning_owner: &dyn CanonicalTrailerOwner,
+) -> Result<(Vec<ParsedXrefEntry>, usize, u64)> {
     let mut entries = Vec::new();
     let mut first_xref_item_offset = 0;
-    let mut table_diagnostics = Vec::new();
     // qpdf's `while (!done)` loop always opens with a subsection header read;
     // the `trailer` keyword is only ever recognised by the lookahead that
     // closes a subsection (`libqpdf/QPDF.cc:851-890`). A table with no
@@ -3802,12 +3797,16 @@ fn parse_xref_table(
                     ))
                 })?;
             if invalid {
-                table_diagnostics.push(damaged_warning(
+                let warning = damaged_warning(
                     filename,
                     b"xref table",
                     "accepting invalid xref table entry",
                     Some(entry_offset as u64),
-                ));
+                );
+                // qpdf's parse_xrefEntry calls QPDF::warn while the row is
+                // being read (`QPDF.cc:835-840`), so a following row error
+                // must not discard this already-emitted warning.
+                warning_owner.push_warning(warning)?;
             }
             // cov:ignore-start: object numbers are narrowed to i32 immediately
             // below, so a u32 addition overflow cannot be reached by a valid
@@ -3864,12 +3863,7 @@ fn parse_xref_table(
 
     let trailer_start = cursor.pos;
     let _ = bytes;
-    Ok((
-        entries,
-        trailer_start,
-        table_diagnostics,
-        first_xref_item_offset,
-    ))
+    Ok((entries, trailer_start, first_xref_item_offset))
 }
 
 /// `QUtil::is_space` (`include/qpdf/QUtil.hh:497-501`). NUL is deliberately
@@ -5386,8 +5380,23 @@ mod final_handle_tests {
     fn classic_xref_section_header_can_span_physical_lines_like_qpdf() {
         let mut cursor = ByteCursor::new(b"\n6\n2147483647", 0);
         let registration = XrefRegistration::default();
-        let error = parse_xref_table(&mut cursor, b"", &registration, None, b"issue-335b.pdf")
-            .expect_err("qpdf reaches the first missing xref row after the split header");
+        let warning_owner = FailingCanonicalOwner {
+            transport_error: false,
+            diagnostics: RefCell::new(Diagnostics::default()),
+            source: RefCell::new(std::io::Cursor::new(Vec::new())),
+            declared_source_length: None,
+            source_read_failure: false,
+            accept_warnings: None,
+        };
+        let error = parse_xref_table(
+            &mut cursor,
+            b"",
+            &registration,
+            None,
+            b"issue-335b.pdf",
+            &warning_owner,
+        )
+        .expect_err("qpdf reaches the first missing xref row after the split header");
         assert!(matches!(
             error,
             Error::QpdfExc(warning)

@@ -506,6 +506,99 @@ fn canonical_route_repair_warnings_match_qpdf() {
     }
 }
 
+fn classic_xref_with_warning_before_bad_entry() -> (Vec<u8>, usize, usize) {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let catalog_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 3\n");
+    // The extra field separator is accepted but warned by qpdf's
+    // parse_xrefEntry (`QPDF.cc:790-802`).
+    bytes.extend_from_slice(b"0000000000  65535 f \n");
+    // The next row is fatal, so warnings already emitted for row zero must
+    // remain in QPDF::warn's document-owned collection during reconstruction.
+    bytes.extend_from_slice(b"not an xref entry\n");
+    bytes.extend_from_slice(b"0000000000 00000 n \n");
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+
+    (bytes, catalog_offset, pages_offset)
+}
+
+#[test]
+fn failed_classic_xref_parse_keeps_prior_entry_warnings_like_qpdf() {
+    let (fixture, catalog_offset, pages_offset) = classic_xref_with_warning_before_bad_entry();
+    let directory = tempfile::tempdir().expect("create qpdf fixture directory");
+    let input = directory
+        .path()
+        .join("classic-xref-warning-before-error.pdf");
+    fs::write(&input, &fixture).expect("write qpdf fixture");
+    let description = input.to_string_lossy().into_owned();
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(fixture),
+        PdfOpenOptions {
+            repair: true,
+            suppress_warnings: true,
+            description: description.as_bytes().to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("canonical recovery should recover objects after the broken xref row");
+    assert_eq!(pdf.root_ref(), Some(ObjectRef::new(1, 0)));
+    pdf.root_handle()
+        .expect("reconstruction should retain the Catalog object");
+    let flpdf_warnings: Vec<String> = pdf
+        .repair_diagnostics()
+        .entries()
+        .iter()
+        .map(|warning| String::from_utf8_lossy(warning.what_bytes()).into_owned())
+        .collect();
+    let rendered = render_xref_table(&pdf.get_xref_table());
+    assert!(rendered.contains(&format!("1/0: uncompressed; offset = {catalog_offset}")));
+    assert!(rendered.contains(&format!("2/0: uncompressed; offset = {pages_offset}")));
+    assert!(
+        flpdf_warnings.first().is_some_and(|warning| {
+            warning.contains("(xref table, offset")
+                && warning.ends_with("accepting invalid xref table entry")
+        }),
+        "the canonical owner must retain the accepted row warning before recovery: {flpdf_warnings:?}"
+    );
+
+    if !qpdf_available() {
+        eprintln!("qpdf 11.9.0 is not available; skipping only the oracle comparison");
+        return;
+    }
+    let qpdf = Command::new("qpdf")
+        .args(["--warning-exit-0", "--show-xref"])
+        .arg(&input)
+        .output()
+        .expect("qpdf should spawn");
+    assert!(
+        qpdf.status.success(),
+        "qpdf should recover this classic table: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    let qpdf_warnings: Vec<String> = String::from_utf8_lossy(&qpdf.stderr)
+        .lines()
+        .filter_map(|line| line.strip_prefix("WARNING: "))
+        .map(str::to_owned)
+        .collect();
+    assert!(qpdf_warnings
+        .first()
+        .is_some_and(|warning| warning.contains("accepting invalid xref table entry")));
+    let qpdf_rows: Vec<String> = String::from_utf8_lossy(&qpdf.stdout)
+        .lines()
+        .filter(|line| line.contains(": uncompressed;") || line.contains(": compressed;"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(flpdf_warnings, qpdf_warnings);
+    assert_eq!(rendered, qpdf_rows);
+}
+
 #[test]
 fn open_reconstruction_does_not_restore_stale_partially_parsed_xref_rows() {
     let (fixture, object_offset, invalid_row_offset) = classic_xref_with_stale_type1_loader_row();
