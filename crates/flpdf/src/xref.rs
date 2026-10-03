@@ -2625,7 +2625,7 @@ pub(crate) struct RecoveredXref {
 /// qpdf's `QPDF::insertReconstructedXrefEntry` overwrite step
 /// (`libqpdf/QPDF.cc:1197-1210`), applied to a line-scan match whose
 /// `obj > 0 && 0 <= gen < 65535` guard (`QPDF.cc:1199-1202`) has already been
-/// enforced by [`scan_object_header_after_first_token`]'s own explicit range
+/// enforced by [`reconstructed_object_ref`]'s explicit range
 /// check before it constructs the `ObjectRef` this function receives. The
 /// remaining behavior -- the last occurrence in the file wins, unless the
 /// object's plain number
@@ -2701,8 +2701,13 @@ fn recover_xref_entries_from_source(
     // so a source-read QPDFExc reports the same `read N bytes` detail.
     let mut chunk = [0u8; 10_240];
 
-    let mut process_line = |line: &[u8], line_start: u64, next_line_start: u64| {
+    let mut process_line = |line: &[u8],
+                            line_start: u64,
+                            next_line_start: u64,
+                            source_window_start: u64,
+                            source_window: &[u8]| {
         let Some(first_token) = read_scan_token(line, 0, line.len()) else {
+            owner.source_seek(next_line_start)?;
             return Ok::<(), Error>(());
         };
         if capture_trailer && trailer.is_none() && first_token.is_word_value(b"trailer") {
@@ -2733,45 +2738,59 @@ fn recover_xref_entries_from_source(
             } // cov:ignore: LLVM maps the successful trailer-candidate edge to the inner dictionary branch
             owner.source_seek(next_line_start)?;
         } else {
-            // qpdf reads the generation and `obj` tokens from the file rather
-            // than from the current line (`QPDF.cc:556-559` calls `readToken`
-            // on `m->file`), so a header split across lines -- `1\n0\nobj` --
-            // is still recovered. Retry with the following bytes appended when
-            // the line alone does not complete the header.
-            let mut header = scan_object_header_after_first_token(line, &first_token)?;
-            if header.is_none() && first_token.is_integer() {
-                let mut lookahead = line.to_vec();
-                lookahead.push(b'\n');
-                owner.source_seek(next_line_start)?;
-                let mut following = vec![0u8; OBJECT_HEADER_LOOKAHEAD];
-                let read = owner.source_read(&mut following)?;
-                lookahead.extend_from_slice(&following[..read]);
-                header = scan_object_header_after_first_token(&lookahead, &first_token)?;
+            if first_token.is_integer() {
+                // qpdf reads the next two tokens from the live source
+                // (`QPDF.cc:556-559`). Its 100-byte limit applies to token
+                // bytes only; whitespace and comments between them are
+                // skipped by QPDFTokenizer without a lookahead byte cap.
+                let token_start = line_start.saturating_add(first_token.end as u64);
+                if let Some((object_ref, offset)) =
+                    scan_object_header_after_first_token_from_source(
+                        owner,
+                        source_length,
+                        source_window_start,
+                        source_window,
+                        token_start,
+                        &first_token,
+                    )?
+                {
+                    let offset = line_start.saturating_add(offset);
+                    registration.insert_reconstructed_xref_entry(object_ref, offset);
+                    insert_reconstructed_xref_entry(
+                        &mut entries,
+                        object_ref,
+                        offset,
+                        deleted_objects,
+                    );
+                }
             }
-            if let Some((object_ref, offset)) = header {
-                registration
-                    .insert_reconstructed_xref_entry(object_ref, line_start.saturating_add(offset));
-                insert_reconstructed_xref_entry(
-                    &mut entries,
-                    object_ref,
-                    line_start.saturating_add(offset),
-                    deleted_objects,
-                );
-            }
+            // qpdf rewinds to the next physical line after evaluating this
+            // candidate, regardless of whether the two following tokens
+            // formed an object header (`QPDF.cc:571-574`).
+            owner.source_seek(next_line_start)?;
         }
         Ok(())
     };
 
+    let mut last_source_window = None;
     loop {
+        let source_window_start = position;
         owner.source_seek(position)?;
         let read = owner.source_read(&mut chunk)?;
         if read == 0 {
             break;
         }
+        last_source_window = Some((source_window_start, read));
         for &byte in &chunk[..read] {
             position = position.saturating_add(1);
             if matches!(byte, b'\n' | b'\r') {
-                process_line(&line, line_start, position)?;
+                process_line(
+                    &line,
+                    line_start,
+                    position,
+                    source_window_start,
+                    &chunk[..read],
+                )?;
                 line.clear();
                 line_start = position;
             } else {
@@ -2780,7 +2799,15 @@ fn recover_xref_entries_from_source(
         }
     }
     if !line.is_empty() {
-        process_line(&line, line_start, position)?;
+        let (source_window_start, source_window_length) =
+            last_source_window.expect("an unterminated final line came from a source read");
+        process_line(
+            &line,
+            line_start,
+            position,
+            source_window_start,
+            &chunk[..source_window_length],
+        )?;
     }
 
     Ok(RecoveredXref {
@@ -3437,8 +3464,179 @@ fn parse_scan_integer(token: &Token) -> Result<i32> {
     }
 }
 
-/// If the already-read first token opens an `int int obj` token sequence,
-/// return the recovered object and the offset of its number token.
+fn reconstructed_object_ref(
+    number_token: &Token,
+    generation_token: &Token,
+) -> Result<Option<ObjectRef>> {
+    let obj = parse_scan_integer(number_token)?;
+    let generation = parse_scan_integer(generation_token)?;
+
+    // qpdf's `insertReconstructedXrefEntry` guards (`QPDF.cc:1197-1210`).
+    if obj <= 0 || !(0..65535).contains(&generation) {
+        return Ok(None);
+    }
+    let number = u32::try_from(obj).expect("positive qpdf int fits u32");
+    let generation = u16::try_from(generation).expect("qpdf generation guard fits u16");
+    Ok(Some(ObjectRef::new(number, generation)))
+}
+
+/// Read qpdf's next recovery token from the live input source. Separators are
+/// consumed as a stream so an arbitrarily long whitespace run or comment does
+/// not require an equally large lookahead allocation. Token contents remain
+/// bounded by `QPDF::reconstruct_xref`'s `MAX_LEN` of 100 bytes.
+struct RecoverySourceTokenReader<'a> {
+    owner: &'a dyn CanonicalTrailerOwner,
+    source_length: u64,
+    source_window_start: u64,
+    source_window: &'a [u8],
+    position: u64,
+    buffer: [u8; 10_240],
+    buffer_position: usize,
+    buffer_length: usize,
+    pending: Option<u8>,
+}
+
+impl<'a> RecoverySourceTokenReader<'a> {
+    fn new(
+        owner: &'a dyn CanonicalTrailerOwner,
+        source_length: u64,
+        source_window_start: u64,
+        source_window: &'a [u8],
+        position: u64,
+    ) -> Self {
+        Self {
+            owner,
+            source_length,
+            source_window_start,
+            source_window,
+            position,
+            buffer: [0; 10_240],
+            buffer_position: 0,
+            buffer_length: 0,
+            pending: None,
+        }
+    }
+
+    fn read_byte(&mut self) -> Result<Option<u8>> {
+        if let Some(byte) = self.pending.take() {
+            return Ok(Some(byte));
+        }
+        if self.buffer_position < self.buffer_length {
+            let byte = self.buffer[self.buffer_position];
+            self.buffer_position += 1;
+            self.position = self.position.saturating_add(1);
+            return Ok(Some(byte));
+        }
+
+        let source_window_end = self
+            .source_window_start
+            .saturating_add(self.source_window.len() as u64);
+        if (self.source_window_start..source_window_end).contains(&self.position) {
+            let index = usize::try_from(self.position - self.source_window_start)
+                .expect("an input window index fits usize");
+            let byte = self.source_window[index];
+            self.position = self.position.saturating_add(1);
+            return Ok(Some(byte));
+        }
+
+        if self.position >= self.source_length {
+            return Ok(None);
+        }
+        self.owner.source_seek(self.position)?;
+        self.buffer_length = self.owner.source_read(&mut self.buffer)?;
+        self.buffer_position = 0;
+        if self.buffer_length == 0 {
+            return Ok(None);
+        }
+        let byte = self.buffer[self.buffer_position];
+        self.buffer_position += 1;
+        self.position = self.position.saturating_add(1);
+        Ok(Some(byte))
+    }
+
+    fn next_token(&mut self) -> Result<Option<Token>> {
+        let first = loop {
+            let Some(byte) = self.read_byte()? else {
+                return Ok(None);
+            };
+            if crate::tokenizer::is_ws(byte) {
+                continue;
+            }
+            if byte == b'%' {
+                while let Some(comment_byte) = self.read_byte()? {
+                    if matches!(comment_byte, b'\r' | b'\n') {
+                        break;
+                    }
+                }
+                continue;
+            }
+            break byte;
+        };
+
+        if crate::tokenizer::is_delimiter(first) {
+            // The caller only accepts an integer generation or the word
+            // `obj`; all delimiter-started tokens fail those checks. qpdf
+            // permits bad tokens at this call site, so retaining their full
+            // body cannot affect recovery.
+            return Ok(Some(Token::new(TokenType::Bad, Vec::new())));
+        }
+
+        let mut token_bytes = Vec::with_capacity(XREF_RECONSTRUCTION_MAX_TOKEN_LEN);
+        token_bytes.push(first);
+        while token_bytes.len() < XREF_RECONSTRUCTION_MAX_TOKEN_LEN {
+            let Some(byte) = self.read_byte()? else {
+                break;
+            };
+            if crate::tokenizer::is_ws(byte) || crate::tokenizer::is_delimiter(byte) {
+                self.pending = Some(byte);
+                break;
+            }
+            token_bytes.push(byte);
+        }
+
+        let mut tokenizer = Tokenizer::new(&token_bytes);
+        Ok(Some(
+            tokenizer.read_qpdf_token(XREF_RECONSTRUCTION_MAX_TOKEN_LEN)?,
+        ))
+    }
+}
+
+fn scan_object_header_after_first_token_from_source(
+    owner: &dyn CanonicalTrailerOwner,
+    source_length: u64,
+    source_window_start: u64,
+    source_window: &[u8],
+    token_start: u64,
+    number_token: &Token,
+) -> Result<Option<(ObjectRef, u64)>> {
+    let mut reader = RecoverySourceTokenReader::new(
+        owner,
+        source_length,
+        source_window_start,
+        source_window,
+        token_start,
+    );
+    let Some(generation_token) = reader.next_token()? else {
+        return Ok(None);
+    };
+    if !generation_token.is_integer() {
+        return Ok(None);
+    }
+
+    let Some(object_token) = reader.next_token()? else {
+        return Ok(None);
+    };
+    if !object_token.is_word_value(b"obj") {
+        return Ok(None);
+    }
+
+    Ok(reconstructed_object_ref(number_token, &generation_token)?
+        .map(|object_ref| (object_ref, number_token.start as u64)))
+}
+
+/// If the already-read first token opens an `int int obj` token sequence in
+/// the byte-backed unit-test scanner, return the recovered object and the
+/// offset of its number token.
 ///
 /// Mirrors qpdf's `reconstruct_xref` per-line logic: the first token must begin
 /// on this line (otherwise the line records nothing — qpdf's
@@ -3446,12 +3644,7 @@ fn parse_scan_integer(token: &Token) -> Result<i32> {
 /// token read to `next_line_start`), the second and third tokens may spill onto
 /// following lines, and the object/generation must satisfy qpdf's
 /// `insertReconstructedXrefEntry` guards (`obj > 0`, `0 <= gen < 65535`).
-/// Bytes read past a line's end when an object header's tokens straddle the
-/// line break. qpdf caps each recovery token at 100 bytes (`QPDF.cc:547`), and
-/// a header is three tokens, so this covers the generation and `obj` tokens
-/// with their separators.
-const OBJECT_HEADER_LOOKAHEAD: usize = 320;
-
+#[cfg(test)]
 fn scan_object_header_after_first_token(
     bytes: &[u8],
     number_token: &Token,
@@ -3470,19 +3663,8 @@ fn scan_object_header_after_first_token(
         return Ok(None);
     }
 
-    let obj = parse_scan_integer(number_token)?;
-    let gen = parse_scan_integer(&gen_token)?;
-
-    // qpdf's `insertReconstructedXrefEntry` guards (`obj > 0`, `0 <= gen < 65535`).
-    if obj <= 0 || !(0..65535).contains(&gen) {
-        return Ok(None);
-    }
-    let number = u32::try_from(obj).expect("positive qpdf int fits u32");
-    let generation = u16::try_from(gen).expect("qpdf generation guard fits u16");
-    Ok(Some((
-        ObjectRef::new(number, generation),
-        number_token.start as u64,
-    )))
+    Ok(reconstructed_object_ref(number_token, &gen_token)?
+        .map(|object_ref| (object_ref, number_token.start as u64)))
 }
 
 fn parse_xref_table(
@@ -6046,6 +6228,9 @@ mod final_handle_tests {
     struct FailingCanonicalOwner {
         transport_error: bool,
         diagnostics: RefCell<Diagnostics>,
+        source: RefCell<std::io::Cursor<Vec<u8>>>,
+        declared_source_length: Option<u64>,
+        source_read_failure: bool,
         /// `None` accepts every warning. `Some(n)` accepts `n` and then fails,
         /// so a sink that gives out partway through a batch can be observed.
         accept_warnings: Option<usize>,
@@ -6102,20 +6287,32 @@ mod final_handle_tests {
             false
         }
 
-        fn source_seek(&self, _offset: u64) -> Result<()> {
-            Ok(())
+        fn source_seek(&self, offset: u64) -> Result<()> {
+            std::io::Seek::seek(
+                &mut *self.source.borrow_mut(),
+                std::io::SeekFrom::Start(offset),
+            )
+            .map(|_| ())
+            .map_err(Error::Io)
         }
 
         fn source_tell(&self) -> Result<u64> {
-            Ok(0)
+            Ok(self.source.borrow().position())
         }
 
         fn source_length(&self) -> Result<u64> {
-            Ok(0)
+            Ok(self.declared_source_length.unwrap_or_else(|| {
+                u64::try_from(self.source.borrow().get_ref().len()).unwrap_or(u64::MAX)
+            }))
         }
 
-        fn source_read(&self, _buffer: &mut [u8]) -> Result<usize> {
-            Ok(0)
+        fn source_read(&self, buffer: &mut [u8]) -> Result<usize> {
+            if self.source_read_failure {
+                return Err(Error::Io(std::io::Error::other(
+                    "synthetic source read failure",
+                )));
+            }
+            std::io::Read::read(&mut *self.source.borrow_mut(), buffer).map_err(Error::Io)
         }
 
         fn begin_parse(&self) -> Result<()> {
@@ -6169,6 +6366,48 @@ mod final_handle_tests {
         }
     }
 
+    #[test]
+    fn recovery_source_token_reader_stops_at_true_or_early_eof() {
+        for (declared_source_length, source) in [(1, b"x".to_vec()), (2, b"x".to_vec())] {
+            let owner = FailingCanonicalOwner {
+                transport_error: false,
+                diagnostics: RefCell::new(Diagnostics::default()),
+                source: RefCell::new(std::io::Cursor::new(source)),
+                declared_source_length: Some(declared_source_length),
+                source_read_failure: false,
+                accept_warnings: None,
+            };
+            let mut tokens =
+                RecoverySourceTokenReader::new(&owner, declared_source_length, 0, &[], 0);
+            let token = tokens
+                .next_token()
+                .expect("the source read should be successful")
+                .expect("the final token must be returned before EOF");
+            assert!(token.is_word_value(b"x"));
+            assert!(tokens
+                .next_token()
+                .expect("the next source read should report EOF")
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn recovery_source_token_reader_propagates_a_source_read_error() {
+        let owner = FailingCanonicalOwner {
+            transport_error: false,
+            diagnostics: RefCell::new(Diagnostics::default()),
+            source: RefCell::new(std::io::Cursor::new(b"x".to_vec())),
+            declared_source_length: Some(1),
+            source_read_failure: true,
+            accept_warnings: None,
+        };
+        let mut tokens = RecoverySourceTokenReader::new(&owner, 1, 0, &[], 0);
+        assert!(matches!(
+            tokens.next_token(),
+            Err(Error::Io(error)) if error.to_string() == "synthetic source read failure"
+        ));
+    }
+
     /// qpdf appends to `m->warnings` one `warn()` call at a time, so a sink
     /// that gives out partway through a batch leaves the warnings it has not
     /// reached yet still pending. Draining the batch before delivering any of
@@ -6178,6 +6417,9 @@ mod final_handle_tests {
         let owner = FailingCanonicalOwner {
             transport_error: false,
             diagnostics: RefCell::new(Diagnostics::default()),
+            source: RefCell::new(std::io::Cursor::new(Vec::new())),
+            declared_source_length: None,
+            source_read_failure: false,
             accept_warnings: Some(1),
         };
         let mut diagnostics = Diagnostics::default();
@@ -6211,6 +6453,9 @@ mod final_handle_tests {
         let owner = FailingCanonicalOwner {
             transport_error: false,
             diagnostics: RefCell::new(Diagnostics::default()),
+            source: RefCell::new(std::io::Cursor::new(Vec::new())),
+            declared_source_length: None,
+            source_read_failure: false,
             accept_warnings: None,
         };
         owner
@@ -6419,6 +6664,9 @@ mod final_handle_tests {
             let owner = FailingCanonicalOwner {
                 transport_error,
                 diagnostics: RefCell::new(Diagnostics::default()),
+                source: RefCell::new(std::io::Cursor::new(Vec::new())),
+                declared_source_length: None,
+                source_read_failure: false,
                 accept_warnings: None,
             };
             let _ = owner.indirect_handle(ObjectRef::new(1, 0));
