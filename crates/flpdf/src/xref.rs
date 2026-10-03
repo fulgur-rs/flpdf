@@ -4557,18 +4557,43 @@ fn parse_qpdf_header_version(bytes: &[u8]) -> Option<String> {
 fn parse_startxref(bytes: &[u8]) -> Result<u64> {
     let marker = b"startxref";
     // qpdf's QPDF::parse searches for the marker only in the final 1054
-    // bytes of the file (`QPDF.cc:440-464`). This preserves its recovery
-    // boundary for files with stale startxref markers in an earlier update.
+    // bytes of the file (`QPDF.cc:439-448`). `InputSource::findLast` keeps
+    // scanning after a candidate rejected by `findStartxref`; the predicate
+    // accepts only a full `startxref` word followed by an integer token
+    // (`QPDF.cc:413-419`, `InputSource.cc:145-166`). After an accepted
+    // candidate, qpdf resumes the search at that integer token's start.
     let search_start = bytes.len().saturating_sub(1054);
-    let Some(relative_pos) = bytes[search_start..]
-        .windows(marker.len())
-        .rposition(|window| window == marker)
-    else {
+    let mut search_offset = search_start;
+    let mut accepted_offset_token_start = None;
+    while search_offset <= bytes.len() {
+        let Some(relative_pos) = bytes.get(search_offset..).and_then(|tail| {
+            tail.windows(marker.len())
+                .position(|window| window == marker)
+        }) else {
+            break;
+        };
+        let candidate_start = search_offset.saturating_add(relative_pos);
+        let mut candidate = ByteCursor::new(bytes, candidate_start);
+        let marker_token = candidate.read_token()?;
+        if marker_token.is_word_value(marker) {
+            let offset_token = candidate.read_token()?;
+            if offset_token.is_integer() {
+                accepted_offset_token_start = Some(offset_token.start);
+                search_offset = offset_token.start;
+                continue;
+            }
+        }
+        // qpdf's `findFirst` advances one byte after a rejected substring so
+        // a later candidate in the same bounded tail can still be tested.
+        search_offset = candidate_start.saturating_add(1);
+    }
+
+    let Some(offset_token_start) = accepted_offset_token_start else {
         return Err(Error::parse(0, "can't find startxref"));
     };
-    let pos = search_start + relative_pos;
-
-    let mut cursor = ByteCursor::new(bytes, pos + marker.len());
+    // `QPDF::parse` reads the accepted integer a second time after `findLast`
+    // has rewound the source to `InputSource::getLastOffset()`.
+    let mut cursor = ByteCursor::new(bytes, offset_token_start);
     let token = cursor.read_token()?;
     if !token.is_integer() {
         // qpdf's findStartxref only accepts the marker when its following

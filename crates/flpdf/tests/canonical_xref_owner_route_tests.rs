@@ -1250,6 +1250,102 @@ fn classic_xref_document(between: &[u8], startxref_value: Option<&[u8]>) -> Vec<
     bytes
 }
 
+#[test]
+fn startxref_candidate_search_falls_back_by_qpdf_token_predicate() {
+    let base = classic_xref_document(b"", None);
+    let xref_offset = base
+        .windows(b"xref\n0 4\n".len())
+        .position(|window| window == b"xref\n0 4\n")
+        .expect("the base fixture has a classic xref table");
+    let directory = tempfile::tempdir().expect("create qpdf fixture directory");
+    let open = |bytes: Vec<u8>, description: &str| {
+        Pdf::open_with_options(
+            Cursor::new(bytes),
+            PdfOpenOptions {
+                repair: true,
+                suppress_warnings: true,
+                description: description.as_bytes().to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("the canonical loader must use qpdf's startxref candidate predicate")
+    };
+    // Every case below must resolve to this table without recovery: the
+    // `startxref` that qpdf's `findLast` + `findStartxref` accept points at
+    // the real section.
+    let expected_rows = {
+        let pdf = open(base.clone(), "base.pdf");
+        assert!(pdf.repair_diagnostics().entries().is_empty());
+        render_xref_table(&pdf.get_xref_table())
+    };
+    // qpdf's findLast searches the byte substring, then applies
+    // findStartxref at that byte. It has no separate left-boundary test, so
+    // the `startxref` inside `notstartxref` is the last accepted candidate.
+    // The earlier, whole-word marker in this fixture points at a bogus
+    // offset: an implementation that rejected the embedded substring would
+    // fall back to it and have to reconstruct the table.
+    let bogus_then_suffix = {
+        let mut bytes = classic_xref_document(b"", Some(b"1\n"));
+        bytes.extend_from_slice(format!("notstartxref\n{xref_offset}\n").as_bytes());
+        bytes
+    };
+    let cases = [
+        (
+            "later-noninteger-startxref.pdf",
+            [base.as_slice(), b"startxref\nnot-an-integer\n"].concat(),
+        ),
+        (
+            "startxref-with-attached-digits.pdf",
+            [base.as_slice(), b"startxref123\n9\n"].concat(),
+        ),
+        ("startxref-suffix-of-word.pdf", bogus_then_suffix),
+    ];
+
+    for (name, fixture) in cases {
+        let input = directory.path().join(name);
+        fs::write(&input, &fixture).expect("write qpdf fixture");
+        let description = input.to_string_lossy().into_owned();
+
+        let pdf = open(fixture, &description);
+        assert!(
+            pdf.repair_diagnostics().entries().is_empty(),
+            "the accepted startxref candidate must not trigger recovery for {name}"
+        );
+        let rows = render_xref_table(&pdf.get_xref_table());
+        assert_eq!(rows, expected_rows, "{name}");
+
+        if !qpdf_available() {
+            eprintln!("qpdf 11.9.0 is not available; skipping only the oracle comparison");
+            continue;
+        }
+        let qpdf = Command::new("qpdf")
+            .arg("--show-xref")
+            .arg(&input)
+            .output()
+            .expect("qpdf should spawn");
+        assert_eq!(
+            qpdf.status.code(),
+            Some(0),
+            "qpdf must use the last candidate accepted by findStartxref for {name}"
+        );
+        let qpdf_warnings: Vec<String> = String::from_utf8_lossy(&qpdf.stderr)
+            .lines()
+            .filter_map(|line| line.strip_prefix("WARNING: "))
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            qpdf_warnings.is_empty(),
+            "qpdf warnings for {name}: {qpdf_warnings:?}"
+        );
+        let qpdf_rows: Vec<String> = String::from_utf8_lossy(&qpdf.stdout)
+            .lines()
+            .filter(|line| line.contains(": uncompressed;") || line.contains(": compressed;"))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(rows, qpdf_rows, "{name}");
+    }
+}
+
 /// A classic section that jumps straight from the `xref` keyword to
 /// `trailer`. qpdf's `while (!done)` loop always opens by reading a
 /// subsection header and only recognises `trailer` through the lookahead that

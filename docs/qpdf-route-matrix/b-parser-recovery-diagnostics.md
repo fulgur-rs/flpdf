@@ -37,7 +37,7 @@ qpdf 11.9.0 pinned source。以下の行範囲はすべて `rg -n` / `sed -n` / 
 1. **`QPDF::parse(password)`**（`libqpdf/QPDF.cc:424-473`）
    - `%PDF-` を先頭 1024 byte から探し、無ければ `warn(damagedPDF("", 0, "can't find PDF header"))` して
      `pdf_version = "1.2"`（`libqpdf/QPDF.cc:430-437`）。**throw しない**。
-   - 末尾 1054 byte から `startxref` を `findLast` し、`readToken` で offset を読む（`libqpdf/QPDF.cc:439-448`）。
+   - 末尾 1054 byte の raw substring を `InputSource::findLast` で走査し、各候補を `QPDF::findStartxref` predicate に渡す（`libqpdf/QPDF.cc:413-419,439-448`; `InputSource.cc:44-140,145-165`）。predicate は候補位置から `readToken` した第1 token が完全な `startxref` word、第2 token が integer の場合だけ受理し、成功時は offset token の開始位置へ戻す。不正候補は検索を継続して直前の有効候補に fallback する。候補より左のword boundaryは別途検査しない。
    - `xref_offset == 0` なら `throw damagedPDF("", 0, "can't find startxref")`。内側 try が
      `read_xref` を包み、`QPDFExc` は素通し、その他 `std::exception` は
      `damagedPDF("", 0, "error reading xref: " + e.what())` に**包み直して** throw。外側 catch が
@@ -45,6 +45,8 @@ qpdf 11.9.0 pinned source。以下の行範囲はすべて `rg -n` / `sed -n` / 
    - `initializeEncryption(); m->parsed = true;`（`libqpdf/QPDF.cc:471-472`）。
    - **`attempt_recovery` の分岐は全ソースで 3 箇所だけ**: `libqpdf/QPDF.cc:463`（parse 直下）、
      `:1391`（`readStream`）、`:1563`（`readObjectAtOffset`）。setter は `:336`。
+
+**2026-10-03 (`flpdf-6ik2q.11`)**: `parse_startxref` が最後のraw substringだけを選び、token predicateが不一致でも前候補を試さないため、末尾に `startxref\nnot-an-integer` または `startxref123` を追記すると、有効な既存startxrefを捨てて不要なrecoveryに入る。canonical regressionでqpdfのfallbackとtoken境界、左境界を要求しないsubstring探索を固定した。
 2. **`QPDF::read_xref(xref_offset)`**（`libqpdf/QPDF.cc:626-719`）— `while (xref_offset)` で
    `visited` に積みながら:
    - offset 直後の空白を読み飛ばし（`skipped_space`）、7 byte 読んで `"xref"` + 空白なら
