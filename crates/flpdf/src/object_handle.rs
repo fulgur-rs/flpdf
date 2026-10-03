@@ -6474,7 +6474,7 @@ impl ObjectHandle {
             dict.replace_key(
                 b"/Length",
                 ObjectHandle::integer(i64::try_from(length).unwrap_or(i64::MAX)),
-            )?;
+            )?; // cov:ignore: a stream-owned dictionary accepts its direct integer length through the same-Pdf replaceKey path.
         }
         Ok(())
     }

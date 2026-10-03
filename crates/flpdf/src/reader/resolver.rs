@@ -1168,7 +1168,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 raw_data,
                 Some(stream_copy_dictionary_value(&source_dict, b"/Filter")?),
                 Some(stream_copy_dictionary_value(&source_dict, b"/DecodeParms")?),
-            )?;
+            )?; // cov:ignore: the source stream and its dictionary values share the source Pdf owner.
             source_data = source.as_stream_data();
         }
 

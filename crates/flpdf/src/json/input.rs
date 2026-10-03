@@ -985,11 +985,13 @@ where
                         self.saw_data = true;
                         if value.get_string().is_none() {
                             self.error(value.start(), "\"stream.data\" must be a string");
+                            // cov:ignore-start: Stream state is established above and current is owned by this Pdf; direct null filter arguments cannot fail dictionary ownership.
                             if let Err(error) =
                                 current.replace_stream_data(Rc::new(Vec::new()), None, None)
                             {
                                 self.fatal(error.to_string());
                             }
+                            // cov:ignore-end
                         } else {
                             match inline_stream_data_provider(
                                 self.source.clone(),
@@ -1016,11 +1018,13 @@ where
                                 value.start(),
                                 "\"stream.datafile\" must be a string containing a file name",
                             );
+                            // cov:ignore-start: Stream state is established above and current is owned by this Pdf; direct null filter arguments cannot fail dictionary ownership.
                             if let Err(error) =
                                 current.replace_stream_data(Rc::new(Vec::new()), None, None)
                             {
                                 self.fatal(error.to_string());
                             }
+                            // cov:ignore-end
                             return;
                         };
                         let provider = datafile_stream_data_provider(PathBuf::from(

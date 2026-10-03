@@ -142,7 +142,7 @@ fn normalize_and_store_stream_handle<R: Read + Seek>(
         std::rc::Rc::clone(&normalized),
         Some(ObjectHandle::null()),
         Some(ObjectHandle::null()),
-    )?;
+    )?; // cov:ignore: normalization has a resolved stream in this Pdf and only removes keys with direct nulls.
     if let Some(dict) = stream.as_stream_dict() {
         dict.replace_key(b"/Length", ObjectHandle::integer(length))?;
     } // cov:ignore: LLVM maps the covered stream-dictionary replacement to the if-let line

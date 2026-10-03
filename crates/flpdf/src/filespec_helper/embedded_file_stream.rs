@@ -48,7 +48,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             Rc::new(data.as_ref().to_vec()),
             Some(ObjectHandle::null()),
             Some(ObjectHandle::null()),
-        )?;
+        )?; // cov:ignore: Pdf::new_stream created this same-Pdf stream and both replacement keys are direct nulls.
         Self::new_from_stream(stream)
     }
 
