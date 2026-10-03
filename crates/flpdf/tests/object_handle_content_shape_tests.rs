@@ -1,14 +1,11 @@
 use flpdf::{ObjectHandle, ObjectRef, Pdf};
 use std::collections::BTreeSet;
-use std::rc::Rc;
+mod common;
 
 fn stream(subtype: &[u8]) -> ObjectHandle {
-    ObjectHandle::stream(
-        ObjectHandle::dictionary(vec![(
-            b"/Subtype".to_vec(),
-            ObjectHandle::name(subtype.to_vec()),
-        )]),
-        Rc::new(Vec::new()),
+    common::qpdf_owned_stream_with_dict(
+        b"",
+        vec![(b"/Subtype".to_vec(), ObjectHandle::name(subtype.to_vec()))],
     )
 }
 
@@ -45,12 +42,12 @@ fn form_and_image_classification_matches_qpdf() {
     assert!(!stream(b"Image").is_form_xobject().unwrap());
     assert!(!ObjectHandle::integer(1).is_form_xobject().unwrap());
 
-    let image = ObjectHandle::stream(
-        ObjectHandle::dictionary(vec![
+    let image = common::qpdf_owned_stream_with_dict(
+        b"",
+        vec![
             (b"/Subtype".to_vec(), ObjectHandle::name(b"Image".to_vec())),
             (b"/ImageMask".to_vec(), ObjectHandle::boolean(true)),
-        ]),
-        Rc::new(Vec::new()),
+        ],
     );
     assert!(image.is_image(false).unwrap());
     assert!(!image.is_image(true).unwrap());

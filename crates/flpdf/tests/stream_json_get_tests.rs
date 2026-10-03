@@ -376,11 +376,13 @@ fn get_stream_json_inline_flate_blob_matches_the_derived_level() {
     let pdf = Pdf::empty().unwrap();
     let stream = pdf.new_stream().unwrap();
     let compressed = deflate_bytes(b"hello flate payload");
-    stream.replace_stream_data(
-        Rc::new(compressed.clone()),
-        Some(ObjectHandle::name(b"FlateDecode".to_vec())),
-        None,
-    );
+    stream
+        .replace_stream_data(
+            Rc::new(compressed.clone()),
+            Some(ObjectHandle::name(b"FlateDecode".to_vec())),
+            None,
+        )
+        .expect("replace stream data");
 
     let decoded = stream
         .get_stream_json(

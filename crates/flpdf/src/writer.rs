@@ -5216,7 +5216,7 @@ mod final_handle_writer_tests {
         ))
         .expect("minimal fixture must open");
         let page = crate::pages::page_refs(&mut pdf).expect("page refs")[0];
-        let direct_stream = ObjectHandle::stream(
+        let direct_stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(1))]),
             Rc::new(b"q".to_vec()),
         );
@@ -5358,7 +5358,7 @@ mod final_handle_writer_tests {
         let raw_contents = pdf.get_object_handle_by_raw_identity(6, 65_535);
         pdf.replace_object(
             raw_contents_ref,
-            ObjectHandle::stream(
+            ObjectHandle::direct_stream(
                 ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(4))]),
                 Rc::new(b"q Q\n".to_vec()),
             ),

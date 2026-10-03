@@ -1222,7 +1222,7 @@ mod tests {
             let mut pdf = Pdf::open_mem_owned(direct_stream_source()).unwrap();
             let page = pdf.get_object_handle(ObjectRef::new(3, 0));
             page.try_is_scalar().unwrap();
-            let direct_stream = ObjectHandle::stream(
+            let direct_stream = ObjectHandle::direct_stream(
                 ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(3))]),
                 Rc::new(b"q Q".to_vec()),
             );

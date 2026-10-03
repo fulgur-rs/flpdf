@@ -2038,7 +2038,7 @@ fn externalize_inline_images_for_target<R: Read + Seek + 'static>(
             Rc::new(rewritten),
             Some(ObjectHandle::null()),
             Some(ObjectHandle::null()),
-        );
+        )?;
     } else {
         let contents = pdf.new_stream_with_data(Rc::new(rewritten))?;
         target.replace_key(b"/Contents", contents)?;
@@ -2566,7 +2566,7 @@ mod tests {
             .get_stream_data(DecodeLevel::Specialized)
             .expect("page filter should remain executable through the live stream");
 
-        let form = ObjectHandle::stream(
+        let form = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![
                 (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
                 (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),

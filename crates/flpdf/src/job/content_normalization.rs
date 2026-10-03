@@ -142,7 +142,7 @@ fn normalize_and_store_stream_handle<R: Read + Seek>(
         std::rc::Rc::clone(&normalized),
         Some(ObjectHandle::null()),
         Some(ObjectHandle::null()),
-    );
+    )?;
     if let Some(dict) = stream.as_stream_dict() {
         dict.replace_key(b"/Length", ObjectHandle::integer(length))?;
     } // cov:ignore: LLVM maps the covered stream-dictionary replacement to the if-let line
@@ -179,7 +179,7 @@ mod tests {
     }
 
     fn filtered_stream(filter: &[u8]) -> ObjectHandle {
-        ObjectHandle::stream(
+        ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(
                 b"Filter".to_vec(),
                 ObjectHandle::name(filter.to_vec()),

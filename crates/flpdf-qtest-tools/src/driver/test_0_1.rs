@@ -345,7 +345,6 @@ fn write_object_details<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
     use super::{replay_stream_events, run_test_0_1, write_object_details, OrderedStreamEvent};
@@ -1133,19 +1132,29 @@ mod tests {
     }
 
     #[test]
-    fn direct_stream_runtime_error_uses_the_canonical_pipeline_error() {
-        let bytes = pdf_with_qtest(b"null", &[]);
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open direct stream fixture");
-        let dict = ObjectHandle::dictionary(vec![(
-            b"Filter".to_vec(),
-            ObjectHandle::name(b"FlateDecode".to_vec()),
-        )]);
-        let qtest = ObjectHandle::stream(dict, Rc::new(b"abc".to_vec()));
+    fn stream_runtime_error_uses_the_canonical_pipeline_error() {
+        let bytes = pdf_with_qtest(
+            b"7 0 R",
+            &[(
+                7,
+                b"<< /Filter /FlateDecode /Length 3 >>\nstream\nabc\nendstream".to_vec(),
+            )],
+        );
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            PdfOpenOptions {
+                repair: true,
+                description: b"fixture.pdf".to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open stream fixture");
+        let qtest = pdf.get_object_handle(ObjectRef::new(7, 0));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut diagnostics_written = 0;
 
-        let error = write_object_details(
+        write_object_details(
             &mut pdf,
             b"fixture.pdf",
             &mut stdout,
@@ -1154,32 +1163,43 @@ mod tests {
             &qtest,
             None,
         )
-        .unwrap_err();
+        .expect("qpdf warns about the decode failure and continues");
 
         assert_eq!(
-            error.to_string(),
-            "stream inflate: inflate: data: incorrect header check"
+            stdout,
+            b"/QTest is a stream.  Dictionary: << /Filter /FlateDecode /Length 3 >>\nRaw stream data:\nabc\nUncompressed stream data:\n\nEnd of stream data\n"
         );
-        assert!(stderr.is_empty());
+        assert_eq!(
+            stderr,
+            b"WARNING: fixture.pdf (offset 163): error decoding stream data for object 7 0: stream inflate: inflate: data: incorrect header check\n"
+        );
     }
 
     #[test]
-    fn direct_stream_decode_param_warning_uses_the_canonical_type_warning() {
-        let bytes = pdf_with_qtest(b"null", &[]);
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open direct stream fixture");
-        let dict = ObjectHandle::dictionary(vec![
-            (
-                b"Filter".to_vec(),
-                ObjectHandle::name(b"FlateDecode".to_vec()),
-            ),
-            (b"DecodeParms".to_vec(), ObjectHandle::integer(42)),
-        ]);
-        let qtest = ObjectHandle::stream(dict, Rc::new(Vec::new()));
+    fn stream_decode_param_warning_uses_the_canonical_type_warning() {
+        let bytes = pdf_with_qtest(
+            b"7 0 R",
+            &[(
+                7,
+                b"<< /Filter /FlateDecode /DecodeParms 42 /Length 0 >>\nstream\n\nendstream"
+                    .to_vec(),
+            )],
+        );
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            PdfOpenOptions {
+                repair: true,
+                description: b"fixture.pdf".to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open stream fixture");
+        let qtest = pdf.get_object_handle(ObjectRef::new(7, 0));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut diagnostics_written = 0;
 
-        let error = write_object_details(
+        write_object_details(
             &mut pdf,
             b"fixture.pdf",
             &mut stdout,
@@ -1188,13 +1208,16 @@ mod tests {
             &qtest,
             None,
         )
-        .unwrap_err();
+        .expect("qpdf warns about the malformed decode parameters and continues");
 
         assert_eq!(
-            error.to_string(),
-            "operation for dictionary attempted on object of type integer: treating as empty"
+            stdout,
+            b"/QTest is a stream.  Dictionary: << /DecodeParms 42 /Filter /FlateDecode /Length 0 >>\nRaw stream data:\n\nUncompressed stream data:\n\nEnd of stream data\n"
         );
-        assert!(stderr.is_empty());
+        assert_eq!(
+            stderr,
+            b"WARNING: fixture.pdf, object 7 0 at offset 156: operation for dictionary attempted on object of type integer: treating as empty\nWARNING: fixture.pdf, object 7 0 at offset 156: operation for dictionary attempted on object of type integer: treating as empty\n"
+        );
     }
 
     #[test]

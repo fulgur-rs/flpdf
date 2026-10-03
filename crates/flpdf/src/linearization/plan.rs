@@ -4365,7 +4365,7 @@ mod tests {
         };
         let page = ObjectHandle::dictionary(vec![(
             b"/Contents".to_vec(),
-            ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
+            ObjectHandle::direct_stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
         )]);
 
         let refs = linearization_content_normalize_refs(&options, &[page], None)
@@ -4676,12 +4676,12 @@ mod tests {
     fn stream_parameter_probe_preserves_present_missing_and_malformed_shapes() -> crate::Result<()>
     {
         let empty_stream =
-            ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new()));
+            ObjectHandle::direct_stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new()));
         assert!(!super::stream_has_indirect_parameter_edge(&empty_stream)?);
 
         let mut pdf = Pdf::empty()?;
         let filter_child = pdf.make_indirect_object_handle(ObjectHandle::integer(7))?;
-        let stream_with_filter = ObjectHandle::stream(
+        let stream_with_filter = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"/Filter".to_vec(), filter_child)]),
             Rc::new(Vec::new()),
         );
@@ -4689,7 +4689,8 @@ mod tests {
             &stream_with_filter
         )?); // cov:ignore: the covered boolean probe is attributed to its multiline call opening by LLVM.
 
-        let malformed_stream = ObjectHandle::stream(ObjectHandle::integer(7), Rc::new(Vec::new()));
+        let malformed_stream =
+            ObjectHandle::direct_stream(ObjectHandle::integer(7), Rc::new(Vec::new()));
         let error = super::stream_has_indirect_parameter_edge(&malformed_stream)
             .expect_err("a non-dictionary stream dictionary must retain qpdf's warning error");
         assert!(error
@@ -4745,7 +4746,7 @@ mod tests {
             !stream_dict.is_resolved(),
             "the dictionary handle starts unresolved"
         );
-        let stream = ObjectHandle::stream(stream_dict, std::rc::Rc::new(Vec::new()));
+        let stream = ObjectHandle::direct_stream(stream_dict, std::rc::Rc::new(Vec::new()));
 
         let mut visited = Vec::new();
         super::collect_direct_handle_children(

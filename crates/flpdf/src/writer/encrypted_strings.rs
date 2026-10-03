@@ -488,7 +488,7 @@ mod tests {
             metadata_ref: None,
         };
         let mut emitter = EncryptedStringEmitter::from_context(&context);
-        let dict = ObjectHandle::stream(
+        let dict = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![
                 (
                     b"/Filter".to_vec(),
@@ -542,7 +542,7 @@ mod tests {
             encrypt_metadata: true,
             metadata_ref: None,
         };
-        let direct_stream = ObjectHandle::stream(
+        let direct_stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(8))]),
             Rc::new(b"raw-data".to_vec()),
         );

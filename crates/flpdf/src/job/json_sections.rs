@@ -1407,7 +1407,7 @@ mod tests {
     }
 
     fn image_handle(filter: ObjectHandle, decode_parms: ObjectHandle) -> ObjectHandle {
-        ObjectHandle::stream(
+        ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![
                 (b"BitsPerComponent".to_vec(), ObjectHandle::integer(8)),
                 (

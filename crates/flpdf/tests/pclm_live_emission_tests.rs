@@ -28,14 +28,18 @@ fn pclm_progress_callback_child_is_discovered_by_the_live_queue() {
             ObjectHandle::integer(42),
         )]))
         .unwrap();
-    page.replace_key(
-        b"/PclmDirectStream",
-        ObjectHandle::stream(
-            ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(999))]),
-            Rc::new(b"pclm-direct".to_vec()),
-        ),
-    )
-    .unwrap();
+    let stream = pdf
+        .new_stream_with_data(Rc::new(b"pclm-stream".to_vec()))
+        .unwrap();
+    stream
+        .try_get_stream_dict()
+        .unwrap()
+        .replace_key(
+            b"/PclmStreamLabel",
+            ObjectHandle::string(b"pclm-label".to_vec()),
+        )
+        .unwrap();
+    page.replace_key(b"/PclmStream", stream).unwrap();
     page.replace_key(
         b"/PclmDirectLabel",
         ObjectHandle::string(b"pclm-label".to_vec()),
@@ -65,11 +69,11 @@ fn pclm_progress_callback_child_is_discovered_by_the_live_queue() {
         .windows(b"/PclmLiveChild 42".len())
         .any(|window| window == b"/PclmLiveChild 42"));
     assert!(output
-        .windows(b"stream\npclm-directendstream".len())
-        .any(|window| window == b"stream\npclm-directendstream"));
+        .windows(b"stream\npclm-streamendstream".len())
+        .any(|window| window == b"stream\npclm-streamendstream"));
     assert!(output
-        .windows(b"/PclmDirectLabel (pclm-label)".len())
-        .any(|window| window == b"/PclmDirectLabel (pclm-label)"));
+        .windows(b"/PclmStreamLabel (pclm-label)".len())
+        .any(|window| window == b"/PclmStreamLabel (pclm-label)"));
 }
 
 #[test]

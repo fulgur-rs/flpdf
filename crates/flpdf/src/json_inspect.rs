@@ -460,7 +460,7 @@ mod tests {
         if let Some(filter) = filter {
             entries.push((b"/Filter".to_vec(), ObjectHandle::name(filter.to_vec())));
         }
-        ObjectHandle::stream(ObjectHandle::dictionary(entries), Rc::new(data))
+        ObjectHandle::direct_stream(ObjectHandle::dictionary(entries), Rc::new(data))
     }
 
     fn stream_pdf() -> Pdf<Cursor<Vec<u8>>> {

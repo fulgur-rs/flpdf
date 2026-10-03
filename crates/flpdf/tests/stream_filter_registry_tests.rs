@@ -6,6 +6,7 @@ use flpdf::{
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+mod common;
 
 struct PrefixPipeline<'a> {
     next: PipelineRef<'a>,
@@ -153,10 +154,7 @@ fn filtered_stream(filter: ObjectHandle, decode_parms: Option<ObjectHandle>) -> 
     if let Some(decode_parms) = decode_parms {
         entries.push((b"DecodeParms".to_vec(), decode_parms));
     }
-    ObjectHandle::stream(
-        ObjectHandle::dictionary(entries),
-        std::rc::Rc::new(b"payload".to_vec()),
-    )
+    common::qpdf_owned_stream_with_dict(b"payload", entries)
 }
 
 #[test]

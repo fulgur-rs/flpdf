@@ -746,7 +746,7 @@ fn unparse_string_writer_covers_stream_reserved_refiltered_and_special_children(
         (b"Label".to_vec(), ObjectHandle::string(b"stream".to_vec())),
         (b"Length".to_vec(), ObjectHandle::integer(3)),
     ]);
-    let stream = ObjectHandle::stream(stream_dict.clone(), Rc::new(b"raw".to_vec()));
+    let stream = ObjectHandle::direct_stream(stream_dict.clone(), Rc::new(b"raw".to_vec()));
     let mut compact = Vec::new();
     let mut compact_callback = compact_string_hook;
     stream
@@ -795,7 +795,7 @@ fn unparse_string_writer_covers_stream_reserved_refiltered_and_special_children(
         .windows(b"{hook:stream}".len())
         .any(|part| part == b"{hook:stream}"));
 
-    let scalar_stream = ObjectHandle::stream(ObjectHandle::integer(1), Rc::new(Vec::new()));
+    let scalar_stream = ObjectHandle::direct_stream(ObjectHandle::integer(1), Rc::new(Vec::new()));
     let mut scalar_stream_body = Vec::new();
     let mut scalar_stream_callback = compact_string_hook;
     scalar_stream
@@ -1134,7 +1134,7 @@ fn mapped_unparse_writes_stream_children_and_non_dictionary_shapes() {
         (b"Child".to_vec(), child),
         (b"Length".to_vec(), ObjectHandle::integer(2)),
     ]);
-    let stream = ObjectHandle::stream(dict, Rc::new(b"ab".to_vec()));
+    let stream = ObjectHandle::direct_stream(dict, Rc::new(b"ab".to_vec()));
     let map = |object_ref| {
         assert_eq!(object_ref, ObjectRef::new(20, 0));
         Ok(ObjectRef::new(8, 0))
@@ -1152,7 +1152,7 @@ fn mapped_unparse_writes_stream_children_and_non_dictionary_shapes() {
         .unwrap();
     assert_eq!(body, b"<< /Child 8 0 R /Length 2 >>");
 
-    let signature = ObjectHandle::stream(
+    let signature = ObjectHandle::direct_stream(
         ObjectHandle::dictionary(vec![
             (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
             (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
@@ -1175,7 +1175,7 @@ fn mapped_unparse_writes_stream_children_and_non_dictionary_shapes() {
     );
 
     let mut nested_non_dictionary = Vec::new();
-    ObjectHandle::stream(ObjectHandle::integer(5), Rc::new(b"ab".to_vec()))
+    ObjectHandle::direct_stream(ObjectHandle::integer(5), Rc::new(b"ab".to_vec()))
         .unparse_stream_body_with_ref_map_and_removed(
             &mut nested_non_dictionary,
             false,
@@ -1219,7 +1219,7 @@ fn mapped_unparse_omits_removed_indirect_dictionary_entries() {
         .unwrap();
     assert_eq!(object, b"<< /Mapped 8 0 R >>");
 
-    let stream = ObjectHandle::stream(
+    let stream = ObjectHandle::direct_stream(
         ObjectHandle::dictionary(vec![
             (b"Mapped".to_vec(), kept),
             (b"Length".to_vec(), ObjectHandle::integer(2)),
@@ -1441,7 +1441,7 @@ fn mapped_stream_writers_cover_qdf_length_and_filter_variants() {
         .is_err());
 
     let stream_with_non_dictionary_dict =
-        ObjectHandle::stream(ObjectHandle::integer(1), Rc::new(Vec::new()));
+        ObjectHandle::direct_stream(ObjectHandle::integer(1), Rc::new(Vec::new()));
     let mut non_dictionary_dict_qdf = Vec::new();
     stream_with_non_dictionary_dict
         .unparse_stream_body_qdf_with_ref_map_and_removed_and_length(
@@ -1556,7 +1556,7 @@ fn unparse_stream_body_resolves_an_unresolved_indirect_stream_dict() {
             .into_iter()
             .collect(),
     ));
-    let handle = ObjectHandle::stream(inner, Rc::new(b"ab".to_vec()));
+    let handle = ObjectHandle::direct_stream(inner, Rc::new(b"ab".to_vec()));
     let mut out = Vec::new();
     handle.unparse_stream_body(&mut out, false).unwrap();
     assert_eq!(out, b"<< /Length 2 >>");
@@ -1574,7 +1574,7 @@ fn unparse_stream_body_propagates_a_dropped_document_error_from_stream_dict() {
     // the way an unresolved `with_value` read alone would.
     let (inner, resolver) = resolver_bearing_handle(ObjectValue::Null);
     drop(resolver);
-    let handle = ObjectHandle::stream(inner, Rc::new(b"ab".to_vec()));
+    let handle = ObjectHandle::direct_stream(inner, Rc::new(b"ab".to_vec()));
     let mut out = Vec::new();
     assert!(handle.unparse_stream_body(&mut out, false).is_err());
 }
@@ -1588,7 +1588,7 @@ fn unparse_stream_body_writes_empty_dict_when_stream_dict_is_not_a_dictionary() 
     // unparse_stream_body_writes_empty_dict_for_a_non_dictionary_self
     // below. Exercises the new nested `_ => Vec::new()` arm for
     // `stream_dict`'s own resolved value.
-    let handle = ObjectHandle::stream(ObjectHandle::integer(5), Rc::new(b"ab".to_vec()));
+    let handle = ObjectHandle::direct_stream(ObjectHandle::integer(5), Rc::new(b"ab".to_vec()));
     let mut out = Vec::new();
     handle.unparse_stream_body(&mut out, false).unwrap();
     assert_eq!(out, b"<< >>");
@@ -1863,7 +1863,7 @@ fn unparse_stream_body_qdf_resolves_an_unresolved_indirect_stream_dict() {
             .into_iter()
             .collect(),
     ));
-    let handle = ObjectHandle::stream(inner, Rc::new(b"ab".to_vec()));
+    let handle = ObjectHandle::direct_stream(inner, Rc::new(b"ab".to_vec()));
     let mut out = Vec::new();
     handle.unparse_stream_body_qdf(&mut out, 0).unwrap();
     assert_eq!(out, b"<<\n  /Length 2\n>>");
@@ -1878,7 +1878,7 @@ fn unparse_stream_body_qdf_propagates_a_dropped_document_error_from_stream_dict(
     // dropped).
     let (inner, resolver) = resolver_bearing_handle(ObjectValue::Null);
     drop(resolver);
-    let handle = ObjectHandle::stream(inner, Rc::new(b"ab".to_vec()));
+    let handle = ObjectHandle::direct_stream(inner, Rc::new(b"ab".to_vec()));
     let mut out = Vec::new();
     assert!(handle.unparse_stream_body_qdf(&mut out, 0).is_err());
 }
@@ -1889,7 +1889,7 @@ fn unparse_stream_body_qdf_writes_empty_dict_when_stream_dict_is_not_a_dictionar
     // `stream_dict` is itself typed as an `ObjectHandle`, so nothing at
     // the type level prevents it from resolving to something other than
     // a `Dictionary`.
-    let handle = ObjectHandle::stream(ObjectHandle::integer(5), Rc::new(b"ab".to_vec()));
+    let handle = ObjectHandle::direct_stream(ObjectHandle::integer(5), Rc::new(b"ab".to_vec()));
     let mut out = Vec::new();
     handle.unparse_stream_body_qdf(&mut out, 0).unwrap();
     assert_eq!(out, b"<<\n>>");

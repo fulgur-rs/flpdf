@@ -974,7 +974,7 @@ mod tests {
         // A side-car stream that will be reachable ONLY via the filespec dict.
         let next = next_object_number(&mut pdf);
         let sidecar_ref = ObjectRef::new(next + 1, 0);
-        let sidecar = ObjectHandle::stream(
+        let sidecar = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(Vec::new()),
             std::rc::Rc::new(b"sidecar".to_vec()),
         );
@@ -1417,7 +1417,7 @@ mod tests {
         // Add a *distinct* second stream object under /EF /UF.
         let next = next_object_number(&mut pdf);
         let stream_uf = ObjectRef::new(next + 1, 0);
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             handle_dictionary(vec![(
                 b"/Type",
                 ObjectHandle::name(b"EmbeddedFile".to_vec()),
@@ -1605,7 +1605,7 @@ mod tests {
         set_test_object(
             &mut pdf,
             stream_ref,
-            ObjectHandle::stream(ef_dict, std::rc::Rc::new(b"payload".to_vec())),
+            ObjectHandle::direct_stream(ef_dict, std::rc::Rc::new(b"payload".to_vec())),
         );
 
         // /EF sub-dict pointing both filespecs at the same stream.

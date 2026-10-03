@@ -6262,7 +6262,7 @@ mod tests {
     #[test]
     fn qdf_dynamic_writer_walks_direct_streams_and_skips_null_or_removed_children() -> Result<()> {
         let removed = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), -1);
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![
                 (b"/Null".to_vec(), ObjectHandle::null()),
                 (b"/Removed".to_vec(), removed.clone()),
@@ -6414,7 +6414,7 @@ mod tests {
 
     #[test]
     fn mapped_stream_writer_overrides_length_and_suppresses_null_children() -> Result<()> {
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![
                 (b"/Length".to_vec(), ObjectHandle::integer(99)),
                 (b"/Null".to_vec(), ObjectHandle::null()),
@@ -6454,7 +6454,7 @@ mod tests {
         assert_eq!(scalar_output, b"<< /Length 1 >>");
 
         let malformed_stream =
-            ObjectHandle::stream(ObjectHandle::integer(1), Rc::new(b"x".to_vec()));
+            ObjectHandle::direct_stream(ObjectHandle::integer(1), Rc::new(b"x".to_vec()));
         let mut malformed_output = Vec::new();
         super::super::output::with_buffer_sink(&mut malformed_output, |out| {
             malformed_stream.unparse_stream_body_with_ref_map_and_removed_and_length(
@@ -6799,7 +6799,7 @@ mod tests {
 
         let stream_length = pdf.make_indirect_object_handle(ObjectHandle::integer(4))?;
         let stream_child = pdf.make_indirect_object_handle(ObjectHandle::integer(8))?;
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![
                 (b"/Length".to_vec(), stream_length),
                 (b"/Child".to_vec(), stream_child),
@@ -6883,7 +6883,7 @@ mod tests {
         let mut pdf = Pdf::empty()?;
         let child = pdf.make_indirect_object_handle(ObjectHandle::integer(7))?;
         let child_ref = child.object_ref().expect("direct stream child identity");
-        let inner = ObjectHandle::stream(
+        let inner = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![
                 (b"/Length".to_vec(), ObjectHandle::integer(99)),
                 (
@@ -6894,7 +6894,7 @@ mod tests {
             ]),
             Rc::new(b"direct-payload".to_vec()),
         );
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(
                 b"/Nested".to_vec(),
                 ObjectHandle::array(vec![inner]),

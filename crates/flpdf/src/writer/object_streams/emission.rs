@@ -297,19 +297,17 @@ where
 /// (`CompressStreams::No`).  Passing the same [`crate::writer::CompressStreams`]
 /// value that drives the surrounding full-rewrite loop ensures the ObjStm
 /// container uses the same policy as every other stream in the document.
-/// Build the synthetic ObjStm container as an ObjectHandle while retaining the
-/// same reference-counted payload for the stream pipeline. The container has
-/// no source object identity, but its dictionary is still emitted through the
-/// same live-handle serializer as ordinary streams; `/Extends`, when present,
-/// is already in output-number space and is therefore stored as a reference
-/// token rather than a legacy `Object` value.
+/// Prepare the ObjStm dictionary and payload separately. qpdf's
+/// `QPDFWriter::writeObjectStream` writes the dictionary fields and body
+/// directly to the output; it does not create a `QPDF_Stream` or
+/// `QPDFObjectHandle::newStream` (`libqpdf/QPDFWriter.cc:1621-1775`).
+/// `/Extends`, when present, is already in output-number space and is stored
+/// as a reference token rather than a legacy `Object` value.
 ///
 /// Taking ownership of the body lets the uncompressed path transfer its
-/// allocation directly into the stream payload. The compressed path allocates
-/// its encoded payload once; the returned handle and the caller share that
-/// allocation, matching qpdf's `shared_ptr<Buffer>` ownership at
-/// `QPDFWriter.cc:1636-1750`.
-pub(crate) fn wrap_objstm_body_as_handle(
+/// allocation directly to the writer. The compressed path allocates its
+/// encoded payload once, matching qpdf's buffer-backed second pass.
+pub(crate) fn prepare_objstm_dictionary_and_data(
     body: ObjStmBody,
     compress: crate::writer::CompressStreams,
     extends: Option<crate::ObjectRef>,
@@ -348,15 +346,14 @@ pub(crate) fn wrap_objstm_body_as_handle(
             ObjectHandle::new_indirect_unresolved(extends, -1),
         ));
     }
-    let handle = ObjectHandle::stream(ObjectHandle::dictionary(entries), Rc::clone(&data));
-    Ok((handle, data))
+    Ok((ObjectHandle::dictionary(entries), data))
 }
 
 #[cfg(test)]
 mod final_handle_tests {
     use super::{
         emit_objstm_body_from_handles_with_sink, emit_objstm_body_from_members_with_sink,
-        wrap_objstm_body_as_handle, ObjStmBody, ObjStmDiscardTarget,
+        prepare_objstm_dictionary_and_data, ObjStmBody, ObjStmDiscardTarget,
     };
     use crate::writer::output::{OutputSink, OutputTarget};
     use crate::writer::CompressStreams;
@@ -440,19 +437,20 @@ mod final_handle_tests {
     }
 
     #[test]
-    fn object_stream_wrapper_retains_an_extends_reference_handle() {
+    fn object_stream_dictionary_retains_an_extends_reference_handle() {
         let body = ObjStmBody {
             bytes: b"1 0\n7".to_vec(),
             first_offset: 4,
             n_members: 1,
         };
-        let (stream, _) =
-            wrap_objstm_body_as_handle(body, CompressStreams::No, Some(ObjectRef::new(9, 0)))
-                .expect("object stream wrapper");
+        let (dictionary, _) = prepare_objstm_dictionary_and_data(
+            body,
+            CompressStreams::No,
+            Some(ObjectRef::new(9, 0)),
+        )
+        .expect("object stream dictionary and data");
         assert_eq!(
-            stream
-                .as_stream_dict()
-                .expect("stream dictionary")
+            dictionary
                 .try_get_key(b"/Extends")
                 .expect("Extends key")
                 .object_ref(),
@@ -461,22 +459,21 @@ mod final_handle_tests {
     }
 
     #[test]
-    fn object_stream_wrapper_shares_payload_with_returned_data() {
-        for compress in [CompressStreams::No, CompressStreams::Yes] {
-            let body = ObjStmBody {
-                bytes: vec![b'x'; 4096],
-                first_offset: 4,
-                n_members: 1,
-            };
-            let (stream, data) =
-                wrap_objstm_body_as_handle(body, compress, None).expect("object stream wrapper");
-            let stored = stream.as_stream_data().expect("stream data");
+    fn uncompressed_object_stream_body_keeps_its_allocation() {
+        let body = ObjStmBody {
+            bytes: vec![b'x'; 4096],
+            first_offset: 4,
+            n_members: 1,
+        };
+        let expected_ptr = body.bytes.as_ptr();
+        let (dictionary, data) =
+            prepare_objstm_dictionary_and_data(body, CompressStreams::No, None)
+                .expect("object stream dictionary and data");
 
-            assert_eq!(
-                stored.as_ref().as_ptr(),
-                data.as_ptr(),
-                "{compress:?} payload must have one allocation"
-            );
-        }
+        assert_eq!(data.as_ptr(), expected_ptr);
+        assert_eq!(
+            dictionary.try_get_key(b"/Length").unwrap().as_integer(),
+            Some(4096)
+        );
     }
 }

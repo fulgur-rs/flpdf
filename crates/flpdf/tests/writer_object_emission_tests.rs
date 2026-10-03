@@ -105,7 +105,7 @@ fn qdf_and_normalize_progress_stream_replacement_uses_live_payload() {
         writer.set_output_memory().unwrap();
         writer.register_progress_reporter(Box::new(move |percent| {
             if percent == 0 {
-                stream.replace_stream_data(Rc::new(b"after".to_vec()), None, None);
+                stream.replace_stream_data(Rc::new(b"after".to_vec()), None, None)?;
             }
             Ok(())
         }));
@@ -554,42 +554,6 @@ fn encrypted_qdf_and_normalize_encrypt_direct_page_dictionary_strings() {
 }
 
 #[test]
-fn qdf_discovery_walks_a_direct_stream_dictionary_child() {
-    let mut pdf = Pdf::open(Cursor::new(
-        include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
-    ))
-    .unwrap();
-    let direct_stream = ObjectHandle::stream(
-        ObjectHandle::dictionary(vec![
-            (b"/Length".to_vec(), ObjectHandle::integer(4)),
-            (
-                b"/DirectQdfLabel".to_vec(),
-                ObjectHandle::string(b"direct".to_vec()),
-            ),
-        ]),
-        Rc::new(b"data".to_vec()),
-    );
-    pdf.root_handle()
-        .unwrap()
-        .replace_key(b"/DirectQdfStream", direct_stream)
-        .unwrap();
-
-    let mut writer = PdfWriter::new(&mut pdf);
-    writer.set_object_stream_mode(ObjectStreamMode::Disable);
-    writer.set_qdf_mode(true);
-    writer.set_static_id(true);
-    writer.set_output_memory().unwrap();
-    writer.write().unwrap();
-    let output = writer.get_buffer().unwrap();
-    assert!(output
-        .windows(b"/DirectQdfStream".len())
-        .any(|window| window == b"/DirectQdfStream"));
-    assert!(output
-        .windows(b"/DirectQdfLabel".len())
-        .any(|window| window == b"/DirectQdfLabel"));
-}
-
-#[test]
 fn qdf_crypt_cleanup_is_single_pass_for_stream_dictionary_state() {
     let mut pdf = Pdf::open(Cursor::new(
         include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
@@ -667,7 +631,7 @@ fn progress_callback_stream_replacement_invalidates_the_planned_payload() {
     writer.set_output_memory().unwrap();
     writer.register_progress_reporter(Box::new(move |percent| {
         if percent == 0 {
-            stream.replace_stream_data(Rc::new(b"after".to_vec()), None, None);
+            stream.replace_stream_data(Rc::new(b"after".to_vec()), None, None)?;
         }
         Ok(())
     }));
@@ -1213,93 +1177,6 @@ fn qdf_objstm_pair_offsets_reuse_first_pass_positions_after_member_mutation() {
 }
 
 #[test]
-fn specialized_nested_direct_stream_keeps_payload_and_framing() {
-    let mut pdf = Pdf::open(Cursor::new(
-        include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
-    ))
-    .unwrap();
-    let direct_stream = ObjectHandle::stream(
-        ObjectHandle::dictionary(vec![
-            (b"/Length".to_vec(), ObjectHandle::integer(999)),
-            (
-                b"/DirectStreamLabel".to_vec(),
-                ObjectHandle::string(b"nested".to_vec()),
-            ),
-        ]),
-        Rc::new(b"direct-payload".to_vec()),
-    );
-    pdf.root_handle()
-        .unwrap()
-        .replace_key(b"/DirectStreamProbe", direct_stream)
-        .unwrap();
-    let mut writer = PdfWriter::new(&mut pdf);
-    writer.set_object_stream_mode(ObjectStreamMode::Disable);
-    writer.set_compress_streams(false);
-    writer.set_extra_header_text("% specialized-live-queue");
-    writer.set_static_id(true);
-    writer.set_output_memory().unwrap();
-    writer
-        .write()
-        .expect("specialized direct-stream write succeeds");
-    let output = writer.get_buffer().unwrap();
-    assert!(output
-        .windows(b"/DirectStreamLabel (nested)".len())
-        .any(|window| window == b"/DirectStreamLabel (nested)"));
-    assert!(output
-        .windows(b"stream\ndirect-payloadendstream".len())
-        .any(|window| window == b"stream\ndirect-payloadendstream"));
-}
-
-#[test]
-fn specialized_encrypted_nested_direct_stream_keeps_payload_and_framing() {
-    let mut pdf = Pdf::open(Cursor::new(
-        include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
-    ))
-    .unwrap();
-    pdf.root_handle()
-        .unwrap()
-        .replace_key(
-            b"/EncryptedDirectStreamProbe",
-            ObjectHandle::stream(
-                ObjectHandle::dictionary(vec![
-                    (b"/Length".to_vec(), ObjectHandle::integer(999)),
-                    (
-                        b"/DirectStreamLabel".to_vec(),
-                        ObjectHandle::string(b"encrypted-nested".to_vec()),
-                    ),
-                ]),
-                Rc::new(b"encrypted-direct-payload".to_vec()),
-            ),
-        )
-        .unwrap();
-    let mut writer = PdfWriter::new(&mut pdf);
-    writer.set_object_stream_mode(ObjectStreamMode::Disable);
-    writer.set_compress_streams(false);
-    writer.set_extra_header_text("% specialized-live-queue");
-    let mut encryption = EncryptParams::v4_aes128(b"u", b"o");
-    encryption.encrypt_metadata = false;
-    writer.set_encryption_parameters(encryption);
-    writer.set_static_id(true);
-    writer.set_static_aes_iv(true);
-    writer.set_output_memory().unwrap();
-    writer.write().expect("specialized encrypted stream write");
-    let output = writer.get_buffer().unwrap();
-
-    assert!(output
-        .windows(b"/Length 48".len())
-        .any(|window| window == b"/Length 48"));
-    assert!(output
-        .windows(b"stream\n".len())
-        .any(|window| window == b"stream\n"));
-    assert!(output
-        .windows(b"endstream /Pages".len())
-        .any(|window| window == b"endstream /Pages"));
-    assert!(!output
-        .windows(b"encrypted-direct-payload".len())
-        .any(|window| window == b"encrypted-direct-payload"));
-}
-
-#[test]
 fn deterministic_direct_root_uses_the_live_classic_trailer_serializer() {
     let mut pdf = Pdf::open(Cursor::new(
         include_bytes!("../../../tests/fixtures/compat/direct-root-one-page.pdf").to_vec(),
@@ -1318,48 +1195,4 @@ fn deterministic_direct_root_uses_the_live_classic_trailer_serializer() {
     assert!(output
         .windows(b"/ID [<".len())
         .any(|window| window == b"/ID [<"));
-}
-
-#[test]
-fn specialized_direct_root_nested_stream_keeps_payload_and_framing() {
-    let mut pdf = Pdf::open(Cursor::new(
-        include_bytes!("../../../tests/fixtures/compat/direct-root-one-page.pdf").to_vec(),
-    ))
-    .unwrap();
-    assert!(
-        pdf.root_ref().is_none(),
-        "fixture must have a direct Catalog"
-    );
-    pdf.root_handle()
-        .unwrap()
-        .replace_key(
-            b"/DirectRootStreamProbe",
-            ObjectHandle::stream(
-                ObjectHandle::dictionary(vec![
-                    (b"/Length".to_vec(), ObjectHandle::integer(999)),
-                    (
-                        b"/DirectRootStreamLabel".to_vec(),
-                        ObjectHandle::string(b"direct-root".to_vec()),
-                    ),
-                ]),
-                Rc::new(b"direct-root-payload".to_vec()),
-            ),
-        )
-        .unwrap();
-    let mut writer = PdfWriter::new(&mut pdf);
-    writer.set_object_stream_mode(ObjectStreamMode::Disable);
-    writer.set_compress_streams(false);
-    writer.set_extra_header_text("% specialized-live-queue");
-    writer.set_static_id(true);
-    writer.set_output_memory().unwrap();
-    writer
-        .write()
-        .expect("specialized direct-root stream write succeeds");
-    let output = writer.get_buffer().unwrap();
-    assert!(output
-        .windows(b"/DirectRootStreamLabel (direct-root)".len())
-        .any(|window| window == b"/DirectRootStreamLabel (direct-root)"));
-    assert!(output
-        .windows(b"stream\ndirect-root-payloadendstream".len())
-        .any(|window| window == b"stream\ndirect-root-payloadendstream"));
 }

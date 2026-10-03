@@ -387,7 +387,7 @@ mod tests {
         let r = ObjectRef::new(n, 0);
         pdf.replace_object(
             r,
-            ObjectHandle::stream(dictionary(entries), Rc::new(data.to_vec())),
+            ObjectHandle::direct_stream(dictionary(entries), Rc::new(data.to_vec())),
         )
         .expect("set canonical stream fixture");
         r
@@ -925,7 +925,7 @@ mod tests {
     #[test]
     fn detached_appearance_rewrite_keeps_structural_failure_fallback() {
         let stream =
-            ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new()));
+            ObjectHandle::direct_stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new()));
         let rewritten = rewrite_appearance_content_with_context(
             b"/F1 18 Tf [",
             &dr_map_with(b"Font", b"F1", b"F1_1"),

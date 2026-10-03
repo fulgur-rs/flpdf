@@ -1256,14 +1256,13 @@ payload・最終 pipeline への書き出しを行う（`libqpdf/QPDFWriter.cc:1
 `stream_buffer` と sink の間で payload を深く複製しない
 （`libqpdf/QPDFWriter.cc:881-884,925-965`、`include/qpdf/Pl_Buffer.hh:50-58`）。
 
-flpdf の linearized ObjStm consumer も `writer/object_streams/emission.rs::wrap_objstm_body_as_handle`
-で `ObjStmBody` の所有権を移し、非圧縮なら元の `Vec<u8>` を、圧縮なら一度だけ生成した
-Flate の `Vec<u8>` を `Rc<Vec<u8>>` にする。`ObjectHandle` と linearization writer は同じ
-`Rc` を共有し、後者はその payload を `/Length` 計算、暗号化 pipeline、または通常の
-stream serializerへ渡す。従って従来の `data.clone()` による container handle と sink 用
-payload の二重保持を除去し、出力 bytes・dictionary・暗号化境界は変えない。所有権共有は
-`ObjectHandle::stream` / `as_stream_data` の既存 qpdf対応（`QPDF_Stream::stream_data` の
-`shared_ptr<Buffer>`）を利用し、回帰は圧縮・非圧縮の両モードで同一 allocation を検査する。
+flpdf の linearized ObjStm consumer は `writer/object_streams/emission.rs::prepare_objstm_dictionary_and_data`
+で `ObjStmBody` を辞書と payload に分けて渡す。非圧縮なら元の `Vec<u8>` を、圧縮なら
+一度だけ生成した Flate の `Vec<u8>` を `Rc<Vec<u8>>` にし、writer はその buffer から
+`/Length` と暗号化済み payload を出力する。qpdf と同じく、生成 ObjStm を `QPDF_Stream` /
+`QPDFObjectHandle::newStream` に包まず `QPDFWriter::writeObjectStream` が直接 dictionary と
+body を書く（`QPDFWriter.cc:1621-1775`）。共有 `Rc` はRust内の buffer ownershipだけを表し、
+stream ObjectHandle factoryとの対応を意味しない。
 
 ### Linearized source-backed ObjStm `/Extends` preservation (`flpdf-eetrz`, 2026-09-17)
 
@@ -1961,9 +1960,17 @@ inline の `no_data_key`、`pipeStreamData` の最大二回試行と raw fallbac
 4393-) を通り、辞書の shallow copy は `ObjectHandle::shallow_copy` と
 `remove_key` を使う。公開 `remove_key` はqpdfの`removeKey`
 （`libqpdf/QPDFObjectHandle.cc:1228-1237`）と同じく辞書を解決し、型警告・例外を伝播する。
-一方、streamデータ置換の `replace_filter_data` は `/Length` のunchecked削除が残る。
-qpdfの `libqpdf/QPDF_Stream.cc:678-680` との差は、任意の辞書handleを受け入れる
-直接stream factoryと併せて `flpdf-6ik2q.8` で解消する。
+現在の stream-data mutation path は、qpdf 同様に source state を先に更新した後、
+`replaceKey` / `removeKey` の resolving API を順に呼び、型・ownership・resolution error を返す
+（`crates/flpdf/src/object_handle.rs:6303-6473`、
+`libqpdf/QPDFObjectHandle.cc:1344-1371`、`libqpdf/QPDF_Stream.cc:640-684`）。
+`.8` の public API cutover で ownerless `ObjectHandle::stream` を削除し、外部consumerを
+`Pdf::new_stream` / `new_stream_with_data` へ移した。ownerless direct-stream constructorは
+`#[cfg(test)]` の fixture だけに残り、crate の release library には producer がない。
+qpdf public `newStream(QPDF*)` は document-owned indirect stream を作り、JSON の private
+`reserveStream(og)` は指定 identity を持つ parser placeholder を作る
+（`QPDFObjectHandle.cc:2017-2043`; `QPDF.cc:1912-1921,1945-1949`）。生成ObjStmも
+synthetic stream handleではなくdictionaryとpayloadを分けて qpdf writer の直接出力経路へ渡す。
 
 `document_json.rs` は `QPDF_json.cc:917-925` 相当の object-map framing と、
 `writeJSONStreamFile` (`QPDF_json.cc:834-849`) 相当の side-file 作成・明示 finish
@@ -3957,7 +3964,7 @@ CI で走らない。ファイル全体が gated な 11 件は全て列挙済み
 | `Buffer` / `Pl_Buffer` / 汎用 `Pl_*` → `Vec<u8>` / `Write` | 856 | 無し |
 | `QPDFDocumentHelper` / `QPDFObjectHelper` 基底 → トレイト無し | 12 | 無し |
 | `std::shared_ptr<QPDFValue>` → `Rc<RefCell<..>>`（`object_handle.rs`） | 79 | 無し（`Rc` による共有 identity の内部所有権機構自体。live direct containment の weak reverse index は `#[cfg(test)]` 限定の containment 検査補助で、production の scheduling には関与しない（`flpdf-3yn9.48.24` で dirty bookkeeping を撤去）。共有 identity と各 object の serialization rule は変えず、Pdf identity provenance は別フィールドで保持。byte-identical suite で確認済み） |
-| `std::shared_ptr<Buffer> QPDF_Stream::stream_data`（`libqpdf/qpdf/QPDF_Stream.hh:104`） → `Rc<Vec<u8>>`（`object_handle.rs` の `ObjectValue::Stream`） | 1 | 無し（共有の意味論は同一。`QPDFObjectHandle::newStream(QPDF*, shared_ptr<Buffer>)` / `replaceStreamData(shared_ptr<Buffer>, ..)` / `QPDF_Stream::getStreamDataBuffer` に対応する `ObjectHandle::stream` / `replace_stream_data` / `as_stream_data` が buffer を共有したまま受け渡す。`Rc<[u8]>` ではなく `Rc<Vec<u8>>` なのは、`Rc::<[u8]>::from(vec)` が refcount ヘッダを前置できず payload 全体を memcpy するため。二段の間接になるのは `shared_ptr<Buffer>` と偶然一致するだけで対応関係ではない — qpdf が `Buffer` 型を要するのは C++ が borrow/own を型で表せず実行時フラグに畳むからで（`include/qpdf/Buffer.hh:35-46` が所有・非所有の両コンストラクタを持つ）、その面は既存の `Buffer` → `Vec<u8>` 行が扱う。`Rc` なのは `Repr` が `Rc<RefCell<..>>` ベースで `ObjectValue` がそもそも `!Send` のため。`replace_stream_data` は `QPDF_Stream::replaceFilterData`（`QPDF_Stream.cc:668-684`）に対応する共有 helper を通り、zero length では `/Length` を削除、nonzero では正確な integer を設定する（`flpdf-25kg.4.5`）。byte-identical suite（`qpdf-zlib-compat`）で確認済み） |
+| `std::shared_ptr<Buffer> QPDF_Stream::stream_data`（`libqpdf/qpdf/QPDF_Stream.hh:104`） → `Rc<Vec<u8>>`（`object_handle.rs` の `ObjectValue::Stream`） | 1 | 無し（buffer storage の共有意味論だけの置換。`replace_stream_data` / `as_stream_data` は qpdf stream の buffer source update / read と同じく payload を共有する。ownerless public `ObjectHandle::stream` API は削除済み。qpdf public factory は owner を要求して fresh indirect stream を登録し、private `QPDF::reserveStream(og)` は ObjGen 付き placeholder を作る。flpdf の public factory は `Pdf::new_stream` / `Pdf::new_stream_with_data`。`Rc<[u8]>` ではなく `Rc<Vec<u8>>` なのは、`Rc::<[u8]>::from(vec)` が refcount header を前置できず payload 全体を memcpy するため。`Buffer` 型の差は既存の `Buffer` → `Vec<u8>` 行が扱い、`Rc` は内部 `Repr` が `Rc<RefCell<..>>` ベースで `ObjectValue` が `!Send` のため。`replace_stream_data` は source state の後に qpdf の resolving `replaceKey` / `removeKey` 順序を通り、zero length では `/Length` を削除、nonzero では整数を設定する（`QPDF_Stream.cc:640-684`）。byte-identical suite（`qpdf-zlib-compat`）で確認済み） |
 | `QPDF_Array` borrow / slash 付き canonical name string → `Vec<ObjectHandle>` の単一 child clone / slash 無し decoded `Vec<u8>`、および live array mutation（`object_handle.rs`） | 0 | 無し。`try_array_item` は `QPDF_Array::at` と同じ valid index の child identity を `Rc` clone で返し、name predicate は同じ decoded bytes を比較するだけで出力しない。`set_array_item` / `set_array_items` / `insert_array_item` / `append_array_item` / `erase_array_item` は `QPDFObjectHandle.cc:869-955` と `QPDF_Array.cc:10-26,220-313` の bounds→warning、ownership、live child containment、`setFromVector` の clear-before-check / partial-prefix 順序を保持する。`nntree.rs` の canonical NNTree engine はこの live mutation boundary を `set_array_items` から利用し、旧 `replace_array_item(s)` は qpdf の warning/ownership/insert/erase 契約を持たない compatibility bridge として残る。 |
 
 配列・辞書の `ArrayItemCursor` / `DictItemCursor` もこの ObjectHandle 境界で qpdf の identity を保持する。qpdf の `operator*` は内部 `ivalue` への参照を返すため C++ の `auto&` はカーソル移動を観測するが、コピーされた `QPDFObjectHandle` は選択 child の shared identity を保ったまま移動後も安定する。Rust の `current()` は安全な値返却 API なので後者に対応し、移動後は新しい `current()` を読む。辞書は qpdf の visible key snapshot を維持し、snapshot 内の削除済み key は initialized null、非辞書 receiver は qpdf の contextual warning/null contract、snapshot end だけが uninitialized を返す（`libqpdf/QPDFObjectHandle.cc:2398-2561`; `qpdf/test_driver.cc:1418-1434`）。

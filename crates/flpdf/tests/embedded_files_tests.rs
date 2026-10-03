@@ -2016,11 +2016,13 @@ fn create_ef_stream_from_provider_finalizes_the_deferred_payload() {
 fn setting_embedded_file_date_creates_missing_params_dictionary() {
     let mut pdf = open(build_no_names_pdf());
     let stream = pdf.new_stream().expect("embedded-file stream");
-    stream.replace_stream_data(
-        Rc::new(b"payload".to_vec()),
-        Some(ObjectHandle::null()),
-        Some(ObjectHandle::null()),
-    );
+    stream
+        .replace_stream_data(
+            Rc::new(b"payload".to_vec()),
+            Some(ObjectHandle::null()),
+            Some(ObjectHandle::null()),
+        )
+        .expect("replace stream data");
     assert!(stream
         .as_stream_dict()
         .expect("stream dictionary")
@@ -2221,11 +2223,13 @@ fn payload_decodes_a_dct_stream_through_the_canonical_pipeline() {
 
     let mut pdf = open(build_no_names_pdf());
     let stream = pdf.new_stream().expect("stream object");
-    stream.replace_stream_data(
-        Rc::new(jpeg.clone()),
-        Some(ObjectHandle::name(b"DCTDecode".to_vec())),
-        Some(ObjectHandle::null()),
-    );
+    stream
+        .replace_stream_data(
+            Rc::new(jpeg.clone()),
+            Some(ObjectHandle::name(b"DCTDecode".to_vec())),
+            Some(ObjectHandle::null()),
+        )
+        .expect("replace stream data");
     let ef = EmbeddedFileStream::new(stream, &mut pdf).expect("wrap stream");
 
     let decoded = ef.payload().expect("decode DCT payload");
@@ -2263,16 +2267,18 @@ fn payload_decodes_a_filter_chain_longer_than_the_whole_buffer_budget() {
 
     let mut pdf = open(build_no_names_pdf());
     let stream = pdf.new_stream().expect("stream object");
-    stream.replace_stream_data(
-        Rc::new(encoded),
-        Some(ObjectHandle::array(vec![
-            ObjectHandle::name(
-                b"ASCIIHexDecode".to_vec()
-            );
-            STAGES
-        ])),
-        Some(ObjectHandle::null()),
-    );
+    stream
+        .replace_stream_data(
+            Rc::new(encoded),
+            Some(ObjectHandle::array(vec![
+                ObjectHandle::name(
+                    b"ASCIIHexDecode".to_vec()
+                );
+                STAGES
+            ])),
+            Some(ObjectHandle::null()),
+        )
+        .expect("replace stream data");
     let ef = EmbeddedFileStream::new(stream, &mut pdf).expect("wrap stream");
 
     assert_eq!(
@@ -2297,11 +2303,13 @@ fn payload_decodes_a_filter_chain_longer_than_the_whole_buffer_budget() {
 fn payload_errors_on_an_unrecognized_filter_name() {
     let mut pdf = open(build_no_names_pdf());
     let stream = pdf.new_stream().expect("stream object");
-    stream.replace_stream_data(
-        Rc::new(b"opaque bytes".to_vec()),
-        Some(ObjectHandle::name(b"NoSuchDecode".to_vec())),
-        Some(ObjectHandle::null()),
-    );
+    stream
+        .replace_stream_data(
+            Rc::new(b"opaque bytes".to_vec()),
+            Some(ObjectHandle::name(b"NoSuchDecode".to_vec())),
+            Some(ObjectHandle::null()),
+        )
+        .expect("replace stream data");
     let ef = EmbeddedFileStream::new(stream, &mut pdf).expect("wrap stream");
 
     let error = ef.payload().expect_err("unknown filter must not decode");
