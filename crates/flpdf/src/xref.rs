@@ -6228,6 +6228,9 @@ mod final_handle_tests {
     struct FailingCanonicalOwner {
         transport_error: bool,
         diagnostics: RefCell<Diagnostics>,
+        source: RefCell<std::io::Cursor<Vec<u8>>>,
+        declared_source_length: Option<u64>,
+        source_read_failure: bool,
         /// `None` accepts every warning. `Some(n)` accepts `n` and then fails,
         /// so a sink that gives out partway through a batch can be observed.
         accept_warnings: Option<usize>,
@@ -6284,20 +6287,32 @@ mod final_handle_tests {
             false
         }
 
-        fn source_seek(&self, _offset: u64) -> Result<()> {
-            Ok(())
+        fn source_seek(&self, offset: u64) -> Result<()> {
+            std::io::Seek::seek(
+                &mut *self.source.borrow_mut(),
+                std::io::SeekFrom::Start(offset),
+            )
+            .map(|_| ())
+            .map_err(Error::Io)
         }
 
         fn source_tell(&self) -> Result<u64> {
-            Ok(0)
+            Ok(self.source.borrow().position())
         }
 
         fn source_length(&self) -> Result<u64> {
-            Ok(0)
+            Ok(self.declared_source_length.unwrap_or_else(|| {
+                u64::try_from(self.source.borrow().get_ref().len()).unwrap_or(u64::MAX)
+            }))
         }
 
-        fn source_read(&self, _buffer: &mut [u8]) -> Result<usize> {
-            Ok(0)
+        fn source_read(&self, buffer: &mut [u8]) -> Result<usize> {
+            if self.source_read_failure {
+                return Err(Error::Io(std::io::Error::other(
+                    "synthetic source read failure",
+                )));
+            }
+            std::io::Read::read(&mut *self.source.borrow_mut(), buffer).map_err(Error::Io)
         }
 
         fn begin_parse(&self) -> Result<()> {
@@ -6351,6 +6366,48 @@ mod final_handle_tests {
         }
     }
 
+    #[test]
+    fn recovery_source_token_reader_stops_at_true_or_early_eof() {
+        for (declared_source_length, source) in [(1, b"x".to_vec()), (2, b"x".to_vec())] {
+            let owner = FailingCanonicalOwner {
+                transport_error: false,
+                diagnostics: RefCell::new(Diagnostics::default()),
+                source: RefCell::new(std::io::Cursor::new(source)),
+                declared_source_length: Some(declared_source_length),
+                source_read_failure: false,
+                accept_warnings: None,
+            };
+            let mut tokens =
+                RecoverySourceTokenReader::new(&owner, declared_source_length, 0, &[], 0);
+            let token = tokens
+                .next_token()
+                .expect("the source read should be successful")
+                .expect("the final token must be returned before EOF");
+            assert!(token.is_word_value(b"x"));
+            assert!(tokens
+                .next_token()
+                .expect("the next source read should report EOF")
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn recovery_source_token_reader_propagates_a_source_read_error() {
+        let owner = FailingCanonicalOwner {
+            transport_error: false,
+            diagnostics: RefCell::new(Diagnostics::default()),
+            source: RefCell::new(std::io::Cursor::new(b"x".to_vec())),
+            declared_source_length: Some(1),
+            source_read_failure: true,
+            accept_warnings: None,
+        };
+        let mut tokens = RecoverySourceTokenReader::new(&owner, 1, 0, &[], 0);
+        assert!(matches!(
+            tokens.next_token(),
+            Err(Error::Io(error)) if error.to_string() == "synthetic source read failure"
+        ));
+    }
+
     /// qpdf appends to `m->warnings` one `warn()` call at a time, so a sink
     /// that gives out partway through a batch leaves the warnings it has not
     /// reached yet still pending. Draining the batch before delivering any of
@@ -6360,6 +6417,9 @@ mod final_handle_tests {
         let owner = FailingCanonicalOwner {
             transport_error: false,
             diagnostics: RefCell::new(Diagnostics::default()),
+            source: RefCell::new(std::io::Cursor::new(Vec::new())),
+            declared_source_length: None,
+            source_read_failure: false,
             accept_warnings: Some(1),
         };
         let mut diagnostics = Diagnostics::default();
@@ -6393,6 +6453,9 @@ mod final_handle_tests {
         let owner = FailingCanonicalOwner {
             transport_error: false,
             diagnostics: RefCell::new(Diagnostics::default()),
+            source: RefCell::new(std::io::Cursor::new(Vec::new())),
+            declared_source_length: None,
+            source_read_failure: false,
             accept_warnings: None,
         };
         owner
@@ -6601,6 +6664,9 @@ mod final_handle_tests {
             let owner = FailingCanonicalOwner {
                 transport_error,
                 diagnostics: RefCell::new(Diagnostics::default()),
+                source: RefCell::new(std::io::Cursor::new(Vec::new())),
+                declared_source_length: None,
+                source_read_failure: false,
                 accept_warnings: None,
             };
             let _ = owner.indirect_handle(ObjectRef::new(1, 0));
