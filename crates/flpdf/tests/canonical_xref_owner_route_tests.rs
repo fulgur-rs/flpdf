@@ -619,13 +619,15 @@ fn classic_xref_integer_overflow_fixture(section: &[u8]) -> (Vec<u8>, usize, usi
 /// Exercise both sides of QPDF::parse's xref-read catch boundary:
 /// parse_xrefFirst narrows subsection values before reading a row, while
 /// parse_xrefEntry warns about accepted whitespace before narrowing its
-/// generation (`QPDF.cc:450-464,722-767,770-842`).
+/// signed 64-bit offset and signed 32-bit generation (`QPDF.cc:450-464,722-767,770-842`;
+/// `QUtil.cc:373-393`).
 fn assert_classic_xref_integer_overflow_matches_qpdf(
     filename: &str,
     section: &[u8],
     accepted_row_offset: Option<usize>,
+    conversion_error: &str,
 ) {
-    const ERROR: &str = "error reading xref: integer out of range converting 2147483648 from a 8-byte signed type to a 4-byte signed type";
+    let error_detail = format!("error reading xref: {conversion_error}");
 
     let (fixture, catalog_offset, pages_offset, section_offset) =
         classic_xref_integer_overflow_fixture(section);
@@ -673,10 +675,10 @@ fn assert_classic_xref_integer_overflow_matches_qpdf(
     assert_eq!(qpdf_error.get_filename(), description.as_bytes());
     assert_eq!(qpdf_error.get_object(), b"");
     assert_eq!(qpdf_error.get_file_position(), 0);
-    assert_eq!(qpdf_error.get_message_detail(), ERROR.as_bytes());
+    assert_eq!(qpdf_error.get_message_detail(), error_detail.as_bytes());
     assert_eq!(
         qpdf_error.what_bytes(),
-        format!("{description}: {ERROR}").as_bytes()
+        format!("{description}: {error_detail}").as_bytes()
     );
     assert_eq!(
         strict_warnings,
@@ -703,7 +705,7 @@ fn assert_classic_xref_integer_overflow_matches_qpdf(
     let mut expected_warnings = accepted_warning.into_iter().collect::<Vec<_>>();
     expected_warnings.extend([
         format!("{description}: file is damaged"),
-        format!("{description}: {ERROR}"),
+        format!("{description}: {error_detail}"),
         format!("{description}: Attempting to reconstruct cross-reference table"),
     ]);
     assert_eq!(flpdf_warnings, expected_warnings);
@@ -730,7 +732,7 @@ fn assert_classic_xref_integer_overflow_matches_qpdf(
     assert_eq!(strict_warnings, strict_qpdf_warnings);
     assert!(strict_stderr
         .lines()
-        .any(|line| line == format!("qpdf: {description}: {ERROR}")));
+        .any(|line| line == format!("qpdf: {description}: {error_detail}")));
 
     let qpdf = Command::new("qpdf")
         .args(["--warning-exit-0", "--show-xref"])
@@ -762,6 +764,17 @@ fn classic_xref_subsection_integer_overflow_matches_qpdf() {
         "classic-xref-subsection-object-overflow.pdf",
         b"2147483648 1\n0000000000 00000 n \n",
         None,
+        "integer out of range converting 2147483648 from a 8-byte signed type to a 4-byte signed type",
+    );
+}
+
+#[test]
+fn classic_xref_subsection_count_overflow_matches_qpdf() {
+    assert_classic_xref_integer_overflow_matches_qpdf(
+        "classic-xref-subsection-count-overflow.pdf",
+        b"0 2147483648\n",
+        None,
+        "integer out of range converting 2147483648 from a 8-byte signed type to a 4-byte signed type",
     );
 }
 
@@ -771,6 +784,27 @@ fn classic_xref_generation_overflow_warns_before_the_qpdf_range_error() {
         "classic-xref-generation-overflow.pdf",
         b"0 1\n0000000000  2147483648 n \n",
         Some(b"0 1\n".len()),
+        "integer out of range converting 2147483648 from a 8-byte signed type to a 4-byte signed type",
+    );
+}
+
+#[test]
+fn classic_xref_object_number_narrowing_preserves_row_warning_order() {
+    assert_classic_xref_integer_overflow_matches_qpdf(
+        "classic-xref-object-number-overflow.pdf",
+        b"2147483647 2\n0000000000 00000 f \n0000000000  00000 n \n",
+        Some(b"2147483647 2\n0000000000 00000 f \n".len()),
+        "integer out of range converting 2147483648 from a 8-byte signed type to a 4-byte signed type",
+    );
+}
+
+#[test]
+fn classic_xref_entry_offset_overflow_uses_qpdf_signed_long_range() {
+    assert_classic_xref_integer_overflow_matches_qpdf(
+        "classic-xref-offset-overflow.pdf",
+        b"0 1\n9223372036854775808 00000 f \n",
+        Some(b"0 1\n".len()),
+        "overflow/underflow converting 9223372036854775808 to 64-bit integer",
     );
 }
 
