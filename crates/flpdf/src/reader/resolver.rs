@@ -3654,6 +3654,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
         }
     }
 
+    /// Expose the resolver's buffered, generation-aware `InputSource` view to
+    /// other canonical document parsers such as xref trailer recovery.
+    pub(crate) fn source_live_input(&self) -> Box<dyn LiveInput + '_> {
+        Box::new(self.live_input())
+    }
+
     /// qpdf `QPDF::readObjectAtOffset` (`libqpdf/QPDF.cc:1591-1637`),
     /// `QPDF::reconstruct_xref` (`libqpdf/QPDF.cc:516-530`), and `QPDF::resolve` fallback (`:1745-1748`).
     ///
@@ -5234,6 +5240,10 @@ impl<R: Read + Seek> LiveInput for ResolverLiveInput<'_, R> {
 
     fn set_last_offset(&mut self, offset: u64) {
         self.resolver.set_last_offset(offset);
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        ResolverLiveInput::finish(self)
     }
 }
 
