@@ -458,18 +458,13 @@ pub(crate) fn authenticate(
         //
         //   1. Password authentication runs FIRST.  If neither the user nor
         //      the owner password authenticates, return `BadPassword`.
-        //   2. A wrong-length `/U` or `/O` entry on this authentication
-        //      path is reported as `BadPassword` (an unusable credential
-        //      entry is indistinguishable from a wrong password to a
-        //      caller), not `Malformed`.  This is scoped to the auth path
-        //      via `standard_handler_r5_inputs` (its only caller); all
-        //      other `Malformed` reclassification is intentionally NOT done
-        //      (e.g. `/UE`/`/OE` length errors stay `Malformed`).
+        //   2. qpdf's initializeEncryption NUL-pads short V=5 parameter
+        //      strings; password checks and key recovery consume their fixed
+        //      prefixes. Project the same bytes before either auth attempt.
         //
         // Password-format validation stays before either authentication attempt,
         // as it does in the V<5 / V=4 branch below.
-        let inputs = standard_handler_r5_inputs_from_handle(encrypt)
-            .map_err(map_uo_length_to_bad_password)?;
+        let inputs = standard_handler_r5_inputs_from_handle(encrypt)?;
         let encrypt_metadata = encrypt_metadata_flag_from_handle(encrypt)?;
         let inputs = inputs.borrowed();
         let weak_crypto = revision == 5 || rc4_in_use();
@@ -624,32 +619,11 @@ fn standard_handler_r5_inputs_from_handle(
     encrypt: &ObjectHandle,
 ) -> Result<StandardHandlerR5InputsOwned> {
     Ok(StandardHandlerR5InputsOwned {
-        u: required_48_byte_string_from_handle(encrypt, "U")?,
-        o: required_48_byte_string_from_handle(encrypt, "O")?,
-        ue: required_32_byte_string_from_handle(encrypt, "UE")?,
-        oe: required_32_byte_string_from_handle(encrypt, "OE")?,
+        u: required_v5_parameter_prefix_from_handle(encrypt, "U")?,
+        o: required_v5_parameter_prefix_from_handle(encrypt, "O")?,
+        ue: required_v5_parameter_prefix_from_handle(encrypt, "UE")?,
+        oe: required_v5_parameter_prefix_from_handle(encrypt, "OE")?,
     })
-}
-
-/// Scoped to the V=5 R=5/R=6 authentication path (the sole caller of
-/// `standard_handler_r5_inputs`): a `/U` or `/O` entry that is not exactly
-/// 48 bytes is an unusable credential entry that is indistinguishable, from a
-/// caller's perspective, from supplying the wrong password — qpdf reports
-/// "invalid password" here, so we map to `BadPassword` for parity.
-///
-/// Only the `/U` / `/O` *length* error is remapped. `/UE` / `/OE` length
-/// errors, missing entries, and non-string entries stay `Malformed`: those are
-/// genuine structural defects, not credential mismatches. No broader
-/// `Malformed` reclassification is performed.
-fn map_uo_length_to_bad_password(err: crate::Error) -> crate::Error {
-    match &err {
-        crate::Error::Encrypted(crate::error::EncryptedError::Malformed { reason })
-            if reason == "/U entry is not 48 bytes" || reason == "/O entry is not 48 bytes" =>
-        {
-            crate::error::EncryptedError::BadPassword.into()
-        }
-        _ => err,
-    }
 }
 
 fn decode_hex_file_key(raw: &[u8]) -> Result<Vec<u8>> {
@@ -706,29 +680,6 @@ fn required_name_from_handle(dict: &ObjectHandle, key: &'static str) -> Result<S
     }
 }
 
-fn required_32_byte_string_from_handle(dict: &ObjectHandle, key: &'static str) -> Result<[u8; 32]> {
-    let key_name = format!("/{key}");
-    let value = dict.try_get_key(key_name.as_bytes())?;
-    let Some(bytes) = value.try_as_string()? else {
-        return Err(if value.is_null() {
-            crate::error::EncryptedError::Malformed {
-                reason: format!("missing /{key} entry"),
-            }
-        } else {
-            crate::error::EncryptedError::Malformed {
-                reason: format!("/{key} entry is not a string"),
-            }
-        }
-        .into());
-    };
-    bytes.as_slice().try_into().map_err(|_| {
-        crate::error::EncryptedError::Malformed {
-            reason: format!("/{key} entry is not 32 bytes"),
-        }
-        .into()
-    })
-}
-
 /// Read a V<5 `/O` or `/U` entry as the fixed 32-byte value qpdf authenticates
 /// against, NUL-padding a shorter stored string.
 ///
@@ -780,7 +731,15 @@ fn required_v_lt_5_32_byte_string_from_handle(
     Ok(padded)
 }
 
-fn required_48_byte_string_from_handle(dict: &ObjectHandle, key: &'static str) -> Result<[u8; 48]> {
+/// Project a V=5 encryption string to the fixed prefix used by qpdf's
+/// password checks and key recovery. `initializeEncryption` pads strings
+/// shorter than 48 bytes for `/O` and `/U`, or 32 bytes for `/OE` and `/UE`,
+/// while consumers read only those leading bytes (`QPDF_encryption.cc:316-321,
+/// 521-588,666-687,828-832`).
+fn required_v5_parameter_prefix_from_handle<const N: usize>(
+    dict: &ObjectHandle,
+    key: &'static str,
+) -> Result<[u8; N]> {
     let key_name = format!("/{key}");
     let value = dict.try_get_key(key_name.as_bytes())?;
     let Some(bytes) = value.try_as_string()? else {
@@ -795,20 +754,10 @@ fn required_48_byte_string_from_handle(dict: &ObjectHandle, key: &'static str) -
         }
         .into());
     };
-    if bytes.len() < 48 {
-        return Err(crate::error::EncryptedError::Malformed {
-            reason: format!("/{key} entry is not 48 bytes"),
-        }
-        .into());
-    }
-    // cov:ignore-start: the preceding length guard makes this slice exactly 48 bytes
-    bytes[..48].try_into().map_err(|_| {
-        crate::error::EncryptedError::Malformed {
-            reason: format!("/{key} entry is not 48 bytes"),
-        }
-        .into()
-    })
-    // cov:ignore-end
+    let mut prefix = [0; N];
+    let copied = bytes.len().min(N);
+    prefix[..copied].copy_from_slice(&bytes[..copied]);
+    Ok(prefix)
 }
 
 fn encrypt_metadata_flag_from_handle(encrypt: &ObjectHandle) -> Result<bool> {
@@ -945,7 +894,8 @@ pub(crate) fn first_file_id_handle(id: &ObjectHandle) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_hex_file_key, parse_inspection_state, required_v_lt_5_32_byte_string_from_handle,
+        decode_hex_file_key, parse_inspection_state, required_v5_parameter_prefix_from_handle,
+        required_v_lt_5_32_byte_string_from_handle,
     };
     use crate::ObjectHandle;
 
@@ -1054,6 +1004,26 @@ mod tests {
     fn raw_key_hex_decoding_matches_qpdf_ignored_characters_and_odd_nibbles() {
         assert_eq!(decode_hex_file_key(b"zA-1").unwrap(), vec![0xa1]);
         assert_eq!(decode_hex_file_key(b"F").unwrap(), vec![0xf0]);
+    }
+
+    #[test]
+    fn v5_parameter_prefix_keeps_missing_and_non_string_errors() {
+        let missing = ObjectHandle::dictionary(Vec::new());
+        assert!(matches!(
+            required_v5_parameter_prefix_from_handle::<32>(&missing, "UE"),
+            Err(crate::Error::Encrypted(
+                crate::error::EncryptedError::Malformed { reason }
+            )) if reason == "missing /UE entry"
+        ));
+
+        let non_string =
+            ObjectHandle::dictionary(vec![(b"/OE".to_vec(), ObjectHandle::integer(1))]);
+        assert!(matches!(
+            required_v5_parameter_prefix_from_handle::<32>(&non_string, "OE"),
+            Err(crate::Error::Encrypted(
+                crate::error::EncryptedError::Malformed { reason }
+            )) if reason == "/OE entry is not a string"
+        ));
     }
 
     #[test]

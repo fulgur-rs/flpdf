@@ -22,15 +22,11 @@ fn encryption_string_observers_use_the_canonical_as_string_route() {
     let source = source("src/encryption/state.rs");
     for (signature, next) in [
         (
-            "fn required_32_byte_string_from_handle(",
             "fn required_v_lt_5_32_byte_string_from_handle(",
+            "fn required_v5_parameter_prefix_from_handle<",
         ),
         (
-            "fn required_v_lt_5_32_byte_string_from_handle(",
-            "fn required_48_byte_string_from_handle(",
-        ),
-        (
-            "fn required_48_byte_string_from_handle(",
+            "fn required_v5_parameter_prefix_from_handle<",
             "fn encrypt_metadata_flag_from_handle(",
         ),
         (

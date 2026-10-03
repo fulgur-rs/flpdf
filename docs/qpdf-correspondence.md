@@ -1844,6 +1844,19 @@ password-match flags. `qpdf_v5_password_parity` covers R5 and R6 by creating
 same-password user/owner files, zeroing `/UE` without changing its length, and
 comparing flpdf's file key with qpdf `--show-encryption-key`.
 
+### V=5 password and wrapped-key parameter lengths (`flpdf-6ik2q.20`)
+
+`QPDF::initializeEncryption` NUL-pads short `/O` and `/U` values to 48 bytes
+and `/OE` and `/UE` values to 32 bytes (`QPDF_encryption.cc:316-321,828-831`).
+The password checks and key-recovery path consume fixed leading ranges from
+those values (`QPDF_encryption.cc:521-588,666-687`), so extra bytes are ignored
+by those consumers. `encryption/state.rs` now projects the four strings to the
+same fixed prefixes, zero-filling short values and retaining the raw
+encryption dictionary for later writing. `qpdf_v5_password_parity` compares
+the recovered file key with qpdf for short `/O`, `/U`, `/OE`, and `/UE` values
+in R5 files, and overlong `/OE` and `/UE` values in R5 and R6 files;
+`reader_tests` also checks the short `/U` and `/UE` authentication path.
+
 ### Accessor warning chains for invalid `/ID` and `/Pages` (`flpdf-6gmnc`, 2026-09-17)
 
 qpdf の `QPDFWriter::copyEncryptionParameters` は、欠落 `/ID` を

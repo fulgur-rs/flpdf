@@ -585,55 +585,36 @@ fn scenario7_rc4_wrong_password_without_weak_opt_in_is_bad_password() {
     );
 }
 
-/// scenario 8: a V=5 file whose /U entry is shorter than 48 bytes, opened on
-/// the authentication path, must report BadPassword, not Malformed. qpdf
-/// reports "invalid password" here.
+/// qpdf NUL-pads a short V=5 `/U` before validating and recovering the key.
 #[test]
-fn scenario8_v5_short_u_entry_is_bad_password() {
+fn v5_short_u_entry_is_nul_padded_before_authentication() {
     let bytes = v5_pdf_with_truncated_u_entry();
-    let err = match Pdf::open_with_options(
+    let pdf = Pdf::open_with_options(
         std::io::Cursor::new(bytes),
         PdfOpenOptions {
             password: b"userpass".to_vec(),
             ..PdfOpenOptions::default()
         },
-    ) {
-        Ok(_) => panic!("a V=5 file with a short /U entry must not open"),
-        Err(err) => err,
-    };
+    )
+    .expect("qpdf accepts a short V=5 /U after NUL-padding it");
 
-    assert!(
-        matches!(
-            v5_terminal_error_with_missing_cf_warning(&err),
-            Error::Encrypted(EncryptedError::BadPassword)
-        ),
-        "expected BadPassword for a wrong-length /U on the auth path, got {err:?}"
-    );
+    assert!(pdf.user_password_matched());
 }
 
-/// Fence: a wrong-length /UE entry (not /U or /O) stays Malformed. The
-/// reclassification is intentionally scoped to /U and /O only.
+/// qpdf NUL-pads a short V=5 `/UE` before unwrapping the file key.
 #[test]
-fn fence_v5_short_ue_entry_stays_malformed() {
+fn v5_short_ue_entry_is_nul_padded_before_key_unwrap() {
     let bytes = v5_pdf_with_truncated_ue_entry();
-    let err = match Pdf::open_with_options(
+    let pdf = Pdf::open_with_options(
         std::io::Cursor::new(bytes),
         PdfOpenOptions {
             password: b"userpass".to_vec(),
             ..PdfOpenOptions::default()
         },
-    ) {
-        Ok(_) => panic!("a V=5 file with a short /UE entry must not open"),
-        Err(err) => err,
-    };
+    )
+    .expect("qpdf accepts a short V=5 /UE after NUL-padding it");
 
-    assert!(
-        matches!(
-            v5_terminal_error_with_missing_cf_warning(&err),
-            Error::Encrypted(EncryptedError::Malformed { .. })
-        ),
-        "/UE length errors must remain Malformed (not reclassified), got {err:?}"
-    );
+    assert!(pdf.user_password_matched());
 }
 
 /// A correct password against a weak (RC4) file is accepted without a
@@ -700,18 +681,25 @@ fn fence_d_non_weak_aes_wrong_password_is_bad_password() {
     );
 }
 
-/// Build a well-formed V=5 R=5 fixture, then binary-edit the `/U <...>` hex
-/// literal so the decoded string is 47 bytes (one byte short of the required
-/// 48). The crafted file still parses; the short /U is detected on the
-/// authentication path.
+/// Build a V=5 R=5 fixture, then binary-edit `/U <...>` to 47 decoded bytes.
 fn v5_pdf_with_truncated_u_entry() -> Vec<u8> {
-    truncate_hex_entry(encrypted_r5_or_r6_minimal_pdf(5), b"/U <")
+    let bytes = encrypted_r5_or_r6_pdf(
+        5,
+        " /CF << /StdCF << /AuthEvent /DocOpen /CFM /AESV3 /Length 32 >> >> /StmF /StdCF /StrF /StdCF",
+        &[],
+    );
+    truncate_hex_entry(bytes, b"/U <")
 }
 
-/// As [`v5_pdf_with_truncated_u_entry`] but truncates the `/UE` entry instead,
-/// to exercise the fence that /UE length errors stay Malformed.
+/// As [`v5_pdf_with_truncated_u_entry`] but shortens `/UE` to exercise
+/// NUL-padding before key unwrap.
 fn v5_pdf_with_truncated_ue_entry() -> Vec<u8> {
-    truncate_hex_entry(encrypted_r5_or_r6_minimal_pdf(5), b"/UE <")
+    let bytes = encrypted_r5_or_r6_pdf(
+        5,
+        " /CF << /StdCF << /AuthEvent /DocOpen /CFM /AESV3 /Length 32 >> >> /StmF /StdCF /StrF /StdCF",
+        &[],
+    );
+    truncate_hex_entry(bytes, b"/UE <")
 }
 
 /// Drop the last hex byte (two hex chars) of the `<...>` string that follows
