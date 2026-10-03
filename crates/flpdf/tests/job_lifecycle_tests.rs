@@ -2908,6 +2908,55 @@ fn json_job_empty_encryption_status_returns_qpdf_exit_code() {
 }
 
 #[test]
+fn json_input_encryption_status_opens_the_json_document() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/json-input/complete.json");
+
+    for status_key in ["isEncrypted", "requiresPassword"] {
+        let info = Arc::new(Mutex::new(SinkState::default()));
+        let warnings = Arc::new(Mutex::new(SinkState::default()));
+        let errors = Arc::new(Mutex::new(SinkState::default()));
+        let logger = QPDFLogger::create();
+        logger.set_info(Some(PipelineHandle::new(RecordingSink {
+            state: Arc::clone(&info),
+        })));
+        logger.set_warn(Some(PipelineHandle::new(RecordingSink {
+            state: Arc::clone(&warnings),
+        })));
+        logger.set_error(Some(PipelineHandle::new(RecordingSink {
+            state: Arc::clone(&errors),
+        })));
+
+        let configuration = serde_json::json!({
+            "inputFile": input,
+            "jsonInput": "",
+            status_key: ""
+        });
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.initialize_from_json_partial(&configuration.to_string())
+            .unwrap();
+
+        assert_eq!(
+            job.run().unwrap(),
+            JobExitCode::Error,
+            "{status_key} on a plaintext JSON input must return qpdf's exit code 2"
+        );
+        assert_eq!(job.get_exit_code(), JobExitCode::Error);
+        assert_eq!(job.encryption_status(), (false, false));
+        assert!(info.lock().unwrap().bytes.is_empty(), "{status_key} stdout");
+        assert!(
+            warnings.lock().unwrap().bytes.is_empty(),
+            "{status_key} must not treat valid JSON as a damaged PDF"
+        );
+        assert!(
+            errors.lock().unwrap().bytes.is_empty(),
+            "{status_key} stderr"
+        );
+    }
+}
+
+#[test]
 fn argv_job_run_returns_warning_status_for_repairable_input() {
     let input = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/test_driver/repairable_input.pdf");
