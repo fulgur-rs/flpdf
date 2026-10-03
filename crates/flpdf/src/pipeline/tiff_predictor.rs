@@ -5,9 +5,8 @@
 //! It covers horizontal differencing, row buffering, packed samples, and
 //! finish-time padding.
 //!
-//! The checked geometry preflight follows qpdf head commit
-//! `cf047b20721b18b15525c04b6970e562c90c4a6a`; pinned qpdf 11.9.0's wrapped
-//! geometry remains the behavioral oracle for ordinary inputs.
+//! Row width uses qpdf 11.9.0's unsigned-32-bit arithmetic, including wrap
+//! before the resulting byte count is validated (`Pl_TIFFPredictor.cc:30-34`).
 
 use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
 use crate::bit_stream::{BitStream, BitStreamError};
@@ -56,32 +55,8 @@ impl<'a> TiffPredictor<'a> {
             ));
         }
 
-        // qpdf head widened this intermediate before checking it so a
-        // wrapped u32 product cannot reach `previous.resize` with a bogus
-        // one-byte row. The wide bound must match the narrow check's own
-        // established upper bound (`u32::MAX - 1`, not `u32::MAX`): at
-        // columns=u32::MAX, colors=1, bits=8 the wide value lands exactly on
-        // `u32::MAX`, which a strict `>` bound against `u32::MAX` would
-        // accept, even though the narrow computation below wraps this exact
-        // geometry down to a plausible-looking 536,870,911-byte (~512 MiB)
-        // row instead of rejecting it during construction.
-        let bits_per_pixel = u64::from(bits_per_sample) * u64::from(samples_per_pixel);
-        if bits_per_pixel + 7 > u64::from(u32::MAX) {
-            return Err(PipelineError::runtime(
-                "TIFFPredictor created with bits_per_sample and samples_per_pixel values that cause overflow",
-            ));
-        }
-        let bytes_per_row = (u64::from(columns) * bits_per_pixel).div_ceil(8);
-        if bytes_per_row == 0 || bytes_per_row > u64::from(u32::MAX - 1) {
-            return Err(PipelineError::runtime(
-                "TIFFPredictor created with invalid columns value",
-            ));
-        }
-
-        // Keep pinned qpdf 11.9.0's wrapped row width for inputs that remain
-        // representable after the head preflight. This preserves its
-        // observed partial-row and packed-row behavior; ordinary geometry has
-        // the same value in both calculations.
+        // The operands are unsigned int in qpdf, so multiplication and the
+        // addition wrap before division and constructor validation.
         let bytes_per_row = columns
             .wrapping_mul(bits_per_sample)
             .wrapping_mul(samples_per_pixel)
@@ -290,29 +265,36 @@ mod tests {
             "TIFFPredictor created with invalid columns value"
         );
         assert_eq!(
-            construction_error(536_870_911, u32::MAX, 8).to_string(),
-            "TIFFPredictor created with bits_per_sample and samples_per_pixel values that cause overflow"
-        );
-        assert_eq!(
-            construction_error(u32::MAX, 5, 8).to_string(),
+            construction_error(1_073_741_824, 4, 8).to_string(),
             "TIFFPredictor created with invalid columns value"
         );
     }
 
-    /// `columns=u32::MAX, colors=1, bits=8` makes the raw bit count 8x
-    /// larger than `u32::MAX` (34,359,738,360 bits), but the u32-wrapped
-    /// byte count collapses to a plausible-looking 536,870,911 bytes
-    /// (~512 MiB) after wrapping and dividing by 8. A preflight bound
-    /// checked only on the *divided* byte count misses this case entirely
-    /// (536,870,911 is far under any reasonable byte-count bound), letting
-    /// a malformed one-byte stream trigger a ~512 MiB allocation. The
-    /// preflight must bound the undivided bit count instead.
     #[test]
-    fn constructor_rejects_columns_that_overflow_before_dividing_by_eight() {
-        assert_eq!(
-            construction_error(u32::MAX, 1, 8).to_string(),
-            "TIFFPredictor created with invalid columns value"
+    fn constructor_uses_qpdf_u32_wrapped_row_geometry() {
+        let mut sink = RecordingSink::new(&[], &[]);
+        let predictor = TiffPredictor::new(
+            "tiff decode",
+            &mut sink,
+            TiffPredictorAction::Decode,
+            1_073_741_825,
+            4,
+            8,
         );
+        let predictor = predictor.expect("qpdf's wrapped row width is four bytes");
+        assert_eq!(predictor.bytes_per_row, 4);
+
+        let mut sink = RecordingSink::new(&[], &[]);
+        let predictor = TiffPredictor::new(
+            "tiff decode",
+            &mut sink,
+            TiffPredictorAction::Decode,
+            u32::MAX,
+            1,
+            8,
+        )
+        .expect("qpdf accepts the wrapped byte count before row data is written");
+        assert_eq!(predictor.bytes_per_row, 536_870_911);
     }
 
     #[test]
