@@ -683,7 +683,7 @@ fn assert_classic_xref_integer_overflow_matches_qpdf(
         accepted_warning.clone().into_iter().collect::<Vec<_>>()
     );
 
-    let mut pdf = Pdf::open_with_options(
+    let pdf = Pdf::open_with_options(
         Cursor::new(fixture.clone()),
         PdfOpenOptions {
             repair: true,
