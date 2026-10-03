@@ -2282,27 +2282,15 @@ where
     }
 }
 
-// The recursion hub for this function's own `Array`/`Dictionary` arms --
-// every nested descent funnels back through this same entry point, so
-// wrapping here bounds the whole probe walk the same way
-// `object_handle.rs`'s own single-hub recursive walkers do. See
-// `CONTENT_EMIT_STACK_RED_ZONE`'s doc for why this needs the same
-// protection those walkers already have.
+// Walk a direct content value for nested streams. The recursive traversal has
+// no parser-derived depth limit, matching qpdf's writer; the hub grows the Rust
+// stack as needed.
 fn has_direct_stream_in_value(value: &ObjectHandle) -> crate::Result<bool> {
-    // The caller is already inside a hub level for this very node --
-    // `ContentEmitter::emit_value` probes the node it is currently at -- so
-    // charging the probe's own root would count that node twice. A parsed
-    // `/Contents` holder that is its own indirect object gets a fresh
-    // `MAX_PARSE_DEPTH` parse budget, so it can legitimately carry the full
-    // 500 containers; double-charging the root rejected exactly that shape
-    // one level short of the bound while qpdf wrote it. Descendants charge
-    // normally through `has_direct_stream_in_value_charged`.
     has_direct_stream_in_value_body(value)
 }
 
-// One charged level of the probe: every descent below the root goes through
-// here so the walk is still bounded.
-fn has_direct_stream_in_value_charged(value: &ObjectHandle) -> crate::Result<bool> {
+// One recursive child step of the probe, with stack growth but no nesting cap.
+fn has_direct_stream_in_value_child(value: &ObjectHandle) -> crate::Result<bool> {
     content_emit_walk_hub(|| has_direct_stream_in_value_body(value))
 }
 
@@ -2317,13 +2305,13 @@ fn has_direct_stream_in_value_body(value: &ObjectHandle) -> crate::Result<bool> 
         }
         if let Some(items) = value.try_as_array()? {
             for item in items {
-                if has_direct_stream_in_value_charged(&item)? {
+                if has_direct_stream_in_value_child(&item)? {
                     return Ok(true);
                 }
             }
         } else if let Some(entries) = value.try_as_dictionary()? {
             for (_, child) in entries {
-                if has_direct_stream_in_value_charged(&child)? {
+                if has_direct_stream_in_value_child(&child)? {
                     return Ok(true);
                 } // cov:ignore: LLVM does not attribute this successful nested dictionary scan continuation
             }
