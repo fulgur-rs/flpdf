@@ -22,18 +22,12 @@
 //! leaving the exact system-libjpeg diagnostic available through
 //! `qpdf-libjpeg-compat`.
 //!
-//! Known component-count limitation (`flpdf-twm6`): the pinned default
-//! `libjpeg-turbo-rs` 0.8.0 backend supports only 1/3/4-component JPEG decode.
-//! Its `decode_image_inner` has dedicated branches for those counts and
-//! otherwise reports `N components not yet supported`. qpdf's `Pl_DCT` uses
-//! libjpeg's `output_components` for each row (`libqpdf/Pl_DCT.cc:297-326`),
-//! so qpdf accepts, for example, a 2-component JPEG that the default backend
-//! cannot decode. This is a permanent capability limitation of the pinned
-//! default backend until upstream adds the missing component path; keep the
-//! explicit gate in `finish` rather than exposing the less-specific upstream
-//! error. Callers requiring qpdf parity for such streams must enable the
-//! explicit `qpdf-libjpeg-compat` feature, which routes decoding through the
-//! system-libjpeg compatibility backend.
+//! The default path handles two-component JPEGs with `Decoder::decode_raw`,
+//! then upsamples and interleaves the raw component planes in libjpeg's frame
+//! order.
+//! This preserves qpdf's `output_width * output_components` scanline output
+//! without asking the RGB/CMYK converter to reinterpret `JCS_UNKNOWN`
+//! (`libqpdf/Pl_DCT.cc:315-325`).
 
 use super::buffer::Buffer;
 use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
@@ -174,6 +168,185 @@ impl<'a> PlDct<'a> {
         None
     }
 
+    /// Recreate one component scanline from libjpeg's raw component plane.
+    ///
+    /// `Pl_DCT::decompress` leaves a two-component JPEG in `JCS_UNKNOWN`, so
+    /// libjpeg performs no color conversion but still upsamples each component
+    /// before interleaving it. Its default is fancy 2:1 horizontal and 2:2
+    /// interpolation, fancy 1:2 vertical interpolation, and sample replication
+    /// for other integral ratios (`jdsample.c:1601-1684,1815-1865,1881-1943,
+    /// 1959-2042`; `jdapimin.c:1409-1434`).
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+    fn upsample_component_row(
+        plane: &[u8],
+        plane_stride: usize,
+        plane_height: usize,
+        downsampled_width: usize,
+        downsampled_height: usize,
+        output_width: usize,
+        output_height: usize,
+        horizontal_expand: usize,
+        vertical_expand: usize,
+        output_y: usize,
+    ) -> Option<Vec<u8>> {
+        if output_y >= output_height || horizontal_expand == 0 || vertical_expand == 0 {
+            return None;
+        }
+        if output_width == 0 {
+            return Some(Vec::new());
+        }
+        if downsampled_width == 0 || downsampled_height == 0 {
+            return None;
+        }
+        if output_width > downsampled_width.checked_mul(horizontal_expand)?
+            || output_height > downsampled_height.checked_mul(vertical_expand)?
+        {
+            return None;
+        }
+        let plane_len = plane_stride.checked_mul(plane_height)?;
+        if plane.len() < plane_len
+            || downsampled_width > plane_stride
+            || downsampled_height > plane_height
+        {
+            return None;
+        }
+
+        let sample = |x: usize, y: usize| -> u32 { u32::from(plane[y * plane_stride + x]) };
+        let source_y = output_y / vertical_expand;
+        let mut row = Vec::with_capacity(output_width);
+
+        // This is libjpeg's h2v1_fancy_upsample, including alternating
+        // rounding biases and edge replication.
+        if horizontal_expand == 2 && vertical_expand == 1 && downsampled_width > 2 {
+            for x in 0..output_width {
+                let sample_x = x / 2;
+                let value = if x % 2 == 0 {
+                    if sample_x == 0 {
+                        sample(0, source_y)
+                    } else {
+                        (3 * sample(sample_x, source_y) + sample(sample_x - 1, source_y) + 1) >> 2
+                    }
+                } else if sample_x == 0 {
+                    (3 * sample(0, source_y) + sample(1, source_y) + 2) >> 2
+                } else if sample_x + 1 == downsampled_width {
+                    sample(sample_x, source_y)
+                } else {
+                    (3 * sample(sample_x, source_y) + sample(sample_x + 1, source_y) + 2) >> 2
+                };
+                row.push(value as u8);
+            }
+            return Some(row);
+        }
+
+        // h1v2_fancy_upsample blends each component center with the adjacent
+        // row. The input controller supplies the nearest row at image edges.
+        if horizontal_expand == 1 && vertical_expand == 2 {
+            let (neighbor_y, bias) = if output_y % 2 == 0 {
+                (source_y.saturating_sub(1), 1)
+            } else {
+                ((source_y + 1).min(downsampled_height - 1), 2)
+            };
+            for x in 0..output_width {
+                let value = (3 * sample(x, source_y) + sample(x, neighbor_y) + bias) >> 2;
+                row.push(value as u8);
+            }
+            return Some(row);
+        }
+
+        // libjpeg selects the 2h2v triangle filter only for component planes
+        // wider than two samples; narrower planes use integer replication.
+        if horizontal_expand == 2 && vertical_expand == 2 && downsampled_width > 2 {
+            let neighbor_y = if output_y % 2 == 0 {
+                source_y.saturating_sub(1)
+            } else {
+                (source_y + 1).min(downsampled_height - 1)
+            };
+            let vertical_sum = |x: usize| 3 * sample(x, source_y) + sample(x, neighbor_y);
+            for x in 0..output_width {
+                let column = x / 2;
+                let value = if column == 0 {
+                    if x % 2 == 0 {
+                        (vertical_sum(0) * 4 + 8) >> 4
+                    } else {
+                        (vertical_sum(0) * 3 + vertical_sum(1) + 7) >> 4
+                    }
+                } else if column + 1 == downsampled_width {
+                    if x % 2 == 0 {
+                        (vertical_sum(column) * 3 + vertical_sum(column - 1) + 8) >> 4
+                    } else {
+                        (vertical_sum(column) * 4 + 7) >> 4
+                    }
+                } else if x % 2 == 0 {
+                    (vertical_sum(column) * 3 + vertical_sum(column - 1) + 8) >> 4
+                } else {
+                    (vertical_sum(column) * 3 + vertical_sum(column + 1) + 7) >> 4
+                };
+                row.push(value as u8);
+            }
+            return Some(row);
+        }
+
+        // The remaining supported cases use libjpeg's integral-factor box
+        // upsampler, which replicates each source sample horizontally and
+        // vertically.
+        for x in 0..output_width {
+            let source_x = x / horizontal_expand;
+            row.push(sample(source_x, source_y) as u8);
+        }
+        Some(row)
+    }
+
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+    fn two_component_scanline(
+        raw: &libjpeg_turbo_rs::RawImage,
+        sampling: [(u8, u8); 2],
+        max_h: usize,
+        max_v: usize,
+        output_y: usize,
+    ) -> Option<Vec<u8>> {
+        if raw.num_components != 2 || raw.width.checked_mul(2).is_none() {
+            return None;
+        }
+        let mut component_rows = [Vec::new(), Vec::new()];
+        for component in 0..2 {
+            let (horizontal_sampling, vertical_sampling) = sampling[component];
+            let horizontal_sampling = usize::from(horizontal_sampling);
+            let vertical_sampling = usize::from(vertical_sampling);
+            if horizontal_sampling == 0
+                || vertical_sampling == 0
+                || max_h % horizontal_sampling != 0
+                || max_v % vertical_sampling != 0
+            {
+                return None;
+            }
+
+            let downsampled_width = (raw.width * horizontal_sampling).div_ceil(max_h);
+            let downsampled_height = (raw.height * vertical_sampling).div_ceil(max_v);
+            let plane = raw.planes.get(component)?;
+            let plane_stride = *raw.plane_widths.get(component)?;
+            let plane_height = *raw.plane_heights.get(component)?;
+            component_rows[component] = Self::upsample_component_row(
+                plane,
+                plane_stride,
+                plane_height,
+                downsampled_width,
+                downsampled_height,
+                raw.width,
+                raw.height,
+                max_h / horizontal_sampling,
+                max_v / vertical_sampling,
+                output_y,
+            )?;
+        }
+
+        let mut row = Vec::with_capacity(raw.width * 2);
+        for x in 0..raw.width {
+            row.push(component_rows[0][x]);
+            row.push(component_rows[1][x]);
+        }
+        Some(row)
+    }
+
     #[cfg(not(feature = "qpdf-libjpeg-compat"))]
     fn require_baseline_eoi(&self, data: &[u8]) -> PipelineResult<()> {
         let metadata = libjpeg_turbo_rs::decode::marker::MarkerReader::new(data)
@@ -264,13 +437,19 @@ impl Pipeline for PlDct<'_> {
 
             let mut decoder = libjpeg_turbo_rs::ScanlineDecoder::new(&data)
                 .map_err(|error| self.jpeg_error(error, &data))?;
-            let (precision, width, height, components) = {
+            let (precision, width, height, sampling) = {
                 let header = decoder.header();
                 (
                     header.precision,
                     header.width(),
                     header.height(),
-                    header.components.len(),
+                    header
+                        .components
+                        .iter()
+                        .map(|component| {
+                            (component.horizontal_sampling, component.vertical_sampling)
+                        })
+                        .collect::<Vec<_>>(),
                 )
             };
 
@@ -280,42 +459,103 @@ impl Pipeline for PlDct<'_> {
                 )));
             }
 
-            let bytes_per_pixel = match components {
-                1 => 1,
-                3 => 3,
-                4 => 4,
-                _ => {
-                    return Err(Self::runtime_error(format!(
-                        "unsupported JPEG component count {components}"
-                    )));
-                }
-            };
-            // cov:ignore-start: JPEG width is u16 and supported bpp is at most 4, so usize multiplication cannot overflow
-            let row_length = width.checked_mul(bytes_per_pixel).ok_or_else(|| {
-                Self::runtime_error(format!("scanline byte length overflow for width {width}"))
-            })?;
+            let components = sampling.len();
+            // cov:ignore-start: libjpeg-turbo-rs rejects SOF counts outside 1..=4 before it returns Decoder::header
+            if !matches!(components, 1 | 2 | 3 | 4) {
+                return Err(Self::runtime_error(format!(
+                    "unsupported JPEG component count {components}"
+                )));
+            }
             // cov:ignore-end
 
-            let mut row = vec![0u8; row_length];
+            if components == 2 {
+                let sampling = [sampling[0], sampling[1]];
+                let max_h = sampling
+                    .iter()
+                    .map(|(horizontal, _)| usize::from(*horizontal))
+                    .max()
+                    .unwrap_or(1);
+                let max_v = sampling
+                    .iter()
+                    .map(|(_, vertical)| usize::from(*vertical))
+                    .max()
+                    .unwrap_or(1);
 
-            for _ in 0..height {
-                decoder
-                    .read_scanline(&mut row)
+                // qpdf's `jpeg_start_decompress` rejects fractional sampling
+                // ratios before it reads entropy data (`jdsample.c:2257-2271`).
+                if sampling.iter().any(|(horizontal, vertical)| {
+                    let horizontal = usize::from(*horizontal);
+                    let vertical = usize::from(*vertical);
+                    horizontal == 0
+                        || vertical == 0
+                        || max_h % horizontal != 0
+                        || max_v % vertical != 0
+                }) {
+                    return Err(Self::runtime_error(
+                        "Fractional sampling not implemented yet",
+                    ));
+                }
+
+                let raw = libjpeg_turbo_rs::Decoder::new(&data)
+                    .map_err(|error| self.jpeg_error(error, &data))?
+                    .decode_raw()
                     .map_err(|error| self.jpeg_error(error, &data))?;
-                // cov:ignore-start: ScanlineDecoder writes into this caller-owned slice and returns no row with a different length
-                if row.len() != row_length {
-                    return Err(Self::runtime_error(format!(
-                        "decoded scanline length {}, expected {row_length}",
-                        row.len()
-                    )));
+                // cov:ignore-start: Decoder::decode_raw derives dimensions from the same frame header read above
+                if raw.width != width || raw.height != height {
+                    return Err(Self::runtime_error(
+                        "decoded JPEG component dimensions do not match the frame",
+                    ));
                 }
                 // cov:ignore-end
-                self.next.write(&row)?;
+                for output_y in 0..height {
+                    // cov:ignore-start: decode_raw returns one correctly shaped plane per frame component
+                    let row = Self::two_component_scanline(&raw, sampling, max_h, max_v, output_y)
+                        .ok_or_else(|| {
+                            Self::runtime_error("decoded JPEG component plane is inconsistent")
+                        })?;
+                    // cov:ignore-end
+                    self.next.write(&row)?;
+                }
+            } else {
+                let bytes_per_pixel = match components {
+                    1 => 1,
+                    3 => 3,
+                    4 => 4,
+                    // cov:ignore-start: The component gate and the two-component branch leave only 1/3/4 here
+                    _ => {
+                        return Err(Self::runtime_error(format!(
+                            "unsupported JPEG component count {components}"
+                        )));
+                    } // cov:ignore-end
+                };
+                // cov:ignore-start: JPEG width is u16 and supported bpp is at most 4, so usize multiplication cannot overflow
+                let row_length = width.checked_mul(bytes_per_pixel).ok_or_else(|| {
+                    Self::runtime_error(format!("scanline byte length overflow for width {width}"))
+                })?;
+                // cov:ignore-end
+
+                let mut row = vec![0u8; row_length];
+
+                for _ in 0..height {
+                    decoder
+                        .read_scanline(&mut row)
+                        .map_err(|error| self.jpeg_error(error, &data))?;
+                    // cov:ignore-start: ScanlineDecoder writes into this caller-owned slice and returns no row with a different length
+                    if row.len() != row_length {
+                        return Err(Self::runtime_error(format!(
+                            "decoded scanline length {}, expected {row_length}",
+                            row.len()
+                        )));
+                    }
+                    // cov:ignore-end
+                    self.next.write(&row)?;
+                }
+
+                decoder
+                    .finish()
+                    .map_err(|error| self.jpeg_error(error, &data))?;
             }
 
-            decoder
-                .finish()
-                .map_err(|error| self.jpeg_error(error, &data))?;
             self.require_baseline_eoi(&data)?;
             self.next.finish()
         }
@@ -536,22 +776,264 @@ mod tests {
 
     #[cfg(not(feature = "qpdf-libjpeg-compat"))]
     #[test]
-    fn default_backend_rejects_two_component_jpeg() {
+    fn default_backend_decodes_two_component_jpeg_as_qpdf_raw_channels() {
         let trace = shared_trace();
         let mut sink = RecordingSink::with_trace(trace.clone(), &[], &[]);
-        let error = {
+        {
             let mut stage = PlDct::new("DCT decode", &mut sink);
             stage
                 .write(&two_component_jpeg())
                 .expect("two-component JPEG must buffer");
             stage
                 .finish()
-                .expect_err("default backend must reject unsupported component count")
+                .expect("default backend must preserve both qpdf output components");
+        }
+
+        assert_eq!(trace.borrow().output, [128, 128]);
+        assert_eq!(
+            trace.borrow().calls,
+            [
+                TraceCall::Write {
+                    data: vec![128, 128],
+                    failed: false,
+                },
+                TraceCall::Finish { failed: false },
+            ]
+        );
+    }
+
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+    #[test]
+    fn default_backend_keeps_gray_rgb_and_cmyk_scanline_counts() {
+        for (pixel_format, bytes_per_pixel) in [
+            (libjpeg_turbo_rs::PixelFormat::Grayscale, 1),
+            (libjpeg_turbo_rs::PixelFormat::Rgb, 3),
+            (libjpeg_turbo_rs::PixelFormat::Cmyk, 4),
+        ] {
+            let input = vec![128; 8 * 8 * bytes_per_pixel];
+            let jpeg = libjpeg_turbo_rs::compress(
+                &input,
+                8,
+                8,
+                pixel_format,
+                75,
+                libjpeg_turbo_rs::Subsampling::S444,
+            )
+            .expect("supported component JPEG must encode");
+            let trace = shared_trace();
+            let mut sink = RecordingSink::with_trace(trace.clone(), &[], &[]);
+            {
+                let mut stage = PlDct::new("DCT decode", &mut sink);
+                stage.write(&jpeg).expect("JPEG must buffer");
+                stage
+                    .finish()
+                    .expect("supported component JPEG must decode");
+            }
+
+            assert_eq!(trace.borrow().output.len(), 8 * 8 * bytes_per_pixel);
+            let writes = trace
+                .borrow()
+                .calls
+                .iter()
+                .filter_map(|call| match call {
+                    TraceCall::Write { data, .. } => Some(data.len()),
+                    TraceCall::Finish { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(writes, vec![8 * bytes_per_pixel; 8]);
+        }
+    }
+
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+    #[test]
+    fn default_backend_rejects_fractional_two_component_sampling_like_qpdf() {
+        let mut jpeg = two_component_jpeg();
+        let sof = jpeg
+            .windows(2)
+            .position(|marker| marker == [0xff, 0xc0])
+            .expect("baseline JPEG must contain SOF0");
+        // The fixture has two SOF entries at offsets +10..+15. Max H is 3,
+        // while the second component uses H=2, which libjpeg cannot upsample.
+        jpeg[sof + 11] = 0x31;
+        jpeg[sof + 14] = 0x21;
+
+        let trace = shared_trace();
+        let mut sink = RecordingSink::with_trace(trace.clone(), &[], &[]);
+        let error = {
+            let mut stage = PlDct::new("DCT decode", &mut sink);
+            stage.write(&jpeg).expect("JPEG must buffer");
+            stage
+                .finish()
+                .expect_err("fractional sampling ratios must be rejected")
         };
 
-        assert_eq!(error.to_string(), "unsupported JPEG component count 2");
-        assert!(trace.borrow().output.is_empty());
+        assert_eq!(error.to_string(), "Fractional sampling not implemented yet");
         assert!(trace.borrow().calls.is_empty());
+    }
+
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+    #[test]
+    fn raw_component_upsampling_rejects_inconsistent_internal_shapes() {
+        assert!(PlDct::upsample_component_row(&[], 1, 1, 1, 1, 1, 1, 0, 1, 0).is_none());
+        assert_eq!(
+            PlDct::upsample_component_row(&[], 0, 0, 1, 1, 0, 1, 1, 1, 0),
+            Some(Vec::new())
+        );
+        assert!(PlDct::upsample_component_row(&[], 1, 1, 0, 1, 1, 1, 1, 1, 0).is_none());
+        assert!(PlDct::upsample_component_row(&[], 2, 1, 1, 1, 1, 1, 1, 1, 0).is_none());
+        assert!(PlDct::upsample_component_row(&[1], 1, 1, 1, 1, 1, 2, 1, 1, 1).is_none());
+        assert!(PlDct::upsample_component_row(&[1, 2, 3], 3, 1, 3, 1, 7, 1, 2, 2, 0).is_none());
+
+        let wrong_count = libjpeg_turbo_rs::RawImage {
+            planes: Vec::new(),
+            plane_widths: Vec::new(),
+            plane_heights: Vec::new(),
+            width: 1,
+            height: 1,
+            num_components: 1,
+        };
+        assert!(PlDct::two_component_scanline(&wrong_count, [(1, 1); 2], 1, 1, 0).is_none());
+
+        let fractional_sampling = libjpeg_turbo_rs::RawImage {
+            planes: vec![vec![1], vec![2]],
+            plane_widths: vec![1, 1],
+            plane_heights: vec![1, 1],
+            width: 1,
+            height: 1,
+            num_components: 2,
+        };
+        assert!(
+            PlDct::two_component_scanline(&fractional_sampling, [(0, 1), (1, 1)], 1, 1, 0,)
+                .is_none()
+        );
+
+        let inconsistent_plane = libjpeg_turbo_rs::RawImage {
+            planes: vec![Vec::new(), vec![2]],
+            plane_widths: vec![1, 1],
+            plane_heights: vec![1, 1],
+            width: 1,
+            height: 1,
+            num_components: 2,
+        };
+        assert!(PlDct::two_component_scanline(&inconsistent_plane, [(1, 1); 2], 1, 1, 0).is_none());
+
+        let oversized_width = libjpeg_turbo_rs::RawImage {
+            planes: Vec::new(),
+            plane_widths: Vec::new(),
+            plane_heights: Vec::new(),
+            width: usize::MAX,
+            height: 0,
+            num_components: 2,
+        };
+        assert!(PlDct::two_component_scanline(&oversized_width, [(1, 1); 2], 1, 1, 0).is_none());
+    }
+
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+    #[test]
+    fn two_component_rows_use_libjpeg_h2v1_fancy_upsampling() {
+        let mut first = vec![0; 8 * 8];
+        first[..4].copy_from_slice(&[10, 20, 30, 40]);
+        let mut second = vec![0; 16 * 8];
+        second[..8].copy_from_slice(&[100, 101, 102, 103, 104, 105, 106, 107]);
+        let raw = libjpeg_turbo_rs::RawImage {
+            planes: vec![first, second],
+            plane_widths: vec![8, 16],
+            plane_heights: vec![8, 8],
+            width: 8,
+            height: 1,
+            num_components: 2,
+        };
+
+        let row = PlDct::two_component_scanline(&raw, [(1, 1), (2, 1)], 2, 1, 0)
+            .expect("raw component planes must have the declared shape");
+        assert_eq!(
+            row,
+            [10, 100, 13, 101, 17, 102, 23, 103, 27, 104, 33, 105, 37, 106, 40, 107,]
+        );
+    }
+
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+    #[test]
+    fn two_component_rows_use_libjpeg_h1v2_fancy_upsampling() {
+        let mut first = vec![0; 8 * 16];
+        first[0] = 1;
+        first[8] = 5;
+        first[16] = 9;
+        first[24] = 13;
+        let mut second = vec![0; 8 * 8];
+        second[0] = 10;
+        second[8] = 30;
+        let raw = libjpeg_turbo_rs::RawImage {
+            planes: vec![first, second],
+            plane_widths: vec![8, 8],
+            plane_heights: vec![16, 8],
+            width: 1,
+            height: 4,
+            num_components: 2,
+        };
+
+        let rows = (0..4)
+            .map(|y| {
+                PlDct::two_component_scanline(&raw, [(1, 2), (1, 1)], 1, 2, y)
+                    .expect("raw component planes must have the declared shape")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows, [[1, 10], [5, 15], [9, 25], [13, 30]]);
+    }
+
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+    #[test]
+    fn two_component_rows_use_libjpeg_h2v2_fancy_upsampling() {
+        let mut first = vec![0; 8 * 8];
+        first[..4].copy_from_slice(&[10, 20, 30, 40]);
+        first[8..12].copy_from_slice(&[50, 60, 70, 80]);
+        let second = vec![200; 16 * 16];
+        let raw = libjpeg_turbo_rs::RawImage {
+            planes: vec![first, second],
+            plane_widths: vec![8, 16],
+            plane_heights: vec![8, 16],
+            width: 8,
+            height: 8,
+            num_components: 2,
+        };
+
+        let row = PlDct::two_component_scanline(&raw, [(1, 1), (2, 2)], 2, 2, 0)
+            .expect("raw component planes must have the declared shape");
+        assert_eq!(
+            row,
+            [10, 200, 12, 200, 18, 200, 22, 200, 28, 200, 32, 200, 38, 200, 40, 200]
+        );
+        let next_row = PlDct::two_component_scanline(&raw, [(1, 1), (2, 2)], 2, 2, 1)
+            .expect("raw component planes must have the declared shape");
+        assert_eq!(
+            next_row,
+            [20, 200, 22, 200, 28, 200, 32, 200, 38, 200, 42, 200, 48, 200, 50, 200]
+        );
+    }
+
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+    #[test]
+    fn two_component_rows_replicate_other_integral_sampling_ratios() {
+        let mut first = vec![0; 8 * 8];
+        first[..2].copy_from_slice(&[10, 20]);
+        first[8..10].copy_from_slice(&[30, 40]);
+        let mut second = vec![0; 32 * 24];
+        second[4 * 32..4 * 32 + 8].copy_from_slice(&[140, 141, 142, 143, 144, 145, 146, 147]);
+        let raw = libjpeg_turbo_rs::RawImage {
+            planes: vec![first, second],
+            plane_widths: vec![8, 32],
+            plane_heights: vec![8, 24],
+            width: 8,
+            height: 6,
+            num_components: 2,
+        };
+
+        let row = PlDct::two_component_scanline(&raw, [(1, 1), (4, 3)], 4, 3, 4)
+            .expect("raw component planes must have the declared shape");
+        assert_eq!(
+            row,
+            [30, 140, 30, 141, 30, 142, 30, 143, 40, 144, 40, 145, 40, 146, 40, 147]
+        );
     }
 
     #[cfg(feature = "qpdf-libjpeg-compat")]
