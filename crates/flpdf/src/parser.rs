@@ -2552,6 +2552,9 @@ mod live_input_tests {
         let mut input = SliceLiveInput::new(b"x");
         input.seek(1).expect("seek within input");
         assert_eq!(input.read_byte().expect("read"), None);
+        input
+            .finish()
+            .expect("slice input has no adapter-owned read-ahead to flush");
         assert!(matches!(
             input.seek(2),
             Err(crate::Error::Parse { offset: 2, .. })

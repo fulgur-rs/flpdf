@@ -3372,6 +3372,7 @@ fn read_trailer_from_live_source(
             Some(empty_offset),
         ));
     } else {
+        // cov:ignore-start: the live file-object parser always creates an initialized handle, and qpdf's isDictionary is a non-fallible type predicate
         let is_dictionary = match trailer.try_is_dictionary() {
             Ok(is_dictionary) => is_dictionary,
             Err(error) => {
@@ -3379,6 +3380,7 @@ fn read_trailer_from_live_source(
                 return Err(error);
             }
         };
+        // cov:ignore-end
         if is_dictionary {
             let token = {
                 let mut tokenizer = LiveTokenSource::new(&mut input);
@@ -3391,13 +3393,10 @@ fn read_trailer_from_live_source(
                     return Err(error);
                 }
             };
-            let after_token = match input.tell() {
-                Ok(offset) => offset,
-                Err(error) => {
-                    input.finish()?;
-                    return Err(error);
-                }
-            };
+            // `LiveTokenSource` records the logical input position after the
+            // qpdf-style delimiter unread; this is `m->file->tell()` after
+            // `QPDF::readToken` in qpdf's warning path.
+            let after_token = token.end as u64;
             if token.is_word_value(b"stream") {
                 diagnostics.push(trailer_warning(
                     filename,
@@ -6329,6 +6328,65 @@ mod final_handle_tests {
         )
     }
 
+    struct FaultAfterCursor {
+        cursor: std::io::Cursor<Vec<u8>>,
+        fail_at: u64,
+    }
+
+    impl std::io::Read for FaultAfterCursor {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+            let position = self.cursor.position();
+            if position >= self.fail_at {
+                return Err(std::io::Error::other("synthetic trailer source failure"));
+            }
+            let available = usize::try_from(self.fail_at - position).unwrap_or(usize::MAX);
+            let limit = buffer.len().min(available);
+            std::io::Read::read(&mut self.cursor, &mut buffer[..limit])
+        }
+    }
+
+    impl std::io::Seek for FaultAfterCursor {
+        fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+            std::io::Seek::seek(&mut self.cursor, position)
+        }
+    }
+
+    fn resolver_with_fault_after_trailer_source(
+        bytes: Vec<u8>,
+        fail_at: u64,
+        unique_id: u64,
+    ) -> Rc<ResolverHandle<FaultAfterCursor>> {
+        ResolverHandle::new_shared(
+            FaultAfterCursor {
+                cursor: std::io::Cursor::new(bytes),
+                fail_at,
+            },
+            0,
+            BTreeMap::new(),
+            true,
+            false,
+            Diagnostics::default(),
+            crate::reader::resolver::ResolverWarningOptions::new(
+                crate::QPDFLogger::create(),
+                true,
+                b"fault.pdf".to_vec(),
+            ),
+            unique_id,
+        )
+    }
+
+    fn assert_trailer_source_read_error(error: Error) {
+        let Error::QpdfExc(error) = error else {
+            panic!("resolver source read must retain its qpdf exception shape: {error:?}");
+        };
+        assert_eq!(error.get_error_code(), QpdfErrorCode::System);
+        assert_eq!(error.get_filename(), b"fault.pdf");
+        assert_eq!(error.get_message_detail(), b"read 128 bytes");
+    }
+
     struct FailingCanonicalOwner {
         transport_error: bool,
         diagnostics: RefCell<Diagnostics>,
@@ -6350,7 +6408,6 @@ mod final_handle_tests {
         }
 
         fn source_live_input(&self) -> Box<dyn LiveInput + '_> {
-            // cov:ignore: failure-injection owner does not parse trailer objects
             Box::new(crate::parser::SliceLiveInput::new(b""))
         }
 
@@ -6576,6 +6633,50 @@ mod final_handle_tests {
             ))
             .expect("the synthetic owner warning sink accepts the diagnostic");
         assert_eq!(owner.repair_diagnostics().entries().len(), 1);
+    }
+
+    #[test]
+    fn failure_injection_owner_live_input_is_empty() {
+        let owner = FailingCanonicalOwner {
+            transport_error: false,
+            diagnostics: RefCell::new(Diagnostics::default()),
+            source: RefCell::new(std::io::Cursor::new(Vec::new())),
+            declared_source_length: None,
+            source_read_failure: false,
+            accept_warnings: None,
+        };
+        let mut input = owner.source_live_input();
+        assert_eq!(input.tell().expect("source position"), 0);
+        assert_eq!(input.read_byte().expect("source EOF"), None);
+        input.finish().expect("slice input has no buffered source");
+    }
+
+    #[test]
+    fn live_trailer_parser_propagates_source_read_failures() {
+        let mut source = b"trailer\n<< /Size 1 /Padding (".to_vec();
+        source.extend(std::iter::repeat_n(b'x', 300));
+        source.extend_from_slice(b") >>\nstartxref\n0\n%%EOF\n");
+        let start = b"trailer".len() as u64;
+        let fail_at = start + 128;
+        let owner = resolver_with_fault_after_trailer_source(source, fail_at, 91);
+        let mut parser = CanonicalTrailerParser::new(owner.as_ref(), b"fault.pdf");
+        let error = read_trailer_from_live_source(owner.as_ref(), start, b"fault.pdf", &mut parser)
+            .expect_err("a source failure inside the trailer body must propagate");
+        assert_trailer_source_read_error(error);
+    }
+
+    #[test]
+    fn live_trailer_lookahead_propagates_source_read_failures() {
+        let mut source = b"trailer\n<< /Size 1 >>".to_vec();
+        source.extend(std::iter::repeat_n(b' ', 200));
+        source.extend_from_slice(b"startxref\n0\n%%EOF\n");
+        let start = b"trailer".len() as u64;
+        let fail_at = start + 128;
+        let owner = resolver_with_fault_after_trailer_source(source, fail_at, 92);
+        let mut parser = CanonicalTrailerParser::new(owner.as_ref(), b"fault.pdf");
+        let error = read_trailer_from_live_source(owner.as_ref(), start, b"fault.pdf", &mut parser)
+            .expect_err("a failure in readTrailer's following-token lookahead must propagate");
+        assert_trailer_source_read_error(error);
     }
 
     #[test]
