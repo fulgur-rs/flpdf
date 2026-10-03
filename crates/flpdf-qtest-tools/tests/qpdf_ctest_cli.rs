@@ -1193,15 +1193,14 @@ fn unsupported_encryption_filter_pdf() -> Vec<u8> {
     bytes
 }
 
-/// qpdf's C API rebuilds a caught `std::runtime_error` as
-/// `QPDFExc(qpdf_e_system, "", "", 0, e.what())` (`qpdf-c.cc:77-79`), so the
-/// location fields stay empty and the whole `what()` — which already carries
-/// the filename for `QPDFSystemError` — becomes the detail. Reading a
-/// directory is the smallest input that reaches that arm after the file
-/// itself opens.
+/// `FileInputSource::read` raises `QPDFExc(qpdf_e_system, filename, "",
+/// last_offset, "read N bytes")` when `fread` fails
+/// (`libqpdf/FileInputSource.cc:116-132`), and qpdf's C API preserves that
+/// exception (`libqpdf/qpdf-c.cc:69-78`). Reading a directory exercises this
+/// read-error path after `fopen` succeeds.
 #[cfg(unix)]
 #[test]
-fn qpdf_ctest_2_reports_a_trapped_system_error_without_location_fields() {
+fn qpdf_ctest_2_preserves_file_source_fields_for_a_system_read_error() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let input = directory.path().join("input-is-a-directory");
     let output = directory.path().join("unused-output.pdf");
@@ -1217,13 +1216,17 @@ fn qpdf_ctest_2_reports_a_trapped_system_error_without_location_fields() {
     assert!(result.status.success());
     let stdout = String::from_utf8_lossy(&result.stdout);
     assert!(stdout.contains("code: 2"), "{stdout}");
-    assert!(stdout.contains("\n  file: \n"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("\n  file: {input_name}\n")),
+        "{stdout}"
+    );
     assert!(stdout.contains("\n  pos: 0\n"), "{stdout}");
-    // The path appears once, in the detail, not again as the filename.
+    assert!(stdout.contains("\n  text: read 1024 bytes\n"), "{stdout}");
+    // The path appears in `what()` and in the independently exposed filename.
     assert_eq!(
         stdout.matches(input_name).count(),
         2,
-        "path must appear only in the `error:` line and the detail: {stdout}"
+        "path must appear in `what()` and the filename field: {stdout}"
     );
     assert!(stdout.ends_with("C test 2 done\n"), "{stdout}");
 }

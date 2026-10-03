@@ -964,6 +964,393 @@ fn reconstruction_header_lookahead_skips_unbounded_separator_whitespace() {
     assert_eq!(rendered, qpdf_rows);
 }
 
+/// Build a valid classic-xref file whose `%PDF-` candidate starts at the last
+/// four-byte position in qpdf's first-1024-byte header search window. qpdf
+/// tests the match from its candidate position, then reads the header line
+/// from that same live source position (`QPDF.cc:388-406,430-437`).
+fn pdf_with_header_at_search_boundary() -> (Vec<u8>, usize, usize) {
+    const HEADER_OFFSET: usize = 1020;
+    // qpdf rejects this first candidate's version, then keeps searching and
+    // accepts the valid candidate whose marker straddles the 1024-byte block.
+    let mut bytes = b"%PDF-x\n".to_vec();
+    bytes.resize(HEADER_OFFSET, b'x');
+    bytes.extend_from_slice(b"%PDF-1.7\r\n");
+
+    let catalog_offset = bytes.len() - HEADER_OFFSET;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_offset = bytes.len() - HEADER_OFFSET;
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+    let xref_offset = bytes.len() - HEADER_OFFSET;
+
+    bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{pages_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+
+    (bytes, catalog_offset, pages_offset)
+}
+
+#[test]
+fn canonical_header_search_reads_the_full_candidate_line_at_the_window_edge() {
+    let (fixture, catalog_offset, pages_offset) = pdf_with_header_at_search_boundary();
+    let directory = tempfile::tempdir().expect("create qpdf fixture directory");
+    let input = directory.path().join("header-at-search-boundary.pdf");
+    fs::write(&input, &fixture).expect("write qpdf fixture");
+    let description = input.to_string_lossy().into_owned();
+
+    let qpdf = Command::new("qpdf")
+        .arg("--show-xref")
+        .arg(&input)
+        .output()
+        .expect("qpdf 11.9.0 should spawn");
+    assert_eq!(
+        qpdf.status.code(),
+        Some(0),
+        "qpdf must accept a header beginning at byte 1020: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    let qpdf_warnings: Vec<String> = String::from_utf8_lossy(&qpdf.stderr)
+        .lines()
+        .filter_map(|line| line.strip_prefix("WARNING: "))
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        qpdf_warnings.is_empty(),
+        "valid prefixed PDF: {qpdf_warnings:?}"
+    );
+    let qpdf_rows: Vec<String> = String::from_utf8_lossy(&qpdf.stdout)
+        .lines()
+        .filter(|line| line.contains(": uncompressed;") || line.contains(": compressed;"))
+        .map(str::to_owned)
+        .collect();
+
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(fixture),
+        PdfOpenOptions {
+            repair: false,
+            suppress_warnings: true,
+            description: description.as_bytes().to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("canonical open must find the complete header past the search-window edge");
+    assert_eq!(pdf.version(), "1.7");
+    assert_eq!(pdf.root_ref(), Some(ObjectRef::new(1, 0)));
+    pdf.root_handle()
+        .expect("the rebased /Root must resolve to the Catalog dictionary");
+    let rendered = render_xref_table(&pdf.get_xref_table());
+    assert!(rendered.contains(&format!("1/0: uncompressed; offset = {catalog_offset}")));
+    assert!(rendered.contains(&format!("2/0: uncompressed; offset = {pages_offset}")));
+    assert_eq!(rendered, qpdf_rows);
+    assert!(pdf.repair_diagnostics().entries().is_empty());
+}
+
+fn pdf_with_header_outside_search_window() -> (Vec<u8>, usize, usize) {
+    const HEADER_OFFSET: usize = 1024;
+    let mut bytes = vec![b'x'; HEADER_OFFSET];
+    bytes.extend_from_slice(b"%PDF-1.7\n");
+
+    let catalog_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+    let xref_offset = bytes.len();
+
+    bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{pages_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+
+    (bytes, catalog_offset, pages_offset)
+}
+
+#[test]
+fn canonical_header_search_rejects_a_candidate_starting_at_byte_1024() {
+    let (fixture, catalog_offset, pages_offset) = pdf_with_header_outside_search_window();
+    let directory = tempfile::tempdir().expect("create qpdf fixture directory");
+    let input = directory.path().join("header-outside-search-window.pdf");
+    fs::write(&input, &fixture).expect("write qpdf fixture");
+    let description = input.to_string_lossy().into_owned();
+
+    let qpdf = Command::new("qpdf")
+        .args(["--warning-exit-0", "--show-xref"])
+        .arg(&input)
+        .output()
+        .expect("qpdf 11.9.0 should spawn");
+    assert!(
+        qpdf.status.success(),
+        "qpdf should continue after warning about the out-of-window header: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    let qpdf_warnings: Vec<String> = String::from_utf8_lossy(&qpdf.stderr)
+        .lines()
+        .filter_map(|line| line.strip_prefix("WARNING: "))
+        .map(str::to_owned)
+        .collect();
+    assert!(qpdf_warnings
+        .iter()
+        .any(|warning| { warning == &format!("{description}: can't find PDF header") }));
+    let qpdf_rows: Vec<String> = String::from_utf8_lossy(&qpdf.stdout)
+        .lines()
+        .filter(|line| line.contains(": uncompressed;") || line.contains(": compressed;"))
+        .map(str::to_owned)
+        .collect();
+
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(fixture),
+        PdfOpenOptions {
+            repair: false,
+            suppress_warnings: true,
+            description: description.as_bytes().to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("a valid xref remains readable after qpdf's missing-header warning");
+    assert_eq!(pdf.version(), "1.2");
+    assert_eq!(pdf.root_ref(), Some(ObjectRef::new(1, 0)));
+    pdf.root_handle()
+        .expect("the physical /Root must resolve when the header is out of range");
+    let warnings: Vec<String> = pdf
+        .repair_diagnostics()
+        .entries()
+        .iter()
+        .map(|warning| String::from_utf8_lossy(warning.what_bytes()).into_owned())
+        .collect();
+    assert_eq!(warnings, qpdf_warnings);
+
+    let rendered = render_xref_table(&pdf.get_xref_table());
+    assert!(rendered.contains(&format!("1/0: uncompressed; offset = {catalog_offset}")));
+    assert!(rendered.contains(&format!("2/0: uncompressed; offset = {pages_offset}")));
+    assert_eq!(rendered, qpdf_rows);
+}
+
+fn pdf_with_a_long_header_line() -> (Vec<u8>, usize, usize) {
+    const COMMENT_BYTES: usize = 12 * 1024;
+    let mut bytes = b"%PDF-1.7".to_vec();
+    bytes.extend(std::iter::repeat_n(b'x', COMMENT_BYTES));
+
+    let catalog_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+    let xref_offset = bytes.len();
+
+    bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{pages_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+
+    (bytes, catalog_offset, pages_offset)
+}
+
+#[test]
+fn canonical_header_reader_skips_a_line_longer_than_10k_like_qpdf() {
+    let (fixture, catalog_offset, pages_offset) = pdf_with_a_long_header_line();
+    let directory = tempfile::tempdir().expect("create qpdf fixture directory");
+    let input = directory.path().join("long-pdf-header-line.pdf");
+    fs::write(&input, &fixture).expect("write qpdf fixture");
+    let description = input.to_string_lossy().into_owned();
+
+    let qpdf = Command::new("qpdf")
+        .arg("--show-xref")
+        .arg(&input)
+        .output()
+        .expect("qpdf 11.9.0 should spawn");
+    assert_eq!(
+        qpdf.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    let qpdf_rows: Vec<String> = String::from_utf8_lossy(&qpdf.stdout)
+        .lines()
+        .filter(|line| line.contains(": uncompressed;") || line.contains(": compressed;"))
+        .map(str::to_owned)
+        .collect();
+
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(fixture),
+        PdfOpenOptions {
+            repair: false,
+            suppress_warnings: true,
+            description: description.as_bytes().to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("the live header reader must scan to the line ending");
+    assert_eq!(pdf.version(), "1.7");
+    assert_eq!(pdf.root_ref(), Some(ObjectRef::new(1, 0)));
+    pdf.root_handle().expect("the /Root remains resolvable");
+    let rendered = render_xref_table(&pdf.get_xref_table());
+    assert!(rendered.contains(&format!("1/0: uncompressed; offset = {catalog_offset}")));
+    assert!(rendered.contains(&format!("2/0: uncompressed; offset = {pages_offset}")));
+    assert_eq!(rendered, qpdf_rows);
+    assert!(pdf.repair_diagnostics().entries().is_empty());
+}
+
+#[test]
+fn canonical_header_reader_consumes_eol_and_eof_like_qpdf() {
+    let directory = tempfile::tempdir().expect("create qpdf fixture directory");
+    for (name, fixture) in [
+        ("header-line-crlf-at-eof.pdf", b"%PDF-1.7\r\n".as_slice()),
+        (
+            "header-line-unterminated-at-eof.pdf",
+            b"%PDF-1.7".as_slice(),
+        ),
+    ] {
+        let input = directory.path().join(name);
+        fs::write(&input, fixture).expect("write qpdf fixture");
+        let description = input.to_string_lossy().into_owned();
+
+        let qpdf = Command::new("qpdf")
+            .arg("--show-xref")
+            .arg(&input)
+            .output()
+            .expect("qpdf 11.9.0 should spawn");
+        assert_eq!(qpdf.status.code(), Some(2));
+        let qpdf_warnings: Vec<String> = String::from_utf8_lossy(&qpdf.stderr)
+            .lines()
+            .filter_map(|line| line.strip_prefix("WARNING: "))
+            .map(str::to_owned)
+            .collect();
+
+        let result = Pdf::open_with_options(
+            Cursor::new(fixture),
+            PdfOpenOptions {
+                repair: true,
+                suppress_warnings: true,
+                description: description.as_bytes().to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        );
+        let error = match result {
+            Ok(_) => panic!("qpdf cannot recover a header-only source"),
+            Err(error) => error,
+        };
+        let (_, diagnostics) = error
+            .open_failure()
+            .expect("recovery failure must retain qpdf's preceding warnings");
+        let warnings: Vec<String> = diagnostics
+            .entries()
+            .iter()
+            .map(|warning| String::from_utf8_lossy(warning.what_bytes()).into_owned())
+            .collect();
+        assert_eq!(warnings, qpdf_warnings);
+        assert!(qpdf_warnings
+            .iter()
+            .all(|warning| !warning.contains("can't find PDF header")));
+        assert!(String::from_utf8_lossy(&qpdf.stderr)
+            .contains("unable to find trailer dictionary while recovering damaged file"));
+        assert!(error
+            .to_string()
+            .contains("unable to find trailer dictionary while recovering damaged file"));
+    }
+}
+
+#[test]
+fn canonical_header_search_handles_a_source_shorter_than_the_marker_like_qpdf() {
+    let fixture = b"x".to_vec();
+    let directory = tempfile::tempdir().expect("create qpdf fixture directory");
+    let input = directory.path().join("short-header-search-input.pdf");
+    fs::write(&input, &fixture).expect("write qpdf fixture");
+    let description = input.to_string_lossy().into_owned();
+
+    let qpdf = Command::new("qpdf")
+        .arg("--show-xref")
+        .arg(&input)
+        .output()
+        .expect("qpdf 11.9.0 should spawn");
+    assert_eq!(qpdf.status.code(), Some(2));
+    let qpdf_warnings: Vec<String> = String::from_utf8_lossy(&qpdf.stderr)
+        .lines()
+        .filter_map(|line| line.strip_prefix("WARNING: "))
+        .map(str::to_owned)
+        .collect();
+    let warnings = canonical_open_warnings(fixture, &description);
+    assert_eq!(warnings, qpdf_warnings);
+    assert!(qpdf_warnings
+        .iter()
+        .any(|warning| warning == &format!("{description}: can't find PDF header")));
+}
+
+#[test]
+fn canonical_header_search_rejects_an_incomplete_marker_at_eof_like_qpdf() {
+    let mut fixture = vec![b'x'; 1019];
+    fixture.extend_from_slice(b"%PDF");
+    let directory = tempfile::tempdir().expect("create qpdf fixture directory");
+    let input = directory.path().join("incomplete-header-marker.pdf");
+    fs::write(&input, &fixture).expect("write qpdf fixture");
+    let description = input.to_string_lossy().into_owned();
+
+    let qpdf = Command::new("qpdf")
+        .arg("--show-xref")
+        .arg(&input)
+        .output()
+        .expect("qpdf 11.9.0 should spawn");
+    assert_eq!(qpdf.status.code(), Some(2));
+    let qpdf_warnings: Vec<String> = String::from_utf8_lossy(&qpdf.stderr)
+        .lines()
+        .filter_map(|line| line.strip_prefix("WARNING: "))
+        .map(str::to_owned)
+        .collect();
+    let warnings = canonical_open_warnings(fixture, &description);
+    assert_eq!(warnings, qpdf_warnings);
+    assert!(qpdf_warnings
+        .iter()
+        .any(|warning| warning == &format!("{description}: can't find PDF header")));
+}
+
+struct HeaderReadFailure {
+    cursor: Cursor<Vec<u8>>,
+}
+
+impl std::io::Read for HeaderReadFailure {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        Err(std::io::Error::other("synthetic header read failure"))
+    }
+}
+
+impl std::io::Seek for HeaderReadFailure {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        std::io::Seek::seek(&mut self.cursor, position)
+    }
+}
+
+#[test]
+fn initial_header_read_error_retains_qpdf_system_exception_context() {
+    let result = Pdf::open_with_options(
+        HeaderReadFailure {
+            cursor: Cursor::new(Vec::new()),
+        },
+        PdfOpenOptions {
+            description: b"header-read.pdf".to_vec(),
+            repair: false,
+            ..PdfOpenOptions::default()
+        },
+    );
+    let error = match result {
+        Ok(_) => panic!("the source read failure must propagate"),
+        Err(error) => error,
+    };
+    let flpdf::Error::QpdfExc(error) = error else {
+        panic!("FileInputSource read failures are QPDFExc system errors: {error:?}");
+    };
+    assert_eq!(error.get_error_code(), flpdf::QpdfErrorCode::System);
+    assert_eq!(error.get_filename(), b"header-read.pdf");
+    assert_eq!(error.get_object(), b"");
+    assert_eq!(error.get_file_position(), 0);
+    assert_eq!(error.get_message_detail(), b"read 1024 bytes");
+}
+
 /// qpdf's `QPDF::readTrailer` parses the trailer from the live source with no
 /// 64 KiB window (`QPDF.cc:565-570,1312-1328`).
 fn recovery_trailer_with_large_padding() -> (Vec<u8>, usize, usize) {

@@ -217,6 +217,14 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
         Ok(())
     }
 
+    fn seek_end(&self) -> Result<u64> {
+        Ok(self
+            .active_reader()?
+            .borrow_mut()
+            .seek(SeekFrom::End(0))?
+            .saturating_sub(self.header_offset.get() as u64))
+    }
+
     pub(crate) fn tell(&self) -> Result<u64> {
         Ok(self
             .active_reader()?
@@ -583,6 +591,10 @@ impl<R: Read + Seek> ResolverCore<R> {
     /// in qpdf-logical coordinates and never sees the physical position.
     fn seek(&mut self, offset: u64) -> Result<()> {
         self.input.borrow().seek(offset)
+    }
+
+    fn seek_end(&mut self) -> Result<u64> {
+        self.input.borrow().seek_end()
     }
 
     /// The input source's current qpdf-logical position.
@@ -3275,6 +3287,16 @@ impl<R: Read + Seek> ResolverHandle<R> {
         result
     }
 
+    /// Seek qpdf's current input to EOF and return its logical position, as
+    /// `QPDF::parse` does before searching the tail for `startxref`.
+    pub(crate) fn seek_end(&self) -> Result<u64> {
+        let result = self.core.borrow_mut().seek_end();
+        if result.is_ok() {
+            self.bump_input_generation();
+        }
+        result
+    }
+
     /// See [`ResolverCore::seek_relative`].
     fn seek_relative(&self, delta: u64) -> Result<()> {
         let result = self.core.borrow_mut().seek_relative(delta);
@@ -3426,7 +3448,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
     pub(crate) fn set_header_offset(&self, offset: usize) {
         let mut core = self.core.borrow_mut();
         core.header_offset = offset;
-        core.input.borrow().header_offset.set(offset);
+        let input = core.input.borrow();
+        input.header_offset.set(offset);
+        // qpdf replaces its source with a fresh OffsetInputSource when a
+        // nonzero header is accepted; that wrapper's last_offset starts at 0.
+        if offset != 0 {
+            input.last_offset.set(0);
+        }
     }
 
     /// Merge a valid `ObjectRef` projection into the owner-held source table.
