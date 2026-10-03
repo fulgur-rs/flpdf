@@ -111,6 +111,78 @@ fn first_objstm_container_number(bytes: &[u8]) -> Option<u32> {
         .ok()
 }
 
+/// qpdf's `QPDFWriter::generateObjectStreams` inserts a null placeholder into
+/// the writer's source QPDF, and `getRenumberedObjGen` reports the output
+/// identity assigned to that source object after a linearized Generate write.
+#[test]
+fn linearized_generate_reports_renumbered_identity_for_generated_objstm_source() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let mut pdf = Pdf::open_mem_owned(std::fs::read(path).expect("read one-page fixture"))
+        .expect("open one-page fixture in memory");
+    let max_source = canonical_object_refs(&mut pdf)
+        .into_iter()
+        .map(|object_ref| object_ref.number)
+        .max()
+        .expect("one-page fixture has source objects");
+    let generated_source = ObjectRef::new(max_source + 1, 0);
+    assert_eq!(generated_source, ObjectRef::new(8, 0));
+
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_output_memory().expect("select memory output");
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    writer.set_linearization(true);
+    writer.write().expect("write linearized Generate PDF");
+
+    assert_eq!(
+        writer
+            .get_renumbered_obj_gen(generated_source)
+            .expect("query generated source renumbering"),
+        Some(ObjectRef::new(8, 0)),
+        "qpdf 11.9.0 maps generated source ObjGen 8 0 to output ObjGen 8 0"
+    );
+}
+
+/// qpdf's two generated placeholders can route to different linearized halves.
+/// Keep each source identity paired with its own emitted container even though
+/// object-number order is reversed by the part layout.
+#[test]
+fn linearized_generate_keeps_generated_source_mapping_across_parts() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/objstm-lin-threepage-2-120.pdf");
+    let mut pdf = Pdf::open_mem_owned(std::fs::read(path).expect("read multi-container fixture"))
+        .expect("open multi-container fixture in memory");
+    let max_source = canonical_object_refs(&mut pdf)
+        .into_iter()
+        .map(|object_ref| object_ref.number)
+        .max()
+        .expect("fixture has source objects");
+    assert_eq!(max_source, 131);
+    let first_generated_source = ObjectRef::new(max_source + 1, 0);
+    let second_generated_source = ObjectRef::new(max_source + 2, 0);
+
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_output_memory().expect("select memory output");
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    writer.set_linearization(true);
+    writer.write().expect("write linearized Generate PDF");
+
+    assert_eq!(
+        writer
+            .get_renumbered_obj_gen(first_generated_source)
+            .expect("query first generated source"),
+        Some(ObjectRef::new(76, 0)),
+        "qpdf 11.9.0 maps generated source ObjGen 132 0 to output ObjGen 76 0"
+    );
+    assert_eq!(
+        writer
+            .get_renumbered_obj_gen(second_generated_source)
+            .expect("query second generated source"),
+        Some(ObjectRef::new(5, 0)),
+        "qpdf 11.9.0 maps generated source ObjGen 133 0 to output ObjGen 5 0"
+    );
+}
+
 /// The first-half (Part-3) ObjStm container holding the first-page shared dicts
 /// (plus the `/Pages` tree and `/Info`) must be emitted BEFORE `/E`, and the
 /// document round-trips (every object, including compressed members, resolves).

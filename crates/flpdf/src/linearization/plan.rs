@@ -3435,6 +3435,21 @@ pub(crate) struct ObjStmBatchPlan {
     pub(crate) part4_batches: Vec<RoutedObjStmBatch>,
 }
 
+/// A surviving linearized Generate batch paired with the null-placeholder
+/// source ObjGen created for that same global even-split batch during qpdf
+/// writer setup. Empty batches are removed together with their source identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GeneratedObjStmBatch {
+    pub(crate) source: Option<ObjectRef>,
+    pub(crate) members: Vec<ObjectRef>,
+}
+
+impl AsRef<[ObjectRef]> for GeneratedObjStmBatch {
+    fn as_ref(&self) -> &[ObjectRef] {
+        &self.members
+    }
+}
+
 impl LinearizationPlan {
     /// Build a Part-tagged ObjStm packing plan from this `LinearizationPlan`.
     ///
@@ -3475,6 +3490,7 @@ impl LinearizationPlan {
         &self,
         pdf: &mut Pdf<R>,
         config: &PlannerConfig,
+        generated_object_stream_sources: &[ObjectRef],
     ) -> crate::Result<ObjStmBatchPlan> {
         if config.mode == ObjectStreamMode::Disable {
             return Ok(ObjStmBatchPlan::default());
@@ -3507,7 +3523,14 @@ impl LinearizationPlan {
                 // erased and `/Info` / the `/Pages` tree kept as ordinary
                 // members. That membership is already qpdf-canonical, so no
                 // post-packing reshape is applied.
-                self.objstm_batches_generate(pdf, config, &ctx, &length_exclusions, optimization)?
+                self.objstm_batches_generate(
+                    pdf,
+                    config,
+                    &ctx,
+                    &length_exclusions,
+                    optimization,
+                    generated_object_stream_sources,
+                )? // cov:ignore: LLVM attributes this Generate call's success terminator to the arm opening; both public generated-source regressions exercise the forwarded list.
             }
             ObjectStreamMode::Preserve => {
                 self.objstm_batches_preserve(pdf, config, &ctx, &length_exclusions, optimization)?
@@ -3546,6 +3569,7 @@ impl LinearizationPlan {
         _ctx: &crate::writer::object_streams::EligibilityContext,
         _length_exclusions: &BTreeSet<ObjectRef>,
         optimization: &crate::optimization::Optimization,
+        generated_object_stream_sources: &[ObjectRef],
     ) -> crate::Result<ObjStmBatchPlan> {
         // `objstm_membership_linearized` filters its containers to the plan's
         // renumber-assigned set BEFORE the even split, so a trailer-only ref with
@@ -3560,6 +3584,7 @@ impl LinearizationPlan {
             pdf,
             &assigned,
             optimization.generate_objstm_eligible(),
+            generated_object_stream_sources,
         )?; // cov:ignore: closing line of a multi-line call; llvm-cov misattributes the hit count to the previous line, not an untested branch
         let routes = route_objstm_containers(
             optimization,
@@ -3590,12 +3615,15 @@ impl LinearizationPlan {
         let mut part4_private: Vec<RoutedObjStmBatch> = Vec::new();
         let mut part4_shared: Vec<RoutedObjStmBatch> = Vec::new();
         let mut part4_rest: Vec<RoutedObjStmBatch> = Vec::new();
-        for (mut members, route) in containers.into_iter().zip(routes) {
+        for (batch, route) in containers.into_iter().zip(routes) {
+            let generated_source = batch.source;
+            let mut members = batch.members;
             members.sort_unstable_by_key(|r| pdf.writer_object_order_key(*r));
             push_routed_objstm_batch(
                 members,
                 route,
                 None,
+                generated_source,
                 &mut open_document_batches,
                 &mut part3_private,
                 &mut part3_shared,
@@ -3736,6 +3764,7 @@ impl LinearizationPlan {
                 members,
                 route,
                 Some(source_container_number),
+                None,
                 &mut open_document_batches,
                 &mut part3_private,
                 &mut part3_shared,
@@ -3837,6 +3866,10 @@ pub(crate) struct RoutedObjStmBatch {
     /// Original ObjStm object number in Preserve mode. Generate mode creates a
     /// fresh container after the source objects, so it uses `None`.
     pub(crate) source_container_number: Option<u32>,
+    /// qpdf's generated null-placeholder source identity for a Generate batch.
+    /// This survives linearization routing so the writer result can preserve
+    /// `getRenumberedObjGen`'s source-to-output mapping.
+    pub(crate) generated_source: Option<ObjectRef>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3844,6 +3877,7 @@ fn push_routed_objstm_batch(
     members: Vec<ObjectRef>,
     route: ContainerPart,
     source_container_number: Option<u32>,
+    generated_source: Option<ObjectRef>,
     open_document_batches: &mut Vec<RoutedObjStmBatch>,
     part3_private: &mut Vec<RoutedObjStmBatch>,
     part3_shared: &mut Vec<RoutedObjStmBatch>,
@@ -3857,36 +3891,43 @@ fn push_routed_objstm_batch(
             members,
             route,
             source_container_number,
+            generated_source,
         }),
         ContainerPart::FirstPagePrivate => part3_private.push(RoutedObjStmBatch {
             members,
             route,
             source_container_number,
+            generated_source,
         }),
         ContainerPart::FirstPageShared => part3_shared.push(RoutedObjStmBatch {
             members,
             route,
             source_container_number,
+            generated_source,
         }),
         ContainerPart::FirstPageOutlines => part3_outlines.push(RoutedObjStmBatch {
             members,
             route,
             source_container_number,
+            generated_source,
         }),
         ContainerPart::OtherPagePrivate => part4_private.push(RoutedObjStmBatch {
             members,
             route,
             source_container_number,
+            generated_source,
         }),
         ContainerPart::OtherPageShared => part4_shared.push(RoutedObjStmBatch {
             members,
             route,
             source_container_number,
+            generated_source,
         }),
         ContainerPart::Rest => part4_rest.push(RoutedObjStmBatch {
             members,
             route,
             source_container_number,
+            generated_source,
         }),
     }
 }
@@ -3932,7 +3973,8 @@ pub(crate) fn objstm_membership_linearized_with_eligibility<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     assigned: &BTreeSet<ObjectRef>,
     eligibility_override: Option<&[ObjectRef]>,
-) -> crate::Result<Vec<Vec<ObjectRef>>> {
+    generated_object_stream_sources: &[ObjectRef],
+) -> crate::Result<Vec<GeneratedObjStmBatch>> {
     // qpdf's DFS already preserves the indirect identity of null-resolving
     // references reached from arrays. Do not append `resurrectable_null_refs`
     // here: that set remains a planner/all-refs aid, and appending it would give
@@ -3952,10 +3994,13 @@ pub(crate) fn objstm_membership_linearized_with_eligibility<R: Read + Seek>(
     }
     let mut streams = crate::writer::object_streams::even_split_into_streams(&eligible);
 
-    // qpdf's setup removes every page dictionary and the Catalog after
-    // membership is selected. Keep that exclusion in the shared writer owner
-    // used by specialized Preserve so Generate and Preserve cannot drift.
-    let mut source_containers = vec![None; streams.len()];
+    // Keep qpdf's setup-time null-placeholder identity paired with the same
+    // global even-split batch while the later linearized exclusions drop page
+    // and Catalog members. The surviving batch may then be routed by linearized
+    // part without losing the source ObjGen used by getRenumberedObjGen.
+    let mut source_containers: Vec<Option<ObjectRef>> = (0..streams.len())
+        .map(|index| generated_object_stream_sources.get(index).copied())
+        .collect();
     crate::writer::object_streams::filter_objstm_batches_for_output(
         pdf,
         &mut streams,
@@ -3963,7 +4008,11 @@ pub(crate) fn objstm_membership_linearized_with_eligibility<R: Read + Seek>(
         true,
         false,
     )?; // cov:ignore: LLVM attributes this covered multiline exclusion terminator to the call setup
-    Ok(streams)
+    Ok(streams
+        .into_iter()
+        .zip(source_containers)
+        .map(|(members, source)| GeneratedObjStmBatch { source, members })
+        .collect())
 }
 
 /// Catalog keys qpdf treats as `open_document_keys` in
@@ -4170,15 +4219,15 @@ fn outlines_in_first_page_predicate<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::
 /// with `objstm-lin-openaction-multi-od` (two OD containers whose min-member
 /// numbers are non-ascending in DFS order).
 ///
-pub(crate) fn route_objstm_containers(
+pub(crate) fn route_objstm_containers<T: AsRef<[ObjectRef]>>(
     optimization: &crate::optimization::Optimization,
     outlines_in_first_page: bool,
-    containers: &[Vec<ObjectRef>],
+    containers: &[T],
 ) -> Vec<ContainerPart> {
     containers
         .iter()
-        .map(|members| {
-            let users = optimization.users_for_members(members.iter());
+        .map(|container| {
+            let users = optimization.users_for_members(container.as_ref().iter());
             classify_container_users(&users, outlines_in_first_page)
         })
         .collect()
@@ -4444,7 +4493,7 @@ mod tests {
         let setup_calls = crate::writer::object_streams::compressible_plan_call_count();
 
         let _ = plan
-            .objstm_batches(&mut pdf, &super::PlannerConfig::default())
+            .objstm_batches(&mut pdf, &super::PlannerConfig::default(), &[])
             .expect("build Preserve ObjStm batches");
 
         assert_eq!(
