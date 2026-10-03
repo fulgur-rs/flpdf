@@ -109,4 +109,5 @@ fn linearized_generate_accepts_502_programmatic_direct_array_levels() {
     let output = writer.get_buffer().expect("completed write retains output");
     assert!(output.starts_with(b"%PDF-"));
     assert!(output.len() > 3_000);
+    assert_eq!(serialized_deep_value_depth(&output), 502);
 }
