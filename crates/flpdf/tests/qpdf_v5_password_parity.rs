@@ -130,7 +130,146 @@ fn zero_hex_dictionary_string(bytes: &mut [u8], key: &str) {
     assert_eq!(digits, 64, "/{key} should contain 32 bytes");
 }
 
+fn shorten_hex_dictionary_string(bytes: &mut [u8], key: &str, byte_length: usize) {
+    let marker = format!("/{key} <");
+    let marker = marker.as_bytes();
+    let start = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .unwrap_or_else(|| panic!("PDF is missing {key} hex string"));
+    let hex_start = start + marker.len();
+    let hex_end = hex_start
+        + bytes[hex_start..]
+            .iter()
+            .position(|byte| *byte == b'>')
+            .unwrap_or_else(|| panic!("PDF has unterminated {key} hex string"));
+    let mut digits = 0;
+    for byte in &mut bytes[hex_start..hex_end] {
+        if byte.is_ascii_hexdigit() {
+            digits += 1;
+            if digits > byte_length * 2 {
+                *byte = b' ';
+            }
+        } else {
+            assert!(byte.is_ascii_whitespace(), "unexpected byte in /{key}");
+        }
+    }
+    assert!(byte_length * 2 < digits, "/{key} must be shortened");
+    assert_eq!(digits % 2, 0, "/{key} must contain whole bytes");
+}
+
+fn append_hex_dictionary_bytes_and_reindex_xref(
+    bytes: &[u8],
+    key: &str,
+    appended_hex: &[u8],
+) -> Vec<u8> {
+    assert!(!appended_hex.is_empty() && appended_hex.len().is_multiple_of(2));
+    assert!(appended_hex.iter().all(u8::is_ascii_hexdigit));
+    let marker = format!("/{key} <");
+    let marker = marker.as_bytes();
+    let start = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .unwrap_or_else(|| panic!("PDF is missing {key} hex string"));
+    let hex_start = start + marker.len();
+    let hex_end = hex_start
+        + bytes[hex_start..]
+            .iter()
+            .position(|byte| *byte == b'>')
+            .unwrap_or_else(|| panic!("PDF has unterminated {key} hex string"));
+
+    let startxref_marker = b"startxref\n";
+    let startxref_start = bytes
+        .windows(startxref_marker.len())
+        .rposition(|window| window == startxref_marker)
+        .unwrap_or_else(|| panic!("PDF is missing startxref"))
+        + startxref_marker.len();
+    let startxref_end = startxref_start
+        + bytes[startxref_start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or_else(|| panic!("PDF has unterminated startxref"));
+    let old_xref_offset = std::str::from_utf8(&bytes[startxref_start..startxref_end])
+        .expect("startxref is ASCII")
+        .parse::<usize>()
+        .expect("startxref is an offset");
+    assert!(bytes[old_xref_offset..].starts_with(b"xref\n"));
+
+    let insertion_offset = hex_end;
+    let delta = appended_hex.len();
+    let mut output = Vec::with_capacity(bytes.len() + delta);
+    output.extend_from_slice(&bytes[..hex_end]);
+    output.extend_from_slice(appended_hex);
+    output.extend_from_slice(&bytes[hex_end..]);
+
+    let xref = &bytes[old_xref_offset..];
+    let mut line_start = 0;
+    let mut remaining_entries = 0;
+    let mut saw_xref = false;
+    for line in xref.split_inclusive(|byte| *byte == b'\n') {
+        let trimmed = line.trim_ascii();
+        if !saw_xref {
+            assert_eq!(trimmed, b"xref");
+            saw_xref = true;
+        } else if trimmed.starts_with(b"trailer") {
+            break;
+        } else if remaining_entries == 0 {
+            let fields: Vec<_> = trimmed
+                .split(|byte| byte.is_ascii_whitespace())
+                .filter(|field| !field.is_empty())
+                .collect();
+            assert_eq!(fields.len(), 2, "expected an xref subsection header");
+            remaining_entries = std::str::from_utf8(fields[1])
+                .expect("xref count is ASCII")
+                .parse::<usize>()
+                .expect("xref count is an integer");
+        } else {
+            let fields: Vec<_> = trimmed
+                .split(|byte| byte.is_ascii_whitespace())
+                .filter(|field| !field.is_empty())
+                .collect();
+            assert_eq!(fields.len(), 3, "expected an xref entry");
+            if fields[2] == b"n" {
+                let old_offset = std::str::from_utf8(fields[0])
+                    .expect("xref offset is ASCII")
+                    .parse::<usize>()
+                    .expect("xref offset is an integer");
+                if old_offset > insertion_offset {
+                    let new_offset = old_offset + delta;
+                    let encoded = format!("{new_offset:010}");
+                    assert_eq!(encoded.len(), 10, "xref offset must fit its field");
+                    let output_entry_start = old_xref_offset + delta + line_start;
+                    output[output_entry_start..output_entry_start + 10]
+                        .copy_from_slice(encoded.as_bytes());
+                }
+            }
+            remaining_entries -= 1;
+        }
+        line_start += line.len();
+    }
+    assert!(saw_xref && remaining_entries == 0);
+
+    let adjusted_xref_offset = old_xref_offset + delta;
+    let encoded_xref_offset = adjusted_xref_offset.to_string();
+    assert_eq!(
+        encoded_xref_offset.len(),
+        startxref_end - startxref_start,
+        "startxref offset must fit its existing field"
+    );
+    output[startxref_start + delta..startxref_end + delta]
+        .copy_from_slice(encoded_xref_offset.as_bytes());
+    output
+}
+
 fn qpdf_file_key_and_encryption_report(path: &Path, password: &[u8]) -> (Vec<u8>, String) {
+    qpdf_file_key_and_encryption_report_with_exit_codes(path, password, &[0])
+}
+
+fn qpdf_file_key_and_encryption_report_with_exit_codes(
+    path: &Path,
+    password: &[u8],
+    exit_codes: &[i32],
+) -> (Vec<u8>, String) {
     let password = String::from_utf8(password.to_vec()).expect("test password is ASCII");
     let output = Command::new("qpdf")
         .arg(format!("--password={password}"))
@@ -140,7 +279,10 @@ fn qpdf_file_key_and_encryption_report(path: &Path, password: &[u8]) -> (Vec<u8>
         .output()
         .expect("run qpdf encryption inspection");
     assert!(
-        output.status.success(),
+        output
+            .status
+            .code()
+            .is_some_and(|code| exit_codes.contains(&code)),
         "qpdf encryption inspection failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
@@ -306,6 +448,111 @@ fn v5_owner_key_precedes_user_key_when_both_passwords_match() {
             Some(expected_key.as_slice()),
             "{suffix} must recover /OE before /UE when the same password validates both entries"
         );
+    }
+}
+
+#[test]
+fn v5_encryption_parameter_lengths_match_qpdf_padding_and_prefix_use() {
+    if !qpdf_available() {
+        eprintln!(
+            "qpdf {EXPECTED_QPDF_VERSION} not available; skipping V=5 parameter length parity test"
+        );
+        return;
+    }
+
+    let input = minimal_fixture();
+    let directory = tempfile::tempdir().expect("create parameter-length directory");
+    let input_path = write_bytes(directory.path(), "input.pdf", &input);
+
+    for r5 in [true, false] {
+        let suffix = if r5 { "r5" } else { "r6" };
+        let original_path = directory.path().join(format!("{suffix}-original.pdf"));
+        write_qpdf_encrypted_with_passwords(&input_path, &original_path, "user", "owner", r5);
+        let original = fs::read(&original_path).expect("read qpdf encrypted fixture");
+
+        if r5 {
+            for (key, password, target_length) in [
+                ("U", b"user".as_slice(), 40),
+                ("O", b"owner".as_slice(), 40),
+                ("UE", b"user".as_slice(), 31),
+                ("OE", b"owner".as_slice(), 31),
+            ] {
+                let mut candidate = original.clone();
+                shorten_hex_dictionary_string(&mut candidate, key, target_length);
+                let candidate_path = write_bytes(
+                    directory.path(),
+                    &format!("{suffix}-short-{key}.pdf"),
+                    &candidate,
+                );
+                let (expected_key, qpdf_report) =
+                    qpdf_file_key_and_encryption_report_with_exit_codes(
+                        &candidate_path,
+                        password,
+                        &[0, 3],
+                    );
+                let role = if key == "O" || key == "OE" {
+                    "owner password"
+                } else {
+                    "user password"
+                };
+                assert!(
+                    qpdf_report.contains(&format!("Supplied password is {role}")),
+                    "qpdf must authenticate the {role} for short /{key}:\n{qpdf_report}"
+                );
+                let pdf = Pdf::open_with_options(
+                    Cursor::new(candidate),
+                    PdfOpenOptions {
+                        password: password.to_vec(),
+                        ..PdfOpenOptions::default()
+                    },
+                )
+                .unwrap_or_else(|error| {
+                    panic!("flpdf should accept qpdf's NUL-padded short /{key}: {error}")
+                });
+                assert_eq!(
+                    pdf.encryption_file_key().as_deref(),
+                    Some(expected_key.as_slice()),
+                    "{suffix} short /{key} must use the same padded material as qpdf"
+                );
+            }
+        }
+
+        for (key, password, appended_hex) in [
+            ("UE", b"user".as_slice(), b"a5".as_slice()),
+            ("OE", b"owner".as_slice(), b"5a".as_slice()),
+        ] {
+            let candidate =
+                append_hex_dictionary_bytes_and_reindex_xref(&original, key, appended_hex);
+            let candidate_path = write_bytes(
+                directory.path(),
+                &format!("{suffix}-long-{key}.pdf"),
+                &candidate,
+            );
+            let (expected_key, qpdf_report) =
+                qpdf_file_key_and_encryption_report(&candidate_path, password);
+            let role = if key == "OE" {
+                "owner password"
+            } else {
+                "user password"
+            };
+            assert!(
+                qpdf_report.contains(&format!("Supplied password is {role}")),
+                "qpdf must authenticate the {role} for long /{key}:\n{qpdf_report}"
+            );
+            let pdf = Pdf::open_with_options(
+                Cursor::new(candidate),
+                PdfOpenOptions {
+                    password: password.to_vec(),
+                    ..PdfOpenOptions::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("flpdf should use the qpdf /{key} prefix: {error}"));
+            assert_eq!(
+                pdf.encryption_file_key().as_deref(),
+                Some(expected_key.as_slice()),
+                "{suffix} long /{key} must use the same prefix as qpdf"
+            );
+        }
     }
 }
 

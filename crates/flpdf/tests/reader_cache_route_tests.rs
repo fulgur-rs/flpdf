@@ -60,7 +60,7 @@ fn encryption_state_production_route_uses_handle_values() {
         ),
         (
             "fn standard_handler_r5_inputs_from_handle",
-            "fn map_uo_length_to_bad_password",
+            "fn decode_hex_file_key",
         ),
         (
             "fn required_integer_from_handle",
@@ -79,4 +79,5 @@ fn encryption_state_production_route_uses_handle_values() {
         assert!(!function.contains("Object::"));
         assert!(!function.contains("materialize"));
     }
+    assert!(!source.contains("map_uo_length_to_bad_password"));
 }
