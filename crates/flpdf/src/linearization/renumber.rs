@@ -159,13 +159,6 @@ pub struct ObjStmRelocation {
     pub container_numbers: Vec<u32>,
 }
 
-impl ObjStmRelocation {
-    /// `true` when no relocation happened (no ObjStm batches).
-    pub fn is_empty(&self) -> bool {
-        self.first_xref_slot == 0 && self.main_xref_slot == 0
-    }
-}
-
 impl RenumberMap {
     // -----------------------------------------------------------------------
     // Construction
@@ -650,7 +643,8 @@ impl RenumberMap {
     /// `None` if the number is out of range, points at a sentinel slot
     /// (slot 0, param dict, or hint stream), or carries a non-zero
     /// generation (renumbered objects are always at generation 0).
-    pub fn original_for_new(&self, new: ObjectRef) -> Option<ObjectRef> {
+    #[cfg(test)]
+    pub(crate) fn original_for_new(&self, new: ObjectRef) -> Option<ObjectRef> {
         if new.generation != 0 {
             return None;
         }
@@ -694,11 +688,6 @@ impl RenumberMap {
         // by_new_number has slots 0..N; slot 0 is unused, so the highest
         // allocated number is by_new_number.len() - 1.
         self.by_new_number.len() - 1
-    }
-
-    /// `true` if no plan objects were mapped (only reservations exist).
-    pub fn is_empty(&self) -> bool {
-        self.by_original.is_empty()
     }
 
     /// Returns `true` when the param-dict slot still holds its sentinel.
@@ -1477,7 +1466,6 @@ mod tests {
         LinearizationPlan {
             part2_objects: vec![ObjectRef::new(3, 0), ObjectRef::new(2, 0)],
             part4_rest: vec![ObjectRef::new(1, 0)],
-            total_object_count: 3,
             root_ref: Some(ObjectRef::new(1, 0)),
             page_hints: vec![PageHintEntry::placeholder(ObjectRef::new(3, 0))],
             ..Default::default()
@@ -1508,7 +1496,6 @@ mod tests {
             part3_objects: vec![ObjectRef::new(5, 0), ObjectRef::new(8, 0)],
             part4_other_pages_private: vec![ObjectRef::new(4, 0), ObjectRef::new(7, 0)],
             part4_rest: vec![ObjectRef::new(1, 0), ObjectRef::new(2, 0)],
-            total_object_count: 8,
             root_ref: Some(ObjectRef::new(1, 0)),
             ..Default::default()
         }
@@ -1836,7 +1823,6 @@ mod tests {
         let plan = LinearizationPlan {
             part2_objects: vec![ObjectRef::new(2, 0)],
             part4_rest: vec![catalog_ref, info_ref, pages_ref, other_part4],
-            total_object_count: 5,
             root_ref: Some(catalog_ref),
             pages_tree_ref: Some(pages_ref),
             info_ref: Some(info_ref),
@@ -1875,7 +1861,6 @@ mod tests {
         let plan = LinearizationPlan {
             part2_objects: vec![ObjectRef::new(2, 0)],
             part4_rest: vec![font_ref, pages_ref, info_ref],
-            total_object_count: 4,
             pages_tree_ref: Some(pages_ref),
             info_ref: Some(info_ref),
             ..Default::default()
@@ -1921,7 +1906,6 @@ mod tests {
         let plan = LinearizationPlan {
             part2_objects: vec![pages_ref, ObjectRef::new(2, 0)],
             part4_rest: vec![ObjectRef::new(3, 0)],
-            total_object_count: 3,
             pages_tree_ref: Some(pages_ref), // in Part 2, not in part4_rest → skipped
             ..Default::default()
         };
@@ -1949,7 +1933,6 @@ mod tests {
             part2_objects: vec![ObjectRef::new(2, 0)],
             part4_other_pages_private: vec![dup],
             part4_rest: vec![dup],
-            total_object_count: 3,
             root_ref: Some(dup),
             pages_tree_ref: Some(dup),
             ..Default::default()
@@ -2178,7 +2161,6 @@ mod tests {
         let plan = LinearizationPlan {
             part2_objects: vec![ObjectRef::new(3, 0)],
             part3_objects: vec![source, later_plain],
-            total_object_count: 3,
             preserve_objstm_plan: Some(crate::writer::object_streams::ObjectStreamPlan {
                 groups: vec![
                     crate::writer::object_streams::ObjectStreamGroup::SourceBacked {
@@ -2413,7 +2395,6 @@ mod tests {
             part4_other_pages_private: vec![ObjectRef::new(4, 0), ObjectRef::new(7, 0)],
             part4_rest: vec![ObjectRef::new(1, 0), ObjectRef::new(2, 0)],
             part4_open_document_plain: vec![od_plain],
-            total_object_count: 9,
             root_ref: Some(ObjectRef::new(1, 0)),
             ..Default::default()
         };
@@ -2445,7 +2426,6 @@ mod tests {
                 ObjectRef::new(21, 0),
                 ObjectRef::new(23, 0),
             ],
-            total_object_count: 60,
             root_ref: Some(ObjectRef::new(50, 0)),
             ..Default::default()
         };

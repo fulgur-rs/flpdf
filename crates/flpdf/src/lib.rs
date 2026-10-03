@@ -90,6 +90,9 @@
 // flpdf-libjpeg-compat crate; this crate keeps unsafe code denied.
 #![deny(unsafe_code)]
 
+#[cfg(test)]
+extern crate self as flpdf;
+
 pub mod acroform_document_helper;
 pub mod annotation_object_helper;
 pub(crate) mod bit_stream;

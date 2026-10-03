@@ -193,7 +193,7 @@ impl SharedObjectHintTable {
     /// must construct consistently.  Silently writing
     /// `first_object_number = 0` would emit a header pointing at PDF
     /// object 0 (the free-list head), which is invalid.
-    pub fn from_plan(
+    pub(crate) fn from_plan(
         plan: &LinearizationPlan,
         renumber: &RenumberMap,
         member_to_container: &std::collections::BTreeMap<ObjectRef, (u32, u32)>,
@@ -404,7 +404,6 @@ mod tests {
                 ObjectRef::new(2, 0),
                 ObjectRef::new(1, 0),
             ],
-            total_object_count: 3,
             page_hints: vec![PageHintEntry {
                 page_ref,
                 first_object_index: 0,
@@ -433,7 +432,6 @@ mod tests {
             part2_objects: vec![ObjectRef::new(3, 0), ObjectRef::new(6, 0)],
             part3_objects: vec![ObjectRef::new(5, 0), ObjectRef::new(8, 0)],
             part4_other_pages_private: vec![ObjectRef::new(4, 0), ObjectRef::new(7, 0)],
-            total_object_count: 8,
             page_hints: vec![
                 PageHintEntry {
                     page_ref: ObjectRef::new(3, 0),
@@ -494,7 +492,6 @@ mod tests {
                 ObjectRef::new(22, 0),
             ],
             part4_other_pages_private: vec![ObjectRef::new(30, 0)],
-            total_object_count: 5,
             page_hints: vec![
                 PageHintEntry {
                     page_ref: ObjectRef::new(10, 0),
@@ -881,7 +878,6 @@ mod tests {
             part3_objects: vec![ObjectRef::new(5, 0)],
             part4_other_pages_shared: vec![ObjectRef::new(9, 0), ObjectRef::new(10, 0)],
             part4_other_pages_private: vec![ObjectRef::new(4, 0)],
-            total_object_count: 5,
             page_hints: vec![
                 PageHintEntry {
                     page_ref: ObjectRef::new(3, 0),

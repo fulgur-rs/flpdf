@@ -50,17 +50,7 @@ use crate::ObjectRef;
 /// Follows the formula from ISO 32000-1 Annex F:
 /// `bits_needed = 0` if `value == 0`, otherwise `64 - value.leading_zeros()`.
 ///
-/// Examples:
-/// ```
-/// use flpdf::linearization::hint_page::bits_needed;
-/// assert_eq!(bits_needed(0), 0);
-/// assert_eq!(bits_needed(1), 1);
-/// assert_eq!(bits_needed(2), 2);
-/// assert_eq!(bits_needed(3), 2);
-/// assert_eq!(bits_needed(7), 3);
-/// assert_eq!(bits_needed(8), 4);
-/// ```
-pub fn bits_needed(value: u64) -> u32 {
+pub(crate) fn bits_needed(value: u64) -> u32 {
     if value == 0 {
         0
     } else {
@@ -227,7 +217,7 @@ pub struct PageOffsetEntry {
 
 /// Complete Page Offset Hint Table: header + one entry per page.
 ///
-/// Constructed via [`PageOffsetHintTable::from_plan`].  All placeholder fields
+/// Constructed via `from_plan`.  All placeholder fields
 /// (`location_of_first_page`, `least_page_length`, `least_content_offset`,
 /// `least_content_length`, per-page `page_length_minus_least`,
 /// `content_stream_offset`, `content_stream_length`)
@@ -419,7 +409,8 @@ impl PageOffsetHintTable {
     /// The `renumber` map orders the folded first-page shared-hint section by
     /// physical object number — the order in which a linearized-PDF reader
     /// walks first-page shared objects positionally.
-    pub fn from_plan(
+    #[cfg(test)]
+    pub(crate) fn from_plan(
         plan: &LinearizationPlan,
         renumber: &RenumberMap,
         member_to_container: &std::collections::BTreeMap<ObjectRef, (u32, u32)>,
@@ -801,7 +792,6 @@ mod tests {
                 ObjectRef::new(2, 0),
                 ObjectRef::new(1, 0),
             ],
-            total_object_count: 3,
             page_hints: vec![PageHintEntry {
                 page_ref,
                 first_object_index: 0,
@@ -829,7 +819,6 @@ mod tests {
             part2_objects: vec![ObjectRef::new(3, 0), ObjectRef::new(6, 0)],
             part3_objects: vec![ObjectRef::new(5, 0), ObjectRef::new(8, 0)],
             part4_other_pages_private: vec![ObjectRef::new(4, 0), ObjectRef::new(7, 0)],
-            total_object_count: 8,
             page_hints: vec![
                 PageHintEntry {
                     page_ref: ObjectRef::new(3, 0),
@@ -1274,7 +1263,6 @@ mod tests {
             part2_objects: vec![ObjectRef::new(3, 0), ObjectRef::new(6, 0)],
             part3_objects: vec![ObjectRef::new(50, 0), ObjectRef::new(8, 0)],
             part4_other_pages_private: vec![ObjectRef::new(4, 0), ObjectRef::new(7, 0)],
-            total_object_count: 8,
             page_hints: vec![
                 PageHintEntry {
                     page_ref: ObjectRef::new(3, 0),

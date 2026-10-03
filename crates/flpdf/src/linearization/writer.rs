@@ -626,6 +626,7 @@ pub struct LinearizedOffsets {
 
     /// `new_object_number → byte_offset` map covering every object in the
     /// linearized file.  Used for structural verification.
+    #[cfg(test)]
     pub xref_offsets: BTreeMap<u32, usize>,
 
     /// Byte range of the `/Prev` value placeholder in the Part 1 (first)
@@ -643,14 +644,16 @@ pub struct LinearizedOffsets {
 }
 
 /// The finished linearized PDF together with the offset metadata.
+#[cfg(test)]
 #[derive(Debug)]
-pub struct LinearizedDocument {
+pub(crate) struct LinearizedDocument {
     /// Raw bytes of the complete linearized PDF file.
     pub bytes: Vec<u8>,
     /// Offset metadata for back-patching.
     pub offsets: LinearizedOffsets,
 }
 
+#[cfg(test)]
 impl LinearizedOffsets {
     /// Transfer the writer-owned metadata map into its in-memory document.
     fn into_document(self, bytes: Vec<u8>) -> LinearizedDocument {
@@ -665,7 +668,7 @@ impl LinearizedOffsets {
 /// sink-backed writer route. The latter deliberately does not retain a
 /// document-sized byte vector after it has reached the configured sink.
 struct LinearizedWriteResult {
-    #[allow(dead_code)]
+    #[cfg(test)]
     document: Option<LinearizedDocument>,
     writer_result: WriterResult,
 }
@@ -4886,6 +4889,7 @@ fn write_linearized_impl<R: Read + Seek>(
         last_xref_offset: final_last_xref_first_entry_offset.saturating_sub(1),
         page_count,
         part1_placeholders: part1_placeholders.clone(),
+        #[cfg(test)]
         xref_offsets: BTreeMap::new(),
         first_trailer_prev_range: 0..0,
         dict_writable_region: part1_dict_region.clone(),
@@ -4925,6 +4929,7 @@ fn write_linearized_impl<R: Read + Seek>(
     // The final trailer view already contains the computed identifier, so
     // both classic and ObjStm/xref-stream routes write the final `/ID` bytes
     // directly while the sink remains forward-only.
+    #[cfg(test)]
     let streaming_output = final_output.is_some();
     let mut final_bytes = Vec::new();
     let target: &mut dyn OutputTarget = match final_output {
@@ -4961,7 +4966,7 @@ fn write_linearized_impl<R: Read + Seek>(
         Some(final_layout),
     );
     let final_finish = final_sink.finish_document();
-    let final_output_length = final_sink.position_usize()?;
+    let _final_output_length = final_sink.position_usize()?;
     drop(final_sink);
     let final_output = final_result?; // cov:ignore: pass 2 reuses the validated plan and fixed layout after pass 1 succeeds; this is only defensive error propagation.
     final_finish?;
@@ -4969,13 +4974,13 @@ fn write_linearized_impl<R: Read + Seek>(
         xref_offsets: _final_xref_offsets,
         lengths: _final_lengths,
         first_page_xref_offset: final_first_page_xref_offset,
-        hint_stream_offset: final_hint_stream_offset,
-        hint_stream_obj_total_len: final_hint_stream_obj_total_len,
-        end_of_first_page_offset: final_end_of_first_page_offset,
+        hint_stream_offset: _final_hint_stream_offset,
+        hint_stream_obj_total_len: _final_hint_stream_obj_total_len,
+        end_of_first_page_offset: _final_end_of_first_page_offset,
         last_xref_offset: final_last_xref_keyword_offset,
-        last_xref_first_entry_offset: final_last_xref_first_entry_offset,
+        last_xref_first_entry_offset: _final_last_xref_first_entry_offset,
         second_xref_end: _final_second_xref_end,
-        first_trailer_prev_range: final_first_trailer_prev_range,
+        first_trailer_prev_range: _final_first_trailer_prev_range,
         id_ranges: _final_id_ranges,
     } = final_output;
 
@@ -5074,32 +5079,34 @@ fn write_linearized_impl<R: Read + Seek>(
         }
     }
 
-    // Move the one writer-owned final xref map into the in-memory inspection
-    // metadata after all WriterResult consumers have read it.
+    // The in-memory helper exposes the final offsets for its focused tests.
+    #[cfg(test)]
     let offsets = LinearizedOffsets {
-        file_length: final_output_length,
-        hint_stream_offset: final_hint_stream_offset,
-        hint_stream_length: final_hint_stream_obj_total_len,
+        file_length: _final_output_length,
+        hint_stream_offset: _final_hint_stream_offset,
+        hint_stream_length: _final_hint_stream_obj_total_len,
         first_page_object_new_num,
-        end_of_first_page_offset: final_end_of_first_page_offset,
+        end_of_first_page_offset: _final_end_of_first_page_offset,
         last_xref_keyword_offset: final_last_xref_keyword_offset,
         // /T = first_entry_pos - 1, matching qpdf's convention.
         // qpdf's check validates: file_T == first_entry_pos - 1.
-        last_xref_offset: final_last_xref_first_entry_offset.saturating_sub(1),
+        last_xref_offset: _final_last_xref_first_entry_offset.saturating_sub(1),
         page_count,
         part1_placeholders: final_part1_offsets.part1_placeholders.clone(),
         xref_offsets: pass1_output.xref_offsets,
-        first_trailer_prev_range: final_first_trailer_prev_range,
+        first_trailer_prev_range: _final_first_trailer_prev_range,
         dict_writable_region: part1_dict_region,
     };
 
     let writer_result = WriterResult::new(old_to_new, written_xref);
+    #[cfg(test)]
     let document = if streaming_output {
         None
     } else {
         Some(offsets.into_document(final_bytes))
     };
     Ok(LinearizedWriteResult {
+        #[cfg(test)]
         document,
         writer_result,
     })
@@ -5988,7 +5995,6 @@ mod tests {
         let stream_ref = stream_handle.object_ref().expect("stream is indirect");
         let plan = LinearizationPlan {
             part4_rest: vec![stream_ref],
-            total_object_count: 1,
             ..Default::default()
         };
         let renumber = RenumberMap::from_plan(&plan);
@@ -6314,7 +6320,6 @@ mod tests {
         let unresolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(91, 0), -1);
         let plan = LinearizationPlan {
             part4_rest: vec![ObjectRef::new(91, 0)],
-            total_object_count: 1,
             ..Default::default()
         };
         let renumber = RenumberMap::from_plan(&plan);

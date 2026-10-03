@@ -197,7 +197,7 @@ git commit -m "refactor: route linearization catalog through handles"
 ### Task 4: Validate all affected writer and CLI behavior
 
 **Files:**
-- Test: `crates/flpdf/tests/linearize_objstm_generate_tests.rs`
+- Test: `crates/flpdf/src/linearization/linearize_objstm_generate_tests.rs`
 - Test: `crates/flpdf/tests/cmp_linearize_objstm_tests.rs`
 - Test: `crates/flpdf/tests/show_linearization_tests.rs`
 - Test: `crates/flpdf-cli/tests/compat_matrix_tests.rs`

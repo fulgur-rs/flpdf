@@ -91,16 +91,6 @@ pub struct SharedObjectHintEntry {
     pub referencing_pages: Vec<u32>,
 }
 
-impl SharedObjectHintEntry {
-    /// Construct a shared-object entry that has no page references yet.
-    pub fn new(object_ref: ObjectRef) -> Self {
-        Self {
-            object_ref,
-            referencing_pages: Vec::new(),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Closure helpers
 // ---------------------------------------------------------------------------
@@ -801,7 +791,7 @@ pub(crate) struct RawSharedObjectHintEntry {
 /// defined by ISO 32000-1 Annex F, together with the raw inputs for the
 /// page-offset and shared-object hint tables.
 ///
-/// Constructed from a [`Pdf`] handle via [`LinearizationPlan::from_pdf`].
+/// Constructed from a [`Pdf`] handle via `from_pdf`.
 /// This struct owns all data it needs and holds no reference into the source
 /// document.
 ///
@@ -849,8 +839,6 @@ pub struct LinearizationPlan {
     // ------------------------------------------------------------------
     // Document summary (copied from the source at construction time)
     // ------------------------------------------------------------------
-    /// Total number of objects as reported by the xref table.
-    pub total_object_count: u32,
     /// `/Root` reference from the trailer, if present.
     pub root_ref: Option<ObjectRef>,
     /// `/Pages` tree root reference (catalog's `/Pages` entry).
@@ -1511,7 +1499,8 @@ impl LinearizationPlan {
     /// inherited page attributes down the `/Pages` tree, which propagates the
     /// same object-resolution errors and returns [`crate::Error::Unsupported`]
     /// if the tree exceeds the page-tree depth bound.
-    pub fn from_pdf<R: Read + Seek>(
+    #[cfg(test)]
+    pub(crate) fn from_pdf<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         use_generate_objstm: bool,
     ) -> crate::Result<Self> {
@@ -1529,7 +1518,7 @@ impl LinearizationPlan {
     /// Preserve from source-ObjStm Preserve. qpdf runs its
     /// `getCompressibleObjGens` stale-generation removal only for Generate and
     /// when Preserve actually consumes source object streams.
-    pub fn from_pdf_with_object_stream_mode<R: Read + Seek>(
+    pub(crate) fn from_pdf_with_object_stream_mode<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         object_stream_mode: crate::writer::ObjectStreamMode,
     ) -> crate::Result<Self> {
@@ -1944,7 +1933,6 @@ impl LinearizationPlan {
             all_refs.sort();
         }
 
-        let total_object_count = all_refs.len() as u32;
         let root_ref = pdf.root_ref();
         let info_handle = pdf.trailer().try_get_key(b"/Info")?;
         let info_ref = info_handle
@@ -2640,7 +2628,6 @@ impl LinearizationPlan {
             part4_rest,
             part4_open_document_plain,
             writer_object_order: pdf.writer_object_order.clone(),
-            total_object_count,
             root_ref,
             pages_tree_ref,
             info_ref,
@@ -3186,7 +3173,8 @@ impl LinearizationPlan {
     /// Useful for callers that want to verify the disjoint invariant.
     /// Uses the three fine-grained Part-4 sub-partitions as the canonical
     /// source of truth.
-    pub fn all_assigned_refs(&self) -> BTreeSet<ObjectRef> {
+    #[cfg(test)]
+    pub(crate) fn all_assigned_refs(&self) -> BTreeSet<ObjectRef> {
         self.part1_objects
             .iter()
             .chain(&self.part2_objects)
@@ -3317,7 +3305,6 @@ impl Default for LinearizationPlan {
             part4_rest: Vec::new(),
             part4_open_document_plain: Vec::new(),
             writer_object_order: None,
-            total_object_count: 0,
             root_ref: None,
             pages_tree_ref: None,
             info_ref: None,
@@ -3423,7 +3410,7 @@ impl LinearizationPlan {
     ///
     /// # Snapshot contract
     ///
-    /// For Generate and Preserve, construct this plan with [`Self::from_pdf`]
+    /// For Generate and Preserve, construct this plan with `from_pdf`
     /// from the same `Pdf` passed here, and pass `true` to `from_pdf` exactly
     /// for Generate mode. Both modes classify their container-member unions
     /// from that one retained object-user snapshot. A hand-built plan without
@@ -4148,7 +4135,7 @@ fn outlines_in_first_page_predicate<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::
 /// ([`ContainerPart::Rest`]). The two-or-more case is part 8 regardless of
 /// `others` or thumbnails (QPDF_linearization.cc:1130).
 ///
-/// The retained routing snapshot comes from [`LinearizationPlan::from_pdf`].
+/// The retained routing snapshot comes from `LinearizationPlan::from_pdf`.
 /// This classifier does not resolve objects or read the PDF.
 ///
 /// # Deviation

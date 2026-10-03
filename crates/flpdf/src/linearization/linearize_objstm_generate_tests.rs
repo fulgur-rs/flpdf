@@ -9,8 +9,9 @@
 //! are parsed directly), so they run on every build and cover the
 //! generate-multipage writer / plan / renumber / hint-reconciliation paths.
 
-use flpdf::linearization::{LinearizationPlan, RenumberMap};
-use flpdf::{
+use crate::linearization::plan::LinearizationPlan;
+use crate::linearization::renumber::RenumberMap;
+use crate::{
     CompressStreams, DecodeLevel, ObjectRef, ObjectStreamMode, Pdf, PdfOpenOptions, PdfWriter,
 };
 use std::cell::RefCell;
@@ -410,7 +411,7 @@ fn outlines_generate_emits_outline_hint_table_and_o_key() {
     // Decode the linearization data and assert the Outlines Hint Table is present
     // with one output unit (the single ObjStm container holding all 81 outline
     // objects). first_object = 3 is deflate-independent (object numbering).
-    let dump = flpdf::linearization::show_linearization_bytes(&bytes, "outlines.pdf")
+    let dump = crate::linearization::show_linearization_bytes(&bytes, "outlines.pdf")
         .expect("show-linearization decode");
     assert!(
         dump.contains("Outlines Hint Table"),
@@ -923,7 +924,7 @@ fn useoutlines_generate_routes_outlines_to_first_page_and_round_trips() {
     // The linearization data must show page-0 nobjects = 4: the page object
     // (part2), its content stream (part2), the first-page shared-dicts
     // container (part3), and the outline container (now in part6 = page-0 section).
-    let dump = flpdf::linearization::show_linearization_bytes(&bytes, "useoutlines.pdf")
+    let dump = crate::linearization::show_linearization_bytes(&bytes, "useoutlines.pdf")
         .expect("show-linearization decode");
     assert!(
         dump.contains("nobjects: 4"),
@@ -968,7 +969,7 @@ fn direct_outlines_root_precedes_its_first_half_objstm_container() {
 ///   obj 22: Content stream for page1
 #[test]
 fn acroform_widget_page0_peeled_from_first_page_section() {
-    use flpdf::ObjectRef;
+    use crate::ObjectRef;
     use std::collections::BTreeSet;
 
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1038,7 +1039,7 @@ fn acroform_widget_page0_peeled_from_first_page_section() {
 /// and the plain Form XObject must appear in the output bytes before the ObjStm.
 #[test]
 fn ineligible_od_stream_routes_to_part4_open_document_plain() {
-    use flpdf::ObjectRef;
+    use crate::ObjectRef;
     use std::collections::BTreeSet;
 
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1130,7 +1131,7 @@ fn ineligible_od_stream_routes_to_part4_open_document_plain() {
 /// skips /Thumb and the plan matches the oracle hint table (nobjects=2 per page).
 #[test]
 fn thumbnail_private_shared_routes_thumbs_to_part9() {
-    use flpdf::ObjectRef;
+    use crate::ObjectRef;
     use std::collections::BTreeSet;
 
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1218,7 +1219,7 @@ fn thumbnail_private_shared_routes_thumbs_to_part9() {
 /// output.)
 #[test]
 fn acroform_widget_peeled_to_open_document_in_disable_mode() {
-    use flpdf::ObjectRef;
+    use crate::ObjectRef;
     use std::collections::BTreeSet;
 
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1226,7 +1227,7 @@ fn acroform_widget_peeled_to_open_document_in_disable_mode() {
         .join("objstm-lin-acroform-widget-page0-5-10.pdf");
 
     let f = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut pdf = flpdf::Pdf::open(std::io::BufReader::new(f)).unwrap();
+    let mut pdf = crate::Pdf::open(std::io::BufReader::new(f)).unwrap();
     let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
     let widget_refs: Vec<ObjectRef> = (6u32..=10)
@@ -1297,7 +1298,7 @@ fn acroform_widget_peeled_to_open_document_in_disable_mode() {
 ///   → widget reaches OD routing → lands in part4_rest ✓
 #[test]
 fn acroform_widget_page1_only_routes_to_od_not_part7() {
-    use flpdf::ObjectRef;
+    use crate::ObjectRef;
     use std::collections::BTreeSet;
 
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1305,7 +1306,7 @@ fn acroform_widget_page1_only_routes_to_od_not_part7() {
         .join("objstm-lin-acroform-widget-page1-only.pdf");
 
     let f = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut pdf = flpdf::Pdf::open(std::io::BufReader::new(f)).unwrap();
+    let mut pdf = crate::Pdf::open(std::io::BufReader::new(f)).unwrap();
     let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
 
     let widget = ObjectRef {
@@ -1355,7 +1356,7 @@ fn acroform_widget_page1_page2_od_container_excluded_from_part8_soht() {
     let bytes = linearize_generate("objstm-lin-acroform-widget-page1-page2.pdf");
 
     // Decode the linearization dump and verify nshared_total matches oracle.
-    let dump = flpdf::linearization::show_linearization_bytes(&bytes, "widget-page1-page2")
+    let dump = crate::linearization::show_linearization_bytes(&bytes, "widget-page1-page2")
         .expect("show-linearization decode");
 
     // Oracle: nshared_first_page=2, nshared_total=2 (no Part-8 OD container entry).
@@ -1369,7 +1370,7 @@ fn acroform_widget_page1_page2_od_container_excluded_from_part8_soht() {
     );
 
     // Round-trip sanity.
-    let mut pdf = flpdf::Pdf::open(std::io::Cursor::new(bytes)).expect("Pdf::open round-trip");
+    let mut pdf = crate::Pdf::open(std::io::Cursor::new(bytes)).expect("Pdf::open round-trip");
     let refs = canonical_object_refs(&mut pdf);
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
@@ -1400,6 +1401,7 @@ fn linearize_mode_force_version(fixture: &str, mode: ObjectStreamMode, force: &s
     write_linearized_with_settings(&mut pdf, &opts).unwrap()
 }
 
+#[path = "../../tests/common/mod.rs"]
 mod common;
 use common::PdfCanonicalTestExt;
 #[allow(unused_imports)]
