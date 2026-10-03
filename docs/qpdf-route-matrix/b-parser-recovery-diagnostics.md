@@ -48,6 +48,7 @@ qpdf 11.9.0 pinned source。以下の行範囲はすべて `rg -n` / `sed -n` / 
      `:1391`（`readStream`）、`:1563`（`readObjectAtOffset`）。setter は `:336`。
 
 **2026-10-03 (`flpdf-6ik2q.11`)**: `parse_startxref` が最後のraw substringだけを選び、token predicateが不一致でも前候補を試さないため、末尾に `startxref\nnot-an-integer` または `startxref123` を追記すると、有効な既存startxrefを捨てて不要なrecoveryに入る。canonical regressionでqpdfのfallbackとtoken境界、左境界を要求しないsubstring探索を固定した。
+**2026-10-03 (`flpdf-6ik2q.13`)**: `parse_xrefEntry` は許容した余分な空白・桁幅の警告を各行の解析中に `QPDF::warn` へ即時追加する（`QPDF.cc:770-842`; 単一 collection は `QPDF.cc:488-503`）。後続行が不正で `read_xrefTable` が throw しても先行警告は残り、その後 `reconstruct_xref` が破損・原因・再構築の警告を順に追加する（`QPDF.cc:846-880,516-530`）。canonical `parse_xref_table` も行ごとに `CanonicalTrailerOwner::push_warning` へ渡し、集約ローカル値の破棄で警告を失わない。余分な区切り空白を含む有効 row 0 と不正 row 1 の fixture で、qpdf 11.9.0 と警告順および復元 xref 行を比較する。
 2. **`QPDF::read_xref(xref_offset)`**（`libqpdf/QPDF.cc:626-719`）— `while (xref_offset)` で
    `visited` に積みながら:
    - offset 直後の空白を読み飛ばし（`skipped_space`）、7 byte 読んで `"xref"` + 空白なら
@@ -65,7 +66,7 @@ qpdf 11.9.0 pinned source。以下の行範囲はすべて `rg -n` / `sed -n` / 
    - 50 byte の `linebuf` を `parse_xrefFirst`（`libqpdf/QPDF.cc:722`）で解析、失敗は
      `throw damagedPDF("xref table", "xref syntax invalid")`（`libqpdf/QPDF.cc:862`）。
    - 各 entry は `readLine(30)` → `parse_xrefEntry`（`libqpdf/QPDF.cc:770`）、失敗は
-     `throw "invalid xref entry (obj=N)"`（`libqpdf/QPDF.cc:876-879`）。`'f'` は `deleted_items` に
+     `throw "invalid xref entry (obj=N)"`（`libqpdf/QPDF.cc:876-879`）。許容された空白 / 桁幅の崩れは同関数内で即時警告され、後続行の throw では取り消されない（`:776-842`）。`'f'` は `deleted_items` に
      **保留**、`'n'` は `insertXrefEntry(i, 1, f1, f2)`（`libqpdf/QPDF.cc:880-885`）。
    - `trailer` キーワードまで subsection を繰り返し、`readTrailer()` が dictionary でなければ
      `throw "expected trailer dictionary"`（`libqpdf/QPDF.cc:894-900`）。
