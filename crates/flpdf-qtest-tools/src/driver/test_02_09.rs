@@ -509,7 +509,7 @@ pub(crate) fn run_test_7<R: Read + Seek>(
         Rc::new(b"new data for stream\n".to_vec()),
         Some(ObjectHandle::null()),
         Some(ObjectHandle::null()),
-    );
+    )?;
 
     let mut writer = PdfWriter::new(pdf);
     writer.set_output_file("a.pdf")?;
@@ -640,7 +640,7 @@ pub(crate) fn run_test_9<R: Read + Seek>(
         Rc::new(b"data for other stream\n".to_vec()),
         Some(ObjectHandle::null()),
         Some(ObjectHandle::null()),
-    );
+    )?;
 
     root.replace_key(b"/QStream", qstream)?;
     root.replace_key(b"/RStream", rstream)?;

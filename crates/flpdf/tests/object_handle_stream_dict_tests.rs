@@ -14,14 +14,16 @@ fn resolving_stream_dictionary_accessor_is_public() {
 }
 
 #[test]
-fn direct_stream_returns_its_live_dictionary() {
-    let dictionary =
-        ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(3))]);
-    let stream = ObjectHandle::stream(dictionary.clone(), Rc::new(b"abc".to_vec()));
+fn qpdf_owned_stream_returns_its_live_dictionary() {
+    let pdf = Pdf::empty().expect("empty PDF");
+    let stream = pdf
+        .new_stream_with_data(Rc::new(b"abc".to_vec()))
+        .expect("new stream");
+    let dictionary = stream.try_get_stream_dict().expect("stream dictionary");
 
     let returned = stream
         .try_get_stream_dict()
-        .expect("direct stream getDict equivalent");
+        .expect("qpdf stream getDict equivalent");
     assert!(returned.is_same_object_as(&dictionary));
 }
 

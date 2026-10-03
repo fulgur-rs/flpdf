@@ -5,9 +5,10 @@ use flpdf::{
 };
 use std::cell::RefCell;
 use std::rc::Rc;
+mod common;
 
 fn stream(data: &[u8]) -> ObjectHandle {
-    ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(data.to_vec()))
+    common::qpdf_owned_stream(data)
 }
 
 fn detail(diagnostic: &QpdfExc) -> String {
@@ -150,24 +151,22 @@ fn parse_as_contents_delivers_inline_image_handles() {
 }
 
 #[test]
-fn detached_parse_throws_the_first_recovery_warning_before_callbacks() {
-    let form = stream(b"\r<0g");
+fn document_owned_parse_routes_the_first_recovery_warning_before_callbacks() {
+    let (pdf, page) = owned_page_with_contents(b"\r<0g");
+    let form = page.try_get_key(b"/Contents").unwrap();
     let mut callbacks = RecordingCallbacks::default();
 
-    let error = form
-        .parse_as_contents(&mut callbacks)
-        .expect_err("a detached qpdf content parse throws its first warning");
+    form.parse_as_contents(&mut callbacks)
+        .expect("an owned qpdf content parse routes recoverable warnings to its document");
 
-    assert!(matches!(
-        error,
-        flpdf::Error::QpdfExc(warning)
-            if warning.get_object() == b"content"
-                && warning.get_file_position() == 1
-                && warning.get_message_detail() == b"invalid character (g) in hexstring"
-    ));
+    assert!(pdf.repair_diagnostics().entries().iter().any(|warning| {
+        warning.get_file_position() == 1
+            && warning.get_message_detail() == b"invalid character (g) in hexstring"
+    }));
     assert_eq!(callbacks.size, Some(4));
-    assert!(callbacks.objects.is_empty());
-    assert_eq!(callbacks.eof_calls, 0);
+    assert_eq!(callbacks.objects.len(), 1);
+    assert!(callbacks.objects[0].0.is_null());
+    assert_eq!(callbacks.eof_calls, 1);
 }
 
 #[test]
@@ -191,51 +190,43 @@ fn parse_content_operations_ignores_inline_image_events() {
 }
 
 #[test]
-fn detached_parse_throws_inline_image_eof_warning_before_normal_eof() {
-    let form = stream(b"BI /W 1 ID \0");
+fn document_owned_parse_routes_inline_image_eof_warning_and_reaches_normal_eof() {
+    let (pdf, page) = owned_page_with_contents(b"BI /W 1 ID \0");
+    let form = page.try_get_key(b"/Contents").unwrap();
     let mut callbacks = RecordingCallbacks::default();
 
-    let error = form
-        .parse_as_contents(&mut callbacks)
-        .expect_err("a detached qpdf content parse throws an inline-image warning");
+    form.parse_as_contents(&mut callbacks)
+        .expect("an owned qpdf content parse routes inline-image warnings to its document");
 
-    assert!(matches!(
-        error,
-        flpdf::Error::QpdfExc(warning)
-            if warning.get_object() == b"stream data"
-                && warning.get_file_position() == 12
-                && warning.get_message_detail() == b"EOF found while reading inline image"
-    ));
+    assert!(pdf.repair_diagnostics().entries().iter().any(|warning| {
+        warning.get_message_detail() == b"EOF found while reading inline image"
+    }));
     assert!(!callbacks.objects.is_empty());
     assert!(!callbacks
         .objects
         .iter()
         .any(|(object, _, _)| object.as_inline_image().is_some()));
-    assert_eq!(callbacks.eof_calls, 0);
+    assert_eq!(callbacks.eof_calls, 1);
 }
 
 #[test]
-fn detached_parse_throws_id_at_eof_warning_before_normal_eof() {
-    let form = stream(b"ID");
+fn document_owned_parse_routes_id_at_eof_warning_and_reaches_normal_eof() {
+    let (pdf, page) = owned_page_with_contents(b"ID");
+    let form = page.try_get_key(b"/Contents").unwrap();
     let mut callbacks = RecordingCallbacks::default();
 
-    let error = form
-        .parse_as_contents(&mut callbacks)
-        .expect_err("a detached qpdf content parse throws an ID-at-EOF warning");
+    form.parse_as_contents(&mut callbacks)
+        .expect("an owned qpdf content parse routes ID-at-EOF warnings to its document");
 
-    assert!(matches!(
-        error,
-        flpdf::Error::QpdfExc(warning)
-            if warning.get_object() == b"stream data"
-                && warning.get_file_position() == 2
-                && warning.get_message_detail() == b"EOF found while reading inline image"
-    ));
+    assert!(pdf.repair_diagnostics().entries().iter().any(|warning| {
+        warning.get_message_detail() == b"EOF found while reading inline image"
+    }));
     assert_eq!(callbacks.objects.len(), 1);
     assert_eq!(
         callbacks.objects[0].0.as_operator().as_deref(),
         Some(b"ID".as_slice())
     );
-    assert_eq!(callbacks.eof_calls, 0);
+    assert_eq!(callbacks.eof_calls, 1);
 }
 
 #[test]
@@ -360,12 +351,14 @@ fn parse_page_contents_matches_qpdf_content_recovery_and_errors() {
     );
 
     for input in [b"<< /A 1".as_slice(), b"[1"] {
-        let error = page_with_contents(stream(input))
-            .parse_page_contents(&mut RecordingCallbacks::default())
-            .expect_err("detached content parsing must surface the qpdf EOF diagnostic");
-        assert!(error
-            .to_string()
-            .contains("parse error while reading object"));
+        let (pdf, page) = owned_page_with_contents(input);
+        page.parse_page_contents(&mut RecordingCallbacks::default())
+            .expect("owned content parsing routes EOF diagnostics to its document");
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|diagnostic| { detail(diagnostic).contains("parse error while reading object") }));
     }
 }
 

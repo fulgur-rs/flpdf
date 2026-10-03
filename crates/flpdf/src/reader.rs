@@ -1270,7 +1270,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// without copying, matching qpdf's shared buffer overload.
     pub fn new_stream_with_data(&self, data: Rc<Vec<u8>>) -> Result<ObjectHandle> {
         let stream = self.new_stream()?;
-        stream.replace_stream_data(data, None, None);
+        stream.replace_stream_data(data, None, None)?;
         Ok(stream)
     }
 

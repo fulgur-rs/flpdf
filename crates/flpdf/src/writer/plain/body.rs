@@ -2032,7 +2032,7 @@ where
     F: FnMut(&mut OutputSink<'_>, &[u8]) -> crate::Result<()>,
 {
     let container = if options.content_normalization {
-        normalize_content_container(container, options)?
+        normalize_content_container(container)?
     } else {
         container.clone()
     };
@@ -2054,8 +2054,7 @@ where
 // mirror rather than imported cross-module, matching that file's own
 // established precedent for this exact constant pair (see its own doc
 // comment on why). A container reached here may be built directly through
-// the public `ObjectHandle::array`/`dictionary`/`stream` factories (see
-// the direct stream factory in `reader.rs`), which -- like
+// the public `ObjectHandle::array`/`dictionary` factories, which -- like
 // every other `ObjectHandle` tree those factories build -- carries no depth
 // bound the way parsed input does.
 const CONTENT_EMIT_STACK_RED_ZONE: usize = 32 * 1024;
@@ -2153,21 +2152,17 @@ fn content_emit_walk_hub<T>(body: impl FnOnce() -> crate::Result<T>) -> crate::R
     )
 }
 
-/// Replace only direct stream values in a page's `/Contents` value or an
-/// indirect array holder. Indirect children retain identity and are never
-/// chased: their terminal streams remain ordinary planned objects, exactly as
-/// in the shared page-content resolver.
-fn normalize_content_container(
-    container: &ObjectHandle,
-    options: &WriterOptions,
-) -> crate::Result<ObjectHandle> {
+/// Rebuild the direct `/Contents` container shape while retaining indirect
+/// child identity. Stream handles are qpdf-owned indirect objects and remain
+/// opaque children, exactly as in the shared page-content resolver.
+fn normalize_content_container(container: &ObjectHandle) -> crate::Result<ObjectHandle> {
     container.try_dereference()?;
     if let Some(entries) = container.try_as_dictionary()? {
         let entries = entries
             .into_iter()
             .map(|(key, value)| {
                 if key.as_slice() == b"/Contents" {
-                    Ok((key, normalize_content_value(&value, options)?))
+                    Ok((key, normalize_content_value(&value)?))
                 } else {
                     Ok((key, value))
                 }
@@ -2178,7 +2173,7 @@ fn normalize_content_container(
     if let Some(items) = container.try_as_array()? {
         let items = items
             .into_iter()
-            .map(|item| normalize_content_value(&item, options))
+            .map(|item| normalize_content_value(&item))
             .collect::<crate::Result<Vec<_>>>()?;
         return Ok(ObjectHandle::array(items));
     } // cov:ignore: LLVM does not attribute this successful array normalization continuation
@@ -2192,23 +2187,16 @@ fn normalize_content_container(
 // outright (`would_create_direct_cycle`), so this walker cannot meet the
 // reciprocal-dictionary shape the other two can; it is routed anyway so the
 // whole family carries one bound. See `CONTENT_EMIT_WALK_DEPTH`'s doc.
-fn normalize_content_value(
-    value: &ObjectHandle,
-    options: &WriterOptions,
-) -> crate::Result<ObjectHandle> {
+fn normalize_content_value(value: &ObjectHandle) -> crate::Result<ObjectHandle> {
     content_emit_walk_hub(|| {
         if value.is_indirect() {
             return Ok(value.clone());
         }
         value.try_dereference()?;
-        if value.as_stream_dict().is_some() {
-            let (dict, data, _) = canonical_stream_output_for_rewrite(value, options, true)?; // cov:ignore: LLVM maps the covered direct-stream normalization continuation to this line
-            return Ok(ObjectHandle::stream(dict, Rc::new(data)));
-        }
         if let Some(items) = value.try_as_array()? {
             let items = items
                 .into_iter()
-                .map(|item| normalize_content_value(&item, options))
+                .map(|item| normalize_content_value(&item))
                 .collect::<crate::Result<Vec<_>>>()?;
             return Ok(ObjectHandle::array(items));
         }
@@ -3029,7 +3017,7 @@ mod final_handle_tests {
 
     #[test]
     fn content_container_emits_direct_streams_and_uses_the_handle_string_writer() {
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![
                 (b"/Length".to_vec(), ObjectHandle::integer(4)),
                 (b"/Label".to_vec(), ObjectHandle::string(b"data".to_vec())),
@@ -3076,11 +3064,7 @@ mod final_handle_tests {
             "getKey resolves the page but leaves its indirect child lazy"
         );
 
-        let options = WriterOptions {
-            content_normalization: true,
-            ..WriterOptions::default()
-        };
-        let normalized = normalize_content_container(&contents, &options)?;
+        let normalized = normalize_content_container(&contents)?;
         assert!(
             contents.is_resolved(),
             "writer-body type inspection resolves the indirect array receiver"
@@ -3099,7 +3083,7 @@ mod final_handle_tests {
         let mut pdf = crate::Pdf::empty()?;
         let removed = pdf.make_indirect_object_handle(ObjectHandle::integer(9))?;
         let removed_ref = removed.object_ref().expect("removed value identity");
-        let contents = ObjectHandle::stream(
+        let contents = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(0))]),
             Rc::new(Vec::new()),
         );
@@ -3155,7 +3139,7 @@ mod final_handle_tests {
     }
 
     fn direct_content_stream() -> ObjectHandle {
-        ObjectHandle::stream(
+        ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(4))]),
             Rc::new(b"data".to_vec()),
         )
@@ -3456,23 +3440,19 @@ mod final_handle_tests {
 
     #[test]
     fn deep_direct_arrays_are_bounded_in_content_normalization() -> crate::Result<()> {
-        let options = WriterOptions {
-            content_normalization: true,
-            ..WriterOptions::default()
-        };
         // `normalize_content_value` enters the hub once per array level plus
         // once for the scalar leaf, and the caller holds no level of its own,
         // so `MAX_PARSE_DEPTH` nested arrays is the deepest admitted chain.
         let bound = crate::parser::MAX_PARSE_DEPTH;
 
-        let normalized = normalize_content_value(&nested_direct_arrays(bound), &options)?;
+        let normalized = normalize_content_value(&nested_direct_arrays(bound))?;
         assert_eq!(
             direct_array_depth(&normalized),
             bound,
             "every level within the bound must still be normalized"
         );
 
-        let error = normalize_content_value(&nested_direct_arrays(bound + 1), &options)
+        let error = normalize_content_value(&nested_direct_arrays(bound + 1))
             .expect_err("nesting past the bound must be reported");
         assert!(matches!(error, crate::Error::Unsupported(_)));
         assert_eq!(
@@ -3555,7 +3535,10 @@ mod final_handle_tests {
             super::planned_member_body_violation(
                 ObjectRef::new(1, 0),
                 ObjectRef::new(1, 0),
-                &ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new()),),
+                &ObjectHandle::direct_stream(
+                    ObjectHandle::dictionary(Vec::new()),
+                    Rc::new(Vec::new()),
+                ),
                 &context,
             )?, // cov:ignore: the checked violation result is asserted by this test.
             Some("stream body")
@@ -3650,7 +3633,7 @@ mod final_handle_tests {
         let mut pdf = crate::Pdf::empty()?;
         let indirect = pdf.make_indirect_object_handle(ObjectHandle::integer(9))?;
         let indirect_ref = indirect.object_ref().expect("indirect child identity");
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(4))]),
             Rc::new(b"q Q\n".to_vec()),
         );
@@ -3663,7 +3646,7 @@ mod final_handle_tests {
                         (b"/Nested".to_vec(), ObjectHandle::integer(2)),
                         (
                             b"/NestedStream".to_vec(),
-                            ObjectHandle::stream(
+                            ObjectHandle::direct_stream(
                                 ObjectHandle::dictionary(vec![(
                                     b"/Length".to_vec(),
                                     ObjectHandle::integer(4),
@@ -3727,7 +3710,7 @@ mod final_handle_tests {
         let removed_refs = [removed.object_ref().expect("removed identity")]
             .into_iter()
             .collect();
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(4))]),
             Rc::new(b"data".to_vec()),
         );
@@ -3901,7 +3884,7 @@ mod object_emitter_tests {
         let child = pdf
             .make_indirect_object_handle(ObjectHandle::integer(7))
             .expect("indirect stream dictionary child");
-        let direct_stream = ObjectHandle::stream(
+        let direct_stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"/Child".to_vec(), child.clone())]),
             Rc::new(b"data".to_vec()),
         );
@@ -4049,11 +4032,11 @@ mod object_emitter_tests {
 
     #[test]
     fn direct_stream_policy_reaches_nested_dictionary_and_array_streams() -> crate::Result<()> {
-        let inner = ObjectHandle::stream(
+        let inner = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(5))]),
             Rc::new(b"inner".to_vec()),
         );
-        let outer = ObjectHandle::stream(
+        let outer = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(
                 b"/Nested".to_vec(),
                 ObjectHandle::array(vec![inner]),
@@ -4094,11 +4077,11 @@ mod object_emitter_tests {
 
     #[test]
     fn encrypted_direct_stream_policy_reaches_nested_streams() -> crate::Result<()> {
-        let inner = ObjectHandle::stream(
+        let inner = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(12))]),
             Rc::new(b"inner-secret".to_vec()),
         );
-        let outer = ObjectHandle::stream(
+        let outer = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(
                 b"/Nested".to_vec(),
                 ObjectHandle::dictionary(vec![(
@@ -4215,7 +4198,7 @@ mod object_emitter_tests {
 
         let mut pdf = pdf();
         let root_source = pdf.root_ref().expect("indirect Catalog");
-        let direct_stream = ObjectHandle::stream(
+        let direct_stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(10))]),
             Rc::new(b"direct-raw".to_vec()),
         );
@@ -4354,7 +4337,7 @@ mod object_emitter_tests {
     fn plain_live_content_container_emits_its_direct_stream_to_the_sink() -> crate::Result<()> {
         let mut pdf = pdf();
         let root_source = pdf.root_ref().expect("indirect Catalog");
-        let direct_stream = ObjectHandle::stream(
+        let direct_stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(13))]),
             Rc::new(b"plain-content".to_vec()),
         );
@@ -4604,7 +4587,7 @@ mod object_emitter_tests {
         assert_eq!(seeds.len(), 1);
         assert!(seeds[0].is_same_object_as(&child));
 
-        let direct_stream = ObjectHandle::stream(
+        let direct_stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"/Child".to_vec(), child.clone())]),
             Rc::new(b"seed".to_vec()),
         );

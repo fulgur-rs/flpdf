@@ -402,7 +402,7 @@ mod tests {
         dictionary
             .replace_key(b"/Length", ObjectHandle::integer(data.len() as i64))
             .unwrap();
-        ObjectHandle::stream(dictionary, Rc::new(data))
+        ObjectHandle::direct_stream(dictionary, Rc::new(data))
     }
 
     fn prepared_gray_optimizer(width: usize, height: usize, data: Vec<u8>) -> ImageOptimizer {
@@ -421,7 +421,7 @@ mod tests {
     fn prepare_matches_qpdf_metadata_skip_reasons_and_numeric_dimensions() {
         assert!(matches!(
             ImageOptimizer::prepare(
-                ObjectHandle::stream(
+                ObjectHandle::direct_stream(
                     ObjectHandle::dictionary(vec![(
                         b"/Width".to_vec(),
                         ObjectHandle::integer(200),
@@ -434,7 +434,7 @@ mod tests {
             PrepareResult::Skip(SkipReason::MissingKeys)
         ));
 
-        let bad_bits = ObjectHandle::stream(
+        let bad_bits = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![
                 (b"/Width".to_vec(), ObjectHandle::integer(200)),
                 (b"/Height".to_vec(), ObjectHandle::integer(200)),
@@ -447,7 +447,7 @@ mod tests {
             PrepareResult::Skip(SkipReason::BitsPerComponent)
         ));
 
-        let bad_colorspace = ObjectHandle::stream(
+        let bad_colorspace = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![
                 (b"/Width".to_vec(), ObjectHandle::integer(200)),
                 (b"/Height".to_vec(), ObjectHandle::integer(200)),
@@ -468,7 +468,7 @@ mod tests {
             min_width: 200,
             ..ImageOptimizationOptions::default()
         };
-        let small = ObjectHandle::stream(
+        let small = ObjectHandle::direct_stream(
             image_dictionary(ObjectHandle::integer(200), ObjectHandle::integer(200)),
             Rc::new(Vec::new()),
         );

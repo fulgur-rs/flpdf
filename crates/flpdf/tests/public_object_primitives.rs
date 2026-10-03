@@ -1,7 +1,5 @@
-use std::collections::BTreeSet;
-use std::rc::Rc;
-
 use flpdf::{AcroFormDocumentHelper, Error, Matrix, ObjectHandle, Pdf};
+use std::collections::BTreeSet;
 
 #[test]
 fn qpdf_object_handle_primitives_are_available_to_external_crates() {
@@ -44,13 +42,15 @@ fn qpdf_object_handle_primitives_are_available_to_external_crates() {
 
 #[test]
 fn qpdf_stream_type_predicate_is_available_to_external_crates() {
-    let stream = ObjectHandle::stream(
-        ObjectHandle::dictionary(vec![
-            (b"/Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
-            (b"/Subtype".to_vec(), ObjectHandle::name(b"Member".to_vec())),
-        ]),
-        Rc::new(Vec::new()),
-    );
+    let pdf = Pdf::empty().unwrap();
+    let stream = pdf.new_stream().unwrap();
+    let dictionary = stream.try_get_stream_dict().unwrap();
+    dictionary
+        .replace_key(b"/Type", ObjectHandle::name(b"ObjStm".to_vec()))
+        .unwrap();
+    dictionary
+        .replace_key(b"/Subtype", ObjectHandle::name(b"Member".to_vec()))
+        .unwrap();
 
     assert!(stream.try_is_stream_of_type(b"ObjStm", b"Member").unwrap());
     assert!(!stream.try_is_stream_of_type(b"XRef", b"Member").unwrap());

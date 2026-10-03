@@ -5,10 +5,9 @@
 //! The PDF byte sequences are hand-crafted to exercise each typed accessor and,
 //! for form fields, the `/Parent` chain inheritance behaviour.
 
-use flpdf::{AnnotationObjectHelper, FormFieldObjectHelper, ObjectHandle, ObjectRef, Pdf};
+use flpdf::{AnnotationObjectHelper, FormFieldObjectHelper, ObjectRef, Pdf};
 use std::collections::BTreeMap;
 use std::io::Cursor;
-use std::rc::Rc;
 
 // ── Minimal PDF builder ───────────────────────────────────────────────────────
 
@@ -480,28 +479,25 @@ fn annotation_handle_builds_qpdf_page_content_for_appearance() {
 
 #[test]
 fn annotation_handle_builds_no_rotate_page_content_for_appearance() {
-    let bytes = build_annotation_pdf(
-        "/Subtype /Widget /F 16 /Rect [10 20 110 40] \
-         /AP << /N 5 0 R >>",
-    );
-    let mut pdf = {
-        let mut pdf = open(bytes);
-        let stream = ObjectHandle::stream(
-            ObjectHandle::dictionary(vec![(
-                b"BBox".to_vec(),
-                ObjectHandle::array(vec![
-                    ObjectHandle::integer(0),
-                    ObjectHandle::integer(0),
-                    ObjectHandle::integer(100),
-                    ObjectHandle::integer(20),
-                ]),
-            )]),
-            Rc::new(Vec::new()),
-        );
-        pdf.replace_object(ObjectRef::new(5, 0), stream)
-            .expect("replace appearance stream");
-        pdf
-    };
+    let bytes = build_pdf(vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>".to_vec(),
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R /Annots [4 0 R] >>".to_vec()),
+        (
+            4,
+            b"<< /Type /Annot /Subtype /Widget /F 16 /Rect [10 20 110 40] /AP << /N 5 0 R >> >>"
+                .to_vec(),
+        ),
+        (
+            5,
+            b"<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Length 0 >>\nstream\n\nendstream"
+                .to_vec(),
+        ),
+    ]);
+    let mut pdf = open(bytes);
 
     // The helper owns the same qpdf NoRotate transform used by page flattening.
     let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));

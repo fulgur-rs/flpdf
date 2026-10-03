@@ -489,14 +489,14 @@ mod tests {
 
     #[test]
     fn object_comparison_skips_stream_payloads() {
-        let source = ObjectHandle::stream(
-            ObjectHandle::dictionary(Vec::new()),
-            Rc::new(b"source".to_vec()),
-        );
-        let emitted = ObjectHandle::stream(
-            ObjectHandle::dictionary(Vec::new()),
-            Rc::new(b"emitted".to_vec()),
-        );
+        let source_pdf = Pdf::empty().unwrap();
+        let emitted_pdf = Pdf::empty().unwrap();
+        let source = source_pdf
+            .new_stream_with_data(Rc::new(b"source".to_vec()))
+            .unwrap();
+        let emitted = emitted_pdf
+            .new_stream_with_data(Rc::new(b"emitted".to_vec()))
+            .unwrap();
         let mut visited = BTreeSet::new();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();

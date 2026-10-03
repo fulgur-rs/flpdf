@@ -79,7 +79,7 @@ use crate::writer::encryption_state::WriterEncryptionState;
 use crate::writer::object::TrailerKind;
 use crate::writer::object_streams::{
     emit_objstm_body_from_handles_with_writer, planner_config_from_options,
-    wrap_objstm_body_as_handle,
+    prepare_objstm_dictionary_and_data,
 };
 use crate::writer::plain::xref::write_xref_table_from_offsets;
 use crate::writer::write_object::WriteObject;
@@ -502,12 +502,7 @@ fn append_objstm_container_object<R: Read + Seek>(
         CompressStreams::No
     };
     let extends = preserved_objstm_extends(container, renumber, pdf)?;
-    let (stream_handle, data) = wrap_objstm_body_as_handle(body, compress, extends)?;
-    let stream_dict = stream_handle.as_stream_dict().ok_or_else(|| {
-        // cov:ignore-start: wrap_objstm_body_as_handle always returns a stream handle.
-        crate::Error::Internal("linearization ObjStm wrapper produced a non-stream handle".into())
-        // cov:ignore-end
-    })?; // cov:ignore: wrap_objstm_body_as_handle always returns a stream handle.
+    let (stream_dict, data) = prepare_objstm_dictionary_and_data(body, compress, extends)?;
     let object_ref = ObjectRef::new(container.container_new_num, 0);
     // PDF encryption applies to the ObjStm container stream as one stream
     // object. The member objects remain plaintext inside that encrypted
@@ -5684,7 +5679,7 @@ mod tests {
         let mut pdf = Pdf::empty().expect("empty PDF for source inspection");
         let source = ObjectRef::new(1, 0);
         let extends_target = pdf.get_object_handle(ObjectRef::new(9, 0));
-        let source_stream = ObjectHandle::stream(
+        let source_stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![
                 (b"Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
                 (b"Extends".to_vec(), extends_target),
@@ -5951,7 +5946,7 @@ mod tests {
     fn linearization_body_stream_and_objstm_paths_write_through_output_sink() {
         let mut pdf = Pdf::empty().expect("empty PDF for stream/ObjStm output");
         let stream_handle = pdf
-            .make_indirect_from_object_handle(ObjectHandle::stream(
+            .make_indirect_from_object_handle(ObjectHandle::direct_stream(
                 ObjectHandle::dictionary(Vec::new()),
                 Rc::new(b"stream-data".to_vec()),
             ))

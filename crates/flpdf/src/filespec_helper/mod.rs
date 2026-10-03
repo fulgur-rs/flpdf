@@ -286,7 +286,7 @@ mod tests {
         let raw_ref = ObjectRef::new(5, 65_535);
         pdf.replace_object(
             raw_ref,
-            ObjectHandle::stream(
+            ObjectHandle::direct_stream(
                 ObjectHandle::dictionary(Vec::new()),
                 std::rc::Rc::new(b"data".to_vec()),
             ),

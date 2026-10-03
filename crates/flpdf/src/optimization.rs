@@ -855,7 +855,7 @@ mod tests {
         let thumb_payload = pdf
             .make_indirect_from_object_handle(ObjectHandle::integer(10))
             .expect("thumbnail payload");
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![
                 (b"/Length".to_vec(), stream_length.clone()),
                 (b"/Filter".to_vec(), stream_filter.clone()),
@@ -1155,7 +1155,10 @@ mod tests {
             .update_object_maps(
                 &pdf,
                 ObjectUser::Root,
-                ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
+                ObjectHandle::direct_stream(
+                    ObjectHandle::dictionary(Vec::new()),
+                    Rc::new(Vec::new()),
+                ),
                 &mut no_stream_parameter_skip,
             )
             .expect("the test callback must be exercised by a stream");

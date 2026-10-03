@@ -48,7 +48,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             Rc::new(data.as_ref().to_vec()),
             Some(ObjectHandle::null()),
             Some(ObjectHandle::null()),
-        );
+        )?;
         Self::new_from_stream(stream)
     }
 

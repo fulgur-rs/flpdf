@@ -1,17 +1,15 @@
 use flpdf::{pipeline::PlString, DecodeLevel, ObjectHandle, ObjectRef, PageObjectHelper, Pdf};
 use std::rc::Rc;
+mod common;
 
 fn stream(data: &[u8]) -> ObjectHandle {
-    ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(data.to_vec()))
+    common::qpdf_owned_stream(data)
 }
 
 fn filtered_stream(filter: &[u8], data: &[u8]) -> ObjectHandle {
-    ObjectHandle::stream(
-        ObjectHandle::dictionary(vec![(
-            b"/Filter".to_vec(),
-            ObjectHandle::name(filter.to_vec()),
-        )]),
-        Rc::new(data.to_vec()),
+    common::qpdf_owned_stream_with_dict(
+        data,
+        vec![(b"/Filter".to_vec(), ObjectHandle::name(filter.to_vec()))],
     )
 }
 
@@ -258,7 +256,11 @@ fn pipe_page_contents_propagates_provider_errors_before_content_diagnostics() {
 
 #[test]
 fn pipe_content_streams_updates_the_full_qpdf_stream_description() {
-    let contents = ObjectHandle::array(vec![stream(b"a"), stream(b"b")]);
+    let first = stream(b"a");
+    let second = stream(b"b");
+    let first_ref = first.object_ref().expect("first qpdf stream identity");
+    let second_ref = second.object_ref().expect("second qpdf stream identity");
+    let contents = ObjectHandle::array(vec![first, second]);
     let mut output = Vec::new();
     let mut pipeline = PlString::new("content output", None, &mut output);
     let mut all_description = String::new();
@@ -268,7 +270,13 @@ fn pipe_content_streams_updates_the_full_qpdf_stream_description() {
         .unwrap();
 
     assert_eq!(output, b"a\nb");
-    assert_eq!(all_description, "page object 7 0 stream 0 0, stream 0 0");
+    assert_eq!(
+        all_description,
+        format!(
+            "page object 7 0 stream {} {}, stream {} {}",
+            first_ref.number, first_ref.generation, second_ref.number, second_ref.generation
+        )
+    );
 }
 
 #[test]

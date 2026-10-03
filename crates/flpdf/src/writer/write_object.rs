@@ -373,7 +373,7 @@ mod tests {
     }
 
     fn stream(data: &[u8]) -> ObjectHandle {
-        ObjectHandle::stream(
+        ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(
                 b"/Length".to_vec(),
                 ObjectHandle::integer(data.len() as i64),

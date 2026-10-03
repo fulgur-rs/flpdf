@@ -6251,7 +6251,7 @@ mod final_handle_tests {
             ObjectHandle::dictionary(entries)
         };
 
-        let filtered = ObjectHandle::stream(
+        let filtered = ObjectHandle::direct_stream(
             dictionary(Some(ObjectHandle::name(b"ASCIIHexDecode".to_vec())), 1),
             Rc::new(b"not-hex".to_vec()),
         );
@@ -6269,7 +6269,7 @@ mod final_handle_tests {
         )
         .is_err());
 
-        let short = ObjectHandle::stream(dictionary(None, 2), Rc::new(vec![0]));
+        let short = ObjectHandle::direct_stream(dictionary(None, 2), Rc::new(vec![0]));
         assert!(build_xref_stream(
             &mut context,
             11,
@@ -6300,7 +6300,7 @@ mod final_handle_tests {
             ),
             (b"/Size".to_vec(), ObjectHandle::integer(1)),
         ]);
-        let stream = ObjectHandle::stream(dictionary, Rc::new(Vec::new()));
+        let stream = ObjectHandle::direct_stream(dictionary, Rc::new(Vec::new()));
         let mut registration = XrefRegistration::default();
         let error = build_xref_stream(
             &mut context,
@@ -7194,7 +7194,7 @@ mod final_handle_tests {
 
     #[test]
     fn trailer_reference_collection_keeps_indirect_stream_children() {
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(
                 b"/Child".to_vec(),
                 ObjectHandle::new_indirect_unresolved(ObjectRef::new(7, 0), -1),
