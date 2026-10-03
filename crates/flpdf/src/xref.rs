@@ -6323,6 +6323,18 @@ mod final_handle_tests {
         }
     }
 
+    #[test]
+    fn fault_after_cursor_returns_zero_for_an_empty_read() {
+        let mut source = FaultAfterCursor {
+            cursor: std::io::Cursor::new(Vec::new()),
+            fail_at: 0,
+        };
+        assert_eq!(
+            std::io::Read::read(&mut source, &mut []).expect("empty read succeeds"),
+            0
+        );
+    }
+
     impl std::io::Seek for FaultAfterCursor {
         fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
             std::io::Seek::seek(&mut self.cursor, position)
@@ -6360,6 +6372,12 @@ mod final_handle_tests {
         assert_eq!(error.get_error_code(), QpdfErrorCode::System);
         assert_eq!(error.get_filename(), b"fault.pdf");
         assert_eq!(error.get_message_detail(), b"read 128 bytes");
+    }
+
+    #[test]
+    #[should_panic(expected = "resolver source read must retain its qpdf exception shape")]
+    fn trailer_source_error_assertion_rejects_non_qpdf_errors() {
+        assert_trailer_source_read_error(Error::Internal("wrong error shape".to_owned()));
     }
 
     struct FailingCanonicalOwner {
