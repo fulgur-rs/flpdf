@@ -5260,6 +5260,22 @@ input/update の overlay/underlayも `show-object` が観測する。
 は両入力経路の overlay/underlay + `show-object` を qpdf 11.9.0 と
 status/stdout/stderr 比較する。新しい bridgeや qpdf-deviation markerは追加しない。
 
+### JSON-input encryption-status inspection (`flpdf-6ik2q.26`, 2026-10-04)
+
+qpdf の `createQPDF` は status inspection の早期 return より前に
+`processFile` を呼び、`doProcessOnce` は main input かつ `json_input` の場合に
+`createFromJSON` を選ぶ。その後 `check_is_encrypted` / `check_requires_password`
+の分岐で戻るため、`updateFromJSON` や create-stage transformations は適用しない
+（`libqpdf/QPDFJob.cc:428-456,1699-1711`、
+`libqpdf/QPDFJob_config.cc:305-308`）。
+
+flpdf の `run_encryption_status` も `json_input` なら既存の
+`create_from_json_document` を使い、`finish_created_document` を通らずに
+暗号状態だけを返す。通常PDF入力は encryption-inspection openerを継続利用する。
+`job_lifecycle_tests.rs::json_input_encryption_status_opens_the_json_document` と
+`cli_job_json.rs::job_json_file_encryption_status_with_json_input_matches_qpdf` が
+`isEncrypted` / `requiresPassword` の終了コード・stdout・stderrをqpdf 11.9.0と比較する。
+
 ### Top-level attachment mutation with a single inspection (`flpdf-awthm`, 2026-09-15)
 
 qpdf's `createQPDF` always completes `handleTransformations`, including

@@ -3912,12 +3912,20 @@ impl QPDFJob {
                 return Ok(JobExitCode::Error);
             }
         };
-        let options = self.configured_open_options(self.configuration.password.clone());
-        let pdf = match self.open_for_encryption_inspection_with_description(
-            BufReader::new(file),
-            path_description_bytes(&input),
-            options,
-        ) {
+        let source: Box<dyn ReadSeek> = Box::new(BufReader::new(file));
+        let input_name = path_description_bytes(&input);
+        let open_result = if self.configuration.json_input {
+            // qpdf's processFile selects createFromJSON for a JSON main input
+            // before createQPDF's encryption-status early return
+            // (`libqpdf/QPDFJob.cc:455-456,1699-1711`). Use the same job
+            // document boundary here, but do not finish the document because
+            // status inspection returns before updateFromJSON and transforms.
+            self.create_from_json_document(source, input_name)
+        } else {
+            let options = self.configured_open_options(self.configuration.password.clone());
+            self.open_for_encryption_inspection_with_description(source, input_name, options)
+        };
+        let pdf = match open_result {
             Ok(pdf) => pdf,
             Err(error) => {
                 self.report_job_error(&error)?;

@@ -1930,6 +1930,44 @@ fn job_json_file_encryption_status_matches_qpdf() {
 }
 
 #[test]
+fn job_json_file_encryption_status_with_json_input_matches_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+    let json_input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/json-input/complete.json");
+
+    for status_key in ["isEncrypted", "requiresPassword"] {
+        let directory = tempfile::tempdir().unwrap();
+        fs::copy(&json_input, directory.path().join("input.json")).unwrap();
+        fs::write(
+            directory.path().join("job.json"),
+            format!(r#"{{"inputFile":"input.json","jsonInput":"","{status_key}":""}}"#),
+        )
+        .unwrap();
+
+        let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+            .current_dir(directory.path())
+            .arg("--job-json-file=job.json")
+            .output()
+            .unwrap();
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .current_dir(directory.path())
+            .arg("--job-json-file=job.json")
+            .output()
+            .unwrap();
+
+        assert_eq!(qpdf.status.code(), Some(2), "qpdf probe: {qpdf:?}");
+        assert_eq!(qpdf.stdout, b"", "qpdf probe: {qpdf:?}");
+        assert_eq!(qpdf.stderr, b"", "qpdf probe: {qpdf:?}");
+        assert_eq!(flpdf.status.code(), qpdf.status.code());
+        assert_eq!(flpdf.stdout, qpdf.stdout);
+        assert_eq!(flpdf.stderr, qpdf.stderr);
+    }
+}
+
+#[test]
 fn job_json_file_empty_encryption_status_matches_qpdf() {
     if !qpdf_available() {
         return;
