@@ -37,6 +37,7 @@ class DctComponentLimitDocumentationTests(unittest.TestCase):
         self.assertIn("Too many color components", dct_section)
         self.assertIn("Bogus marker length", dct_section)
         self.assertIn("Invalid component ID", dct_section)
+        self.assertIn("Windows同梱qpdf runtime", dct_section)
         self.assertIn("libqpdf/Pl_DCT.cc:297-326", dct_section)
 
 

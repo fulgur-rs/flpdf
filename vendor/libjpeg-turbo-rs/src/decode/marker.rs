@@ -10,6 +10,15 @@ use crate::common::huffman_table::HuffmanTable;
 use crate::common::quant_table::QuantTable;
 use crate::common::types::*;
 
+// The pinned qpdf 11.9.0 Windows package accepts SOS references to all frame
+// slots, while its Linux/macOS libjpeg-turbo 2.1.5 build searches only the
+// first MAX_COMPS_IN_SCAN slots (jdmarker.c:312-319). Keep that linked-runtime
+// difference separate from the four-components-per-SOS count limit.
+#[cfg(windows)]
+const MAX_SOS_FRAME_COMPONENT_LOOKUP: usize = MAX_COMPONENTS;
+#[cfg(not(windows))]
+const MAX_SOS_FRAME_COMPONENT_LOOKUP: usize = MAX_COMPONENTS_IN_SCAN;
+
 /// "ICC_PROFILE\0" identifier (12 bytes) in APP2 markers.
 const ICC_PROFILE_HEADER: &[u8; 12] = b"ICC_PROFILE\0";
 
@@ -345,13 +354,12 @@ impl<'a> MarkerReader<'a> {
                     // at scan 8 in milliseconds while we ground through all
                     // of it (libFuzzer timeout, P4-37).
                     //
-                    // C's `get_sos` searches only `ci < MAX_COMPS_IN_SCAN`
-                    // (`jdmarker.c:312-319`) and guards
-                    // `!cinfo->cur_comp_info[ci]` while storing matches at
-                    // scan slot `i`. Thus only the first four frame slots are
-                    // searchable, and the guard also requires frame index >=
-                    // scan position. Preserve this ordering plus duplicate
-                    // component rejection below.
+                    // Linux/macOS libjpeg-turbo 2.1.5 `get_sos` searches only
+                    // `ci < MAX_COMPS_IN_SCAN` (`jdmarker.c:312-319`); the
+                    // pinned Windows qpdf package accepts every SOF slot.
+                    // In either case C requires frame index >= scan position
+                    // and rejects duplicate components. Preserve the observed
+                    // runtime bound plus that shared ordering below.
                     if let Some(f) = frame.as_ref() {
                         // Fixed-size scratch: read_sos caps scan components
                         // at MAX_COMPONENTS_IN_SCAN, and this runs per SOS on the
@@ -363,7 +371,7 @@ impl<'a> MarkerReader<'a> {
                                 .components
                                 .iter()
                                 .enumerate()
-                                .take(MAX_COMPONENTS_IN_SCAN)
+                                .take(MAX_SOS_FRAME_COMPONENT_LOOKUP)
                                 .skip(scan_pos)
                                 .find(|(_, frame_comp)| frame_comp.id == scan_comp.component_id)
                             {

@@ -112,7 +112,7 @@ fn default_dct_rejects_frames_over_libjpeg_limit_like_qpdf() {
 }
 
 #[test]
-fn default_dct_rejects_sos_components_after_libjpeg_scan_index_limit_like_qpdf() {
+fn default_dct_matches_qpdf_sos_component_lookup_behavior() {
     if !qpdf_is_available() {
         return;
     }
@@ -122,14 +122,6 @@ fn default_dct_rejects_sos_components_after_libjpeg_scan_index_limit_like_qpdf()
         "/tests/fixtures/dct-5-component-sos-id-five.pdf"
     ));
     let qpdf = filtered_data("qpdf", fixture);
-    assert_eq!(qpdf.status.code(), Some(3), "qpdf: {qpdf:?}");
-    assert!(qpdf.stdout.is_empty(), "qpdf: {qpdf:?}");
-    assert!(
-        String::from_utf8_lossy(&qpdf.stderr).contains("Invalid component ID 5 in SOS"),
-        "qpdf diagnostic: {}",
-        String::from_utf8_lossy(&qpdf.stderr)
-    );
-
     let flpdf = filtered_data(env!("CARGO_BIN_EXE_flpdf"), fixture);
     assert_eq!(flpdf.status.code(), qpdf.status.code(), "flpdf: {flpdf:?}");
     assert_eq!(flpdf.stdout, qpdf.stdout);
@@ -139,6 +131,18 @@ fn default_dct_rejects_sos_components_after_libjpeg_scan_index_limit_like_qpdf()
             .replace("flpdf: operation", "<tool>: operation")
     };
     assert_eq!(normalize_tool(&flpdf.stderr), normalize_tool(&qpdf.stderr));
+    if qpdf.status.code() == Some(3) {
+        assert!(qpdf.stdout.is_empty(), "qpdf: {qpdf:?}");
+        assert!(
+            String::from_utf8_lossy(&qpdf.stderr).contains("Invalid component ID 5 in SOS"),
+            "qpdf diagnostic: {}",
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+    } else {
+        assert_eq!(qpdf.status.code(), Some(0), "qpdf: {qpdf:?}");
+        assert_eq!(qpdf.stdout.len(), 5);
+        assert!(qpdf.stderr.is_empty(), "qpdf: {qpdf:?}");
+    }
 }
 
 #[test]

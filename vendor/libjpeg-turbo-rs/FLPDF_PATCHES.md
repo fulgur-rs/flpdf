@@ -8,8 +8,9 @@ The local changes keep the Rust decoder aligned with the libjpeg linked by
 qpdf 11.9.0:
 
 - Frame parsing accepts the linked libjpeg limit of ten components, while SOS
-  parsing retains the independent four-components-per-scan limit and the C
-  `get_sos` lookup bound to the first four frame slots.
+  parsing retains the independent four-components-per-scan limit. The SOS
+  frame-ID lookup bound matches the qpdf package for each target: first four
+  frame slots on Linux/macOS, all ten on Windows.
 - Huffman, progressive, and arithmetic DC predictor state is indexed for all
   ten frame components.
 - The color-converted `Image` API returns `Unsupported` above four channels
@@ -19,7 +20,8 @@ qpdf 11.9.0:
   10`, matching libjpeg's component-count diagnostic.
 - SOS length/count failures and component IDs outside the first four frame
   slots preserve libjpeg's `Bogus marker length` and `Invalid component ID N in
-  SOS` diagnostics.
+  SOS` diagnostics on Linux/macOS. Windows follows its qpdf package's broader
+  SOS frame-ID lookup.
 
 The DCT pipeline in flpdf owns qpdf's default output behavior for unknown
 color spaces: it interleaves the decoded planes in frame order. The canonical
