@@ -111,3 +111,40 @@ fn linearized_generate_accepts_502_programmatic_direct_array_levels() {
     assert!(output.len() > 3_000);
     assert_eq!(serialized_deep_value_depth(&output), 502);
 }
+
+/// qpdf 11.9.0 writes 5,000 direct array levels in every linearized mode (its
+/// writer has no nesting limit and it only crashes past roughly 8,000 levels
+/// on an 8 MiB stack). Run the Rust writer on libtest's small default thread
+/// stack so every recursive walk on the linearized path must grow its own
+/// stack instead of overflowing.
+fn linearized_deep_write(object_streams: ObjectStreamMode) {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/one-page.pdf");
+    let mut pdf = Pdf::open_mem_owned(std::fs::read(fixture).expect("read one-page fixture"))
+        .expect("open one-page fixture in memory");
+    pdf.root_handle()
+        .expect("get Catalog")
+        .replace_key(b"/Deep", nested_direct_array(5_000))
+        .expect("install programmatic direct graph");
+
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_output_memory().expect("select memory output");
+    writer.set_object_stream_mode(object_streams);
+    writer.set_linearization(true);
+    writer
+        .write()
+        .expect("qpdf linearized writer has no direct nesting cap");
+
+    let output = writer.get_buffer().expect("completed write retains output");
+    assert_eq!(serialized_deep_value_depth(&output), 5_000);
+}
+
+#[test]
+fn linearized_writer_grows_its_stack_for_5000_direct_array_levels() {
+    linearized_deep_write(ObjectStreamMode::Disable);
+}
+
+#[test]
+fn linearized_generate_grows_its_stack_for_5000_direct_array_levels() {
+    linearized_deep_write(ObjectStreamMode::Generate);
+}

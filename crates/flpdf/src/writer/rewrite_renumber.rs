@@ -593,7 +593,27 @@ struct ResurrectableWalkState<'a> {
     removed_refs: &'a BTreeSet<ObjectRef>,
 }
 
+const RESURRECTABLE_WALK_STACK_RED_ZONE: usize = 32 * 1024;
+const RESURRECTABLE_WALK_STACK_GROWTH_SIZE: usize = 1024 * 1024;
+
+/// One level of the recursive direct-container walk, run on a Rust stack
+/// segment large enough for deep direct containers. qpdf's
+/// `getCompressibleObjGens` and writer traversals have no direct-nesting
+/// limit, so this walk grows the stack instead of rejecting deep input.
 fn walk_resurrectable_handle(
+    handle: &crate::ObjectHandle,
+    in_array: bool,
+    edge_context: bool,
+    state: &mut ResurrectableWalkState<'_>,
+) -> crate::Result<()> {
+    stacker::maybe_grow(
+        RESURRECTABLE_WALK_STACK_RED_ZONE,
+        RESURRECTABLE_WALK_STACK_GROWTH_SIZE,
+        || walk_resurrectable_handle_level(handle, in_array, edge_context, state),
+    )
+}
+
+fn walk_resurrectable_handle_level(
     handle: &crate::ObjectHandle,
     in_array: bool,
     edge_context: bool,
