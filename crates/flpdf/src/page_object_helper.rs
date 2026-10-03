@@ -2400,15 +2400,15 @@ mod tests {
         let dictionary = form.try_get_stream_dict()?;
         dictionary.replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))?;
         dictionary.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))?;
-        dictionary.replace_key(
-            b"/BBox",
-            ObjectHandle::array(vec![
-                ObjectHandle::integer(0),
-                ObjectHandle::integer(0),
-                ObjectHandle::integer(200),
-                ObjectHandle::integer(200),
-            ]),
-        )?;
+        let bounding_box = ObjectHandle::array(vec![
+            ObjectHandle::integer(0),
+            ObjectHandle::integer(0),
+            ObjectHandle::integer(200),
+            ObjectHandle::integer(200),
+        ]);
+        dictionary
+            .replace_key(b"/BBox", bounding_box)
+            .expect("new Form stream dictionary accepts /BBox");
         dictionary.replace_key(b"/Resources", ObjectHandle::dictionary(Vec::new()))?;
 
         externalize_inline_images_for_target(&mut pdf, form.clone(), "form object", 0)?;
