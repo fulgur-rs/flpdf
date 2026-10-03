@@ -3824,14 +3824,14 @@ fn parse_xref_table(
             }
             let offset = match qpdf_string_to_ll_checked(parsed.field1) {
                 QpdfLongLongParse::Value(value) => value,
-                QpdfLongLongParse::NoDigits => 0,
+                QpdfLongLongParse::NoDigits => 0, // cov:ignore: parse_xref_entry_line requires field1 to start with an ASCII digit (QPDF.cc:782-787)
                 QpdfLongLongParse::Overflow(message) => {
                     return Err(qpdf_read_xref_conversion_error(filename, &message));
                 }
             };
             let generation = match qpdf_string_to_int_checked(parsed.field2) {
                 QpdfIntParse::Value(value) => value,
-                QpdfIntParse::NoDigits => 0,
+                QpdfIntParse::NoDigits => 0, // cov:ignore: parse_xref_entry_line requires field2 to start with an ASCII digit (QPDF.cc:802-807)
                 QpdfIntParse::Overflow(message) => {
                     return Err(qpdf_read_xref_conversion_error(filename, &message));
                 }
@@ -3938,21 +3938,21 @@ fn parse_xref_first_line_with_bytes(
         return Ok(None);
     };
     let Ok(count_text) = std::str::from_utf8(&line[count_start..pos]) else {
-        return Ok(None);
+        return Ok(None); // cov:ignore: count_start..pos contains only bytes accepted by the ASCII-digit scan above
     };
     // qpdf converts `obj` before `num` (`QPDF.cc:764-765`) through the
     // signed-int primitive; a range failure is caught by QPDF::parse as
     // `error reading xref`, not rejected as subsection syntax.
     let first = match qpdf_string_to_int_checked(first_text) {
         QpdfIntParse::Value(value) => value,
-        QpdfIntParse::NoDigits => 0,
+        QpdfIntParse::NoDigits => 0, // cov:ignore: first_start..first_end contains only bytes accepted by the ASCII-digit scan above
         QpdfIntParse::Overflow(message) => {
             return Err(qpdf_read_xref_conversion_error(filename, &message));
         }
     };
     let count = match qpdf_string_to_int_checked(count_text) {
         QpdfIntParse::Value(value) => value,
-        QpdfIntParse::NoDigits => 0,
+        QpdfIntParse::NoDigits => 0, // cov:ignore: count_start..pos contains only bytes accepted by the ASCII-digit scan above
         QpdfIntParse::Overflow(message) => {
             return Err(qpdf_read_xref_conversion_error(filename, &message));
         }
