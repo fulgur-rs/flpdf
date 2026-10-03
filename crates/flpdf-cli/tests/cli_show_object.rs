@@ -1,6 +1,7 @@
 //! qpdf 11.9.0 `--show-object` selector and stream-output parity tests.
 
 use assert_cmd::Command;
+use std::process::Command as ShellCommand;
 use std::process::Output;
 
 #[path = "support/eol.rs"]
@@ -34,6 +35,55 @@ fn flpdf(args: &[&str]) -> Output {
         .args(args)
         .output()
         .unwrap()
+}
+
+fn tiff_predictor_wrapped_geometry_pdf() -> Vec<u8> {
+    const FLATE_ABCD: &[u8] = &[
+        0x78, 0x9c, 0x4b, 0x4c, 0x4a, 0x4e, 0x01, 0x00, 0x03, 0xd8, 0x01, 0x8b,
+    ];
+
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (object_number, body) in [
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (2, b"<< /Type /Pages /Count 0 /Kids [] >>".to_vec()),
+        (
+            3,
+            [
+                format!(
+                    "<< /Length {} /Filter /FlateDecode /DecodeParms << /Predictor 2 /Colors 4 /BitsPerComponent 8 /Columns 1073741825 >> >>\nstream\n",
+                    FLATE_ABCD.len()
+                )
+                .as_bytes(),
+                FLATE_ABCD,
+                b"\nendstream",
+            ]
+            .concat(),
+        ),
+    ] {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(format!("{object_number} 0 obj\n").as_bytes());
+        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
+fn qpdf_11_9_available() -> bool {
+    let Ok(output) = ShellCommand::new("qpdf").arg("--version").output() else {
+        return false;
+    };
+    let version = String::from_utf8_lossy(&output.stdout);
+    output.status.success() && version.lines().next().map(str::trim) == Some("qpdf version 11.9.0")
 }
 
 #[test]
@@ -122,6 +172,42 @@ fn show_object_stream_matches_qpdf_default_raw_and_filtered_modes() {
     let filtered = flpdf(&["--show-object=4", "--filtered-stream-data", MULTI_STREAM]);
     assert!(filtered.status.success(), "{:?}", filtered.stderr);
     assert_eq!(filtered.stdout, b"q 1 0 0 1 0 0 cm");
+}
+
+#[test]
+fn tiff_predictor_row_geometry_wraps_like_qpdf_11_9_0() {
+    if !qpdf_11_9_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("qpdf 11.9.0 is required for the TIFF predictor arithmetic oracle test");
+        }
+        eprintln!("qpdf 11.9.0 not available; skipping TIFF predictor arithmetic parity test");
+        return;
+    }
+
+    let directory = tempfile::tempdir().expect("create TIFF predictor fixture directory");
+    let path = directory.path().join("tiff-predictor-wrap.pdf");
+    std::fs::write(&path, tiff_predictor_wrapped_geometry_pdf())
+        .expect("write TIFF predictor fixture");
+    let path_arg = path.to_str().expect("temporary path is UTF-8");
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-object=3", "--filtered-stream-data"])
+        .arg(&path)
+        .output()
+        .expect("run qpdf filtered stream inspection");
+    assert_eq!(qpdf.status.code(), Some(0));
+    assert_eq!(qpdf.stdout, b"abcd");
+    assert!(qpdf.stderr.is_empty());
+
+    let flpdf = flpdf(&["--show-object=3", "--filtered-stream-data", path_arg]);
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "flpdf rejected qpdf 11.9.0's wrapped TIFF row width:\n{}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
 }
 
 #[test]
