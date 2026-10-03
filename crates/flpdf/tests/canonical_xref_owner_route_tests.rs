@@ -1257,31 +1257,62 @@ fn startxref_candidate_search_falls_back_by_qpdf_token_predicate() {
         .windows(b"xref\n0 4\n".len())
         .position(|window| window == b"xref\n0 4\n")
         .expect("the base fixture has a classic xref table");
-    let suffix_token_without_left_boundary = format!("notstartxref\n{xref_offset}\n").into_bytes();
+    let directory = tempfile::tempdir().expect("create qpdf fixture directory");
+    let open = |bytes: Vec<u8>, description: &str| {
+        Pdf::open_with_options(
+            Cursor::new(bytes),
+            PdfOpenOptions {
+                repair: true,
+                suppress_warnings: true,
+                description: description.as_bytes().to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("the canonical loader must use qpdf's startxref candidate predicate")
+    };
+    // Every case below must resolve to this table without recovery: the
+    // `startxref` that qpdf's `findLast` + `findStartxref` accept points at
+    // the real section.
+    let expected_rows = {
+        let pdf = open(base.clone(), "base.pdf");
+        assert!(pdf.repair_diagnostics().entries().is_empty());
+        render_xref_table(&pdf.get_xref_table())
+    };
+    // qpdf's findLast searches the byte substring, then applies
+    // findStartxref at that byte. It has no separate left-boundary test, so
+    // the `startxref` inside `notstartxref` is the last accepted candidate.
+    // The earlier, whole-word marker in this fixture points at a bogus
+    // offset: an implementation that rejected the embedded substring would
+    // fall back to it and have to reconstruct the table.
+    let bogus_then_suffix = {
+        let mut bytes = classic_xref_document(b"", Some(b"1\n"));
+        bytes.extend_from_slice(format!("notstartxref\n{xref_offset}\n").as_bytes());
+        bytes
+    };
     let cases = [
         (
             "later-noninteger-startxref.pdf",
-            b"startxref\nnot-an-integer\n".to_vec(),
+            [base.as_slice(), b"startxref\nnot-an-integer\n"].concat(),
         ),
         (
             "startxref-with-attached-digits.pdf",
-            b"startxref123\n9\n".to_vec(),
+            [base.as_slice(), b"startxref123\n9\n"].concat(),
         ),
-        // qpdf's findLast searches the byte substring, then applies
-        // findStartxref at that byte. It has no separate left-boundary test.
-        (
-            "startxref-suffix-of-word.pdf",
-            suffix_token_without_left_boundary,
-        ),
+        ("startxref-suffix-of-word.pdf", bogus_then_suffix),
     ];
-    let directory = tempfile::tempdir().expect("create qpdf fixture directory");
 
-    for (name, suffix) in cases {
-        let mut fixture = base.clone();
-        fixture.extend_from_slice(&suffix);
+    for (name, fixture) in cases {
         let input = directory.path().join(name);
         fs::write(&input, &fixture).expect("write qpdf fixture");
         let description = input.to_string_lossy().into_owned();
+
+        let pdf = open(fixture, &description);
+        assert!(
+            pdf.repair_diagnostics().entries().is_empty(),
+            "the accepted startxref candidate must not trigger recovery for {name}"
+        );
+        let rows = render_xref_table(&pdf.get_xref_table());
+        assert_eq!(rows, expected_rows, "{name}");
 
         if !qpdf_available() {
             eprintln!("qpdf 11.9.0 is not available; skipping only the oracle comparison");
@@ -1295,7 +1326,7 @@ fn startxref_candidate_search_falls_back_by_qpdf_token_predicate() {
         assert_eq!(
             qpdf.status.code(),
             Some(0),
-            "qpdf must fall back to the last candidate accepted by findStartxref for {name}"
+            "qpdf must use the last candidate accepted by findStartxref for {name}"
         );
         let qpdf_warnings: Vec<String> = String::from_utf8_lossy(&qpdf.stderr)
             .lines()
@@ -1311,26 +1342,7 @@ fn startxref_candidate_search_falls_back_by_qpdf_token_predicate() {
             .filter(|line| line.contains(": uncompressed;") || line.contains(": compressed;"))
             .map(str::to_owned)
             .collect();
-
-        let pdf = Pdf::open_with_options(
-            Cursor::new(fixture),
-            PdfOpenOptions {
-                repair: true,
-                suppress_warnings: true,
-                description: description.as_bytes().to_vec(),
-                ..PdfOpenOptions::default()
-            },
-        )
-        .expect("the canonical loader must use qpdf's startxref candidate predicate");
-        assert!(
-            pdf.repair_diagnostics().entries().is_empty(),
-            "a rejected trailing marker must not trigger unnecessary recovery for {name}"
-        );
-        assert_eq!(
-            render_xref_table(&pdf.get_xref_table()),
-            qpdf_rows,
-            "{name}"
-        );
+        assert_eq!(rows, qpdf_rows, "{name}");
     }
 }
 
