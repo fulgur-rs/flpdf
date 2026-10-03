@@ -282,6 +282,37 @@ and exit status as qpdf 11.9.0. The same live-source regression also checks
 `readTrailer`'s post-dictionary `stream` warning; a malformed hex-string
 candidate checks trailer parser warning bytes and offsets.
 
+### Initial PDF header candidate search (`flpdf-6ik2q.12`, 2026-10-03)
+
+`QPDF::parse` calls `InputSource::findFirst("%PDF-", 0, 1024, PatternFinder)`
+before it seeks to EOF for the `startxref` scan (`libqpdf/QPDF.cc:430-442`).
+`findFirst` limits candidate start positions to the first 1024 bytes. When a
+marker straddles its current 1024-byte read block, it rereads from the
+candidate position; the `QPDF::findHeader` predicate then calls
+`InputSource::readLine(1024)` from that position, independent of the original
+search block (`libqpdf/InputSource.cc:21-40,44-140`; `libqpdf/QPDF.cc:388-406`).
+It parses the PDF version on those candidate-local bytes and consumes the
+complete CR/LF run before continuing (`libqpdf/FileInputSource.cc:53-81`). An
+invalid version rejects that candidate and continues to the next marker. A
+valid nonzero candidate installs `OffsetInputSource`, which rebases later
+positions; when no candidate is accepted, qpdf records `can't find PDF header`,
+defaults to version `1.2`, and continues parsing (`libqpdf/QPDF.cc:402-406,430-437`;
+`libqpdf/OffsetInputSource.cc:7-40`).
+
+If a source read fails, `FileInputSource::read` raises `QPDFExc(qpdf_e_system)`
+with the source name, current last offset, and requested byte count
+(`libqpdf/FileInputSource.cc:116-132`). The C API preserves that `QPDFExc`
+instead of rebuilding it as an offsetless runtime error (`libqpdf/qpdf-c.cc:69-78`).
+The flpdf initial-header read now propagates the owner's corresponding system
+exception unchanged; the canonical regression checks filename, offset, and
+`read 1024 bytes` detail.
+
+The canonical xref loader now performs this search on its live source instead
+of passing the clipped first-1024-byte snapshot to the version parser. Its
+regression fixture includes an invalid first candidate and a valid `%PDF-1.7`
+candidate at byte 1020; flpdf and qpdf 11.9.0 agree on version, `/Root`, xref
+rows, warnings, and `--show-xref` exit status.
+
 ### `startxref` candidate predicate and fallback (`flpdf-6ik2q.11`, 2026-10-03)
 
 `QPDF::parse` limits marker discovery to the final 1054 bytes and uses

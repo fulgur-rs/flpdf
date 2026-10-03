@@ -99,6 +99,7 @@ pub(crate) trait CanonicalTrailerOwner {
     /// Xref loading uses these operations instead of a complete input
     /// snapshot.
     fn source_seek(&self, offset: u64) -> Result<()>;
+    fn source_seek_end(&self) -> Result<u64>;
     fn source_tell(&self) -> Result<u64>;
     fn source_length(&self) -> Result<u64>;
     fn source_read(&self, buffer: &mut [u8]) -> Result<usize>;
@@ -166,6 +167,10 @@ impl<R: Read + Seek + 'static> CanonicalTrailerOwner for ResolverHandle<R> {
 
     fn source_seek(&self, offset: u64) -> Result<()> {
         self.seek(offset)
+    }
+
+    fn source_seek_end(&self) -> Result<u64> {
+        ResolverHandle::seek_end(self)
     }
 
     fn source_tell(&self) -> Result<u64> {
@@ -1040,21 +1045,16 @@ pub(crate) fn load_xref_state_from_source(
     owner: &dyn CanonicalTrailerOwner,
     options: XrefLoadOptions,
 ) -> Result<LoadedXrefState> {
-    let physical_length = owner.source_length()?;
-    let prefix_length = usize::try_from(physical_length.min(1024)).unwrap_or(1024);
-    let prefix = match read_live_source_range(owner, 0, prefix_length) {
-        Err(Error::QpdfExc(exception)) if exception.get_error_code() == QpdfErrorCode::System => {
-            // qpdf's processFile C wrapper catches the initial FileInputSource
-            // runtime error rather than a QPDFExc (`qpdf-c.cc:70-79`), so this
-            // initial read retains its empty-location SystemBytes shape.
-            let mut message = options.description.clone();
-            message.extend_from_slice(b": read 1024 bytes");
-            return Err(Error::SystemBytes(message));
-        }
-        other => other?,
-    };
+    // qpdf's `QPDF::parse` searches the live InputSource for the header before
+    // it seeks to EOF to find `startxref` (`QPDF.cc:430-442`). Read the same
+    // first InputSource block here; candidate checks may then read from the
+    // candidate's own source position, even when it straddles this block.
+    owner.source_seek(0)?;
+    let mut header_search_block = vec![0; 1024];
+    let header_search_bytes = owner.source_read(&mut header_search_block)?;
+    header_search_block.truncate(header_search_bytes);
     let mut initial_diagnostics = Diagnostics::default();
-    let (version, header_offset) = match find_qpdf_header(&prefix) {
+    let (version, header_offset) = match find_qpdf_header(owner, &header_search_block)? {
         Some((offset, version)) => (version, offset),
         None => {
             initial_diagnostics.push(damaged_warning(
@@ -1069,7 +1069,10 @@ pub(crate) fn load_xref_state_from_source(
     owner.set_header_offset(header_offset);
     deliver_canonical_diagnostics(owner, &mut initial_diagnostics)?;
 
-    let logical_length = physical_length.saturating_sub(header_offset as u64);
+    // This corresponds to `QPDF::parse`'s seek-to-end after its header search.
+    // Once `header_offset` is installed, the owner reports qpdf's logical
+    // OffsetInputSource length directly.
+    let logical_length = owner.source_seek_end()?;
     let tail_length = usize::try_from(logical_length.min(1054)).unwrap_or(1054);
     let tail_start = logical_length.saturating_sub(tail_length as u64);
     let tail = read_live_source_range(owner, tail_start, tail_length)?;
@@ -4511,24 +4514,137 @@ fn parse_usize(value: u64, name: &str) -> Result<usize> {
     usize::try_from(value).map_err(|_| Error::parse(0, format!("{name} does not fit usize")))
 }
 
-fn find_qpdf_header(bytes: &[u8]) -> Option<(usize, String)> {
-    let search_end = bytes.len().min(1024);
-    (0..search_end).find_map(|offset| {
-        if !bytes[offset..].starts_with(b"%PDF-") {
-            return None;
+fn read_qpdf_input_block(
+    owner: &dyn CanonicalTrailerOwner,
+    offset: u64,
+    length: usize,
+) -> Result<Vec<u8>> {
+    owner.source_seek(offset)?;
+    let mut bytes = vec![0; length];
+    let bytes_read = owner.source_read(&mut bytes)?;
+    bytes.truncate(bytes_read);
+    Ok(bytes)
+}
+
+/// Consume through the next CR/LF run like `FileInputSource::findAndSkipNextEOL`
+/// (`libqpdf/FileInputSource.cc:53-81`). `InputSource::readLine` performs this
+/// after its bounded line read, so long header lines still advance the live
+/// source before `QPDF::parse` seeks to EOF.
+fn skip_qpdf_input_line(owner: &dyn CanonicalTrailerOwner) -> Result<()> {
+    const EOL_SCAN_SIZE: usize = 10 * 1024;
+
+    loop {
+        let block_offset = owner.source_tell()?;
+        let mut block = vec![0; EOL_SCAN_SIZE];
+        let bytes_read = owner.source_read(&mut block)?;
+        if bytes_read == 0 {
+            return Ok(());
         }
-        parse_qpdf_header_version(&bytes[offset..]).map(|version| (offset, version))
-    })
+        let Some(eol) = block[..bytes_read]
+            .iter()
+            .position(|byte| matches!(byte, b'\r' | b'\n'))
+        else {
+            continue;
+        };
+
+        let mut next = block_offset.saturating_add(eol as u64).saturating_add(1);
+        owner.source_seek(next)?;
+        loop {
+            let mut byte = [0; 1];
+            if owner.source_read(&mut byte)? == 0 {
+                return Ok(());
+            }
+            if !matches!(byte[0], b'\r' | b'\n') {
+                // qpdf's unreadCh puts the first non-EOL byte back after it
+                // finishes consuming the complete line-ending run.
+                owner.source_seek(next)?;
+                return Ok(());
+            }
+            next = next.saturating_add(1);
+        }
+    }
+}
+
+/// `InputSource::readLine(1024)` reads from the candidate itself, then seeks
+/// back to that position to consume the full line ending. The candidate search
+/// window does not cap this second read (`InputSource.cc:21-40`).
+fn read_qpdf_header_line(owner: &dyn CanonicalTrailerOwner, offset: u64) -> Result<Vec<u8>> {
+    const HEADER_LINE_READ_SIZE: usize = 1024;
+
+    let line = read_qpdf_input_block(owner, offset, HEADER_LINE_READ_SIZE)?;
+    owner.source_seek(offset)?;
+    skip_qpdf_input_line(owner)?;
+    owner.set_source_last_offset(offset);
+    Ok(line)
+}
+
+/// Port qpdf's `InputSource::findFirst("%PDF-", 0, 1024, finder)` search and
+/// `QPDF::findHeader` predicate in source order. The 1024-byte length limits
+/// candidate start positions. If a marker straddles a search block, qpdf
+/// rereads from that candidate; once matched, `findHeader` reads a separate
+/// 1024-byte line window from the candidate position.
+fn find_qpdf_header(
+    owner: &dyn CanonicalTrailerOwner,
+    first_block: &[u8],
+) -> Result<Option<(usize, String)>> {
+    const HEADER_MARKER: &[u8] = b"%PDF-";
+    const FIND_BLOCK_SIZE: usize = 1024;
+    const HEADER_SEARCH_LENGTH: usize = 1024;
+
+    if first_block.len() < HEADER_MARKER.len() {
+        return Ok(None);
+    }
+
+    let mut block = first_block.to_vec();
+    let mut block_offset = 0usize;
+    let mut position = 0usize;
+    loop {
+        if position.saturating_add(HEADER_MARKER.len()) > block.len() {
+            block_offset = block_offset.saturating_add(position);
+            block = read_qpdf_input_block(owner, block_offset as u64, FIND_BLOCK_SIZE)?;
+            if block.len() < HEADER_MARKER.len() {
+                return Ok(None);
+            }
+            position = 0;
+        }
+
+        let Some(relative) = block[position..]
+            .iter()
+            .position(|byte| *byte == HEADER_MARKER[0])
+        else {
+            position = block.len();
+            continue;
+        };
+        let candidate_in_block = position + relative;
+        let candidate_offset = block_offset.saturating_add(candidate_in_block);
+        if candidate_offset >= HEADER_SEARCH_LENGTH {
+            return Ok(None);
+        }
+        if candidate_in_block.saturating_add(HEADER_MARKER.len()) > block.len() {
+            // qpdf's findFirst advances the next block start to this candidate
+            // before checking a pattern that crosses the current buffer.
+            position = candidate_in_block;
+            continue;
+        }
+
+        if block[candidate_in_block..].starts_with(HEADER_MARKER) {
+            let line = read_qpdf_header_line(owner, candidate_offset as u64)?;
+            if let Some(version) = parse_qpdf_header_version(&line) {
+                return Ok(Some((candidate_offset, version)));
+            }
+        }
+        // A matched but invalid version is a rejected Finder candidate, so
+        // qpdf continues from the following byte in the current search block.
+        position = candidate_in_block.saturating_add(1);
+    }
 }
 
 fn parse_qpdf_header_version(bytes: &[u8]) -> Option<String> {
-    // `QPDF::findHeader` calls `readLine(1024)`, so a dot/version component
-    // beyond that candidate-local window must not make an otherwise invalid
-    // candidate valid.
+    // `QPDF::findHeader` validates the C string returned by `readLine(1024)`.
     let line = &bytes[..bytes.len().min(1024)];
     let line_end = line
         .iter()
-        .position(|byte| *byte == b'\n' || *byte == b'\r')
+        .position(|byte| matches!(byte, 0 | b'\n' | b'\r'))
         .unwrap_or(line.len());
     let version = line.get(5..line_end)?;
     let major_end = version
@@ -6480,6 +6596,11 @@ mod final_handle_tests {
             .map_err(Error::Io)
         }
 
+        fn source_seek_end(&self) -> Result<u64> {
+            std::io::Seek::seek(&mut *self.source.borrow_mut(), std::io::SeekFrom::End(0))
+                .map_err(Error::Io)
+        }
+
         fn source_tell(&self) -> Result<u64> {
             Ok(self.source.borrow().position())
         }
@@ -6663,6 +6784,11 @@ mod final_handle_tests {
             source_read_failure: false,
             accept_warnings: None,
         };
+        assert_eq!(
+            owner.source_seek_end().expect("source EOF position"),
+            0,
+            "the empty failure-injection source implements qpdf's seek-to-end"
+        );
         let mut input = owner.source_live_input();
         assert_eq!(input.tell().expect("source position"), 0);
         assert_eq!(input.read_byte().expect("source EOF"), None);

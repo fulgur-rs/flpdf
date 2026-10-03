@@ -37,6 +37,7 @@ qpdf 11.9.0 pinned source。以下の行範囲はすべて `rg -n` / `sed -n` / 
 1. **`QPDF::parse(password)`**（`libqpdf/QPDF.cc:424-473`）
    - `%PDF-` を先頭 1024 byte から探し、無ければ `warn(damagedPDF("", 0, "can't find PDF header"))` して
      `pdf_version = "1.2"`（`libqpdf/QPDF.cc:430-437`）。**throw しない**。
+   - header 探索は `InputSource::findFirst("%PDF-", 0, 1024, finder)` なので、1024-byte 制限は候補の開始位置にかかる。marker が read block を跨ぐ場合は候補位置から block を読み直し、`QPDF::findHeader` は候補位置から別途 `readLine(1024)` して版番号を検証する（`libqpdf/InputSource.cc:21-40,44-140`; `libqpdf/QPDF.cc:388-406`）。`readLine` は候補位置から次の CR/LF run まで source も進める（`libqpdf/FileInputSource.cc:53-81`）。有効な非0候補だけ `OffsetInputSource` で後続 offset を rebasing する。無効候補は次の `%PDF-` を探す。
    - 末尾 1054 byte の raw substring を `InputSource::findLast` で走査し、各候補を `QPDF::findStartxref` predicate に渡す（`libqpdf/QPDF.cc:413-419,439-448`; `InputSource.cc:44-140,145-165`）。predicate は候補位置から `readToken` した第1 token が完全な `startxref` word、第2 token が integer の場合だけ受理し、成功時は offset token の開始位置へ戻す。不正候補は検索を継続して直前の有効候補に fallback する。候補より左のword boundaryは別途検査しない。
    - `xref_offset == 0` なら `throw damagedPDF("", 0, "can't find startxref")`。内側 try が
      `read_xref` を包み、`QPDFExc` は素通し、その他 `std::exception` は
