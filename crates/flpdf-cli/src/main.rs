@@ -3792,7 +3792,11 @@ fn run_top_level_page_selection_inspection(
     job.set_verbose(args.verbose);
     configure_top_level_inspection_job(&mut job, args)?;
     configure_cli_overlay_specs(&mut job, overlay_specs)?;
-    if args.show_attachment.is_some() {
+    if args
+        .show_attachment
+        .as_ref()
+        .is_some_and(|key| !arg_parser::os_bytes(key.as_os_str()).is_empty())
+    {
         // qpdf reserves the save pipeline inside checkConfiguration
         // (`QPDFJob.cc:621-626`), before any page-selection or mutation info
         // output can claim standard output. The attachment report repeats the
@@ -3859,7 +3863,11 @@ fn run_combined_top_level_inspection(
     let mut job = new_cli_job(args.no_warn);
     configure_top_level_inspection_job(&mut job, args)?;
     configure_cli_overlay_specs(&mut job, overlay_specs)?;
-    if args.show_attachment.is_some() {
+    if args
+        .show_attachment
+        .as_ref()
+        .is_some_and(|key| !arg_parser::os_bytes(key.as_os_str()).is_empty())
+    {
         // qpdf reserves the save pipeline during checkConfiguration, before
         // doInspection emits any info output (`QPDFJob.cc:614-626`). The
         // attachment report itself repeats the idempotent reservation, but
@@ -4357,7 +4365,11 @@ fn run_json_input_inspection(
         cli.remove_restrictions,
         cli.coalesce_contents,
     )?;
-    if cli.show_attachment.is_some() {
+    if cli
+        .show_attachment
+        .as_ref()
+        .is_some_and(|key| !arg_parser::os_bytes(key.as_os_str()).is_empty())
+    {
         job.logger().save_to_standard_output(true)?;
     }
     configure_top_level_attachment_mutations(&mut job, cli, attachment_segments)?;

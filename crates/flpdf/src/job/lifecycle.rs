@@ -3773,9 +3773,23 @@ impl QPDFJob {
     /// Reserve the save pipeline when this job writes to standard output.
     ///
     /// `only_if_not_set` makes repeated calls idempotent, so the create and
-    /// write stages can both reserve without the second one failing.
+    /// write stages can both reserve without the second one failing. A
+    /// non-empty `show_attachment` key also reserves stdout, just like qpdf's
+    /// `checkConfiguration` (`libqpdf/QPDFJob.cc:614-626`).
     fn reserve_standard_output(&mut self) -> Result<()> {
-        if self.configuration.output_file.as_deref() != Some(Path::new("-")) {
+        let output_file_is_stdout =
+            self.configuration.output_file.as_deref() == Some(Path::new("-"));
+        // qpdf reserves the save pipeline for a non-empty attachment key in
+        // checkConfiguration, before doInspection can emit showNpages
+        // (`libqpdf/QPDFJob.cc:614-626,1646-1693`). An empty key remains a
+        // selected configuration value for usage checks but produces no
+        // inspection output.
+        let show_attachment_to_stdout = self
+            .configuration
+            .show_attachment
+            .as_ref()
+            .is_some_and(|key| !key.is_empty());
+        if !output_file_is_stdout && !show_attachment_to_stdout {
             return Ok(());
         }
         if let Err(error) = self.logger.save_to_standard_output(true) {
@@ -4634,13 +4648,20 @@ impl QPDFJob {
                 }
             }
         }
-        if self.configuration.output_file.as_deref() == Some(Path::new("-")) {
-            if self.configuration.split_pages.is_some_and(|size| size != 0) {
-                return Err(UsageError::new(
-                    "--split-pages may not be used when writing to standard output",
-                )
-                .into());
-            }
+        let output_file_is_stdout =
+            self.configuration.output_file.as_deref() == Some(Path::new("-"));
+        if output_file_is_stdout && self.configuration.split_pages.is_some_and(|size| size != 0) {
+            return Err(UsageError::new(
+                "--split-pages may not be used when writing to standard output",
+            )
+            .into());
+        }
+        let show_attachment_to_stdout = self
+            .configuration
+            .show_attachment
+            .as_ref()
+            .is_some_and(|key| !key.is_empty());
+        if output_file_is_stdout || show_attachment_to_stdout {
             self.logger.save_to_standard_output(true)?;
         }
         if let (Some(input), Some(output)) = (
@@ -7292,6 +7313,36 @@ mod tests {
             "reserving stdout must reroute info output to stderr so verbose \
              transformations cannot consume the stream the PDF needs"
         );
+    }
+
+    #[test]
+    fn check_configuration_reserves_stdout_for_nonempty_attachment_inspection() {
+        for (key, should_reserve_stdout) in [(b"payload".to_vec(), true), (Vec::new(), false)] {
+            let logger = QPDFLogger::create();
+            let mut job = QPDFJob::new();
+            job.set_logger(logger.clone());
+            {
+                let mut config = job.config();
+                config
+                    .input_file("unused.pdf")
+                    .expect("input path configuration succeeds");
+                config.show_npages();
+                config.show_attachment(key);
+            }
+
+            job.check_configuration()
+                .expect("attachment inspection configuration is valid");
+
+            let save_to_stdout = logger
+                .get_save_if_set()
+                .is_some_and(|save| save.is_same(&logger.standard_output()));
+            assert_eq!(save_to_stdout, should_reserve_stdout);
+            let info_to_stdout = logger
+                .get_info()
+                .expect("info pipeline")
+                .is_same(&logger.standard_output());
+            assert_eq!(info_to_stdout, !should_reserve_stdout);
+        }
     }
 
     #[test]
