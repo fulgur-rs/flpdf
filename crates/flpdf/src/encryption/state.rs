@@ -466,8 +466,8 @@ pub(crate) fn authenticate(
         //      other `Malformed` reclassification is intentionally NOT done
         //      (e.g. `/UE`/`/OE` length errors stay `Malformed`).
         //
-        // Keep this authentication ordering identical in the `else`
-        // (V<5 / V=4) branch below.
+        // Password-format validation stays before either authentication attempt,
+        // as it does in the V<5 / V=4 branch below.
         let inputs = standard_handler_r5_inputs_from_handle(encrypt)
             .map_err(map_uo_length_to_bad_password)?;
         let encrypt_metadata = encrypt_metadata_flag_from_handle(encrypt)?;
@@ -476,22 +476,24 @@ pub(crate) fn authenticate(
         // qpdf's `hash_V5` branches on `R < 6` (`QPDF_encryption.cc:240-251`),
         // so V=5 with R=2..5 uses the single SHA-256 salt hash and only R>=6
         // runs ISO 32000-2 Algorithm 2.B.
-        let user_attempt = if revision >= 6 {
-            check_user_password_r6(&password, &inputs)
-        } else {
-            check_user_password_r5(&password, &inputs)
-        };
         let owner_attempt = if revision >= 6 {
             check_owner_password_r6(&password, &inputs)
         } else {
             check_owner_password_r5(&password, &inputs)
         };
-        let user_password_matched = user_attempt.is_ok();
         let owner_password_matched = owner_attempt.is_ok();
-        let file_key = match (user_attempt, owner_attempt) {
+        let user_attempt = if revision >= 6 {
+            check_user_password_r6(&password, &inputs)
+        } else {
+            check_user_password_r5(&password, &inputs)
+        };
+        let user_password_matched = user_attempt.is_ok();
+        // QPDF::recover_encryption_key_with_password tries the owner entry
+        // first and selects /OE when the password also validates /U.
+        let file_key = match (owner_attempt, user_attempt) {
             (Ok(key), _) => key,
             (Err(_), Ok(key)) => key,
-            (Err(user_err), Err(_owner_err)) => return Err(user_err),
+            (Err(_owner_err), Err(user_err)) => return Err(user_err),
         };
         let user_password = if user_password_matched {
             password.clone()

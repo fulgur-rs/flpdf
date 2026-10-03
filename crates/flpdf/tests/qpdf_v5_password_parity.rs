@@ -71,12 +71,22 @@ fn qpdf_check(path: &Path, password: &[u8]) -> Output {
 
 fn write_qpdf_encrypted(input: &Path, output: &Path, user_password: &[u8], r5: bool) {
     let user_password = String::from_utf8(user_password.to_vec()).expect("test password is ASCII");
+    write_qpdf_encrypted_with_passwords(input, output, &user_password, "owner", r5);
+}
+
+fn write_qpdf_encrypted_with_passwords(
+    input: &Path,
+    output: &Path,
+    user_password: &str,
+    owner_password: &str,
+    r5: bool,
+) {
     let mut command = Command::new("qpdf");
     command
         .arg("--static-id")
         .arg("--encrypt")
         .arg(user_password)
-        .arg("owner")
+        .arg(owner_password)
         .arg("256");
     if r5 {
         command.arg("--force-R5");
@@ -93,6 +103,63 @@ fn write_qpdf_encrypted(input: &Path, output: &Path, user_password: &[u8], r5: b
         String::from_utf8_lossy(&output_result.stdout),
         String::from_utf8_lossy(&output_result.stderr)
     );
+}
+
+fn zero_hex_dictionary_string(bytes: &mut [u8], key: &str) {
+    let marker = format!("/{key} <");
+    let marker = marker.as_bytes();
+    let start = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .unwrap_or_else(|| panic!("PDF is missing {key} hex string"));
+    let hex_start = start + marker.len();
+    let hex_end = hex_start
+        + bytes[hex_start..]
+            .iter()
+            .position(|byte| *byte == b'>')
+            .unwrap_or_else(|| panic!("PDF has unterminated {key} hex string"));
+    let mut digits = 0;
+    for byte in &mut bytes[hex_start..hex_end] {
+        if byte.is_ascii_hexdigit() {
+            *byte = b'0';
+            digits += 1;
+        } else {
+            assert!(byte.is_ascii_whitespace(), "unexpected byte in /{key}");
+        }
+    }
+    assert_eq!(digits, 64, "/{key} should contain 32 bytes");
+}
+
+fn qpdf_file_key_and_encryption_report(path: &Path, password: &[u8]) -> (Vec<u8>, String) {
+    let password = String::from_utf8(password.to_vec()).expect("test password is ASCII");
+    let output = Command::new("qpdf")
+        .arg(format!("--password={password}"))
+        .arg("--show-encryption")
+        .arg("--show-encryption-key")
+        .arg(path)
+        .output()
+        .expect("run qpdf encryption inspection");
+    assert!(
+        output.status.success(),
+        "qpdf encryption inspection failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8_lossy(&output.stdout).into_owned();
+    let key_hex = report
+        .lines()
+        .find_map(|line| line.strip_prefix("Encryption key = "))
+        .unwrap_or_else(|| panic!("qpdf encryption report should include the file key:\n{report}"));
+    assert_eq!(key_hex.len(), 64);
+    let file_key = key_hex
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            u8::from_str_radix(std::str::from_utf8(pair).expect("ASCII key hex"), 16)
+                .expect("valid key hex")
+        })
+        .collect();
+    (file_key, report)
 }
 
 fn assert_qpdf_accepts(path: &Path, password: &[u8]) {
@@ -186,6 +253,59 @@ fn v5_password_truncation_matches_qpdf_reader_writer_split() {
         });
         write_qpdf_encrypted(&input_path, &qpdf_127_path, &prefix, r5);
         assert_flpdf_accepts(&fs::read(&qpdf_127_path).unwrap(), &longer);
+    }
+}
+
+#[test]
+fn v5_owner_key_precedes_user_key_when_both_passwords_match() {
+    if !qpdf_available() {
+        eprintln!("qpdf {EXPECTED_QPDF_VERSION} not available; skipping V=5 key-priority test");
+        return;
+    }
+
+    let input = minimal_fixture();
+    let directory = tempfile::tempdir().expect("create key-priority directory");
+    let input_path = write_bytes(directory.path(), "input.pdf", &input);
+    let password = b"shared-password";
+
+    for r5 in [true, false] {
+        let suffix = if r5 { "r5" } else { "r6" };
+        let valid_path = directory.path().join(format!("{suffix}-valid.pdf"));
+        write_qpdf_encrypted_with_passwords(
+            &input_path,
+            &valid_path,
+            "shared-password",
+            "shared-password",
+            r5,
+        );
+
+        let mut corrupted = fs::read(&valid_path).expect("read qpdf encrypted fixture");
+        zero_hex_dictionary_string(&mut corrupted, "UE");
+        let corrupted_path = write_bytes(
+            directory.path(),
+            &format!("{suffix}-bad-ue.pdf"),
+            &corrupted,
+        );
+        let (expected_key, qpdf_report) =
+            qpdf_file_key_and_encryption_report(&corrupted_path, password);
+        assert!(qpdf_report.contains("Supplied password is owner password"));
+        assert!(qpdf_report.contains("Supplied password is user password"));
+
+        let pdf = Pdf::open_with_options(
+            Cursor::new(corrupted),
+            PdfOpenOptions {
+                password: password.to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("flpdf should accept both matching passwords: {error}"));
+        assert!(pdf.owner_password_matched());
+        assert!(pdf.user_password_matched());
+        assert_eq!(
+            pdf.encryption_file_key().as_deref(),
+            Some(expected_key.as_slice()),
+            "{suffix} must recover /OE before /UE when the same password validates both entries"
+        );
     }
 }
 
