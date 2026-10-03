@@ -11873,7 +11873,7 @@ mod tests {
         let object_ref = ObjectRef::new(1, 0);
         let handle: ObjectHandle = pdf.get_object_handle(object_ref);
 
-        pdf.push_warning("before the loop").unwrap();
+        pdf.resolver.push_warning("before the loop").unwrap();
         let resolver = Rc::clone(&pdf.resolver);
         let outer = ResolveMark::begin(
             &resolver.core,
@@ -11882,7 +11882,7 @@ mod tests {
         .expect("first mark");
         handle.try_is_scalar().expect("a loop is not an error");
         drop(outer);
-        pdf.push_warning("after the loop").unwrap();
+        pdf.resolver.push_warning("after the loop").unwrap();
 
         let diagnostics = pdf.repair_diagnostics();
         let messages = diagnostics

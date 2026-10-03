@@ -158,6 +158,21 @@ fn shorten_hex_dictionary_string(bytes: &mut [u8], key: &str, byte_length: usize
     assert_eq!(digits % 2, 0, "/{key} must contain whole bytes");
 }
 
+fn flip_first_hex_dictionary_nibble(bytes: &mut [u8], key: &str) {
+    let marker = format!("/{key} <");
+    let start = bytes
+        .windows(marker.len())
+        .position(|window| window == marker.as_bytes())
+        .unwrap_or_else(|| panic!("PDF is missing {key} hex string"))
+        + marker.len();
+    let first = bytes[start];
+    assert!(
+        first.is_ascii_hexdigit(),
+        "/{key} must begin with hex digits"
+    );
+    bytes[start] = if first == b'0' { b'1' } else { b'0' };
+}
+
 fn append_hex_dictionary_bytes_and_reindex_xref(
     bytes: &[u8],
     key: &str,
@@ -270,14 +285,7 @@ fn qpdf_file_key_and_encryption_report_with_exit_codes(
     password: &[u8],
     exit_codes: &[i32],
 ) -> (Vec<u8>, String) {
-    let password = String::from_utf8(password.to_vec()).expect("test password is ASCII");
-    let output = Command::new("qpdf")
-        .arg(format!("--password={password}"))
-        .arg("--show-encryption")
-        .arg("--show-encryption-key")
-        .arg(path)
-        .output()
-        .expect("run qpdf encryption inspection");
+    let output = qpdf_encryption_output(path, password);
     assert!(
         output
             .status
@@ -287,6 +295,21 @@ fn qpdf_file_key_and_encryption_report_with_exit_codes(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    qpdf_file_key_and_report_from_output(&output)
+}
+
+fn qpdf_encryption_output(path: &Path, password: &[u8]) -> Output {
+    let password = String::from_utf8(password.to_vec()).expect("test password is ASCII");
+    Command::new("qpdf")
+        .arg(format!("--password={password}"))
+        .arg("--show-encryption")
+        .arg("--show-encryption-key")
+        .arg(path)
+        .output()
+        .expect("run qpdf encryption inspection")
+}
+
+fn qpdf_file_key_and_report_from_output(output: &Output) -> (Vec<u8>, String) {
     let report = String::from_utf8_lossy(&output.stdout).into_owned();
     let key_hex = report
         .lines()
@@ -302,6 +325,22 @@ fn qpdf_file_key_and_encryption_report_with_exit_codes(
         })
         .collect();
     (file_key, report)
+}
+
+fn qpdf_perms_warning_offset(stderr: &[u8]) -> i64 {
+    let stderr = String::from_utf8_lossy(stderr);
+    let marker = "(encryption dictionary, offset ";
+    let start = stderr
+        .find(marker)
+        .unwrap_or_else(|| panic!("qpdf warning has no encryption-dictionary context: {stderr}"))
+        + marker.len();
+    let end = start
+        + stderr[start..]
+            .find(')')
+            .unwrap_or_else(|| panic!("qpdf warning has no offset terminator: {stderr}"));
+    stderr[start..end]
+        .parse::<i64>()
+        .unwrap_or_else(|error| panic!("invalid qpdf warning offset: {error}"))
 }
 
 fn assert_qpdf_accepts(path: &Path, password: &[u8]) {
@@ -554,6 +593,133 @@ fn v5_encryption_parameter_lengths_match_qpdf_padding_and_prefix_use() {
             );
         }
     }
+}
+
+#[test]
+fn v5_perms_validation_and_warning_contract_match_qpdf() {
+    if !qpdf_available() {
+        eprintln!("qpdf {EXPECTED_QPDF_VERSION} not available; skipping V=5 /Perms parity test");
+        return;
+    }
+
+    let input = minimal_fixture();
+    let directory = tempfile::tempdir().expect("create /Perms parity directory");
+    let input_path = write_bytes(directory.path(), "input.pdf", &input);
+
+    for r5 in [true, false] {
+        let suffix = if r5 { "r5" } else { "r6" };
+        let original_path = directory.path().join(format!("{suffix}-original.pdf"));
+        write_qpdf_encrypted_with_passwords(&input_path, &original_path, "user", "owner", r5);
+        let original = fs::read(&original_path).expect("read qpdf encrypted fixture");
+
+        for (key, password) in [
+            ("UE", b"user".as_slice()),
+            ("OE", b"owner".as_slice()),
+            ("Perms", b"user".as_slice()),
+        ] {
+            let mut candidate = original.clone();
+            flip_first_hex_dictionary_nibble(&mut candidate, key);
+            let candidate_path = write_bytes(
+                directory.path(),
+                &format!("{suffix}-bad-{key}.pdf"),
+                &candidate,
+            );
+            assert_qpdf_perms_warning_matches_flpdf(&candidate_path, candidate, password);
+        }
+
+        let mut short_perms = original.clone();
+        shorten_hex_dictionary_string(&mut short_perms, "Perms", 12);
+        let short_perms_path = write_bytes(
+            directory.path(),
+            &format!("{suffix}-short-perms.pdf"),
+            &short_perms,
+        );
+        assert_qpdf_perms_warning_matches_flpdf(&short_perms_path, short_perms, b"user");
+
+        let long_perms = append_hex_dictionary_bytes_and_reindex_xref(&original, "Perms", b"a5");
+        let long_perms_path = write_bytes(
+            directory.path(),
+            &format!("{suffix}-long-perms.pdf"),
+            &long_perms,
+        );
+        let qpdf_output = qpdf_encryption_output(&long_perms_path, b"user");
+        assert_eq!(qpdf_output.status.code(), Some(0));
+        let (expected_key, qpdf_report) = qpdf_file_key_and_report_from_output(&qpdf_output);
+        assert!(qpdf_report.contains("Supplied password is user password"));
+        let pdf = Pdf::open_with_options(
+            Cursor::new(long_perms),
+            PdfOpenOptions {
+                password: b"user".to_vec(),
+                suppress_warnings: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("qpdf accepts /Perms values longer than the first 16 bytes");
+        assert!(pdf.repair_diagnostics().entries().is_empty());
+        assert_eq!(
+            pdf.encryption_file_key().as_deref(),
+            Some(expected_key.as_slice()),
+            "{suffix} long /Perms must use the same first-block key as qpdf"
+        );
+    }
+}
+
+fn assert_qpdf_perms_warning_matches_flpdf(path: &Path, bytes: Vec<u8>, password: &[u8]) {
+    let qpdf_output = qpdf_encryption_output(path, password);
+    assert_eq!(
+        qpdf_output.status.code(),
+        Some(3),
+        "qpdf should report a non-fatal /Perms warning:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&qpdf_output.stdout),
+        String::from_utf8_lossy(&qpdf_output.stderr)
+    );
+    let expected_message = b"/Perms field in encryption dictionary doesn't match expected value";
+    let qpdf_stderr = String::from_utf8_lossy(&qpdf_output.stderr);
+    assert!(
+        qpdf_stderr.contains("(encryption dictionary, offset "),
+        "qpdf should identify the encryption dictionary in its warning:\n{qpdf_stderr}"
+    );
+    assert!(
+        qpdf_output
+            .stderr
+            .windows(expected_message.len())
+            .any(|window| window == expected_message),
+        "qpdf should emit its fixed /Perms warning:\n{qpdf_stderr}"
+    );
+    let (expected_key, qpdf_report) = qpdf_file_key_and_report_from_output(&qpdf_output);
+    let role = if password == b"owner" {
+        "Supplied password is owner password"
+    } else {
+        "Supplied password is user password"
+    };
+    assert!(qpdf_report.contains(role));
+
+    let description = path.display().to_string();
+    let pdf = Pdf::open_with_options(
+        Cursor::new(bytes),
+        PdfOpenOptions {
+            description: description.as_bytes().to_vec(),
+            password: password.to_vec(),
+            suppress_warnings: true,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap_or_else(|error| panic!("flpdf should accept the authenticated PDF: {error}"));
+    let diagnostics = pdf.repair_diagnostics();
+    assert_eq!(diagnostics.entries().len(), 1);
+    let warning = &diagnostics.entries()[0];
+    assert_eq!(warning.get_error_code(), flpdf::QpdfErrorCode::DamagedPdf);
+    assert_eq!(warning.get_filename(), description.as_bytes());
+    assert_eq!(warning.get_object(), b"encryption dictionary");
+    assert_eq!(
+        warning.get_file_position(),
+        qpdf_perms_warning_offset(&qpdf_output.stderr)
+    );
+    assert_eq!(warning.get_message_detail(), expected_message);
+    assert_eq!(
+        pdf.encryption_file_key().as_deref(),
+        Some(expected_key.as_slice())
+    );
 }
 
 #[test]

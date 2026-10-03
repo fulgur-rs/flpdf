@@ -356,22 +356,6 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.num_warnings()
     }
 
-    /// Record a non-fatal processing warning on this handle.
-    ///
-    /// Used by recoverable code paths (e.g. form-field inheritance walks that hit
-    /// a cyclic / over-deep / non-dictionary `/Parent` chain and fall back rather
-    /// than aborting) so the soft failure is surfaced via [`Pdf::repair_diagnostics`]
-    /// instead of being silently swallowed. Mirrors qpdf, which warns and continues
-    /// on malformed field trees.
-    ///
-    /// Still takes `&mut self` although the sink no longer requires it: every
-    /// caller already holds a `&mut Pdf`, and the resolver's own warnings go
-    /// through [`resolver::ResolverHandle::push_warning`] instead. Both doors
-    /// reach the one collection.
-    pub(crate) fn push_warning(&mut self, message: impl Into<String>) -> Result<()> {
-        self.resolver.push_warning(message)
-    }
-
     /// Record and route a complete qpdf warning value without rebuilding its
     /// source/object context at a higher layer.
     pub(crate) fn push_qpdf_warning(&self, warning: QpdfExc) -> Result<()> {
@@ -891,7 +875,16 @@ impl<R: Read + Seek> Pdf<R> {
         )?;
         let state = authenticated.state;
         if let Some(warning) = authenticated.perms_warning {
-            self.push_warning(warning)?;
+            let warning = QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                self.input_description(),
+                b"encryption dictionary",
+                i64::try_from(self.resolver.last_offset()).unwrap_or(i64::MAX),
+                warning.as_bytes(),
+            );
+            // qpdf calls warn(damagedPDF("encryption dictionary", ...))
+            // after V=5 key recovery (`QPDF_encryption.cc:938-950`).
+            self.push_qpdf_warning(warning)?;
         }
         if let Some(inspection) = self.encryption_inspection.borrow_mut().as_mut() {
             inspection.user_password = state.user_password.clone();
@@ -1607,7 +1600,7 @@ mod warning_api_tests {
             Pdf::open_mem_owned(crate::engine::EMPTY_PDF_BYTES.to_vec()).expect("empty PDF opens");
         pdf.set_suppress_warnings(true);
 
-        pdf.push_warning("first warning").unwrap();
+        pdf.resolver.push_warning("first warning").unwrap();
         assert!(pdf.any_warnings());
         assert_eq!(pdf.num_warnings(), 1);
 
@@ -1617,7 +1610,7 @@ mod warning_api_tests {
         assert_eq!(pdf.num_warnings(), 0);
         assert!(pdf.get_warnings().is_empty());
 
-        pdf.push_warning("second warning").unwrap();
+        pdf.resolver.push_warning("second warning").unwrap();
         let second = pdf.get_warnings();
         assert_eq!(second.len(), 1);
         assert_eq!(second.entries()[0].get_message_detail(), b"second warning");

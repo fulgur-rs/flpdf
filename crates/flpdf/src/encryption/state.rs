@@ -541,11 +541,12 @@ pub(crate) fn authenticate(
         )
     };
 
-    // qpdf's raw-key branch bypasses password recovery entirely, including
-    // the R=6 /Perms validation that belongs to the password-authenticated
-    // path (QPDF_encryption.cc:907-950).
-    let perms_warning = if revision == 6 && !password_is_hex_key {
-        r6_perms_warning_from_handle(encrypt, &file_key, permissions, encrypt_metadata)?
+    // qpdf's raw-key branch bypasses key recovery and /Perms content
+    // validation. Password-authenticated V=5 files check the same first
+    // 12 decrypted /Perms bytes for both R5 and R6
+    // (QPDF_encryption.cc:666-695,938-950).
+    let perms_warning = if version >= 5 && !password_is_hex_key {
+        v5_perms_warning_from_handle(encrypt, &file_key, permissions, encrypt_metadata)?
     } else {
         None
     };
@@ -778,29 +779,21 @@ fn required_permissions_from_handle(encrypt: &ObjectHandle) -> Result<i32> {
     ))
 }
 
-fn r6_perms_warning_from_handle(
+/// Validate qpdf's V=5 `/Perms` block after file-key recovery.
+///
+/// qpdf pads short values to 16 bytes at initialization, decrypts the complete
+/// value with zero-IV AES, and compares only the first 12 output bytes
+/// (`QPDF_encryption.cc:316-321,691-695,828-832`). Padding a short value and
+/// projecting a long value to its first 16 bytes is equivalent for this
+/// comparison: AES-CBC's first block depends only on that first block, and
+/// qpdf returns only 12 decrypted bytes from the pipeline.
+fn v5_perms_warning_from_handle(
     encrypt: &ObjectHandle,
     file_key: &[u8],
     permissions: Permissions,
     encrypt_metadata: bool,
 ) -> Result<Option<String>> {
-    let Some(entries) = encrypt.try_as_dictionary()? else {
-        return Ok(None);
-    };
-    let Some(perms) = entries.get(b"/Perms".as_slice()).cloned() else {
-        return Ok(None);
-    };
-    let Some(bytes) = perms.try_as_string()? else {
-        return Ok(Some("R=6 /Perms entry is not a string".into()));
-    };
-    let Ok(bytes) = <[u8; 16]>::try_from(bytes.as_slice()) else {
-        return Ok(Some("R=6 /Perms entry is not 16 bytes".into()));
-    };
-    let Ok(file_key) = <&[u8; 32]>::try_from(file_key) else {
-        return Ok(Some(
-            "R=6 /Perms cannot be verified with non-256-bit file key".into(),
-        ));
-    };
+    let bytes = required_v5_parameter_prefix_from_handle::<16>(encrypt, "Perms")?;
     let decrypted = PlAesPdf::process_to_vec_without_padding(
         "AES /Perms decryption",
         false,
@@ -809,35 +802,15 @@ fn r6_perms_warning_from_handle(
         1,
         None,
     )?; // cov:ignore: qpdf's fixed AES key, IV, and 16-byte input cannot fail
-    let block: [u8; 16] = decrypted
-        .try_into()
-        .expect("qpdf AES /Perms processing returns one decrypted block");
-    let perms_p = i32::from_le_bytes(block[..4].try_into().expect("slice length checked"));
-    let perms_metadata = match block[8] {
-        b'T' => true,
-        b'F' => false,
-        _ => {
-            return Ok(Some(
-                "R=6 /Perms encrypted-metadata flag is not T or F".into(),
-            ))
-        }
-    };
-    if perms_p != permissions.raw() {
-        return Ok(Some(format!(
-            "R=6 /Perms permissions value {perms_p} does not match /P {}",
-            permissions.raw()
-        )));
-    }
-    if block[4..8] != [0xff; 4] {
-        return Ok(Some("R=6 /Perms reserved bytes are invalid".into()));
-    }
-    if perms_metadata != encrypt_metadata {
+    let mut expected = [0; 12];
+    expected[..4].copy_from_slice(&permissions.raw().to_le_bytes());
+    expected[4..8].fill(0xff);
+    expected[8] = if encrypt_metadata { b'T' } else { b'F' };
+    expected[9..12].copy_from_slice(b"adb");
+    if decrypted[..12] != expected {
         return Ok(Some(
-            "R=6 /Perms encrypted-metadata flag does not match /EncryptMetadata".into(),
+            "/Perms field in encryption dictionary doesn't match expected value".into(),
         ));
-    }
-    if &block[9..12] != b"adb" {
-        return Ok(Some("R=6 /Perms magic bytes are not 'adb'".into()));
     }
     Ok(None)
 }

@@ -67,7 +67,7 @@ fn encryption_state_production_route_uses_handle_values() {
             "/// qpdf's `/ID[0]` value",
         ),
         (
-            "fn r6_perms_warning_from_handle",
+            "fn v5_perms_warning_from_handle",
             "/// qpdf's `/ID[0]` value",
         ),
     ] {

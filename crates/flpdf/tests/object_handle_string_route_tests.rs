@@ -29,10 +29,6 @@ fn encryption_string_observers_use_the_canonical_as_string_route() {
             "fn required_v5_parameter_prefix_from_handle<",
             "fn encrypt_metadata_flag_from_handle(",
         ),
-        (
-            "fn r6_perms_warning_from_handle(",
-            "/// qpdf's `/ID[0]` value",
-        ),
     ] {
         let body = function_body(&source, signature, next);
         assert!(
@@ -44,6 +40,17 @@ fn encryption_string_observers_use_the_canonical_as_string_route() {
             "{signature} must not duplicate qpdf asString's resolve/cast pair"
         );
     }
+
+    let perms = function_body(
+        &source,
+        "fn v5_perms_warning_from_handle(",
+        "/// qpdf's `/ID[0]` value",
+    );
+    assert!(perms.contains("required_v5_parameter_prefix_from_handle::<16>(encrypt, \"Perms\")?"));
+    assert!(
+        !perms.contains("try_dereference()?") && !perms.contains("try_get_value_as_string()?"),
+        "V=5 /Perms validation must use the canonical handle string projection"
+    );
 }
 
 #[test]
