@@ -1,0 +1,149 @@
+//! SIMD dispatch layer for hot-path JPEG decode and encode operations.
+//!
+//! Resolves function pointers once at init time via `detect()` / `detect_encoder()`.
+//! On aarch64, NEON is always available (ARMv8 mandatory).
+//! Set `JSIMD_FORCENONE=1` to force scalar fallback.
+
+pub mod scalar;
+
+#[cfg(target_arch = "aarch64")]
+pub mod aarch64;
+
+#[cfg(target_arch = "x86_64")]
+pub mod x86_64;
+
+#[cfg(target_arch = "wasm32")]
+pub mod wasm32;
+
+/// Function-pointer dispatch table for SIMD-accelerated decode operations.
+pub struct SimdRoutines {
+    /// Combined dequant + IDCT (ISLOW) + level-shift + clamp → u8 output.
+    /// `coeffs` and `quant` are both in natural (row-major) order.
+    pub idct_islow: fn(coeffs: &[i16; 64], quant: &[u16; 64], output: &mut [u8; 64]),
+
+    /// Combined dequant + IDCT (IFAST) + level-shift + clamp → u8 output.
+    pub idct_ifast: fn(coeffs: &[i16; 64], quant: &[u16; 64], output: &mut [u8; 64]),
+
+    /// Combined dequant + IDCT (Float) + level-shift + clamp → u8 output.
+    pub idct_float: fn(coeffs: &[i16; 64], quant: &[u16; 64], output: &mut [u8; 64]),
+
+    /// YCbCr → interleaved RGB, one row.
+    #[allow(clippy::type_complexity)]
+    pub ycbcr_to_rgb_row: fn(y: &[u8], cb: &[u8], cr: &[u8], rgb: &mut [u8], width: usize),
+
+    /// Fancy horizontal 2x upsample, one row.
+    /// Output length must be `in_width * 2`.
+    pub fancy_upsample_h2v1: fn(input: &[u8], in_width: usize, output: &mut [u8]),
+}
+
+/// Pre-computed quantization divisor table with adaptive-precision reciprocals.
+///
+/// Uses C libjpeg-turbo's `compute_reciprocal` algorithm for exact results:
+/// reciprocal precision adapts per-element, with a correction factor and
+/// per-element variable shift to match true integer division.
+///
+/// The NEON path uses `reciprocals`, `corrections`, `shifts` to avoid scalar division.
+/// The AVX2 path uses `reciprocals`, `corrections`, `scales` (two `mulhi` ops, matching C).
+/// The scalar path ignores these and divides directly using `divisors`.
+pub struct QuantDivisors {
+    /// Divisor values (quant × 8, matching FDCT output scaling).
+    pub divisors: [u16; 64],
+    /// Adaptive-precision reciprocals (see `compute_reciprocal`).
+    pub reciprocals: [u16; 64],
+    /// Correction factors: divisor/2, adjusted +1 when reciprocal was rounded down.
+    pub corrections: [u16; 64],
+    /// Per-element right-shift amounts: `r - 16` where `r = 16 + flss(divisor) - 1`.
+    pub shifts: [i16; 64],
+    /// Scale factors for AVX2: `1 << (32 - r)`, replacing per-element shift with a
+    /// second `pmulhuw`. Matches C libjpeg-turbo's SCALE table in jcdctmgr.c.
+    pub scales: [u16; 64],
+    /// Divisors re-arranged in zigzag scan order for fused quantize+reorder.
+    pub divisors_zigzag: [u16; 64],
+    /// Reciprocals re-arranged in zigzag scan order.
+    pub reciprocals_zigzag: [u16; 64],
+    /// Corrections re-arranged in zigzag scan order.
+    pub corrections_zigzag: [u16; 64],
+    /// Shifts re-arranged in zigzag scan order.
+    pub shifts_zigzag: [i16; 64],
+    /// Scales re-arranged in zigzag scan order.
+    pub scales_zigzag: [u16; 64],
+    /// Float divisors matching C `jcdctmgr.c` `forward_DCT_float`:
+    /// `1 / (quant[i] * aanscale[row] * aanscale[col] * 8)`. Paired with the
+    /// raw float FDCT (no AA&N rescale) and `quantize_float` to reproduce
+    /// `cjpeg -dct float` byte-for-byte.
+    pub float_divisors: [f32; 64],
+    /// Float divisors re-arranged in zigzag scan order so the float quant
+    /// step can fuse zigzag reorder.
+    pub float_divisors_zigzag: [f32; 64],
+}
+
+/// Function-pointer dispatch table for SIMD-accelerated encode operations.
+pub struct EncoderSimdRoutines {
+    /// RGB → YCbCr color conversion, one row.
+    /// Only handles interleaved RGB (3 bytes/pixel).
+    #[allow(clippy::type_complexity)]
+    pub rgb_to_ycbcr_row: fn(rgb: &[u8], y: &mut [u8], cb: &mut [u8], cr: &mut [u8], width: usize),
+
+    /// Combined FDCT (islow) + quantize + zigzag reorder for one 8×8 block.
+    /// `input` is modified in-place by FDCT (caller must not read after call).
+    /// `quant` contains pre-scaled divisors and reciprocals.
+    /// Output is in zigzag scan order, ready for Huffman encoding.
+    pub fdct_quantize: fn(input: &mut [i16; 64], quant: &QuantDivisors, output: &mut [i16; 64]),
+}
+
+/// Detect available SIMD features and return the best dispatch table.
+///
+/// Checks `JSIMD_FORCENONE` env var first. If set to "1", returns scalar.
+/// Otherwise selects NEON on aarch64, scalar elsewhere.
+pub fn detect() -> SimdRoutines {
+    // Env-var override is a std-only debugging aid; a no_std build has
+    // no environment to read (issue #356).
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    if std::env::var("JSIMD_FORCENONE").ok().as_deref() == Some("1") {
+        return scalar::routines();
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "simd"))]
+    {
+        return aarch64::routines();
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+    {
+        return x86_64::routines();
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        return wasm32::routines();
+    }
+
+    #[allow(unreachable_code)]
+    scalar::routines()
+}
+
+/// Detect available SIMD features and return the best encoder dispatch table.
+pub fn detect_encoder() -> EncoderSimdRoutines {
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    if std::env::var("JSIMD_FORCENONE").ok().as_deref() == Some("1") {
+        return scalar::encoder_routines();
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "simd"))]
+    {
+        return aarch64::encoder_routines();
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+    {
+        return x86_64::encoder_routines();
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        return wasm32::encoder_routines();
+    }
+
+    #[allow(unreachable_code)]
+    scalar::encoder_routines()
+}

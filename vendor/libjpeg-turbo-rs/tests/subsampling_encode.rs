@@ -1,0 +1,468 @@
+mod helpers;
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use libjpeg_turbo_rs::{compress, decompress, decompress_to, PixelFormat, Subsampling};
+
+#[test]
+fn encode_s440_roundtrip() {
+    let pixels = vec![128u8; 32 * 32 * 3];
+    let jpeg = compress(&pixels, 32, 32, PixelFormat::Rgb, 75, Subsampling::S440).unwrap();
+    let img = decompress(&jpeg).unwrap();
+    assert_eq!(img.width, 32);
+    assert_eq!(img.height, 32);
+}
+
+#[test]
+fn encode_s411_roundtrip() {
+    let pixels = vec![128u8; 64 * 16 * 3];
+    let jpeg = compress(&pixels, 64, 16, PixelFormat::Rgb, 75, Subsampling::S411).unwrap();
+    let img = decompress(&jpeg).unwrap();
+    assert_eq!(img.width, 64);
+    assert_eq!(img.height, 16);
+}
+
+#[test]
+fn encode_s440_gradient_pixel_accuracy() {
+    let (w, h) = (32, 32);
+    let mut pixels = vec![0u8; w * h * 3];
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) * 3;
+            pixels[i] = (x * 8) as u8;
+            pixels[i + 1] = (y * 8) as u8;
+            pixels[i + 2] = 128;
+        }
+    }
+    let jpeg = compress(&pixels, w, h, PixelFormat::Rgb, 95, Subsampling::S440).unwrap();
+    let img = decompress(&jpeg).unwrap();
+    assert_eq!(img.data.len(), w * h * 3);
+}
+
+#[test]
+fn encode_s411_gradient_pixel_accuracy() {
+    let (w, h) = (64, 16);
+    let mut pixels = vec![0u8; w * h * 3];
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) * 3;
+            pixels[i] = (x * 4) as u8;
+            pixels[i + 1] = (y * 16) as u8;
+            pixels[i + 2] = 128;
+        }
+    }
+    let jpeg = compress(&pixels, w, h, PixelFormat::Rgb, 95, Subsampling::S411).unwrap();
+    let img = decompress(&jpeg).unwrap();
+    assert_eq!(img.data.len(), w * h * 3);
+}
+
+// ===========================================================================
+// C djpeg cross-validation helpers
+// ===========================================================================
+
+/// Parse a binary PPM (P6) file and return `(width, height, rgb_data)`.
+fn parse_ppm(path: &Path) -> (usize, usize, Vec<u8>) {
+    let raw: Vec<u8> = std::fs::read(path).expect("failed to read PPM file");
+    assert!(raw.len() > 3, "PPM too short");
+    assert_eq!(&raw[0..2], b"P6", "not a P6 PPM");
+    let mut idx: usize = 2;
+    // Skip whitespace and comments
+    loop {
+        while idx < raw.len() && raw[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        if idx < raw.len() && raw[idx] == b'#' {
+            while idx < raw.len() && raw[idx] != b'\n' {
+                idx += 1;
+            }
+        } else {
+            break;
+        }
+    }
+    let (width, next) = read_ppm_number(&raw, idx);
+    idx = next;
+    while idx < raw.len() && raw[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    let (height, next) = read_ppm_number(&raw, idx);
+    idx = next;
+    while idx < raw.len() && raw[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    let (_maxval, next) = read_ppm_number(&raw, idx);
+    // Exactly one whitespace byte after maxval before binary data
+    idx = next + 1;
+    let expected: usize = width * height * 3;
+    assert_eq!(
+        raw.len() - idx,
+        expected,
+        "PPM pixel data length mismatch: expected {}, got {}",
+        expected,
+        raw.len() - idx,
+    );
+    (width, height, raw[idx..idx + expected].to_vec())
+}
+
+fn read_ppm_number(data: &[u8], idx: usize) -> (usize, usize) {
+    let mut end: usize = idx;
+    while end < data.len() && data[end].is_ascii_digit() {
+        end += 1;
+    }
+    (
+        std::str::from_utf8(&data[idx..end])
+            .unwrap()
+            .parse()
+            .unwrap(),
+        end,
+    )
+}
+
+// ===========================================================================
+// C djpeg cross-validation test
+// ===========================================================================
+
+/// Encode a 32x32 gradient with Rust for S440 and S411, then decode with both
+/// Rust and C djpeg. The two decoded outputs must be pixel-identical (diff=0).
+#[test]
+fn c_djpeg_subsampling_encode_diff_zero() {
+    let djpeg: PathBuf = require_c_tool!("djpeg");
+
+    let (w, h): (usize, usize) = (32, 32);
+    let mut pixels: Vec<u8> = vec![0u8; w * h * 3];
+    for y in 0..h {
+        for x in 0..w {
+            let i: usize = (y * w + x) * 3;
+            pixels[i] = (x * 8) as u8;
+            pixels[i + 1] = (y * 8) as u8;
+            pixels[i + 2] = 128;
+        }
+    }
+
+    let modes: &[(Subsampling, &str)] = &[(Subsampling::S440, "S440"), (Subsampling::S411, "S411")];
+
+    for &(ss, label) in modes {
+        let jpeg: Vec<u8> =
+            compress(&pixels, w, h, PixelFormat::Rgb, 95, ss).expect("Rust encode failed");
+
+        // Rust decode
+        let rust_img = decompress_to(&jpeg, PixelFormat::Rgb).expect("Rust decode failed");
+
+        // C djpeg decode
+        let tmp_jpg: PathBuf =
+            std::env::temp_dir().join(format!("ljt_subsamp_{}_{}.jpg", label, std::process::id()));
+        let tmp_ppm: PathBuf =
+            std::env::temp_dir().join(format!("ljt_subsamp_{}_{}.ppm", label, std::process::id()));
+
+        std::fs::write(&tmp_jpg, &jpeg).expect("write tmp jpg");
+
+        let output = Command::new(&djpeg)
+            .arg("-ppm")
+            .arg("-outfile")
+            .arg(&tmp_ppm)
+            .arg(&tmp_jpg)
+            .output()
+            .expect("failed to run djpeg");
+        assert!(
+            output.status.success(),
+            "{}: djpeg failed (exit {:?}): {}",
+            label,
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        let (cw, ch, c_pixels) = parse_ppm(&tmp_ppm);
+        std::fs::remove_file(&tmp_jpg).ok();
+        std::fs::remove_file(&tmp_ppm).ok();
+
+        assert_eq!(cw, rust_img.width, "{}: width mismatch", label);
+        assert_eq!(ch, rust_img.height, "{}: height mismatch", label);
+        assert_eq!(
+            c_pixels.len(),
+            rust_img.data.len(),
+            "{}: pixel data length mismatch",
+            label,
+        );
+
+        let max_diff: u8 = c_pixels
+            .iter()
+            .zip(rust_img.data.iter())
+            .map(|(&a, &b)| (a as i16 - b as i16).unsigned_abs() as u8)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_diff, 0,
+            "{}: Rust encode -> C djpeg decode vs Rust decode max_diff={} (must be 0)",
+            label, max_diff,
+        );
+    }
+}
+
+// ===========================================================================
+// libjpeg-turbo 3.x widened TJSAMP range (TJSAMP_441/410/24).
+// These tests exercise the encoder paths at h*v = 4 (S441) and h*v = 8
+// (S410, S24) per MCU and confirm the SOF sampling factors round-trip back
+// through our own decoder.
+// ===========================================================================
+
+#[test]
+fn encode_s441_roundtrip_dimensions() {
+    let (w, h) = (16, 64);
+    let pixels: Vec<u8> = vec![128u8; w * h * 3];
+    let jpeg: Vec<u8> = compress(&pixels, w, h, PixelFormat::Rgb, 75, Subsampling::S441).unwrap();
+    let img = decompress(&jpeg).unwrap();
+    assert_eq!(img.width, w);
+    assert_eq!(img.height, h);
+    assert_eq!(img.data.len(), w * h * 3);
+}
+
+#[test]
+fn encode_s410_roundtrip_dimensions() {
+    let (w, h) = (64, 32);
+    let pixels: Vec<u8> = vec![128u8; w * h * 3];
+    let jpeg: Vec<u8> = compress(&pixels, w, h, PixelFormat::Rgb, 75, Subsampling::S410).unwrap();
+    let img = decompress(&jpeg).unwrap();
+    assert_eq!(img.width, w);
+    assert_eq!(img.height, h);
+    assert_eq!(img.data.len(), w * h * 3);
+}
+
+#[test]
+fn encode_s24_roundtrip_dimensions() {
+    let (w, h) = (32, 64);
+    let pixels: Vec<u8> = vec![128u8; w * h * 3];
+    let jpeg: Vec<u8> = compress(&pixels, w, h, PixelFormat::Rgb, 75, Subsampling::S24).unwrap();
+    let img = decompress(&jpeg).unwrap();
+    assert_eq!(img.width, w);
+    assert_eq!(img.height, h);
+    assert_eq!(img.data.len(), w * h * 3);
+}
+
+/// 16x64 (S441) / 64x32 (S410) / 32x64 (S24) RGB gradient — exercises every
+/// luma block in the MCU plus the (1,4)/(4,2)/(2,4) chroma downsamples.
+fn gen_gradient(w: usize, h: usize) -> Vec<u8> {
+    let mut p: Vec<u8> = vec![0u8; w * h * 3];
+    for y in 0..h {
+        for x in 0..w {
+            let i: usize = (y * w + x) * 3;
+            p[i] = (x * 4) as u8;
+            p[i + 1] = (y * 4) as u8;
+            p[i + 2] = ((x + y) * 2) as u8;
+        }
+    }
+    p
+}
+
+fn measured_diffs(orig: &[u8], decoded: &[u8]) -> (u8, f64) {
+    let max_diff: u8 = orig
+        .iter()
+        .zip(decoded.iter())
+        .map(|(&a, &b)| (a as i16 - b as i16).unsigned_abs() as u8)
+        .max()
+        .unwrap_or(0);
+    let sum: u32 = orig
+        .iter()
+        .zip(decoded.iter())
+        .map(|(&a, &b)| (a as i16 - b as i16).unsigned_abs() as u32)
+        .sum();
+    (max_diff, sum as f64 / orig.len() as f64)
+}
+
+// Bounds set per CLAUDE.md "tolerance must reflect measured reality + small
+// margin". Probed with the gradient above at q=95 (release build):
+//   S441 max=7  mean=1.62
+//   S410 max=8  mean=1.76
+//   S24  max=9  mean=1.76
+// Bumped by +1 on max to absorb optimizer/SIMD jitter; mean cap is ~25% above
+// measured so genuine quality regressions still trip it.
+
+#[test]
+fn encode_s441_gradient_roundtrip_within_measured_bound() {
+    let (w, h) = (16, 64);
+    let pixels: Vec<u8> = gen_gradient(w, h);
+    let jpeg: Vec<u8> = compress(&pixels, w, h, PixelFormat::Rgb, 95, Subsampling::S441).unwrap();
+    let img = decompress(&jpeg).unwrap();
+    let (max_diff, mean_diff) = measured_diffs(&pixels, &img.data);
+    assert!(
+        max_diff <= 8,
+        "S441 gradient max_diff={} exceeds bound 8 (measured 7)",
+        max_diff
+    );
+    assert!(
+        mean_diff < 2.0,
+        "S441 gradient mean_diff={:.2} exceeds bound 2.0 (measured 1.62)",
+        mean_diff
+    );
+}
+
+#[test]
+fn encode_s410_gradient_roundtrip_within_measured_bound() {
+    let (w, h) = (64, 32);
+    let pixels: Vec<u8> = gen_gradient(w, h);
+    let jpeg: Vec<u8> = compress(&pixels, w, h, PixelFormat::Rgb, 95, Subsampling::S410).unwrap();
+    let img = decompress(&jpeg).unwrap();
+    let (max_diff, mean_diff) = measured_diffs(&pixels, &img.data);
+    assert!(
+        max_diff <= 9,
+        "S410 gradient max_diff={} exceeds bound 9 (measured 8)",
+        max_diff
+    );
+    assert!(
+        mean_diff < 2.2,
+        "S410 gradient mean_diff={:.2} exceeds bound 2.2 (measured 1.76)",
+        mean_diff
+    );
+}
+
+#[test]
+fn encode_s24_gradient_roundtrip_within_measured_bound() {
+    let (w, h) = (32, 64);
+    let pixels: Vec<u8> = gen_gradient(w, h);
+    let jpeg: Vec<u8> = compress(&pixels, w, h, PixelFormat::Rgb, 95, Subsampling::S24).unwrap();
+    let img = decompress(&jpeg).unwrap();
+    let (max_diff, mean_diff) = measured_diffs(&pixels, &img.data);
+    assert!(
+        max_diff <= 10,
+        "S24 gradient max_diff={} exceeds bound 10 (measured 9)",
+        max_diff
+    );
+    assert!(
+        mean_diff < 2.2,
+        "S24 gradient mean_diff={:.2} exceeds bound 2.2 (measured 1.76)",
+        mean_diff
+    );
+}
+
+/// C djpeg cross-validation: Rust encode of S441/S410/S24 gradient, decoded
+/// by both Rust and C djpeg, must produce pixel-identical output (diff=0).
+/// This is the strongest possible check: it pins our SOF + Huffman + DQT
+/// emission to the canonical libjpeg-turbo decoder's interpretation.
+#[test]
+fn c_djpeg_new_subsamp_encode_diff_zero() {
+    let djpeg: PathBuf = require_c_tool!("djpeg");
+
+    let cases: &[(Subsampling, &str, usize, usize)] = &[
+        (Subsampling::S441, "S441", 16, 64),
+        (Subsampling::S410, "S410", 64, 32),
+        (Subsampling::S24, "S24", 32, 64),
+    ];
+
+    for &(ss, label, w, h) in cases {
+        let pixels: Vec<u8> = gen_gradient(w, h);
+        let jpeg: Vec<u8> = compress(&pixels, w, h, PixelFormat::Rgb, 95, ss)
+            .unwrap_or_else(|e| panic!("{}: Rust encode failed: {}", label, e));
+
+        let rust_img = decompress_to(&jpeg, PixelFormat::Rgb)
+            .unwrap_or_else(|e| panic!("{}: Rust decode failed: {}", label, e));
+
+        let tmp_jpg: PathBuf =
+            std::env::temp_dir().join(format!("ljt_subsamp_{}_{}.jpg", label, std::process::id()));
+        let tmp_ppm: PathBuf =
+            std::env::temp_dir().join(format!("ljt_subsamp_{}_{}.ppm", label, std::process::id()));
+        std::fs::write(&tmp_jpg, &jpeg).expect("write tmp jpg");
+
+        let output = Command::new(&djpeg)
+            .arg("-ppm")
+            .arg("-outfile")
+            .arg(&tmp_ppm)
+            .arg(&tmp_jpg)
+            .output()
+            .expect("failed to run djpeg");
+        assert!(
+            output.status.success(),
+            "{}: djpeg failed (exit {:?}): {}",
+            label,
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        let (cw, ch, c_pixels) = parse_ppm(&tmp_ppm);
+        std::fs::remove_file(&tmp_jpg).ok();
+        std::fs::remove_file(&tmp_ppm).ok();
+
+        assert_eq!(cw, rust_img.width, "{}: width mismatch", label);
+        assert_eq!(ch, rust_img.height, "{}: height mismatch", label);
+        assert_eq!(
+            c_pixels.len(),
+            rust_img.data.len(),
+            "{}: length mismatch",
+            label
+        );
+
+        let max_diff: u8 = c_pixels
+            .iter()
+            .zip(rust_img.data.iter())
+            .map(|(&a, &b)| (a as i16 - b as i16).unsigned_abs() as u8)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_diff, 0,
+            "{}: Rust-encode + C-djpeg-decode vs Rust-decode max_diff={} (must be 0)",
+            label, max_diff,
+        );
+    }
+}
+
+#[test]
+fn cmyk_with_excessive_subsampling_returns_error() {
+    // CMYK applies luma sampling to comp 0 AND comp 3, so S410 (h*v=8) /
+    // S24 (h*v=8) push per-MCU block count to 18 — past JPEG spec § B.2.3's
+    // 10-block cap. Caught by codex review on commit 74f42ed; without this
+    // guard we'd emit invalid JPEGs that conforming decoders reject.
+    for ss in [Subsampling::S410, Subsampling::S24] {
+        let pixels: Vec<u8> = vec![128u8; 32 * 32 * 4];
+        let result = compress(&pixels, 32, 32, PixelFormat::Cmyk, 75, ss);
+        assert!(
+            result.is_err(),
+            "compress(CMYK, {:?}) must reject — would produce 18-block MCUs",
+            ss
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("blocks per MCU"),
+            "error should mention block-count limit, got: {}",
+            err_msg
+        );
+    }
+}
+
+#[test]
+fn cmyk_with_supported_subsampling_at_block_cap_succeeds() {
+    // S411 (h=4, v=1) and S441 (h=1, v=4) both yield h*v=4 -> 10 blocks per
+    // MCU exactly. Confirm we accept (don't over-reject by mistake).
+    for (ss, w, h) in [
+        (Subsampling::S411, 64usize, 16usize),
+        (Subsampling::S441, 16, 64),
+    ] {
+        let pixels: Vec<u8> = vec![128u8; w * h * 4];
+        let result = compress(&pixels, w, h, PixelFormat::Cmyk, 75, ss);
+        assert!(
+            result.is_ok(),
+            "compress(CMYK, {:?}) should succeed at the 10-block boundary",
+            ss
+        );
+    }
+}
+
+#[test]
+fn jpeg_subsampling_inferred_from_sof_for_new_modes() {
+    // Independently verify decoder's SOF-based subsampling inference recognizes
+    // the (4,2) and (2,4) ratios introduced for S410 and S24.
+    use libjpeg_turbo_rs::Decoder;
+
+    for (subsamp, w, h) in [
+        (Subsampling::S441, 16usize, 64usize),
+        (Subsampling::S410, 64, 32),
+        (Subsampling::S24, 32, 64),
+    ] {
+        let pixels: Vec<u8> = vec![128u8; w * h * 3];
+        let jpeg: Vec<u8> = compress(&pixels, w, h, PixelFormat::Rgb, 75, subsamp).unwrap();
+        let decoder: Decoder<'_> = Decoder::new(&jpeg).unwrap();
+        let detected: Subsampling = decoder.jpeg_subsampling();
+        assert_eq!(
+            detected, subsamp,
+            "decoder.jpeg_subsampling() should round-trip {:?} via SOF; got {:?}",
+            subsamp, detected,
+        );
+    }
+}

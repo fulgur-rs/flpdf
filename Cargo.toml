@@ -11,6 +11,7 @@ members = [
 # that boundary explicit even though it is already non-member.
 exclude = [
     "fuzz",
+    "vendor/libjpeg-turbo-rs",
 ]
 resolver = "2"
 
@@ -73,6 +74,9 @@ ar_archive_writer = "=0.5.3"
 stacker = "0.1.24"
 libjpeg-turbo-rs = "=0.8.0"
 cc = "1"
+
+[patch.crates-io]
+libjpeg-turbo-rs = { path = "vendor/libjpeg-turbo-rs" }
 
 # The shipped CLI is compared with qpdf's resident RSS. qpdf keeps most of
 # its implementation in a shared libqpdf image, while a default Rust release

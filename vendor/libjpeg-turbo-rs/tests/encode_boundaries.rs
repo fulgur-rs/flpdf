@@ -1,0 +1,762 @@
+mod helpers;
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use libjpeg_turbo_rs::{decompress, decompress_to, Encoder, PixelFormat, Subsampling};
+
+/// All 7 subsampling modes.
+const ALL_SUBSAMPLINGS: [Subsampling; 7] = [
+    Subsampling::S444,
+    Subsampling::S422,
+    Subsampling::S420,
+    Subsampling::S440,
+    Subsampling::S411,
+    Subsampling::S441,
+    Subsampling::Unknown,
+];
+
+/// All pixel formats the encoder supports for encode+decode roundtrip.
+/// Excludes Cmyk (special 4-component path) and Rgb565 (decode-only).
+const ENCODABLE_FORMATS: [PixelFormat; 11] = [
+    PixelFormat::Rgb,
+    PixelFormat::Rgba,
+    PixelFormat::Bgr,
+    PixelFormat::Bgra,
+    PixelFormat::Rgbx,
+    PixelFormat::Bgrx,
+    PixelFormat::Xrgb,
+    PixelFormat::Xbgr,
+    PixelFormat::Argb,
+    PixelFormat::Abgr,
+    PixelFormat::Grayscale,
+];
+
+/// Compute PSNR between two RGB byte slices.
+fn psnr_rgb(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len());
+    if a.is_empty() {
+        return f64::INFINITY;
+    }
+    let mse: f64 = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| {
+            let diff = x as f64 - y as f64;
+            diff * diff
+        })
+        .sum::<f64>()
+        / a.len() as f64;
+    if mse < 1e-10 {
+        return f64::INFINITY;
+    }
+    10.0 * (255.0_f64 * 255.0 / mse).log10()
+}
+
+// --- Quality boundary tests ---
+
+#[test]
+fn quality_1_encodes_and_decodes() {
+    let pixels: Vec<u8> = vec![128u8; 32 * 32 * 3];
+    let jpeg = Encoder::new(&pixels, 32, 32, PixelFormat::Rgb)
+        .quality(1)
+        .encode()
+        .unwrap();
+    let image = decompress(&jpeg).unwrap();
+    assert_eq!(image.width, 32);
+    assert_eq!(image.height, 32);
+    assert_eq!(image.data.len(), 32 * 32 * 3);
+}
+
+#[test]
+fn quality_100_high_psnr() {
+    let mut pixels: Vec<u8> = Vec::with_capacity(32 * 32 * 3);
+    for y in 0..32u8 {
+        for x in 0..32u8 {
+            pixels.push(x.wrapping_mul(8));
+            pixels.push(y.wrapping_mul(8));
+            pixels.push(128);
+        }
+    }
+    let jpeg = Encoder::new(&pixels, 32, 32, PixelFormat::Rgb)
+        .quality(100)
+        .subsampling(Subsampling::S444)
+        .encode()
+        .unwrap();
+    let image = decompress(&jpeg).unwrap();
+    assert_eq!(image.width, 32);
+    assert_eq!(image.height, 32);
+
+    let psnr = psnr_rgb(&pixels, &image.data);
+    // Q100 with S444 should be near-lossless. Actual measured: ~51 dB.
+    assert!(
+        psnr > 45.0,
+        "quality=100 should produce near-lossless PSNR (>45 dB), got {:.1} dB",
+        psnr
+    );
+}
+
+#[test]
+fn quality_0_treated_as_quality_1() {
+    // quality=0 is clamped to 1 by quality_scaling, so encode should succeed
+    let pixels: Vec<u8> = vec![128u8; 16 * 16 * 3];
+    let jpeg = Encoder::new(&pixels, 16, 16, PixelFormat::Rgb)
+        .quality(0)
+        .encode()
+        .unwrap();
+    let image = decompress(&jpeg).unwrap();
+    assert_eq!(image.width, 16);
+    assert_eq!(image.height, 16);
+}
+
+// --- Subsampling with non-aligned dimensions ---
+
+#[test]
+fn all_subsamplings_with_3x5_image() {
+    let pixels: Vec<u8> = (0..3 * 5 * 3)
+        .map(|i| ((i * 37 + 13) % 256) as u8)
+        .collect();
+    for &ss in &ALL_SUBSAMPLINGS {
+        let jpeg = Encoder::new(&pixels, 3, 5, PixelFormat::Rgb)
+            .quality(75)
+            .subsampling(ss)
+            .encode()
+            .unwrap_or_else(|e| panic!("encode failed for {:?}: {}", ss, e));
+        let image =
+            decompress(&jpeg).unwrap_or_else(|e| panic!("decode failed for {:?}: {}", ss, e));
+        assert_eq!(image.width, 3, "width mismatch for {:?}", ss);
+        assert_eq!(image.height, 5, "height mismatch for {:?}", ss);
+    }
+}
+
+#[test]
+fn all_subsamplings_with_1x1_image() {
+    let pixels: Vec<u8> = vec![128, 64, 32]; // 1x1 RGB
+    for &ss in &ALL_SUBSAMPLINGS {
+        let jpeg = Encoder::new(&pixels, 1, 1, PixelFormat::Rgb)
+            .quality(75)
+            .subsampling(ss)
+            .encode()
+            .unwrap_or_else(|e| panic!("encode failed for {:?}: {}", ss, e));
+        let image =
+            decompress(&jpeg).unwrap_or_else(|e| panic!("decode failed for {:?}: {}", ss, e));
+        assert_eq!(image.width, 1);
+        assert_eq!(image.height, 1);
+    }
+}
+
+// --- Restart interval boundary tests ---
+
+#[test]
+fn restart_interval_1_every_mcu() {
+    let pixels: Vec<u8> = vec![128u8; 32 * 32 * 3];
+    let jpeg = Encoder::new(&pixels, 32, 32, PixelFormat::Rgb)
+        .quality(75)
+        .subsampling(Subsampling::S444)
+        .restart_blocks(1)
+        .encode()
+        .unwrap();
+
+    // Should contain DRI marker
+    let has_dri = jpeg.windows(2).any(|w| w[0] == 0xFF && w[1] == 0xDD);
+    assert!(has_dri, "restart_blocks(1) should produce DRI marker");
+
+    let image = decompress(&jpeg).unwrap();
+    assert_eq!(image.width, 32);
+    assert_eq!(image.height, 32);
+}
+
+#[test]
+fn restart_interval_65535_larger_than_image() {
+    let pixels: Vec<u8> = vec![128u8; 16 * 16 * 3];
+    // 16x16 with S444: 2x2 MCUs = 4 MCUs total. restart_blocks(65535) > 4
+    let jpeg = Encoder::new(&pixels, 16, 16, PixelFormat::Rgb)
+        .quality(75)
+        .subsampling(Subsampling::S444)
+        .restart_blocks(65535)
+        .encode()
+        .unwrap();
+
+    let image = decompress(&jpeg).unwrap();
+    assert_eq!(image.width, 16);
+    assert_eq!(image.height, 16);
+}
+
+// --- Per-component quality ---
+
+#[test]
+fn per_component_quality_luma_100_chroma_1() {
+    let mut pixels: Vec<u8> = Vec::with_capacity(32 * 32 * 3);
+    for y in 0..32u8 {
+        for x in 0..32u8 {
+            pixels.push(x.wrapping_mul(8));
+            pixels.push(y.wrapping_mul(8));
+            pixels.push(128);
+        }
+    }
+    let jpeg = Encoder::new(&pixels, 32, 32, PixelFormat::Rgb)
+        .quality(75)
+        .quality_factor(0, 100) // luma table = quality 100
+        .quality_factor(1, 1) // chroma table = quality 1
+        .subsampling(Subsampling::S444)
+        .encode()
+        .unwrap();
+
+    let image = decompress(&jpeg).unwrap();
+    assert_eq!(image.width, 32);
+    assert_eq!(image.height, 32);
+    assert_eq!(image.data.len(), 32 * 32 * 3);
+}
+
+// --- Encode then decode with every pixel format ---
+
+#[test]
+fn encode_decode_all_pixel_formats() {
+    for &pf in &ENCODABLE_FORMATS {
+        let bpp = pf.bytes_per_pixel();
+        let (w, h) = (16, 16);
+        let pixels: Vec<u8> = (0..w * h * bpp)
+            .map(|i| ((i * 37 + 13) % 256) as u8)
+            .collect();
+
+        let ss = if pf == PixelFormat::Grayscale {
+            Subsampling::S444
+        } else {
+            Subsampling::S420
+        };
+
+        let jpeg = Encoder::new(&pixels, w, h, pf)
+            .quality(75)
+            .subsampling(ss)
+            .encode()
+            .unwrap_or_else(|e| panic!("encode failed for {:?}: {}", pf, e));
+
+        let image =
+            decompress(&jpeg).unwrap_or_else(|e| panic!("decode failed for {:?}: {}", pf, e));
+        assert_eq!(image.width, w, "width mismatch for {:?}", pf);
+        assert_eq!(image.height, h, "height mismatch for {:?}", pf);
+        assert!(
+            !image.data.is_empty(),
+            "decoded data should not be empty for {:?}",
+            pf
+        );
+    }
+}
+
+// --- Special pixel values ---
+
+#[test]
+fn encode_all_zero_pixels() {
+    let pixels: Vec<u8> = vec![0u8; 16 * 16 * 3];
+    let jpeg = Encoder::new(&pixels, 16, 16, PixelFormat::Rgb)
+        .quality(75)
+        .encode()
+        .unwrap();
+    let image = decompress(&jpeg).unwrap();
+    assert_eq!(image.width, 16);
+    assert_eq!(image.height, 16);
+    // All-zero input: decoded should be close to zero (lossy, but not wildly off)
+    let max_val: u8 = *image.data.iter().max().unwrap();
+    assert!(
+        max_val < 30,
+        "all-zero pixels should decode to near-zero, max was {}",
+        max_val
+    );
+}
+
+#[test]
+fn encode_all_255_pixels() {
+    let pixels: Vec<u8> = vec![255u8; 16 * 16 * 3];
+    let jpeg = Encoder::new(&pixels, 16, 16, PixelFormat::Rgb)
+        .quality(75)
+        .encode()
+        .unwrap();
+    let image = decompress(&jpeg).unwrap();
+    assert_eq!(image.width, 16);
+    assert_eq!(image.height, 16);
+    // All-255 input: decoded should be close to 255
+    let min_val: u8 = *image.data.iter().min().unwrap();
+    assert!(
+        min_val > 225,
+        "all-255 pixels should decode to near-255, min was {}",
+        min_val
+    );
+}
+
+// --- Progressive encode with grayscale ---
+
+#[test]
+fn progressive_encode_grayscale() {
+    let pixels: Vec<u8> = vec![128u8; 32 * 32];
+    let jpeg = Encoder::new(&pixels, 32, 32, PixelFormat::Grayscale)
+        .quality(75)
+        .progressive(true)
+        .encode()
+        .unwrap();
+
+    // Should contain SOF2 marker (progressive)
+    let has_sof2 = jpeg.windows(2).any(|w| w[0] == 0xFF && w[1] == 0xC2);
+    assert!(has_sof2, "progressive grayscale should contain SOF2 marker");
+
+    let image = decompress(&jpeg).unwrap();
+    assert_eq!(image.width, 32);
+    assert_eq!(image.height, 32);
+    assert_eq!(image.pixel_format, PixelFormat::Grayscale);
+}
+
+// --- Arithmetic encode with all subsampling modes ---
+
+#[test]
+fn arithmetic_encode_all_subsamplings() {
+    // Arithmetic encode supports S444, S422, S420, S440, S411, S441
+    let subsamplings = [
+        Subsampling::S444,
+        Subsampling::S422,
+        Subsampling::S420,
+        Subsampling::S440,
+        Subsampling::S411,
+        Subsampling::S441,
+    ];
+
+    let pixels: Vec<u8> = (0..32 * 32 * 3)
+        .map(|i| ((i * 37 + 13) % 256) as u8)
+        .collect();
+
+    for &ss in &subsamplings {
+        let jpeg = Encoder::new(&pixels, 32, 32, PixelFormat::Rgb)
+            .quality(75)
+            .subsampling(ss)
+            .arithmetic(true)
+            .encode()
+            .unwrap_or_else(|e| panic!("arithmetic encode failed for {:?}: {}", ss, e));
+
+        // Should contain SOF9 marker (arithmetic sequential DCT)
+        let has_sof9 = jpeg.windows(2).any(|w| w[0] == 0xFF && w[1] == 0xC9);
+        assert!(
+            has_sof9,
+            "arithmetic encode should contain SOF9 marker for {:?}",
+            ss
+        );
+
+        let image = decompress(&jpeg)
+            .unwrap_or_else(|e| panic!("decode of arithmetic {:?} failed: {}", ss, e));
+        assert_eq!(image.width, 32, "width mismatch for arithmetic {:?}", ss);
+        assert_eq!(image.height, 32, "height mismatch for arithmetic {:?}", ss);
+    }
+}
+
+// --- CMYK encode roundtrip ---
+
+#[test]
+fn cmyk_encode_decode_roundtrip() {
+    let pixels: Vec<u8> = vec![128u8; 16 * 16 * 4];
+    let jpeg = Encoder::new(&pixels, 16, 16, PixelFormat::Cmyk)
+        .quality(75)
+        .encode()
+        .unwrap();
+    // CMYK JPEG should be valid (can at least be parsed)
+    assert!(jpeg.len() > 100, "CMYK JPEG should not be trivially small");
+    assert_eq!(jpeg[0], 0xFF);
+    assert_eq!(jpeg[1], 0xD8);
+}
+
+// --- Quality 1 vs quality 100 produces different file sizes ---
+
+#[test]
+fn quality_affects_file_size() {
+    let pixels: Vec<u8> = (0..32 * 32 * 3)
+        .map(|i| ((i * 37 + 13) % 256) as u8)
+        .collect();
+    let jpeg_q1 = Encoder::new(&pixels, 32, 32, PixelFormat::Rgb)
+        .quality(1)
+        .subsampling(Subsampling::S444)
+        .encode()
+        .unwrap();
+    let jpeg_q100 = Encoder::new(&pixels, 32, 32, PixelFormat::Rgb)
+        .quality(100)
+        .subsampling(Subsampling::S444)
+        .encode()
+        .unwrap();
+
+    assert!(
+        jpeg_q100.len() > jpeg_q1.len(),
+        "quality=100 ({} bytes) should produce larger file than quality=1 ({} bytes)",
+        jpeg_q100.len(),
+        jpeg_q1.len()
+    );
+}
+
+// --- C djpeg cross-validation ---
+
+fn parse_ppm(path: &Path) -> (usize, usize, Vec<u8>) {
+    let raw: Vec<u8> = std::fs::read(path).expect("failed to read PPM");
+    assert!(&raw[0..2] == b"P6", "not P6 PPM");
+    let mut idx: usize = 2;
+    loop {
+        while idx < raw.len() && raw[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        if idx < raw.len() && raw[idx] == b'#' {
+            while idx < raw.len() && raw[idx] != b'\n' {
+                idx += 1;
+            }
+        } else {
+            break;
+        }
+    }
+    let (w, next) = read_ppm_num(&raw, idx);
+    idx = next;
+    while idx < raw.len() && raw[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    let (h, next) = read_ppm_num(&raw, idx);
+    idx = next;
+    while idx < raw.len() && raw[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    let (_maxval, next) = read_ppm_num(&raw, idx);
+    idx = next + 1;
+    (w, h, raw[idx..idx + w * h * 3].to_vec())
+}
+
+fn read_ppm_num(data: &[u8], idx: usize) -> (usize, usize) {
+    let mut end: usize = idx;
+    while end < data.len() && data[end].is_ascii_digit() {
+        end += 1;
+    }
+    (
+        std::str::from_utf8(&data[idx..end])
+            .unwrap()
+            .parse()
+            .unwrap(),
+        end,
+    )
+}
+
+fn c_djpeg_cross_validate_subsampling(djpeg: &Path, ss: Subsampling) {
+    let pixels: Vec<u8> = (0..32 * 32 * 3)
+        .map(|i| ((i * 37 + 13) % 256) as u8)
+        .collect();
+
+    let jpeg: Vec<u8> = Encoder::new(&pixels, 32, 32, PixelFormat::Rgb)
+        .quality(90)
+        .subsampling(ss)
+        .encode()
+        .unwrap();
+
+    let rust_dec = decompress_to(&jpeg, PixelFormat::Rgb).unwrap();
+
+    let tmp_jpg: String = format!("/tmp/ljt_eb_{:?}.jpg", ss);
+    let tmp_ppm: String = format!("/tmp/ljt_eb_{:?}.ppm", ss);
+    std::fs::write(&tmp_jpg, &jpeg).unwrap();
+
+    let output = Command::new(djpeg)
+        .arg("-ppm")
+        .arg("-outfile")
+        .arg(&tmp_ppm)
+        .arg(&tmp_jpg)
+        .output()
+        .expect("failed to run djpeg");
+    assert!(output.status.success(), "djpeg failed for {:?}", ss);
+
+    let (_, _, c_pixels) = parse_ppm(Path::new(&tmp_ppm));
+    std::fs::remove_file(&tmp_jpg).ok();
+    std::fs::remove_file(&tmp_ppm).ok();
+
+    let max_diff: u8 = c_pixels
+        .iter()
+        .zip(rust_dec.data.iter())
+        .map(|(&a, &b)| (a as i16 - b as i16).unsigned_abs() as u8)
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        max_diff, 0,
+        "{:?}: C djpeg vs Rust decode max_diff={} (must be 0)",
+        ss, max_diff
+    );
+}
+
+/// C djpeg cross-validation for S444/S422/S420 — must match exactly.
+#[test]
+fn c_djpeg_cross_validation_common_subsamplings_diff_zero() {
+    let djpeg: PathBuf = require_c_tool!("djpeg");
+    for &ss in &[Subsampling::S444, Subsampling::S422, Subsampling::S420] {
+        c_djpeg_cross_validate_subsampling(&djpeg, ss);
+    }
+}
+
+/// C djpeg cross-validation for S440 — diff=0.
+#[test]
+fn c_djpeg_cross_validation_s440_diff_zero() {
+    let djpeg: PathBuf = require_c_tool!("djpeg");
+    c_djpeg_cross_validate_subsampling(&djpeg, Subsampling::S440);
+}
+
+/// C djpeg cross-validation for S411 — diff=0.
+#[test]
+fn c_djpeg_cross_validation_s411_diff_zero() {
+    let djpeg: PathBuf = require_c_tool!("djpeg");
+    c_djpeg_cross_validate_subsampling(&djpeg, Subsampling::S411);
+}
+
+/// C djpeg cross-validation for S441 — diff=0.
+#[test]
+fn c_djpeg_cross_validation_s441_diff_zero() {
+    let djpeg: PathBuf = require_c_tool!("djpeg");
+    c_djpeg_cross_validate_subsampling(&djpeg, Subsampling::S441);
+}
+
+/// Parse a binary PGM (P5) file and return (width, height, grayscale_pixels).
+fn parse_pgm(path: &Path) -> (usize, usize, Vec<u8>) {
+    let raw: Vec<u8> = std::fs::read(path).expect("failed to read PGM");
+    assert!(&raw[0..2] == b"P5", "not P5 PGM");
+    let mut idx: usize = 2;
+    loop {
+        while idx < raw.len() && raw[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        if idx < raw.len() && raw[idx] == b'#' {
+            while idx < raw.len() && raw[idx] != b'\n' {
+                idx += 1;
+            }
+        } else {
+            break;
+        }
+    }
+    let (w, next) = read_ppm_num(&raw, idx);
+    idx = next;
+    while idx < raw.len() && raw[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    let (h, next) = read_ppm_num(&raw, idx);
+    idx = next;
+    while idx < raw.len() && raw[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    let (_maxval, next) = read_ppm_num(&raw, idx);
+    idx = next + 1;
+    (w, h, raw[idx..idx + w * h].to_vec())
+}
+
+/// Helper: encode with Rust, decode with both Rust and C djpeg, assert diff=0.
+/// Supports both RGB (PPM) and grayscale (PGM) output.
+fn c_djpeg_cross_validate_jpeg(djpeg: &Path, jpeg: &[u8], label: &str, is_grayscale: bool) {
+    let pid: u32 = std::process::id();
+    let tmp_jpg: String = format!("/tmp/ljt_eb_ext_{}_{}.jpg", label, pid);
+    let tmp_out: String = format!(
+        "/tmp/ljt_eb_ext_{}_{}.{}",
+        label,
+        pid,
+        if is_grayscale { "pgm" } else { "ppm" }
+    );
+    std::fs::write(&tmp_jpg, jpeg).unwrap();
+
+    let format_flag: &str = if is_grayscale { "-pnm" } else { "-ppm" };
+    let output = Command::new(djpeg)
+        .arg(format_flag)
+        .arg("-outfile")
+        .arg(&tmp_out)
+        .arg(&tmp_jpg)
+        .output()
+        .expect("failed to run djpeg");
+    assert!(
+        output.status.success(),
+        "{}: djpeg failed: {}",
+        label,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let decode_fmt: PixelFormat = if is_grayscale {
+        PixelFormat::Grayscale
+    } else {
+        PixelFormat::Rgb
+    };
+    let rust_dec = decompress_to(jpeg, decode_fmt)
+        .unwrap_or_else(|e| panic!("{}: Rust decode failed: {}", label, e));
+
+    let (cw, ch, c_pixels) = if is_grayscale {
+        parse_pgm(Path::new(&tmp_out))
+    } else {
+        parse_ppm(Path::new(&tmp_out))
+    };
+    std::fs::remove_file(&tmp_jpg).ok();
+    std::fs::remove_file(&tmp_out).ok();
+
+    assert_eq!(rust_dec.width, cw, "{}: width mismatch", label);
+    assert_eq!(rust_dec.height, ch, "{}: height mismatch", label);
+    assert_eq!(
+        rust_dec.data.len(),
+        c_pixels.len(),
+        "{}: data length mismatch",
+        label
+    );
+
+    let max_diff: u8 = c_pixels
+        .iter()
+        .zip(rust_dec.data.iter())
+        .map(|(&a, &b)| (a as i16 - b as i16).unsigned_abs() as u8)
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        max_diff, 0,
+        "{}: C djpeg vs Rust decode max_diff={} (must be 0)",
+        label, max_diff
+    );
+}
+
+/// Extended C djpeg cross-validation covering quality extremes, special pixel
+/// values, small dimensions, arithmetic coding, and CMYK encode.
+#[test]
+fn c_djpeg_encode_boundaries_extended_diff_zero() {
+    let djpeg: PathBuf = require_c_tool!("djpeg");
+
+    // --- Quality extremes: Q0 (clamped to Q1) and Q1 ---
+    {
+        let pixels: Vec<u8> = (0..32 * 32 * 3)
+            .map(|i| ((i * 37 + 13) % 256) as u8)
+            .collect();
+        for &q in &[0u8, 1] {
+            let jpeg: Vec<u8> = Encoder::new(&pixels, 32, 32, PixelFormat::Rgb)
+                .quality(q)
+                .subsampling(Subsampling::S444)
+                .encode()
+                .unwrap_or_else(|e| panic!("encode Q{} failed: {}", q, e));
+            c_djpeg_cross_validate_jpeg(&djpeg, &jpeg, &format!("q{}", q), false);
+        }
+    }
+
+    // --- Quality extreme: Q100 ---
+    {
+        let pixels: Vec<u8> = (0..32 * 32 * 3)
+            .map(|i| ((i * 37 + 13) % 256) as u8)
+            .collect();
+        let jpeg: Vec<u8> = Encoder::new(&pixels, 32, 32, PixelFormat::Rgb)
+            .quality(100)
+            .subsampling(Subsampling::S444)
+            .encode()
+            .unwrap();
+        c_djpeg_cross_validate_jpeg(&djpeg, &jpeg, "q100", false);
+    }
+
+    // --- All-zero pixels ---
+    {
+        let pixels: Vec<u8> = vec![0u8; 16 * 16 * 3];
+        let jpeg: Vec<u8> = Encoder::new(&pixels, 16, 16, PixelFormat::Rgb)
+            .quality(75)
+            .subsampling(Subsampling::S444)
+            .encode()
+            .unwrap();
+        c_djpeg_cross_validate_jpeg(&djpeg, &jpeg, "all_zero", false);
+    }
+
+    // --- All-255 pixels ---
+    {
+        let pixels: Vec<u8> = vec![255u8; 16 * 16 * 3];
+        let jpeg: Vec<u8> = Encoder::new(&pixels, 16, 16, PixelFormat::Rgb)
+            .quality(75)
+            .subsampling(Subsampling::S444)
+            .encode()
+            .unwrap();
+        c_djpeg_cross_validate_jpeg(&djpeg, &jpeg, "all_255", false);
+    }
+
+    // --- Extreme small dimensions with various subsamplings ---
+    {
+        // 1x1
+        let pixels_1x1: Vec<u8> = vec![128, 64, 32];
+        for &ss in &[
+            Subsampling::S444,
+            Subsampling::S422,
+            Subsampling::S420,
+            Subsampling::S440,
+            Subsampling::S411,
+            Subsampling::S441,
+        ] {
+            let jpeg: Vec<u8> = Encoder::new(&pixels_1x1, 1, 1, PixelFormat::Rgb)
+                .quality(75)
+                .subsampling(ss)
+                .encode()
+                .unwrap_or_else(|e| panic!("1x1 {:?} encode failed: {}", ss, e));
+            c_djpeg_cross_validate_jpeg(&djpeg, &jpeg, &format!("1x1_{:?}", ss), false);
+        }
+
+        // 3x5
+        let pixels_3x5: Vec<u8> = (0..3 * 5 * 3)
+            .map(|i| ((i * 37 + 13) % 256) as u8)
+            .collect();
+        for &ss in &[
+            Subsampling::S444,
+            Subsampling::S422,
+            Subsampling::S420,
+            Subsampling::S440,
+            Subsampling::S411,
+            Subsampling::S441,
+        ] {
+            let jpeg: Vec<u8> = Encoder::new(&pixels_3x5, 3, 5, PixelFormat::Rgb)
+                .quality(75)
+                .subsampling(ss)
+                .encode()
+                .unwrap_or_else(|e| panic!("3x5 {:?} encode failed: {}", ss, e));
+            c_djpeg_cross_validate_jpeg(&djpeg, &jpeg, &format!("3x5_{:?}", ss), false);
+        }
+    }
+
+    // --- Arithmetic encode ---
+    {
+        let pixels: Vec<u8> = (0..32 * 32 * 3)
+            .map(|i| ((i * 37 + 13) % 256) as u8)
+            .collect();
+        for &ss in &[Subsampling::S444, Subsampling::S420, Subsampling::S422] {
+            let jpeg: Vec<u8> = Encoder::new(&pixels, 32, 32, PixelFormat::Rgb)
+                .quality(75)
+                .subsampling(ss)
+                .arithmetic(true)
+                .encode()
+                .unwrap_or_else(|e| panic!("arithmetic {:?} encode failed: {}", ss, e));
+            c_djpeg_cross_validate_jpeg(&djpeg, &jpeg, &format!("arith_{:?}", ss), false);
+        }
+    }
+
+    // --- CMYK encode: djpeg decodes CMYK to RGB, compare dimensions ---
+    // djpeg converts CMYK JPEG to RGB PPM; we verify djpeg accepts the file
+    // and the output dimensions match. Pixel values are not compared 1:1
+    // because CMYK->RGB conversion may differ between implementations.
+    {
+        let pixels: Vec<u8> = (0..16 * 16 * 4)
+            .map(|i| ((i * 41 + 7) % 256) as u8)
+            .collect();
+        let jpeg: Vec<u8> = Encoder::new(&pixels, 16, 16, PixelFormat::Cmyk)
+            .quality(75)
+            .encode()
+            .unwrap();
+
+        let pid: u32 = std::process::id();
+        let tmp_jpg: String = format!("/tmp/ljt_eb_ext_cmyk_{}.jpg", pid);
+        let tmp_ppm: String = format!("/tmp/ljt_eb_ext_cmyk_{}.ppm", pid);
+        std::fs::write(&tmp_jpg, &jpeg).unwrap();
+
+        let output = Command::new(&djpeg)
+            .arg("-ppm")
+            .arg("-outfile")
+            .arg(&tmp_ppm)
+            .arg(&tmp_jpg)
+            .output()
+            .expect("failed to run djpeg");
+
+        std::fs::remove_file(&tmp_jpg).ok();
+
+        if output.status.success() {
+            let (cw, ch, _c_pixels) = parse_ppm(Path::new(&tmp_ppm));
+            std::fs::remove_file(&tmp_ppm).ok();
+            assert_eq!(cw, 16, "CMYK width mismatch");
+            assert_eq!(ch, 16, "CMYK height mismatch");
+        } else {
+            std::fs::remove_file(&tmp_ppm).ok();
+            // Some djpeg builds do not support CMYK; skip gracefully
+            eprintln!(
+                "NOTE: djpeg does not support CMYK JPEG: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
