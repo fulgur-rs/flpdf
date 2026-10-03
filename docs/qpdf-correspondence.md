@@ -282,6 +282,25 @@ and exit status as qpdf 11.9.0. The same live-source regression also checks
 `readTrailer`'s post-dictionary `stream` warning; a malformed hex-string
 candidate checks trailer parser warning bytes and offsets.
 
+### `startxref` candidate predicate and fallback (`flpdf-6ik2q.11`, 2026-10-03)
+
+`QPDF::parse` limits marker discovery to the final 1054 bytes and uses
+`InputSource::findLast("startxref", ..., PatternFinder(QPDF::findStartxref))`
+(`libqpdf/QPDF.cc:413-419,439-448`; `libqpdf/InputSource.cc:44-140,145-165`).
+Each substring candidate is tested by reading the complete first token and its
+following token: the first must equal the `startxref` word and the second must
+be an integer. A rejected last candidate does not shadow an earlier valid one;
+after acceptance, `findLast` resumes at the offset token's start. qpdf does not
+apply a separate left word-boundary check before a matching substring.
+
+`parse_startxref` applies that predicate to each candidate in its existing
+1054-byte tail window and re-reads the selected integer token, matching qpdf's
+`findLast`/`findStartxref` call order. Canonical `Pdf::open` tests append both a
+non-integer candidate and an attached-digit `startxref123` candidate after a
+valid marker, then compare qpdf 11.9.0 warnings, xref rows, and exit status. A
+third case fixes qpdf's substring-without-left-boundary behavior. Signed
+`startxref` offset conversion remains the separate `flpdf-6ik2q.15` finding.
+
 ### Canonical trailer nested value descriptions (`flpdf-7yb9k`, 2026-09-17)
 
 qpdf constructs `QPDFParser` for `readTrailer` with the literal object
