@@ -4387,9 +4387,14 @@ impl ObjectHandle {
         }
     }
 
-    /// Give an undescribed direct value the owning document identity that
-    /// qpdf's `setObjectDescription` installs on a stream dictionary. Existing
-    /// owners are preserved.
+    /// Give an unowned direct value the owning document identity that
+    /// qpdf's `setObjectDescription` installs on a stream dictionary
+    /// (`QPDF_Stream::setDictDescription`, `libqpdf/QPDF_Stream.cc:305-312`).
+    /// qpdf records the owner together with the description, so a described
+    /// dictionary is always owned; here the two are separate fields, and a
+    /// dictionary that already carries a description (as the qpdf JSON reader
+    /// installs) still receives the owner. Existing owners and descriptions
+    /// are preserved.
     pub(crate) fn set_pdf_identity_if_unowned(
         &self,
         pdf_unique_id: u64,
@@ -4397,7 +4402,7 @@ impl ObjectHandle {
     ) {
         let shared = self.0.borrow().shared.clone();
         let mut shared = shared.borrow_mut();
-        if shared.identity.active_pdf_unique_id.is_none() && shared.description.is_none() {
+        if shared.identity.active_pdf_unique_id.is_none() {
             shared.identity.active_pdf_unique_id = NonZeroU64::new(pdf_unique_id);
             shared.identity.resolver = resolver;
         }
@@ -16446,6 +16451,40 @@ mod mutation_tests {
             replacement_dict.owning_pdf_unique_id(),
             stream.owning_pdf_unique_id()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn replace_stream_dict_binds_a_described_but_unowned_dictionary_to_its_stream_pdf(
+    ) -> crate::Result<()> {
+        let document = crate::Pdf::empty()?;
+        let mut foreign_document = crate::Pdf::empty()?;
+        let stream = document.new_stream()?;
+        let replacement_dict = ObjectHandle::dictionary(vec![]);
+        replacement_dict.set_description_json("input.json", "object 1 0", 17);
+        assert_eq!(replacement_dict.owning_pdf_unique_id(), None);
+        stream.replace_stream_dict(replacement_dict.clone())?;
+        let foreign_filter = foreign_document
+            .make_indirect_object_handle(ObjectHandle::name(b"/Foreign".to_vec()))?;
+
+        let error = stream
+            .replace_stream_data(
+                Rc::new(b"replacement bytes".to_vec()),
+                Some(foreign_filter),
+                None,
+            )
+            .expect_err("a described replacement dictionary is owned by the stream's document");
+
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "Attempting to add an object from a different QPDF. Use QPDF::copyForeignObject to add objects from another file."
+        ));
+        assert_eq!(
+            replacement_dict.owning_pdf_unique_id(),
+            stream.owning_pdf_unique_id()
+        );
+        assert!(!replacement_dict.try_has_key(b"/Filter")?);
         Ok(())
     }
 

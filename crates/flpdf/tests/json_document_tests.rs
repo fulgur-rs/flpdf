@@ -178,6 +178,35 @@ fn create_from_json_reads_inline_stream_data_when_the_source_starts_past_a_prefi
 }
 
 #[test]
+fn json_imported_stream_dictionary_rejects_a_filter_owned_by_another_document() {
+    // qpdf's JSON reader gives the stream dictionary the importing QPDF as
+    // owner together with its description (`QPDF::JSONReactor::
+    // setObjectDescription`, `libqpdf/QPDF_json.cc:721-730`), so
+    // `replaceStreamData` -> `replaceKey` -> `checkOwnership` rejects a
+    // `/Filter` handle that belongs to a different QPDF before mutating.
+    let json = br#"{"qpdf":[{"jsonversion":2,"pdfversion":"1.3"},{"obj:1 0 R":{"stream":{"dict":{"/Type":"/XObject"},"data":"SGVsbG8="}},"trailer":{"value":{}}}]}"#;
+    let mut pdf = Pdf::create_from_json(Cursor::new(json.to_vec()), "in.json").expect("create");
+    let other = Pdf::create_from_json(Cursor::new(json.to_vec()), "other.json").expect("other");
+    let foreign_filter = other.new_stream().expect("foreign stream");
+    let stream = pdf.get_object_handle(ObjectRef::new(1, 0));
+
+    let error = stream
+        .replace_stream_data(std::rc::Rc::new(b"x".to_vec()), Some(foreign_filter), None)
+        .expect_err("a filter owned by another QPDF must be rejected");
+
+    assert!(matches!(
+        error,
+        flpdf::Error::Internal(message)
+            if message == "Attempting to add an object from a different QPDF. Use QPDF::copyForeignObject to add objects from another file."
+    ));
+    assert!(!stream
+        .try_get_stream_dict()
+        .expect("stream dict")
+        .try_has_key(b"/Filter")
+        .expect("has key"));
+}
+
+#[test]
 fn create_from_json_uses_qpdf_rootless_seed_and_complete_metadata() {
     let mut pdf = Pdf::create_from_json(Cursor::new(ROOTLESS_COMPLETE_JSON), "rootless.json")
         .expect("complete JSON should create a document");
