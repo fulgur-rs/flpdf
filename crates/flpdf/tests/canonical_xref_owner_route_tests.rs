@@ -2035,6 +2035,262 @@ fn startxref_candidate_search_falls_back_by_qpdf_token_predicate() {
     }
 }
 
+fn classic_xref_document_with_header_prefix(prefix: &[u8], startxref: &[u8]) -> Vec<u8> {
+    let mut bytes = prefix.to_vec();
+    let header_offset = bytes.len();
+    bytes.extend_from_slice(b"%PDF-1.4\n");
+    let mut offsets = Vec::new();
+    for object in [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".as_slice(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".as_slice(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n".as_slice(),
+    ] {
+        offsets.push(bytes.len() - header_offset);
+        bytes.extend_from_slice(object);
+    }
+    bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(b"trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n");
+    bytes.extend_from_slice(startxref);
+    bytes.extend_from_slice(b"%%EOF\n");
+    bytes
+}
+
+#[derive(Clone, Copy)]
+enum NegativeStartxrefSourceFailure {
+    FileInputSource,
+    OffsetInputSource,
+}
+
+fn assert_negative_startxref_matches_qpdf(
+    filename: &str,
+    fixture: Vec<u8>,
+    source_failure: NegativeStartxrefSourceFailure,
+    offset: &str,
+) {
+    let directory = tempfile::tempdir().expect("create qpdf fixture directory");
+    let input = directory.path().join(filename);
+    fs::write(&input, &fixture).expect("write qpdf fixture");
+    let description = input.to_string_lossy().into_owned();
+    let error_detail = match source_failure {
+        NegativeStartxrefSourceFailure::FileInputSource => {
+            format!("seek to {description}, offset {offset} (0): Invalid argument")
+        }
+        NegativeStartxrefSourceFailure::OffsetInputSource => {
+            "offset input source: seek before beginning of file".to_owned()
+        }
+    };
+
+    let strict_error = match Pdf::open_with_options(
+        fs::File::open(&input).expect("open PDF fixture for strict mode"),
+        PdfOpenOptions {
+            repair: false,
+            suppress_warnings: true,
+            description: description.as_bytes().to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("strict open must attempt qpdf's signed seek for startxref -1"),
+        Err(error) => error,
+    };
+    assert!(strict_error.open_failure().is_none());
+    let Error::QpdfExc(qpdf_error) = &strict_error else {
+        panic!("qpdf's read_xref seek exception must cross QPDF::parse as DamagedPdf: {strict_error:?}");
+    };
+    assert_eq!(
+        qpdf_error.get_error_code(),
+        flpdf::QpdfErrorCode::DamagedPdf
+    );
+    assert_eq!(qpdf_error.get_filename(), description.as_bytes());
+    assert_eq!(qpdf_error.get_object(), b"");
+    assert_eq!(qpdf_error.get_file_position(), 0);
+    assert_eq!(
+        qpdf_error.get_message_detail(),
+        format!("error reading xref: {error_detail}").as_bytes()
+    );
+
+    let pdf = Pdf::open_with_options(
+        fs::File::open(&input).expect("open PDF fixture for repair mode"),
+        PdfOpenOptions {
+            repair: true,
+            suppress_warnings: true,
+            description: description.as_bytes().to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("qpdf repairs after the signed startxref seek fails");
+    let flpdf_warnings: Vec<String> = pdf
+        .repair_diagnostics()
+        .entries()
+        .iter()
+        .map(|warning| String::from_utf8_lossy(warning.what_bytes()).into_owned())
+        .collect();
+    assert_eq!(
+        flpdf_warnings,
+        vec![
+            format!("{description}: file is damaged"),
+            format!("{description}: error reading xref: {error_detail}"),
+            format!("{description}: Attempting to reconstruct cross-reference table"),
+        ]
+    );
+
+    if !qpdf_available() {
+        eprintln!("qpdf 11.9.0 is not available; skipping only the oracle comparison");
+        return;
+    }
+    let strict_qpdf = Command::new("qpdf")
+        .args(["--suppress-recovery", "--check"])
+        .arg(&input)
+        .output()
+        .expect("qpdf should spawn");
+    assert_eq!(strict_qpdf.status.code(), Some(2));
+    let strict_stderr = String::from_utf8_lossy(&strict_qpdf.stderr);
+    assert_eq!(
+        strict_stderr.trim(),
+        format!("qpdf: {description}: error reading xref: {error_detail}")
+    );
+
+    let qpdf = Command::new("qpdf")
+        .args(["--warning-exit-0", "--show-xref"])
+        .arg(&input)
+        .output()
+        .expect("qpdf should spawn");
+    assert!(qpdf.status.success());
+    let qpdf_warnings: Vec<String> = String::from_utf8_lossy(&qpdf.stderr)
+        .lines()
+        .filter_map(|line| line.strip_prefix("WARNING: "))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(flpdf_warnings, qpdf_warnings);
+    let qpdf_rows: Vec<String> = String::from_utf8_lossy(&qpdf.stdout)
+        .lines()
+        .filter(|line| line.contains(": uncompressed;") || line.contains(": compressed;"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(render_xref_table(&pdf.get_xref_table()), qpdf_rows);
+}
+
+#[test]
+fn negative_startxref_matches_qpdf_file_seek_error() {
+    let fixture = classic_xref_document(b"", Some(b"-1\n"));
+    assert_negative_startxref_matches_qpdf(
+        "negative-startxref.pdf",
+        fixture,
+        NegativeStartxrefSourceFailure::FileInputSource,
+        "-1",
+    );
+}
+
+#[test]
+fn negative_startxref_matches_qpdf_buffer_seek_error() {
+    let description = b"memory.pdf";
+    let error = match Pdf::open_with_options(
+        Cursor::new(classic_xref_document(b"", Some(b"-1\n"))),
+        PdfOpenOptions {
+            repair: false,
+            suppress_warnings: true,
+            description: description.to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("strict memory input must attempt qpdf's signed seek"),
+        Err(error) => error,
+    };
+    assert!(error.open_failure().is_none());
+    let Error::QpdfExc(qpdf_error) = error else {
+        panic!("qpdf's BufferInputSource seek failure is wrapped by QPDF::parse: {error:?}");
+    };
+    assert_eq!(
+        qpdf_error.get_error_code(),
+        flpdf::QpdfErrorCode::DamagedPdf
+    );
+    assert_eq!(qpdf_error.get_filename(), description);
+    assert_eq!(qpdf_error.get_object(), b"");
+    assert_eq!(qpdf_error.get_file_position(), 0);
+    assert_eq!(
+        qpdf_error.get_message_detail(),
+        b"error reading xref: memory.pdf: seek before beginning of buffer"
+    );
+}
+
+#[test]
+fn negative_startxref_after_header_offset_matches_qpdf_offset_source_error() {
+    let fixture = classic_xref_document_with_header_prefix(b"leading material\n", b"-1\n");
+    assert_negative_startxref_matches_qpdf(
+        "negative-startxref-after-header.pdf",
+        fixture,
+        NegativeStartxrefSourceFailure::OffsetInputSource,
+        "-1",
+    );
+}
+
+#[test]
+fn minimum_signed_startxref_matches_qpdf_file_seek_error() {
+    let offset = "-9223372036854775808";
+    let fixture = classic_xref_document(b"", Some(format!("{offset}\n").as_bytes()));
+    assert_negative_startxref_matches_qpdf(
+        "minimum-signed-startxref.pdf",
+        fixture,
+        NegativeStartxrefSourceFailure::FileInputSource,
+        offset,
+    );
+}
+
+#[test]
+fn startxref_signed_long_overflow_matches_uncaught_qpdf_conversion() {
+    let directory = tempfile::tempdir().expect("create qpdf fixture directory");
+    for (index, value) in ["9223372036854775808", "-9223372036854775809"]
+        .into_iter()
+        .enumerate()
+    {
+        let fixture = classic_xref_document(b"", Some(format!("{value}\n").as_bytes()));
+        let input = directory
+            .path()
+            .join(format!("startxref-signed-long-overflow-{index}.pdf"));
+        fs::write(&input, &fixture).expect("write qpdf fixture");
+        let expected =
+            format!("overflow/underflow converting {value} to 64-bit integer").into_bytes();
+
+        for repair in [false, true] {
+            let error = match Pdf::open_with_options(
+                fs::File::open(&input).expect("open PDF fixture"),
+                PdfOpenOptions {
+                    repair,
+                    suppress_warnings: true,
+                    description: input.to_string_lossy().as_bytes().to_vec(),
+                    ..PdfOpenOptions::default()
+                },
+            ) {
+                Ok(_) => {
+                    panic!("QUtil::string_to_ll overflow occurs before qpdf's recovery catch")
+                }
+                Err(error) => error,
+            };
+            assert!(error.open_failure().is_none());
+            assert_eq!(error.raw_message(), Some(expected.as_slice()));
+        }
+
+        if !qpdf_available() {
+            eprintln!("qpdf 11.9.0 is not available; skipping only the oracle comparison");
+            return;
+        }
+        for args in [vec!["--suppress-recovery", "--check"], vec!["--check"]] {
+            let qpdf = Command::new("qpdf")
+                .args(&args)
+                .arg(&input)
+                .output()
+                .expect("qpdf should spawn");
+            assert_eq!(qpdf.status.code(), Some(2));
+            assert_eq!(
+                String::from_utf8_lossy(&qpdf.stderr).trim(),
+                format!("qpdf: {}", String::from_utf8_lossy(&expected))
+            );
+        }
+    }
+}
+
 /// A classic section that jumps straight from the `xref` keyword to
 /// `trailer`. qpdf's `while (!done)` loop always opens by reading a
 /// subsection header and only recognises `trailer` through the lookahead that

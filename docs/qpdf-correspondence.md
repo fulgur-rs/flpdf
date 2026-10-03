@@ -330,7 +330,34 @@ apply a separate left word-boundary check before a matching substring.
 non-integer candidate and an attached-digit `startxref123` candidate after a
 valid marker, then compare qpdf 11.9.0 warnings, xref rows, and exit status. A
 third case fixes qpdf's substring-without-left-boundary behavior. Signed
-`startxref` offset conversion remains the separate `flpdf-6ik2q.15` finding.
+`startxref` conversion and seek failures are handled in the separate
+`flpdf-6ik2q.15` slice; this section owns only candidate matching and fallback.
+
+### Signed `startxref` conversion and seek boundary (`flpdf-6ik2q.15`, 2026-10-03)
+
+`QPDF::findStartxref` accepts a signed integer token and rewinds the source to
+its start (`libqpdf/QPDF.cc:413-420`). `QPDF::parse` converts it with
+`QUtil::string_to_ll` before entering the `read_xref` try/catch
+(`QPDF.cc:439-464`): signed 64-bit overflow/underflow is a raw range error and
+does not enter recovery. A negative value is nonzero, so `read_xref` passes it
+to `InputSource::seek` (`QPDF.cc:626-640`); a resulting non-`QPDFExc` exception
+is wrapped as `DamagedPdf` with `error reading xref: ` and offset zero before
+the normal repair branch (`QPDF.cc:450-469`).
+
+flpdf parses through the existing `qpdf_string_to_ll_checked` primitive and
+keeps the conversion exception outside recovery. Its canonical owner now
+accepts qpdf's signed `i64` seek coordinate; nonnegative xref windows adapt
+from their range indexes with checked `qpdf_offset_t` narrowing. The resolver
+applies `OffsetInputSource`'s physical header shift before checking its
+negative logical tell (`OffsetInputSource.cc:37-55`). At the underlying source
+boundary it preserves qpdf's `FileInputSource` system-error text
+(`FileInputSource.cc:100-107`) and `BufferInputSource` lower-bound text
+(`BufferInputSource.cc:83-112`). The read-xref wrapper then creates the same
+offset-zero `DamagedPdf`, allowing reconstruction to emit qpdf's warning order.
+
+Canonical tests compare qpdf 11.9.0 for strict and repair opens with `-1`,
+`i64::MIN`, a leading header prefix, and signed 64-bit overflow/underflow; a
+`Cursor` case pins the `processMemoryFile` / `BufferInputSource` error detail.
 
 ### Canonical trailer nested value descriptions (`flpdf-7yb9k`, 2026-09-17)
 

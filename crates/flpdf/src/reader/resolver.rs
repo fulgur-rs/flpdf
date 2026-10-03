@@ -172,6 +172,22 @@ impl StreamReadError {
     }
 }
 
+fn qpdf_file_input_seek_error(description: &[u8], offset: i64, error: std::io::Error) -> Error {
+    let mut message = b"seek to ".to_vec();
+    message.extend_from_slice(description);
+    message.extend_from_slice(b", offset ");
+    message.extend_from_slice(offset.to_string().as_bytes());
+    message.extend_from_slice(b" (0): ");
+    message.extend_from_slice(crate::qutil::strerror_text(&error).as_bytes());
+    Error::SystemBytes(message)
+}
+
+fn qpdf_buffer_input_seek_error(description: &[u8]) -> Error {
+    let mut message = description.to_vec();
+    message.extend_from_slice(b": seek before beginning of buffer");
+    Error::SystemBytes(message)
+}
+
 struct StreamInput<R: Read + Seek + 'static> {
     /// `None` is qpdf's `InvalidInputSource`. The input source is held behind
     /// an `Rc` and replaced, rather than mutated, when it is closed so a
@@ -180,14 +196,16 @@ struct StreamInput<R: Read + Seek + 'static> {
     reader: Option<Rc<RefCell<R>>>,
     header_offset: Cell<usize>,
     last_offset: Cell<u64>,
+    description: Vec<u8>,
 }
 
 impl<R: Read + Seek + 'static> StreamInput<R> {
-    fn new(reader: R, header_offset: usize) -> Self {
+    fn new(reader: R, header_offset: usize, description: Vec<u8>) -> Self {
         Self {
             reader: Some(Rc::new(RefCell::new(reader))),
             header_offset: Cell::new(header_offset),
             last_offset: Cell::new(0),
+            description,
         }
     }
 
@@ -196,6 +214,7 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
             reader: None,
             header_offset: Cell::new(0),
             last_offset: Cell::new(0),
+            description: Vec::new(),
         }
     }
 
@@ -210,10 +229,51 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
     }
 
     pub(crate) fn seek(&self, offset: u64) -> Result<()> {
-        let physical = (self.header_offset.get() as u64).saturating_add(offset);
-        self.active_reader()?
+        let offset = crate::qutil::qpdf_u64_to_offset_checked(offset).map_err(Error::System)?;
+        self.seek_qpdf_offset(offset)
+    }
+
+    fn seek_qpdf_offset(&self, offset: i64) -> Result<()> {
+        let header_offset = crate::qutil::qpdf_usize_to_offset_checked(self.header_offset.get())
+            .map_err(Error::System)?;
+        let physical = header_offset.checked_add(offset).ok_or_else(|| {
+            Error::System(format!(
+                "seeking to {offset} offset by {header_offset} would cause an overflow of the offset type"
+            ))
+        })?;
+        let seek_result = self
+            .active_reader()?
             .borrow_mut()
-            .seek(SeekFrom::Start(physical))?;
+            .seek(SeekFrom::Start(physical as u64));
+
+        if physical < 0 {
+            return match seek_result {
+                Err(error) if error.raw_os_error().is_some() => Err(qpdf_file_input_seek_error(
+                    &self.description,
+                    physical,
+                    error,
+                )),
+                // qpdf's BufferInputSource assigns its signed cursor before
+                // rejecting a negative position. A Cursor accepts every u64
+                // position, so the qpdf buffer boundary is enforced here.
+                _ => Err(qpdf_buffer_input_seek_error(&self.description)),
+            };
+        }
+
+        seek_result.map_err(|error| {
+            if error.raw_os_error().is_some() {
+                qpdf_file_input_seek_error(&self.description, physical, error)
+            } else {
+                Error::Io(error)
+            }
+        })?;
+        if offset < 0 {
+            // OffsetInputSource seeks the proxy first, then rejects a
+            // negative logical tell (`OffsetInputSource.cc:37-55`).
+            return Err(Error::SystemBytes(
+                b"offset input source: seek before beginning of file".to_vec(),
+            ));
+        }
         Ok(())
     }
 
@@ -589,8 +649,8 @@ impl<R: Read + Seek> ResolverCore<R> {
     /// here for the same reason `OffsetInputSource` applies it inside
     /// `m->file` (`libqpdf/QPDF.cc:406`): every caller above this line works
     /// in qpdf-logical coordinates and never sees the physical position.
-    fn seek(&mut self, offset: u64) -> Result<()> {
-        self.input.borrow().seek(offset)
+    fn seek(&mut self, offset: i64) -> Result<()> {
+        self.input.borrow().seek_qpdf_offset(offset)
     }
 
     fn seek_end(&mut self) -> Result<u64> {
@@ -974,7 +1034,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
         } = warning_options;
         Rc::new_cyclic(|self_weak| Self {
             core: RefCell::new(ResolverCore {
-                input: RefCell::new(Rc::new(StreamInput::new(reader, header_offset))),
+                input: RefCell::new(Rc::new(StreamInput::new(
+                    reader,
+                    header_offset,
+                    description.clone(),
+                ))),
                 input_generation: Cell::new(0),
                 header_offset,
                 xref_registration: XrefRegistration::from_effective_entries(initial_entries),
@@ -3280,10 +3344,17 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
     /// See [`ResolverCore::seek`].
     pub(crate) fn seek(&self, offset: u64) -> Result<()> {
+        let offset = crate::qutil::qpdf_u64_to_offset_checked(offset).map_err(Error::System)?;
+        self.seek_qpdf_offset(offset)
+    }
+
+    /// Seek using qpdf's signed `qpdf_offset_t` coordinate.
+    pub(crate) fn seek_qpdf_offset(&self, offset: i64) -> Result<()> {
         let result = self.core.borrow_mut().seek(offset);
-        if result.is_ok() {
-            self.bump_input_generation();
-        }
+        // OffsetInputSource can move the proxy successfully and then throw
+        // because its logical tell is negative. Invalidate live token buffers
+        // after every attempted qpdf seek, including that error path.
+        self.bump_input_generation();
         result
     }
 
@@ -5869,6 +5940,7 @@ mod tests {
     use super::ResolveMark;
     use super::ResolverHandle;
     use super::ResolverWarningOptions;
+    use super::StreamInput;
     use super::CLOSED_INPUT_SOURCE_ERROR;
     use super::REENTRANT_PARSE_ERROR;
     use crate::encryption::state::{EncryptionMode, EncryptionState};
@@ -5879,10 +5951,64 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::fs;
-    use std::io::Cursor;
+    use std::io::{self, Cursor, Read, Seek, SeekFrom};
     use std::process::Command; // cov:ignore: test-only import has no executable LLVM counter.
     use std::rc::Rc;
     use std::sync::Arc;
+
+    struct FailsAbsoluteSeek;
+
+    fn invalid_argument_raw_os_error() -> io::Error {
+        #[cfg(windows)]
+        {
+            io::Error::from_raw_os_error(87)
+        }
+        #[cfg(not(windows))]
+        {
+            io::Error::from_raw_os_error(22)
+        }
+    }
+
+    // cov:ignore-start: this fixture exercises the absolute seek failure only; read is never called
+    impl Read for FailsAbsoluteSeek {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+    // cov:ignore-end
+
+    impl Seek for FailsAbsoluteSeek {
+        fn seek(&mut self, _position: SeekFrom) -> io::Result<u64> {
+            Err(invalid_argument_raw_os_error())
+        }
+    }
+
+    #[test]
+    fn stream_input_formats_file_seek_errors_with_qpdf_context() {
+        let input = StreamInput::new(FailsAbsoluteSeek, 0, b"fixture.pdf".to_vec());
+        let error = input
+            .seek_qpdf_offset(0)
+            .expect_err("the injected file seek fails");
+
+        assert_eq!(
+            error.raw_message(),
+            Some(b"seek to fixture.pdf, offset 0 (0): Invalid argument".as_slice())
+        );
+    }
+
+    #[test]
+    fn stream_input_checks_header_rebasing_overflow_like_offset_input_source() {
+        let input = StreamInput::new(Cursor::new(Vec::new()), 1, b"fixture.pdf".to_vec());
+        let error = input
+            .seek_qpdf_offset(i64::MAX)
+            .expect_err("the logical offset plus header shift exceeds qpdf_offset_t");
+
+        assert!(matches!(
+            error,
+            Error::System(message)
+                if message == "seeking to 9223372036854775807 offset by 1 would cause an overflow of the offset type"
+        ));
+    }
 
     /// A three-object document with a classic cross-reference table: catalog,
     /// page tree, and one page. Every object is uncompressed (xref type 1).
