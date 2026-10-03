@@ -28,6 +28,10 @@ const NULL_LENGTH_FRAMING: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/fixtures/compat/null-length-framing-matrix.pdf"
 );
+const DCT_TWO_COMPONENT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/dct-two-component.pdf"
+);
 
 fn flpdf(args: &[&str]) -> Output {
     Command::cargo_bin("flpdf")
@@ -84,6 +88,32 @@ fn qpdf_11_9_available() -> bool {
     };
     let version = String::from_utf8_lossy(&output.stdout);
     output.status.success() && version.lines().next().map(str::trim) == Some("qpdf version 11.9.0")
+}
+
+fn normalize_diagnostic_program_name(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .replace(
+            "\nqpdf: operation succeeded with warnings",
+            "\nTOOL: operation succeeded with warnings",
+        )
+        .replace(
+            "\nflpdf: operation succeeded with warnings",
+            "\nTOOL: operation succeeded with warnings",
+        )
+}
+
+fn two_component_fractional_sampling_pdf() -> Vec<u8> {
+    let mut pdf = std::fs::read(DCT_TWO_COMPONENT).expect("read two-component DCT fixture");
+    let sof = pdf
+        .windows(2)
+        .position(|marker| marker == [0xff, 0xc0])
+        .expect("baseline JPEG must contain SOF0");
+    let segment_length = u16::from_be_bytes([pdf[sof + 2], pdf[sof + 3]]) as usize;
+    assert_eq!(segment_length, 14);
+    assert_eq!(pdf[sof + 9], 2);
+    pdf[sof + 11] = 0x31;
+    pdf[sof + 14] = 0x21;
+    pdf
 }
 
 #[test]
@@ -208,6 +238,78 @@ fn tiff_predictor_row_geometry_wraps_like_qpdf_11_9_0() {
     );
     assert_eq!(flpdf.stdout, qpdf.stdout);
     assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
+fn show_object_two_component_dct_matches_qpdf_11_9_output_components() {
+    if !qpdf_11_9_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("qpdf 11.9.0 is required for the two-component DCT oracle test");
+        }
+        eprintln!("qpdf 11.9.0 not available; skipping two-component DCT parity test");
+        return;
+    }
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-object=3", "--filtered-stream-data"])
+        .arg(DCT_TWO_COMPONENT)
+        .output()
+        .expect("run qpdf 11.9.0 on the two-component DCT fixture");
+    assert_eq!(qpdf.status.code(), Some(0));
+    assert_eq!(qpdf.stdout, [0x80, 0x80]);
+    assert!(qpdf.stderr.is_empty(), "{:?}", qpdf.stderr);
+
+    let flpdf = flpdf(&[
+        "--show-object=3",
+        "--filtered-stream-data",
+        DCT_TWO_COMPONENT,
+    ]);
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "flpdf rejected qpdf's two output components:\n{}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
+fn show_object_two_component_fractional_sampling_error_matches_qpdf_11_9() {
+    if !qpdf_11_9_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("qpdf 11.9.0 is required for the DCT sampling error oracle test");
+        }
+        eprintln!("qpdf 11.9.0 not available; skipping DCT sampling error parity test");
+        return;
+    }
+
+    let directory = tempfile::tempdir().expect("create fractional sampling fixture directory");
+    let path = directory.path().join("dct-fractional-sampling.pdf");
+    std::fs::write(&path, two_component_fractional_sampling_pdf())
+        .expect("write fractional sampling fixture");
+    let path_arg = path.to_str().expect("temporary path is UTF-8");
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-object=3", "--filtered-stream-data"])
+        .arg(&path)
+        .output()
+        .expect("run qpdf 11.9.0 on the fractional sampling fixture");
+    assert_eq!(qpdf.status.code(), Some(3));
+    assert!(qpdf.stdout.is_empty());
+
+    let flpdf = flpdf(&["--show-object=3", "--filtered-stream-data", path_arg]);
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "fractional sampling status differs from qpdf:\n{}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(
+        normalize_diagnostic_program_name(&flpdf.stderr),
+        normalize_diagnostic_program_name(&qpdf.stderr)
+    );
 }
 
 #[test]
