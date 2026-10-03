@@ -2,8 +2,8 @@
 //!
 //! qpdf correspondence: QPDF_linearization.cc hint decoding plus QPDFJob.cc display formatting.
 //!
-//! This module is the read-side inverse of the hint-stream encoder in
-//! [`super::hint_stream`].  It decodes the FlateDecode-compressed hint stream of
+//! This module is the read-side inverse of the internal hint-stream encoder.
+//! It decodes the FlateDecode-compressed hint stream of
 //! a linearized PDF and renders a textual dump that reproduces qpdf's
 //! `--show-linearization` output byte-for-byte (qpdf 11.9.0,
 //! `QPDF::dumpLinearizationDataInternal`).

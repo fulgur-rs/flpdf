@@ -4995,8 +4995,8 @@ It emits ordinary first-page containers, the outline root, outline containers,
 and then ineligible outline streams, preserving the existing q9o3 stream
 ordering. The strict live regression is
 `cmp_linearize_objstm_tests.rs::direct_outlines_linearized_objstm_is_byte_identical_to_qpdf`,
-with a default-feature root/container ordering guard in
-`linearize_objstm_generate_tests.rs`.
+with a default-feature root/container ordering guard in the internal unit-test
+module `crates/flpdf/src/linearization/linearize_objstm_generate_tests.rs`.
 
 ### QPDFJob writer/inspection option acceptance (`flpdf-urjhr`, 2026-09-15)
 

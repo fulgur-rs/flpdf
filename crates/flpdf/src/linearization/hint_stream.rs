@@ -99,7 +99,8 @@ use crate::pipeline::{Pipeline, PipelineResult};
 /// Contains both the uncompressed and FlateDecode-compressed forms of the
 /// hint stream, plus the byte offset of the Shared Object section within the
 /// uncompressed stream (the PDF `/S` key value).
-pub struct HintStreamBytes {
+#[cfg(test)]
+pub(crate) struct HintStreamBytes {
     /// The raw, uncompressed bit-packed hint stream.
     pub uncompressed: Vec<u8>,
     /// The FlateDecode-compressed hint stream (zlib/deflate wrapped).
@@ -124,7 +125,7 @@ pub(crate) enum HintStreamMode {
     Compressed,
 }
 
-/// The canonical writer result. Unlike [`HintStreamBytes`], this value owns
+/// The canonical writer result. Unlike `HintStreamBytes`, this value owns
 /// only the representation selected by the writer's stream policy.
 #[derive(Debug)]
 pub(crate) struct SelectedHintStream {
@@ -543,7 +544,8 @@ fn encode_hint_sections_for_test(
 /// header field value does not fit in its fixed-width Annex F slot (e.g. a value
 /// exceeding `u32::MAX` for a 32-bit slot), which typically indicates a file
 /// larger than 4 GiB or a malformed linearization plan.
-pub fn encode_hint_stream(
+#[cfg(test)]
+pub(crate) fn encode_hint_stream(
     page_offset: &PageOffsetHintTable,
     shared_object: &SharedObjectHintTable,
     outline: Option<&OutlineHintTable>,
@@ -613,6 +615,7 @@ fn encode_hint_stream_selected_with_out_buffer_size(
     })
 }
 
+#[cfg(test)]
 fn encode_hint_stream_with_out_buffer_size(
     page_offset: &PageOffsetHintTable,
     shared_object: &SharedObjectHintTable,
@@ -764,7 +767,6 @@ mod tests {
                 ObjectRef::new(2, 0),
                 ObjectRef::new(1, 0),
             ],
-            total_object_count: 3,
             page_hints: vec![PageHintEntry {
                 page_ref: ObjectRef::new(3, 0),
                 first_object_index: 0,
@@ -983,7 +985,6 @@ mod tests {
             part2_objects: vec![ObjectRef::new(3, 0), ObjectRef::new(6, 0)],
             part3_objects: vec![ObjectRef::new(5, 0), ObjectRef::new(8, 0)],
             part4_other_pages_private: vec![ObjectRef::new(4, 0), ObjectRef::new(7, 0)],
-            total_object_count: 8,
             page_hints: vec![
                 PageHintEntry {
                     page_ref: ObjectRef::new(3, 0),

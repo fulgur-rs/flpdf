@@ -157,7 +157,7 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
 - [ ] Route `set_linearization_pass1_filename` through `write_linearized_with_pass1_file`, back-patch the returned document, and send the final bytes through the configured `PdfWriter` sink.
 - [ ] Populate writer result maps for linearized uncompressed and compressed entries from the final linearization layout, so result queries do not report standard-writer data for a linearized write.
 - [ ] Keep `check_linearization` and `show_linearization` as reader/inspection APIs, but remove direct public writer entry points that bypass `PdfWriter`; migrate their unit/integration tests to the canonical object.
-- [ ] Run `cargo test -p flpdf --test cmp_linearize_tests`, `cargo test -p flpdf --test cmp_linearize_objstm_tests`, `cargo test -p flpdf --test linearize_classic_tests`, and `cargo test -p flpdf --test linearize_objstm_generate_tests`.
+- [ ] Run `cargo test -p flpdf --test cmp_linearize_tests`, `cargo test -p flpdf --test cmp_linearize_objstm_tests`, `cargo test -p flpdf --test linearize_classic_tests`, and `cargo test -p flpdf --lib linearization::linearize_objstm_generate_tests`.
 
 ## Task 5: Migrate library consumers and public documentation
 

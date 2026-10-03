@@ -65,7 +65,9 @@
 use std::ops::Range;
 
 use crate::linearization::part1::{Part1Placeholders, PLACEHOLDER_WIDTH};
-use crate::linearization::writer::{LinearizedDocument, LinearizedOffsets, PREV_PLACEHOLDER_WIDTH};
+#[cfg(test)]
+use crate::linearization::writer::LinearizedDocument;
+use crate::linearization::writer::{LinearizedOffsets, PREV_PLACEHOLDER_WIDTH};
 use crate::Result;
 
 // ---------------------------------------------------------------------------
@@ -309,6 +311,7 @@ pub fn back_patch_param_dict(bytes: &mut [u8], offsets: &mut LinearizedOffsets) 
 // LinearizedDocument convenience method
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 impl LinearizedDocument {
     /// Back-patch all numeric placeholders in the Part 1 parameter dictionary
     /// with their now-known values from `self.offsets`.
@@ -319,7 +322,7 @@ impl LinearizedDocument {
     /// # Errors
     ///
     /// Propagates any error from [`back_patch_param_dict`].
-    pub fn back_patch(&mut self) -> Result<()> {
+    pub(crate) fn back_patch(&mut self) -> Result<()> {
         back_patch_param_dict(&mut self.bytes, &mut self.offsets)
     }
 }
@@ -393,7 +396,6 @@ mod tests {
         LinearizationPlan {
             part2_objects: vec![ObjectRef::new(3, 0), ObjectRef::new(2, 0)],
             part4_rest: vec![ObjectRef::new(1, 0)],
-            total_object_count: 3,
             root_ref: Some(ObjectRef::new(1, 0)),
             page_hints: vec![PageHintEntry::placeholder(ObjectRef::new(3, 0))],
             ..Default::default()
@@ -718,7 +720,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 11. PLACEHOLDER_WIDTH is the public cap used by the preflight; ensure
+    // 11. PLACEHOLDER_WIDTH is the cap used by the preflight; ensure
     //     it stays the qpdf-spec 10 (so 10^10 stays the value overflow limit).
     // -----------------------------------------------------------------------
     #[test]

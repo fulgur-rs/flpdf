@@ -82,13 +82,13 @@ pub const PARAM_DICT_TRAILING_PAD: usize = 66;
 /// Byte ranges of each numeric value field inside the [`Part1Bytes`] buffer.
 ///
 /// **Pre-back-patch**: every range is exactly [`PLACEHOLDER_WIDTH`] bytes of
-/// ASCII `b'0'`.  This is the [`all_valid`](Self::all_valid) invariant.
+/// ASCII `b'0'`.  This is the `all_valid` invariant.
 ///
-/// **Post-back-patch** (after [`back_patch_param_dict`](crate::linearization::back_patch_param_dict)):
+/// **Post-back-patch** (after [`back_patch_param_dict`](crate::linearization::back_patch::back_patch_param_dict)):
 /// the back-patcher splices the variable-width compact dict into place and
 /// updates these ranges to point at the rewritten value bytes — each range
 /// becomes 1..=10 bytes wide (`value.to_string().len()`).  The
-/// [`all_valid`](Self::all_valid) check no longer holds and is intentionally
+/// `all_valid` check no longer holds and is intentionally
 /// not maintained post-splice.
 ///
 /// ## Which fields need back-patching
@@ -128,7 +128,8 @@ impl Part1Placeholders {
     /// O, E, T, N.
     ///
     /// Useful for checking disjoint and ordering invariants.
-    pub fn as_slice(&self) -> [Range<usize>; 7] {
+    #[cfg(test)]
+    pub(crate) fn as_slice(&self) -> [Range<usize>; 7] {
         [
             self.l.clone(),
             self.h_offset.clone(),
@@ -146,10 +147,11 @@ impl Part1Placeholders {
     ///
     /// Post-back-patch the ranges shrink to their variable-width value bytes,
     /// so this returns `false` after a successful
-    /// [`back_patch_param_dict`](crate::linearization::back_patch_param_dict)
+    /// [`back_patch_param_dict`](crate::linearization::back_patch::back_patch_param_dict)
     /// call — the writer asserts this invariant only on the freshly built
     /// `Part1Bytes`.
-    pub fn all_valid(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn all_valid(&self) -> bool {
         let ranges = self.as_slice();
         for r in &ranges {
             if r.len() != PLACEHOLDER_WIDTH {
@@ -361,7 +363,8 @@ impl Part1Bytes {
     }
 
     /// Length of the serialized Part 1 in bytes.
-    pub fn byte_length(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn byte_length(&self) -> usize {
         self.bytes.len()
     }
 }
@@ -385,7 +388,6 @@ mod tests {
         LinearizationPlan {
             part2_objects: vec![ObjectRef::new(3, 0), ObjectRef::new(2, 0)],
             part4_rest: vec![ObjectRef::new(1, 0)],
-            total_object_count: 3,
             root_ref: Some(ObjectRef::new(1, 0)),
             page_hints: vec![PageHintEntry::placeholder(ObjectRef::new(3, 0))],
             ..Default::default()

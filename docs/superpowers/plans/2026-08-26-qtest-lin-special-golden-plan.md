@@ -117,7 +117,7 @@ Run:
     cargo test -p flpdf --lib linearization::plan::tests
     cargo test -p flpdf --test writer_tests
     cargo test -p flpdf --test linearize_classic_tests
-    cargo test -p flpdf --test linearize_objstm_generate_tests
+    cargo test -p flpdf --lib linearization::linearize_objstm_generate_tests
     cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 - [ ] Step 2: Run qtest with the CLI and shim PR branches.
