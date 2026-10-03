@@ -3876,19 +3876,33 @@ fn run_combined_top_level_inspection(
     )?;
     configure_top_level_attachment_mutations(&mut job, args, attachment_segments)?;
 
-    if args.page_ops.empty {
+    let input = if args.page_ops.empty {
         reject_empty_inspection_output(args.input.as_deref())?;
-        job.config().empty_input()?;
+        None
     } else {
-        let input = args.input.as_ref().ok_or_else(missing_input_usage_error)?;
-        let input_options = pdf_open_options(args.repair, &args.password)?;
-        job.set_password(input_options.password);
-        job.set_password_mode(args.password.password_mode.into());
-        job.set_password_is_hex_key(args.password.password_is_hex_key);
-        job.set_suppress_password_recovery(args.password.suppress_password_recovery);
-        job.set_suppress_recovery(args.password.recovery.suppress_recovery);
-        job.set_ignore_xref_streams(args.password.recovery.ignore_xref_streams);
-        job.config().input_file(input.clone())?;
+        Some(
+            args.input
+                .as_deref()
+                .ok_or_else(missing_input_usage_error)?,
+        )
+    };
+    // qpdf's argv callback reads --password-file for empty and file input alike,
+    // before createQPDF starts. Carry the resolved password and open policy on
+    // this Job even when the primary input is empty.
+    let input_options = pdf_open_options(args.repair, &args.password)?;
+    job.set_password(input_options.password);
+    job.set_password_mode(args.password.password_mode.into());
+    job.set_password_is_hex_key(args.password.password_is_hex_key);
+    job.set_suppress_password_recovery(args.password.suppress_password_recovery);
+    job.set_suppress_recovery(args.password.recovery.suppress_recovery);
+    job.set_ignore_xref_streams(args.password.recovery.ignore_xref_streams);
+    match input {
+        Some(input) => {
+            job.config().input_file(input.to_path_buf())?;
+        }
+        None => {
+            job.config().empty_input()?;
+        }
     }
 
     // qpdf applies rotations before underlay/overlay and both before the
