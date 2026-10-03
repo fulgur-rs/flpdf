@@ -271,7 +271,6 @@ pub(crate) struct LiveBodyOutput {
 fn collect_live_dictionary_children(
     handle: &ObjectHandle,
     found: &mut Vec<ObjectHandle>,
-    depth: usize,
 ) -> crate::Result<()> {
     let mut current_key = LiveDictionaryKeyBuffer::default();
     let mut next_key = LiveDictionaryKeyBuffer::default();
@@ -282,7 +281,7 @@ fn collect_live_dictionary_children(
     ) {
         std::mem::swap(&mut current_key, &mut next_key);
         if !value.try_is_null()? {
-            collect_live_seed_handles(&value, found, depth + 1)?;
+            collect_live_seed_handles(&value, found)?;
         }
         first_entry = false;
     }
@@ -292,7 +291,6 @@ fn collect_live_dictionary_children(
 fn collect_live_seed_handles(
     handle: &ObjectHandle,
     found: &mut Vec<ObjectHandle>,
-    depth: usize,
 ) -> crate::Result<()> {
     if handle
         .qpdf_obj_gen()
@@ -301,25 +299,12 @@ fn collect_live_seed_handles(
         found.push(handle.clone());
         return Ok(());
     }
-    // The parser bounds nesting in parsed input, but a library-built inline
-    // root or trailer value could nest arbitrarily (or form a direct cycle).
-    // Bound the direct-seed recursion the same way the parser does rather than
-    // overflow the stack.
-    // qpdf-deviation: QPDFWriter::enqueueObject has no MAX_PARSE_DEPTH cap on direct seed values.
-    if depth > crate::parser::MAX_PARSE_DEPTH {
-        // cov:ignore-start: defensive stack bound; parsed input is parser-capped and factory-built seed trees are acyclic, so this overflow arm is unreachable from the corpus.
-        return Err(crate::Error::Unsupported(format!(
-            "plain live writer: direct seed nesting exceeds maximum of {}",
-            crate::parser::MAX_PARSE_DEPTH
-        )));
-        // cov:ignore-end
-    }
     if handle.try_is_array()? {
         let items = handle.try_array_items()?;
         let mut cursor = items.begin();
         while !cursor.is_end() {
             let item = cursor.current();
-            collect_live_seed_handles(&item, found, depth + 1)?;
+            collect_live_seed_handles(&item, found)?;
             cursor.next();
         }
     } else if let Some(stream_dict) = handle.as_stream_dict() {
@@ -328,10 +313,10 @@ fn collect_live_seed_handles(
         // (`QPDFWriter.cc:1129-1147`). `try_as_dictionary` does not view a
         // stream as a dictionary, so descend the stream dictionary explicitly.
         // cov:ignore-start: defensive descent into a direct stream's dictionary -- parsed streams are indirect (taken by the base case above) and an in-memory stream surfaces its dictionary through the `try_as_dictionary` arm below, so this body is unreachable from the corpus.
-        collect_live_dictionary_children(&stream_dict, found, depth)?;
+        collect_live_dictionary_children(&stream_dict, found)?;
         // cov:ignore-end
     } else if handle.try_is_dictionary()? {
-        collect_live_dictionary_children(handle, found, depth)?;
+        collect_live_dictionary_children(handle, found)?;
     }
     Ok(())
 }
@@ -344,27 +329,19 @@ fn collect_live_seed_handles(
 fn collect_live_child_handles(
     handle: &ObjectHandle,
     found: &mut Vec<ObjectHandle>,
-    depth: usize,
 ) -> crate::Result<()> {
-    // qpdf-deviation: QPDFWriter::unparseObject recurses into direct children without this MAX_PARSE_DEPTH cap.
-    if depth > crate::parser::MAX_PARSE_DEPTH {
-        return Err(crate::Error::Unsupported(format!(
-            "plain live writer: emitted value nesting exceeds maximum of {}",
-            crate::parser::MAX_PARSE_DEPTH
-        )));
-    }
     if handle.try_is_array()? {
         let items = handle.try_array_items()?;
         let mut cursor = items.begin();
         while !cursor.is_end() {
             let item = cursor.current();
-            collect_live_seed_handles(&item, found, depth + 1)?;
+            collect_live_seed_handles(&item, found)?;
             cursor.next();
         }
     } else if let Some(stream_dict) = handle.as_stream_dict() {
-        collect_live_dictionary_children(&stream_dict, found, depth)?; // cov:ignore: LLVM maps the covered direct stream-dictionary child traversal continuation to this line
+        collect_live_dictionary_children(&stream_dict, found)?; // cov:ignore: LLVM maps the covered direct stream-dictionary child traversal continuation to this line
     } else if handle.try_is_dictionary()? {
-        collect_live_dictionary_children(handle, found, depth)?;
+        collect_live_dictionary_children(handle, found)?;
     }
     Ok(())
 }
@@ -382,7 +359,7 @@ fn enqueue_object<R: Read + Seek>(
     value: &ObjectHandle,
 ) -> crate::Result<()> {
     let mut handles = Vec::new();
-    collect_live_seed_handles(value, &mut handles, 0)?;
+    collect_live_seed_handles(value, &mut handles)?;
     for handle in handles {
         queue.enqueue_handle(pdf, handle)?;
     }
@@ -1398,7 +1375,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
     ) -> crate::Result<()> {
         for value in children {
             let mut indirect_children = Vec::new();
-            collect_live_seed_handles(&value, &mut indirect_children, 0)?;
+            collect_live_seed_handles(&value, &mut indirect_children)?;
             for child in indirect_children {
                 self.queue.borrow_mut().enqueue_handle(self.pdf, child)?;
             }
@@ -1408,7 +1385,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
 
     fn enqueue_surviving_children(&mut self, value: &ObjectHandle) -> crate::Result<()> {
         let mut children = Vec::new();
-        collect_live_child_handles(value, &mut children, 0)?;
+        collect_live_child_handles(value, &mut children)?;
         self.enqueue_surviving_handles(children)
     }
 
@@ -2060,91 +2037,9 @@ where
 const CONTENT_EMIT_STACK_RED_ZONE: usize = 32 * 1024;
 const CONTENT_EMIT_STACK_GROWTH_SIZE: usize = 1024 * 1024;
 
-// Active recursion depth of this module's content-emission walkers.
-//
-// `stacker::maybe_grow` swaps stack segments without leaving the current
-// thread, so a thread-local counter observes every level of one walk and
-// never mixes two concurrent emissions.
-//
-// None of the three walkers records the nodes already on its path, and
-// neither does the qpdf counterpart this emission route mirrors:
-// `QPDFWriter::unparseObject` (`libqpdf/QPDFWriter.cc:1318-1325`) validates
-// only that its `level` is non-negative. A pair of *direct* dictionaries
-// holding each other therefore recurses until the process runs out of
-// memory. Parsed input cannot reach that shape -- `parser.rs` caps direct
-// container nesting at `MAX_PARSE_DEPTH` and the direct containers it builds
-// are trees -- but `ObjectHandle::replace_key` accepts it from a library
-// caller, since it refuses only the single-hop self-insert and not the
-// two-hop pair `a.replace_key(b"/B", b)` plus `b.replace_key(b"/A", a)`.
-// Bounding the walkers at the parser's own limit turns such a graph into a
-// diagnostic instead of resource exhaustion.
-//
-// The budget this leaves a parsed page is exact rather than generous, so a
-// test pins it. A page dictionary spends one parse frame of its own, leaving
-// `MAX_PARSE_DEPTH - 1` nested containers for its `/Contents` value plus the
-// scalar at the bottom. `ContentEmitter::emit_value` holds level 0 for the
-// page and its shape probe walks that chain from level 1, so the deepest
-// page the parser can produce ends exactly on `MAX_PARSE_DEPTH` -- the last
-// level admitted. `deepest_parseable_page_contents_still_writes` writes such
-// a page end to end.
-//
-// All three walkers share the one counter because they interleave:
-// `ContentEmitter::emit_value` runs `has_direct_stream_in_value` as a shape
-// probe over the node it is currently at, so the probe descends only what
-// remains of that node's subtree and the combined count still tracks one
-// path through the container rather than summing two independent walks.
-// The counter is deliberately *not* shared with the `ObjectHandle`
-// serializer this emitter falls through to (`writer::object`'s own
-// `unparse_object_walk_hub`), which keeps a separate budget: sharing one
-// would make the effective bound depend on how deep the content walk was
-// when it handed off, and that walker charges its levels differently --
-// a direct scalar goes through its fast path without entering a hub at all.
-thread_local! {
-    static CONTENT_EMIT_WALK_DEPTH: Cell<usize> = const { Cell::new(0) };
-}
-
-// Counts one active level of a content-emission walk and restores the count
-// when the level unwinds, on the error path as well as the success path.
-struct ContentEmitWalkDepthGuard;
-
-impl ContentEmitWalkDepthGuard {
-    #[deprecated(
-        note = "no qpdf counterpart; QPDFWriter::unparseObject has no upper nesting limit"
-    )]
-    fn enter() -> crate::Result<Self> {
-        let depth = CONTENT_EMIT_WALK_DEPTH.with(|depth| {
-            let entered = depth.get();
-            depth.set(entered + 1);
-            entered
-        });
-        // Constructed before the bound is tested so the count is restored
-        // even when this level is rejected.
-        let guard = Self;
-        if depth > crate::parser::MAX_PARSE_DEPTH {
-            return Err(crate::Error::Unsupported(format!(
-                "writer: direct content nesting exceeds maximum of {}",
-                crate::parser::MAX_PARSE_DEPTH
-            )));
-        }
-        Ok(guard)
-    }
-}
-
-impl Drop for ContentEmitWalkDepthGuard {
-    fn drop(&mut self) {
-        CONTENT_EMIT_WALK_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
-    }
-}
-
-/// Run one level of a content-emission recursion with this module's shared
-/// stack growth and nesting bound.
-///
-/// Every walker in the family routes its body through here, so a direct
-/// container graph that never reaches an indirect boundary is rejected at
-/// the same depth wherever it is met.
-#[allow(deprecated)]
+/// Run one level of qpdf's recursive content emission on a Rust stack segment
+/// large enough for deep direct containers.
 fn content_emit_walk_hub<T>(body: impl FnOnce() -> crate::Result<T>) -> crate::Result<T> {
-    let _depth = ContentEmitWalkDepthGuard::enter()?;
     stacker::maybe_grow(
         CONTENT_EMIT_STACK_RED_ZONE,
         CONTENT_EMIT_STACK_GROWTH_SIZE,
@@ -2180,13 +2075,9 @@ fn normalize_content_container(container: &ObjectHandle) -> crate::Result<Object
     Ok(container.clone()) // cov:ignore: the pre-scan records only page dictionaries and array holders
 }
 
-// The recursion hub for this function's own `Array` arm below -- every
-// nested descent funnels back through this same entry point, so routing it
-// through the family hub bounds the whole walk. Only the `Array` arm
-// recurses, and `ObjectHandle`'s array mutators reject a direct cycle
-// outright (`would_create_direct_cycle`), so this walker cannot meet the
-// reciprocal-dictionary shape the other two can; it is routed anyway so the
-// whole family carries one bound. See `CONTENT_EMIT_WALK_DEPTH`'s doc.
+// The recursion hub for this function's `Array` arm. qpdf recursively emits
+// direct containers without a parser-depth limit; the hub only grows the Rust
+// stack for the same recursive traversal.
 fn normalize_content_value(value: &ObjectHandle) -> crate::Result<ObjectHandle> {
     content_emit_walk_hub(|| {
         if value.is_indirect() {
@@ -2220,12 +2111,8 @@ where
     F: FnMut(&mut OutputSink<'_>, &[u8]) -> crate::Result<()>,
 {
     // The recursion hub for this impl's `emit_array`/`emit_dictionary`
-    // arms below -- every nested descent (including `has_direct_stream_in_value`'s
-    // own separate probe walk) funnels back through this same entry point
-    // before recursing further, so wrapping here bounds the whole emission
-    // walk the same way `object_handle.rs`'s own single-hub recursive
-    // walkers do. See `CONTENT_EMIT_STACK_RED_ZONE`'s doc for why this
-    // needs the same protection those walkers already have.
+    // arms below. qpdf's `QPDFWriter::unparseObject` has no upper nesting
+    // limit; grow the Rust stack before following its direct-child recursion.
     //
     // A direct stream value gets full `stream ... endstream` framing
     // ([`Self::emit_direct_stream`]) wherever it is reached while walking
@@ -2395,27 +2282,15 @@ where
     }
 }
 
-// The recursion hub for this function's own `Array`/`Dictionary` arms --
-// every nested descent funnels back through this same entry point, so
-// wrapping here bounds the whole probe walk the same way
-// `object_handle.rs`'s own single-hub recursive walkers do. See
-// `CONTENT_EMIT_STACK_RED_ZONE`'s doc for why this needs the same
-// protection those walkers already have.
+// Walk a direct content value for nested streams. The recursive traversal has
+// no parser-derived depth limit, matching qpdf's writer; the hub grows the Rust
+// stack as needed.
 fn has_direct_stream_in_value(value: &ObjectHandle) -> crate::Result<bool> {
-    // The caller is already inside a hub level for this very node --
-    // `ContentEmitter::emit_value` probes the node it is currently at -- so
-    // charging the probe's own root would count that node twice. A parsed
-    // `/Contents` holder that is its own indirect object gets a fresh
-    // `MAX_PARSE_DEPTH` parse budget, so it can legitimately carry the full
-    // 500 containers; double-charging the root rejected exactly that shape
-    // one level short of the bound while qpdf wrote it. Descendants charge
-    // normally through `has_direct_stream_in_value_charged`.
     has_direct_stream_in_value_body(value)
 }
 
-// One charged level of the probe: every descent below the root goes through
-// here so the walk is still bounded.
-fn has_direct_stream_in_value_charged(value: &ObjectHandle) -> crate::Result<bool> {
+// One recursive child step of the probe, with stack growth but no nesting cap.
+fn has_direct_stream_in_value_child(value: &ObjectHandle) -> crate::Result<bool> {
     content_emit_walk_hub(|| has_direct_stream_in_value_body(value))
 }
 
@@ -2430,13 +2305,13 @@ fn has_direct_stream_in_value_body(value: &ObjectHandle) -> crate::Result<bool> 
         }
         if let Some(items) = value.try_as_array()? {
             for item in items {
-                if has_direct_stream_in_value_charged(&item)? {
+                if has_direct_stream_in_value_child(&item)? {
                     return Ok(true);
                 }
             }
         } else if let Some(entries) = value.try_as_dictionary()? {
             for (_, child) in entries {
-                if has_direct_stream_in_value_charged(&child)? {
+                if has_direct_stream_in_value_child(&child)? {
                     return Ok(true);
                 } // cov:ignore: LLVM does not attribute this successful nested dictionary scan continuation
             }
@@ -2958,7 +2833,7 @@ mod final_handle_tests {
         emit_content_container_from_handle_with_ref_map,
         emit_content_container_from_handle_with_ref_map_and_string_writer,
         normalize_content_container, normalize_content_value, object_streams, PlainWritePlan,
-        PlannedIndirectObject, CONTENT_EMIT_WALK_DEPTH,
+        PlannedIndirectObject,
     };
     use crate::token_filter::{TokenFilter, TokenFilterOutput};
     use crate::tokenizer::Token;
@@ -3109,26 +2984,6 @@ mod final_handle_tests {
         Ok(())
     }
 
-    // Two direct dictionaries holding each other: `a` under `/B` holds `b`,
-    // and `b` under `/A` holds `a`. Neither handle is indirect, so no walk
-    // ever meets the indirect boundary that normally terminates a descent.
-    // `ObjectHandle::replace_key` refuses only the single-hop self-insert, so
-    // this two-hop shape does close into a real cycle -- asserted here so the
-    // emission assertions below cannot pass against an unaliased pair.
-    fn reciprocal_direct_dictionary_cycle() -> crate::Result<ObjectHandle> {
-        let a = ObjectHandle::dictionary(vec![]);
-        let b = ObjectHandle::dictionary(vec![]);
-        a.replace_key(b"/B", b.clone())?;
-        b.replace_key(b"/A", a.clone())?;
-        assert!(
-            a.try_get_key(b"/B")?
-                .try_get_key(b"/A")?
-                .is_same_object_as(&a),
-            "the reciprocal replace_key pair must close into a direct cycle"
-        );
-        Ok(a)
-    }
-
     // Wrap a content value in the `/Contents` holder the emitter is handed.
     // Kept as a helper so each call site can pass one already-built handle:
     // an inline multi-line argument list would push the caller's `?` onto a
@@ -3199,88 +3054,24 @@ mod final_handle_tests {
     }
 
     #[test]
-    fn direct_dictionary_cycle_is_rejected_by_the_content_emit_family() -> crate::Result<()> {
+    fn content_emit_family_accepts_direct_nesting_beyond_parser_limit() -> crate::Result<()> {
         let options = WriterOptions {
             newline_before_endstream: NewlineBeforeEndstream::Never,
             ..WriterOptions::default()
         };
-
-        // A plain cycle is met by the shape probe, which descends a
-        // container looking for a direct stream and never finds a terminus.
-        let holder = content_holder(reciprocal_direct_dictionary_cycle()?);
-        let probed = emit_content_container(&holder, &options)
-            .expect_err("a direct cycle must not be walked by the content shape probe");
-        assert!(
-            matches!(probed, crate::Error::Unsupported(_)),
-            "unexpected error kind: {probed:?}"
-        );
-        assert!(
-            probed
-                .to_string()
-                .contains("direct content nesting exceeds maximum of"),
-            "unexpected message: {probed}"
-        );
-
-        // A cycle carrying a direct stream lets the probe terminate on its
-        // first entry, so the emitter itself is the walk that descends.
-        let cyclic = reciprocal_direct_dictionary_cycle()?;
-        cyclic.replace_key(b"/A_stream", direct_content_stream())?;
-        let streamed = emit_content_container(&content_holder(cyclic), &options)
-            .expect_err("a direct cycle must not be walked by the content emitter");
-        assert!(
-            matches!(streamed, crate::Error::Unsupported(_)),
-            "unexpected error kind: {streamed:?}"
-        );
-        assert!(
-            streamed
-                .to_string()
-                .contains("direct content nesting exceeds maximum of"),
-            "unexpected message: {streamed}"
-        );
-
-        // Every rejected level restores the shared counter on its way out,
-        // so a later emission starts from zero instead of inheriting the
-        // exhausted budget of the refused walk.
-        assert_eq!(CONTENT_EMIT_WALK_DEPTH.with(std::cell::Cell::get), 0);
-        let plain = content_holder(direct_content_stream());
-        let ordinary = emit_content_container(&plain, &options)?;
-        assert!(ordinary
-            .windows(b"stream\ndata\nendstream".len())
-            .any(|window| window == b"stream\ndata\nendstream"));
-        Ok(())
-    }
-
-    #[test]
-    fn acyclic_direct_content_nesting_is_bounded_at_the_parser_limit() -> crate::Result<()> {
-        let options = WriterOptions {
-            newline_before_endstream: NewlineBeforeEndstream::Never,
-            ..WriterOptions::default()
-        };
-        // The emitter runs its shape probe on the node it is already
-        // positioned at, and the probe's own root does not charge that node a
-        // second time, so a chain of `n` holder dictionaries, wrapped in the
-        // content container and terminating in a direct stream, reaches hub
-        // level `n + 1`. `MAX_PARSE_DEPTH` is the last level admitted.
-        let within_bound = crate::parser::MAX_PARSE_DEPTH - 1;
-
-        let within = content_holder(nested_direct_content_dictionaries(within_bound));
-        let emitted = emit_content_container(&within, &options)?;
+        let holder = content_holder(nested_direct_content_dictionaries(502));
+        let emitted = emit_content_container(&holder, &options)?;
         assert_eq!(
             String::from_utf8_lossy(&emitted).matches("/K").count(),
-            within_bound,
-            "every level within the bound must still be emitted"
+            502,
+            "qpdf's writer serializes every direct dictionary level"
         );
 
-        let past_bound = content_holder(nested_direct_content_dictionaries(within_bound + 1));
-        let error = emit_content_container(&past_bound, &options)
-            .expect_err("nesting past the bound must be reported");
-        assert!(matches!(error, crate::Error::Unsupported(_)));
+        let normalized = normalize_content_value(&nested_direct_arrays(502))?;
         assert_eq!(
-            error.to_string(),
-            format!(
-                "unsupported PDF feature: writer: direct content nesting exceeds maximum of {}",
-                crate::parser::MAX_PARSE_DEPTH
-            )
+            direct_array_depth(&normalized),
+            502,
+            "qpdf's writer normalization does not add a parser-depth cap"
         );
         Ok(())
     }
@@ -3335,13 +3126,9 @@ mod final_handle_tests {
         Ok(direct_array_depth(&page.try_get_key(b"/Contents")?))
     }
 
-    // The content-emission bound must never reject input the parser accepts.
-    // The parser caps container nesting at `MAX_PARSE_DEPTH` frames and the
-    // page dictionary spends the first, so this is the deepest `/Contents`
-    // any readable file can carry -- and the shape that lands exactly on the
-    // last hub level the family admits. Mutating the bound to `depth >=
-    // MAX_PARSE_DEPTH` turns this test red, so it pins that boundary rather
-    // than merely exercising a deep walk.
+    // The parser still bounds direct nesting in input files. The writer must
+    // preserve the deepest shape that parser accepts without imposing another
+    // limit of its own.
     #[test]
     fn deepest_parseable_page_contents_still_writes() -> crate::Result<()> {
         let deepest = crate::parser::MAX_PARSE_DEPTH - 1;
@@ -3427,8 +3214,8 @@ mod final_handle_tests {
              not measuring the shape qpdf accepts"
         );
 
-        // The emitter probes the node it is already charged for, so charging
-        // the probe's own root too would reject this exact depth.
+        // The writer may serialize any direct nesting level represented by
+        // the parsed Contents tree.
         let written = write_with_content_normalization(indirect_contents_holder_pdf(deepest))?;
         assert_eq!(
             String::from_utf8_lossy(&written).matches("[ 0 ]").count(),
@@ -3439,28 +3226,9 @@ mod final_handle_tests {
     }
 
     #[test]
-    fn deep_direct_arrays_are_bounded_in_content_normalization() -> crate::Result<()> {
-        // `normalize_content_value` enters the hub once per array level plus
-        // once for the scalar leaf, and the caller holds no level of its own,
-        // so `MAX_PARSE_DEPTH` nested arrays is the deepest admitted chain.
-        let bound = crate::parser::MAX_PARSE_DEPTH;
-
-        let normalized = normalize_content_value(&nested_direct_arrays(bound))?;
-        assert_eq!(
-            direct_array_depth(&normalized),
-            bound,
-            "every level within the bound must still be normalized"
-        );
-
-        let error = normalize_content_value(&nested_direct_arrays(bound + 1))
-            .expect_err("nesting past the bound must be reported");
-        assert!(matches!(error, crate::Error::Unsupported(_)));
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "unsupported PDF feature: writer: direct content nesting exceeds maximum of {bound}"
-            )
-        );
+    fn deep_direct_arrays_are_normalized_without_a_writer_depth_cap() -> crate::Result<()> {
+        let normalized = normalize_content_value(&nested_direct_arrays(502))?;
+        assert_eq!(direct_array_depth(&normalized), 502);
         Ok(())
     }
 
@@ -3870,15 +3638,14 @@ mod object_emitter_tests {
             matches!(error, crate::Error::Unsupported(message) if message.contains("overflows u32"))
         );
 
-        let error = collect_live_child_handles(
-            &ObjectHandle::null(),
-            &mut Vec::new(),
-            crate::parser::MAX_PARSE_DEPTH + 1,
-        )
-        .expect_err("emission-time child traversal must enforce the parser depth");
-        assert!(
-            matches!(error, crate::Error::Unsupported(message) if message.contains("nesting exceeds maximum"))
-        );
+        let mut deep = ObjectHandle::integer(1);
+        for _ in 0..502 {
+            deep = ObjectHandle::array(vec![deep]);
+        }
+        let mut deep_children = Vec::new();
+        collect_live_child_handles(&deep, &mut deep_children)
+            .expect("qpdf's direct-child traversal has no nesting cap");
+        assert!(deep_children.is_empty());
 
         let mut pdf = pdf();
         let child = pdf
@@ -3889,7 +3656,7 @@ mod object_emitter_tests {
             Rc::new(b"data".to_vec()),
         );
         let mut found = Vec::new();
-        collect_live_child_handles(&direct_stream, &mut found, 0)
+        collect_live_child_handles(&direct_stream, &mut found)
             .expect("direct stream dictionary traversal");
         assert_eq!(found.len(), 1);
         assert!(found[0].is_same_object_as(&child));
@@ -4575,7 +4342,7 @@ mod object_emitter_tests {
 
         let direct_array = ObjectHandle::array(vec![child.clone(), ObjectHandle::null()]);
         let mut seeds = Vec::new();
-        collect_live_seed_handles(&direct_array, &mut seeds, 0)?;
+        collect_live_seed_handles(&direct_array, &mut seeds)?;
         assert_eq!(seeds.len(), 1);
         assert!(seeds[0].is_same_object_as(&child));
         let direct_dictionary = ObjectHandle::dictionary(vec![
@@ -4583,7 +4350,7 @@ mod object_emitter_tests {
             (b"/Null".to_vec(), ObjectHandle::null()),
         ]);
         seeds.clear();
-        collect_live_seed_handles(&direct_dictionary, &mut seeds, 0)?;
+        collect_live_seed_handles(&direct_dictionary, &mut seeds)?;
         assert_eq!(seeds.len(), 1);
         assert!(seeds[0].is_same_object_as(&child));
 
@@ -4592,7 +4359,7 @@ mod object_emitter_tests {
             Rc::new(b"seed".to_vec()),
         );
         seeds.clear();
-        collect_live_seed_handles(&direct_stream, &mut seeds, 0)?;
+        collect_live_seed_handles(&direct_stream, &mut seeds)?;
         assert_eq!(seeds.len(), 1);
         assert!(seeds[0].is_same_object_as(&child));
 

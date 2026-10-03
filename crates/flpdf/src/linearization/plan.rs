@@ -34,7 +34,6 @@
 
 use crate::linearization::renumber::RenumberMap;
 use crate::object_handle::{LiveDictionaryKeyBuffer, ObjectHandle, ObjectValue};
-use crate::parser::MAX_PARSE_DEPTH;
 use crate::pdf::WriterObjectOrderKey;
 use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::writer::object_streams::{
@@ -186,7 +185,7 @@ fn stream_has_indirect_parameter_edge(handle: &ObjectHandle) -> Result<bool> {
             continue;
         };
         let mut refs = Vec::new();
-        collect_direct_handle_refs(&value, 0, &mut refs)?;
+        collect_direct_handle_refs(&value, &mut refs)?;
         if !refs.is_empty() {
             return Ok(true);
         }
@@ -224,33 +223,21 @@ fn stream_parameters_removed_for_linearization(
 /// traversed in place. This mirrors qpdf's `QPDFObjectHandle` child access:
 /// the handle identity is retained at each indirect boundary, while only the
 /// current direct container is inspected.
-fn collect_direct_handle_refs(
-    handle: &ObjectHandle,
-    depth: usize,
-    out: &mut Vec<ObjectRef>,
-) -> Result<()> {
-    // qpdf-deviation: the qpdf writer's direct-container traversal has no MAX_PARSE_DEPTH cap.
-    if depth > MAX_PARSE_DEPTH {
-        return Err(crate::Error::Unsupported(format!(
-            "linearization plan: inline object nesting exceeds maximum of {MAX_PARSE_DEPTH}"
-        )));
-    }
+fn collect_direct_handle_refs(handle: &ObjectHandle, out: &mut Vec<ObjectRef>) -> Result<()> {
     let mut contextual = Vec::new();
-    collect_direct_handle_refs_with_context(handle, depth, false, &mut contextual)?;
+    collect_direct_handle_refs_with_context(handle, false, &mut contextual)?;
     out.extend(contextual.into_iter().map(|(object_ref, _)| object_ref));
     Ok(())
 }
 
 fn collect_direct_handle_refs_with_stream_parameters(
     handle: &ObjectHandle,
-    depth: usize,
     out: &mut Vec<ObjectRef>,
     skipped_stream_parameter_streams: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
     let mut contextual = Vec::new();
     collect_direct_handle_refs_with_stream_parameters_context(
         handle,
-        depth,
         false,
         &mut contextual,
         skipped_stream_parameter_streams,
@@ -265,56 +252,34 @@ fn collect_direct_handle_refs_with_stream_parameters(
 /// not resurrect a body object in the linearization plan.
 fn collect_direct_handle_refs_with_context(
     handle: &ObjectHandle,
-    depth: usize,
     in_array: bool,
     out: &mut Vec<(ObjectRef, bool)>,
 ) -> Result<()> {
-    // qpdf-deviation: qpdf linearization object-graph traversal has no MAX_PARSE_DEPTH cap for inline containers.
-    if depth > MAX_PARSE_DEPTH {
-        return Err(crate::Error::Unsupported(format!(
-            "linearization plan: inline object nesting exceeds maximum of {MAX_PARSE_DEPTH}"
-        )));
-    }
     if let Some(object_ref) = handle.object_ref() {
         out.push((object_ref, in_array));
         return Ok(());
     }
-    collect_direct_handle_children(
-        handle,
-        depth,
-        in_array,
-        &mut |child, child_depth, child_in_array| {
-            collect_direct_handle_refs_with_context(child, child_depth, child_in_array, out)
-        },
-    )
+    collect_direct_handle_children(handle, &mut |child, child_in_array| {
+        collect_direct_handle_refs_with_context(child, child_in_array, out)
+    })
 }
 
 fn collect_direct_handle_refs_with_stream_parameters_context(
     handle: &ObjectHandle,
-    depth: usize,
     in_array: bool,
     out: &mut Vec<(ObjectRef, bool)>,
     skipped_stream_parameter_streams: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
-    // qpdf-deviation: qpdf linearization object-graph traversal has no MAX_PARSE_DEPTH cap for inline containers.
-    if depth > MAX_PARSE_DEPTH {
-        return Err(crate::Error::Unsupported(format!(
-            "linearization plan: inline object nesting exceeds maximum of {MAX_PARSE_DEPTH}"
-        )));
-    }
     if let Some(object_ref) = handle.object_ref() {
         out.push((object_ref, in_array));
         return Ok(());
     }
     collect_direct_handle_children_with_stream_parameters(
         handle,
-        depth,
-        in_array,
         skipped_stream_parameter_streams,
-        &mut |child, child_depth, child_in_array| {
+        &mut |child, child_in_array| {
             collect_direct_handle_refs_with_stream_parameters_context(
                 child,
-                child_depth,
                 child_in_array,
                 out,
                 skipped_stream_parameter_streams,
@@ -323,35 +288,22 @@ fn collect_direct_handle_refs_with_stream_parameters_context(
     )
 }
 
-/// Walk the direct children of one handle. The closure receives each child,
-/// the incremented inline depth, and whether its edge came from an array.
-fn collect_direct_handle_children<F>(
-    handle: &ObjectHandle,
-    depth: usize,
-    _parent_in_array: bool,
-    visit: &mut F,
-) -> Result<()>
+/// Walk the direct children of one handle. The closure receives each child
+/// and whether its edge came from an array.
+fn collect_direct_handle_children<F>(handle: &ObjectHandle, visit: &mut F) -> Result<()>
 where
-    F: FnMut(&ObjectHandle, usize, bool) -> Result<()>,
+    F: FnMut(&ObjectHandle, bool) -> Result<()>,
 {
-    collect_direct_handle_children_with_stream_parameters(
-        handle,
-        depth,
-        _parent_in_array,
-        &BTreeSet::new(),
-        visit,
-    )
+    collect_direct_handle_children_with_stream_parameters(handle, &BTreeSet::new(), visit)
 }
 
 fn collect_direct_handle_children_with_stream_parameters<F>(
     handle: &ObjectHandle,
-    depth: usize,
-    _parent_in_array: bool,
     skipped_stream_parameter_streams: &BTreeSet<QpdfObjGen>,
     visit: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&ObjectHandle, usize, bool) -> Result<()>,
+    F: FnMut(&ObjectHandle, bool) -> Result<()>,
 {
     handle.try_dereference()?;
     let kind = handle.with_value(|value| match value {
@@ -374,19 +326,19 @@ where
             stream_dict.try_dereference()?;
             let skip_stream_parameters =
                 handle_has_stream_parameter_skip(handle, skipped_stream_parameter_streams)?;
-            visit_live_dictionary_children(&stream_dict, depth, skip_stream_parameters, visit)?;
+            visit_live_dictionary_children(&stream_dict, skip_stream_parameters, visit)?;
         }
         DirectContainerKind::Array => {
             let items = handle.try_array_items()?;
             let mut cursor = items.begin();
             while !cursor.is_end() {
                 let child = cursor.current();
-                visit(&child, depth + 1, true)?;
+                visit(&child, true)?;
                 cursor.next();
             }
         }
         DirectContainerKind::Dictionary => {
-            visit_live_dictionary_children(handle, depth, false, visit)?;
+            visit_live_dictionary_children(handle, false, visit)?;
         }
         DirectContainerKind::Scalar => {}
     }
@@ -406,12 +358,11 @@ enum DirectContainerKind {
 /// be released before it is invoked (`QPDFWriter.cc:1488-1504`).
 fn visit_live_dictionary_children<F>(
     dictionary: &ObjectHandle,
-    depth: usize,
     skip_stream_parameters: bool,
     visit: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&ObjectHandle, usize, bool) -> Result<()>,
+    F: FnMut(&ObjectHandle, bool) -> Result<()>,
 {
     let mut current_key = LiveDictionaryKeyBuffer::default();
     let mut next_key = LiveDictionaryKeyBuffer::default();
@@ -428,7 +379,7 @@ where
             first_entry = false;
             continue;
         }
-        visit(&child, depth + 1, false)?;
+        visit(&child, false)?;
         first_entry = false;
     }
     Ok(())
@@ -445,19 +396,15 @@ fn handle_has_stream_parameter_skip(
 
 fn collect_handle_children_with_stream_parameters(
     handle: &ObjectHandle,
-    depth: usize,
     out: &mut Vec<(ObjectRef, bool)>,
     skipped_stream_parameter_streams: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
     collect_direct_handle_children_with_stream_parameters(
         handle,
-        depth,
-        false,
         skipped_stream_parameter_streams,
-        &mut |child, child_depth, in_array| {
+        &mut |child, in_array| {
             collect_direct_handle_refs_with_stream_parameters_context(
                 child,
-                child_depth,
                 in_array,
                 out,
                 skipped_stream_parameter_streams,
@@ -573,7 +520,7 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
                     {
                         let resources = current_handle.try_get_key(b"/Resources")?;
                         let mut seeds: Vec<(ObjectRef, bool)> = Vec::new();
-                        collect_direct_handle_refs_with_context(&resources, 0, false, &mut seeds)?;
+                        collect_direct_handle_refs_with_context(&resources, false, &mut seeds)?;
                         for &(r, va) in &seeds {
                             if va {
                                 seen_as_array.insert(r);
@@ -623,7 +570,6 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
                             let mut child_refs: Vec<(ObjectRef, bool)> = Vec::new();
                             collect_handle_children_with_stream_parameters(
                                 &child_handle,
-                                0,
                                 &mut child_refs,
                                 skipped_stream_parameter_streams,
                             )?;
@@ -676,7 +622,6 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
                         let mut seen_parents: BTreeSet<ObjectRef> = BTreeSet::new();
                         collect_direct_handle_refs_with_stream_parameters(
                             v,
-                            0,
                             &mut to_visit,
                             skipped_stream_parameter_streams,
                         )?; // cov:ignore: LLVM maps this covered parent-seed call terminator to a zero-count continuation region
@@ -708,13 +653,12 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
                                 if pk == b"/Parent" {
                                     // Climb to the next ancestor instead of
                                     // stopping at one level.
-                                    collect_direct_handle_refs(pv, 0, &mut to_visit)?;
+                                    collect_direct_handle_refs(pv, &mut to_visit)?;
                                     continue;
                                 }
                                 let mut refs: Vec<(ObjectRef, bool)> = Vec::new();
                                 collect_direct_handle_refs_with_stream_parameters_context(
                                     pv,
-                                    0,
                                     false,
                                     &mut refs,
                                     skipped_stream_parameter_streams,
@@ -733,7 +677,6 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
                     }
                     collect_direct_handle_refs_with_stream_parameters_context(
                         v,
-                        0,
                         false,
                         &mut refs_raw,
                         skipped_stream_parameter_streams,
@@ -758,7 +701,6 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
             let mut refs: Vec<(ObjectRef, bool)> = Vec::new();
             collect_handle_children_with_stream_parameters(
                 &current_handle,
-                0,
                 &mut refs,
                 skipped_stream_parameter_streams,
             )?; // cov:ignore: LLVM maps this covered ordinary-object call terminator to a zero-count continuation region
@@ -4798,15 +4740,10 @@ mod tests {
         let stream = ObjectHandle::direct_stream(stream_dict, std::rc::Rc::new(Vec::new()));
 
         let mut visited = Vec::new();
-        super::collect_direct_handle_children(
-            &stream,
-            0,
-            false,
-            &mut |child, _depth, _in_array| {
-                visited.push(child.as_integer());
-                Ok(())
-            },
-        )
+        super::collect_direct_handle_children(&stream, &mut |child, _in_array| {
+            visited.push(child.as_integer());
+            Ok(())
+        })
         .expect("an indirect stream dictionary resolves during the walk");
 
         // `/Length` is skipped like qpdf's writer does; `/Kid` must survive.
@@ -4814,33 +4751,31 @@ mod tests {
     }
 
     #[test]
-    fn direct_reference_walkers_reject_depth_beyond_parser_limit() {
-        let handle = ObjectHandle::null();
+    fn direct_reference_walkers_accept_depth_beyond_parser_limit() {
+        let mut handle = ObjectHandle::null();
+        for _ in 0..=MAX_PARSE_DEPTH {
+            handle = ObjectHandle::array(vec![handle]);
+        }
+
         let mut refs = Vec::new();
-        let error = collect_direct_handle_refs(&handle, MAX_PARSE_DEPTH + 1, &mut refs)
-            .expect_err("the direct reference walk has a parser-depth guard");
-        assert!(error.to_string().contains("maximum of 500"));
+        collect_direct_handle_refs(&handle, &mut refs)
+            .expect("qpdf's direct-reference walk has no parser-depth cap");
+        assert!(refs.is_empty());
 
         let mut contextual = Vec::new();
-        let error = collect_direct_handle_refs_with_context(
-            &handle,
-            MAX_PARSE_DEPTH + 1,
-            false,
-            &mut contextual,
-        )
-        .expect_err("the contextual reference walk has a parser-depth guard");
-        assert!(error.to_string().contains("maximum of 500"));
+        collect_direct_handle_refs_with_context(&handle, false, &mut contextual)
+            .expect("qpdf's contextual direct-reference walk has no parser-depth cap");
+        assert!(contextual.is_empty());
 
         let mut stream_contextual = Vec::new();
-        let error = collect_direct_handle_refs_with_stream_parameters_context(
+        collect_direct_handle_refs_with_stream_parameters_context(
             &handle,
-            MAX_PARSE_DEPTH + 1,
             false,
             &mut stream_contextual,
             &BTreeSet::new(),
         )
-        .expect_err("the stream-policy reference walk has a parser-depth guard");
-        assert!(error.to_string().contains("maximum of 500"));
+        .expect("qpdf's stream-policy direct-reference walk has no parser-depth cap");
+        assert!(stream_contextual.is_empty());
     }
 
     #[test]

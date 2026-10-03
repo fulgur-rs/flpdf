@@ -35,7 +35,6 @@ use std::collections::{BTreeSet, VecDeque};
 use std::io::{Read, Seek};
 
 use crate::object_ref::ObjectRef;
-use crate::parser::MAX_PARSE_DEPTH;
 #[cfg(test)]
 use crate::qpdf_obj_gen::QpdfObjGen;
 #[cfg(test)]
@@ -222,7 +221,7 @@ impl CanonicalCatalogFirstRenumber {
             // qpdf's enqueueObject recurses through a direct Catalog instead
             // of assigning it an object number. Its indirect descendants are
             // nevertheless numbered in the Catalog's dictionary order.
-            collect_canonical_enqueue_refs(pdf, root, 0, skip_length, &mut seeds)?;
+            collect_canonical_enqueue_refs(pdf, root, skip_length, &mut seeds)?;
             // cov:ignore: direct-root traversal is exercised by the writer tests; LLVM maps this successful-call terminator to a zero-count continuation region.
         } // cov:ignore: direct-root traversal executes above; LLVM places this branch-exit counter on an uninstrumented continuation line.
 
@@ -241,7 +240,7 @@ impl CanonicalCatalogFirstRenumber {
             // array-valued trailer entry still reaches the recursive collector
             // so its null elements retain their positions/identities.
             if !value.try_is_null()? {
-                collect_canonical_enqueue_refs(pdf, &value, 0, skip_length, &mut seeds)?;
+                collect_canonical_enqueue_refs(pdf, &value, skip_length, &mut seeds)?;
                 // cov:ignore: successful trailer traversal is covered; llvm-cov attributes this continuation to the defensive error path
             }
         }
@@ -261,7 +260,7 @@ impl CanonicalCatalogFirstRenumber {
                 .map(|raw| pdf.get_object_handle_by_raw_identity(raw.get_obj(), raw.get_gen()))
                 .unwrap_or_else(|| pdf.get_object_handle(source));
             let mut found = Vec::new();
-            collect_canonical_children(pdf, &handle, 0, skip_length, &mut found)?;
+            collect_canonical_children(pdf, &handle, skip_length, &mut found)?;
             for reference in found {
                 if !removed_refs.contains(&reference) {
                     enqueue(reference, &mut old_to_new, &mut order, &mut queue);
@@ -281,24 +280,15 @@ impl CanonicalCatalogFirstRenumber {
 pub(crate) fn collect_canonical_enqueue_refs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: &crate::ObjectHandle,
-    depth: usize,
     skip_length: bool,
     found: &mut Vec<ObjectRef>,
 ) -> crate::Result<()> {
-    collect_canonical_enqueue_refs_with_linearized_omission(
-        pdf,
-        handle,
-        depth,
-        skip_length,
-        found,
-        None,
-    )
+    collect_canonical_enqueue_refs_with_linearized_omission(pdf, handle, skip_length, found, None)
 }
 
 fn collect_canonical_enqueue_refs_with_linearized_omission<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: &crate::ObjectHandle,
-    depth: usize,
     skip_length: bool,
     found: &mut Vec<ObjectRef>,
     stream_parameter_omission: LinearizedStreamParameterOmission<'_>,
@@ -315,7 +305,6 @@ fn collect_canonical_enqueue_refs_with_linearized_omission<R: Read + Seek>(
     collect_canonical_children_with_linearized_omission(
         pdf,
         handle,
-        depth,
         skip_length,
         found,
         stream_parameter_omission,
@@ -326,41 +315,24 @@ fn collect_canonical_enqueue_refs_with_linearized_omission<R: Read + Seek>(
 pub(crate) fn collect_canonical_children<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: &crate::ObjectHandle,
-    depth: usize,
     skip_length: bool,
     found: &mut Vec<ObjectRef>,
 ) -> crate::Result<()> {
-    collect_canonical_children_with_linearized_omission(
-        pdf,
-        handle,
-        depth,
-        skip_length,
-        found,
-        None,
-    )
+    collect_canonical_children_with_linearized_omission(pdf, handle, skip_length, found, None)
 }
 
 fn collect_canonical_children_with_linearized_omission<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: &crate::ObjectHandle,
-    depth: usize,
     skip_length: bool,
     found: &mut Vec<ObjectRef>,
     stream_parameter_omission: LinearizedStreamParameterOmission<'_>,
 ) -> crate::Result<()> {
-    // qpdf-deviation: QPDFWriter::enqueueObject recursively visits direct containers without this MAX_PARSE_DEPTH rejection.
-    if depth > MAX_PARSE_DEPTH {
-        return Err(Error::Unsupported(
-            "plain rewrite: inline object nesting exceeds MAX_PARSE_DEPTH during canonical enqueue collection"
-                .to_string(),
-        ));
-    }
     if let Some(items) = handle.try_as_array()? {
         for item in items {
             collect_canonical_enqueue_refs_with_linearized_omission(
                 pdf,
                 &item,
-                depth + 1,
                 skip_length,
                 found,
                 stream_parameter_omission,
@@ -374,7 +346,6 @@ fn collect_canonical_children_with_linearized_omission<R: Read + Seek>(
                 collect_canonical_enqueue_refs_with_linearized_omission(
                     pdf,
                     &value,
-                    depth + 1,
                     skip_length,
                     found,
                     stream_parameter_omission,
@@ -401,7 +372,6 @@ fn collect_canonical_children_with_linearized_omission<R: Read + Seek>(
                     collect_canonical_enqueue_refs_with_linearized_omission(
                         pdf,
                         &value,
-                        depth + 1,
                         skip_length,
                         found,
                         stream_parameter_omission,
@@ -447,10 +417,9 @@ pub(crate) fn ensure_canonical_owner<R: Read + Seek>(
 ///
 /// # Errors
 ///
-/// Returns [`Error::Unsupported`] when the trailer has no `/Root` or inline
-/// nesting exceeds [`MAX_PARSE_DEPTH`] (via the canonical enqueue collector), and propagates
-/// [`Error::Io`] / [`Error::Parse`] / [`Error::Encrypted`] from resolving
-/// objects during the walk.
+/// Returns [`Error::Unsupported`] when the trailer has no `/Root`, and
+/// propagates [`Error::Io`] / [`Error::Parse`] / [`Error::Encrypted`] from
+/// resolving objects during the walk.
 pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     skip_length: bool,
@@ -473,7 +442,6 @@ pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
         collect_canonical_enqueue_refs_with_linearized_omission(
             pdf,
             &root,
-            0,
             skip_length,
             &mut seeds,
             Some(&skip_stream_parameters),
@@ -492,7 +460,6 @@ pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
             collect_canonical_enqueue_refs_with_linearized_omission(
                 pdf,
                 &value,
-                0,
                 skip_length,
                 &mut seeds,
                 Some(&skip_stream_parameters),
@@ -513,7 +480,6 @@ pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
         collect_canonical_children_with_linearized_omission(
             pdf,
             &handle,
-            0,
             skip_length,
             &mut found,
             Some(&skip_stream_parameters),
@@ -547,7 +513,7 @@ pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
 /// ([`crate::writer::object_streams::get_compressible_objgens`]) and must not append
 /// this set a second time.
 ///
-/// Propagates resolve errors and the [`MAX_PARSE_DEPTH`] guard from the walk.
+/// Propagates resolution errors from the walk.
 /// Null-resolving references to retain, minus any identities removed by the
 /// current qpdf operation's compressible-object walk.
 ///
@@ -573,7 +539,7 @@ pub(crate) fn resurrectable_null_refs_excluding<R: Read + Seek>(
             result: &mut result,
             removed_refs,
         };
-        walk_resurrectable_handle(&root, 0, false, false, &mut state)?;
+        walk_resurrectable_handle(&root, false, false, &mut state)?;
         queue.extend(follow);
     }
 
@@ -590,7 +556,7 @@ pub(crate) fn resurrectable_null_refs_excluding<R: Read + Seek>(
             result: &mut result,
             removed_refs,
         };
-        walk_resurrectable_handle(&value, 0, false, true, &mut state)?;
+        walk_resurrectable_handle(&value, false, true, &mut state)?;
         queue.extend(follow);
     }
 
@@ -605,7 +571,7 @@ pub(crate) fn resurrectable_null_refs_excluding<R: Read + Seek>(
             result: &mut result,
             removed_refs,
         };
-        walk_resurrectable_handle(&handle, 0, false, false, &mut state)?;
+        walk_resurrectable_handle(&handle, false, false, &mut state)?;
         for r in follow {
             if !visited.contains(&r) {
                 queue.push_back(r);
@@ -627,21 +593,32 @@ struct ResurrectableWalkState<'a> {
     removed_refs: &'a BTreeSet<ObjectRef>,
 }
 
+const RESURRECTABLE_WALK_STACK_RED_ZONE: usize = 32 * 1024;
+const RESURRECTABLE_WALK_STACK_GROWTH_SIZE: usize = 1024 * 1024;
+
+/// One level of the recursive direct-container walk, run on a Rust stack
+/// segment large enough for deep direct containers. qpdf's
+/// `getCompressibleObjGens` and writer traversals have no direct-nesting
+/// limit, so this walk grows the stack instead of rejecting deep input.
 fn walk_resurrectable_handle(
     handle: &crate::ObjectHandle,
-    depth: usize,
     in_array: bool,
     edge_context: bool,
     state: &mut ResurrectableWalkState<'_>,
 ) -> crate::Result<()> {
-    // qpdf-deviation: qpdf writer traversal has no MAX_PARSE_DEPTH rejection for nested direct values.
-    if depth > MAX_PARSE_DEPTH {
-        return Err(Error::Unsupported(
-            "linearization: inline nesting exceeds MAX_PARSE_DEPTH during resurrectable walk"
-                .to_string(),
-        ));
-    }
+    stacker::maybe_grow(
+        RESURRECTABLE_WALK_STACK_RED_ZONE,
+        RESURRECTABLE_WALK_STACK_GROWTH_SIZE,
+        || walk_resurrectable_handle_level(handle, in_array, edge_context, state),
+    )
+}
 
+fn walk_resurrectable_handle_level(
+    handle: &crate::ObjectHandle,
+    in_array: bool,
+    edge_context: bool,
+    state: &mut ResurrectableWalkState<'_>,
+) -> crate::Result<()> {
     let is_null = handle.try_is_null()?;
     // `object_ref()` is the identity of a canonical handle, not a stored
     // reference value. A handle fetched from the document cache therefore
@@ -674,7 +651,7 @@ fn walk_resurrectable_handle(
 
     if let Some(elements) = handle.try_as_array()? {
         for element in elements {
-            walk_resurrectable_handle(&element, depth + 1, true, true, state)?;
+            walk_resurrectable_handle(&element, true, true, state)?;
         }
         return Ok(());
     }
@@ -693,7 +670,7 @@ fn walk_resurrectable_handle(
         // indirect null in an array is a surviving edge. Dictionary nulls are
         // discarded by the existing walk at the same child boundary as qpdf.
         for value in values {
-            walk_resurrectable_handle(&value, depth + 1, false, true, state)?;
+            walk_resurrectable_handle(&value, false, true, state)?;
         }
         return Ok(());
     }
@@ -707,7 +684,7 @@ fn walk_resurrectable_handle(
             _ => None, // cov:ignore: as_stream_dict guarantees a dictionary-backed stream value
         }) {
             for value in values {
-                walk_resurrectable_handle(&value, depth + 1, false, true, state)?;
+                walk_resurrectable_handle(&value, false, true, state)?;
             }
         }
     }
@@ -900,7 +877,7 @@ impl ObjectStreamRenumber {
             seeds.push(root);
         } else if let Some(root) = &direct_root {
             // cov:ignore-start: LLVM maps this covered direct-root call to a zero-count continuation region.
-            collect_canonical_enqueue_refs(pdf, root, 0, skip_length, &mut seeds)?;
+            collect_canonical_enqueue_refs(pdf, root, skip_length, &mut seeds)?;
             // cov:ignore-end
         } // cov:ignore: direct-root traversal executes above; LLVM places this branch-exit counter on an uninstrumented continuation line.
         let trailer = pdf.trailer();
@@ -919,7 +896,7 @@ impl ObjectStreamRenumber {
             // ref is seeded, matching qpdf's recursive trailer enqueue. A bare
             // reference yields exactly one seed as before. The live handle
             // graph applies qpdf's null-visible dictionary rule while walking.
-            collect_canonical_enqueue_refs(pdf, &value, 0, skip_length, &mut seeds)?;
+            collect_canonical_enqueue_refs(pdf, &value, skip_length, &mut seeds)?;
             // cov:ignore: successful trailer traversal is covered; llvm-cov attributes this continuation to the defensive error path
         }
         seeds.retain(|reference| !removed_refs.contains(reference));
@@ -948,7 +925,7 @@ impl ObjectStreamRenumber {
                         })
                         .unwrap_or_else(|| pdf.get_object_handle(cur));
                     let mut found = Vec::new();
-                    collect_canonical_children(pdf, &handle, 0, skip_length, &mut found)?; // cov:ignore: successful object-stream traversal is covered; llvm-cov attributes this continuation to the defensive error path
+                    collect_canonical_children(pdf, &handle, skip_length, &mut found)?; // cov:ignore: successful object-stream traversal is covered; llvm-cov attributes this continuation to the defensive error path
                     found.retain(|reference| !removed_refs.contains(reference));
                     for reference in found {
                         enqueue_object_stream(
@@ -1289,7 +1266,12 @@ mod tests {
     }
 
     #[test]
-    fn resurrectable_walk_rejects_programmatic_depth_beyond_parser_limit() {
+    fn resurrectable_walk_accepts_programmatic_depth_beyond_parser_limit() {
+        let mut handle = ObjectHandle::null();
+        for _ in 0..=MAX_PARSE_DEPTH {
+            handle = ObjectHandle::array(vec![handle]);
+        }
+
         let mut follow = Vec::new();
         let mut result = BTreeSet::new();
         let removed_refs = BTreeSet::new();
@@ -1298,15 +1280,10 @@ mod tests {
             result: &mut result,
             removed_refs: &removed_refs,
         };
-        let error = walk_resurrectable_handle(
-            &ObjectHandle::null(),
-            MAX_PARSE_DEPTH + 1,
-            false,
-            false,
-            &mut state,
-        )
-        .expect_err("the resurrectable walk has a parser-depth guard");
-        assert!(error.to_string().contains("MAX_PARSE_DEPTH"));
+        walk_resurrectable_handle(&handle, false, false, &mut state)
+            .expect("qpdf's resurrectable walk has no direct-container depth cap");
+        assert!(follow.is_empty());
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -1315,7 +1292,7 @@ mod tests {
         let unresolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(91, 0), -1);
         let mut found = Vec::new();
 
-        let error = collect_canonical_children(&mut pdf, &unresolved, 0, false, &mut found)
+        let error = collect_canonical_children(&mut pdf, &unresolved, false, &mut found)
             .expect_err("an unresolved child must remain a fallible traversal");
         assert!(matches!(
             error,
@@ -1335,7 +1312,7 @@ mod tests {
             removed_refs: &removed_refs,
         };
 
-        let error = walk_resurrectable_handle(&unresolved, 0, false, false, &mut state)
+        let error = walk_resurrectable_handle(&unresolved, false, false, &mut state)
             .expect_err("the resurrectable walk must propagate resolution errors");
         assert!(matches!(
             error,

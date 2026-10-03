@@ -837,79 +837,9 @@ impl ObjectWriterEmissionVecTestExt for ObjectHandle {
 const UNPARSE_STACK_RED_ZONE: usize = 32 * 1024;
 const UNPARSE_STACK_GROWTH_SIZE: usize = 1024 * 1024;
 
-// Active recursion depth of this module's `unparse_object_walk*` family.
-//
-// `stacker::maybe_grow` swaps stack segments without leaving the current
-// thread, so a thread-local counter observes every level of one walk and
-// never mixes two concurrent writes.
-//
-// qpdf's `QPDFWriter::unparseObject` (`libqpdf/QPDFWriter.cc:1318-1325`)
-// validates only that its `level` is non-negative. Nothing bounds the walk
-// from above and nothing records the nodes already on the path, so a pair of
-// *direct* dictionaries holding each other recurses until the process runs
-// out of memory. Parsed input cannot reach that shape -- `parser.rs` caps
-// container nesting at `MAX_PARSE_DEPTH` and the direct containers it builds
-// are trees -- but `ObjectHandle::replace_key` accepts it from a library
-// caller, since it refuses only the single-hop self-insert and not the
-// two-hop pair `a.replace_key(b"/B", b)` plus `b.replace_key(b"/A", a)`.
-// Bounding every hub at the parser's own limit turns such a graph into a
-// diagnostic instead of resource exhaustion, and leaves every graph the
-// parser can produce untouched. The live body writer's direct-seed collector
-// (`writer/plain/body.rs`) already refuses the same nesting before emission
-// starts, so this makes the remaining emission routes agree with it.
-//
-// The count starts at zero for the outermost hub, so `MAX_PARSE_DEPTH + 1`
-// hub levels are admitted rather than exactly `MAX_PARSE_DEPTH`. That extra
-// level is not slack: a top-level indirect stream spends one hub on the
-// stream itself and a second on its dictionary (`UnparseContainer::Stream`
-// re-enters the walk with `stream_dict`), so a maximally nested parsed
-// stream dictionary would otherwise trip a bound set at the parser's count.
-thread_local! {
-    static UNPARSE_WALK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-// Counts one active level of the walk and restores the count when the level
-// unwinds, on the error path as well as the success path.
-struct UnparseWalkDepthGuard;
-
-impl UnparseWalkDepthGuard {
-    #[deprecated(
-        note = "no qpdf counterpart; QPDFWriter::unparseObject has no upper nesting limit"
-    )]
-    fn enter() -> Result<Self> {
-        let depth = UNPARSE_WALK_DEPTH.with(|depth| {
-            let entered = depth.get();
-            depth.set(entered + 1);
-            entered
-        });
-        // Constructed before the bound is tested so the count is restored
-        // even when this level is rejected.
-        let guard = Self;
-        if depth > crate::parser::MAX_PARSE_DEPTH {
-            return Err(Error::Unsupported(format!(
-                "writer: direct object nesting exceeds maximum of {}",
-                crate::parser::MAX_PARSE_DEPTH
-            )));
-        }
-        Ok(guard)
-    }
-}
-
-impl Drop for UnparseWalkDepthGuard {
-    fn drop(&mut self) {
-        UNPARSE_WALK_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
-    }
-}
-
-/// Run one level of an `unparse_object_walk*` recursion with the family's
-/// shared stack growth and nesting bound.
-///
-/// Every hub in the family routes its body through here, so a direct
-/// container graph that never reaches an indirect boundary is rejected at
-/// the same depth wherever it is met.
-#[allow(deprecated)]
+/// Run one level of qpdf's recursive `QPDFWriter::unparseObject` walk on a
+/// Rust stack segment large enough for deep direct containers.
 fn unparse_object_walk_hub<T>(body: impl FnOnce() -> Result<T>) -> Result<T> {
-    let _depth = UnparseWalkDepthGuard::enter()?;
     stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, body)
 }
 
@@ -7380,26 +7310,6 @@ mod tests {
         Ok(())
     }
 
-    // Two direct dictionaries holding each other: `a` under `/B` holds `b`,
-    // and `b` under `/A` holds `a`. Neither handle is indirect, so no walk
-    // ever meets the indirect boundary that normally terminates a descent.
-    // `replace_key` refuses only the single-hop self-insert, so this two-hop
-    // shape does close into a real cycle -- asserted here so the walk
-    // assertions below cannot pass against an unaliased pair.
-    fn reciprocal_direct_dictionary_cycle() -> Result<ObjectHandle> {
-        let a = ObjectHandle::dictionary(vec![]);
-        let b = ObjectHandle::dictionary(vec![]);
-        a.replace_key(b"/B", b.clone())?;
-        b.replace_key(b"/A", a.clone())?;
-        assert!(
-            a.try_get_key(b"/B")?
-                .try_get_key(b"/A")?
-                .is_same_object_as(&a),
-            "the reciprocal replace_key pair must close into a direct cycle"
-        );
-        Ok(a)
-    }
-
     // `n` nested direct dictionaries around a scalar leaf. Only the
     // dictionaries enter a walk hub; the leaf is written by the direct-scalar
     // fast path, so the nesting count equals the hub depth reached.
@@ -7412,103 +7322,30 @@ mod tests {
     }
 
     #[test]
-    fn direct_dictionary_cycle_is_rejected_by_the_unparse_hub_family() -> Result<()> {
-        let cycle = reciprocal_direct_dictionary_cycle()?;
+    fn direct_nesting_beyond_parser_limit_is_unparsed_by_every_hub() -> Result<()> {
+        let deep = nested_direct_dictionaries(502);
+        let mut plain = Vec::new();
+        super::super::output::with_buffer_sink(&mut plain, |out| {
+            ObjectWriterEmission::unparse_object(&deep, out)
+        })?;
+        assert_eq!(String::from_utf8_lossy(&plain).matches("/K").count(), 502);
 
-        let plain = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
-            ObjectWriterEmission::unparse_object(&cycle, out)
-        })
-        .expect_err("a direct cycle must not be walked by the plain hub");
-        assert!(
-            matches!(plain, Error::Unsupported(_)),
-            "unexpected error kind: {plain:?}"
-        );
-        assert!(
-            plain
-                .to_string()
-                .contains("direct object nesting exceeds maximum of"),
-            "unexpected message: {plain}"
-        );
-
-        let qdf = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
-            ObjectWriterEmission::unparse_object_qdf(&cycle, out, 0)
-        })
-        .expect_err("a direct cycle must not be walked by the qdf hub");
-        assert!(matches!(qdf, Error::Unsupported(_)));
-        assert!(
-            qdf.to_string()
-                .contains("direct object nesting exceeds maximum of"),
-            "unexpected message: {qdf}"
-        );
+        let mut qdf = Vec::new();
+        super::super::output::with_buffer_sink(&mut qdf, |out| {
+            ObjectWriterEmission::unparse_object_qdf(&deep, out, 0)
+        })?;
+        assert_eq!(String::from_utf8_lossy(&qdf).matches("/K").count(), 502);
 
         let mut map = |_: &ObjectHandle| Ok(ObjectRef::new(1, 0));
-        let dynamic = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
-            cycle.unparse_object_with_dynamic_ref_map(out, &mut map, &BTreeSet::new())
-        })
-        .expect_err("a direct cycle must not be walked by the dynamic ref-map hub");
-        assert!(matches!(dynamic, Error::Unsupported(_)));
-        assert!(
-            dynamic
-                .to_string()
-                .contains("direct object nesting exceeds maximum of"),
-            "unexpected message: {dynamic}"
-        );
-
-        // The same callback still serves an ordinary indirect child, so the
-        // rejection above is the only behavior the cycle adds to this route.
-        let mut mapped = Vec::new();
+        let mut dynamic = Vec::new();
         let indirect_child = ObjectHandle::array(vec![ObjectHandle::new_indirect_unresolved(
             ObjectRef::new(4, 0),
             -1,
         )]);
-        super::super::output::with_buffer_sink(&mut mapped, |out| {
+        super::super::output::with_buffer_sink(&mut dynamic, |out| {
             indirect_child.unparse_object_with_dynamic_ref_map(out, &mut map, &BTreeSet::new())
         })?;
-        assert_eq!(mapped, b"[ 1 0 R ]");
-
-        // Every rejected level restores the shared counter on its way out,
-        // so a later write starts from zero instead of inheriting the
-        // exhausted budget of the refused walk.
-        assert_eq!(UNPARSE_WALK_DEPTH.with(std::cell::Cell::get), 0);
-        let mut output = Vec::new();
-        let deep = nested_direct_dictionaries(crate::parser::MAX_PARSE_DEPTH + 1);
-        super::super::output::with_buffer_sink(&mut output, |out| {
-            ObjectWriterEmission::unparse_object(&deep, out)
-        })?;
-        assert_eq!(
-            String::from_utf8_lossy(&output).matches("/K").count(),
-            crate::parser::MAX_PARSE_DEPTH + 1
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn acyclic_direct_nesting_is_bounded_at_the_parser_limit() -> Result<()> {
-        let bound = crate::parser::MAX_PARSE_DEPTH;
-
-        let mut output = Vec::new();
-        let within_bound = nested_direct_dictionaries(bound + 1);
-        super::super::output::with_buffer_sink(&mut output, |out| {
-            ObjectWriterEmission::unparse_object(&within_bound, out)
-        })?;
-        assert_eq!(
-            String::from_utf8_lossy(&output).matches("/K").count(),
-            bound + 1,
-            "every level within the bound must still be written"
-        );
-
-        let past_bound = nested_direct_dictionaries(bound + 2);
-        let error = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
-            ObjectWriterEmission::unparse_object(&past_bound, out)
-        })
-        .expect_err("nesting past the bound must be reported");
-        assert!(matches!(error, Error::Unsupported(_)));
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "unsupported PDF feature: writer: direct object nesting exceeds maximum of {bound}"
-            )
-        );
+        assert_eq!(dynamic, b"[ 1 0 R ]");
         Ok(())
     }
 }

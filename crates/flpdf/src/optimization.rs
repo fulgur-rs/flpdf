@@ -5,7 +5,6 @@
 
 pub(crate) mod inherited_attrs;
 
-use crate::parser::MAX_PARSE_DEPTH;
 use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::{ObjectHandle, ObjectRef, Pdf};
 use std::collections::{BTreeMap, BTreeSet};
@@ -460,17 +459,9 @@ impl Optimization {
             user,
             top: true,
             via_array: false,
-            inline_depth: 0,
         }];
 
         while let Some(pending) = stack.pop() {
-            // qpdf-deviation: QPDF::getCompressibleObjGens uses an explicit work queue without a MAX_PARSE_DEPTH cap.
-            if pending.inline_depth > MAX_PARSE_DEPTH {
-                return Err(crate::Error::Unsupported(format!(
-                    "optimization: inline object nesting exceeds maximum of {MAX_PARSE_DEPTH}"
-                )));
-            }
-
             if pending.object.is_indirect() {
                 // qpdf's QPDFWriter::enqueueObject checks the owning QPDF
                 // before it accepts any indirect handle
@@ -501,15 +492,6 @@ impl Optimization {
                 }
                 self.record_raw(pending.user.clone(), object_gen);
             }
-            // The inline-depth guard counts only direct container nesting.
-            // Crossing an indirect handle resets that count, matching the
-            // old resolver's reference arm and qpdf's handle traversal.
-            let inline_depth = if pending.object.is_indirect() {
-                0
-            } else {
-                pending.inline_depth
-            };
-
             if let Some(items) = pending.object.as_array() {
                 for item in items.into_iter().rev() {
                     stack.push(Pending {
@@ -517,7 +499,6 @@ impl Optimization {
                         user: pending.user.clone(),
                         top: false,
                         via_array: true,
-                        inline_depth: inline_depth + 1,
                     });
                 }
                 continue;
@@ -539,7 +520,6 @@ impl Optimization {
                         user: pending.user.clone(),
                         top: false,
                         via_array: false,
-                        inline_depth: inline_depth + 1,
                     });
                 }
                 continue;
@@ -569,7 +549,6 @@ impl Optimization {
                         user: child_user,
                         top: false,
                         via_array: false,
-                        inline_depth: inline_depth + 1,
                     });
                 }
             }
@@ -593,7 +572,6 @@ struct Pending {
     user: ObjectUser,
     top: bool,
     via_array: bool,
-    inline_depth: usize,
 }
 
 fn is_page_resolved(object: &ObjectHandle) -> crate::Result<bool> {
@@ -670,7 +648,6 @@ fn empty_object_users() -> &'static CompactObjectUserSet {
 mod tests {
     use super::{CompactObjectUserSet, ObjectUser, Optimization};
     use crate::object_handle::ObjectHandle;
-    use crate::parser::MAX_PARSE_DEPTH;
     use crate::qpdf_obj_gen::QpdfObjGen;
     use crate::{ObjectRef, Pdf, Result};
     use std::collections::{BTreeMap, BTreeSet};
@@ -1148,7 +1125,7 @@ mod tests {
     }
 
     #[test]
-    fn object_user_walk_rejects_programmatic_depth_beyond_parser_limit() {
+    fn object_user_walk_accepts_programmatic_depth_beyond_parser_limit() {
         let pdf = Pdf::empty().expect("create owner for direct test values");
         let mut optimization = Optimization::default();
         optimization
@@ -1162,14 +1139,13 @@ mod tests {
                 &mut no_stream_parameter_skip,
             )
             .expect("the test callback must be exercised by a stream");
-        let error = optimization
+        optimization
             .update_object_maps(
                 &pdf,
                 ObjectUser::Root,
-                nested_direct_array(MAX_PARSE_DEPTH + 1),
+                nested_direct_array(502),
                 &mut no_stream_parameter_skip,
             )
-            .expect_err("the object-user walk has a parser-depth guard");
-        assert!(error.to_string().contains("maximum of 500"));
+            .expect("qpdf's object-user traversal has no direct-container depth cap");
     }
 }

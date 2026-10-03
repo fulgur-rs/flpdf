@@ -292,13 +292,14 @@ const SMALL_PAGE_COUNT: usize = 2;
 const LARGE_PAGE_COUNT: usize = 8;
 const SMALL_PAGE_OBJECT_COUNT: usize = 2;
 const LARGE_PAGE_OBJECT_COUNT: usize = 16;
-// The clean route measured 2,174 allocated bytes per added page-private
-// object and 2,176 bytes per page/object edge on the page-count axis. A
-// synthetic duplicate `Vec<BTreeSet<ObjectRef>>` measured 2,200 and 2,211,
-// respectively. Each bound sits between the current route and that retired
-// ownership table, with the allocation sizes taken from `Layout`.
-const PAGE_PRIVATE_OBJECT_ALLOCATED_BYTES_BOUND: usize = 2_187;
-const PAGE_PRIVATE_PAGE_ALLOCATED_BYTES_BOUND: usize = 2_193;
+// The route without a direct-nesting counter measures 2,147 allocated bytes
+// per added page-private object and 2,144 bytes per page/object edge on the
+// page-count axis. A synthetic duplicate `Vec<BTreeSet<ObjectRef>>` measures
+// 2,173 and 2,180, respectively. Each bound sits between the current route
+// and that retired ownership table, with the allocation sizes taken from
+// `Layout`.
+const PAGE_PRIVATE_OBJECT_ALLOCATED_BYTES_BOUND: usize = 2_160;
+const PAGE_PRIVATE_PAGE_ALLOCATED_BYTES_BOUND: usize = 2_162;
 
 #[test]
 fn linearization_page_private_cost_scales_with_pages_and_objects() {
