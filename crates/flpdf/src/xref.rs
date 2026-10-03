@@ -1594,10 +1594,7 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
             &options.description,
             canonical_trailer_owner,
         );
-        let (entries, trailer_start, first_xref_item_offset) = match table {
-            Ok(table) => table,
-            Err(error) => return Err(error),
-        };
+        let (entries, trailer_start, first_xref_item_offset) = table?;
         let mut deferred_free = Vec::new();
         for entry in entries {
             match entry {
