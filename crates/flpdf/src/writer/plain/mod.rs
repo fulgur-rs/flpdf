@@ -287,7 +287,6 @@ fn write_plain_live<R: Read + Seek>(
         crate::writer::rewrite_renumber::collect_canonical_enqueue_refs(
             pdf,
             direct_root,
-            0,
             true,
             &mut references,
         )?; // cov:ignore: direct-root reference collection is covered by the direct-root writer differential.
@@ -396,7 +395,6 @@ pub(crate) fn extend_late_trailer_map<R: Read + Seek>(
         crate::writer::rewrite_renumber::collect_canonical_enqueue_refs(
             pdf,
             &value,
-            0,
             true,
             &mut references,
         )?; // cov:ignore: live trailer reference collection is covered by the late-trailer tests.
