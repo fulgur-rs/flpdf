@@ -131,6 +131,11 @@ pub fn safe_fopen(filename: &str, mode: &str) -> crate::Result<File> {
 /// failure (not just [`safe_fopen`]) should route it through this instead of
 /// `io::Error`'s own `Display`.
 pub(crate) fn strerror_text(error: &std::io::Error) -> String {
+    #[cfg(windows)]
+    if let Some(message) = error.raw_os_error().and_then(qpdf_windows_strerror_text) {
+        return message.to_owned();
+    }
+
     // A real syscall failure on a `strerror`-rendering host already carries
     // exactly the text qpdf prints, so use it rather than the table below.
     // The table keys on `ErrorKind`, which is coarser than `errno`: `EPERM`
@@ -155,6 +160,17 @@ pub(crate) fn strerror_text(error: &std::io::Error) -> String {
         return message.to_owned();
     }
     strerror_from_display(error)
+}
+
+#[cfg(any(test, windows))]
+fn qpdf_windows_strerror_text(raw_os_error: i32) -> Option<&'static str> {
+    match raw_os_error {
+        // Rust preserves Win32 ERROR_NEGATIVE_SEEK (131) for a seek before
+        // offset zero; qpdf's MSVC `_fseeki64` path sets errno to EINVAL and
+        // QPDFSystemError renders it as "Invalid argument".
+        131 => Some("Invalid argument"),
+        _ => None,
+    }
 }
 
 /// Render `error` through its own `Display`, less the ` (os error N)` suffix
@@ -869,9 +885,10 @@ mod tests {
     use super::{
         int_to_string_base, parse_numrange, qpdf_i64_to_int_checked, qpdf_size_to_int,
         qpdf_string_to_int_checked, qpdf_string_to_ll_checked, qpdf_u64_to_offset_checked,
-        qpdf_usize_to_offset_checked, safe_fopen, same_file, strerror_text, to_utf8, utf8_to_ascii,
-        utf8_to_ascii_checked, utf8_to_mac_roman, utf8_to_pdf_doc, utf8_to_pdf_doc_checked,
-        utf8_to_win_ansi, QpdfIntParse, QpdfLongLongParse,
+        qpdf_usize_to_offset_checked, qpdf_windows_strerror_text, safe_fopen, same_file,
+        strerror_text, to_utf8, utf8_to_ascii, utf8_to_ascii_checked, utf8_to_mac_roman,
+        utf8_to_pdf_doc, utf8_to_pdf_doc_checked, utf8_to_win_ansi, QpdfIntParse,
+        QpdfLongLongParse,
     };
     use std::io::{Read, Write};
 
@@ -992,6 +1009,25 @@ mod tests {
         ] {
             assert_eq!(strerror_text(&std::io::Error::from(kind)), expected);
         }
+    }
+
+    #[test]
+    fn qpdf_windows_negative_seek_code_uses_einval_wording() {
+        assert_eq!(
+            qpdf_windows_strerror_text(131),
+            Some("Invalid argument"),
+            "Win32 ERROR_NEGATIVE_SEEK maps to qpdf's MSVC EINVAL text"
+        );
+        assert_eq!(qpdf_windows_strerror_text(87), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strerror_text_maps_windows_negative_seek_to_qpdf_wording() {
+        assert_eq!(
+            strerror_text(&std::io::Error::from_raw_os_error(131)),
+            "Invalid argument"
+        );
     }
 
     #[test]
