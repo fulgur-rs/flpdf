@@ -207,7 +207,7 @@ git commit -m "refactor: route linearization catalog through handles"
 ```bash
 cargo test -p flpdf --test cmp_linearize_tests --features qpdf-zlib-compat
 cargo test -p flpdf --test cmp_linearize_objstm_tests --features qpdf-zlib-compat
-cargo test -p flpdf --test linearize_objstm_generate_tests
+cargo test -p flpdf --lib linearization::linearize_objstm_generate_tests
 cargo test -p flpdf --test show_linearization_tests
 cargo test -p flpdf-cli --test compat_matrix_tests
 ```

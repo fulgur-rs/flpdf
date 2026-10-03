@@ -126,7 +126,7 @@
   cargo test -p flpdf --lib linearization::renumber::tests
   cargo test -p flpdf --lib linearization::hint_page::tests
   cargo test -p flpdf --lib linearization::hint_shared::tests
-  cargo test -p flpdf --test linearize_objstm_generate_tests
+  cargo test -p flpdf --lib linearization::linearize_objstm_generate_tests
   ```
 
 ### Task 4: Route both linearization passes through one raw serializer map/set
@@ -165,7 +165,7 @@
   cargo test -p flpdf --test qpdf_obj_gen_header_tests
   cargo test -p flpdf --test cmp_linearize_tests
   cargo test -p flpdf --features qpdf-zlib-compat --test cmp_linearize_objstm_tests
-  cargo test -p flpdf --test linearize_objstm_generate_tests
+  cargo test -p flpdf --lib linearization::linearize_objstm_generate_tests
   ```
 
 ### Task 5: Documentation, full verification, and delivery preparation

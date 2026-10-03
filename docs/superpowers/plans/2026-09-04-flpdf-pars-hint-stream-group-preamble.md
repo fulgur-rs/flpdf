@@ -207,7 +207,7 @@ Expected: all commands exit 0. No deviation marker is added because this change 
 
 ~~~bash
 cargo test -p flpdf --features qpdf-zlib-compat --test cmp_linearize_objstm_tests
-cargo test -p flpdf --features qpdf-zlib-compat --test linearize_objstm_generate_tests
+cargo test -p flpdf --features qpdf-zlib-compat --lib linearization::linearize_objstm_generate_tests
 cargo test -p flpdf --features qpdf-zlib-compat --test show_linearization_tests
 cargo test -p flpdf --features qpdf-zlib-compat --test writer_linearization_route_tests
 ~~~
