@@ -8,11 +8,10 @@
 //! output to match qpdf's classic-libz output (the Pure-Rust miniz_oxide default
 //! produces equivalent but not byte-identical compression).
 //!
-//! The public-API sequence mirrors the CLI's `--linearize` path: build the
-//! [`LinearizationPlan`] and [`RenumberMap`] from one handle, then re-open the
-//! file so [`write_linearized`] can seek/read objects independently, write with
-//! `deterministic_id` set, and `back_patch` the param-dict placeholders, `/Prev`,
-//! and `/ID`.
+//! The public-API sequence mirrors the CLI's `--linearize` path: open a `Pdf`,
+//! apply writer settings, and pass that same live handle to `PdfWriter` with
+//! linearization and `deterministic_id` enabled. The canonical writer plans,
+//! emits, and back-patches the output before returning the bytes.
 //!
 //! CAVEAT: byte-identity pins to the linked libz version (captured with zlib1g
 //! 1:1.3.dfsg-3.1ubuntu2.1 / qpdf 11.9.0); a different libz may shift the deflate
@@ -52,8 +51,8 @@ fn flpdf_linearized_at(path: &Path) -> Vec<u8> {
 }
 
 /// As [`flpdf_linearized`], but opens the fixture with `open_with_repair` so an
-/// input whose xref must be reconstructed still parses. Both the plan handle and
-/// the write handle repair independently (each re-opens the file).
+/// input whose xref must be reconstructed still parses. The repaired `Pdf`
+/// handle is passed directly to the canonical writer route.
 fn flpdf_linearized_repair(fixture: &str) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
@@ -345,9 +344,8 @@ fn indirect_extensions_linearized_is_byte_identical_to_qpdf() {
 // reference) and the /Page leaf has no local /Resources, so linearization
 // must push the inherited /Resources down to the leaf (minting a fresh
 // indirect object for the copy) and strip it from the now-interior /Pages
-// node. This exercises the fix on `write_linearized`'s own `Pdf` handle (a
-// separate handle from the one `LinearizationPlan::from_pdf` used for planning,
-// exactly as the CLI and this file's `flpdf_linearized` helper both do).
+// node. This verifies the fix on the live `Pdf` handle used by the canonical
+// writer route for both planning and writing.
 // Confirmed (by temporarily reverting the fix) that without it, this fixture
 // diverges from qpdf: the interior /Pages node keeps its /Resources dict
 // unstripped, the /Page leaf never gains a /Resources key at all (the mutation

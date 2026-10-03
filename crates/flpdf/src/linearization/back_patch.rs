@@ -720,7 +720,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 11. PLACEHOLDER_WIDTH is the public cap used by the preflight; ensure
+    // 11. PLACEHOLDER_WIDTH is the cap used by the preflight; ensure
     //     it stays the qpdf-spec 10 (so 10^10 stays the value overflow limit).
     // -----------------------------------------------------------------------
     #[test]

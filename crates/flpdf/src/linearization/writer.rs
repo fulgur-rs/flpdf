@@ -3948,9 +3948,9 @@ pub(crate) fn write_linearized<R: Read + Seek>(
 
 /// Write linearized output through the canonical [`crate::PdfWriter`] route.
 ///
-/// The public compatibility helpers above accept an already-built plan for
-/// the inspection/fixture APIs.  A real writer must plan and emit the same
-/// live `Pdf` after all writer settings and graph mutations have settled.  The
+/// The test-only plan-injected helper above accepts an already-built plan for
+/// focused internal tests. A real writer plans and emits the same live `Pdf`
+/// after all writer settings and graph mutations have settled. The
 /// returned mapping is taken from the final local renumber map, including any
 /// ObjStm relocation performed by the two-pass linearization emitter.
 pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(

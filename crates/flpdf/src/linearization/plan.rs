@@ -747,8 +747,8 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
 // LinearizationPlan
 // ---------------------------------------------------------------------------
 
-/// Raw identity backing for [`LinearizationPlan`].  The public plan fields
-/// below are checked `ObjectRef` projections; this is the writer-facing source
+/// Raw identity backing for [`LinearizationPlan`]. The plan fields below are
+/// checked `ObjectRef` projections; this is the writer-facing source
 /// of truth and therefore keeps object generations that cannot be represented
 /// by an indirect PDF reference.
 #[allow(dead_code)]
@@ -2551,8 +2551,8 @@ impl LinearizationPlan {
         )?; // cov:ignore: the raw plan builder consumes this qpdf outline-routing predicate; LLVM attributes the continuation to the call terminator
 
         // Object counts are scalar hint inputs rather than source identities,
-        // so they may include raw-only objects even though the public object
-        // vectors are checked projections. Keep the public hint record
+        // so they may include raw-only objects even though the object vectors
+        // are checked projections. Keep the hint record
         // accurate for both the classic and ObjStm-folded page-offset paths.
         if let Some(first_hint) = page_hints.first_mut() {
             first_hint.object_count = (raw.part2_objects.len()
@@ -3034,8 +3034,8 @@ impl LinearizationPlan {
     }
 
     /// Return the shared-hint inputs without narrowing raw source identities.
-    /// The public `canonical_shared_hints` view remains available to callers
-    /// that expose `SharedObjectHintEntry`; linearization hint encoders use
+    /// The checked `canonical_shared_hints` view remains available to crate
+    /// callers that need `SharedObjectHintEntry`; hint encoders use
     /// this raw view so a first-page or Part-8 object with generation 65536 is
     /// still counted and looked up through `RenumberMap::new_for_raw`.
     pub(crate) fn canonical_raw_shared_hints(
@@ -3135,7 +3135,7 @@ impl LinearizationPlan {
         let mut part8_extra = Vec::new();
         for entry in &self.raw.shared_hints {
             let Some(object) = entry.object else {
-                continue; // cov:ignore: raw shared-hint records contain source identities only; synthetic containers come from the public folded view
+                continue; // cov:ignore: raw shared-hint records contain source identities only; synthetic containers come from the checked folded view
             };
             if first_page_raw.contains(&object) {
                 first_extra.push(entry.clone());
@@ -3459,7 +3459,7 @@ impl LinearizationPlan {
                     &length_exclusions,
                     optimization,
                     generated_object_stream_sources,
-                )? // cov:ignore: LLVM attributes this Generate call's success terminator to the arm opening; both public generated-source regressions exercise the forwarded list.
+                )? // cov:ignore: LLVM attributes this Generate call's success terminator to the arm opening; both writer-route generated-source regressions exercise the forwarded list.
             }
             ObjectStreamMode::Preserve => {
                 self.objstm_batches_preserve(pdf, config, &ctx, &length_exclusions, optimization)?

@@ -3,11 +3,11 @@
 //! ({first-page `/Font` dict, `/Font`, `/Info`, `/Pages` tree} in one first-half
 //! container, `/Catalog` standalone).
 //!
-//! These tests drive the public `write_linearized` API with
+//! These tests exercise the public `PdfWriter` route with
 //! `ObjectStreamMode::Generate` and assert structural properties of the
 //! back-patched bytes WITHOUT requiring qpdf at test time (the offsets/markers
-//! are parsed directly), so they run on every build and cover the
-//! generate-multipage writer / plan / renumber / hint-reconciliation paths.
+//! are parsed directly), so they run on every build. As crate unit tests, they
+//! also inspect the internal plan, renumber map, and hint reconciliation.
 
 use crate::linearization::plan::LinearizationPlan;
 use crate::linearization::renumber::RenumberMap;
@@ -27,7 +27,7 @@ fn canonical_object_refs<R: Read + Seek + 'static>(pdf: &mut Pdf<R>) -> Vec<Obje
         .collect()
 }
 
-/// Linearize `fixture` with `--object-streams=generate` via the public API and
+/// Linearize `fixture` with `--object-streams=generate` via `PdfWriter` and
 /// return the complete back-patched bytes.
 fn linearize_generate(fixture: &str) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))

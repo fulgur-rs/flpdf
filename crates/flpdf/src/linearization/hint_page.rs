@@ -281,7 +281,7 @@ fn page0_object_count_with_objstm(
 /// part9 object). Page 0 is handled separately (it owns its first-page
 /// containers) and is not consulted here.
 /// `source_container_by_member` is the writer-setup snapshot of qpdf's
-/// source-backed ObjStm membership. An empty map is used only by the public
+/// source-backed ObjStm membership. An empty map is used only by the test-only
 /// plan helper, where the bounded manual-plan fallback is built once.
 pub(crate) fn non_page_owned_containers(
     plan: &LinearizationPlan,
@@ -485,7 +485,7 @@ impl PageOffsetHintTable {
             // Raw-generation body objects cannot be ObjStm members (the
             // eligibility API is intentionally bounded by valid PDF
             // references), so they remain standalone and must be added to the
-            // folded scalar count even though they are absent from the public
+            // folded scalar count even though they are absent from the checked
             // ObjectRef vectors.
             object_counts[0] += plan
                 .raw
