@@ -232,6 +232,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/fulgur-rs/flpdf/compare/v0.10.0...v0.11.0) - 2026-10-03
+
+### Fixed
+
+- reserve stdout for attachment inspection
+- validate v5 perms like qpdf
+- match qpdf v5 encryption parameter lengths
+- prefer owner key for V5 password recovery
+- align linearization API with qpdf visibility
+- match qpdf Windows negative seek text (flpdf-6ik2q.15)
+- parse startxref with signed qpdf offsets
+- match qpdf classic xref integer conversion
+- retain warnings from failed classic xref parses
+- match qpdf header search input semantics
+- parse reconstructed trailers from live source
+- stream xref reconstruction header tokens
+- remove qpdf-less public stream construction
+- match qpdf unparse error contract
+- match qpdf direct traversal depth behavior
+- match qpdf object replacement ownership boundary
+- store real values as qpdf source text
+- *(job)* preserve linearized stream retry behavior
+- *(linearize)* filter page dictionaries by raw identity
+- *(linearization)* match qpdf shared hint integers
+- *(linearization)* preserve raw page identity in hint checks
+- preserve raw page handles when flattening annotations
+- *(acroform)* resolve appearance matrix components
+- *(job)* match qpdf repeated page annotation copy
+- *(reader)* match qpdf ObjStm header error offset
+- preserve raw page identity on removal
+- keep raw page handles in overlay route
+- preserve raw page identity in extraction
+
+### Other
+
+- Merge pull request #2469 from fulgur-rs/codex/flpdf-6ik2q-25-attachment-reserve
+- Match qpdf's reserved DCT marker diagnostic
+- Decode qpdf-compatible two-component JPEG streams
+- Match qpdf 11.9 TIFF predictor geometry wrap
+- classify linearization test modules
+- clarify linearization test API routes
+- Merge pull request #2458 from fulgur-rs/codex/flpdf-6ik2q-15-startxref-signed-offset
+- make qpdf seek error probes portable
+- document unreachable xref header branch
+- document unreachable xref conversion branches
+- fix xref overflow regression lint
+- cover classic xref integer overflow parity
+- simplify classic xref error propagation
+- Merge pull request #2453 from fulgur-rs/codex/flpdf-6ik2q-11-startxref-candidate
+- make startxref candidate regression independent of qpdf availability
+- Merge commit 'bd8bc3dc318601f1224d5052c905d7f49bc7dc05' into codex/flpdf-6ik2q-11-startxref-candidate
+- cover trailer source test guards
+- cover live trailer recovery failure paths
+- cover xref recovery reader eof paths
+- clarify valid Form fixture setup
+- cover qpdf stream mutation call paths
+- cover nonredundant page label deltas
+- Merge pull request #2442 from fulgur-rs/codex/flpdf-6ik2q-5-direct-graph
+- *(api)* [**breaking**] remove outline source_ref projection
+- Merge pull request #2443 from fulgur-rs/codex/flpdf-3yn9-48-180-9-empty-run
+- *(writer)* resolve encryption dictionary handles
+- cover real conversion boundaries and refresh correspondence
+- Merge pull request #2433 from fulgur-rs/codex/flpdf-6ik2q-2-remove-key
+- *(cli)* run attachment output in one job
+- Merge pull request #2432 from fulgur-rs/codex/flpdf-3yn9-48-180-5-no-pages-run
+- Merge pull request #2431 from fulgur-rs/codex/flpdf-6ik2q-4-value-metadata
+- *(copy)* normalize source route line endings
+- *(copy)* cover stale generation reservation
+- *(object-copy)* use resolving accessors
+- *(job)* satisfy qpdf module classification policy
+- *(job)* exercise content filter error pipeline
+- *(job)* cover normalization error boundaries
+- *(job)* cover normalization paths in the Job
+- *(job)* cover linearized normalization lifecycle
+- *(cli)* refresh single-job page route contracts
+- *(job)* cover unified rewrite coalesce route
+- *(cli)* run rewrite page extraction in one job
+- *(job)* own linearized content normalization
+- Merge pull request #2428 from fulgur-rs/codex/flpdf-ihyup-27-linearized-objstm-raw-page
+- *(linearization)* simplify hint fixture helper
+- *(linearization)* cover shared hint overflow boundary
+- Merge pull request #2403 from fulgur-rs/codex/flpdf-ihyup-stream-provider-raw-callback
+- Preserve raw QpdfObjGen stream provider identity
+- *(page)* keep raw handles through annotation flattening
+- Merge pull request #2398 from fulgur-rs/fix/flpdf-ihyup-21-split-page-raw-handles
+- *(acroform)* use resolving object accessors
+- *(acroform)* cover indirect appearance matrix values
+- *(signatures)* use resolving accessors
+- *(cli)* route encryption status through QPDFJob
+- Merge pull request #2391 from fulgur-rs/test/flpdf-2xwgb-measurement-gates
+- verify xref handoff allocation counter
+- *(perf)* measure linearization route ownership costs
+- update ObjStm route symbol after pairing tokens
+- page helpers insert pages by raw handles
+- cover overlay raw-handle error paths
+- fix private page_refs rustdoc link
+- retire public page_refs projection
+- cover pipeline error branches
+- Exclude workspace route tests from crate package
+- Add README release setup link
+- *(fuzz)* cover incremental xref chains
+
 ## [0.10.0](https://github.com/fulgur-rs/flpdf/compare/v0.9.0...v0.10.0) - 2026-09-27
 
 ### Added
