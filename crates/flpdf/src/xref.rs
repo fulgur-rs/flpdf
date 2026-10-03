@@ -37,7 +37,8 @@
 //! order warnings are reported in, or the bytes written.
 use crate::object_handle::ObjectValue;
 use crate::parser::{
-    parse_qpdf_file_object_handle_with_diagnostics, HandleResolver, ParserDiagnostic,
+    parse_live_file_object, parse_qpdf_file_object_handle_with_diagnostics, HandleResolver,
+    LiveInput, LiveTokenSource, ParserDiagnostic,
 };
 use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::qutil::{qpdf_string_to_int_checked, QpdfIntParse};
@@ -101,6 +102,13 @@ pub(crate) trait CanonicalTrailerOwner {
     fn source_tell(&self) -> Result<u64>;
     fn source_length(&self) -> Result<u64>;
     fn source_read(&self, buffer: &mut [u8]) -> Result<usize>;
+    /// qpdf's `m->file` as consumed by `QPDFParser` and the trailing
+    /// `readToken` in `QPDF::readTrailer` (`QPDF.cc:1313-1328`).
+    ///
+    /// The default is a direct adapter for test and alternate owners. The
+    /// document resolver overrides it with its buffered, re-entrant source
+    /// view so nested owner operations cannot replay prefetched bytes.
+    fn source_live_input(&self) -> Box<dyn LiveInput + '_>;
     /// Enter the document's parse guard, mirroring qpdf's `QPDF::readTrailer`
     /// constructing its parser with `this` as the context
     /// (`libqpdf/QPDF.cc:1317`), which is what arms `QPDF::ParseGuard`.
@@ -170,6 +178,10 @@ impl<R: Read + Seek + 'static> CanonicalTrailerOwner for ResolverHandle<R> {
 
     fn source_read(&self, buffer: &mut [u8]) -> Result<usize> {
         self.read(buffer)
+    }
+
+    fn source_live_input(&self) -> Box<dyn LiveInput + '_> {
+        ResolverHandle::source_live_input(self)
     }
 
     fn begin_parse(&self) -> crate::Result<()> {
@@ -2712,30 +2724,19 @@ fn recover_xref_entries_from_source(
         };
         if capture_trailer && trailer.is_none() && first_token.is_word_value(b"trailer") {
             let trailer_start = line_start.saturating_add(first_token.end as u64);
-            let remaining = source_length.saturating_sub(trailer_start);
-            let window_length = usize::try_from(remaining.min(64 * 1024)).unwrap_or(64 * 1024);
-            let window = read_live_source_range(owner, trailer_start, window_length)?;
-            let result = {
+            let (candidate, diagnostics) = {
                 let mut resolver = CanonicalTrailerParser::new(owner, filename);
-                read_trailer(
-                    &window,
-                    trailer_start as usize,
-                    trailer_start as usize,
-                    filename,
-                    &mut resolver,
-                )
+                read_trailer_from_live_source(owner, trailer_start, filename, &mut resolver)?
             };
-            if let Ok((candidate, diagnostics)) = result {
-                // qpdf's reconstruct_xref emits parser warnings even when
-                // readTrailer returns a non-dictionary candidate
-                // (`QPDF.cc:565-568`). The candidate is discarded, but the
-                // warning side effects remain on the document.
-                trailer_diagnostics.extend(diagnostics);
-                if candidate.try_is_dictionary().unwrap_or(false) {
-                    owner.set_trailer_if_uninitialized(candidate.clone());
-                    trailer = Some(candidate);
-                }
-            } // cov:ignore: LLVM maps the successful trailer-candidate edge to the inner dictionary branch
+            // qpdf's reconstruct_xref emits parser warnings even when
+            // readTrailer returns a non-dictionary candidate
+            // (`QPDF.cc:565-568`). The candidate is discarded, but the
+            // warning side effects remain on the document.
+            trailer_diagnostics.extend(diagnostics);
+            if candidate.try_is_dictionary().unwrap_or(false) {
+                owner.set_trailer_if_uninitialized(candidate.clone());
+                trailer = Some(candidate);
+            }
             owner.source_seek(next_line_start)?;
         } else {
             if first_token.is_integer() {
@@ -3333,6 +3334,84 @@ fn read_trailer(
             ));
         }
     }
+    Ok((trailer, diagnostics))
+}
+
+/// Read a trailer from qpdf's live document source, the same `m->file` that
+/// `QPDF::readTrailer` passes to `QPDFParser` (`QPDF.cc:1313-1328`). Unlike the
+/// window-backed classic route, reconstruction must not manufacture EOF at a
+/// fixed byte limit inside a valid trailer object.
+fn read_trailer_from_live_source(
+    owner: &dyn CanonicalTrailerOwner,
+    start: u64,
+    filename: &[u8],
+    resolver: &mut dyn HandleResolver,
+) -> Result<(ObjectHandle, Vec<QpdfExc>)> {
+    let mut input = owner.source_live_input();
+    input.seek(start)?;
+    let parsed = match parse_live_file_object(&mut input, resolver) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            input.finish()?;
+            return Err(error);
+        }
+    };
+    let trailer = parsed.value;
+    let start_offset = i64::try_from(start).unwrap_or(i64::MAX);
+    trailer.set_shared_description(trailer_description_template(filename), start_offset);
+
+    // The live parser reports absolute source offsets, so its diagnostic base
+    // is zero. It retains the tokenizer's raw invalid-byte detail itself; the
+    // optional slice used by `trailer_diagnostics` is only needed by the
+    // window-backed wrapper when it reconstructs a lossy hex-string byte.
+    let mut diagnostics = trailer_diagnostics(0, parsed.diagnostics, filename, None);
+    if let Some(empty_offset) = parsed.empty {
+        diagnostics.push(trailer_warning(
+            filename,
+            "empty object treated as null",
+            Some(empty_offset),
+        ));
+    } else {
+        let is_dictionary = match trailer.try_is_dictionary() {
+            Ok(is_dictionary) => is_dictionary,
+            Err(error) => {
+                input.finish()?;
+                return Err(error);
+            }
+        };
+        if is_dictionary {
+            let token = {
+                let mut tokenizer = LiveTokenSource::new(&mut input);
+                tokenizer.next_token()
+            };
+            let token = match token {
+                Ok(token) => token,
+                Err(error) => {
+                    input.finish()?;
+                    return Err(error);
+                }
+            };
+            let after_token = match input.tell() {
+                Ok(offset) => offset,
+                Err(error) => {
+                    input.finish()?;
+                    return Err(error);
+                }
+            };
+            if token.is_word_value(b"stream") {
+                diagnostics.push(trailer_warning(
+                    filename,
+                    "stream keyword found in trailer",
+                    Some(after_token),
+                ));
+            }
+        }
+    }
+
+    input.finish()?;
+    // qpdf overrides the last-token offset with the start captured at
+    // `readTrailer` entry (`QPDF.cc:1323-1328`).
+    owner.set_source_last_offset(start);
     Ok((trailer, diagnostics))
 }
 
@@ -6243,6 +6322,11 @@ mod final_handle_tests {
 
         fn direct_handle(&self, value: ObjectValue) -> ObjectHandle {
             ObjectHandle::from_value(value)
+        }
+
+        fn source_live_input(&self) -> Box<dyn LiveInput + '_> {
+            // cov:ignore: failure-injection owner does not parse trailer objects
+            Box::new(crate::parser::SliceLiveInput::new(b""))
         }
 
         // cov:ignore-start: failure-injection owner has no canonical xref state; these test-only trait stubs have no production behavior

@@ -964,6 +964,256 @@ fn reconstruction_header_lookahead_skips_unbounded_separator_whitespace() {
     assert_eq!(rendered, qpdf_rows);
 }
 
+/// qpdf's `QPDF::readTrailer` parses the trailer from the live source with no
+/// 64 KiB window (`QPDF.cc:565-570,1312-1328`).
+fn recovery_trailer_with_large_padding() -> (Vec<u8>, usize, usize) {
+    const PADDING_LENGTH: usize = 66_000;
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let catalog_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+    bytes.extend_from_slice(b"trailer\n<< /Size 3 /Root 1 0 R /Padding (");
+    bytes.extend(std::iter::repeat_n(b'x', PADDING_LENGTH));
+    bytes.extend_from_slice(b") >>\nstream\nstartxref\n0\n%%EOF\n");
+    (bytes, catalog_offset, pages_offset)
+}
+
+#[test]
+fn reconstruction_trailer_parser_reads_beyond_the_64k_window() {
+    let (fixture, catalog_offset, pages_offset) = recovery_trailer_with_large_padding();
+    let directory = tempfile::tempdir().expect("create qpdf fixture directory");
+    let input = directory.path().join("large-recovery-trailer.pdf");
+    fs::write(&input, &fixture).expect("write qpdf fixture");
+    let description = input.to_string_lossy().into_owned();
+    let stream_offset = fixture
+        .windows(b"stream".len())
+        .position(|window| window == b"stream")
+        .expect("fixture has the post-trailer stream token")
+        + b"stream".len();
+    let expected_warnings = vec![
+        format!("{description}: file is damaged"),
+        format!("{description}: can't find startxref"),
+        format!("{description}: Attempting to reconstruct cross-reference table"),
+        format!("{description} (trailer, offset {stream_offset}): stream keyword found in trailer"),
+    ];
+
+    let oracle_rows = if qpdf_available() {
+        let qpdf = Command::new("qpdf")
+            .arg("--show-xref")
+            .arg(&input)
+            .output()
+            .expect("qpdf should spawn");
+        assert_eq!(
+            qpdf.status.code(),
+            Some(3),
+            "qpdf accepts the long trailer and reports recovery warnings"
+        );
+        let qpdf_warnings: Vec<String> = String::from_utf8_lossy(&qpdf.stderr)
+            .lines()
+            .filter_map(|line| line.strip_prefix("WARNING: "))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(qpdf_warnings, expected_warnings);
+        Some(
+            String::from_utf8_lossy(&qpdf.stdout)
+                .lines()
+                .filter(|line| line.contains(": uncompressed;") || line.contains(": compressed;"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        eprintln!("qpdf 11.9.0 is not available; skipping only the oracle comparison");
+        None
+    };
+
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(fixture),
+        PdfOpenOptions {
+            repair: true,
+            suppress_warnings: true,
+            description: description.as_bytes().to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("canonical reconstruction must parse trailer strings beyond 64 KiB");
+
+    assert_eq!(pdf.root_ref(), Some(ObjectRef::new(1, 0)));
+    pdf.root_handle()
+        .expect("recovered /Root must resolve to the Catalog dictionary");
+    let rendered = render_xref_table(&pdf.get_xref_table());
+    assert_eq!(
+        rendered,
+        vec![
+            format!("1/0: uncompressed; offset = {catalog_offset}"),
+            format!("2/0: uncompressed; offset = {pages_offset}"),
+        ],
+        "the long trailer must not prevent reconstructed object rows"
+    );
+    assert_eq!(
+        pdf.repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|warning| String::from_utf8_lossy(warning.what_bytes()).into_owned())
+            .collect::<Vec<_>>(),
+        expected_warnings
+    );
+    if let Some(oracle_rows) = oracle_rows {
+        assert_eq!(rendered, oracle_rows);
+    }
+}
+
+#[test]
+fn reconstruction_live_trailer_parser_preserves_token_warning_offsets() {
+    let fixture = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\ntrailer\n<< /Size 3 /Root 1 0 R /Invalid <g> >>\nstartxref\n0\n%%EOF\n".to_vec();
+    let directory = tempfile::tempdir().expect("create qpdf fixture directory");
+    let input = directory.path().join("invalid-trailer-hex.pdf");
+    fs::write(&input, &fixture).expect("write qpdf fixture");
+    let description = input.to_string_lossy().into_owned();
+    let expected_warnings = vec![
+        format!("{description}: file is damaged"),
+        format!("{description}: can't find startxref"),
+        format!("{description}: Attempting to reconstruct cross-reference table"),
+        format!("{description} (trailer, offset 150): invalid character (g) in hexstring"),
+        format!("{description} (trailer, offset 152): unexpected >"),
+        format!("{description} (trailer, offset 120): expected dictionary key but found non-name object; inserting key /QPDFFake1"),
+    ];
+
+    let qpdf_rows = if qpdf_available() {
+        let qpdf = Command::new("qpdf")
+            .arg("--show-xref")
+            .arg(&input)
+            .output()
+            .expect("qpdf should spawn");
+        assert_eq!(qpdf.status.code(), Some(3));
+        let qpdf_warnings: Vec<String> = String::from_utf8_lossy(&qpdf.stderr)
+            .lines()
+            .filter_map(|line| line.strip_prefix("WARNING: "))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(qpdf_warnings, expected_warnings);
+        Some(
+            String::from_utf8_lossy(&qpdf.stdout)
+                .lines()
+                .filter(|line| line.contains(": uncompressed;") || line.contains(": compressed;"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        eprintln!("qpdf 11.9.0 is not available; skipping only the oracle comparison");
+        None
+    };
+
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(fixture),
+        PdfOpenOptions {
+            repair: true,
+            suppress_warnings: true,
+            description: description.as_bytes().to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("canonical recovery must keep parser warnings from a trailer candidate");
+    assert_eq!(pdf.root_ref(), Some(ObjectRef::new(1, 0)));
+    pdf.root_handle()
+        .expect("recovered /Root must resolve to the Catalog dictionary");
+    let flpdf_warnings: Vec<String> = pdf
+        .repair_diagnostics()
+        .entries()
+        .iter()
+        .map(|warning| String::from_utf8_lossy(warning.what_bytes()).into_owned())
+        .collect();
+    assert_eq!(flpdf_warnings, expected_warnings);
+
+    let rendered = render_xref_table(&pdf.get_xref_table());
+    assert_eq!(
+        rendered,
+        vec![
+            "1/0: uncompressed; offset = 9".to_owned(),
+            "2/0: uncompressed; offset = 58".to_owned(),
+        ]
+    );
+    if let Some(qpdf_rows) = qpdf_rows {
+        assert_eq!(rendered, qpdf_rows);
+    }
+}
+
+#[test]
+fn reconstruction_live_trailer_parser_skips_non_dictionary_candidates() {
+    let mut fixture = b"%PDF-1.4\n".to_vec();
+    let catalog_offset = fixture.len();
+    fixture.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_offset = fixture.len();
+    fixture.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+    fixture.extend_from_slice(
+        b"trailer\n42\ntrailer\nendobj\ntrailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n",
+    );
+    let directory = tempfile::tempdir().expect("create qpdf fixture directory");
+    let input = directory
+        .path()
+        .join("non-dictionary-trailer-candidates.pdf");
+    fs::write(&input, &fixture).expect("write qpdf fixture");
+    let description = input.to_string_lossy().into_owned();
+
+    let oracle = if qpdf_available() {
+        let qpdf = Command::new("qpdf")
+            .arg("--show-xref")
+            .arg(&input)
+            .output()
+            .expect("qpdf should spawn");
+        assert_eq!(qpdf.status.code(), Some(3));
+        let warnings: Vec<String> = String::from_utf8_lossy(&qpdf.stderr)
+            .lines()
+            .filter_map(|line| line.strip_prefix("WARNING: "))
+            .map(str::to_owned)
+            .collect();
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("empty object treated as null")));
+        let rows: Vec<String> = String::from_utf8_lossy(&qpdf.stdout)
+            .lines()
+            .filter(|line| line.contains(": uncompressed;") || line.contains(": compressed;"))
+            .map(str::to_owned)
+            .collect();
+        Some((warnings, rows))
+    } else {
+        eprintln!("qpdf 11.9.0 is not available; skipping only the oracle comparison");
+        None
+    };
+
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(fixture),
+        PdfOpenOptions {
+            repair: true,
+            suppress_warnings: true,
+            description: description.as_bytes().to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("recovery must continue past non-dictionary trailer candidates");
+    assert_eq!(pdf.root_ref(), Some(ObjectRef::new(1, 0)));
+    pdf.root_handle()
+        .expect("the last dictionary trailer candidate must provide /Root");
+    let warnings: Vec<String> = pdf
+        .repair_diagnostics()
+        .entries()
+        .iter()
+        .map(|warning| String::from_utf8_lossy(warning.what_bytes()).into_owned())
+        .collect();
+    let rendered = render_xref_table(&pdf.get_xref_table());
+    assert_eq!(
+        rendered,
+        vec![
+            format!("1/0: uncompressed; offset = {catalog_offset}"),
+            format!("2/0: uncompressed; offset = {pages_offset}"),
+        ]
+    );
+    if let Some((oracle_warnings, oracle_rows)) = oracle {
+        assert_eq!(warnings, oracle_warnings);
+        assert_eq!(rendered, oracle_rows);
+    }
+}
+
 /// Build a single-page document whose cross-reference section is a classic
 /// table, inserting `between` after the last subsection entry and writing
 /// `startxref_value` (default: the table offset) after the `startxref`

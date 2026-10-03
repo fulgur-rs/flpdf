@@ -102,7 +102,39 @@ pub(crate) trait LiveInput {
     fn seek(&mut self, offset: u64) -> Result<()>;
     fn read_byte(&mut self) -> Result<Option<u8>>;
     fn unread_byte(&mut self) -> Result<()>;
+    /// Settle any adapter-owned read-ahead before another owner operation
+    /// observes the shared input source. Source adapters without read-ahead
+    /// need no action.
+    fn finish(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn set_last_offset(&mut self, _offset: u64) {}
+}
+
+impl<I: LiveInput + ?Sized> LiveInput for Box<I> {
+    fn tell(&mut self) -> Result<u64> {
+        (**self).tell()
+    }
+
+    fn seek(&mut self, offset: u64) -> Result<()> {
+        (**self).seek(offset)
+    }
+
+    fn read_byte(&mut self) -> Result<Option<u8>> {
+        (**self).read_byte()
+    }
+
+    fn unread_byte(&mut self) -> Result<()> {
+        (**self).unread_byte()
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        (**self).finish()
+    }
+
+    fn set_last_offset(&mut self, offset: u64) {
+        (**self).set_last_offset(offset);
+    }
 }
 
 /// A decoded object-stream member is still consumed by qpdf's same

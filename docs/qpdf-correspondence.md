@@ -256,17 +256,18 @@ the same `readTrailer` (`QPDF.cc:894` and `QPDF.cc:565`), so parser warnings,
 empty-object handling, and the post-dictionary `stream` lookahead have one
 owner (`QPDF.cc:1312-1328`).
 
-`flpdf-3yn9.48.18` routes both classic owner variants and reconstruction
-candidate discovery through `crates/flpdf/src/xref.rs::read_trailer`. It uses
-the existing handle-producing parser so indirect trailer children retain the
-caller-provided document identity, converts parser diagnostics to
-`QpdfExc { object: "trailer" }`, appends qpdf's empty-object warning, and uses
-`Tokenizer::read_token(true, 0)` only for the dictionary-followed-by-`stream`
-lookahead. The classic fixed-width xref reader remains on its own
-`ByteCursor`/`readLine`-equivalent route. The `/Prev` merge helper seeds its
-local visitor with the already-read nonzero `LoadedXref.startxref`, so a
-self-referential initial `/Prev` is rejected before the section is parsed a
-second time.
+`flpdf-3yn9.48.18` routes classic trailer parsing through
+`crates/flpdf/src/xref.rs::read_trailer`. Reconstruction now uses
+`read_trailer_from_live_source`, which passes the canonical owner's live source
+to the same `LiveInput`/`QPDFParser` implementation. This preserves indirect
+trailer children in the document's object cache without limiting the trailer
+to a 64 KiB snapshot. Both routes convert parser diagnostics to
+`QpdfExc { object: "trailer" }`, append qpdf's empty-object warning, and perform
+the dictionary-followed-by-`stream` lookahead. The classic fixed-width xref
+reader remains on its own `ByteCursor`/`readLine`-equivalent route. The `/Prev`
+merge helper seeds its local visitor with the already-read nonzero
+`LoadedXref.startxref`, so a self-referential initial `/Prev` is rejected
+before the section is parsed a second time.
 
 Live qpdf 11.9.0 probes and the xref regression tests record the observable
 contract: a dictionary followed by `stream` reports
@@ -274,6 +275,12 @@ contract: a dictionary followed by `stream` reports
 candidate reports `(trailer, offset 53): empty object treated as null`; and a
 self-`/Prev` section retains one three-warning recovery sequence. The warning
 detail, object attribution, offset, and order match the Rust route.
+
+2026-10-03 (`flpdf-6ik2q.10`): a reconstructed trailer with a 66,000-byte
+`/Padding` string now parses to the same `/Root`, xref rows, warning sequence,
+and exit status as qpdf 11.9.0. The same live-source regression also checks
+`readTrailer`'s post-dictionary `stream` warning; a malformed hex-string
+candidate checks trailer parser warning bytes and offsets.
 
 ### Canonical trailer nested value descriptions (`flpdf-7yb9k`, 2026-09-17)
 
