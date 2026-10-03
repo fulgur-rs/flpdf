@@ -1,0 +1,898 @@
+//! Image file I/O helpers for BMP and PPM formats.
+//!
+//! Provides `load_image` / `save_bmp` / `save_ppm` matching libjpeg-turbo's
+//! `tj3LoadImage8()` / `tj3SaveImage8()` functionality.
+
+// libjpeg-turbo-rs: alloc prelude (no_std support, issue #356)
+use crate::common::error::{JpegError, Result};
+use crate::common::types::PixelFormat;
+#[allow(unused_imports)]
+use alloc::{format, vec};
+#[allow(unused_imports)]
+use alloc::{string::String, vec::Vec};
+#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+use std::fs;
+#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+use std::io::{BufWriter, Write};
+#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+use std::path::Path;
+
+/// Loaded image data with metadata.
+#[derive(Debug, Clone)]
+pub struct LoadedImage {
+    /// Raw pixel data in the format indicated by `pixel_format`.
+    pub pixels: Vec<u8>,
+    /// Image width in pixels.
+    pub width: usize,
+    /// Image height in pixels.
+    pub height: usize,
+    /// Pixel format of the loaded data.
+    pub pixel_format: PixelFormat,
+}
+
+/// Load an image from a BMP or PPM/PGM file.
+/// Format is auto-detected from file header magic bytes.
+#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+pub fn load_image<P: AsRef<Path>>(path: P) -> Result<LoadedImage> {
+    let data: Vec<u8> = fs::read(path.as_ref())?;
+    load_image_from_bytes(&data)
+}
+
+/// PNG file signature (first 8 bytes).
+const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+/// Return true when `data` begins with the PNG 8-byte signature.
+fn is_png(data: &[u8]) -> bool {
+    data.len() >= 8 && data[..8] == PNG_SIGNATURE
+}
+
+/// Load image from raw file bytes (auto-detect format from header).
+pub fn load_image_from_bytes(data: &[u8]) -> Result<LoadedImage> {
+    if data.len() < 2 {
+        return Err(JpegError::CorruptData(
+            "file too small to detect format".into(),
+        ));
+    }
+
+    if data[0] == b'B' && data[1] == b'M' {
+        load_bmp_from_bytes(data)
+    } else if data[0] == b'P' && (data[1] == b'5' || data[1] == b'6') {
+        load_ppm_from_bytes(data)
+    } else if is_png(data) {
+        #[cfg(feature = "png")]
+        {
+            load_png_from_bytes(data)
+        }
+        #[cfg(not(feature = "png"))]
+        {
+            Err(JpegError::Unsupported(
+                "PNG support not enabled in this build (rebuild with --features png)".into(),
+            ))
+        }
+    } else {
+        Err(JpegError::Unsupported(
+            "unsupported image format (expected BMP or PPM/PGM)".into(),
+        ))
+    }
+}
+
+/// Save pixel data as a BMP file.
+///
+/// Supports `Rgb`, `Bgr`, `Rgba`, `Bgra`, and `Grayscale` pixel formats.
+/// - 24-bit BMP is written for Rgb/Bgr/Grayscale inputs.
+/// - 32-bit BMP is written for Rgba/Bgra inputs.
+#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+pub fn save_bmp<P: AsRef<Path>>(
+    path: P,
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    pixel_format: PixelFormat,
+) -> Result<()> {
+    validate_pixel_buffer(pixels, width, height, pixel_format)?;
+
+    let file = fs::File::create(path.as_ref())?;
+    let mut writer = BufWriter::new(file);
+
+    let is_32bit: bool = matches!(pixel_format, PixelFormat::Rgba | PixelFormat::Bgra);
+    let bits_per_pixel: u32 = if is_32bit { 32 } else { 24 };
+    let bmp_bpp: usize = (bits_per_pixel / 8) as usize;
+    let row_size_unpadded: usize = width * bmp_bpp;
+    let row_stride: usize = (row_size_unpadded + 3) & !3; // pad to 4-byte boundary
+    let padding: usize = row_stride - row_size_unpadded;
+    let pixel_data_size: u32 = (row_stride * height) as u32;
+    let file_size: u32 = 14 + 40 + pixel_data_size;
+
+    // BMP file header (14 bytes)
+    writer.write_all(b"BM")?;
+    writer.write_all(&file_size.to_le_bytes())?;
+    writer.write_all(&[0u8; 4])?; // reserved
+    writer.write_all(&(14u32 + 40).to_le_bytes())?; // pixel data offset
+
+    // DIB header — BITMAPINFOHEADER (40 bytes)
+    writer.write_all(&40u32.to_le_bytes())?; // header size
+    writer.write_all(&(width as i32).to_le_bytes())?;
+    writer.write_all(&(height as i32).to_le_bytes())?;
+    writer.write_all(&1u16.to_le_bytes())?; // planes
+    writer.write_all(&(bits_per_pixel as u16).to_le_bytes())?;
+    writer.write_all(&0u32.to_le_bytes())?; // compression (BI_RGB)
+    writer.write_all(&pixel_data_size.to_le_bytes())?;
+    writer.write_all(&2835i32.to_le_bytes())?; // x pixels per meter (~72 DPI)
+    writer.write_all(&2835i32.to_le_bytes())?; // y pixels per meter
+    writer.write_all(&0u32.to_le_bytes())?; // colors used
+    writer.write_all(&0u32.to_le_bytes())?; // important colors
+
+    let src_bpp: usize = pixel_format.bytes_per_pixel();
+    let pad_bytes: [u8; 3] = [0u8; 3];
+
+    // BMP rows are stored bottom-up
+    for y in (0..height).rev() {
+        let row_start: usize = y * width * src_bpp;
+        for x in 0..width {
+            let pixel_start: usize = row_start + x * src_bpp;
+            match pixel_format {
+                PixelFormat::Rgb => {
+                    // RGB → BGR for BMP
+                    let r: u8 = pixels[pixel_start];
+                    let g: u8 = pixels[pixel_start + 1];
+                    let b: u8 = pixels[pixel_start + 2];
+                    writer.write_all(&[b, g, r])?;
+                }
+                PixelFormat::Bgr => {
+                    // Already in BGR order
+                    writer.write_all(&pixels[pixel_start..pixel_start + 3])?;
+                }
+                PixelFormat::Rgba => {
+                    // RGBA → BGRA for BMP
+                    let r: u8 = pixels[pixel_start];
+                    let g: u8 = pixels[pixel_start + 1];
+                    let b: u8 = pixels[pixel_start + 2];
+                    let a: u8 = pixels[pixel_start + 3];
+                    writer.write_all(&[b, g, r, a])?;
+                }
+                PixelFormat::Bgra => {
+                    // Already in BGRA order
+                    writer.write_all(&pixels[pixel_start..pixel_start + 4])?;
+                }
+                PixelFormat::Grayscale => {
+                    // Grayscale → BGR with R=G=B=gray
+                    let g: u8 = pixels[pixel_start];
+                    writer.write_all(&[g, g, g])?;
+                }
+                _ => {
+                    return Err(JpegError::Unsupported(format!(
+                        "BMP save does not support pixel format {:?}",
+                        pixel_format
+                    )));
+                }
+            }
+        }
+        if padding > 0 {
+            writer.write_all(&pad_bytes[..padding])?;
+        }
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+/// Save pixel data as a PPM (P6) or PGM (P5) file.
+///
+/// - `Grayscale` → PGM P5 format
+/// - `Rgb` → PPM P6 format
+/// - `Bgr` → PPM P6 format (converted to RGB)
+#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+pub fn save_ppm<P: AsRef<Path>>(
+    path: P,
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    pixel_format: PixelFormat,
+) -> Result<()> {
+    validate_pixel_buffer(pixels, width, height, pixel_format)?;
+
+    let file = fs::File::create(path.as_ref())?;
+    let mut writer = BufWriter::new(file);
+
+    match pixel_format {
+        PixelFormat::Grayscale => {
+            // PGM P5
+            let header: String = format!("P5\n{} {}\n255\n", width, height);
+            writer.write_all(header.as_bytes())?;
+            writer.write_all(pixels)?;
+        }
+        PixelFormat::Rgb => {
+            // PPM P6
+            let header: String = format!("P6\n{} {}\n255\n", width, height);
+            writer.write_all(header.as_bytes())?;
+            writer.write_all(pixels)?;
+        }
+        PixelFormat::Bgr => {
+            // Convert BGR → RGB for PPM P6
+            let header: String = format!("P6\n{} {}\n255\n", width, height);
+            writer.write_all(header.as_bytes())?;
+            for chunk in pixels.chunks(3) {
+                writer.write_all(&[chunk[2], chunk[1], chunk[0]])?;
+            }
+        }
+        _ => {
+            return Err(JpegError::Unsupported(format!(
+                "PPM save does not support pixel format {:?}",
+                pixel_format
+            )));
+        }
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+// ---------- Internal helpers ----------
+
+/// Validate that the pixel buffer has the expected size.
+#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+fn validate_pixel_buffer(
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    pixel_format: PixelFormat,
+) -> Result<()> {
+    let expected: usize = width * height * pixel_format.bytes_per_pixel();
+    if pixels.len() != expected {
+        return Err(JpegError::BufferTooSmall {
+            need: expected,
+            got: pixels.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Load a BMP image from in-memory bytes.
+fn load_bmp_from_bytes(data: &[u8]) -> Result<LoadedImage> {
+    if data.len() < 54 {
+        return Err(JpegError::CorruptData("BMP file too small".into()));
+    }
+
+    // Validate magic
+    if data[0] != b'B' || data[1] != b'M' {
+        return Err(JpegError::CorruptData("invalid BMP magic".into()));
+    }
+
+    let pixel_offset: usize = u32::from_le_bytes([data[10], data[11], data[12], data[13]]) as usize;
+    let dib_size: u32 = u32::from_le_bytes([data[14], data[15], data[16], data[17]]);
+    if dib_size < 40 {
+        return Err(JpegError::Unsupported(format!(
+            "unsupported BMP DIB header size: {}",
+            dib_size
+        )));
+    }
+
+    let width: i32 = i32::from_le_bytes([data[18], data[19], data[20], data[21]]);
+    let height_raw: i32 = i32::from_le_bytes([data[22], data[23], data[24], data[25]]);
+    let bits_per_pixel: u16 = u16::from_le_bytes([data[28], data[29]]);
+    let compression: u32 = u32::from_le_bytes([data[30], data[31], data[32], data[33]]);
+
+    if width <= 0 {
+        return Err(JpegError::CorruptData("BMP width must be positive".into()));
+    }
+    let width: usize = width as usize;
+
+    // Negative height = top-down storage
+    let top_down: bool = height_raw < 0;
+    let height: usize = height_raw.unsigned_abs() as usize;
+    if height == 0 {
+        return Err(JpegError::CorruptData("BMP height must be non-zero".into()));
+    }
+
+    if compression != 0 {
+        return Err(JpegError::Unsupported(format!(
+            "compressed BMP not supported (compression={})",
+            compression
+        )));
+    }
+
+    let bmp_bpp: usize = (bits_per_pixel / 8) as usize;
+    let row_size_unpadded: usize = width * bmp_bpp;
+    let row_stride: usize = (row_size_unpadded + 3) & !3;
+
+    match bits_per_pixel {
+        24 => {
+            // 24-bit BGR → output as RGB
+            let mut pixels: Vec<u8> = Vec::with_capacity(width * height * 3);
+            for y in 0..height {
+                let src_y: usize = if top_down { y } else { height - 1 - y };
+                let row_offset: usize = pixel_offset + src_y * row_stride;
+                if row_offset + row_size_unpadded > data.len() {
+                    return Err(JpegError::UnexpectedEof);
+                }
+                for x in 0..width {
+                    let px: usize = row_offset + x * 3;
+                    let b: u8 = data[px];
+                    let g: u8 = data[px + 1];
+                    let r: u8 = data[px + 2];
+                    pixels.push(r);
+                    pixels.push(g);
+                    pixels.push(b);
+                }
+            }
+            Ok(LoadedImage {
+                pixels,
+                width,
+                height,
+                pixel_format: PixelFormat::Rgb,
+            })
+        }
+        32 => {
+            // 32-bit BGRA → output as RGBA
+            let mut pixels: Vec<u8> = Vec::with_capacity(width * height * 4);
+            for y in 0..height {
+                let src_y: usize = if top_down { y } else { height - 1 - y };
+                let row_offset: usize = pixel_offset + src_y * row_stride;
+                if row_offset + row_size_unpadded > data.len() {
+                    return Err(JpegError::UnexpectedEof);
+                }
+                for x in 0..width {
+                    let px: usize = row_offset + x * 4;
+                    let b: u8 = data[px];
+                    let g: u8 = data[px + 1];
+                    let r: u8 = data[px + 2];
+                    let a: u8 = data[px + 3];
+                    pixels.push(r);
+                    pixels.push(g);
+                    pixels.push(b);
+                    pixels.push(a);
+                }
+            }
+            Ok(LoadedImage {
+                pixels,
+                width,
+                height,
+                pixel_format: PixelFormat::Rgba,
+            })
+        }
+        _ => Err(JpegError::Unsupported(format!(
+            "unsupported BMP bit depth: {}",
+            bits_per_pixel
+        ))),
+    }
+}
+
+/// Load a PPM (P6) or PGM (P5) image from in-memory bytes.
+fn load_ppm_from_bytes(data: &[u8]) -> Result<LoadedImage> {
+    if data.len() < 3 {
+        return Err(JpegError::CorruptData("PPM/PGM file too small".into()));
+    }
+
+    let magic: &[u8] = &data[0..2];
+    let is_grayscale: bool = magic == b"P5";
+    let is_rgb: bool = magic == b"P6";
+
+    if !is_grayscale && !is_rgb {
+        return Err(JpegError::Unsupported(format!(
+            "unsupported PPM magic: {:?}",
+            core::str::from_utf8(magic).unwrap_or("??")
+        )));
+    }
+
+    // Parse header: "P[56]\n{width} {height}\n{maxval}\n"
+    let header_str: &str = core::str::from_utf8(data)
+        .map_err(|_| JpegError::CorruptData("PPM header is not valid UTF-8".into()))
+        .or_else(|_| {
+            // The pixel data may not be valid UTF-8; parse only enough of the header.
+            // Find the header end by looking for the third newline.
+            let mut newline_count: usize = 0;
+            let mut header_end: usize = 0;
+            for (i, &byte) in data.iter().enumerate() {
+                if byte == b'\n' {
+                    newline_count += 1;
+                    if newline_count == 3 {
+                        header_end = i + 1;
+                        break;
+                    }
+                }
+            }
+            if header_end == 0 {
+                return Err(JpegError::CorruptData("cannot parse PPM header".into()));
+            }
+            core::str::from_utf8(&data[..header_end])
+                .map_err(|_| JpegError::CorruptData("PPM header is not valid UTF-8".into()))
+        })?;
+
+    // Parse width, height, maxval from the header
+    let (width, height, maxval, header_len) = parse_ppm_header(header_str)?;
+
+    if maxval != 255 {
+        return Err(JpegError::Unsupported(format!(
+            "PPM maxval {} not supported (only 255)",
+            maxval
+        )));
+    }
+
+    let bpp: usize = if is_grayscale { 1 } else { 3 };
+    let expected_data_len: usize = width * height * bpp;
+    let pixel_data: &[u8] = &data[header_len..];
+
+    if pixel_data.len() < expected_data_len {
+        return Err(JpegError::UnexpectedEof);
+    }
+
+    let pixels: Vec<u8> = pixel_data[..expected_data_len].to_vec();
+
+    let pixel_format: PixelFormat = if is_grayscale {
+        PixelFormat::Grayscale
+    } else {
+        PixelFormat::Rgb
+    };
+
+    Ok(LoadedImage {
+        pixels,
+        width,
+        height,
+        pixel_format,
+    })
+}
+
+/// Parse PPM/PGM header and return (width, height, maxval, header_byte_length).
+fn parse_ppm_header(header: &str) -> Result<(usize, usize, usize, usize)> {
+    // Tokenize: skip comments (lines starting with #) and split on whitespace
+    let mut tokens: Vec<&str> = Vec::new();
+    let mut token_byte_ends: Vec<usize> = Vec::new();
+
+    let bytes: &[u8] = header.as_bytes();
+    let len: usize = bytes.len();
+    let mut i: usize = 0;
+
+    // Skip magic ("P5" or "P6")
+    while i < len && bytes[i] != b'\n' && bytes[i] != b' ' && bytes[i] != b'\t' {
+        i += 1;
+    }
+    // Skip whitespace/newline after magic
+    while i < len
+        && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n' || bytes[i] == b'\r')
+    {
+        i += 1;
+    }
+
+    // Parse remaining tokens: width, height, maxval
+    while tokens.len() < 3 && i < len {
+        // Skip comments
+        if bytes[i] == b'#' {
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            if i < len {
+                i += 1; // skip newline
+            }
+            continue;
+        }
+
+        // Skip whitespace
+        if bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n' || bytes[i] == b'\r' {
+            i += 1;
+            continue;
+        }
+
+        // Read token
+        let start: usize = i;
+        while i < len
+            && bytes[i] != b' '
+            && bytes[i] != b'\t'
+            && bytes[i] != b'\n'
+            && bytes[i] != b'\r'
+        {
+            i += 1;
+        }
+        let token: &str = &header[start..i];
+        tokens.push(token);
+        token_byte_ends.push(i);
+    }
+
+    if tokens.len() < 3 {
+        return Err(JpegError::CorruptData(
+            "PPM header incomplete: need width, height, maxval".into(),
+        ));
+    }
+
+    let width: usize = tokens[0]
+        .parse()
+        .map_err(|_| JpegError::CorruptData(format!("invalid PPM width: {}", tokens[0])))?;
+    let height: usize = tokens[1]
+        .parse()
+        .map_err(|_| JpegError::CorruptData(format!("invalid PPM height: {}", tokens[1])))?;
+    let maxval: usize = tokens[2]
+        .parse()
+        .map_err(|_| JpegError::CorruptData(format!("invalid PPM maxval: {}", tokens[2])))?;
+
+    // The pixel data starts after the single whitespace character following maxval
+    let header_end: usize = token_byte_ends[2];
+    // Skip exactly one whitespace character after maxval (per PPM spec)
+    let data_start: usize = if header_end < len {
+        header_end + 1
+    } else {
+        header_end
+    };
+
+    Ok((width, height, maxval, data_start))
+}
+
+// =========================================================================
+// 12/16-bit PPM I/O (tj3LoadImage12/16, tj3SaveImage12/16)
+// =========================================================================
+
+/// Loaded 12-bit image data (J12SAMPLE, samples in 0..4095).
+///
+/// Mirrors libjpeg-turbo's `tj3LoadImage12()` return shape: `i16` samples
+/// in the inclusive range `0..=4095`, interpreted as PGM (1 component) or
+/// PPM (3 components).
+#[derive(Debug, Clone)]
+pub struct LoadedImage12 {
+    /// Pixel samples as 12-bit values (0..=4095).
+    pub pixels: Vec<i16>,
+    /// Image width in pixels.
+    pub width: usize,
+    /// Image height in pixels.
+    pub height: usize,
+    /// Number of components (1 for grayscale, 3 for RGB).
+    pub num_components: usize,
+    /// Maximum sample value from the PPM header (always <= 4095).
+    pub maxval: u16,
+}
+
+/// Load a 12-bit PPM/PGM file (maxval in `256..=4095`).
+///
+/// Mirrors libjpeg-turbo's `tj3LoadImage12()`. PPM samples above 255 are
+/// stored as 2-byte big-endian per the PPM spec (network byte order).
+/// Samples are validated to be `<= maxval` and returned as `i16` in
+/// `0..=4095` (no rescaling — PPM maxval is just an upper bound).
+#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+pub fn load_ppm_12bit<P: AsRef<Path>>(path: P) -> Result<LoadedImage12> {
+    let data: Vec<u8> = fs::read(path.as_ref())?;
+    load_ppm_12bit_from_bytes(&data)
+}
+
+/// Load a 12-bit PPM/PGM from raw bytes (shared core for `load_ppm_12bit`).
+pub fn load_ppm_12bit_from_bytes(data: &[u8]) -> Result<LoadedImage12> {
+    let (width, height, maxval, num_components, samples) = parse_ppm_highbit(data)?;
+    if !(256..=4095).contains(&maxval) {
+        return Err(JpegError::Unsupported(format!(
+            "PPM maxval {maxval} out of 12-bit range (256..=4095)"
+        )));
+    }
+    // Samples are already range-checked by parse_ppm_highbit().
+    let pixels: Vec<i16> = samples.into_iter().map(|s| s as i16).collect();
+    Ok(LoadedImage12 {
+        pixels,
+        width,
+        height,
+        num_components,
+        maxval: maxval as u16,
+    })
+}
+
+/// Save 12-bit pixel data as a PPM (P6) or PGM (P5) file with maxval=4095.
+///
+/// Mirrors libjpeg-turbo's `tj3SaveImage12()`. Writes 2-byte big-endian
+/// samples per the PPM spec. `num_components` must be 1 or 3. Input
+/// samples are clamped to `0..=4095` before writing.
+#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+pub fn save_ppm_12bit<P: AsRef<Path>>(
+    path: P,
+    pixels: &[i16],
+    width: usize,
+    height: usize,
+    num_components: usize,
+) -> Result<()> {
+    if num_components != 1 && num_components != 3 {
+        return Err(JpegError::Unsupported(format!(
+            "PPM 12-bit save supports 1 or 3 components, got {num_components}"
+        )));
+    }
+    let expected: usize = width * height * num_components;
+    if pixels.len() < expected {
+        return Err(JpegError::BufferTooSmall {
+            need: expected,
+            got: pixels.len(),
+        });
+    }
+    // Re-use the 16-bit writer by upcasting; clamp to valid 12-bit range
+    // (negative values -> 0, > 4095 -> 4095). This matches the C
+    // implementation, which zero-extends J12SAMPLE via `(unsigned)v`.
+    let mut buf: Vec<u16> = Vec::with_capacity(expected);
+    for &s in &pixels[..expected] {
+        let clamped: i32 = (s as i32).clamp(0, 4095);
+        buf.push(clamped as u16);
+    }
+    save_ppm_16bit(path, &buf, width, height, num_components, 4095)
+}
+
+/// Loaded 16-bit image data from a high-bit-depth PPM/PGM.
+#[derive(Debug, Clone)]
+pub struct LoadedImage16 {
+    /// Pixel samples as 16-bit values (0..maxval).
+    pub pixels: Vec<u16>,
+    /// Image width in pixels.
+    pub width: usize,
+    /// Image height in pixels.
+    pub height: usize,
+    /// Number of components (1 for grayscale, 3 for RGB).
+    pub num_components: usize,
+    /// Maximum sample value from the PPM header.
+    pub maxval: u16,
+}
+
+/// Load a high-bit-depth PPM/PGM file (maxval > 255).
+///
+/// Returns 16-bit samples. For PPM, samples are big-endian 2-byte per
+/// component per the PPM spec. Supports maxval 256..65535.
+#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+pub fn load_ppm_16bit<P: AsRef<Path>>(path: P) -> Result<LoadedImage16> {
+    let data: Vec<u8> = fs::read(path.as_ref())?;
+    load_ppm_16bit_from_bytes(&data)
+}
+
+/// Load a high-bit-depth PPM/PGM from raw bytes.
+pub fn load_ppm_16bit_from_bytes(data: &[u8]) -> Result<LoadedImage16> {
+    let (width, height, maxval, num_components, pixels) = parse_ppm_highbit(data)?;
+    if !(256..=65535).contains(&maxval) {
+        return Err(JpegError::Unsupported(format!(
+            "PPM maxval {maxval} out of 16-bit range (256..=65535)"
+        )));
+    }
+    Ok(LoadedImage16 {
+        pixels,
+        width,
+        height,
+        num_components,
+        maxval: maxval as u16,
+    })
+}
+
+/// Shared parser for high-bit-depth PPM/PGM (maxval > 255). Returns
+/// `(width, height, maxval, num_components, samples_u16)`. Validates that
+/// the magic is P5/P6, maxval > 255, the sample buffer is large enough,
+/// and each sample is `<= maxval` (per `rdppm.c::get_word_*` semantics).
+fn parse_ppm_highbit(data: &[u8]) -> Result<(usize, usize, usize, usize, Vec<u16>)> {
+    if data.len() < 3 {
+        return Err(JpegError::CorruptData("PPM/PGM file too small".into()));
+    }
+
+    let magic: &[u8] = &data[0..2];
+    let is_grayscale: bool = magic == b"P5";
+    let is_rgb: bool = magic == b"P6";
+    if !is_grayscale && !is_rgb {
+        return Err(JpegError::Unsupported(format!(
+            "unsupported PPM magic for high-bit load: {:?}",
+            core::str::from_utf8(magic).unwrap_or("??")
+        )));
+    }
+
+    // Find a prefix long enough for the textual header. PPM comment lines
+    // can introduce extra newlines, so we scan up to the first valid-UTF-8
+    // prefix that contains the magic + 3 whitespace-delimited ASCII tokens
+    // (width, height, maxval), skipping `#`-prefixed comments. Capping at
+    // 64 KiB keeps worst-case effort bounded.
+    let scan_len: usize = data.len().min(65536);
+    let header_str: &str = core::str::from_utf8(&data[..scan_len])
+        .or_else(|_| {
+            // Fall back to the longest valid-UTF-8 prefix of the scan window.
+            let mut cut: usize = scan_len;
+            while cut > 0 && core::str::from_utf8(&data[..cut]).is_err() {
+                cut -= 1;
+            }
+            core::str::from_utf8(&data[..cut])
+        })
+        .map_err(|_| JpegError::CorruptData("PPM header is not valid UTF-8".into()))?;
+
+    let (width, height, maxval, header_len) = parse_ppm_header(header_str)?;
+    if !(1..=65535).contains(&maxval) {
+        return Err(JpegError::CorruptData(format!(
+            "PPM maxval {maxval} out of range (1..=65535)"
+        )));
+    }
+
+    let num_components: usize = if is_grayscale { 1 } else { 3 };
+    let num_samples: usize = width
+        .checked_mul(height)
+        .and_then(|v| v.checked_mul(num_components))
+        .ok_or_else(|| JpegError::CorruptData("PPM dimensions overflow".into()))?;
+    let expected_data_len: usize = num_samples
+        .checked_mul(2)
+        .ok_or_else(|| JpegError::CorruptData("PPM high-bit sample buffer size overflow".into()))?;
+    let pixel_data: &[u8] = &data[header_len..];
+    if pixel_data.len() < expected_data_len {
+        return Err(JpegError::UnexpectedEof);
+    }
+
+    let maxval_u16: u16 = maxval as u16;
+    let mut pixels: Vec<u16> = Vec::with_capacity(num_samples);
+    for chunk in pixel_data[..expected_data_len].chunks_exact(2) {
+        let v: u16 = u16::from_be_bytes([chunk[0], chunk[1]]);
+        if v > maxval_u16 {
+            return Err(JpegError::CorruptData(format!(
+                "PPM sample {v} exceeds declared maxval {maxval}"
+            )));
+        }
+        pixels.push(v);
+    }
+
+    Ok((width, height, maxval, num_components, pixels))
+}
+
+/// Save 16-bit pixel data as a PPM (P6) or PGM (P5) file.
+///
+/// Writes 2-byte big-endian samples per the PPM spec.
+#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+pub fn save_ppm_16bit<P: AsRef<Path>>(
+    path: P,
+    pixels: &[u16],
+    width: usize,
+    height: usize,
+    num_components: usize,
+    maxval: u16,
+) -> Result<()> {
+    if num_components != 1 && num_components != 3 {
+        return Err(JpegError::Unsupported(format!(
+            "PPM 16-bit save supports 1 or 3 components, got {}",
+            num_components
+        )));
+    }
+
+    let expected: usize = width * height * num_components;
+    if pixels.len() < expected {
+        return Err(JpegError::CorruptData(format!(
+            "pixel buffer too small: need {}, got {}",
+            expected,
+            pixels.len()
+        )));
+    }
+
+    let magic: &str = if num_components == 1 { "P5" } else { "P6" };
+    let file = fs::File::create(path.as_ref())?;
+    let mut writer = BufWriter::new(file);
+
+    let header: String = format!("{}\n{} {}\n{}\n", magic, width, height, maxval);
+    writer.write_all(header.as_bytes())?;
+
+    // Write 2-byte big-endian samples
+    for &sample in &pixels[..expected] {
+        writer.write_all(&sample.to_be_bytes())?;
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+// =========================================================================
+// PNG I/O (feature-gated; only available when the `png` feature is enabled)
+// =========================================================================
+
+/// Load an 8-bit PNG file and return a `LoadedImage`.
+///
+/// Supported colour types:
+/// - Grayscale (8-bit) → `PixelFormat::Grayscale`
+/// - GrayscaleAlpha (8-bit, alpha dropped) → `PixelFormat::Grayscale`
+/// - RGB (8-bit) → `PixelFormat::Rgb`
+/// - RGBA (8-bit) → `PixelFormat::Rgba`
+/// - Indexed-colour PNG → returns `Unsupported`
+///
+/// 16-bit PNG returns `Unsupported` (out of scope for this PR).
+#[cfg(feature = "png")]
+pub fn load_png_from_bytes(data: &[u8]) -> Result<LoadedImage> {
+    use std::io::Cursor;
+
+    let decoder: png::Decoder<Cursor<&[u8]>> = png::Decoder::new(Cursor::new(data));
+    let mut reader: png::Reader<Cursor<&[u8]>> = decoder
+        .read_info()
+        .map_err(|e| JpegError::CorruptData(format!("PNG decode error: {e}")))?;
+
+    let info: &png::Info = reader.info();
+    let width: usize = info.width as usize;
+    let height: usize = info.height as usize;
+
+    // Reject 16-bit PNG — out of scope for the 8-bit image I/O path.
+    if info.bit_depth != png::BitDepth::Eight {
+        return Err(JpegError::Unsupported(format!(
+            "PNG bit depth {:?} not supported (only 8-bit PNG is supported; \
+             use tj3LoadImage16 for 16-bit precision)",
+            info.bit_depth
+        )));
+    }
+
+    // Indexed-colour PNG requires palette expansion before we can emit a
+    // flat pixel buffer; bail out rather than expanding silently.
+    if info.color_type == png::ColorType::Indexed {
+        return Err(JpegError::Unsupported(
+            "indexed-colour PNG is not supported".into(),
+        ));
+    }
+
+    let (pixel_format, bytes_per_pixel): (PixelFormat, usize) = match info.color_type {
+        png::ColorType::Grayscale => (PixelFormat::Grayscale, 1),
+        // GrayscaleAlpha: drop the alpha channel to match libjpeg-turbo's
+        // behaviour when the caller does not request an alpha output format.
+        png::ColorType::GrayscaleAlpha => (PixelFormat::Grayscale, 2),
+        png::ColorType::Rgb => (PixelFormat::Rgb, 3),
+        png::ColorType::Rgba => (PixelFormat::Rgba, 4),
+        other => {
+            return Err(JpegError::Unsupported(format!(
+                "PNG colour type {other:?} is not supported"
+            )));
+        }
+    };
+
+    let mut frame_buf: Vec<u8> = vec![0u8; reader.output_buffer_size()];
+    let frame_info: png::OutputInfo = reader
+        .next_frame(&mut frame_buf)
+        .map_err(|e| JpegError::CorruptData(format!("PNG frame decode error: {e}")))?;
+    // Trim to the number of bytes actually written.
+    frame_buf.truncate(frame_info.buffer_size());
+
+    // When the PNG is GrayscaleAlpha, drop every second byte (the alpha
+    // channel) so we return a dense 1-bpp Grayscale buffer.
+    let pixels: Vec<u8> = if pixel_format == PixelFormat::Grayscale && bytes_per_pixel == 2 {
+        frame_buf.chunks_exact(2).map(|px| px[0]).collect()
+    } else {
+        frame_buf
+    };
+
+    Ok(LoadedImage {
+        pixels,
+        width,
+        height,
+        pixel_format,
+    })
+}
+
+/// Save a `LoadedImage` as an 8-bit PNG file.
+///
+/// Supported pixel formats:
+/// - `Grayscale` → PNG colour type Grayscale
+/// - `Rgb` → PNG colour type RGB
+/// - `Rgba` → PNG colour type RGBA
+///
+/// BGR/BGRA/RGBX/etc. are not handled here; callers in `tj3SaveImage8`
+/// should either reject them or convert before calling this function.
+#[cfg(all(feature = "png", any(not(target_arch = "wasm32"), target_os = "wasi")))]
+pub fn save_png<P: AsRef<Path>>(
+    path: P,
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    pixel_format: PixelFormat,
+) -> Result<()> {
+    validate_pixel_buffer(pixels, width, height, pixel_format)?;
+
+    let (color_type, bytes_per_pixel): (png::ColorType, usize) = match pixel_format {
+        PixelFormat::Grayscale => (png::ColorType::Grayscale, 1),
+        PixelFormat::Rgb => (png::ColorType::Rgb, 3),
+        PixelFormat::Rgba => (png::ColorType::Rgba, 4),
+        other => {
+            return Err(JpegError::Unsupported(format!(
+                "PNG save does not support pixel format {other:?}"
+            )));
+        }
+    };
+
+    let file: fs::File = fs::File::create(path.as_ref())?;
+    let buf_writer: std::io::BufWriter<fs::File> = std::io::BufWriter::new(file);
+    let mut encoder: png::Encoder<std::io::BufWriter<fs::File>> =
+        png::Encoder::new(buf_writer, width as u32, height as u32);
+    encoder.set_color(color_type);
+    encoder.set_depth(png::BitDepth::Eight);
+
+    let mut png_writer: png::Writer<std::io::BufWriter<fs::File>> = encoder
+        .write_header()
+        .map_err(|e| JpegError::Unsupported(format!("PNG header write error: {e}")))?;
+
+    // `write_image_data` expects the full interleaved pixel buffer at once.
+    let expected_len: usize = width * height * bytes_per_pixel;
+    png_writer
+        .write_image_data(&pixels[..expected_len])
+        .map_err(|e| JpegError::Unsupported(format!("PNG data write error: {e}")))?;
+
+    png_writer
+        .finish()
+        .map_err(|e| JpegError::Unsupported(format!("PNG finalize error: {e}")))?;
+
+    Ok(())
+}

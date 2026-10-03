@@ -1,0 +1,953 @@
+//! Extended scaling factor tests.
+//!
+//! All 16 libjpeg-turbo scaling factors are supported via dedicated IDCT kernels
+//! (1×1 through 16×16): 2/1, 15/8, 7/4, 13/8, 3/2, 11/8, 5/4, 9/8, 1/1,
+//! 7/8, 3/4, 5/8, 1/2, 3/8, 1/4, 1/8.
+//!
+//! This test file:
+//! - Tests scaling factors across multiple subsampling modes
+//! - Verifies intermediate factors produce correctly-sized output
+
+mod helpers;
+
+use std::path::PathBuf;
+use std::process::Command;
+
+use libjpeg_turbo_rs::api::streaming::StreamingDecoder;
+use libjpeg_turbo_rs::{compress, decompress, Image, PixelFormat, ScalingFactor, Subsampling};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn decode_scaled(data: &[u8], num: u32, denom: u32) -> Image {
+    let mut decoder = StreamingDecoder::new(data).unwrap();
+    decoder.set_scale(ScalingFactor::new(num, denom));
+    decoder.decode().unwrap()
+}
+
+/// Create a synthetic test image with a gradient pattern.
+fn make_gradient(width: usize, height: usize) -> Vec<u8> {
+    let mut pixels: Vec<u8> = Vec::with_capacity(width * height * 3);
+    for y in 0..height {
+        for x in 0..width {
+            pixels.push(((x * 255) / width.max(1)) as u8); // R
+            pixels.push(((y * 255) / height.max(1)) as u8); // G
+            pixels.push((((x + y) * 127) / (width + height).max(1)) as u8); // B
+        }
+    }
+    pixels
+}
+
+/// Encode a gradient image with the given subsampling, return JPEG bytes.
+fn encode_gradient(width: usize, height: usize, subsampling: Subsampling) -> Vec<u8> {
+    let pixels: Vec<u8> = make_gradient(width, height);
+    compress(&pixels, width, height, PixelFormat::Rgb, 90, subsampling).unwrap()
+}
+
+/// Encode a grayscale gradient, return JPEG bytes.
+fn encode_grayscale_gradient(width: usize, height: usize) -> Vec<u8> {
+    let mut pixels: Vec<u8> = Vec::with_capacity(width * height);
+    for y in 0..height {
+        for x in 0..width {
+            pixels.push(((x * 255 + y * 127) / (width + height).max(1)) as u8);
+        }
+    }
+    compress(
+        &pixels,
+        width,
+        height,
+        PixelFormat::Grayscale,
+        90,
+        Subsampling::S444,
+    )
+    .unwrap()
+}
+
+// ===========================================================================
+// 1/1 scale (full size)
+// ===========================================================================
+
+#[test]
+fn scale_1_1_420_dimensions() {
+    let data = encode_gradient(320, 240, Subsampling::S420);
+    let img = decode_scaled(&data, 1, 1);
+    assert_eq!(img.width, 320);
+    assert_eq!(img.height, 240);
+    assert_eq!(img.data.len(), 320 * 240 * 3);
+}
+
+#[test]
+fn scale_1_1_444_dimensions() {
+    let data = encode_gradient(320, 240, Subsampling::S444);
+    let img = decode_scaled(&data, 1, 1);
+    assert_eq!(img.width, 320);
+    assert_eq!(img.height, 240);
+    assert_eq!(img.data.len(), 320 * 240 * 3);
+}
+
+#[test]
+fn scale_1_1_grayscale_dimensions() {
+    let data = encode_grayscale_gradient(320, 240);
+    let img = decode_scaled(&data, 1, 1);
+    assert_eq!(img.width, 320);
+    assert_eq!(img.height, 240);
+    assert_eq!(img.pixel_format, PixelFormat::Grayscale);
+    assert_eq!(img.data.len(), 320 * 240);
+}
+
+#[test]
+fn scale_1_1_matches_default_decode() {
+    let data = include_bytes!("fixtures/photo_320x240_420.jpg");
+    let default_img = decompress(data).unwrap();
+    let scaled_img = decode_scaled(data, 1, 1);
+    assert_eq!(default_img.width, scaled_img.width);
+    assert_eq!(default_img.height, scaled_img.height);
+    assert_eq!(default_img.data, scaled_img.data);
+}
+
+#[test]
+fn scale_1_1_odd_dimensions() {
+    // Non-MCU-aligned image size
+    let pixels: Vec<u8> = make_gradient(37, 29);
+    let jpeg = compress(&pixels, 37, 29, PixelFormat::Rgb, 90, Subsampling::S420).unwrap();
+    let img = decode_scaled(&jpeg, 1, 1);
+    assert_eq!(img.width, 37);
+    assert_eq!(img.height, 29);
+}
+
+// ===========================================================================
+// 1/2 scale (half size)
+// ===========================================================================
+
+#[test]
+fn scale_1_2_420_dimensions() {
+    let data = encode_gradient(320, 240, Subsampling::S420);
+    let img = decode_scaled(&data, 1, 2);
+    assert_eq!(img.width, 160);
+    assert_eq!(img.height, 120);
+    assert_eq!(img.data.len(), 160 * 120 * 3);
+}
+
+#[test]
+fn scale_1_2_444_dimensions() {
+    let data = encode_gradient(320, 240, Subsampling::S444);
+    let img = decode_scaled(&data, 1, 2);
+    assert_eq!(img.width, 160);
+    assert_eq!(img.height, 120);
+    assert_eq!(img.data.len(), 160 * 120 * 3);
+}
+
+#[test]
+fn scale_1_2_422_dimensions() {
+    let data = encode_gradient(320, 240, Subsampling::S422);
+    let img = decode_scaled(&data, 1, 2);
+    assert_eq!(img.width, 160);
+    assert_eq!(img.height, 120);
+    assert_eq!(img.data.len(), 160 * 120 * 3);
+}
+
+#[test]
+fn scale_1_2_grayscale_dimensions() {
+    let data = encode_grayscale_gradient(320, 240);
+    let img = decode_scaled(&data, 1, 2);
+    assert_eq!(img.width, 160);
+    assert_eq!(img.height, 120);
+    assert_eq!(img.pixel_format, PixelFormat::Grayscale);
+    assert_eq!(img.data.len(), 160 * 120);
+}
+
+#[test]
+fn scale_1_2_odd_dimensions() {
+    let pixels: Vec<u8> = make_gradient(37, 29);
+    let jpeg = compress(&pixels, 37, 29, PixelFormat::Rgb, 90, Subsampling::S420).unwrap();
+    let img = decode_scaled(&jpeg, 1, 2);
+    // ceil(37/2)=19, ceil(29/2)=15
+    assert_eq!(img.width, 19);
+    assert_eq!(img.height, 15);
+}
+
+#[test]
+fn scale_1_2_large_image() {
+    let data = include_bytes!("fixtures/gradient_640x480.jpg");
+    let img = decode_scaled(data, 1, 2);
+    assert_eq!(img.width, 320);
+    assert_eq!(img.height, 240);
+}
+
+#[test]
+fn scale_1_2_progressive() {
+    let data = include_bytes!("fixtures/photo_320x240_420_prog.jpg");
+    let img = decode_scaled(data, 1, 2);
+    assert_eq!(img.width, 160);
+    assert_eq!(img.height, 120);
+    assert_eq!(img.data.len(), 160 * 120 * 3);
+}
+
+// ===========================================================================
+// 1/4 scale (quarter size)
+// ===========================================================================
+
+#[test]
+fn scale_1_4_420_dimensions() {
+    let data = encode_gradient(320, 240, Subsampling::S420);
+    let img = decode_scaled(&data, 1, 4);
+    assert_eq!(img.width, 80);
+    assert_eq!(img.height, 60);
+    assert_eq!(img.data.len(), 80 * 60 * 3);
+}
+
+#[test]
+fn scale_1_4_444_dimensions() {
+    let data = encode_gradient(320, 240, Subsampling::S444);
+    let img = decode_scaled(&data, 1, 4);
+    assert_eq!(img.width, 80);
+    assert_eq!(img.height, 60);
+    assert_eq!(img.data.len(), 80 * 60 * 3);
+}
+
+#[test]
+fn scale_1_4_422_dimensions() {
+    let data = encode_gradient(320, 240, Subsampling::S422);
+    let img = decode_scaled(&data, 1, 4);
+    assert_eq!(img.width, 80);
+    assert_eq!(img.height, 60);
+    assert_eq!(img.data.len(), 80 * 60 * 3);
+}
+
+#[test]
+fn scale_1_4_grayscale_dimensions() {
+    let data = encode_grayscale_gradient(320, 240);
+    let img = decode_scaled(&data, 1, 4);
+    assert_eq!(img.width, 80);
+    assert_eq!(img.height, 60);
+    assert_eq!(img.pixel_format, PixelFormat::Grayscale);
+    assert_eq!(img.data.len(), 80 * 60);
+}
+
+#[test]
+fn scale_1_4_odd_dimensions() {
+    let pixels: Vec<u8> = make_gradient(37, 29);
+    let jpeg = compress(&pixels, 37, 29, PixelFormat::Rgb, 90, Subsampling::S420).unwrap();
+    let img = decode_scaled(&jpeg, 1, 4);
+    // ceil(37/4)=10, ceil(29/4)=8
+    assert_eq!(img.width, 10);
+    assert_eq!(img.height, 8);
+}
+
+#[test]
+fn scale_1_4_progressive() {
+    let data = include_bytes!("fixtures/photo_320x240_420_prog.jpg");
+    let img = decode_scaled(data, 1, 4);
+    assert_eq!(img.width, 80);
+    assert_eq!(img.height, 60);
+}
+
+// ===========================================================================
+// 1/8 scale (eighth size)
+// ===========================================================================
+
+#[test]
+fn scale_1_8_420_dimensions() {
+    let data = encode_gradient(320, 240, Subsampling::S420);
+    let img = decode_scaled(&data, 1, 8);
+    assert_eq!(img.width, 40);
+    assert_eq!(img.height, 30);
+    assert_eq!(img.data.len(), 40 * 30 * 3);
+}
+
+#[test]
+fn scale_1_8_444_dimensions() {
+    let data = encode_gradient(320, 240, Subsampling::S444);
+    let img = decode_scaled(&data, 1, 8);
+    assert_eq!(img.width, 40);
+    assert_eq!(img.height, 30);
+    assert_eq!(img.data.len(), 40 * 30 * 3);
+}
+
+#[test]
+fn scale_1_8_422_dimensions() {
+    let data = encode_gradient(320, 240, Subsampling::S422);
+    let img = decode_scaled(&data, 1, 8);
+    assert_eq!(img.width, 40);
+    assert_eq!(img.height, 30);
+    assert_eq!(img.data.len(), 40 * 30 * 3);
+}
+
+#[test]
+fn scale_1_8_grayscale_dimensions() {
+    let data = encode_grayscale_gradient(320, 240);
+    let img = decode_scaled(&data, 1, 8);
+    assert_eq!(img.width, 40);
+    assert_eq!(img.height, 30);
+    assert_eq!(img.pixel_format, PixelFormat::Grayscale);
+    assert_eq!(img.data.len(), 40 * 30);
+}
+
+#[test]
+fn scale_1_8_odd_dimensions() {
+    let pixels: Vec<u8> = make_gradient(37, 29);
+    let jpeg = compress(&pixels, 37, 29, PixelFormat::Rgb, 90, Subsampling::S420).unwrap();
+    let img = decode_scaled(&jpeg, 1, 8);
+    // ceil(37/8)=5, ceil(29/8)=4
+    assert_eq!(img.width, 5);
+    assert_eq!(img.height, 4);
+}
+
+#[test]
+fn scale_1_8_minimum_size() {
+    // 8x8 image scaled to 1/8 = 1x1
+    let data = include_bytes!("fixtures/gray_8x8.jpg");
+    let img = decode_scaled(data, 1, 8);
+    assert_eq!(img.width, 1);
+    assert_eq!(img.height, 1);
+}
+
+#[test]
+fn scale_1_8_large_image() {
+    let data = include_bytes!("fixtures/gradient_640x480.jpg");
+    let img = decode_scaled(data, 1, 8);
+    assert_eq!(img.width, 80);
+    assert_eq!(img.height, 60);
+}
+
+// ===========================================================================
+// Equivalent fraction forms produce same output as canonical forms
+// ===========================================================================
+
+#[test]
+fn scale_4_8_same_as_1_2() {
+    let data = include_bytes!("fixtures/photo_320x240_420.jpg");
+    let half = decode_scaled(data, 1, 2);
+    let four_eighth = decode_scaled(data, 4, 8);
+    assert_eq!(half.width, four_eighth.width);
+    assert_eq!(half.height, four_eighth.height);
+    assert_eq!(half.data, four_eighth.data);
+}
+
+#[test]
+fn scale_2_8_same_as_1_4() {
+    let data = include_bytes!("fixtures/photo_320x240_420.jpg");
+    let quarter = decode_scaled(data, 1, 4);
+    let two_eighth = decode_scaled(data, 2, 8);
+    assert_eq!(quarter.width, two_eighth.width);
+    assert_eq!(quarter.height, two_eighth.height);
+    assert_eq!(quarter.data, two_eighth.data);
+}
+
+#[test]
+fn scale_2_4_same_as_1_2() {
+    let data = include_bytes!("fixtures/photo_320x240_420.jpg");
+    let half = decode_scaled(data, 1, 2);
+    let two_fourths = decode_scaled(data, 2, 4);
+    assert_eq!(half.width, two_fourths.width);
+    assert_eq!(half.height, two_fourths.height);
+    assert_eq!(half.data, two_fourths.data);
+}
+
+// ===========================================================================
+// Extended scaling factor tests
+//
+// All 16 libjpeg-turbo scaling factors are now supported via dedicated IDCT
+// kernels (block sizes 1 through 16). ScalingFactor::block_size() computes
+// ceil(num * 8 / denom) clamped to [1, 16], mapping each factor to its
+// corresponding IDCT kernel size.
+// ===========================================================================
+
+#[test]
+fn intermediate_scale_block_size_mapping() {
+    // Verify ScalingFactor::block_size() for all 15 C test factors
+    let cases: Vec<(u32, u32, usize)> = vec![
+        // (num, denom, expected_block_size)
+        (16, 8, 16), // 2.0x -> 16x16 IDCT
+        (15, 8, 15), // 1.875x -> 15x15 IDCT
+        (14, 8, 14), // 1.75x -> 14x14 IDCT
+        (13, 8, 13), // 1.625x -> 13x13 IDCT
+        (12, 8, 12), // 1.5x -> 12x12 IDCT
+        (11, 8, 11), // 1.375x -> 11x11 IDCT
+        (10, 8, 10), // 1.25x -> 10x10 IDCT
+        (9, 8, 9),   // 1.125x -> 9x9 IDCT
+        // 8/8 = 1.0x -> full IDCT (canonical 1/1)
+        (8, 8, 8),
+        (7, 8, 7), // 0.875x -> 7x7 IDCT
+        (6, 8, 6), // 0.75x -> 6x6 IDCT
+        (5, 8, 5), // 0.625x -> 5x5 IDCT
+        (4, 8, 4), // 0.5x -> half IDCT (ratio_x8=4)
+        (3, 8, 3), // 0.375x -> 3x3 IDCT
+        (2, 8, 2), // 0.25x -> quarter IDCT (ratio_x8=2)
+        (1, 8, 1), // 0.125x -> eighth IDCT (ratio_x8=1)
+    ];
+    for (num, denom, expected_block) in cases {
+        let sf = ScalingFactor::new(num, denom);
+        assert_eq!(
+            sf.block_size(),
+            expected_block,
+            "ScalingFactor({}/{}).block_size() should be {}, got {}",
+            num,
+            denom,
+            expected_block,
+            sf.block_size()
+        );
+    }
+}
+
+#[test]
+fn intermediate_7_8_decodes_at_full_size() {
+    // 7/8 maps to block_size 8 (full), so output uses full IDCT dimensions
+    // but scale_dim computes ceil(320*7/8)=280, ceil(240*7/8)=210
+    let data = encode_gradient(320, 240, Subsampling::S420);
+    let img = decode_scaled(&data, 7, 8);
+    let expected_w: usize = ScalingFactor::new(7, 8).scale_dim(320);
+    let expected_h: usize = ScalingFactor::new(7, 8).scale_dim(240);
+    // The decode should succeed regardless; verify dimensions are reasonable
+    assert!(img.width > 0, "decoded width should be positive");
+    assert!(img.height > 0, "decoded height should be positive");
+    // Document the actual dimensions produced
+    assert_eq!(
+        img.width, expected_w,
+        "7/8 scale width: expected scale_dim result {}, got {}",
+        expected_w, img.width
+    );
+    assert_eq!(
+        img.height, expected_h,
+        "7/8 scale height: expected scale_dim result {}, got {}",
+        expected_h, img.height
+    );
+}
+
+#[test]
+fn intermediate_3_8_decodes_at_half_idct() {
+    // 3/8 maps to block_size 4 (same as 1/2), scale_dim gives ceil(320*3/8)=120
+    let data = encode_gradient(320, 240, Subsampling::S420);
+    let img = decode_scaled(&data, 3, 8);
+    let expected_w: usize = ScalingFactor::new(3, 8).scale_dim(320);
+    let expected_h: usize = ScalingFactor::new(3, 8).scale_dim(240);
+    assert!(img.width > 0);
+    assert!(img.height > 0);
+    assert_eq!(img.width, expected_w);
+    assert_eq!(img.height, expected_h);
+}
+
+// ===========================================================================
+// Pixel content validation
+// ===========================================================================
+
+#[test]
+fn scaled_output_has_dynamic_range() {
+    // All 4 supported scale factors should produce non-uniform output from a real photo
+    let data = include_bytes!("fixtures/photo_320x240_420.jpg");
+    for (num, denom) in &[(1u32, 1u32), (1, 2), (1, 4), (1, 8)] {
+        let img = decode_scaled(data, *num, *denom);
+        let min = *img.data.iter().min().unwrap();
+        let max = *img.data.iter().max().unwrap();
+        assert!(
+            max - min > 30,
+            "scale {}/{}: expected dynamic range, got min={} max={}",
+            num,
+            denom,
+            min,
+            max
+        );
+    }
+}
+
+#[test]
+fn smaller_scale_produces_fewer_pixels() {
+    let data = include_bytes!("fixtures/photo_320x240_420.jpg");
+    let full = decode_scaled(data, 1, 1);
+    let half = decode_scaled(data, 1, 2);
+    let quarter = decode_scaled(data, 1, 4);
+    let eighth = decode_scaled(data, 1, 8);
+
+    assert!(full.data.len() > half.data.len());
+    assert!(half.data.len() > quarter.data.len());
+    assert!(quarter.data.len() > eighth.data.len());
+}
+
+#[test]
+fn scale_dimension_calculation_is_ceil_division() {
+    // Verify ScalingFactor::scale_dim computes ceil(dim * num / denom)
+    let cases: Vec<(usize, u32, u32, usize)> = vec![
+        (320, 1, 1, 320),
+        (320, 1, 2, 160),
+        (320, 1, 4, 80),
+        (320, 1, 8, 40),
+        (240, 1, 1, 240),
+        (240, 1, 2, 120),
+        (240, 1, 4, 60),
+        (240, 1, 8, 30),
+        // Odd sizes
+        (37, 1, 2, 19), // ceil(37/2)
+        (37, 1, 4, 10), // ceil(37/4)
+        (37, 1, 8, 5),  // ceil(37/8)
+        (29, 1, 2, 15), // ceil(29/2)
+        (29, 1, 4, 8),  // ceil(29/4)
+        (29, 1, 8, 4),  // ceil(29/8)
+    ];
+    for (dim, num, denom, expected) in cases {
+        let sf = ScalingFactor::new(num, denom);
+        assert_eq!(
+            sf.scale_dim(dim),
+            expected,
+            "scale_dim({}, {}/{}) should be {}",
+            dim,
+            num,
+            denom,
+            expected
+        );
+    }
+}
+
+// ===========================================================================
+// Real fixture images at all 4 supported scales
+// ===========================================================================
+
+#[test]
+fn fixture_photo_320x240_420_all_scales() {
+    let data = include_bytes!("fixtures/photo_320x240_420.jpg");
+    for (num, denom, ew, eh) in &[
+        (1u32, 1u32, 320usize, 240usize),
+        (1, 2, 160, 120),
+        (1, 4, 80, 60),
+        (1, 8, 40, 30),
+    ] {
+        let img = decode_scaled(data, *num, *denom);
+        assert_eq!(img.width, *ew, "scale {}/{} width", num, denom);
+        assert_eq!(img.height, *eh, "scale {}/{} height", num, denom);
+    }
+}
+
+#[test]
+fn fixture_photo_320x240_444_all_scales() {
+    let data = include_bytes!("fixtures/photo_320x240_444.jpg");
+    for (num, denom, ew, eh) in &[
+        (1u32, 1u32, 320usize, 240usize),
+        (1, 2, 160, 120),
+        (1, 4, 80, 60),
+        (1, 8, 40, 30),
+    ] {
+        let img = decode_scaled(data, *num, *denom);
+        assert_eq!(img.width, *ew, "scale {}/{} width", num, denom);
+        assert_eq!(img.height, *eh, "scale {}/{} height", num, denom);
+    }
+}
+
+#[test]
+fn fixture_gray_8x8_all_scales() {
+    let data = include_bytes!("fixtures/gray_8x8.jpg");
+    for (num, denom, ew, eh) in &[
+        (1u32, 1u32, 8usize, 8usize),
+        (1, 2, 4, 4),
+        (1, 4, 2, 2),
+        (1, 8, 1, 1),
+    ] {
+        let img = decode_scaled(data, *num, *denom);
+        assert_eq!(img.width, *ew, "scale {}/{} width", num, denom);
+        assert_eq!(img.height, *eh, "scale {}/{} height", num, denom);
+        assert_eq!(img.pixel_format, PixelFormat::Grayscale);
+    }
+}
+
+// ===========================================================================
+// C djpeg cross-validation helpers
+// ===========================================================================
+
+/// Parse a binary PPM (P6) file and return (width, height, pixel_data).
+fn parse_ppm(data: &[u8]) -> (u32, u32, Vec<u8>) {
+    let header_end = find_ppm_header_end(data);
+    let header = std::str::from_utf8(&data[..header_end]).expect("PPM header not UTF-8");
+
+    let mut tokens = header.split_ascii_whitespace();
+    let magic = tokens.next().expect("missing PPM magic");
+    assert_eq!(magic, "P6", "expected P6 PPM format, got {}", magic);
+    let width: u32 = tokens
+        .next()
+        .expect("missing width")
+        .parse()
+        .expect("bad width");
+    let height: u32 = tokens
+        .next()
+        .expect("missing height")
+        .parse()
+        .expect("bad height");
+    let maxval: u32 = tokens
+        .next()
+        .expect("missing maxval")
+        .parse()
+        .expect("bad maxval");
+    assert_eq!(maxval, 255, "expected maxval 255, got {}", maxval);
+
+    let pixel_data = data[header_end..].to_vec();
+    let expected_len = (width * height * 3) as usize;
+    assert_eq!(
+        pixel_data.len(),
+        expected_len,
+        "PPM pixel data length mismatch: got {} expected {} ({}x{}x3)",
+        pixel_data.len(),
+        expected_len,
+        width,
+        height,
+    );
+
+    (width, height, pixel_data)
+}
+
+/// Find the byte offset where PPM P6 header ends and binary pixel data begins.
+fn find_ppm_header_end(data: &[u8]) -> usize {
+    let mut tokens_found = 0;
+    let mut i = 0;
+    let mut in_token = false;
+
+    while i < data.len() && tokens_found < 4 {
+        let b = data[i];
+        if b == b'#' {
+            // Skip comment lines
+            while i < data.len() && data[i] != b'\n' {
+                i += 1;
+            }
+            in_token = false;
+        } else if b.is_ascii_whitespace() {
+            if in_token {
+                tokens_found += 1;
+                in_token = false;
+            }
+        } else {
+            in_token = true;
+        }
+        i += 1;
+    }
+    // After the 4th token, `i` points right after the single whitespace delimiter
+    i
+}
+
+// ===========================================================================
+// C djpeg cross-validation: full scale diff=0, scaled dimensions match
+// ===========================================================================
+
+#[test]
+fn c_djpeg_scaling_full_diff_zero() {
+    let djpeg: PathBuf = require_c_tool!("djpeg");
+
+    let jpeg_data = include_bytes!("fixtures/photo_320x240_420.jpg");
+
+    let tmp_dir = std::env::temp_dir();
+    let input_jpg = tmp_dir.join("scaling_extended_xval.jpg");
+    std::fs::write(&input_jpg, jpeg_data).expect("failed to write temp JPEG");
+
+    // --- Full scale (1/1): pixel-exact match required ---
+    {
+        let rust_img = decode_scaled(jpeg_data, 1, 1);
+
+        let tmp_ppm = tmp_dir.join("scaling_extended_xval_1_1.ppm");
+        let status = Command::new(&djpeg)
+            .arg("-scale")
+            .arg("1/1")
+            .arg("-ppm")
+            .arg("-outfile")
+            .arg(&tmp_ppm)
+            .arg(&input_jpg)
+            .status()
+            .expect("failed to run djpeg");
+        assert!(status.success(), "djpeg failed for scale 1/1");
+
+        let ppm_data = std::fs::read(&tmp_ppm).expect("failed to read PPM output");
+        let (c_width, c_height, c_pixels) = parse_ppm(&ppm_data);
+
+        assert_eq!(
+            rust_img.width, c_width as usize,
+            "1/1 width mismatch: rust={} c={}",
+            rust_img.width, c_width,
+        );
+        assert_eq!(
+            rust_img.height, c_height as usize,
+            "1/1 height mismatch: rust={} c={}",
+            rust_img.height, c_height,
+        );
+        assert_eq!(
+            rust_img.data.len(),
+            c_pixels.len(),
+            "1/1 pixel data length mismatch: rust={} c={}",
+            rust_img.data.len(),
+            c_pixels.len(),
+        );
+
+        let diff_count = rust_img
+            .data
+            .iter()
+            .zip(c_pixels.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(
+            diff_count,
+            0,
+            "1/1 pixel diff: {} bytes differ out of {} (must be 0)",
+            diff_count,
+            rust_img.data.len(),
+        );
+
+        let _ = std::fs::remove_file(&tmp_ppm);
+    }
+
+    // --- Scaled decodes (1/2, 1/4, 1/8): dimensions must match C djpeg ---
+    for &(num, denom) in &[(1u32, 2u32), (1, 4), (1, 8)] {
+        let rust_img = decode_scaled(jpeg_data, num, denom);
+
+        let tmp_ppm = tmp_dir.join(format!("scaling_extended_xval_{}_{}.ppm", num, denom));
+        let status = Command::new(&djpeg)
+            .arg("-scale")
+            .arg(format!("{}/{}", num, denom))
+            .arg("-ppm")
+            .arg("-outfile")
+            .arg(&tmp_ppm)
+            .arg(&input_jpg)
+            .status()
+            .expect("failed to run djpeg");
+        assert!(status.success(), "djpeg failed for scale {}/{}", num, denom,);
+
+        let ppm_data = std::fs::read(&tmp_ppm).expect("failed to read PPM output");
+        let (c_width, c_height, _c_pixels) = parse_ppm(&ppm_data);
+
+        assert_eq!(
+            rust_img.width, c_width as usize,
+            "scale {}/{} width mismatch: rust={} c={}",
+            num, denom, rust_img.width, c_width,
+        );
+        assert_eq!(
+            rust_img.height, c_height as usize,
+            "scale {}/{} height mismatch: rust={} c={}",
+            num, denom, rust_img.height, c_height,
+        );
+
+        let _ = std::fs::remove_file(&tmp_ppm);
+    }
+
+    let _ = std::fs::remove_file(&input_jpg);
+}
+
+/// Pixel-exact comparison for scaled decodes (1/2, 1/4, 1/8) against C djpeg.
+/// Per-component IDCT sizes match C libjpeg-turbo, producing diff=0.
+#[test]
+fn c_djpeg_scaling_scaled_pixel_diff_zero() {
+    let djpeg: PathBuf = require_c_tool!("djpeg");
+
+    let jpeg_data = include_bytes!("fixtures/photo_320x240_420.jpg");
+
+    let tmp_dir = std::env::temp_dir();
+    let input_jpg = tmp_dir.join("scaling_extended_xval_px.jpg");
+    std::fs::write(&input_jpg, jpeg_data).expect("failed to write temp JPEG");
+
+    for &(num, denom) in &[(1u32, 2u32), (1, 4), (1, 8)] {
+        let rust_img = decode_scaled(jpeg_data, num, denom);
+
+        let tmp_ppm = tmp_dir.join(format!("scaling_extended_xval_px_{}_{}.ppm", num, denom));
+        let status = Command::new(&djpeg)
+            .arg("-scale")
+            .arg(format!("{}/{}", num, denom))
+            .arg("-ppm")
+            .arg("-outfile")
+            .arg(&tmp_ppm)
+            .arg(&input_jpg)
+            .status()
+            .expect("failed to run djpeg");
+        assert!(status.success(), "djpeg failed for scale {}/{}", num, denom,);
+
+        let ppm_data = std::fs::read(&tmp_ppm).expect("failed to read PPM output");
+        let (c_width, c_height, c_pixels) = parse_ppm(&ppm_data);
+
+        assert_eq!(rust_img.width, c_width as usize);
+        assert_eq!(rust_img.height, c_height as usize);
+
+        let max_diff: u8 = rust_img
+            .data
+            .iter()
+            .zip(c_pixels.iter())
+            .map(|(&a, &b)| (a as i16 - b as i16).unsigned_abs() as u8)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_diff, 0,
+            "scale {}/{}: max pixel diff={} (must be 0 vs C djpeg)",
+            num, denom, max_diff,
+        );
+
+        let _ = std::fs::remove_file(&tmp_ppm);
+    }
+
+    let _ = std::fs::remove_file(&input_jpg);
+}
+
+/// Pixel-exact comparison for 4:2:2 **full-scale** decode against C djpeg.
+/// Full-scale 422 decode uses standard fancy upsample and matches C exactly.
+#[test]
+fn c_djpeg_scaling_422_full_scale_diff_zero() {
+    let djpeg: PathBuf = require_c_tool!("djpeg");
+
+    let jpeg_data = include_bytes!("fixtures/photo_320x240_422.jpg");
+    let tmp_dir = std::env::temp_dir();
+    let input_jpg = tmp_dir.join("scaling_ext_422_full.jpg");
+    std::fs::write(&input_jpg, jpeg_data).expect("failed to write temp JPEG");
+
+    let rust_img = decode_scaled(jpeg_data, 1, 1);
+
+    let tmp_ppm = tmp_dir.join("scaling_ext_422_full.ppm");
+    let status = Command::new(&djpeg)
+        .arg("-scale")
+        .arg("1/1")
+        .arg("-ppm")
+        .arg("-outfile")
+        .arg(&tmp_ppm)
+        .arg(&input_jpg)
+        .status()
+        .expect("failed to run djpeg");
+    assert!(status.success(), "djpeg failed for 422 scale 1/1");
+
+    let ppm_data = std::fs::read(&tmp_ppm).expect("failed to read PPM output");
+    let (c_width, c_height, c_pixels) = parse_ppm(&ppm_data);
+
+    assert_eq!(rust_img.width, c_width as usize);
+    assert_eq!(rust_img.height, c_height as usize);
+
+    let max_diff: u8 = rust_img
+        .data
+        .iter()
+        .zip(c_pixels.iter())
+        .map(|(&a, &b)| (a as i16 - b as i16).unsigned_abs() as u8)
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        max_diff, 0,
+        "422 scale 1/1: max pixel diff={} (must be 0 vs C djpeg)",
+        max_diff,
+    );
+
+    let _ = std::fs::remove_file(&tmp_ppm);
+    let _ = std::fs::remove_file(&input_jpg);
+}
+
+/// Pixel-exact comparison for 4:2:2 **scaled** decode (1/2, 1/4, 1/8) against C djpeg.
+#[test]
+fn c_djpeg_scaling_422_scaled_pixel_diff_zero() {
+    let djpeg: PathBuf = require_c_tool!("djpeg");
+
+    let jpeg_data = include_bytes!("fixtures/photo_320x240_422.jpg");
+    let tmp_dir = std::env::temp_dir();
+    let input_jpg = tmp_dir.join("scaling_ext_422_xval.jpg");
+    std::fs::write(&input_jpg, jpeg_data).expect("failed to write temp JPEG");
+
+    for &(num, denom) in &[(1u32, 2u32), (1, 4), (1, 8)] {
+        let rust_img = decode_scaled(jpeg_data, num, denom);
+
+        let tmp_ppm = tmp_dir.join(format!("scaling_ext_422_{}_{}.ppm", num, denom));
+        let status = Command::new(&djpeg)
+            .arg("-scale")
+            .arg(format!("{}/{}", num, denom))
+            .arg("-ppm")
+            .arg("-outfile")
+            .arg(&tmp_ppm)
+            .arg(&input_jpg)
+            .status()
+            .expect("failed to run djpeg");
+        assert!(
+            status.success(),
+            "djpeg failed for 422 scale {}/{}",
+            num,
+            denom,
+        );
+
+        let ppm_data = std::fs::read(&tmp_ppm).expect("failed to read PPM output");
+        let (c_width, c_height, c_pixels) = parse_ppm(&ppm_data);
+
+        assert_eq!(
+            rust_img.width, c_width as usize,
+            "422 scale {}/{} width mismatch: rust={} c={}",
+            num, denom, rust_img.width, c_width,
+        );
+        assert_eq!(
+            rust_img.height, c_height as usize,
+            "422 scale {}/{} height mismatch: rust={} c={}",
+            num, denom, rust_img.height, c_height,
+        );
+
+        let max_diff: u8 = rust_img
+            .data
+            .iter()
+            .zip(c_pixels.iter())
+            .map(|(&a, &b)| (a as i16 - b as i16).unsigned_abs() as u8)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_diff, 0,
+            "422 scale {}/{}: max pixel diff={} (must be 0 vs C djpeg)",
+            num, denom, max_diff,
+        );
+
+        let _ = std::fs::remove_file(&tmp_ppm);
+    }
+
+    let _ = std::fs::remove_file(&input_jpg);
+}
+
+/// Pixel-exact comparison for scaled decodes against C djpeg using **4:4:4**
+/// subsampling. No chroma subsampling means IDCT scaling is uniform across
+/// all components — a different code path from 4:2:0 and 4:2:2.
+#[test]
+fn c_djpeg_scaling_444_pixel_diff_zero() {
+    let djpeg: PathBuf = require_c_tool!("djpeg");
+
+    let jpeg_data = include_bytes!("fixtures/photo_320x240_444.jpg");
+    let tmp_dir = std::env::temp_dir();
+    let input_jpg = tmp_dir.join("scaling_ext_444_xval.jpg");
+    std::fs::write(&input_jpg, jpeg_data).expect("failed to write temp JPEG");
+
+    for &(num, denom) in &[(1u32, 1u32), (1, 2), (1, 4), (1, 8)] {
+        let rust_img = decode_scaled(jpeg_data, num, denom);
+
+        let tmp_ppm = tmp_dir.join(format!("scaling_ext_444_{}_{}.ppm", num, denom));
+        let status = Command::new(&djpeg)
+            .arg("-scale")
+            .arg(format!("{}/{}", num, denom))
+            .arg("-ppm")
+            .arg("-outfile")
+            .arg(&tmp_ppm)
+            .arg(&input_jpg)
+            .status()
+            .expect("failed to run djpeg");
+        assert!(
+            status.success(),
+            "djpeg failed for 444 scale {}/{}",
+            num,
+            denom,
+        );
+
+        let ppm_data = std::fs::read(&tmp_ppm).expect("failed to read PPM output");
+        let (c_width, c_height, c_pixels) = parse_ppm(&ppm_data);
+
+        assert_eq!(
+            rust_img.width, c_width as usize,
+            "444 scale {}/{} width mismatch: rust={} c={}",
+            num, denom, rust_img.width, c_width,
+        );
+        assert_eq!(
+            rust_img.height, c_height as usize,
+            "444 scale {}/{} height mismatch: rust={} c={}",
+            num, denom, rust_img.height, c_height,
+        );
+
+        let max_diff: u8 = rust_img
+            .data
+            .iter()
+            .zip(c_pixels.iter())
+            .map(|(&a, &b)| (a as i16 - b as i16).unsigned_abs() as u8)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_diff, 0,
+            "444 scale {}/{}: max pixel diff={} (must be 0 vs C djpeg)",
+            num, denom, max_diff,
+        );
+
+        let _ = std::fs::remove_file(&tmp_ppm);
+    }
+
+    let _ = std::fs::remove_file(&input_jpg);
+}

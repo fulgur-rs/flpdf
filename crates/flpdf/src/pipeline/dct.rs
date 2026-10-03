@@ -22,11 +22,11 @@
 //! than an error, and closes the accept/reject and message gap for reserved
 //! markers that appear before SOS.
 //!
-//! The default path handles two-component JPEGs with `Decoder::decode_raw`,
-//! then upsamples and interleaves the raw component planes in libjpeg's frame
-//! order.
-//! This preserves qpdf's `output_width * output_components` scanline output
-//! without asking the RGB/CMYK converter to reinterpret `JCS_UNKNOWN`
+//! The default path handles unknown-color-space JPEGs (two and five to ten
+//! components) with `Decoder::decode_raw`, then upsamples and interleaves the
+//! raw component planes in libjpeg's frame order. This preserves qpdf's
+//! `output_width * output_components` scanline output without asking the
+//! RGB/CMYK converter to reinterpret `JCS_UNKNOWN`
 //! (`libqpdf/Pl_DCT.cc:315-325`).
 
 use super::buffer::Buffer;
@@ -108,6 +108,14 @@ impl<'a> PlDct<'a> {
         // --filtered-stream-data` on a 1-byte `/DCTDecode` stream).
         if matches!(error, libjpeg_turbo_rs::JpegError::UnexpectedEof) {
             return Self::runtime_error("invalid jpeg data reading from buffer");
+        }
+        if let libjpeg_turbo_rs::JpegError::CorruptData(message) = &error {
+            if message.starts_with("Too many color components: ")
+                || message == "Bogus marker length"
+                || (message.starts_with("Invalid component ID ") && message.ends_with(" in SOS"))
+            {
+                return Self::runtime_error(message);
+            }
         }
         // qpdf-deviation-start: generic libjpeg-turbo-rs diagnostics may differ from system libjpeg format_message; reserved pre-SOS markers are remapped above
         let message = error.to_string();
@@ -296,19 +304,22 @@ impl<'a> PlDct<'a> {
     }
 
     #[cfg(not(feature = "qpdf-libjpeg-compat"))]
-    fn two_component_scanline(
+    fn unknown_component_scanline(
         raw: &libjpeg_turbo_rs::RawImage,
-        sampling: [(u8, u8); 2],
+        sampling: &[(u8, u8)],
         max_h: usize,
         max_v: usize,
         output_y: usize,
     ) -> Option<Vec<u8>> {
-        if raw.num_components != 2 || raw.width.checked_mul(2).is_none() {
+        let num_components = raw.num_components;
+        if num_components < 2
+            || num_components != sampling.len()
+            || raw.width.checked_mul(num_components).is_none()
+        {
             return None;
         }
-        let mut component_rows = [Vec::new(), Vec::new()];
-        for component in 0..2 {
-            let (horizontal_sampling, vertical_sampling) = sampling[component];
+        let mut component_rows = Vec::with_capacity(num_components);
+        for (component, &(horizontal_sampling, vertical_sampling)) in sampling.iter().enumerate() {
             let horizontal_sampling = usize::from(horizontal_sampling);
             let vertical_sampling = usize::from(vertical_sampling);
             if horizontal_sampling == 0
@@ -324,7 +335,7 @@ impl<'a> PlDct<'a> {
             let plane = raw.planes.get(component)?;
             let plane_stride = *raw.plane_widths.get(component)?;
             let plane_height = *raw.plane_heights.get(component)?;
-            component_rows[component] = Self::upsample_component_row(
+            let row = Self::upsample_component_row(
                 plane,
                 plane_stride,
                 plane_height,
@@ -336,12 +347,14 @@ impl<'a> PlDct<'a> {
                 max_v / vertical_sampling,
                 output_y,
             )?;
+            component_rows.push(row);
         }
 
-        let mut row = Vec::with_capacity(raw.width * 2);
+        let mut row = Vec::with_capacity(raw.width.checked_mul(num_components)?);
         for x in 0..raw.width {
-            row.push(component_rows[0][x]);
-            row.push(component_rows[1][x]);
+            for component_row in &component_rows {
+                row.push(*component_row.get(x)?);
+            }
         }
         Some(row)
     }
@@ -459,16 +472,7 @@ impl Pipeline for PlDct<'_> {
             }
 
             let components = sampling.len();
-            // cov:ignore-start: libjpeg-turbo-rs rejects SOF counts outside 1..=4 before it returns Decoder::header
-            if !matches!(components, 1 | 2 | 3 | 4) {
-                return Err(Self::runtime_error(format!(
-                    "unsupported JPEG component count {components}"
-                )));
-            }
-            // cov:ignore-end
-
-            if components == 2 {
-                let sampling = [sampling[0], sampling[1]];
+            if components == 2 || components >= 5 {
                 let max_h = sampling
                     .iter()
                     .map(|(horizontal, _)| usize::from(*horizontal))
@@ -500,7 +504,7 @@ impl Pipeline for PlDct<'_> {
                     .decode_raw()
                     .map_err(|error| self.jpeg_error(error, &data))?;
                 // cov:ignore-start: Decoder::decode_raw derives dimensions from the same frame header read above
-                if raw.width != width || raw.height != height {
+                if raw.width != width || raw.height != height || raw.num_components != components {
                     return Err(Self::runtime_error(
                         "decoded JPEG component dimensions do not match the frame",
                     ));
@@ -508,8 +512,9 @@ impl Pipeline for PlDct<'_> {
                 // cov:ignore-end
                 for output_y in 0..height {
                     // cov:ignore-start: decode_raw returns one correctly shaped plane per frame component
-                    let row = Self::two_component_scanline(&raw, sampling, max_h, max_v, output_y)
-                        .ok_or_else(|| {
+                    let row =
+                        Self::unknown_component_scanline(&raw, &sampling, max_h, max_v, output_y)
+                            .ok_or_else(|| {
                             Self::runtime_error("decoded JPEG component plane is inconsistent")
                         })?;
                     // cov:ignore-end
@@ -520,7 +525,7 @@ impl Pipeline for PlDct<'_> {
                     1 => 1,
                     3 => 3,
                     4 => 4,
-                    // cov:ignore-start: The component gate and the two-component branch leave only 1/3/4 here
+                    // cov:ignore-start: Component counts 2 and 5-10 use the raw component route
                     _ => {
                         return Err(Self::runtime_error(format!(
                             "unsupported JPEG component count {components}"
@@ -583,7 +588,8 @@ mod tests {
         }
     }
 
-    fn two_component_jpeg() -> Vec<u8> {
+    fn jpeg_with_frame_components(num_components: usize) -> Vec<u8> {
+        assert!(num_components >= 1);
         let mut jpeg = libjpeg_turbo_rs::compress(
             &[128u8],
             1,
@@ -599,11 +605,20 @@ mod tests {
             .expect("baseline JPEG must contain SOF0");
         let segment_length = u16::from_be_bytes([jpeg[sof + 2], jpeg[sof + 3]]);
         assert_eq!(segment_length, 11);
-        jpeg[sof + 9] = 2;
-        jpeg[sof + 2..sof + 4].copy_from_slice(&(segment_length + 3).to_be_bytes());
+        jpeg[sof + 9] = num_components as u8;
+        let extra_components = num_components - 1;
+        let added_length = u16::try_from(extra_components * 3)
+            .expect("test component descriptors must fit in an SOF segment");
+        jpeg[sof + 2..sof + 4].copy_from_slice(&(segment_length + added_length).to_be_bytes());
         let second_component = sof + 2 + usize::from(segment_length);
-        jpeg.splice(second_component..second_component, [2, 0x11, 0]);
+        let descriptors =
+            (2..=num_components).flat_map(|component_id| [component_id as u8, 0x11, 0]);
+        jpeg.splice(second_component..second_component, descriptors);
         jpeg
+    }
+
+    fn two_component_jpeg() -> Vec<u8> {
+        jpeg_with_frame_components(2)
     }
 
     #[test]
@@ -845,6 +860,28 @@ mod tests {
 
     #[cfg(not(feature = "qpdf-libjpeg-compat"))]
     #[test]
+    fn high_component_scanline_api_returns_an_error_instead_of_panicking() {
+        let jpeg = jpeg_with_frame_components(5);
+        let mut decoder = libjpeg_turbo_rs::ScanlineDecoder::new(&jpeg)
+            .expect("ten-component frame headers are valid for the raw decoder");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decoder.read_scanline(&mut [0; 5])
+        }));
+        assert!(
+            result.is_ok(),
+            "scanline output must reject this format with an error instead of panicking"
+        );
+        let error = result
+            .expect("scanline output must not panic")
+            .expect_err("the image API has no unknown-component pixel format");
+        assert_eq!(
+            error.to_string(),
+            "unsupported feature: scanline output does not support 5-component JPEGs"
+        );
+    }
+
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+    #[test]
     fn default_backend_rejects_fractional_two_component_sampling_like_qpdf() {
         let mut jpeg = two_component_jpeg();
         let sof = jpeg
@@ -891,7 +928,7 @@ mod tests {
             height: 1,
             num_components: 1,
         };
-        assert!(PlDct::two_component_scanline(&wrong_count, [(1, 1); 2], 1, 1, 0).is_none());
+        assert!(PlDct::unknown_component_scanline(&wrong_count, &[(1, 1); 2], 1, 1, 0).is_none());
 
         let fractional_sampling = libjpeg_turbo_rs::RawImage {
             planes: vec![vec![1], vec![2]],
@@ -901,10 +938,14 @@ mod tests {
             height: 1,
             num_components: 2,
         };
-        assert!(
-            PlDct::two_component_scanline(&fractional_sampling, [(0, 1), (1, 1)], 1, 1, 0,)
-                .is_none()
-        );
+        assert!(PlDct::unknown_component_scanline(
+            &fractional_sampling,
+            &[(0, 1), (1, 1)],
+            1,
+            1,
+            0,
+        )
+        .is_none());
 
         let inconsistent_plane = libjpeg_turbo_rs::RawImage {
             planes: vec![Vec::new(), vec![2]],
@@ -914,7 +955,9 @@ mod tests {
             height: 1,
             num_components: 2,
         };
-        assert!(PlDct::two_component_scanline(&inconsistent_plane, [(1, 1); 2], 1, 1, 0).is_none());
+        assert!(
+            PlDct::unknown_component_scanline(&inconsistent_plane, &[(1, 1); 2], 1, 1, 0).is_none()
+        );
 
         let oversized_width = libjpeg_turbo_rs::RawImage {
             planes: Vec::new(),
@@ -924,7 +967,9 @@ mod tests {
             height: 0,
             num_components: 2,
         };
-        assert!(PlDct::two_component_scanline(&oversized_width, [(1, 1); 2], 1, 1, 0).is_none());
+        assert!(
+            PlDct::unknown_component_scanline(&oversized_width, &[(1, 1); 2], 1, 1, 0).is_none()
+        );
     }
 
     #[cfg(not(feature = "qpdf-libjpeg-compat"))]
@@ -943,7 +988,7 @@ mod tests {
             num_components: 2,
         };
 
-        let row = PlDct::two_component_scanline(&raw, [(1, 1), (2, 1)], 2, 1, 0)
+        let row = PlDct::unknown_component_scanline(&raw, &[(1, 1), (2, 1)], 2, 1, 0)
             .expect("raw component planes must have the declared shape");
         assert_eq!(
             row,
@@ -973,7 +1018,7 @@ mod tests {
 
         let rows = (0..4)
             .map(|y| {
-                PlDct::two_component_scanline(&raw, [(1, 2), (1, 1)], 1, 2, y)
+                PlDct::unknown_component_scanline(&raw, &[(1, 2), (1, 1)], 1, 2, y)
                     .expect("raw component planes must have the declared shape")
             })
             .collect::<Vec<_>>();
@@ -996,13 +1041,13 @@ mod tests {
             num_components: 2,
         };
 
-        let row = PlDct::two_component_scanline(&raw, [(1, 1), (2, 2)], 2, 2, 0)
+        let row = PlDct::unknown_component_scanline(&raw, &[(1, 1), (2, 2)], 2, 2, 0)
             .expect("raw component planes must have the declared shape");
         assert_eq!(
             row,
             [10, 200, 12, 200, 18, 200, 22, 200, 28, 200, 32, 200, 38, 200, 40, 200]
         );
-        let next_row = PlDct::two_component_scanline(&raw, [(1, 1), (2, 2)], 2, 2, 1)
+        let next_row = PlDct::unknown_component_scanline(&raw, &[(1, 1), (2, 2)], 2, 2, 1)
             .expect("raw component planes must have the declared shape");
         assert_eq!(
             next_row,
@@ -1027,12 +1072,29 @@ mod tests {
             num_components: 2,
         };
 
-        let row = PlDct::two_component_scanline(&raw, [(1, 1), (4, 3)], 4, 3, 4)
+        let row = PlDct::unknown_component_scanline(&raw, &[(1, 1), (4, 3)], 4, 3, 4)
             .expect("raw component planes must have the declared shape");
         assert_eq!(
             row,
             [30, 140, 30, 141, 30, 142, 30, 143, 40, 144, 40, 145, 40, 146, 40, 147]
         );
+    }
+
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+    #[test]
+    fn unknown_component_rows_preserve_frame_component_order() {
+        let raw = libjpeg_turbo_rs::RawImage {
+            planes: vec![vec![0x11], vec![0x22], vec![0x33], vec![0x44], vec![0x55]],
+            plane_widths: vec![1; 5],
+            plane_heights: vec![1; 5],
+            width: 1,
+            height: 1,
+            num_components: 5,
+        };
+
+        let row = PlDct::unknown_component_scanline(&raw, &[(1, 1); 5], 1, 1, 0)
+            .expect("each frame component must produce one output sample");
+        assert_eq!(row, [0x11, 0x22, 0x33, 0x44, 0x55]);
     }
 
     #[cfg(feature = "qpdf-libjpeg-compat")]
@@ -1095,6 +1157,41 @@ mod tests {
         // by the default pre-pass.
         assert!(matches!(error, PipelineError::Runtime(_)));
         assert_eq!(error.message(), "Unsupported marker type 0x02");
+    }
+
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+    #[test]
+    fn linked_libjpeg_component_diagnostics_are_preserved() {
+        let trace = shared_trace();
+        let mut sink = RecordingSink::with_trace(trace, &[], &[]);
+        let stage = PlDct::new("DCT decode", &mut sink);
+
+        for message in [
+            "Too many color components: 11, max 10",
+            "Bogus marker length",
+            "Invalid component ID 5 in SOS",
+        ] {
+            let error = stage.jpeg_error(
+                libjpeg_turbo_rs::JpegError::CorruptData(message.to_owned()),
+                &[0xff, 0xd8],
+            );
+            assert_eq!(error.message(), message);
+        }
+
+        let fallback = stage.jpeg_error(
+            libjpeg_turbo_rs::JpegError::CorruptData("generic marker failure".to_owned()),
+            &[0xff, 0xd8],
+        );
+        assert_eq!(fallback.message(), "corrupt data: generic marker failure");
+
+        let unsupported = stage.jpeg_error(
+            libjpeg_turbo_rs::JpegError::Unsupported("unsupported process".to_owned()),
+            &[0xff, 0xd8],
+        );
+        assert_eq!(
+            unsupported.message(),
+            "unsupported feature: unsupported process"
+        );
     }
 
     #[cfg(not(feature = "qpdf-libjpeg-compat"))]
