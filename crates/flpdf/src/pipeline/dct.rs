@@ -7,20 +7,20 @@
 //! a missing trailing EOI is reported as `invalid jpeg data reading from
 //! buffer` (`libqpdf/Pl_DCT.cc:199-206,312-325`).
 //!
-//! Known diagnostic limitation (`flpdf-69n1`): the default
-//! `libjpeg-turbo-rs` 0.8.0 parser does not expose the reserved marker byte
-//! that system libjpeg formats as `Unsupported marker type 0xNN`. Do not
-//! fabricate that byte in this adapter. Callers that require qpdf's exact
-//! marker diagnostic must enable the explicit `qpdf-libjpeg-compat` feature,
-//! which routes DCT decoding through the system-libjpeg compatibility crate.
+//! Known diagnostic limitation (`flpdf-69n1`): generic errors from the default
+//! `libjpeg-turbo-rs` 0.8.0 parser do not preserve every system-libjpeg detail.
+//! For reserved markers before SOS, the default pre-pass captures the marker
+//! byte and formats reserved marker bytes as qpdf's exact
+//! `Unsupported marker type 0xNN` (`libqpdf/Pl_DCT.cc:24-31`,
+//! `/usr/include/jerror.h:132`). Other diagnostics that need the linked
+//! system-libjpeg wording can use the explicit `qpdf-libjpeg-compat` feature.
 //!
 //! Correctness fix (`flpdf-401z`): the default path now scans marker segments
 //! before the Rust decoder starts and rejects reserved marker codes with a
-//! flpdf-specific error. This compensates for `libjpeg-turbo-rs` treating an
-//! unrecognized marker as "skip its segment and continue" rather than an
-//! error. The pre-pass closes the accept/reject gap for reserved markers while
-//! leaving the exact system-libjpeg diagnostic available through
-//! `qpdf-libjpeg-compat`.
+//! qpdf-matching marker diagnostic. This compensates for `libjpeg-turbo-rs`
+//! treating an unrecognized marker as "skip its segment and continue" rather
+//! than an error, and closes the accept/reject and message gap for reserved
+//! markers that appear before SOS.
 //!
 //! The default path handles two-component JPEGs with `Decoder::decode_raw`,
 //! then upsamples and interleaves the raw component planes in libjpeg's frame
@@ -109,8 +109,7 @@ impl<'a> PlDct<'a> {
         if matches!(error, libjpeg_turbo_rs::JpegError::UnexpectedEof) {
             return Self::runtime_error("invalid jpeg data reading from buffer");
         }
-        // qpdf-deviation-start: libjpeg-turbo-rs 0.8.0 cannot surface the reserved marker byte
-        // that system libjpeg reports in its Unsupported marker type 0xNN diagnostic
+        // qpdf-deviation-start: generic libjpeg-turbo-rs diagnostics may differ from system libjpeg format_message; reserved pre-SOS markers are remapped above
         let message = error.to_string();
         // qpdf-deviation-end
         PipelineError::runtime(message.as_bytes())
@@ -431,7 +430,7 @@ impl Pipeline for PlDct<'_> {
         {
             if let Some(marker) = Self::first_reserved_marker_before_sos(&data) {
                 return Err(Self::runtime_error(format!(
-                    "unsupported JPEG marker 0x{marker:02x}"
+                    "Unsupported marker type 0x{marker:02x}"
                 )));
             }
 
@@ -1092,12 +1091,10 @@ mod tests {
             .finish()
             .expect_err("reserved JPEG marker must fail rather than silently succeed");
 
-        // The default pre-pass reports a flpdf-specific marker diagnostic;
-        // only the compatibility backend preserves qpdf's exact wording.
-        // Pin the default message so a future dependency bump or pre-pass
-        // change cannot silently reintroduce acceptance.
+        // Pin qpdf 11.9.0's libjpeg diagnostic for the marker byte captured
+        // by the default pre-pass.
         assert!(matches!(error, PipelineError::Runtime(_)));
-        assert_eq!(error.message(), "unsupported JPEG marker 0x02");
+        assert_eq!(error.message(), "Unsupported marker type 0x02");
     }
 
     #[cfg(not(feature = "qpdf-libjpeg-compat"))]
@@ -1162,7 +1159,7 @@ mod tests {
             .finish()
             .expect_err("default backend must reject a reserved marker");
         assert!(matches!(error, PipelineError::Runtime(_)));
-        assert_eq!(error.to_string(), "unsupported JPEG marker 0x02");
+        assert_eq!(error.to_string(), "Unsupported marker type 0x02");
     }
 
     #[cfg(feature = "qpdf-libjpeg-compat")]

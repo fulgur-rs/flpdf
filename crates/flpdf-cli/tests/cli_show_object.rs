@@ -32,6 +32,10 @@ const DCT_TWO_COMPONENT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/dct-two-component.pdf"
 );
+const DCT_RESERVED_MARKER: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/dct-reserved-marker.pdf"
+);
 
 fn flpdf(args: &[&str]) -> Output {
     Command::cargo_bin("flpdf")
@@ -303,6 +307,43 @@ fn show_object_two_component_fractional_sampling_error_matches_qpdf_11_9() {
         flpdf.status.code(),
         qpdf.status.code(),
         "fractional sampling status differs from qpdf:\n{}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(
+        normalize_diagnostic_program_name(&flpdf.stderr),
+        normalize_diagnostic_program_name(&qpdf.stderr)
+    );
+}
+
+#[test]
+fn show_object_default_dct_reserved_marker_diagnostic_matches_qpdf_11_9() {
+    if !qpdf_11_9_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("qpdf 11.9.0 is required for the DCT marker diagnostic oracle test");
+        }
+        eprintln!("qpdf 11.9.0 not available; skipping DCT marker diagnostic parity test");
+        return;
+    }
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-object=3", "--filtered-stream-data"])
+        .arg(DCT_RESERVED_MARKER)
+        .output()
+        .expect("run qpdf 11.9.0 on the reserved-marker DCT fixture");
+    assert_eq!(qpdf.status.code(), Some(3));
+    assert!(qpdf.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&qpdf.stderr).contains("Unsupported marker type 0x02"));
+
+    let flpdf = flpdf(&[
+        "--show-object=3",
+        "--filtered-stream-data",
+        DCT_RESERVED_MARKER,
+    ]);
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "reserved-marker exit differs from qpdf:\n{}",
         String::from_utf8_lossy(&flpdf.stderr)
     );
     assert_eq!(flpdf.stdout, qpdf.stdout);
