@@ -505,6 +505,8 @@ mod tests {
 
     #[test]
     fn handle_constructors_report_qpdf_object_types() {
+        let pdf = handle_pdf();
+        let stream = pdf.new_stream().expect("create qpdf-owned stream handle");
         let cases = [
             (ObjectHandle::null(), "null"),
             (ObjectHandle::boolean(false), "boolean"),
@@ -515,10 +517,7 @@ mod tests {
             (ObjectHandle::name(b"N".to_vec()), "name"),
             (ObjectHandle::array(Vec::new()), "array"),
             (ObjectHandle::dictionary(Vec::new()), "dictionary"),
-            (
-                ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
-                "stream",
-            ),
+            (stream, "stream"),
             (ObjectHandle::operator(b"q".to_vec()), "operator"),
             (ObjectHandle::inline_image(b"abc".to_vec()), "inline-image"),
         ];
@@ -654,12 +653,11 @@ mod tests {
     }
 
     #[test]
-    fn object_serializer_inlines_a_direct_stream_dictionary() {
+    fn object_serializer_writes_a_stream_dictionary() {
         let mut pdf = handle_pdf();
-        let stream = ObjectHandle::stream(
-            ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(3))]),
-            Rc::new(b"abc".to_vec()),
-        );
+        let stream = pdf
+            .new_stream_with_data(Rc::new(b"abc".to_vec()))
+            .expect("create qpdf-owned stream");
 
         assert_eq!(
             write_qpdf_object_handle(&mut pdf, &stream).expect("serialize stream"),

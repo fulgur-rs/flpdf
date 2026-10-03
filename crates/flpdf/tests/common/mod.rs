@@ -11,8 +11,10 @@ use flpdf::{
     CompressStreams, CopyEncryptionSource, DecodeLevel, EncryptParams, NewlineBeforeEndstream,
     ObjectHandle, ObjectStreamMode, PageDocumentHelper, Pdf, PdfWriter, Result, StreamDataMode,
 };
+use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::io::{Read, Seek, Write};
+use std::io::{Cursor, Read, Seek, Write};
+use std::rc::Rc;
 
 /// Project repaired raw page handles only for integration cases whose API
 /// contract specifically exercises valid `N G R` references.
@@ -61,6 +63,60 @@ pub fn canonical_object_refs<R: Read + Seek + 'static>(pdf: &mut Pdf<R>) -> Vec<
         .into_iter()
         .filter_map(|handle| handle.object_ref())
         .collect()
+}
+
+thread_local! {
+    static QPDF_STREAM_TEST_PDF: RefCell<Pdf<Cursor<Vec<u8>>>> =
+        RefCell::new(Pdf::empty().expect("create qpdf-shaped test stream document"));
+}
+
+/// Create a stream through the document-owned qpdf constructor for tests
+/// that do not already have a document under test.
+pub fn qpdf_owned_stream(data: &[u8]) -> ObjectHandle {
+    qpdf_owned_stream_with_dict(data, Vec::new())
+}
+
+/// Create a document-owned qpdf stream and then apply dictionary keys through
+/// the live stream dictionary handle.
+pub fn qpdf_owned_stream_with_dict(
+    data: &[u8],
+    entries: Vec<(Vec<u8>, ObjectHandle)>,
+) -> ObjectHandle {
+    qpdf_owned_stream_with_buffer(Rc::new(data.to_vec()), entries)
+}
+
+/// Create a qpdf-owned stream without copying an already-shared buffer.
+pub fn qpdf_owned_stream_with_buffer(
+    data: Rc<Vec<u8>>,
+    entries: Vec<(Vec<u8>, ObjectHandle)>,
+) -> ObjectHandle {
+    QPDF_STREAM_TEST_PDF.with(|pdf| {
+        let pdf = pdf.borrow();
+        let stream = pdf.new_stream().expect("create qpdf-owned stream");
+        let mut filter = None;
+        let mut decode_parms = None;
+        let mut remaining_entries = Vec::with_capacity(entries.len());
+        for (mut key, value) in entries {
+            if !key.starts_with(b"/") {
+                key.insert(0, b'/');
+            }
+            match key.as_slice() {
+                b"/Filter" => filter = Some(value),
+                b"/DecodeParms" => decode_parms = Some(value),
+                _ => remaining_entries.push((key, value)),
+            }
+        }
+        stream
+            .replace_stream_data(data, filter, decode_parms)
+            .expect("replace qpdf stream data");
+        let dictionary = stream.try_get_stream_dict().expect("new stream dictionary");
+        for (key, value) in remaining_entries {
+            dictionary
+                .replace_key(&key, value)
+                .expect("set stream dictionary key");
+        }
+        stream
+    })
 }
 
 /// Result shape used by integration tests that only need to assert that the

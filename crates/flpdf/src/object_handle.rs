@@ -1,8 +1,8 @@
 //! The core object-handle graph: shared, cloneable identity for direct and
 //! indirect PDF objects, with parsed-offset tracking and document-owned
 //! reserved-object construction.
-//! Stream data replacement still uses unchecked dictionary removal and does
-//! not yet match qpdf's resolution behavior for an indirect stream dictionary.
+//! The ownerless direct-stream fixture is test-only; qpdf's public stream
+//! factories allocate document-owned indirect streams.
 //!
 //! qpdf correspondence: `QPDFObjectHandle`, `QPDFObject`, and `QPDFValue` identity and payload ownership, `QPDF::newReserved`/`QPDF_Reserved`, `QPDFObjectHandle::copyStream`/`QPDF::copyStreamData` stream-copy primitives, and `QPDF::setImmediateCopyFrom`.
 //!
@@ -1036,6 +1036,21 @@ mod parse_tests {
 ///
 /// Document-created handles resolve indirect references lazily through their
 /// document's qpdf-compatible resolver.
+///
+/// Streams are created through a document so they retain the owning PDF and
+/// indirect object identity, matching qpdf's `QPDFObjectHandle::newStream(QPDF*)`
+/// (`libqpdf/QPDFObjectHandle.cc:2017-2043`; `libqpdf/QPDF.cc:1912-1921`).
+/// An ownerless direct stream constructor is not part of this public API.
+///
+/// ```compile_fail
+/// use flpdf::ObjectHandle;
+/// use std::rc::Rc;
+///
+/// let _stream = ObjectHandle::stream(
+///     ObjectHandle::dictionary(Vec::new()),
+///     Rc::new(Vec::new()),
+/// );
+/// ```
 #[derive(Clone)]
 pub struct ObjectHandle(Rc<RefCell<ObjectSlot>>);
 
@@ -2404,6 +2419,22 @@ impl ObjectHandle {
         resolver: Weak<dyn DocumentResolver>,
     ) -> Self {
         Self::new_direct_with_resolver(value, NO_PARSED_OFFSET, Some(resolver))
+    }
+
+    /// Construct a direct value qpdf associates with an owning document even
+    /// though the value itself is not indirect. `QPDF_Stream::setDictDescription`
+    /// applies this to a stream's dictionary (`libqpdf/QPDF_Stream.cc:296-312`).
+    pub(crate) fn from_value_with_resolver_and_pdf_unique_id(
+        value: ObjectValue,
+        resolver: Weak<dyn DocumentResolver>,
+        pdf_unique_id: u64,
+    ) -> Self {
+        Self::new_parsed_direct_with_resolver(
+            value,
+            NO_PARSED_OFFSET,
+            resolver,
+            Some(pdf_unique_id),
+        )
     }
 
     /// Construct a parser-created direct value with the owning document's
@@ -4356,6 +4387,27 @@ impl ObjectHandle {
         }
     }
 
+    /// Give an unowned direct value the owning document identity that
+    /// qpdf's `setObjectDescription` installs on a stream dictionary
+    /// (`QPDF_Stream::setDictDescription`, `libqpdf/QPDF_Stream.cc:305-312`).
+    /// qpdf records the owner together with the description, so a described
+    /// dictionary is always owned; here the two are separate fields, and a
+    /// dictionary that already carries a description (as the qpdf JSON reader
+    /// installs) still receives the owner. Existing owners and descriptions
+    /// are preserved.
+    pub(crate) fn set_pdf_identity_if_unowned(
+        &self,
+        pdf_unique_id: u64,
+        resolver: Option<Weak<dyn DocumentResolver>>,
+    ) {
+        let shared = self.0.borrow().shared.clone();
+        let mut shared = shared.borrow_mut();
+        if shared.identity.active_pdf_unique_id.is_none() {
+            shared.identity.active_pdf_unique_id = NonZeroU64::new(pdf_unique_id);
+            shared.identity.resolver = resolver;
+        }
+    }
+
     fn source_extent_route(&self) -> Option<(QpdfObjGen, Rc<dyn DocumentResolver>)> {
         let (object_gen, resolver) = {
             let slot = self.0.borrow();
@@ -4450,21 +4502,25 @@ impl ObjectHandle {
         Self::new_direct(ObjectValue::Dictionary(entries), NO_PARSED_OFFSET)
     }
 
-    /// Construct a direct stream value from `dict` (a dictionary handle —
-    /// typically built via [`Self::dictionary`]) and `data` (the stream's
-    /// raw, undecoded bytes). qpdf's own model never allows a stream to be a
-    /// direct value (only ever a top-level indirect object,
-    /// `libqpdf/QPDF_Stream.cc:173-178`); this crate's own types do not
-    /// forbid it, matching [`Self::unparse_resolved`]'s own doc for that
-    /// case. Mainly useful for building a handle that is deliberately never
-    /// attached to a [`crate::Pdf`]'s object graph, e.g. in tests.
+    /// Construct an ownerless direct stream value for internal tests.
+    /// This test-only helper has no public qpdf counterpart:
+    /// `QPDFObjectHandle::newStream(QPDF*)`
+    /// delegates to `QPDF::newStream` and registers a fresh indirect object
+    /// (`libqpdf/QPDFObjectHandle.cc:2017-2043`; `libqpdf/QPDF.cc:1912-1921`).
+    /// qpdf's private JSON `reserveStream(og)` instead creates an owned stream
+    /// with an object identity (`libqpdf/QPDF.cc:1945-1949`), and its stream
+    /// constructor rejects non-dictionary input (`libqpdf/QPDF_Stream.cc:109-137`).
+    /// Use [`crate::Pdf::new_stream`] or [`crate::Pdf::new_stream_with_data`]
+    /// for qpdf-shaped stream creation. This test fixture carries neither a
+    /// document owner nor an object identity.
     ///
-    /// `data` is used as given rather than copied, the way
-    /// `QPDFObjectHandle::newStream(QPDF*, std::shared_ptr<Buffer>)` uses "the
-    /// given buffer as the stream data"
-    /// (`include/qpdf/QPDFObjectHandle.hh:546-558`). Handing the same buffer
-    /// to a second stream shares it; nothing here copies the bytes.
-    pub fn stream(dict: ObjectHandle, data: Rc<Vec<u8>>) -> Self {
+    /// `data` is used as given rather than copied, matching the shared payload
+    /// in `QPDF_Stream::stream_data` (`include/qpdf/QPDFObjectHandle.hh:546-558`).
+    /// Handing the same buffer to a second stream shares it; nothing here
+    /// copies the bytes. This storage correspondence does not make this
+    /// factory equivalent to qpdf's owner-bound stream constructors.
+    #[cfg(test)]
+    pub(crate) fn direct_stream(dict: ObjectHandle, data: Rc<Vec<u8>>) -> Self {
         Self::new_direct(
             ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict: dict,
@@ -4735,20 +4791,6 @@ impl ObjectHandle {
             });
         }
         Ok(())
-    }
-
-    // qpdf-deviation: stream construction/mutation still uses non-resolving
-    // replacement; canonical dictionary mutation uses replace_dictionary_key.
-    fn replace_key_unchecked(&self, key: &[u8], value: ObjectHandle) {
-        if value.is_direct() && value.is_null() {
-            self.remove_key_unchecked(key);
-            return;
-        }
-        self.with_value_mut(|v| {
-            if let Some(ObjectValue::Dictionary(entries)) = v {
-                entries.insert(key.to_vec(), value.clone());
-            }
-        });
     }
 
     /// Resolve this handle and emit qpdf's dictionary type warning when a
@@ -5557,7 +5599,7 @@ impl ObjectHandle {
             } else {
                 value.shallow_copy()?
             };
-            destination_dict.replace_key_unchecked(&key, value);
+            destination_dict.replace_key(&key, value)?;
         }
 
         resolver.copy_stream_data(&result, self)?;
@@ -6245,7 +6287,9 @@ impl ObjectHandle {
     /// untouched rather than removing it. A zero byte length removes
     /// `/Length`; a nonzero length installs the exact integer, matching qpdf's
     /// shared `QPDF_Stream::replaceFilterData` boundary for buffer and
-    /// provider replacement. A no-op if this handle's value is not a stream.
+    /// provider replacement. The receiver is resolved and asserted to be a
+    /// stream before its data source changes, then filter and length keys are
+    /// updated in qpdf's order.
     ///
     /// `data` is installed as given, not copied — qpdf's own
     /// `std::shared_ptr<Buffer>` overload is documented against its
@@ -6258,12 +6302,27 @@ impl ObjectHandle {
     /// resolution behavior, since this method mutates the stream data in
     /// place and updates its dictionary through qpdf's lower-level
     /// stream-internal path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::System`] if this handle is not a stream and propagates
+    /// resolution, ownership, or dictionary mutation errors. qpdf calls
+    /// `asStreamWithAssert()` before changing stream state
+    /// (`libqpdf/QPDFObjectHandle.cc:1344-1350`), then updates the source and
+    /// filter dictionary in that order (`libqpdf/QPDF_Stream.cc:640-684`).
     pub fn replace_stream_data(
         &self,
         data: Rc<Vec<u8>>,
         filter: Option<ObjectHandle>,
         decode_parms: Option<ObjectHandle>,
-    ) {
+    ) -> Result<()> {
+        self.try_dereference()?;
+        if !self.with_value(|value| matches!(value, Some(ObjectValue::Stream(_)))) {
+            let type_name = self.type_name()?;
+            return Err(Error::System(format!(
+                "operation for stream attempted on object of type {type_name}"
+            )));
+        }
         self.set_content_normalization_applied(false);
         let length = data.len();
         self.with_value_mut(|v| {
@@ -6272,7 +6331,7 @@ impl ObjectHandle {
                 stream.stream_provider = None;
             }
         });
-        self.replace_filter_data(filter, decode_parms, length);
+        self.replace_filter_data(filter, decode_parms, length)
     }
 
     /// Replace this handle's stream source with a deferred qpdf-style
@@ -6318,7 +6377,7 @@ impl ObjectHandle {
                 stream.stream_provider = Some(provider);
             }
         });
-        self.replace_filter_data(filter, decode_parms, 0);
+        self.replace_filter_data(filter, decode_parms, 0)?;
         Ok(())
     }
 
@@ -6375,6 +6434,8 @@ impl ObjectHandle {
             ));
         }
         self.check_key_value_ownership(&dictionary)?;
+        let owner_pdf_unique_id = self.owning_pdf_unique_id();
+        let owner_resolver = self.context().map(|resolver| Rc::downgrade(&resolver));
 
         let previous = self.with_value_mut(|value| match value {
             Some(ObjectValue::Stream(stream)) => Some(std::mem::replace(
@@ -6390,6 +6451,9 @@ impl ObjectHandle {
                 type_name
             )));
         };
+        if let Some(pdf_unique_id) = owner_pdf_unique_id {
+            dictionary.set_pdf_identity_if_unowned(pdf_unique_id, owner_resolver);
+        }
         Ok(())
     }
 
@@ -6401,25 +6465,23 @@ impl ObjectHandle {
         filter: Option<ObjectHandle>,
         decode_parms: Option<ObjectHandle>,
         length: usize,
-    ) {
-        let Some(dict) = self.as_stream_dict() else {
-            return;
-        };
+    ) -> Result<()> {
+        let dict = self.try_get_stream_dict()?;
         if let Some(filter) = filter {
-            dict.replace_key_unchecked(b"/Filter", filter);
+            dict.replace_key(b"/Filter", filter)?;
         }
         if let Some(decode_parms) = decode_parms {
-            dict.replace_key_unchecked(b"/DecodeParms", decode_parms);
+            dict.replace_key(b"/DecodeParms", decode_parms)?;
         }
         if length == 0 {
-            // qpdf-deviation: legacy stream setup still uses unchecked dictionary storage; qpdf QPDF_Stream::replaceFilterData calls resolving removeKey. The stream-model cutover removes this remaining consumer.
-            dict.remove_key_unchecked(b"/Length");
+            dict.remove_key(b"/Length")?;
         } else {
-            dict.replace_key_unchecked(
+            dict.replace_key(
                 b"/Length",
                 ObjectHandle::integer(i64::try_from(length).unwrap_or(i64::MAX)),
-            );
+            )?; // cov:ignore: a stream-owned dictionary accepts its direct integer length through the same-Pdf replaceKey path.
         }
+        Ok(())
     }
 
     /// Return the live dictionary owned by a stream after lazily resolving the
@@ -7390,7 +7452,7 @@ impl ObjectHandle {
                     )));
                 }
             } else {
-                stream_dict.replace_key_unchecked(b"/Length", ObjectHandle::integer(actual_length));
+                stream_dict.replace_key(b"/Length", ObjectHandle::integer(actual_length))?;
             }
             return Ok(true);
         }
@@ -7698,7 +7760,7 @@ fn unparse_resolved_into(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()>
             return Ok(());
         }
 
-        unparse_resolved_value(handle, value, out)
+        unparse_resolved_value(value, out)
     })
 }
 
@@ -7724,11 +7786,7 @@ fn unparse_resolved_child(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()
     }
 }
 
-fn unparse_resolved_value(
-    handle: &ObjectHandle,
-    value: ObjectValue,
-    out: &mut Vec<u8>,
-) -> Result<()> {
+fn unparse_resolved_value(value: ObjectValue, out: &mut Vec<u8>) -> Result<()> {
     match value {
         ObjectValue::Null => out.extend_from_slice(b"null"),
         ObjectValue::Unresolved => return Err(unresolved_unparse_error()),
@@ -7774,18 +7832,10 @@ fn unparse_resolved_value(
             }
             out.extend_from_slice(b">>");
         }
-        ObjectValue::Stream(stream) => {
-            // qpdf owns streams as indirect objects. This direct-stream arm
-            // retains the existing Rust-only factory behavior for a value
-            // without an object number.
-            unparse_resolved_into(&stream.stream_dict, out)?;
-            out.extend_from_slice(b"\nstream\n");
-            let data = match &stream.stream_data {
-                Some(data) => data.clone(),
-                None => handle.get_raw_stream_data()?,
-            };
-            out.extend_from_slice(&data);
-            out.extend_from_slice(b"\nendstream");
+        ObjectValue::Stream(_) => {
+            return Err(Error::Internal(
+                "attempted to unparse a stream without an object identity".to_owned(),
+            ));
         }
     }
     Ok(())
@@ -8703,7 +8753,7 @@ mod object_json_writer_tests {
     }
 
     fn flate_stream() -> ObjectHandle {
-        ObjectHandle::stream(
+        ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![
                 (b"/Length".to_vec(), ObjectHandle::integer(13)),
                 (
@@ -8828,7 +8878,7 @@ mod object_json_writer_tests {
 
     #[test]
     fn stream_json_retries_an_unfilterable_stream_as_raw_data() {
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![
                 (b"/Length".to_vec(), ObjectHandle::integer(3)),
                 (
@@ -9430,8 +9480,14 @@ mod content_shape_internal_tests {
         let page = ObjectHandle::dictionary(vec![(
             b"/Contents".to_vec(),
             ObjectHandle::array(vec![
-                ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
-                ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
+                ObjectHandle::direct_stream(
+                    ObjectHandle::dictionary(Vec::new()),
+                    Rc::new(Vec::new()),
+                ),
+                ObjectHandle::direct_stream(
+                    ObjectHandle::dictionary(Vec::new()),
+                    Rc::new(Vec::new()),
+                ),
             ]),
         )]);
 
@@ -10648,7 +10704,8 @@ pub(crate) mod identity_tests {
             b"Type".to_vec(),
             ObjectHandle::name(b"ObjStm".to_vec()),
         )]);
-        let wrong_type_stream = ObjectHandle::stream(wrong_type_dict, std::rc::Rc::new(Vec::new()));
+        let wrong_type_stream =
+            ObjectHandle::direct_stream(wrong_type_dict, std::rc::Rc::new(Vec::new()));
         assert!(!wrong_type_stream
             .try_is_stream_of_type(b"XRef", b"")
             .unwrap());
@@ -10660,14 +10717,14 @@ pub(crate) mod identity_tests {
             b"Type".to_vec(),
             ObjectHandle::name(b"XRef".to_vec()),
         )]);
-        let xref_stream = ObjectHandle::stream(xref_dict, std::rc::Rc::new(Vec::new()));
+        let xref_stream = ObjectHandle::direct_stream(xref_dict, std::rc::Rc::new(Vec::new()));
         assert!(xref_stream.try_is_stream_of_type(b"XRef", b"").unwrap());
 
         let objstm_dict = ObjectHandle::dictionary(vec![(
             b"Type".to_vec(),
             ObjectHandle::name(b"ObjStm".to_vec()),
         )]);
-        let objstm_stream = ObjectHandle::stream(objstm_dict, std::rc::Rc::new(Vec::new()));
+        let objstm_stream = ObjectHandle::direct_stream(objstm_dict, std::rc::Rc::new(Vec::new()));
         assert!(objstm_stream.try_is_stream_of_type(b"ObjStm", b"").unwrap());
     }
 
@@ -11614,7 +11671,7 @@ mod object_value_tests {
     #[test]
     fn stream_handle_round_trips_its_dict_and_data() {
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(3))]);
-        let stream = ObjectHandle::stream(dict.clone(), Rc::new(b"abc".to_vec()));
+        let stream = ObjectHandle::direct_stream(dict.clone(), Rc::new(b"abc".to_vec()));
         assert!(stream.as_stream_dict().expect("stream dict").ptr_eq(&dict));
         assert_eq!(stream.as_stream_data(), Some(Rc::new(b"abc".to_vec())));
         assert_eq!(
@@ -11629,7 +11686,8 @@ mod object_value_tests {
 
     #[test]
     fn raw_stream_data_uses_replacements_including_an_empty_buffer() {
-        let stream = ObjectHandle::stream(ObjectHandle::dictionary(vec![]), Rc::new(Vec::new()));
+        let stream =
+            ObjectHandle::direct_stream(ObjectHandle::dictionary(vec![]), Rc::new(Vec::new()));
         assert!(
             stream
                 .get_raw_stream_data()
@@ -11638,7 +11696,9 @@ mod object_value_tests {
             "an empty replacement is data, not an original-stream sentinel"
         );
 
-        stream.replace_stream_data(Rc::new(b"replacement".to_vec()), None, None);
+        stream
+            .replace_stream_data(Rc::new(b"replacement".to_vec()), None, None)
+            .expect("replace stream data");
         assert_eq!(
             stream
                 .get_raw_stream_data()
@@ -11733,7 +11793,7 @@ mod stream_payload_sharing_tests {
     #[test]
     fn stream_only_state_is_shared_by_aliases() {
         let stream =
-            ObjectHandle::stream(ObjectHandle::dictionary(vec![]), Rc::new(b"abc".to_vec()));
+            ObjectHandle::direct_stream(ObjectHandle::dictionary(vec![]), Rc::new(b"abc".to_vec()));
         let alias = stream.clone();
 
         stream.mark_content_normalization_applied();
@@ -11745,7 +11805,9 @@ mod stream_payload_sharing_tests {
         let debug = stream.with_value(|value| format!("{value:?}"));
         assert!(debug.contains("<TokenFilter>"));
 
-        alias.replace_stream_data(Rc::new(b"replacement".to_vec()), None, None);
+        alias
+            .replace_stream_data(Rc::new(b"replacement".to_vec()), None, None)
+            .expect("replace stream data");
         assert!(!stream.content_normalization_applied());
         assert!(stream.is_data_modified());
     }
@@ -11775,10 +11837,12 @@ mod stream_payload_sharing_tests {
     #[test]
     fn one_buffer_backs_two_streams_without_copying() {
         let shared = Rc::new(vec![0x5a; 4096]);
-        let source = ObjectHandle::stream(length_dict(4096), Rc::clone(&shared));
-        let destination = ObjectHandle::stream(length_dict(0), Rc::new(Vec::new()));
+        let source = ObjectHandle::direct_stream(length_dict(4096), Rc::clone(&shared));
+        let destination = ObjectHandle::direct_stream(length_dict(0), Rc::new(Vec::new()));
 
-        destination.replace_stream_data(source.as_stream_data().expect("stream data"), None, None);
+        destination
+            .replace_stream_data(source.as_stream_data().expect("stream data"), None, None)
+            .expect("replace stream data");
 
         assert!(Rc::ptr_eq(&payload_of(&source), &shared));
         assert!(Rc::ptr_eq(&payload_of(&destination), &shared));
@@ -11803,7 +11867,7 @@ mod stream_payload_sharing_tests {
     #[test]
     fn direct_value_clone_shares_the_stream_payload_but_not_the_dictionary() {
         let shared = Rc::new(vec![0x5a; 4096]);
-        let stream = ObjectHandle::stream(length_dict(4096), Rc::clone(&shared));
+        let stream = ObjectHandle::direct_stream(length_dict(4096), Rc::clone(&shared));
         let source_dict = stream.as_stream_dict().expect("source stream dict");
 
         let copy = ObjectHandle::from_value(
@@ -11832,8 +11896,8 @@ mod stream_payload_sharing_tests {
     // throw (`libqpdf/QPDF_Stream.cc:140-145`).
     #[test]
     fn direct_value_clone_propagates_a_nested_direct_streams_rejection() {
-        let inner = ObjectHandle::stream(length_dict(3), Rc::new(b"abc".to_vec()));
-        let outer = ObjectHandle::stream(
+        let inner = ObjectHandle::direct_stream(length_dict(3), Rc::new(b"abc".to_vec()));
+        let outer = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"Nested".to_vec(), inner)]),
             Rc::new(b"xyz".to_vec()),
         );
@@ -11881,7 +11945,7 @@ mod stream_payload_sharing_tests {
     #[test]
     fn shallow_copy_refuses_a_stream() {
         let shared = Rc::new(vec![0x5a; 4096]);
-        let stream = ObjectHandle::stream(length_dict(4096), Rc::clone(&shared));
+        let stream = ObjectHandle::direct_stream(length_dict(4096), Rc::clone(&shared));
 
         let error = stream.shallow_copy().expect_err("streams cannot be cloned");
 
@@ -11898,7 +11962,7 @@ mod stream_payload_sharing_tests {
     // child, so the throw comes from the same `QPDF_Stream::copy`.
     #[test]
     fn shallow_copy_refuses_a_direct_stream_nested_in_a_container() {
-        let stream = ObjectHandle::stream(length_dict(4096), Rc::new(vec![0x5a; 4096]));
+        let stream = ObjectHandle::direct_stream(length_dict(4096), Rc::new(vec![0x5a; 4096]));
         let dictionary = ObjectHandle::dictionary(vec![(b"Nested".to_vec(), stream.clone())]);
         let array = ObjectHandle::array(vec![ObjectHandle::array(vec![stream])]);
 
@@ -11948,7 +12012,7 @@ mod stream_payload_sharing_tests {
     #[test]
     fn as_stream_data_hands_out_the_stored_payload_without_copying_it() {
         let shared = Rc::new(vec![0x5a; 4096]);
-        let stream = ObjectHandle::stream(length_dict(4096), Rc::clone(&shared));
+        let stream = ObjectHandle::direct_stream(length_dict(4096), Rc::clone(&shared));
 
         let handed_out = stream.as_stream_data().expect("stream data");
 
@@ -11961,9 +12025,11 @@ mod stream_payload_sharing_tests {
     #[test]
     fn an_empty_payload_is_shared_like_any_other() {
         let shared = Rc::new(Vec::new());
-        let stream = ObjectHandle::stream(length_dict(4096), Rc::new(vec![0x5a; 4096]));
+        let stream = ObjectHandle::direct_stream(length_dict(4096), Rc::new(vec![0x5a; 4096]));
 
-        stream.replace_stream_data(Rc::clone(&shared), None, None);
+        stream
+            .replace_stream_data(Rc::clone(&shared), None, None)
+            .expect("replace stream data");
 
         assert!(Rc::ptr_eq(&payload_of(&stream), &shared));
         assert!(!stream
@@ -12069,7 +12135,8 @@ mod resolution_state_tests {
 
         impl StreamDataProvider for ReaderHoldingProvider {}
 
-        let stream = ObjectHandle::stream(ObjectHandle::dictionary(vec![]), Rc::new(Vec::new()));
+        let stream =
+            ObjectHandle::direct_stream(ObjectHandle::dictionary(vec![]), Rc::new(Vec::new()));
         let dropped = Rc::new(std::cell::Cell::new(false));
         let reader = ReadOnDrop {
             stream: stream.clone(),
@@ -12346,7 +12413,8 @@ mod resolution_state_tests {
     /// so the only strong reference to `source` it introduces is the one the
     /// stream itself holds.
     fn direct_stream_with_provider_for(source: &ObjectHandle) -> ObjectHandle {
-        let stream = ObjectHandle::stream(ObjectHandle::dictionary(vec![]), Rc::new(Vec::new()));
+        let stream =
+            ObjectHandle::direct_stream(ObjectHandle::dictionary(vec![]), Rc::new(Vec::new()));
         stream.with_value_mut(|value| {
             if let Some(ObjectValue::Stream(stream)) = value {
                 stream.stream_data = None;
@@ -12416,7 +12484,7 @@ mod resolution_state_tests {
         // dictionary the walk descends into are left as they were.
         let data = Rc::new(b"stream bytes".to_vec());
         let stream_dict = ObjectHandle::dictionary(vec![]);
-        let stream = ObjectHandle::stream(stream_dict.clone(), data.clone());
+        let stream = ObjectHandle::direct_stream(stream_dict.clone(), data.clone());
         let owner = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
         owner.set_resolved(ObjectValue::Dictionary(
             [(b"S".to_vec(), stream.clone())].into_iter().collect(),
@@ -12970,12 +13038,7 @@ mod type_code_tests {
     }
 
     #[test]
-    fn a_direct_stream_value_unparse_resolved_inlines_rather_than_referencing() {
-        // A *direct* Stream `ObjectValue` is a Rust-only construction shape
-        // reachable through the public `ObjectHandle::stream` factory. qpdf
-        // creates streams as indirect objects (`QPDF.cc:1912-1923`), so this
-        // case has no qpdf output contract; retain the existing explicit
-        // factory behavior without introducing another representation.
+    fn a_direct_stream_without_object_identity_cannot_be_unparsed() {
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
         let handle = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: dict,
@@ -12986,10 +13049,11 @@ mod type_code_tests {
             content_normalization_applied: false,
             stream_length: 0,
         })));
-        assert_eq!(
-            handle.unparse_resolved().unwrap(),
-            b"<< /Length 2 >>\nstream\nab\nendstream"
-        );
+        assert!(matches!(
+            handle.unparse_resolved(),
+            Err(Error::Internal(message))
+                if message == "attempted to unparse a stream without an object identity"
+        ));
     }
 
     #[test]
@@ -13118,25 +13182,6 @@ mod type_code_tests {
         let handle = ObjectHandle::real_from_string(b"not-a-real");
 
         assert_eq!(handle.unparse_resolved().unwrap(), b"not-a-real");
-    }
-
-    #[test]
-    fn unparse_resolved_reports_missing_original_data_for_a_direct_stream() {
-        let handle = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
-            stream_dict: ObjectHandle::dictionary(Vec::new()),
-            stream_data: None,
-            stream_provider: None,
-            filter_on_write: true,
-            stream_token_filters: Default::default(),
-            content_normalization_applied: false,
-            stream_length: 0,
-        })));
-
-        assert!(handle
-            .unparse_resolved()
-            .expect_err("a direct original stream has no source")
-            .to_string()
-            .contains("pipeStreamData called for original direct stream"));
     }
 }
 
@@ -13403,7 +13448,7 @@ mod mutation_tests {
             b"Filter".to_vec(),
             ObjectHandle::name(b"FlateDecode".to_vec()),
         )]);
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             dict,
             Rc::new(vec![
                 0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x06, 0x2c, 0x02, 0x15,
@@ -13445,7 +13490,7 @@ mod mutation_tests {
                 ]),
             ),
         ]);
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             dict,
             Rc::new(vec![
                 0x78, 0x9c, 0xe3, 0xe2, 0xe2, 0xe2, 0x02, 0x00, 0x00, 0x68, 0x00, 0x29,
@@ -13481,7 +13526,8 @@ mod mutation_tests {
             ),
             (b"DecodeParms".to_vec(), ObjectHandle::array(vec![])),
         ]);
-        let stream = ObjectHandle::stream(dict, Rc::new(b"789ccb48cdc9c90700062c0215>".to_vec()));
+        let stream =
+            ObjectHandle::direct_stream(dict, Rc::new(b"789ccb48cdc9c90700062c0215>".to_vec()));
         let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
         let mut filtering_attempted = false;
 
@@ -13649,7 +13695,7 @@ mod mutation_tests {
             (b"DCTDecode".as_slice(), DecodeLevel::Generalized),
             (b"RunLengthDecode".as_slice(), DecodeLevel::Generalized),
         ] {
-            let stream = ObjectHandle::stream(
+            let stream = ObjectHandle::direct_stream(
                 ObjectHandle::dictionary(vec![(
                     b"Filter".to_vec(),
                     ObjectHandle::name(filter.to_vec()),
@@ -13684,7 +13730,7 @@ mod mutation_tests {
                 ObjectHandle::dictionary(vec![(b"Predictor".to_vec(), predictor)]),
             ),
         ]);
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             dict,
             Rc::new(vec![
                 0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x06, 0x2c, 0x02, 0x15,
@@ -13776,7 +13822,7 @@ mod mutation_tests {
 
     #[test]
     fn pipe_stream_data_preserves_an_unsupported_filter_without_attempting_filtering() {
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(
                 b"Filter".to_vec(),
                 ObjectHandle::name(b"UnknownDecode".to_vec()),
@@ -13939,7 +13985,7 @@ mod mutation_tests {
                 ]),
             ),
         ]);
-        let stream = ObjectHandle::stream(dict, Rc::new(encoded));
+        let stream = ObjectHandle::direct_stream(dict, Rc::new(encoded));
         let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
         let mut filtering_attempted = false;
 
@@ -13978,7 +14024,7 @@ mod mutation_tests {
                 ObjectHandle::array(vec![first_params, second_params]),
             ),
         ]);
-        let stream = ObjectHandle::stream(dict.clone(), Rc::new(Vec::new()));
+        let stream = ObjectHandle::direct_stream(dict.clone(), Rc::new(Vec::new()));
 
         assert!(stream.prepare_stream_filter_plan(&dict).unwrap().is_none());
         assert!(super::warning_emission_tests::warnings(&recorder)
@@ -13989,7 +14035,7 @@ mod mutation_tests {
 
     #[test]
     fn pipe_stream_data_keeps_crypt_as_a_no_stage_after_filterability() {
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![
                 (b"Filter".to_vec(), ObjectHandle::name(b"Crypt".to_vec())),
                 (
@@ -14218,7 +14264,7 @@ mod mutation_tests {
 
     #[test]
     fn pipe_stream_data_gates_specialized_filters_by_decode_level() {
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(
                 b"Filter".to_vec(),
                 ObjectHandle::name(b"DCTDecode".to_vec()),
@@ -14245,7 +14291,7 @@ mod mutation_tests {
 
     #[test]
     fn pipe_stream_data_gates_non_lossy_specialized_filters_separately() {
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(
                 b"Filter".to_vec(),
                 ObjectHandle::name(b"RunLengthDecode".to_vec()),
@@ -14284,7 +14330,7 @@ mod mutation_tests {
             encoded = wrapped;
             filters.push(ObjectHandle::name(b"ASCIIHexDecode".to_vec()));
         }
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"Filter".to_vec(), ObjectHandle::array(filters))]),
             Rc::new(encoded),
         );
@@ -14411,7 +14457,7 @@ mod mutation_tests {
 
     #[test]
     fn pipe_stream_data_rejects_present_decode_parms_for_dct_before_stage_build() {
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![
                 (
                     b"Filter".to_vec(),
@@ -14447,8 +14493,10 @@ mod mutation_tests {
 
     #[test]
     fn pipe_stream_data_normalizes_before_compressing_output() {
-        let stream =
-            ObjectHandle::stream(ObjectHandle::dictionary(vec![]), Rc::new(b"q\rQ".to_vec()));
+        let stream = ObjectHandle::direct_stream(
+            ObjectHandle::dictionary(vec![]),
+            Rc::new(b"q\rQ".to_vec()),
+        );
         let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
         let mut filtering_attempted = false;
 
@@ -14476,7 +14524,7 @@ mod mutation_tests {
 
     #[test]
     fn stream_data_filterability_probe_rejects_an_unknown_filter_without_piping_source() {
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(
                 b"Filter".to_vec(),
                 ObjectHandle::name(b"BogusDecode".to_vec()),
@@ -15854,7 +15902,7 @@ mod mutation_tests {
     #[test]
     fn merge_resources_propagates_the_stream_rejection_from_either_privatizing_site() {
         let stream = || {
-            ObjectHandle::stream(
+            ObjectHandle::direct_stream(
                 ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(3))]),
                 Rc::new(b"abc".to_vec()),
             )
@@ -16202,7 +16250,9 @@ mod mutation_tests {
             content_normalization_applied: false,
             stream_length: 37,
         })));
-        stream.replace_stream_data(Rc::new(b"new data".to_vec()), None, None);
+        stream
+            .replace_stream_data(Rc::new(b"new data".to_vec()), None, None)
+            .expect("replace stream data");
         assert_eq!(stream.as_stream_data(), Some(Rc::new(b"new data".to_vec())));
         assert_eq!(dict.try_get_key(b"/Length").unwrap().as_integer(), Some(8));
         assert_eq!(
@@ -16228,7 +16278,9 @@ mod mutation_tests {
             stream_length: 37,
         })));
 
-        stream.replace_stream_data(Rc::new(Vec::new()), None, None);
+        stream
+            .replace_stream_data(Rc::new(Vec::new()), None, None)
+            .expect("replace stream data");
 
         assert!(!dict.try_has_key(b"/Length").unwrap());
     }
@@ -16246,7 +16298,9 @@ mod mutation_tests {
             stream_length: 3,
         })));
 
-        stream.replace_stream_data(Rc::new(Vec::new()), None, None);
+        stream
+            .replace_stream_data(Rc::new(Vec::new()), None, None)
+            .expect("replace stream data");
 
         assert!(!dict.try_has_key(b"/Length").unwrap());
     }
@@ -16264,13 +16318,19 @@ mod mutation_tests {
             stream_length: 3,
         })));
 
-        stream.replace_stream_data(Rc::new(Vec::new()), None, None);
+        stream
+            .replace_stream_data(Rc::new(Vec::new()), None, None)
+            .expect("replace stream data");
         assert!(!dict.try_has_key(b"/Length").unwrap());
 
-        stream.replace_stream_data(Rc::new(b"new data".to_vec()), None, None);
+        stream
+            .replace_stream_data(Rc::new(b"new data".to_vec()), None, None)
+            .expect("replace stream data");
         assert_eq!(dict.try_get_key(b"/Length").unwrap().as_integer(), Some(8));
 
-        stream.replace_stream_data(Rc::new(Vec::new()), None, None);
+        stream
+            .replace_stream_data(Rc::new(Vec::new()), None, None)
+            .expect("replace stream data");
         assert!(!dict.try_has_key(b"/Length").unwrap());
     }
 
@@ -16289,11 +16349,13 @@ mod mutation_tests {
         let filter = ObjectHandle::name(b"FlateDecode".to_vec());
         let parms =
             ObjectHandle::dictionary(vec![(b"Predictor".to_vec(), ObjectHandle::integer(12))]);
-        stream.replace_stream_data(
-            Rc::new(b"x".to_vec()),
-            Some(filter.clone()),
-            Some(parms.clone()),
-        );
+        stream
+            .replace_stream_data(
+                Rc::new(b"x".to_vec()),
+                Some(filter.clone()),
+                Some(parms.clone()),
+            )
+            .expect("replace stream data");
         assert!(dict.try_get_key(b"/Filter").unwrap().ptr_eq(&filter));
         assert!(dict.try_get_key(b"/DecodeParms").unwrap().ptr_eq(&parms));
     }
@@ -16313,7 +16375,9 @@ mod mutation_tests {
             content_normalization_applied: false,
             stream_length: 0,
         })));
-        stream.replace_stream_data(Rc::new(b"new".to_vec()), None, None);
+        stream
+            .replace_stream_data(Rc::new(b"new".to_vec()), None, None)
+            .expect("replace stream data");
         assert_eq!(
             dict.try_get_key(b"/Filter").unwrap().as_name(),
             Some(b"FlateDecode".to_vec())
@@ -16321,10 +16385,107 @@ mod mutation_tests {
     }
 
     #[test]
-    fn replace_stream_data_on_a_non_stream_handle_is_a_no_op() {
+    fn replace_stream_data_on_a_non_stream_handle_matches_qpdf_assertion() {
         let scalar = ObjectHandle::integer(1);
-        scalar.replace_stream_data(Rc::new(b"x".to_vec()), None, None);
+        let error = scalar
+            .replace_stream_data(Rc::new(b"x".to_vec()), None, None)
+            .expect_err("replaceStreamData asserts that the receiver is a stream");
+        assert!(matches!(
+            error,
+            Error::System(message)
+                if message == "operation for stream attempted on object of type integer"
+        ));
         assert_eq!(scalar.as_integer(), Some(1));
+    }
+
+    #[test]
+    fn replace_stream_data_preserves_qpdf_mutation_order_on_filter_ownership_error(
+    ) -> crate::Result<()> {
+        let document = crate::Pdf::empty()?;
+        let mut foreign_document = crate::Pdf::empty()?;
+        let stream = document.new_stream()?;
+        let foreign_filter = foreign_document
+            .make_indirect_object_handle(ObjectHandle::name(b"/Foreign".to_vec()))?;
+        let replacement = Rc::new(b"replacement bytes".to_vec());
+
+        let error = stream
+            .replace_stream_data(Rc::clone(&replacement), Some(foreign_filter), None)
+            .expect_err("qpdf rejects a filter value owned by a different document");
+
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "Attempting to add an object from a different QPDF. Use QPDF::copyForeignObject to add objects from another file."
+        ));
+        assert_eq!(stream.as_stream_data(), Some(replacement));
+        let dict = stream.try_get_stream_dict()?;
+        assert!(!dict.try_has_key(b"/Filter")?);
+        assert!(!dict.try_has_key(b"/Length")?);
+        Ok(())
+    }
+
+    #[test]
+    fn replace_stream_dict_binds_an_unowned_dictionary_to_its_stream_pdf() -> crate::Result<()> {
+        let document = crate::Pdf::empty()?;
+        let mut foreign_document = crate::Pdf::empty()?;
+        let stream = document.new_stream()?;
+        let replacement_dict = ObjectHandle::dictionary(vec![]);
+        stream.replace_stream_dict(replacement_dict.clone())?;
+        let foreign_filter = foreign_document
+            .make_indirect_object_handle(ObjectHandle::name(b"/Foreign".to_vec()))?;
+
+        let error = stream
+            .replace_stream_data(
+                Rc::new(b"replacement bytes".to_vec()),
+                Some(foreign_filter),
+                None,
+            )
+            .expect_err("qpdf assigns the stream owner to an undescribed replacement dict");
+
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "Attempting to add an object from a different QPDF. Use QPDF::copyForeignObject to add objects from another file."
+        ));
+        assert_eq!(
+            replacement_dict.owning_pdf_unique_id(),
+            stream.owning_pdf_unique_id()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replace_stream_dict_binds_a_described_but_unowned_dictionary_to_its_stream_pdf(
+    ) -> crate::Result<()> {
+        let document = crate::Pdf::empty()?;
+        let mut foreign_document = crate::Pdf::empty()?;
+        let stream = document.new_stream()?;
+        let replacement_dict = ObjectHandle::dictionary(vec![]);
+        replacement_dict.set_description_json("input.json", "object 1 0", 17);
+        assert_eq!(replacement_dict.owning_pdf_unique_id(), None);
+        stream.replace_stream_dict(replacement_dict.clone())?;
+        let foreign_filter = foreign_document
+            .make_indirect_object_handle(ObjectHandle::name(b"/Foreign".to_vec()))?;
+
+        let error = stream
+            .replace_stream_data(
+                Rc::new(b"replacement bytes".to_vec()),
+                Some(foreign_filter),
+                None,
+            )
+            .expect_err("a described replacement dictionary is owned by the stream's document");
+
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "Attempting to add an object from a different QPDF. Use QPDF::copyForeignObject to add objects from another file."
+        ));
+        assert_eq!(
+            replacement_dict.owning_pdf_unique_id(),
+            stream.owning_pdf_unique_id()
+        );
+        assert!(!replacement_dict.try_has_key(b"/Filter")?);
+        Ok(())
     }
 
     #[test]
@@ -16623,7 +16784,8 @@ mod mutation_tests {
                 if message == "attempted to shallow copy QPDFObjectHandle from destroyed QPDF"
         ));
 
-        let stream = ObjectHandle::stream(ObjectHandle::dictionary(vec![]), Rc::new(Vec::new()));
+        let stream =
+            ObjectHandle::direct_stream(ObjectHandle::dictionary(vec![]), Rc::new(Vec::new()));
         assert!(matches!(
             stream.unsafe_shallow_copy(),
             Err(Error::System(message)) if message == "stream objects cannot be cloned"
@@ -16971,7 +17133,7 @@ mod stream_provider_contract_tests {
     }
 
     fn provider_stream() -> ObjectHandle {
-        ObjectHandle::stream(
+        ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(3))]),
             Rc::new(b"old".to_vec()),
         )
@@ -17362,7 +17524,9 @@ mod stream_provider_contract_tests {
         drop(provider);
         assert!(ownership.upgrade().is_some());
 
-        stream.replace_stream_data(Rc::new(b"new".to_vec()), None, None);
+        stream
+            .replace_stream_data(Rc::new(b"new".to_vec()), None, None)
+            .expect("replace stream data");
         assert!(
             ownership.upgrade().is_none(),
             "buffer replacement must clear provider ownership"
@@ -17599,7 +17763,8 @@ mod stream_provider_contract_tests {
 
     #[test]
     fn provider_backed_direct_stream_rejects_missing_qpdf_identity() {
-        let stream = ObjectHandle::stream(ObjectHandle::dictionary(vec![]), Rc::new(Vec::new()));
+        let stream =
+            ObjectHandle::direct_stream(ObjectHandle::dictionary(vec![]), Rc::new(Vec::new()));
         stream.with_value_mut(|value| {
             if let Some(ObjectValue::Stream(stream)) = value {
                 stream.stream_data = None;
@@ -19566,7 +19731,7 @@ mod filter_on_write_tests {
     #[test]
     fn filter_on_write_defaults_true_and_is_shared_by_aliases() {
         let stream =
-            ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new()));
+            ObjectHandle::direct_stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new()));
         let alias = stream.clone();
 
         assert!(
@@ -19777,7 +19942,7 @@ mod drop_tests {
             ),
             (
                 "stream",
-                ObjectHandle::stream(stream_dict, Rc::new(Vec::new()))
+                ObjectHandle::direct_stream(stream_dict, Rc::new(Vec::new()))
                     .with_value(|value| value.cloned())
                     .expect("stream value"),
             ),
@@ -19836,7 +20001,7 @@ mod drop_tests {
         let mut handle = ObjectHandle::integer(0);
         for _ in 0..DEEP_DROP_DEPTH {
             let dictionary = ObjectHandle::dictionary(vec![(b"/Next".to_vec(), handle)]);
-            handle = ObjectHandle::stream(dictionary, Rc::clone(&data));
+            handle = ObjectHandle::direct_stream(dictionary, Rc::clone(&data));
         }
         drop(handle);
         assert_eq!(Rc::strong_count(&data), 1);

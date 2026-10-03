@@ -1069,7 +1069,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// lets `ObjectHandle::copy_stream` use the same path as `Pdf::new_stream`.
     pub(crate) fn new_stream_handle(&self) -> Result<ObjectHandle> {
         let stream = self.direct_object_handle(ObjectValue::Stream(Box::new(StreamValue {
-            stream_dict: ObjectHandle::dictionary(Vec::new()),
+            stream_dict: self.new_stream_dictionary_handle(),
             stream_data: None,
             stream_length: 0,
             stream_provider: None,
@@ -1079,6 +1079,19 @@ impl<R: Read + Seek> ResolverHandle<R> {
         })));
         stream.set_parsed_offset_if_unset(0);
         self.make_indirect_from_object_handle(stream)
+    }
+
+    /// Create a new stream's direct dictionary with the owning document
+    /// identity that qpdf installs through `QPDF_Stream::setDictDescription`
+    /// (`libqpdf/QPDF_Stream.cc:296-312`). Ordinary programmatic dictionaries
+    /// remain unowned until a stream takes ownership of the dictionary slot.
+    pub(crate) fn new_stream_dictionary_handle(&self) -> ObjectHandle {
+        let resolver: Weak<dyn DocumentResolver> = self.self_weak.clone();
+        ObjectHandle::from_value_with_resolver_and_pdf_unique_id(
+            ObjectValue::Dictionary(BTreeMap::new()),
+            resolver,
+            self.pdf_unique_id.get(),
+        )
     }
 
     /// Create qpdf's reserved construction sentinel and register its
@@ -1155,12 +1168,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 raw_data,
                 Some(stream_copy_dictionary_value(&source_dict, b"/Filter")?),
                 Some(stream_copy_dictionary_value(&source_dict, b"/DecodeParms")?),
-            );
+            )?; // cov:ignore: the source stream and its dictionary values share the source Pdf owner.
             source_data = source.as_stream_data();
         }
 
         if let Some(data) = source_data {
-            destination.replace_stream_data(data, filter, decode_parms);
+            destination.replace_stream_data(data, filter, decode_parms)?;
             return Ok(());
         }
 

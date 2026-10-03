@@ -876,7 +876,7 @@ mod tests {
         source
             .replace_object(
                 raw_ref,
-                ObjectHandle::stream(
+                ObjectHandle::direct_stream(
                     ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(4))]),
                     Rc::new(b"data".to_vec()),
                 ),
@@ -1193,7 +1193,7 @@ mod tests {
     fn copy_foreign_object_rejects_a_direct_stream_child() {
         let mut source = minimal_pdf();
         let mut target = minimal_pdf();
-        let direct_stream = ObjectHandle::stream(
+        let direct_stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(Vec::new()),
             Rc::new(b"direct stream".to_vec()),
         );
@@ -1213,7 +1213,7 @@ mod tests {
     fn copy_foreign_object_retries_a_failed_stream_replacement() {
         let mut source = minimal_pdf();
         let mut target = minimal_pdf();
-        let direct_stream = ObjectHandle::stream(
+        let direct_stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(Vec::new()),
             Rc::new(b"direct stream".to_vec()),
         );

@@ -607,10 +607,7 @@ where
     }
 
     fn make_empty_stream(&self) -> ObjectHandle {
-        let dictionary = self
-            .pdf
-            .resolver
-            .direct_object_handle(ObjectValue::Dictionary(BTreeMap::new()));
+        let dictionary = self.pdf.resolver.new_stream_dictionary_handle();
         self.pdf
             .resolver
             .direct_object_handle(ObjectValue::Stream(Box::new(StreamValue {
@@ -988,7 +985,13 @@ where
                         self.saw_data = true;
                         if value.get_string().is_none() {
                             self.error(value.start(), "\"stream.data\" must be a string");
-                            current.replace_stream_data(Rc::new(Vec::new()), None, None);
+                            // cov:ignore-start: Stream state is established above and current is owned by this Pdf; direct null filter arguments cannot fail dictionary ownership.
+                            if let Err(error) =
+                                current.replace_stream_data(Rc::new(Vec::new()), None, None)
+                            {
+                                self.fatal(error.to_string());
+                            }
+                            // cov:ignore-end
                         } else {
                             match inline_stream_data_provider(
                                 self.source.clone(),
@@ -1015,7 +1018,13 @@ where
                                 value.start(),
                                 "\"stream.datafile\" must be a string containing a file name",
                             );
-                            current.replace_stream_data(Rc::new(Vec::new()), None, None);
+                            // cov:ignore-start: Stream state is established above and current is owned by this Pdf; direct null filter arguments cannot fail dictionary ownership.
+                            if let Err(error) =
+                                current.replace_stream_data(Rc::new(Vec::new()), None, None)
+                            {
+                                self.fatal(error.to_string());
+                            }
+                            // cov:ignore-end
                             return;
                         };
                         let provider = datafile_stream_data_provider(PathBuf::from(
@@ -1202,7 +1211,7 @@ mod shape_predicate_tests {
         let (dictionary, recorder) =
             handle_resolving(ObjectValue::Dictionary(std::collections::BTreeMap::new()));
         drop(recorder);
-        let current = ObjectHandle::stream(dictionary, Rc::new(Vec::new()));
+        let current = ObjectHandle::direct_stream(dictionary, Rc::new(Vec::new()));
         reactor.stack.push(StackFrame {
             state: ReactorState::Object,
             object: Some(current),

@@ -633,7 +633,7 @@ mod final_handle_tests {
     fn form_resource_prepass_does_not_drop_a_raw_generation_form() {
         let mut pdf = fixture();
         let raw_ref = ObjectRef::new(50, 65_535);
-        let form = ObjectHandle::stream(
+        let form = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![
                 (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
                 (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),

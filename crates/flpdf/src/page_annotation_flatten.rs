@@ -1196,7 +1196,7 @@ mod tests {
         )]);
         pdf.replace_object(ObjectRef::new(6, 0), font_category)
             .unwrap();
-        let appearance = ObjectHandle::stream(
+        let appearance = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(
                 b"/Resources".to_vec(),
                 ObjectHandle::dictionary(vec![(
@@ -1255,7 +1255,7 @@ mod tests {
         )]);
         pdf.replace_object(ObjectRef::new(6, 0), font_category)
             .unwrap();
-        let appearance = ObjectHandle::stream(
+        let appearance = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(
                 b"/Resources".to_vec(),
                 ObjectHandle::dictionary(vec![(
@@ -1317,7 +1317,7 @@ mod tests {
     fn qpdf_flatten_rejects_a_direct_stream_when_installing_a_missing_resource_category() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
         register_acroform_fields(&mut pdf, &[]);
-        let appearance = ObjectHandle::stream(
+        let appearance = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(
                 b"/Resources".to_vec(),
                 ObjectHandle::dictionary(Vec::new()),
@@ -1340,7 +1340,7 @@ mod tests {
 
         let default_resources = ObjectHandle::dictionary(vec![(
             b"/Font".to_vec(),
-            ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
+            ObjectHandle::direct_stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
         )]);
 
         let error = merge_widget_default_resources_on_page(
@@ -1358,7 +1358,7 @@ mod tests {
     #[test]
     fn qpdf_document_flatten_propagates_default_resource_merge_error() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
-        let appearance = ObjectHandle::stream(
+        let appearance = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(
                 b"/Resources".to_vec(),
                 ObjectHandle::dictionary(Vec::new()),
@@ -1381,7 +1381,7 @@ mod tests {
 
         let default_resources = ObjectHandle::dictionary(vec![(
             b"/Font".to_vec(),
-            ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
+            ObjectHandle::direct_stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
         )]);
         let acroform = ObjectHandle::dictionary(vec![
             (b"/Fields".to_vec(), ObjectHandle::array(Vec::new())),
@@ -1423,7 +1423,7 @@ mod tests {
         pdf.replace_object(ObjectRef::new(9, 0), shared_resources)
             .unwrap();
 
-        let appearance1 = ObjectHandle::stream(
+        let appearance1 = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(
                 b"/Resources".to_vec(),
                 pdf.get_object_handle(ObjectRef::new(9, 0)),
@@ -1444,7 +1444,7 @@ mod tests {
         ]);
         pdf.replace_object(ObjectRef::new(4, 0), widget1).unwrap();
 
-        let appearance2 = ObjectHandle::stream(
+        let appearance2 = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(
                 b"/Resources".to_vec(),
                 pdf.get_object_handle(ObjectRef::new(9, 0)),
@@ -1529,7 +1529,7 @@ mod tests {
                 pdf.get_object_handle(ObjectRef::new(8, 0)),
             ),
         ]);
-        let appearance = ObjectHandle::stream(
+        let appearance = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"/Resources".to_vec(), appearance_resources)]),
             Rc::new(Vec::new()),
         );
@@ -1587,7 +1587,7 @@ mod tests {
             b"/ProcSet".to_vec(),
             ObjectHandle::array(vec![ObjectHandle::name(b"PDF".to_vec())]),
         )]);
-        let appearance = ObjectHandle::stream(
+        let appearance = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"/Resources".to_vec(), appearance_resources)]),
             Rc::new(Vec::new()),
         );
@@ -1649,7 +1649,7 @@ mod tests {
             b"/ProcSet".to_vec(),
             pdf.get_object_handle(ObjectRef::new(9, 0)),
         )]);
-        let appearance = ObjectHandle::stream(
+        let appearance = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"/Resources".to_vec(), appearance_resources)]),
             Rc::new(Vec::new()),
         );
@@ -1735,7 +1735,7 @@ mod tests {
             b"/ProcSet".to_vec(),
             pdf.get_object_handle(ObjectRef::new(9, 0)),
         )]);
-        let appearance = ObjectHandle::stream(
+        let appearance = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"/Resources".to_vec(), appearance_resources)]),
             Rc::new(Vec::new()),
         );
@@ -1760,7 +1760,10 @@ mod tests {
             ),
             (
                 b"/XObject".to_vec(),
-                ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
+                ObjectHandle::direct_stream(
+                    ObjectHandle::dictionary(Vec::new()),
+                    Rc::new(Vec::new()),
+                ),
             ),
         ]);
 
@@ -1839,7 +1842,7 @@ mod tests {
         // `getKey("/Resources")` on an absent key returns a null handle, and
         // `mergeResources` returns immediately when the receiver isn't a
         // dictionary (QPDFObjectHandle.cc:1063-1069).
-        let appearance = ObjectHandle::stream(
+        let appearance = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(
                 b"/Resources".to_vec(),
                 ObjectHandle::dictionary(Vec::new()),
@@ -1905,7 +1908,7 @@ mod tests {
             b"/ProcSet".to_vec(),
             ObjectHandle::array(vec![ObjectHandle::name(b"PDF".to_vec())]),
         )]);
-        let appearance = ObjectHandle::stream(
+        let appearance = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"/Resources".to_vec(), appearance_resources)]),
             Rc::new(Vec::new()),
         );
@@ -1968,7 +1971,7 @@ mod tests {
         register_acroform_fields(&mut pdf, &[]);
         let appearance_resources =
             ObjectHandle::dictionary(vec![(b"/ProcSet".to_vec(), ObjectHandle::integer(7))]);
-        let appearance = ObjectHandle::stream(
+        let appearance = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"/Resources".to_vec(), appearance_resources)]),
             Rc::new(Vec::new()),
         );
@@ -2020,7 +2023,7 @@ mod tests {
             b"/ProcSet".to_vec(),
             ObjectHandle::array(vec![ObjectHandle::array(vec![ObjectHandle::integer(1)])]),
         )]);
-        let appearance = ObjectHandle::stream(
+        let appearance = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(b"/Resources".to_vec(), appearance_resources)]),
             Rc::new(Vec::new()),
         );
@@ -2091,7 +2094,7 @@ mod tests {
         ]);
         let appearance = ObjectHandle::dictionary(vec![(
             b"/N".to_vec(),
-            ObjectHandle::stream(appearance_dict, Rc::new(Vec::new())),
+            ObjectHandle::direct_stream(appearance_dict, Rc::new(Vec::new())),
         )]);
         let widget = ObjectHandle::dictionary(vec![
             (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
@@ -2134,7 +2137,7 @@ mod tests {
         pdf.replace_object(ObjectRef::new(4, 0), non_stream_widget)
             .unwrap();
 
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![(
                 b"/Resources".to_vec(),
                 ObjectHandle::dictionary(Vec::new()),
@@ -2224,7 +2227,7 @@ mod tests {
         .unwrap();
         pdf.replace_object(font_ref, ObjectHandle::dictionary(Vec::new()))
             .unwrap();
-        let appearance = ObjectHandle::stream(
+        let appearance = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![
                 (
                     b"/BBox".to_vec(),
@@ -2618,7 +2621,7 @@ mod tests {
                 b"/AP",
                 ObjectHandle::dictionary(vec![(
                     b"/N".to_vec(),
-                    ObjectHandle::stream(
+                    ObjectHandle::direct_stream(
                         ObjectHandle::dictionary(vec![(
                             b"/BBox".to_vec(),
                             ObjectHandle::array(vec![

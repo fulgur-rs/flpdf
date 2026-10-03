@@ -154,13 +154,11 @@ pub(crate) fn run_test_10<R: Read + Seek>(
     // `/Contents` with a *direct* array (`ObjectHandle::add_page_contents`'s
     // own doc), so interleaving vs. batching the two `addPageContents` calls
     // allocates nothing in between either way.
-    let baked_dict = ObjectHandle::dictionary(Vec::new());
     let baked_data = Rc::new(b"BT /F1 12 Tf 72 620 Td (Baked) Tj ET\n".to_vec());
-    let baked = pdf.make_indirect_object_handle(ObjectHandle::stream(baked_dict, baked_data))?;
+    let baked = pdf.new_stream_with_data(baked_data)?;
 
-    let mashed_dict = ObjectHandle::dictionary(Vec::new());
     let mashed_data = Rc::new(b"BT /F1 18 Tf 72 520 Td (Mashed) Tj ET\n".to_vec());
-    let mashed = pdf.make_indirect_object_handle(ObjectHandle::stream(mashed_dict, mashed_data))?;
+    let mashed = pdf.new_stream_with_data(mashed_data)?;
 
     page.add_page_contents(baked, true)?;
     page.add_page_contents(mashed, false)?;
@@ -418,8 +416,7 @@ fn create_page_contents<R: Read + Seek>(
     text: &str,
 ) -> flpdf::Result<ObjectHandle> {
     let contents = format!("BT /F1 15 Tf 72 720 Td ({text}) Tj ET\n");
-    let dict = ObjectHandle::dictionary(Vec::new());
-    pdf.make_indirect_object_handle(ObjectHandle::stream(dict, Rc::new(contents.into_bytes())))
+    pdf.new_stream_with_data(Rc::new(contents.into_bytes()))
 }
 
 fn page_at(pages: &[ObjectRef], index: usize) -> flpdf::Result<ObjectRef> {

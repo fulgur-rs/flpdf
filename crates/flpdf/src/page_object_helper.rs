@@ -2038,7 +2038,7 @@ fn externalize_inline_images_for_target<R: Read + Seek + 'static>(
             Rc::new(rewritten),
             Some(ObjectHandle::null()),
             Some(ObjectHandle::null()),
-        );
+        )?; // cov:ignore: this branch already established a same-Pdf Form stream and passes direct null filters.
     } else {
         let contents = pdf.new_stream_with_data(Rc::new(rewritten))?;
         target.replace_key(b"/Contents", contents)?;
@@ -2390,6 +2390,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn externalize_inline_images_replaces_a_form_stream_with_qpdf_stream_data() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let mut content = b"q 200 0 0 200 0 0 cm BI /W 2 /H 2 /CS /G /BPC 8 ID\n".to_vec();
+        content.extend_from_slice(&[0, 64, 128, 255]);
+        content.extend_from_slice(b"\nEI Q\n");
+        let form = pdf.new_stream_with_data(Rc::new(content))?;
+        let dictionary = form.try_get_stream_dict()?;
+        dictionary.replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))?;
+        dictionary.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))?;
+        let bounding_box = ObjectHandle::array(vec![
+            ObjectHandle::integer(0),
+            ObjectHandle::integer(0),
+            ObjectHandle::integer(200),
+            ObjectHandle::integer(200),
+        ]);
+        dictionary
+            .replace_key(b"/BBox", bounding_box)
+            .expect("new Form stream dictionary accepts /BBox");
+        dictionary.replace_key(b"/Resources", ObjectHandle::dictionary(Vec::new()))?;
+
+        externalize_inline_images_for_target(&mut pdf, form.clone(), "form object", 0)?;
+
+        let rewritten = form.get_raw_stream_data()?;
+        assert!(rewritten
+            .windows(b"/IIm1 Do".len())
+            .any(|bytes| bytes == b"/IIm1 Do"));
+        let xobjects = dictionary
+            .try_get_key(b"/Resources")?
+            .try_get_key(b"/XObject")?;
+        assert!(xobjects.try_has_key(b"/IIm1")?);
+        assert!(dictionary.try_has_key(b"/Length")?);
+        Ok(())
+    }
+
     /// Build a minimal valid PDF from a contiguous run of `1..=objects.len()`
     /// objects, in `(object_number, body_literal)` order. `catalog_ref` is
     /// the object number of the `/Catalog` object.
@@ -2566,7 +2601,7 @@ mod tests {
             .get_stream_data(DecodeLevel::Specialized)
             .expect("page filter should remain executable through the live stream");
 
-        let form = ObjectHandle::stream(
+        let form = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(vec![
                 (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
                 (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),

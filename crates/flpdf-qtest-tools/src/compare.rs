@@ -203,6 +203,19 @@ mod tests {
         encoder.finish().unwrap()
     }
 
+    fn stream(
+        pdf: &Pdf<Cursor<Vec<u8>>>,
+        entries: Vec<(Vec<u8>, ObjectHandle)>,
+        data: Rc<Vec<u8>>,
+    ) -> ObjectHandle {
+        let stream = pdf.new_stream_with_data(data).expect("create stream");
+        let dictionary = stream.as_stream_dict().expect("stream dictionary");
+        for (key, value) in entries {
+            dictionary.replace_key(&key, value).expect("set stream key");
+        }
+        stream
+    }
+
     #[test]
     fn xref_stream_classification_resolves_the_type_name() {
         let pdf = dummy_pdf();
@@ -353,16 +366,18 @@ mod tests {
 
     #[test]
     fn identical_streams_ignore_length_and_compare_payload() {
-        let actual = ObjectHandle::stream(
-            ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(1))]),
-            Rc::new(b"same".to_vec()),
-        );
-        let expected = ObjectHandle::stream(
-            ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(999))]),
-            Rc::new(b"same".to_vec()),
-        );
         let mut actual_pdf = dummy_pdf();
         let mut expected_pdf = dummy_pdf();
+        let actual = stream(
+            &actual_pdf,
+            vec![(b"/Length".to_vec(), ObjectHandle::integer(1))],
+            Rc::new(b"same".to_vec()),
+        );
+        let expected = stream(
+            &expected_pdf,
+            vec![(b"/Length".to_vec(), ObjectHandle::integer(999))],
+            Rc::new(b"same".to_vec()),
+        );
         assert_eq!(
             compare_objects(
                 "stream",
@@ -379,22 +394,24 @@ mod tests {
     #[test]
     fn flate_streams_compare_decoded_payloads() {
         let source = b"same decoded stream payload";
-        let actual = ObjectHandle::stream(
-            ObjectHandle::dictionary(vec![(
-                b"/Filter".to_vec(),
-                ObjectHandle::name(b"FlateDecode".to_vec()),
-            )]),
-            Rc::new(zlib(source, Compression::none())),
-        );
-        let expected = ObjectHandle::stream(
-            ObjectHandle::dictionary(vec![(
-                b"/Filter".to_vec(),
-                ObjectHandle::name(b"FlateDecode".to_vec()),
-            )]),
-            Rc::new(zlib(source, Compression::best())),
-        );
         let mut actual_pdf = dummy_pdf();
         let mut expected_pdf = dummy_pdf();
+        let actual = stream(
+            &actual_pdf,
+            vec![(
+                b"/Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            )],
+            Rc::new(zlib(source, Compression::none())),
+        );
+        let expected = stream(
+            &expected_pdf,
+            vec![(
+                b"/Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            )],
+            Rc::new(zlib(source, Compression::best())),
+        );
         assert_eq!(
             compare_objects(
                 "flate",
@@ -410,19 +427,20 @@ mod tests {
 
     #[test]
     fn flate_decode_failure_is_propagated() {
-        let make = || {
-            ObjectHandle::stream(
-                ObjectHandle::dictionary(vec![(
+        let mut actual_pdf = dummy_pdf();
+        let mut expected_pdf = dummy_pdf();
+        let make = |pdf: &Pdf<Cursor<Vec<u8>>>| {
+            stream(
+                pdf,
+                vec![(
                     b"/Filter".to_vec(),
                     ObjectHandle::name(b"FlateDecode".to_vec()),
-                )]),
+                )],
                 Rc::new(b"not zlib".to_vec()),
             )
         };
-        let actual = make();
-        let expected = make();
-        let mut actual_pdf = dummy_pdf();
-        let mut expected_pdf = dummy_pdf();
+        let actual = make(&actual_pdf);
+        let expected = make(&expected_pdf);
         assert!(compare_objects(
             "flate-error",
             &actual,

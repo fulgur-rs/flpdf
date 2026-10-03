@@ -737,7 +737,7 @@ pub(crate) fn run_test_79<R: Read + Seek>(
         std::rc::Rc::new(b"from string".to_vec()),
         Some(ObjectHandle::null()),
         Some(ObjectHandle::null()),
-    );
+    )?;
     let indirect_16059 = pdf.make_indirect_object_handle(ObjectHandle::integer(16059))?;
     // qpdf builds this dictionary by string-concatenating
     // `pdf.makeIndirectObject(...).unparse()` into a literal and parsing it
@@ -767,7 +767,7 @@ pub(crate) fn run_test_79<R: Read + Seek>(
         std::rc::Rc::new(b"from buffer".to_vec()),
         Some(ObjectHandle::null()),
         Some(ObjectHandle::null()),
-    );
+    )?;
 
     let streams = [s1, s2, s3];
     trailer.replace_key(b"/Originals", ObjectHandle::array(streams.to_vec()))?;
@@ -787,7 +787,7 @@ pub(crate) fn run_test_79<R: Read + Seek>(
             std::rc::Rc::new(format!("something new {istr}").into_bytes()),
             Some(ObjectHandle::null()),
             Some(ObjectHandle::null()),
-        );
+        )?;
         let copy_data = copy.get_stream_data(DecodeLevel::Generalized)?;
         assert_eq!(orig_data.len(), copy_data.len());
         assert_eq!(orig_data.as_slice(), copy_data.as_slice());

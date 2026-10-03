@@ -829,7 +829,9 @@ fn json_reactor_rejects_both_stream_data_sources_in_an_existing_stream() {
     let mut pdf = Pdf::empty().expect("empty PDF");
     let stream = pdf.new_stream().expect("stream");
     let object_ref = stream.object_ref().expect("stream identity");
-    stream.replace_stream_data(Rc::new(b"old".to_vec()), None, None);
+    stream
+        .replace_stream_data(Rc::new(b"old".to_vec()), None, None)
+        .expect("replace stream data");
 
     let json = format!(
         "{{\"qpdf\":[{{\"jsonversion\":2}},{{\"obj:{} {} R\":{{\"stream\":{{\"dict\":{{}},\"data\":\"YQ==\",\"datafile\":\"ignored.bin\"}}}}}}]}}",
@@ -855,7 +857,9 @@ fn json_reactor_updates_an_existing_stream_without_requiring_new_data() {
     let mut pdf = Pdf::empty().expect("empty PDF");
     let stream = pdf.new_stream().expect("stream");
     let object_ref = stream.object_ref().expect("stream identity");
-    stream.replace_stream_data(Rc::new(b"old".to_vec()), None, None);
+    stream
+        .replace_stream_data(Rc::new(b"old".to_vec()), None, None)
+        .expect("replace stream data");
 
     let json = format!(
         "{{\"qpdf\":[{{\"jsonversion\":2}},{{\"obj:{} {} R\":{{\"stream\":{{\"dict\":{{\"/K\":7}}}}}}}}]}}",
@@ -1359,7 +1363,8 @@ fn json_warning_route_preserves_qpdf_context_and_suppression() {
 
 #[test]
 fn json_reactor_handles_stream_dictionary_boundary_errors() {
-    let stream = ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new()));
+    let stream =
+        ObjectHandle::direct_stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new()));
     let error = stream
         .replace_stream_dict(ObjectHandle::integer(1))
         .expect_err("non-dictionary replacement");

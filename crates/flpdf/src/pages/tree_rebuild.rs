@@ -1744,7 +1744,7 @@ mod tests {
     #[test]
     fn promote_inherited_value_promotes_direct_streams() {
         let mut pdf = Pdf::empty().expect("empty PDF");
-        let stream = ObjectHandle::stream(
+        let stream = ObjectHandle::direct_stream(
             ObjectHandle::dictionary(Vec::new()),
             Rc::new(b"stream".to_vec()),
         );

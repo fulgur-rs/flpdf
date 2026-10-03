@@ -2,6 +2,7 @@ use flpdf::ObjectHandle;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::rc::Rc;
+mod common;
 
 const SIZE_CLASS_COUNT: usize = 6;
 
@@ -433,14 +434,12 @@ fn direct_scalar_uses_at_most_two_allocations_without_a_single_owner_list() {
     }
 
     let (wide_stream, stream_heavy) = measure_construction(|| {
-        let dictionary = ObjectHandle::dictionary(
-            dictionary_keys
-                .iter()
-                .zip(values.iter().copied())
-                .map(|(key, value)| (key.clone(), ObjectHandle::integer(value)))
-                .collect(),
-        );
-        ObjectHandle::stream(dictionary, Rc::clone(&stream_data))
+        let entries = dictionary_keys
+            .iter()
+            .zip(values.iter().copied())
+            .map(|(key, value)| (key.clone(), ObjectHandle::integer(value)))
+            .collect();
+        common::qpdf_owned_stream_with_buffer(Rc::clone(&stream_data), entries)
     });
     std::hint::black_box(&wide_stream);
     report_measurement("wide-stream", stream_heavy);
@@ -448,7 +447,19 @@ fn direct_scalar_uses_at_most_two_allocations_without_a_single_owner_list() {
         .as_stream_dict()
         .expect("wide value is a stream");
     assert!(stream_dictionary.try_is_dictionary().unwrap());
-    assert_eq!(stream_dictionary.try_get_keys().unwrap().len(), WIDE_ITEMS);
+    assert_eq!(
+        stream_dictionary.try_get_keys().unwrap().len(),
+        WIDE_ITEMS + 1,
+        "qpdf newStream(data) installs /Length in addition to dictionary entries"
+    );
+    assert_eq!(
+        stream_dictionary
+            .try_get_key(b"/Length")
+            .unwrap()
+            .try_get_int_value()
+            .unwrap(),
+        stream_data.len() as i64
+    );
     for (key, value) in dictionary_keys.iter().zip(values.iter().copied()) {
         assert_eq!(
             stream_dictionary

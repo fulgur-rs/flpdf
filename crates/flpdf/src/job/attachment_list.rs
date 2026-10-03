@@ -369,7 +369,7 @@ mod tests {
         }
         pdf.replace_object(
             stream_ref,
-            ObjectHandle::stream(dict.into_handle(), Rc::new(b"data".to_vec())),
+            ObjectHandle::direct_stream(dict.into_handle(), Rc::new(b"data".to_vec())),
         )
         .expect("install embedded-file stream fixture");
         stream_ref
