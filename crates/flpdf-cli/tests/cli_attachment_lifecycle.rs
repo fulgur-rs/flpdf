@@ -1746,3 +1746,79 @@ fn copy_attachments_conflict_error_names_the_target_not_the_donor() {
         "the conflict error must name the target file, not the donor: {stderr:?}"
     );
 }
+
+#[test]
+fn job_json_reserves_attachment_stdout_before_show_npages_like_qpdf() {
+    if !support::is_qpdf_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let payload = b"job-json attachment payload\n";
+    let payload_file = temp.path().join("payload.bin");
+    std::fs::write(&payload_file, payload).unwrap();
+    let attached_pdf = temp.path().join("attached.pdf");
+    assert!(qpdf_add_attachment(
+        input.path(),
+        &payload_file,
+        "payload",
+        &attached_pdf,
+        &[]
+    ));
+
+    let job_json = temp.path().join("job.json");
+    std::fs::write(
+        &job_json,
+        serde_json::to_vec(&serde_json::json!({
+            "inputFile": attached_pdf,
+            "showNpages": "",
+            "showAttachment": "payload",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let job_json_arg = format!("--job-json-file={}", job_json.display());
+
+    let qpdf = ShellCommand::new("qpdf")
+        .arg(&job_json_arg)
+        .output()
+        .unwrap();
+    assert_eq!(qpdf.status.code(), Some(0), "qpdf: {qpdf:?}");
+    assert_eq!(qpdf.stdout, payload);
+
+    let flpdf = CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&job_json_arg)
+        .output()
+        .unwrap();
+    assert_eq!(flpdf.status.code(), qpdf.status.code(), "flpdf: {flpdf:?}");
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
+fn empty_show_attachment_does_not_reserve_stdout_like_qpdf() {
+    if !support::is_qpdf_available() {
+        return;
+    }
+
+    let input = minimal_pdf_temp();
+    let args = ["--show-npages", "--show-attachment="];
+    let qpdf = ShellCommand::new("qpdf")
+        .args(args)
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert_eq!(qpdf.status.code(), Some(0), "qpdf: {qpdf:?}");
+
+    let flpdf = CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert_eq!(flpdf.status.code(), qpdf.status.code(), "flpdf: {flpdf:?}");
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}

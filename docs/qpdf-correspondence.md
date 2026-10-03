@@ -2995,13 +2995,33 @@ qpdf の route ownership は `QPDFJob.cc:343,498-502,625,709-925,2934,3051-3054,
 logger consumer に移行済みである。
 
 - `save`: JSON stdout、raw/filtered stream stdout、attachment stdout、rewrite/QDF の
-  output `-`。いずれも document open / info write より先に `saveToStandardOutput`
-  相当を設定し、独立した stdout terminal を作らない
+  output `-`。qpdf は document open / inspection info write より先に
+  `saveToStandardOutput` を設定する。flpdf の output `-` / JSON / raw-filtered
+  paths は同じ順序で既に予約し、`flpdf-6ik2q.25` で public `QPDFJob` と
+  `--job-json-file` の non-empty `showAttachment` も `check_configuration` 内で
+  `create_qpdf` より前に予約する。empty `showAttachment` は qpdf の empty-string
+  sentinel と同じく何も書かず、stdoutを予約しない。
 - `info`: check summary、show object、show pages/npages、attachment listing、encryption /
   linearization inspection、rewrite/page-operation verbose output
 - `warn`: document warning、warning completion summary、normalization warning
 - `error`: check error と top-level の通常 fatal error
 - `usage`: `UsageError` を `usage_exit` へ直接渡し、qpdf の空行・help block付き exit-2 を再現
+
+`QPDFJob::Config::showAttachment` は値を `attachment_to_show` へ保存し、
+`require_outfile` を false にする（`QPDFJob_config.cc:543-547`）。
+`QPDFJob::createQPDF` は `checkConfiguration` を入力処理前に呼び、non-empty
+`attachment_to_show` ならsave pipelineを標準出力へ切り替える。したがって
+`doInspection` の `showNpages` はstderrへ移り、その後の `showAttachment` bytesだけが
+stdoutへ出る（`QPDFJob.cc:428-431,614-626,1646-1693`）。`QPDFLogger::setSave` は
+標準出力が既に使用済みなら `std::logic_error` を投げる
+（`QPDFLogger.cc:184-222`）。flpdf は同じ予約を `QPDFJob::check_configuration` と
+`reserve_standard_output` に持ち、CLIのcreate-stage変換経路も従来の早期予約を保つ。
+`crates/flpdf/src/job/lifecycle.rs::check_configuration_reserves_stdout_for_nonempty_attachment_inspection`
+はpublic Jobのsave/info sink選択を、
+`crates/flpdf-cli/tests/cli_attachment_lifecycle.rs::job_json_reserves_attachment_stdout_before_show_npages_like_qpdf`
+はjob JSONのpayloadとpage-count stdout/stderrをqpdf 11.9.0と比較する。
+`crates/flpdf-cli/tests/cli_attachment_lifecycle.rs::empty_show_attachment_does_not_reserve_stdout_like_qpdf`
+はempty-key sentinelのno-opを固定する。
 
 添付の mutation route も同じ writer 境界に接続する。qpdf は
 `handleTransformations` 内で `addAttachments` / `removeEmbeddedFile` を完了してから
