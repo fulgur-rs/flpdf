@@ -1857,6 +1857,26 @@ the recovered file key with qpdf for short `/O`, `/U`, `/OE`, and `/UE` values
 in R5 files, and overlong `/OE` and `/UE` values in R5 and R6 files;
 `reader_tests` also checks the short `/U` and `/UE` authentication path.
 
+### V=5 `/Perms` validation and warning (`flpdf-6ik2q.21`)
+
+qpdf checks that `/Perms` is a string before password authentication, NUL-pads
+short values to 16 bytes, and then decrypts the block and compares its first
+12 bytes with the expected `/P`, `/EncryptMetadata`, and `adb` fields for both
+R5 and R6 (`QPDF_encryption.cc:666-695,815-832,938-950`). A mismatch emits the
+same damaged-PDF warning for either revision, with object `encryption
+dictionary` and the input's last offset. The raw-hex-key branch still performs
+the initial type check but bypasses content validation.
+
+flpdf already checks the V=5 `/Perms` type before authentication in `reader.rs`,
+but its previous `state.rs` check ran only for R6, rejected values whose length
+was not exactly 16, and emitted R6-specific text without qpdf's object
+context. The canonical password-authentication route now projects the field to
+the bytes used by qpdf, compares the same first 12 decrypted bytes for R5/R6,
+and passes a qpdf-shaped warning through the reader's diagnostic/logger path.
+`qpdf_v5_password_parity` compares bad `/UE`, `/OE`, short `/Perms`, and
+overlong `/Perms` values against qpdf; `qpdf_v5_perms_warning_parity` compares
+CLI stdout, warning bytes/context, and exit status for R5/R6.
+
 ### Accessor warning chains for invalid `/ID` and `/Pages` (`flpdf-6gmnc`, 2026-09-17)
 
 qpdf の `QPDFWriter::copyEncryptionParameters` は、欠落 `/ID` を
@@ -2872,7 +2892,7 @@ pinned qpdf 11.9.0 と `/usr/bin/qpdf` の malformed `/ID` probe（offset 416）
 warningを配送してから `updateCache`/member valueを確定する順序
 （`QPDF.cc:1560-1833,1700-1753`）を維持する。暗号の unknown `/StrF`・`/StmF` fallbackも
 `QPDF_encryption.cc:976-1005,1041-1154` と同じくwarning成功後に `cf_string`/`cf_stream` を
-`AES`へ書き換え、R6 `/Perms` warningは認証済み`EncryptionState`のreader commitより先に
+`AES`へ書き換え、V=5 `/Perms` warningは認証済み`EncryptionState`のreader commitより先に
 配送する。warning sink failureではcache/stateを未commitのままcallerへ返し、正常sinkでの
 retry時だけfallbackを一度確定する。
 

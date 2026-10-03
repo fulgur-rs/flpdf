@@ -768,20 +768,33 @@ fn r6_perms_mismatch_warns_without_failing_open() {
 }
 
 #[test]
-fn r6_perms_wrong_length_warns_without_attempting_decryption() {
-    let pdf = Pdf::open_with_options(
-        std::io::Cursor::new(encrypted_r5_or_r6_pdf(6, " /Perms <00>", &[])),
-        PdfOpenOptions {
-            password: b"userpass".to_vec(),
-            ..PdfOpenOptions::default()
-        },
-    )
-    .unwrap();
+fn v5_short_perms_is_nul_padded_before_content_validation() {
+    for revision in [5, 6] {
+        let encrypt_suffix =
+            " /CF << /StdCF << /AuthEvent /DocOpen /CFM /AESV3 /Length 32 >> >> /StmF /StdCF /StrF /StdCF /Perms <00>";
+        let description = format!("r{revision}-short-perms.pdf");
+        let pdf = Pdf::open_with_options(
+            std::io::Cursor::new(encrypted_r5_or_r6_pdf(revision, encrypt_suffix, &[])),
+            PdfOpenOptions {
+                description: description.as_bytes().to_vec(),
+                password: b"userpass".to_vec(),
+                suppress_warnings: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("qpdf pads short V=5 /Perms values and continues validation");
 
-    assert!(pdf.repair_diagnostics().entries().iter().any(|entry| {
-        String::from_utf8_lossy(entry.get_message_detail())
-            .contains("R=6 /Perms entry is not 16 bytes")
-    }));
+        let warnings = pdf.repair_diagnostics();
+        assert_eq!(warnings.entries().len(), 1);
+        let warning = &warnings.entries()[0];
+        assert_eq!(warning.get_error_code(), QpdfErrorCode::DamagedPdf);
+        assert_eq!(warning.get_filename(), description.as_bytes());
+        assert_eq!(warning.get_object(), b"encryption dictionary");
+        assert_eq!(
+            warning.get_message_detail(),
+            b"/Perms field in encryption dictionary doesn't match expected value"
+        );
+    }
 }
 
 #[test]

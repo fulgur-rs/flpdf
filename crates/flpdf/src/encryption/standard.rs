@@ -1139,7 +1139,7 @@ pub(crate) fn build_v4_encrypt_dict(
 /// padding (`QPDF_encryption.cc:655-663`). For this one block that is
 /// byte-equivalent to AES-256 ECB, but the pipeline route preserves qpdf's
 /// ownership and error contract. Verified by the reader via the inverse path
-/// in `r6_perms_warning`.
+/// in `v5_perms_warning_from_handle`.
 pub(crate) fn compute_perms_blob(
     p: i32,
     encrypt_metadata: bool,
