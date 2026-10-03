@@ -5958,6 +5958,17 @@ mod tests {
 
     struct FailsAbsoluteSeek;
 
+    fn invalid_argument_raw_os_error() -> io::Error {
+        #[cfg(windows)]
+        {
+            io::Error::from_raw_os_error(87)
+        }
+        #[cfg(not(windows))]
+        {
+            io::Error::from_raw_os_error(22)
+        }
+    }
+
     // cov:ignore-start: this fixture exercises the absolute seek failure only; read is never called
     impl Read for FailsAbsoluteSeek {
         fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
@@ -5968,7 +5979,7 @@ mod tests {
 
     impl Seek for FailsAbsoluteSeek {
         fn seek(&mut self, _position: SeekFrom) -> io::Result<u64> {
-            Err(io::Error::from_raw_os_error(22))
+            Err(invalid_argument_raw_os_error())
         }
     }
 

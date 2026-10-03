@@ -4933,7 +4933,10 @@ mod final_handle_tests {
                 b"error reading xref: logic error".as_slice(),
             ),
             (
-                Error::Io(std::io::Error::from_raw_os_error(22)),
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "synthetic invalid seek",
+                )),
                 b"error reading xref: Invalid argument".as_slice(),
             ),
             (
