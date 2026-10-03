@@ -1769,11 +1769,7 @@ fn merge_xref_stream_from_classic_trailer_with_build_diagnostics(
     canonical_trailer_owner: &dyn CanonicalTrailerOwner,
     hybrid_build_diagnostics_sink: Option<&mut Diagnostics>,
 ) -> Result<()> {
-    let has_xref_stream_key = loaded
-        .loaded
-        .trailer
-        .as_dictionary()
-        .is_some_and(|entries| entries.contains_key(b"/XRefStm".as_slice()));
+    let has_xref_stream_key = loaded.loaded.trailer.try_has_key(b"/XRefStm")?;
     if !has_xref_stream_key {
         return Ok(());
     }

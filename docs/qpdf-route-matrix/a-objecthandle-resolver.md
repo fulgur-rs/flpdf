@@ -998,6 +998,21 @@ syntactic inventory and still includes non-resolving accessor implementations
 inside `object_handle.rs`. A6 remains `mixed`; the remaining production caller
 families require their own source and call-chain audits.
 
+### A6 hybrid-xref key-presence slice `flpdf-3yn9.48.208.29` (2026-10-03)
+
+`xref.rs::merge_xref_stream_from_classic_trailer_with_build_diagnostics` now
+checks `/XRefStm` with `loaded.loaded.trailer.try_has_key` before the existing
+ignore-xref-streams gate. qpdf 11.9.0's `QPDFObjectHandle::hasKey` resolves the
+trailer handle and treats both direct-null and indirect-null values as absent
+(`QPDFObjectHandle.cc:965-975`; `QPDF_Dictionary.cc:97-101`). The source-route
+guard pins the resolving accessor and key-check ordering. qpdf differential
+tests compare `--show-npages` for both null forms; each side exits 0, prints
+`1`, and emits no stderr. The post-cutover syntactic inventory is 149
+production calls: `as_dictionary` 14, `as_array` 13, `as_integer` 9,
+`as_name` 16, `as_string` 28, `as_real` 13, `is_null` 56, `get_key` 0, and
+`has_key` 0. This is one caller migration; A6 remains mixed while other
+production callers remain.
+
 ### 分類集計
 
 <!-- route-matrix-aggregate: document-tally unit=area-physical file=a-objecthandle-resolver.md -->
