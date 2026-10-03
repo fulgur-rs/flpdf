@@ -1834,6 +1834,16 @@ gates exit/stderr rather than claiming undefined ciphertext bytes.
 | `QPDFCryptoProvider.cc` / `QPDFCrypto_*` | 774 | provider 抽象が無い | ⚪ |
 | ランダム源 3 ファイル | 185 | `writer.rs` の `fresh_id_bytes` 等に散在 | 🔀 |
 
+### V=5 owner-key recovery precedence (`flpdf-6ik2q.19`)
+
+`QPDF::recover_encryption_key_with_password` checks the owner password before
+the user password and unwraps `/OE` when both passwords match
+(`libqpdf/QPDF_encryption.cc:666-685`). `encryption/state.rs` evaluates the
+R5/R6 owner attempt first and selects that file key while retaining both
+password-match flags. `qpdf_v5_password_parity` covers R5 and R6 by creating
+same-password user/owner files, zeroing `/UE` without changing its length, and
+comparing flpdf's file key with qpdf `--show-encryption-key`.
+
 ### Accessor warning chains for invalid `/ID` and `/Pages` (`flpdf-6gmnc`, 2026-09-17)
 
 qpdf の `QPDFWriter::copyEncryptionParameters` は、欠落 `/ID` を
