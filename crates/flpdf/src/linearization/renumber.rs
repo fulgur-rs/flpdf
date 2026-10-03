@@ -1450,6 +1450,7 @@ mod tests {
             members,
             route,
             source_container_number,
+            generated_source: None,
         }
     }
 

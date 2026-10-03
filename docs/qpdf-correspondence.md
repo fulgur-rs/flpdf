@@ -1476,6 +1476,29 @@ flpdf 出力が 3 方式・2 surface の全 6 組で byte-identical になり、
 変更しない。これは qpdf の既存 user/part precedence を補うもので、qpdf-deviation marker
 は追加しない。
 
+### Linearized Generate placeholder renumbering (`flpdf-6ik2q.16`, 2026-10-03)
+
+`QPDFWriter::generateObjectStreams` inserts an indirect null placeholder into
+the writer's source `QPDF` for every global even-split batch
+(`libqpdf/QPDFWriter.cc:1970-2006`). After linearization removes page and
+Catalog members, `getLinearizedParts` returns the surviving container
+identities; `enqueuePart` sends each through `enqueueObject`, which records its
+output number in `m->obj_renumber` (`QPDF_linearization.cc:1435-1446`;
+`QPDFWriter.cc:1072-1141,2236-2243`). The public
+`getRenumberedObjGen` reads that same map after `write()`
+(`include/qpdf/QPDFWriter.hh:430-433`; `QPDFWriter.cc:2216-2219`).
+
+flpdf's common writer setup already retained the generated placeholder refs,
+and the plain route consumed them. The linearized route had discarded that
+setup list before producing `WriterResult::old_to_new`, so the public
+`PdfWriter::get_renumbered_obj_gen` returned `None` for an emitted generated
+container source. It now carries the placeholder ref with its exact even-split
+batch through page filtering, part routing, and `ObjStmLayout`, then records the
+source-to-output mapping in the writer result. A one-page live qpdf C++ probe
+returns `8 0 -> 8 0`; a two-container probe returns `132 0 -> 76 0` and
+`133 0 -> 5 0`, and the public Rust regressions assert those mappings. The
+linearized Generate byte-differential suite remains the output authority.
+
 ### Linearized raw identity follow-ups (`flpdf-pwyo2`, 2026-09-15)
 
 `flpdf-474u8` の raw slot移行後に残っていた八つの linearization consumer gapを、

@@ -210,6 +210,10 @@ struct ObjStmContainer {
     /// Original source container in Preserve mode. Generate-mode containers
     /// are qpdf's null placeholders and therefore have no source dictionary.
     source_container: Option<ObjectRef>,
+    /// Writer-setup placeholder identity for a Generate-mode container.
+    /// qpdf retains this source ObjGen in `obj_renumber` even though the
+    /// emitted object stream is serialized from generated members.
+    generated_source: Option<ObjectRef>,
     /// `(original_ref, new_ref)` pairs in batch order.
     members: Vec<(ObjectRef, ObjectRef)>,
 }
@@ -259,6 +263,7 @@ fn filter_page_dictionary_batches(
                 members,
                 route: batch.route,
                 source_container_number: batch.source_container_number,
+                generated_source: batch.generated_source,
             });
         }
     }
@@ -283,9 +288,10 @@ impl ObjStmLayout {
         plan: &LinearizationPlan,
         pdf: &mut Pdf<R>,
         options: &WriterOptions,
+        generated_object_stream_sources: &[ObjectRef],
     ) -> Result<crate::linearization::plan::ObjStmBatchPlan> {
         let config = planner_config_from_options(options);
-        let batch_plan = plan.objstm_batches(pdf, &config)?;
+        let batch_plan = plan.objstm_batches(pdf, &config, generated_object_stream_sources)?;
 
         // Writer-level invariant (qpdf linearization rule): a page DICTIONARY may
         // never be compressed — the linearization layout addresses pages by file
@@ -371,6 +377,7 @@ impl ObjStmLayout {
                 out.push(ObjStmContainer {
                     container_new_num,
                     source_container,
+                    generated_source: batch.generated_source,
                     members,
                 });
             }
@@ -4060,7 +4067,7 @@ fn write_linearized_impl<R: Read + Seek>(
         encryption_parameters,
         source_object_stream_data,
         generated_compressible: _,
-        generated_object_stream_sources: _,
+        generated_object_stream_sources,
     } = setup;
     // Keep qpdf's setup-owned object-number mapping directly. The previous
     // ObjectRef-keyed conversion allocated a second relation before the
@@ -4228,7 +4235,8 @@ fn write_linearized_impl<R: Read + Seek>(
     // early-returns), so the Disable / non-ObjStm path is completely
     // unchanged.
     // ------------------------------------------------------------------
-    let resolved_batch_plan = ObjStmLayout::resolve_batches(plan, pdf, options)?;
+    let resolved_batch_plan =
+        ObjStmLayout::resolve_batches(plan, pdf, options, &generated_object_stream_sources)?;
 
     // Whether this write schedules any ObjStm container/member relocation —
     // true for Generate (always builds fresh containers) or for Preserve on a
@@ -4595,12 +4603,14 @@ fn write_linearized_impl<R: Read + Seek>(
                 plan.optimization
                     .as_ref()
                     .and_then(|optimization| optimization.generate_objstm_eligible()),
+                &generated_object_stream_sources,
             )?; // cov:ignore: closing line of a multi-line call; llvm-cov misattributes the hit count to the previous line, not an untested branch
             let mut rank = std::collections::BTreeMap::new();
-            for (split_index, members) in membership.iter().enumerate() {
+            for (split_index, batch) in membership.iter().enumerate() {
                 // `objstm_membership_linearized` drops empty containers, so
                 // `first()` is always present.
-                let first = *members
+                let first = *batch
+                    .members
                     .first()
                     .expect("objstm_membership_linearized never yields an empty container");
                 // Only rank containers the Generate layout actually
@@ -4996,6 +5006,20 @@ fn write_linearized_impl<R: Read + Seek>(
                 ObjectRef::new(source_container_number, 0),
                 ObjectRef::new(container.container_new_num, 0),
             );
+        }
+    }
+    if options.object_streams == crate::writer::ObjectStreamMode::Generate
+        && !objstm_layout.is_empty()
+    {
+        for container in objstm_layout
+            .open_document
+            .iter()
+            .chain(&objstm_layout.part3)
+            .chain(&objstm_layout.part4)
+        {
+            if let Some(source) = container.generated_source {
+                old_to_new.insert(source, ObjectRef::new(container.container_new_num, 0));
+            }
         }
     }
 
@@ -5569,11 +5593,13 @@ mod tests {
                 ],
                 route: ContainerPart::Rest,
                 source_container_number: Some(99),
+                generated_source: None,
             },
             RoutedObjStmBatch {
                 members: vec![ObjectRef::new(4, 0)],
                 route: ContainerPart::OtherPagePrivate,
                 source_container_number: None,
+                generated_source: None,
             },
         ];
         let page_dicts: BTreeSet<QpdfObjGen> = [
@@ -5603,6 +5629,7 @@ mod tests {
             members: vec![ObjectRef::new(member_number, 0)],
             route: ContainerPart::Rest,
             source_container_number: None,
+            generated_source: None,
         }];
 
         assert!(filter_page_dictionary_batches(batches, &BTreeSet::new()).is_err());
@@ -5663,6 +5690,7 @@ mod tests {
         let container = ObjStmContainer {
             container_new_num: 2,
             source_container: Some(source),
+            generated_source: None,
             members: Vec::new(),
         };
         let renumber = RenumberMap::from_plan(&LinearizationPlan::default());
@@ -5691,6 +5719,7 @@ mod tests {
         let container = ObjStmContainer {
             container_new_num: 2,
             source_container: Some(source),
+            generated_source: None,
             members: Vec::new(),
         };
         let renumber = RenumberMap::from_plan(&LinearizationPlan::default());
@@ -5774,6 +5803,7 @@ mod tests {
             members: vec![member],
             route: ContainerPart::OtherPagePrivate,
             source_container_number: None,
+            generated_source: None,
         }];
 
         let anchors = second_half_container_anchors(&plan, &[], &[], &batches, &BTreeMap::new());
@@ -5804,11 +5834,13 @@ mod tests {
             members: vec![first_half_member],
             route: ContainerPart::FirstPagePrivate,
             source_container_number: None,
+            generated_source: None,
         }];
         let second_half_batches = vec![RoutedObjStmBatch {
             members: vec![second_half_member],
             route: ContainerPart::OtherPagePrivate,
             source_container_number: None,
+            generated_source: None,
         }];
 
         let anchors = second_half_container_anchors(
@@ -5841,11 +5873,13 @@ mod tests {
                 members: vec![ObjectRef::new(7, 0)],
                 route: ContainerPart::Rest,
                 source_container_number: None,
+                generated_source: None,
             },
             RoutedObjStmBatch {
                 members: vec![ObjectRef::new(9, 0)],
                 route: ContainerPart::Rest,
                 source_container_number: Some(99),
+                generated_source: None,
             },
         ];
 
@@ -5992,6 +6026,7 @@ mod tests {
         let container = ObjStmContainer {
             container_new_num: 2,
             source_container: None,
+            generated_source: None,
             members: Vec::new(),
         };
         let mut plain_objstm_bytes = Vec::new();

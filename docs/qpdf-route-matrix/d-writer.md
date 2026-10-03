@@ -414,6 +414,17 @@ Generate の even-split membershipとDisable/classic pathは変更しない。qp
 - `QPDF::Writer`（`include/qpdf/QPDF.hh:724-768`、`friend class QPDFWriter`）: `getLinearizedParts` /
   `generateHintStream` / `getObjectStreamData` / `getCompressibleObjGens` の 4 つだけを開く。
 
+**2026-10-03 (`flpdf-6ik2q.16`)**: public `getRenumberedObjGen` は
+`write()` 後に writer の `m->obj_renumber` を読む
+(`QPDFWriter.hh:430-433`; `QPDFWriter.cc:2216-2219`)。Generate は
+`generateObjectStreams` で source `QPDF` に null placeholder を追加し、linearized
+`getLinearizedParts` / `enqueuePart` / `enqueueObject` がその source ObjGen を同じ
+renumber map に登録する (`QPDFWriter.cc:1970-2006,1072-1141,2236-2243`;
+`QPDF_linearization.cc:1435-1446`)。flpdf は `WriterSetupState` が収集した生成元を
+linearized batch から `ObjStmLayout` まで運び、`WriterResult::old_to_new` に反映する。
+live qpdf API probe の 1-container `8→8` と part reorder を含む 2-container
+`132→76, 133→5` の両 mapping を public `PdfWriter` regression が確認する。
+
 ### D-8. 経路の要約（flpdf 対応付けの基準）
 
 | qpdf 経路 | 条件 | 採番 | ObjStm | xref |
