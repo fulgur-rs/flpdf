@@ -864,6 +864,106 @@ fn reconstruction_skips_a_candidate_whose_generation_token_exceeds_max_len_like_
     );
 }
 
+/// qpdf limits each recovery token to 100 bytes, but its tokenizer skips
+/// whitespace between the object number, generation and `obj` keyword without
+/// counting those separators (`QPDF.cc:547-559`, `QPDFTokenizer.cc:921-953`).
+fn recovery_header_with_unbounded_separator_whitespace() -> (Vec<u8>, usize, usize) {
+    const SEPARATOR_WHITESPACE: usize = 16_384;
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let catalog_offset = bytes.len();
+    bytes.extend_from_slice(b"1\n");
+    bytes.extend(std::iter::repeat_n(b' ', SEPARATOR_WHITESPACE));
+    bytes.push(b'%');
+    bytes.extend(std::iter::repeat_n(b'x', 400));
+    bytes.push(b'\n');
+    bytes.extend_from_slice(b"0\n");
+    bytes.extend(std::iter::repeat_n(b' ', SEPARATOR_WHITESPACE));
+    bytes.push(b'%');
+    bytes.extend(std::iter::repeat_n(b'x', 400));
+    bytes.push(b'\n');
+    bytes.extend_from_slice(b"obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let pages_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+    bytes.extend_from_slice(b"trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n");
+
+    (bytes, catalog_offset, pages_offset)
+}
+
+#[test]
+fn reconstruction_header_lookahead_skips_unbounded_separator_whitespace() {
+    let (fixture, catalog_offset, pages_offset) =
+        recovery_header_with_unbounded_separator_whitespace();
+    let directory = tempfile::tempdir().expect("create qpdf fixture directory");
+    let input = directory.path().join("unbounded-header-whitespace.pdf");
+    fs::write(&input, &fixture).expect("write qpdf fixture");
+    let description = input.to_string_lossy().into_owned();
+
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(fixture),
+        PdfOpenOptions {
+            repair: true,
+            suppress_warnings: true,
+            description: description.as_bytes().to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("canonical recovery must accept whitespace between header tokens");
+
+    assert_eq!(pdf.root_ref(), Some(ObjectRef::new(1, 0)));
+    pdf.root_handle()
+        .expect("recovered /Root must resolve to the Catalog dictionary");
+    let rendered = render_xref_table(&pdf.get_xref_table());
+    assert_eq!(
+        rendered,
+        vec![
+            format!("1/0: uncompressed; offset = {catalog_offset}"),
+            format!("2/0: uncompressed; offset = {pages_offset}"),
+        ],
+        "the line scan must register the object whose header spans long separators"
+    );
+
+    let warnings: Vec<String> = pdf
+        .repair_diagnostics()
+        .entries()
+        .iter()
+        .map(|warning| String::from_utf8_lossy(warning.what_bytes()).into_owned())
+        .collect();
+    let expected_warnings = vec![
+        format!("{description}: file is damaged"),
+        format!("{description}: can't find startxref"),
+        format!("{description}: Attempting to reconstruct cross-reference table"),
+    ];
+    assert_eq!(warnings, expected_warnings);
+
+    if !qpdf_available() {
+        eprintln!("qpdf 11.9.0 is not available; skipping only the oracle comparison");
+        return;
+    }
+    let qpdf = Command::new("qpdf")
+        .arg("--show-xref")
+        .arg(&input)
+        .output()
+        .expect("qpdf should spawn");
+    assert_eq!(
+        qpdf.status.code(),
+        Some(3),
+        "qpdf reports reconstructed damaged files with exit 3"
+    );
+    let qpdf_warnings: Vec<String> = String::from_utf8_lossy(&qpdf.stderr)
+        .lines()
+        .filter_map(|line| line.strip_prefix("WARNING: "))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(qpdf_warnings, expected_warnings);
+    let qpdf_rows: Vec<String> = String::from_utf8_lossy(&qpdf.stdout)
+        .lines()
+        .filter(|line| line.contains(": uncompressed;") || line.contains(": compressed;"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(rendered, qpdf_rows);
+}
+
 /// Build a single-page document whose cross-reference section is a classic
 /// table, inserting `between` after the last subsection entry and writing
 /// `startxref_value` (default: the table offset) after the `startxref`
