@@ -510,32 +510,23 @@ const UNICODE_TO_PDF_DOC: [(u32, u8); 41] = [
     (0x20ac, 0xa0),
 ];
 
-/// Result of qpdf's two-stage decimal-integer conversion
-/// (`QUtil::string_to_int`, `libqpdf/QUtil.cc:373-393`): `strtoll` parses a
-/// leading digit run into an i64 (`string_to_ll`), then `QIntC::to_int`
-/// narrows that i64 to i32. Both stages throw an uncaught `std::range_error`
-/// on overflow in qpdf (`include/qpdf/QIntC.hh:87-109`); callers must
-/// surface [`Overflow`](QpdfIntParse::Overflow) as a fatal error rather than
-/// silently treating the value as absent or mismatched.
-///
-/// [`NoDigits`](QpdfIntParse::NoDigits) represents qpdf's `strtoll` result of
-/// zero when the input has no leading digit run. Callers with a shape
-/// precondition may treat that as impossible; unchecked qpdf callers use it as
-/// the numeric zero.
+/// Result of qpdf's `QUtil::string_to_ll` conversion
+/// (`libqpdf/QUtil.cc:377-387`). `strtoll` parses a leading decimal prefix;
+/// overflow raises `std::range_error`, while input without digits converts to
+/// zero. Callers must surface [`Overflow`](QpdfLongLongParse::Overflow) as a
+/// fatal error instead of treating it as an absent value.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum QpdfIntParse {
+pub(crate) enum QpdfLongLongParse {
     /// No leading digit was found; qpdf's `strtoll` result is zero.
     NoDigits,
-    /// qpdf's 64-bit parse or i32 narrowing would overflow.
+    /// qpdf's signed 64-bit conversion would overflow.
     Overflow(String),
-    /// The parsed value after qpdf's i32 narrowing stage.
-    Value(i32),
+    /// The parsed signed 64-bit value.
+    Value(i64),
 }
 
-/// Parse a decimal prefix with qpdf's `QUtil::string_to_int` semantics.
-pub(crate) fn qpdf_string_to_int_checked(text: &str) -> QpdfIntParse {
-    // `QUtil::string_to_ll` delegates to `strtoll`, which consumes leading C
-    // whitespace and exactly one optional sign before the digit prefix.
+/// Parse a decimal prefix with qpdf's `QUtil::string_to_ll` semantics.
+pub(crate) fn qpdf_string_to_ll_checked(text: &str) -> QpdfLongLongParse {
     let text = text.split('\0').next().unwrap_or(text);
     let stripped = text.trim_start_matches(|character| {
         matches!(
@@ -553,10 +544,10 @@ pub(crate) fn qpdf_string_to_int_checked(text: &str) -> QpdfIntParse {
         .position(|byte| !byte.is_ascii_digit())
         .unwrap_or(digits.len());
     if digits_end == 0 {
-        return QpdfIntParse::NoDigits;
+        return QpdfLongLongParse::NoDigits;
     }
     let Ok(magnitude) = digits[..digits_end].parse::<u128>() else {
-        return QpdfIntParse::Overflow(format!(
+        return QpdfLongLongParse::Overflow(format!(
             "overflow/underflow converting {text} to 64-bit integer"
         ));
     };
@@ -566,16 +557,53 @@ pub(crate) fn qpdf_string_to_int_checked(text: &str) -> QpdfIntParse {
         i128::try_from(magnitude).unwrap_or(i128::MAX)
     };
     if signed < i128::from(i64::MIN) || signed > i128::from(i64::MAX) {
-        return QpdfIntParse::Overflow(format!(
+        return QpdfLongLongParse::Overflow(format!(
             "overflow/underflow converting {text} to 64-bit integer"
         ));
     }
-    let value = signed as i64;
-    match i32::try_from(value) {
-        Ok(value) => QpdfIntParse::Value(value),
-        Err(_) => QpdfIntParse::Overflow(format!(
+    QpdfLongLongParse::Value(signed as i64)
+}
+
+/// Narrow qpdf's signed 64-bit intermediate through `QIntC::to_int`
+/// (`include/qpdf/QIntC.hh:87-109`).
+pub(crate) fn qpdf_i64_to_int_checked(value: i64) -> std::result::Result<i32, String> {
+    i32::try_from(value).map_err(|_| {
+        format!(
             "integer out of range converting {value} from a 8-byte signed type to a 4-byte signed type"
-        )),
+        )
+    })
+}
+
+/// Result of qpdf's two-stage decimal-integer conversion
+/// (`QUtil::string_to_int`, `libqpdf/QUtil.cc:389-393`): `string_to_ll`
+/// parses a leading digit run into an i64, then `QIntC::to_int` narrows that
+/// value to i32. Both stages throw an uncaught `std::range_error` on overflow;
+/// callers must surface [`Overflow`](QpdfIntParse::Overflow) as a fatal error
+/// rather than silently treating it as absent or mismatched.
+///
+/// [`NoDigits`](QpdfIntParse::NoDigits) represents qpdf's `strtoll` result of
+/// zero when the input has no leading digit run. Callers with a shape
+/// precondition may treat that as impossible; unchecked qpdf callers use it as
+/// the numeric zero.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum QpdfIntParse {
+    /// No leading digit was found; qpdf's `strtoll` result is zero.
+    NoDigits,
+    /// qpdf's 64-bit parse or i32 narrowing would overflow.
+    Overflow(String),
+    /// The parsed value after qpdf's i32 narrowing stage.
+    Value(i32),
+}
+
+/// Parse a decimal prefix with qpdf's `QUtil::string_to_int` semantics.
+pub(crate) fn qpdf_string_to_int_checked(text: &str) -> QpdfIntParse {
+    match qpdf_string_to_ll_checked(text) {
+        QpdfLongLongParse::NoDigits => QpdfIntParse::NoDigits,
+        QpdfLongLongParse::Overflow(message) => QpdfIntParse::Overflow(message),
+        QpdfLongLongParse::Value(value) => match qpdf_i64_to_int_checked(value) {
+            Ok(value) => QpdfIntParse::Value(value),
+            Err(message) => QpdfIntParse::Overflow(message),
+        },
     }
 }
 
@@ -819,10 +847,11 @@ const MAC_ROMAN_TO_UNICODE: [u32; 128] = [
 #[cfg(test)]
 mod tests {
     use super::{
-        int_to_string_base, parse_numrange, qpdf_size_to_int, qpdf_string_to_int_checked,
-        safe_fopen, same_file, strerror_text, to_utf8, utf8_to_ascii, utf8_to_ascii_checked,
-        utf8_to_mac_roman, utf8_to_pdf_doc, utf8_to_pdf_doc_checked, utf8_to_win_ansi,
-        QpdfIntParse,
+        int_to_string_base, parse_numrange, qpdf_i64_to_int_checked, qpdf_size_to_int,
+        qpdf_string_to_int_checked, qpdf_string_to_ll_checked, safe_fopen, same_file,
+        strerror_text, to_utf8, utf8_to_ascii, utf8_to_ascii_checked, utf8_to_mac_roman,
+        utf8_to_pdf_doc, utf8_to_pdf_doc_checked, utf8_to_win_ansi, QpdfIntParse,
+        QpdfLongLongParse,
     };
     use std::io::{Read, Write};
 
@@ -998,6 +1027,53 @@ mod tests {
         assert!(safe_fopen(plus_path, "").is_err());
         assert!(safe_fopen(plus_path, "r?").is_err());
         assert!(safe_fopen(plus_path, "z").is_err());
+    }
+
+    #[test]
+    fn qpdf_string_to_ll_checked_matches_strtoll_prefix_rules() {
+        assert_eq!(qpdf_string_to_ll_checked(""), QpdfLongLongParse::NoDigits);
+        assert_eq!(qpdf_string_to_ll_checked("-"), QpdfLongLongParse::NoDigits);
+        assert_eq!(
+            qpdf_string_to_ll_checked("-42"),
+            QpdfLongLongParse::Value(-42)
+        );
+        assert_eq!(
+            qpdf_string_to_ll_checked("-9223372036854775808"),
+            QpdfLongLongParse::Value(i64::MIN)
+        );
+        assert_eq!(
+            qpdf_string_to_ll_checked("9223372036854775807"),
+            QpdfLongLongParse::Value(i64::MAX)
+        );
+        assert_eq!(
+            qpdf_string_to_ll_checked("  +42trailing"),
+            QpdfLongLongParse::Value(42)
+        );
+        assert_eq!(
+            qpdf_string_to_ll_checked("42\0not-a-number"),
+            QpdfLongLongParse::Value(42)
+        );
+    }
+
+    #[test]
+    fn qpdf_string_to_ll_checked_reports_signed_64_bit_overflow() {
+        for text in ["9223372036854775808", "-9223372036854775809"] {
+            assert_eq!(
+                qpdf_string_to_ll_checked(text),
+                QpdfLongLongParse::Overflow(format!(
+                    "overflow/underflow converting {text} to 64-bit integer"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn qpdf_i64_to_int_checked_matches_qintc_signed_narrowing() {
+        assert_eq!(qpdf_i64_to_int_checked(42).unwrap(), 42);
+        assert_eq!(
+            qpdf_i64_to_int_checked(2_147_483_648).unwrap_err(),
+            "integer out of range converting 2147483648 from a 8-byte signed type to a 4-byte signed type"
+        );
     }
 
     #[test]

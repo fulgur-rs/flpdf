@@ -41,7 +41,10 @@ use crate::parser::{
     LiveInput, LiveTokenSource, ParserDiagnostic,
 };
 use crate::qpdf_obj_gen::QpdfObjGen;
-use crate::qutil::{qpdf_string_to_int_checked, QpdfIntParse};
+use crate::qutil::{
+    qpdf_i64_to_int_checked, qpdf_string_to_int_checked, qpdf_string_to_ll_checked, QpdfIntParse,
+    QpdfLongLongParse,
+};
 use crate::reader::resolver::ResolverHandle;
 use crate::tokenizer::{Token, TokenType, Tokenizer};
 use crate::writer::DecodeLevel;
@@ -3740,6 +3743,20 @@ fn scan_object_header_after_first_token(
         .map(|object_ref| (object_ref, number_token.start as u64)))
 }
 
+/// qpdf's outer parse catches non-QPDF exceptions raised while reading the
+/// xref chain and converts them to `damagedPDF("", 0, "error reading xref: ...")`
+/// (`QPDF.cc:450-464`). Preserve that catch boundary for QUtil/QIntC range
+/// failures produced by the classic table parser.
+fn qpdf_read_xref_conversion_error(filename: &[u8], detail: &str) -> Error {
+    Error::QpdfExc(QpdfExc::new(
+        QpdfErrorCode::DamagedPdf,
+        filename,
+        b"",
+        0,
+        format!("error reading xref: {detail}"),
+    ))
+}
+
 fn parse_xref_table(
     cursor: &mut ByteCursor<'_>,
     bytes: &[u8],
@@ -3759,8 +3776,8 @@ fn parse_xref_table(
     while !done {
         let header_start = cursor.pos;
         let header = cursor.read_bytes(50);
-        let (first, count, header_bytes) =
-            parse_xref_first_line_with_bytes(&header).ok_or_else(|| {
+        let (first, count, header_bytes) = parse_xref_first_line_with_bytes(&header, filename)?
+            .ok_or_else(|| {
                 Error::QpdfExc(QpdfExc::new(
                     QpdfErrorCode::DamagedPdf,
                     filename,
@@ -3783,17 +3800,17 @@ fn parse_xref_table(
         for index in 0..count {
             let entry_offset = cursor.pos;
             let line = cursor.read_line(30);
-            let (offset, generation, in_use, invalid) =
-                parse_xref_entry_line(&line).ok_or_else(|| {
-                    Error::QpdfExc(QpdfExc::new(
-                        QpdfErrorCode::DamagedPdf,
-                        filename,
-                        b"xref table",
-                        i64::try_from(entry_offset).unwrap_or(i64::MAX),
-                        format!("invalid xref entry (obj={})", first + index).into_bytes(),
-                    ))
-                })?;
-            if invalid {
+            let object_number = i64::from(first) + i64::from(index);
+            let parsed = parse_xref_entry_line(&line).ok_or_else(|| {
+                Error::QpdfExc(QpdfExc::new(
+                    QpdfErrorCode::DamagedPdf,
+                    filename,
+                    b"xref table",
+                    i64::try_from(entry_offset).unwrap_or(i64::MAX),
+                    format!("invalid xref entry (obj={object_number})").into_bytes(),
+                ))
+            })?;
+            if parsed.invalid {
                 let warning = damaged_warning(
                     filename,
                     b"xref table",
@@ -3805,31 +3822,33 @@ fn parse_xref_table(
                 // must not discard this already-emitted warning.
                 warning_owner.push_warning(warning)?;
             }
-            // cov:ignore-start: object numbers are narrowed to i32 immediately
-            // below, so a u32 addition overflow cannot be reached by a valid
-            // parsed xref row.
-            let object_number = first.checked_add(index).ok_or_else(|| {
-                Error::QpdfExc(QpdfExc::new(
-                    QpdfErrorCode::DamagedPdf,
-                    filename,
-                    b"xref table",
-                    i64::try_from(entry_offset).unwrap_or(i64::MAX),
-                    b"invalid xref entry",
-                ))
-            })?;
-            // cov:ignore-end
-            let object_ref = QpdfObjGen::new(
-                i32::try_from(object_number)
-                    .map_err(|_| Error::parse(0, "object number does not fit i32"))?,
-                generation,
-            );
-            match in_use {
+            let offset = match qpdf_string_to_ll_checked(parsed.field1) {
+                QpdfLongLongParse::Value(value) => value,
+                QpdfLongLongParse::NoDigits => 0, // cov:ignore: parse_xref_entry_line requires field1 to start with an ASCII digit (QPDF.cc:782-787)
+                QpdfLongLongParse::Overflow(message) => {
+                    return Err(qpdf_read_xref_conversion_error(filename, &message));
+                }
+            };
+            let generation = match qpdf_string_to_int_checked(parsed.field2) {
+                QpdfIntParse::Value(value) => value,
+                QpdfIntParse::NoDigits => 0, // cov:ignore: parse_xref_entry_line requires field2 to start with an ASCII digit (QPDF.cc:802-807)
+                QpdfIntParse::Overflow(message) => {
+                    return Err(qpdf_read_xref_conversion_error(filename, &message));
+                }
+            };
+            let object_number = qpdf_i64_to_int_checked(object_number)
+                .map_err(|message| qpdf_read_xref_conversion_error(filename, &message))?;
+            let object_ref = QpdfObjGen::new(object_number, generation);
+            match parsed.in_use {
                 b'f' => {
                     let _next = offset;
                     entries.push(ParsedXrefEntry::Free { object_ref });
                 }
                 b'n' => {
                     entries.push(ParsedXrefEntry::Live);
+                    // The xref row grammar above accepts digits only, so the
+                    // qpdf `qpdf_offset_t` result is nonnegative here.
+                    let offset = offset as u64;
                     registration.insert_xref_entry(object_ref, XrefEntry::Uncompressed { offset });
                 }
                 // cov:ignore-start: parse_xref_entry_line accepts only the
@@ -3882,11 +3901,17 @@ fn is_pdf_delimiter(byte: u8) -> bool {
 }
 
 #[cfg(test)]
-fn parse_xref_first_line(line: &[u8]) -> Option<(u32, u32)> {
-    parse_xref_first_line_with_bytes(line).map(|(first, count, _)| (first, count))
+fn parse_xref_first_line(line: &[u8]) -> Option<(i32, i32)> {
+    parse_xref_first_line_with_bytes(line, b"")
+        .ok()
+        .flatten()
+        .map(|(first, count, _)| (first, count))
 }
 
-fn parse_xref_first_line_with_bytes(line: &[u8]) -> Option<(u32, u32, usize)> {
+fn parse_xref_first_line_with_bytes(
+    line: &[u8],
+    filename: &[u8],
+) -> Result<Option<(i32, i32, usize)>> {
     let mut pos = 0;
     while line.get(pos).copied().is_some_and(is_pdf_space) {
         pos += 1;
@@ -3896,7 +3921,7 @@ fn parse_xref_first_line_with_bytes(line: &[u8]) -> Option<(u32, u32, usize)> {
         pos += 1;
     }
     if pos == first_start || !line.get(pos).copied().is_some_and(is_pdf_space) {
-        return None;
+        return Ok(None);
     }
     let first_end = pos;
     while line.get(pos).copied().is_some_and(is_pdf_space) {
@@ -3907,23 +3932,45 @@ fn parse_xref_first_line_with_bytes(line: &[u8]) -> Option<(u32, u32, usize)> {
         pos += 1;
     }
     if pos == count_start {
-        return None;
+        return Ok(None);
     }
-    let first = std::str::from_utf8(&line[first_start..first_end])
-        .ok()?
-        .parse::<u64>()
-        .ok()?;
-    let count = std::str::from_utf8(&line[count_start..pos])
-        .ok()?
-        .parse::<u64>()
-        .ok()?;
+    let Ok(first_text) = std::str::from_utf8(&line[first_start..first_end]) else {
+        return Ok(None); // cov:ignore: first_start..first_end contains only bytes accepted by the ASCII-digit scan above
+    };
+    let Ok(count_text) = std::str::from_utf8(&line[count_start..pos]) else {
+        return Ok(None); // cov:ignore: count_start..pos contains only bytes accepted by the ASCII-digit scan above
+    };
+    // qpdf converts `obj` before `num` (`QPDF.cc:764-765`) through the
+    // signed-int primitive; a range failure is caught by QPDF::parse as
+    // `error reading xref`, not rejected as subsection syntax.
+    let first = match qpdf_string_to_int_checked(first_text) {
+        QpdfIntParse::Value(value) => value,
+        QpdfIntParse::NoDigits => 0, // cov:ignore: first_start..first_end contains only bytes accepted by the ASCII-digit scan above
+        QpdfIntParse::Overflow(message) => {
+            return Err(qpdf_read_xref_conversion_error(filename, &message));
+        }
+    };
+    let count = match qpdf_string_to_int_checked(count_text) {
+        QpdfIntParse::Value(value) => value,
+        QpdfIntParse::NoDigits => 0, // cov:ignore: count_start..pos contains only bytes accepted by the ASCII-digit scan above
+        QpdfIntParse::Overflow(message) => {
+            return Err(qpdf_read_xref_conversion_error(filename, &message));
+        }
+    };
     while line.get(pos).copied().is_some_and(is_pdf_space) {
         pos += 1;
     }
-    Some((u32::try_from(first).ok()?, u32::try_from(count).ok()?, pos))
+    Ok(Some((first, count, pos)))
 }
 
-fn parse_xref_entry_line(line: &[u8]) -> Option<(u64, i32, u8, bool)> {
+struct ParsedXrefEntryLine<'line> {
+    field1: &'line str,
+    field2: &'line str,
+    in_use: u8,
+    invalid: bool,
+}
+
+fn parse_xref_entry_line(line: &[u8]) -> Option<ParsedXrefEntryLine<'_>> {
     let mut pos = 0;
     let mut invalid = false;
     while line.get(pos).copied().is_some_and(is_pdf_space) {
@@ -3965,12 +4012,12 @@ fn parse_xref_entry_line(line: &[u8]) -> Option<(u64, i32, u8, bool)> {
         .trim();
     let second_text = std::str::from_utf8(&line[second_start..pos]).ok()?.trim();
     invalid |= first_text.len() != 10 || second_text.len() != 5;
-    Some((
-        first_text.parse::<u64>().ok()?,
-        second_text.parse::<i32>().ok()?,
+    Some(ParsedXrefEntryLine {
+        field1: first_text,
+        field2: second_text,
         in_use,
         invalid,
-    ))
+    })
 }
 
 /// An xref-stream read's terminal error, boxed for a large `Err` arm.
@@ -5537,9 +5584,12 @@ mod final_handle_tests {
     #[test]
     fn classic_xref_leniency_covers_whitespace_and_diagnostic_boundaries() {
         assert_eq!(parse_xref_first_line(b"  0 1\n"), Some((0, 1)));
-        let (_, _, _, invalid) = parse_xref_entry_line(b" 0000000000  65535  f \n")
+        let parsed = parse_xref_entry_line(b" 0000000000  65535  f \n")
             .expect("qpdf accepts a parseable but non-fixed-width xref row");
-        assert!(invalid);
+        assert!(parsed.invalid);
+        assert_eq!(parsed.field1, "0000000000");
+        assert_eq!(parsed.field2, "65535");
+        assert_eq!(parsed.in_use, b'f');
         assert!(parse_xref_entry_line(b"0000000000 00000 x\n").is_none());
 
         // Two spaces before the keyword: qpdf adds its `skip` to the offset it

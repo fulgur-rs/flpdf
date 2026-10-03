@@ -5,7 +5,7 @@ use std::io::Cursor;
 use std::path::PathBuf;
 use std::process::Command;
 
-use flpdf::{ObjectRef, Pdf, PdfOpenOptions, XrefEntry};
+use flpdf::{Error, ObjectRef, Pdf, PdfOpenOptions, XrefEntry};
 
 fn source_file(path: &str) -> String {
     fs::read_to_string(
@@ -597,6 +597,215 @@ fn failed_classic_xref_parse_keeps_prior_entry_warnings_like_qpdf() {
         .collect();
     assert_eq!(flpdf_warnings, qpdf_warnings);
     assert_eq!(rendered, qpdf_rows);
+}
+
+fn classic_xref_integer_overflow_fixture(section: &[u8]) -> (Vec<u8>, usize, usize, usize) {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let catalog_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n");
+    let section_offset = bytes.len();
+    bytes.extend_from_slice(section);
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    (bytes, catalog_offset, pages_offset, section_offset)
+}
+
+/// Exercise both sides of QPDF::parse's xref-read catch boundary:
+/// parse_xrefFirst narrows subsection values before reading a row, while
+/// parse_xrefEntry warns about accepted whitespace before narrowing its
+/// signed 64-bit offset and signed 32-bit generation (`QPDF.cc:450-464,722-767,770-842`;
+/// `QUtil.cc:373-393`).
+fn assert_classic_xref_integer_overflow_matches_qpdf(
+    filename: &str,
+    section: &[u8],
+    accepted_row_offset: Option<usize>,
+    conversion_error: &str,
+) {
+    let error_detail = format!("error reading xref: {conversion_error}");
+
+    let (fixture, catalog_offset, pages_offset, section_offset) =
+        classic_xref_integer_overflow_fixture(section);
+    let directory = tempfile::tempdir().expect("create qpdf fixture directory");
+    let input = directory.path().join(filename);
+    fs::write(&input, &fixture).expect("write qpdf fixture");
+    let description = input.to_string_lossy().into_owned();
+    let accepted_warning = accepted_row_offset.map(|offset| {
+        format!(
+            "{description} (xref table, offset {}): accepting invalid xref table entry",
+            section_offset + offset
+        )
+    });
+
+    let strict_error = match Pdf::open_with_options(
+        Cursor::new(fixture.clone()),
+        PdfOpenOptions {
+            repair: false,
+            suppress_warnings: true,
+            description: description.as_bytes().to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("strict open must reject the overflowing xref integer"),
+        Err(error) => error,
+    };
+    let mut strict_warnings = Vec::new();
+    let terminal_error = if let Some((source, diagnostics)) = strict_error.open_failure() {
+        strict_warnings = diagnostics
+            .entries()
+            .iter()
+            .map(|warning| String::from_utf8_lossy(warning.what_bytes()).into_owned())
+            .collect();
+        source
+    } else {
+        &strict_error
+    };
+    let Error::QpdfExc(qpdf_error) = terminal_error else {
+        panic!("qpdf catches range_error as DamagedPdf, got {terminal_error:?}");
+    };
+    assert_eq!(
+        qpdf_error.get_error_code(),
+        flpdf::QpdfErrorCode::DamagedPdf
+    );
+    assert_eq!(qpdf_error.get_filename(), description.as_bytes());
+    assert_eq!(qpdf_error.get_object(), b"");
+    assert_eq!(qpdf_error.get_file_position(), 0);
+    assert_eq!(qpdf_error.get_message_detail(), error_detail.as_bytes());
+    assert_eq!(
+        qpdf_error.what_bytes(),
+        format!("{description}: {error_detail}").as_bytes()
+    );
+    assert_eq!(
+        strict_warnings,
+        accepted_warning.clone().into_iter().collect::<Vec<_>>()
+    );
+
+    let pdf = Pdf::open_with_options(
+        Cursor::new(fixture.clone()),
+        PdfOpenOptions {
+            repair: true,
+            suppress_warnings: true,
+            description: description.as_bytes().to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("repair mode should reconstruct the two catalog objects");
+    assert_eq!(pdf.root_ref(), Some(ObjectRef::new(1, 0)));
+    let flpdf_warnings: Vec<String> = pdf
+        .repair_diagnostics()
+        .entries()
+        .iter()
+        .map(|warning| String::from_utf8_lossy(warning.what_bytes()).into_owned())
+        .collect();
+    let mut expected_warnings = accepted_warning.into_iter().collect::<Vec<_>>();
+    expected_warnings.extend([
+        format!("{description}: file is damaged"),
+        format!("{description}: {error_detail}"),
+        format!("{description}: Attempting to reconstruct cross-reference table"),
+    ]);
+    assert_eq!(flpdf_warnings, expected_warnings);
+    let rendered = render_xref_table(&pdf.get_xref_table());
+    assert!(rendered.contains(&format!("1/0: uncompressed; offset = {catalog_offset}")));
+    assert!(rendered.contains(&format!("2/0: uncompressed; offset = {pages_offset}")));
+
+    if !qpdf_available() {
+        eprintln!("qpdf 11.9.0 is not available; skipping only the oracle comparison");
+        return;
+    }
+    let strict_qpdf = Command::new("qpdf")
+        .args(["--suppress-recovery", "--check"])
+        .arg(&input)
+        .output()
+        .expect("qpdf should spawn");
+    assert_eq!(strict_qpdf.status.code(), Some(2));
+    let strict_stderr = String::from_utf8_lossy(&strict_qpdf.stderr);
+    let strict_qpdf_warnings: Vec<String> = strict_stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("WARNING: "))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(strict_warnings, strict_qpdf_warnings);
+    assert!(strict_stderr
+        .lines()
+        .any(|line| line == format!("qpdf: {description}: {error_detail}")));
+
+    let qpdf = Command::new("qpdf")
+        .args(["--warning-exit-0", "--show-xref"])
+        .arg(&input)
+        .output()
+        .expect("qpdf should spawn");
+    assert!(
+        qpdf.status.success(),
+        "qpdf should recover this classic table: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    let qpdf_warnings: Vec<String> = String::from_utf8_lossy(&qpdf.stderr)
+        .lines()
+        .filter_map(|line| line.strip_prefix("WARNING: "))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(flpdf_warnings, qpdf_warnings);
+    let qpdf_rows: Vec<String> = String::from_utf8_lossy(&qpdf.stdout)
+        .lines()
+        .filter(|line| line.contains(": uncompressed;") || line.contains(": compressed;"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(rendered, qpdf_rows);
+}
+
+#[test]
+fn classic_xref_subsection_integer_overflow_matches_qpdf() {
+    assert_classic_xref_integer_overflow_matches_qpdf(
+        "classic-xref-subsection-object-overflow.pdf",
+        b"2147483648 1\n0000000000 00000 n \n",
+        None,
+        "integer out of range converting 2147483648 from a 8-byte signed type to a 4-byte signed type",
+    );
+}
+
+#[test]
+fn classic_xref_subsection_count_overflow_matches_qpdf() {
+    assert_classic_xref_integer_overflow_matches_qpdf(
+        "classic-xref-subsection-count-overflow.pdf",
+        b"0 2147483648\n",
+        None,
+        "integer out of range converting 2147483648 from a 8-byte signed type to a 4-byte signed type",
+    );
+}
+
+#[test]
+fn classic_xref_generation_overflow_warns_before_the_qpdf_range_error() {
+    assert_classic_xref_integer_overflow_matches_qpdf(
+        "classic-xref-generation-overflow.pdf",
+        b"0 1\n0000000000  2147483648 n \n",
+        Some(b"0 1\n".len()),
+        "integer out of range converting 2147483648 from a 8-byte signed type to a 4-byte signed type",
+    );
+}
+
+#[test]
+fn classic_xref_object_number_narrowing_preserves_row_warning_order() {
+    assert_classic_xref_integer_overflow_matches_qpdf(
+        "classic-xref-object-number-overflow.pdf",
+        b"2147483647 2\n0000000000 00000 f \n0000000000  00000 n \n",
+        Some(b"2147483647 2\n0000000000 00000 f \n".len()),
+        "integer out of range converting 2147483648 from a 8-byte signed type to a 4-byte signed type",
+    );
+}
+
+#[test]
+fn classic_xref_entry_offset_overflow_uses_qpdf_signed_long_range() {
+    assert_classic_xref_integer_overflow_matches_qpdf(
+        "classic-xref-offset-overflow.pdf",
+        b"0 1\n9223372036854775808 00000 f \n",
+        Some(b"0 1\n".len()),
+        "overflow/underflow converting 9223372036854775808 to 64-bit integer",
+    );
 }
 
 #[test]
