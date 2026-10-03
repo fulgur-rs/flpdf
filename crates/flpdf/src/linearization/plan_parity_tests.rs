@@ -1,4 +1,6 @@
 //! Source-derived plan traversal tests that exercise writer-private data.
+//!
+//! qpdf correspondence: QPDF_linearization.cc linearization plan traversal.
 
 use crate::linearization::plan::LinearizationPlan;
 use crate::{ObjectRef, ObjectStreamMode, Pdf};

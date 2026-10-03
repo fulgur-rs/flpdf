@@ -8,6 +8,8 @@
 //! back-patched bytes WITHOUT requiring qpdf at test time (the offsets/markers
 //! are parsed directly), so they run on every build. As crate unit tests, they
 //! also inspect the internal plan, renumber map, and hint reconciliation.
+//!
+//! qpdf correspondence: QPDFWriter.cc linearized ObjStm emission.
 
 use crate::linearization::plan::LinearizationPlan;
 use crate::linearization::renumber::RenumberMap;

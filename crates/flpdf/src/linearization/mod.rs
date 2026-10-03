@@ -1,9 +1,10 @@
 //! Public linearization inspection APIs and crate-private writer machinery.
 //!
-//! qpdf correspondence: `QPDF::checkLinearization` and
-//! `QPDF::showLinearizationData` are public inspection operations. Planning,
-//! hint-table construction, renumbering, and back-patching are writer internals
-//! in qpdf and remain crate-private here.
+//! qpdf correspondence: QPDF.hh public linearization inspection methods.
+//!
+//! `QPDF::checkLinearization` and `QPDF::showLinearizationData` are public
+//! inspection operations. Planning, hint-table construction, renumbering, and
+//! back-patching are writer internals in qpdf and remain crate-private here.
 
 pub(crate) mod back_patch;
 pub mod check;

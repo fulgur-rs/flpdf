@@ -72,9 +72,11 @@
 | `crates/flpdf/src/linearization/hint_page.rs` | correspondence | QPDF_linearization.cc page-offset hint planning split into a data module |
 | `crates/flpdf/src/linearization/hint_shared.rs` | correspondence | QPDF_linearization.cc shared-object hint planning split into a data module |
 | `crates/flpdf/src/linearization/hint_stream.rs` | correspondence | QPDF_linearization.cc plus BitStream.cc and BitWriter.cc hint encoding responsibilities |
-| `crates/flpdf/src/linearization/mod.rs` | correspondence | QPDF_linearization.cc responsibilities split across the linearization module tree |
+| `crates/flpdf/src/linearization/linearize_objstm_generate_tests.rs` | correspondence | QPDFWriter.cc linearized ObjStm emission |
+| `crates/flpdf/src/linearization/mod.rs` | correspondence | QPDF.hh public linearization inspection methods |
 | `crates/flpdf/src/linearization/part1.rs` | correspondence | QPDFWriter.cc first-part linearized output split from the writer |
 | `crates/flpdf/src/linearization/plan.rs` | correspondence | QPDF_linearization.cc object classification and layout planning |
+| `crates/flpdf/src/linearization/plan_parity_tests.rs` | correspondence | QPDF_linearization.cc linearization plan traversal |
 | `crates/flpdf/src/linearization/renumber.rs` | correspondence | QPDFWriter.cc linearized object renumbering layered over the shared rewrite renumberer |
 | `crates/flpdf/src/linearization/show.rs` | correspondence | QPDF_linearization.cc hint decoding plus QPDFJob.cc display formatting |
 | `crates/flpdf/src/linearization/writer.rs` | correspondence | QPDFWriter.cc linearized write path split from the standard writer |
