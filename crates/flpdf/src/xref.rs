@@ -3935,7 +3935,7 @@ fn parse_xref_first_line_with_bytes(
         return Ok(None);
     }
     let Ok(first_text) = std::str::from_utf8(&line[first_start..first_end]) else {
-        return Ok(None);
+        return Ok(None); // cov:ignore: first_start..first_end contains only bytes accepted by the ASCII-digit scan above
     };
     let Ok(count_text) = std::str::from_utf8(&line[count_start..pos]) else {
         return Ok(None); // cov:ignore: count_start..pos contains only bytes accepted by the ASCII-digit scan above
