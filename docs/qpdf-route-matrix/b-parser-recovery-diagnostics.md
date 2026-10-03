@@ -39,6 +39,7 @@ qpdf 11.9.0 pinned source。以下の行範囲はすべて `rg -n` / `sed -n` / 
      `pdf_version = "1.2"`（`libqpdf/QPDF.cc:430-437`）。**throw しない**。
    - header 探索は `InputSource::findFirst("%PDF-", 0, 1024, finder)` なので、1024-byte 制限は候補の開始位置にかかる。marker が read block を跨ぐ場合は候補位置から block を読み直し、`QPDF::findHeader` は候補位置から別途 `readLine(1024)` して版番号を検証する（`libqpdf/InputSource.cc:21-40,44-140`; `libqpdf/QPDF.cc:388-406`）。`readLine` は候補位置から次の CR/LF run まで source も進める（`libqpdf/FileInputSource.cc:53-81`）。有効な非0候補だけ `OffsetInputSource` で後続 offset を rebasing する。無効候補は次の `%PDF-` を探す。
    - 末尾 1054 byte の raw substring を `InputSource::findLast` で走査し、各候補を `QPDF::findStartxref` predicate に渡す（`libqpdf/QPDF.cc:413-419,439-448`; `InputSource.cc:44-140,145-165`）。predicate は候補位置から `readToken` した第1 token が完全な `startxref` word、第2 token が integer の場合だけ受理し、成功時は offset token の開始位置へ戻す。不正候補は検索を継続して直前の有効候補に fallback する。候補より左のword boundaryは別途検査しない。
+   - 受理した offset token は `QUtil::string_to_ll` で signed `qpdf_offset_t` に変換する。この変換は内側 `read_xref` try より前なので 64-bit overflow/underflow は recovery catch を通らない。負値は 0 sentinel ではなく `read_xref` に渡り、signed `InputSource::seek` の失敗が catch 内で `DamagedPdf` に包まれてから recovery へ進む（`QPDF.cc:439-464,626-640`; `QUtil.cc:377-387`）。
    - `xref_offset == 0` なら `throw damagedPDF("", 0, "can't find startxref")`。内側 try が
      `read_xref` を包み、`QPDFExc` は素通し、その他 `std::exception` は
      `damagedPDF("", 0, "error reading xref: " + e.what())` に**包み直して** throw。外側 catch が
@@ -51,6 +52,8 @@ qpdf 11.9.0 pinned source。以下の行範囲はすべて `rg -n` / `sed -n` / 
 **2026-10-03 (`flpdf-6ik2q.13`)**: `parse_xrefEntry` は許容した余分な空白・桁幅の警告を各行の解析中に `QPDF::warn` へ即時追加する（`QPDF.cc:770-842`; 単一 collection は `QPDF.cc:488-503`）。後続行が不正で `read_xrefTable` が throw しても先行警告は残り、その後 `reconstruct_xref` が破損・原因・再構築の警告を順に追加する（`QPDF.cc:846-880,516-530`）。canonical `parse_xref_table` も行ごとに `CanonicalTrailerOwner::push_warning` へ渡し、集約ローカル値の破棄で警告を失わない。余分な区切り空白を含む有効 row 0 と不正 row 1 の fixture で、qpdf 11.9.0 と警告順および復元 xref 行を比較する。
 
 **2026-10-03 (`flpdf-6ik2q.14`)**: classic subsection の object/count は qpdf `int` へ `QUtil::string_to_int` で変換し（`libqpdf/QPDF.cc:722-767`; `libqpdf/QUtil.cc:389-393`）、entry の field1 は signed `qpdf_offset_t`、generation は `int` へ変換する。entry parser は whitespace/field-width warning を `string_to_ll` / `string_to_int` より先に発行し、range exception は `QPDF::parse` の read_xref catch が `DamagedPdf` の `error reading xref: ...` に包む（`libqpdf/QPDF.cc:450-464,770-842`; `include/qpdf/QIntC.hh:87-109`）。live qpdf fixture で subsection object、generation、field1 offset の上限をそれぞれ超過させ、strict error fields、warning order、repair 後の xref rows を固定する。
+
+**2026-10-03 (`flpdf-6ik2q.15`)**: `startxref` は qpdf の signed `qpdf_offset_t` と同じ `i64` で変換する。`string_to_ll` の range error は recovery 前の raw error、負値の seek error は `read_xref` catch による offset-zero `DamagedPdf` と通常の再構築警告を経る。`FileInputSource` の OS seek、`BufferInputSource` の下限、header rebasing 後に `OffsetInputSource` が返す文言をそれぞれ canonical fixture で比較し、`i64::MIN` と両方向の overflow も検査する（`libqpdf/QPDF.cc:439-469,626-640`; `QUtil.cc:377-387`; `FileInputSource.cc:100-107`; `BufferInputSource.cc:83-112`; `OffsetInputSource.cc:37-55`）。
 
 2. **`QPDF::read_xref(xref_offset)`**（`libqpdf/QPDF.cc:626-719`）— `while (xref_offset)` で
    `visited` に積みながら:

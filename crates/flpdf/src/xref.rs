@@ -42,8 +42,8 @@ use crate::parser::{
 };
 use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::qutil::{
-    qpdf_i64_to_int_checked, qpdf_string_to_int_checked, qpdf_string_to_ll_checked, QpdfIntParse,
-    QpdfLongLongParse,
+    qpdf_i64_to_int_checked, qpdf_string_to_int_checked, qpdf_string_to_ll_checked,
+    qpdf_u64_to_offset_checked, QpdfIntParse, QpdfLongLongParse,
 };
 use crate::reader::resolver::ResolverHandle;
 use crate::tokenizer::{Token, TokenType, Tokenizer};
@@ -101,7 +101,14 @@ pub(crate) trait CanonicalTrailerOwner {
     /// qpdf's live `m->file` source boundary (`QPDF.hh:67-97,1453-1457`).
     /// Xref loading uses these operations instead of a complete input
     /// snapshot.
-    fn source_seek(&self, offset: u64) -> Result<()>;
+    /// qpdf's signed `InputSource::seek(qpdf_offset_t, SEEK_SET)` boundary.
+    fn source_seek(&self, offset: i64) -> Result<()>;
+    /// Adapt a source position held in flpdf's unsigned window coordinates to
+    /// qpdf's signed `qpdf_offset_t` input-source contract.
+    fn source_seek_nonnegative(&self, offset: u64) -> Result<()> {
+        let offset = qpdf_u64_to_offset_checked(offset).map_err(Error::System)?;
+        self.source_seek(offset)
+    }
     fn source_seek_end(&self) -> Result<u64>;
     fn source_tell(&self) -> Result<u64>;
     fn source_length(&self) -> Result<u64>;
@@ -168,8 +175,8 @@ impl<R: Read + Seek + 'static> CanonicalTrailerOwner for ResolverHandle<R> {
         ResolverHandle::set_trailer_if_uninitialized(self, trailer)
     }
 
-    fn source_seek(&self, offset: u64) -> Result<()> {
-        self.seek(offset)
+    fn source_seek(&self, offset: i64) -> Result<()> {
+        self.seek_qpdf_offset(offset)
     }
 
     fn source_seek_end(&self) -> Result<u64> {
@@ -850,7 +857,7 @@ fn read_live_source_range(
     offset: u64,
     length: usize,
 ) -> Result<Vec<u8>> {
-    owner.source_seek(offset)?;
+    owner.source_seek_nonnegative(offset)?;
     let mut bytes = Vec::with_capacity(length);
     let mut chunk = vec![0u8; 64 * 1024];
     while bytes.len() < length {
@@ -1081,6 +1088,13 @@ pub(crate) fn load_xref_state_from_source(
     let tail = read_live_source_range(owner, tail_start, tail_length)?;
     let startxref = match parse_startxref(&tail) {
         Ok(offset) => offset,
+        // QPDF::parse performs QUtil::string_to_ll before its read_xref try
+        // (`QPDF.cc:439-464`). Range errors therefore escape recovery even
+        // when attempt_recovery is enabled.
+        Err(error @ Error::SystemBytes(_)) => {
+            deliver_canonical_diagnostics(owner, &mut initial_diagnostics)?;
+            return Err(error);
+        }
         Err(error) if owner.attempt_recovery() => {
             // The canonical recovery scanner reads the same live source in
             // chunks. Keep no complete input snapshot merely because qpdf's
@@ -1102,6 +1116,35 @@ pub(crate) fn load_xref_state_from_source(
             return Err(error);
         }
     };
+    if startxref < 0 {
+        // qpdf passes the signed offset directly to read_xref, whose seek is
+        // inside QPDF::parse's inner catch (`QPDF.cc:450-464,626-640`).
+        // Normalize only that source exception at the same boundary; repair
+        // then receives the resulting DamagedPdf trigger in normal order.
+        let source_error = match owner.source_seek(startxref) {
+            Err(error) => error,
+            // cov:ignore-start: StreamInput::seek_qpdf_offset always returns Err for negative logical offsets, including the post-seek OffsetInputSource check
+            Ok(()) => {
+                Error::SystemBytes(b"negative qpdf source seek unexpectedly succeeded".to_vec())
+            } // cov:ignore-end
+        };
+        let error = qpdf_read_xref_runtime_error(&options.description, source_error);
+        if owner.attempt_recovery() {
+            return load_xref_state_from_window(
+                &[],
+                0,
+                version,
+                header_offset,
+                0,
+                options,
+                Diagnostics::default(),
+                vec![error],
+                owner,
+            );
+        }
+        return Err(error);
+    }
+    let startxref = startxref as u64;
     if startxref == 0 {
         // qpdf's `xref_offset == 0` guard skips `read_xref` entirely
         // (`QPDF.cc:450-452`). Do not put the direct reconstruction handoff
@@ -2717,7 +2760,7 @@ fn recover_xref_entries_from_source(
                             source_window_start: u64,
                             source_window: &[u8]| {
         let Some(first_token) = read_scan_token(line, 0, line.len()) else {
-            owner.source_seek(next_line_start)?;
+            owner.source_seek_nonnegative(next_line_start)?;
             return Ok::<(), Error>(());
         };
         if capture_trailer && trailer.is_none() && first_token.is_word_value(b"trailer") {
@@ -2735,7 +2778,7 @@ fn recover_xref_entries_from_source(
                 owner.set_trailer_if_uninitialized(candidate.clone());
                 trailer = Some(candidate);
             }
-            owner.source_seek(next_line_start)?;
+            owner.source_seek_nonnegative(next_line_start)?;
         } else {
             if first_token.is_integer() {
                 // qpdf reads the next two tokens from the live source
@@ -2766,7 +2809,7 @@ fn recover_xref_entries_from_source(
             // qpdf rewinds to the next physical line after evaluating this
             // candidate, regardless of whether the two following tokens
             // formed an object header (`QPDF.cc:571-574`).
-            owner.source_seek(next_line_start)?;
+            owner.source_seek_nonnegative(next_line_start)?;
         }
         Ok(())
     };
@@ -2774,7 +2817,7 @@ fn recover_xref_entries_from_source(
     let mut last_source_window = None;
     loop {
         let source_window_start = position;
-        owner.source_seek(position)?;
+        owner.source_seek_nonnegative(position)?;
         let read = owner.source_read(&mut chunk)?;
         if read == 0 {
             break;
@@ -3618,7 +3661,7 @@ impl<'a> RecoverySourceTokenReader<'a> {
         if self.position >= self.source_length {
             return Ok(None);
         }
-        self.owner.source_seek(self.position)?;
+        self.owner.source_seek_nonnegative(self.position)?;
         self.buffer_length = self.owner.source_read(&mut self.buffer)?;
         self.buffer_position = 0;
         if self.buffer_length == 0 {
@@ -3747,14 +3790,28 @@ fn scan_object_header_after_first_token(
 /// xref chain and converts them to `damagedPDF("", 0, "error reading xref: ...")`
 /// (`QPDF.cc:450-464`). Preserve that catch boundary for QUtil/QIntC range
 /// failures produced by the classic table parser.
-fn qpdf_read_xref_conversion_error(filename: &[u8], detail: &str) -> Error {
+fn qpdf_read_xref_runtime_error(filename: &[u8], error: Error) -> Error {
+    let detail = match error {
+        Error::QpdfExc(error) => return Error::QpdfExc(error),
+        Error::SystemBytes(message) => message,
+        Error::System(message) | Error::Internal(message) => message.into_bytes(),
+        Error::Io(error) => crate::qutil::strerror_text(&error).into_bytes(),
+        error => error.to_string().into_bytes(),
+    };
+    let detail = detail.split(|byte| *byte == 0).next().unwrap_or_default();
+    let mut message = b"error reading xref: ".to_vec();
+    message.extend_from_slice(detail);
     Error::QpdfExc(QpdfExc::new(
         QpdfErrorCode::DamagedPdf,
         filename,
         b"",
         0,
-        format!("error reading xref: {detail}"),
+        message,
     ))
+}
+
+fn qpdf_read_xref_conversion_error(filename: &[u8], detail: &str) -> Error {
+    qpdf_read_xref_runtime_error(filename, Error::SystemBytes(detail.as_bytes().to_vec()))
 }
 
 fn parse_xref_table(
@@ -4557,7 +4614,7 @@ fn read_qpdf_input_block(
     offset: u64,
     length: usize,
 ) -> Result<Vec<u8>> {
-    owner.source_seek(offset)?;
+    owner.source_seek_nonnegative(offset)?;
     let mut bytes = vec![0; length];
     let bytes_read = owner.source_read(&mut bytes)?;
     bytes.truncate(bytes_read);
@@ -4586,7 +4643,7 @@ fn skip_qpdf_input_line(owner: &dyn CanonicalTrailerOwner) -> Result<()> {
         };
 
         let mut next = block_offset.saturating_add(eol as u64).saturating_add(1);
-        owner.source_seek(next)?;
+        owner.source_seek_nonnegative(next)?;
         loop {
             let mut byte = [0; 1];
             if owner.source_read(&mut byte)? == 0 {
@@ -4595,7 +4652,7 @@ fn skip_qpdf_input_line(owner: &dyn CanonicalTrailerOwner) -> Result<()> {
             if !matches!(byte[0], b'\r' | b'\n') {
                 // qpdf's unreadCh puts the first non-EOL byte back after it
                 // finishes consuming the complete line-ending run.
-                owner.source_seek(next)?;
+                owner.source_seek_nonnegative(next)?;
                 return Ok(());
             }
             next = next.saturating_add(1);
@@ -4610,7 +4667,7 @@ fn read_qpdf_header_line(owner: &dyn CanonicalTrailerOwner, offset: u64) -> Resu
     const HEADER_LINE_READ_SIZE: usize = 1024;
 
     let line = read_qpdf_input_block(owner, offset, HEADER_LINE_READ_SIZE)?;
-    owner.source_seek(offset)?;
+    owner.source_seek_nonnegative(offset)?;
     skip_qpdf_input_line(owner)?;
     owner.set_source_last_offset(offset);
     Ok(line)
@@ -4708,7 +4765,7 @@ fn parse_qpdf_header_version(bytes: &[u8]) -> Option<String> {
     )
 }
 
-fn parse_startxref(bytes: &[u8]) -> Result<u64> {
+fn parse_startxref(bytes: &[u8]) -> Result<i64> {
     let marker = b"startxref";
     // qpdf's QPDF::parse searches for the marker only in the final 1054
     // bytes of the file (`QPDF.cc:439-448`). `InputSource::findLast` keeps
@@ -4759,8 +4816,11 @@ fn parse_startxref(bytes: &[u8]) -> Result<u64> {
     }
     let text = std::str::from_utf8(&token.value)
         .map_err(|_| Error::parse(token.start, "number is not utf-8"))?;
-    text.parse::<u64>()
-        .map_err(|_| Error::parse(token.start, "invalid unsigned integer"))
+    match qpdf_string_to_ll_checked(text) {
+        QpdfLongLongParse::NoDigits => Ok(0), // cov:ignore: Integer token requires a digit (`tokenizer.rs:660-686`; qpdf `QPDFTokenizer.cc:487-515`)
+        QpdfLongLongParse::Value(offset) => Ok(offset),
+        QpdfLongLongParse::Overflow(message) => Err(Error::SystemBytes(message.into_bytes())),
+    }
 }
 
 struct ByteCursor<'a> {
@@ -4846,6 +4906,52 @@ mod final_handle_tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn read_xref_runtime_exceptions_follow_qpdf_parse_catch_boundary() {
+        let original = QpdfExc::new(QpdfErrorCode::Object, b"input.pdf", b"", 4, b"qpdf");
+        let passed_through =
+            qpdf_read_xref_runtime_error(b"outer.pdf", Error::QpdfExc(original.clone()));
+        assert!(matches!(
+            passed_through,
+            Error::QpdfExc(error)
+                if error.get_error_code() == original.get_error_code()
+                    && error.what_bytes() == original.what_bytes()
+        ));
+
+        for (source, detail) in [
+            (
+                Error::SystemBytes(b"raw system\0ignored".to_vec()),
+                b"error reading xref: raw system".as_slice(),
+            ),
+            (
+                Error::System("runtime error".to_owned()),
+                b"error reading xref: runtime error".as_slice(),
+            ),
+            (
+                Error::Internal("logic error".to_owned()),
+                b"error reading xref: logic error".as_slice(),
+            ),
+            (
+                Error::Io(std::io::Error::from_raw_os_error(22)),
+                b"error reading xref: Invalid argument".as_slice(),
+            ),
+            (
+                Error::parse(3, "parser error"),
+                b"error reading xref: parse error at byte 3: parser error".as_slice(),
+            ),
+        ] {
+            assert!(matches!(
+                qpdf_read_xref_runtime_error(b"input.pdf", source),
+                Error::QpdfExc(wrapped)
+                    if wrapped.get_error_code() == QpdfErrorCode::DamagedPdf
+                        && wrapped.get_filename() == b"input.pdf"
+                        && wrapped.get_object() == b""
+                        && wrapped.get_file_position() == 0
+                        && wrapped.get_message_detail() == detail
+            ));
+        }
+    }
 
     /// Load xref state the way `Pdf::open` does: through a `ResolverHandle`
     /// that owns the input source before parsing starts, mirroring qpdf's
@@ -6643,7 +6749,10 @@ mod final_handle_tests {
             false
         }
 
-        fn source_seek(&self, offset: u64) -> Result<()> {
+        fn source_seek(&self, offset: i64) -> Result<()> {
+            let offset = u64::try_from(offset).map_err(|_| {
+                Error::SystemBytes(b"synthetic source cannot seek before its beginning".to_vec())
+            })?;
             std::io::Seek::seek(
                 &mut *self.source.borrow_mut(),
                 std::io::SeekFrom::Start(offset),
@@ -6725,6 +6834,26 @@ mod final_handle_tests {
         fn repair_diagnostics(&self) -> Diagnostics {
             self.diagnostics.borrow().clone()
         }
+    }
+
+    #[test]
+    fn failure_injection_owner_rejects_negative_signed_source_offsets() {
+        let owner = FailingCanonicalOwner {
+            transport_error: false,
+            diagnostics: RefCell::new(Diagnostics::default()),
+            source: RefCell::new(std::io::Cursor::new(Vec::new())),
+            declared_source_length: Some(0),
+            source_read_failure: false,
+            accept_warnings: None,
+        };
+        let error = owner
+            .source_seek(-1)
+            .expect_err("the synthetic Cursor owner has no negative coordinate");
+
+        assert_eq!(
+            error.raw_message(),
+            Some(b"synthetic source cannot seek before its beginning".as_slice())
+        );
     }
 
     #[test]

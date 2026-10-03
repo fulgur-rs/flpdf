@@ -574,6 +574,26 @@ pub(crate) fn qpdf_i64_to_int_checked(value: i64) -> std::result::Result<i32, St
     })
 }
 
+/// Narrow an unsigned Rust source position into qpdf's signed `qpdf_offset_t`
+/// (`QIntC::to_offset`, `include/qpdf/QIntC.hh:220-224`).
+pub(crate) fn qpdf_u64_to_offset_checked(value: u64) -> std::result::Result<i64, String> {
+    i64::try_from(value).map_err(|_| {
+        format!(
+            "integer out of range converting {value} from a 8-byte unsigned type to a 8-byte signed type"
+        )
+    })
+}
+
+/// Convert a Rust source-header position to qpdf's signed `qpdf_offset_t`.
+pub(crate) fn qpdf_usize_to_offset_checked(value: usize) -> std::result::Result<i64, String> {
+    i64::try_from(value).map_err(|_| {
+        format!(
+            "integer out of range converting {value} from a {}-byte unsigned type to a 8-byte signed type",
+            std::mem::size_of::<usize>()
+        )
+    })
+}
+
 /// Result of qpdf's two-stage decimal-integer conversion
 /// (`QUtil::string_to_int`, `libqpdf/QUtil.cc:389-393`): `string_to_ll`
 /// parses a leading digit run into an i64, then `QIntC::to_int` narrows that
@@ -848,10 +868,10 @@ const MAC_ROMAN_TO_UNICODE: [u32; 128] = [
 mod tests {
     use super::{
         int_to_string_base, parse_numrange, qpdf_i64_to_int_checked, qpdf_size_to_int,
-        qpdf_string_to_int_checked, qpdf_string_to_ll_checked, safe_fopen, same_file,
-        strerror_text, to_utf8, utf8_to_ascii, utf8_to_ascii_checked, utf8_to_mac_roman,
-        utf8_to_pdf_doc, utf8_to_pdf_doc_checked, utf8_to_win_ansi, QpdfIntParse,
-        QpdfLongLongParse,
+        qpdf_string_to_int_checked, qpdf_string_to_ll_checked, qpdf_u64_to_offset_checked,
+        qpdf_usize_to_offset_checked, safe_fopen, same_file, strerror_text, to_utf8, utf8_to_ascii,
+        utf8_to_ascii_checked, utf8_to_mac_roman, utf8_to_pdf_doc, utf8_to_pdf_doc_checked,
+        utf8_to_win_ansi, QpdfIntParse, QpdfLongLongParse,
     };
     use std::io::{Read, Write};
 
@@ -1073,6 +1093,25 @@ mod tests {
         assert_eq!(
             qpdf_i64_to_int_checked(2_147_483_648).unwrap_err(),
             "integer out of range converting 2147483648 from a 8-byte signed type to a 4-byte signed type"
+        );
+    }
+
+    #[test]
+    fn qpdf_unsigned_positions_narrow_to_signed_offset_like_qintc() {
+        assert_eq!(qpdf_u64_to_offset_checked(i64::MAX as u64), Ok(i64::MAX));
+        assert_eq!(qpdf_usize_to_offset_checked(42), Ok(42));
+        assert_eq!(
+            qpdf_u64_to_offset_checked(u64::MAX).unwrap_err(),
+            "integer out of range converting 18446744073709551615 from a 8-byte unsigned type to a 8-byte signed type"
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn qpdf_usize_to_offset_checked_reports_64_bit_unsigned_overflow() {
+        assert_eq!(
+            qpdf_usize_to_offset_checked(usize::MAX).unwrap_err(),
+            "integer out of range converting 18446744073709551615 from a 8-byte unsigned type to a 8-byte signed type"
         );
     }
 
