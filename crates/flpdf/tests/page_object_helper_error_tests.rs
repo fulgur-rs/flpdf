@@ -242,6 +242,44 @@ fn get_attribute_preserves_nonstandard_page_rotate_value_like_qpdf() {
 }
 
 #[test]
+fn form_provider_describes_page_contents_with_qpdf_obj_gen() {
+    // qpdf's ContentProvider labels the page contents as
+    // "contents from page object " + getObjGen().unparse(' ')
+    // (`libqpdf/QPDFPageObjectHelper.cc:35`), i.e. "3 0" without " R".
+    let bytes = single_page(
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 30] /Resources << >> /Contents [4 0 R 7] >>",
+        &[(4, "<< /Length 3 >>\nstream\nq Q\nendstream".into())],
+    );
+    let (mut pdf, page_ref) = helper_for(bytes);
+    pdf.set_suppress_warnings(true);
+    let page = pdf.get_object_handle(page_ref);
+    let wrapped = {
+        let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
+        helper.get_form_xobject_for_page(false).unwrap()
+    };
+    wrapped.get_raw_stream_data().unwrap();
+
+    let messages: Vec<String> = pdf
+        .get_warnings()
+        .entries()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("contents from page object 3 0: item index 1 (from 0)")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .all(|message| !message.contains("contents from page object 3 0 R")),
+        "{messages:?}"
+    );
+}
+
+#[test]
 fn form_provider_reads_live_page_contents_when_materialized_like_qpdf() {
     let bytes = single_page(
         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 30] /Resources << >> /Contents 4 0 R >>",
@@ -300,12 +338,22 @@ fn remove_unreferenced_resources_accepts_direct_dictionary_target_like_qpdf() {
         b"/Resources".to_vec(),
         ObjectHandle::dictionary(vec![(b"/XObject".to_vec(), xobjects.clone())]),
     )]);
-    let mut helper = PageObjectHelper::from_object_handle(target, &mut pdf);
+    let mut helper = PageObjectHelper::from_object_handle(target.clone(), &mut pdf);
 
     helper
         .remove_unreferenced_resources()
         .expect("qpdf removes unused resources from a direct dictionary target");
-    assert!(!xobjects.try_has_key(b"/Unused").unwrap());
+    let pruned = target
+        .try_get_key(b"/Resources")
+        .unwrap()
+        .try_get_key(b"/XObject")
+        .unwrap();
+    assert!(!pruned.try_has_key(b"/Unused").unwrap());
+    // qpdf replaces even a direct category with a shallow copy
+    // (`libqpdf/QPDFPageObjectHelper.cc:576-585`), so the caller's original
+    // dictionary is left untouched.
+    assert!(!pruned.is_same_object_as(&xobjects));
+    assert!(xobjects.try_has_key(b"/Unused").unwrap());
 }
 
 #[test]
@@ -409,6 +457,70 @@ fn remove_unreferenced_resources_runs_the_action_for_each_form_reference_like_qp
             "Bad token found while scanning content stream; not attempting to remove unreferenced objects from this object",
         ]
     );
+}
+
+/// qpdf snapshots `numWarnings` only through the receiver's owning QPDF
+/// (`q ? q->numWarnings() : 0`, `libqpdf/QPDFPageObjectHelper.cc:550-553`).
+/// A contextless direct receiver (here a shallow copy of the page) therefore
+/// never takes the bad-token veto even though the content parser warned;
+/// probed with the public C++ API on the same shape.
+#[test]
+fn remove_unreferenced_resources_ignores_parser_warnings_for_contextless_receiver_like_qpdf() {
+    let bytes = single_page(
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 30] /Resources << /Font << /F1 4 0 R /Unused 4 0 R >> >> /Contents 5 0 R >>",
+        &[
+            (4, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()),
+            (5, "<< /Length 14 >>\nstream\n<0g> /F1 12 Tf\nendstream".into()),
+        ],
+    );
+    let (mut pdf, page_ref) = helper_for(bytes);
+    let receiver = pdf.get_object_handle(page_ref).shallow_copy().unwrap();
+    let warnings_before = pdf.num_warnings();
+    let mut helper = PageObjectHelper::from_object_handle(receiver.clone(), &mut pdf);
+
+    helper.remove_unreferenced_resources().unwrap();
+
+    assert!(
+        pdf.num_warnings() > warnings_before,
+        "the content parser still warns"
+    );
+    let fonts = receiver
+        .try_get_key(b"/Resources")
+        .unwrap()
+        .try_get_key(b"/Font")
+        .unwrap();
+    assert!(fonts.try_has_key(b"/F1").unwrap());
+    assert!(!fonts.try_has_key(b"/Unused").unwrap());
+}
+
+/// qpdf's `forEachXObject` walks `xobj_dict.getKeys()`, which drops keys whose
+/// values are null (`libqpdf/QPDFPageObjectHelper.cc:335-338`,
+/// `libqpdf/QPDF_Dictionary.cc:118-127`); probed with the public C++ API on the
+/// same shape (only `/Image` is enumerated).
+#[test]
+fn for_each_xobject_skips_keys_whose_values_resolve_to_null_like_qpdf() {
+    let bytes = single_page(
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 30] /Resources << /XObject << /N null /Dang 99 0 R /NR 4 0 R /Image 5 0 R >> >> >>",
+        &[
+            (4, "null".into()),
+            (
+                5,
+                "<< /Type /XObject /Subtype /Image /Width 2 /Height 3 /Length 0 >>\nstream\n\nendstream"
+                    .into(),
+            ),
+        ],
+    );
+    let (mut pdf, page_ref) = helper_for(bytes);
+    let target = pdf.get_object_handle(page_ref);
+    let mut helper = PageObjectHelper::from_object_handle(target, &mut pdf);
+    let mut names = Vec::new();
+    helper
+        .for_each_xobject(false, |_, _, key| {
+            names.push(key);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(names, vec![b"/Image".to_vec()]);
 }
 
 #[test]

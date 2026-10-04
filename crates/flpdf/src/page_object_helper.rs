@@ -503,9 +503,11 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
                     .to_owned(),
             ));
         }
+        // qpdf: "contents from page object " + getObjGen().unparse(' ')
+        // (`libqpdf/QPDFPageObjectHelper.cc:35`), e.g. "3 0" without " R".
         let page_description = format!(
             "contents from page object {}",
-            object_handle_description(&page)
+            page.get_obj_gen().unparse_with_separator(' ')
         );
         let form = self.pdf.new_stream()?;
         let dict = form
@@ -1368,12 +1370,16 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
                 continue;
             }
             let xobjects = resources.try_get_key(b"/XObject")?;
-            let Some(entries) = xobjects.try_as_dictionary()? else {
+            if !xobjects.try_is_dictionary()? {
                 continue;
-            };
+            }
 
-            for (key, value) in entries {
-                let object = value;
+            // qpdf iterates `xobj_dict.getKeys()`, which omits keys whose values
+            // resolve to null, and reads each value with `getKey`
+            // (`libqpdf/QPDFPageObjectHelper.cc:335-338`,
+            // `libqpdf/QPDF_Dictionary.cc:118-127`).
+            for key in xobjects.try_get_keys()? {
+                let object = xobjects.try_get_key(&key)?;
                 if selector(&object)? {
                     action(object.clone(), xobjects.clone(), key)?;
                 }

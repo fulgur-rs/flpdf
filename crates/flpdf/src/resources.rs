@@ -75,7 +75,11 @@ fn remove_unreferenced_resources_helper<R: Read + Seek>(
     is_page: bool,
     unresolved: &mut BTreeSet<Vec<u8>>,
 ) -> Result<bool> {
-    let diagnostics_before = diagnostic_count(pdf);
+    // qpdf reads `numWarnings` through the receiver's owning QPDF and uses 0
+    // for both snapshots when there is none (`QPDFPageObjectHelper.cc:550-553`),
+    // so a contextless direct receiver never takes the bad-token veto.
+    let has_owner = target.context().is_some();
+    let diagnostics_before = if has_owner { diagnostic_count(pdf) } else { 0 };
     let (finder, parse_error) = {
         let mut helper = PageObjectHelper::from_object_handle(target.clone(), pdf);
         let mut finder = ResourceFinder::default();
@@ -90,7 +94,8 @@ fn remove_unreferenced_resources_helper<R: Read + Seek>(
         warn_resource_parse_failure(&target, Some(&parse_error))?;
         return Ok(false);
     }
-    if diagnostic_count(pdf) > diagnostics_before {
+    let diagnostics_after = if has_owner { diagnostic_count(pdf) } else { 0 };
+    if diagnostics_after > diagnostics_before {
         warn_resource_parse_failure(&target, None)?;
         return Ok(false);
     }
@@ -108,13 +113,10 @@ fn remove_unreferenced_resources_helper<R: Read + Seek>(
             if !value.try_is_dictionary()? {
                 continue;
             }
-            let dictionary = if value.is_indirect() {
-                let copy = value.shallow_copy()?;
-                resources.replace_key(category, copy.clone())?;
-                copy
-            } else {
-                value
-            };
+            // qpdf copies every category dictionary, direct or indirect,
+            // before mutating it: `resources.replaceKeyAndGetNew(iter,
+            // dict.shallowCopy())` (`QPDFPageObjectHelper.cc:576-585`).
+            let dictionary = resources.replace_key_and_get_new(category, value.shallow_copy()?)?;
             known_names.extend(
                 dictionary
                     .try_get_keys()?
