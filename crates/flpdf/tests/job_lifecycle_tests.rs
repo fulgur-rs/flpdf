@@ -2936,6 +2936,11 @@ fn json_job_empty_encryption_status_returns_qpdf_exit_code() {
         let mut job = QPDFJob::new();
         job.initialize_from_json(&json).unwrap();
 
+        assert!(job
+            .create_qpdf()
+            .expect("empty encryption-status create succeeds")
+            .is_none());
+        assert_eq!(job.encryption_status(), (false, false));
         assert_eq!(job.run().unwrap(), JobExitCode::Error);
     }
 }
@@ -3229,21 +3234,105 @@ fn create_qpdf_skips_the_stages_for_an_encryption_status_job() {
     })
     .to_string();
 
+    let (logger, errors) = logger_with_error_sink();
     let mut job = QPDFJob::new();
+    job.set_logger(logger);
     job.initialize_from_json_partial(&json).unwrap();
-    let mut pdf = job
+    assert!(job
         .create_qpdf()
-        .expect("a status-only job must not fail on the unread update file")
-        .expect("createQPDF should still return the document");
+        .expect("a status-only job must not open the update file")
+        .is_none());
+    assert_eq!(job.encryption_status(), (false, false));
+    assert!(errors.lock().unwrap().bytes.is_empty());
+}
 
-    let page_ref = common::checked_page_refs(&mut pdf).unwrap()[0];
-    let page = pdf.get_object_handle(page_ref);
-    page.try_is_scalar().unwrap();
-    assert_eq!(
-        page.try_get_key(b"/Rotate").unwrap().as_integer(),
-        None,
-        "an encryption-status job must not rotate the document it only inspects"
-    );
+#[test]
+fn create_qpdf_successful_encryption_status_queries_return_no_document() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+    let plaintext = root.join("minimal.pdf");
+    let encrypted = root.join("encrypted/v4-aes-128-r4.pdf");
+
+    for (input, status_key, password, expected_status) in [
+        (plaintext.clone(), "isEncrypted", None, (false, false)),
+        (plaintext, "requiresPassword", None, (false, false)),
+        (
+            encrypted.clone(),
+            "isEncrypted",
+            Some("user-v4-aes"),
+            (true, false),
+        ),
+        (
+            encrypted.clone(),
+            "requiresPassword",
+            Some("user-v4-aes"),
+            (true, false),
+        ),
+        (encrypted, "requiresPassword", None, (true, true)),
+    ] {
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(
+            &serde_json::json!({
+                "inputFile": input,
+                status_key: ""
+            })
+            .to_string(),
+        )
+        .unwrap();
+        if let Some(password) = password {
+            job.set_password(password.as_bytes().to_vec());
+        }
+
+        assert!(job
+            .create_qpdf()
+            .unwrap_or_else(|error| panic!("{status_key} create failed: {error}"))
+            .is_none());
+        assert_eq!(job.encryption_status(), expected_status, "{status_key}");
+    }
+}
+
+/// qpdf's `doProcessOnce` raises `max_input_version` for each source it opens
+/// before `createQPDF` returns for an encryption-status query
+/// (`libqpdf/QPDFJob.cc:428-456,1695-1716`), so the public floor reflects a
+/// file-backed status source too. A wrong password throws before that update.
+#[test]
+fn create_qpdf_encryption_status_records_the_input_version_floor() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+    let versioned = root.join("compat/one-page-v17.pdf");
+    let encrypted = root.join("encrypted/v4-aes-128-r4.pdf");
+
+    for (input, status_key, password, expected) in [
+        (
+            versioned.clone(),
+            "isEncrypted",
+            None,
+            Some(flpdf::PdfVersion::new(1, 7, 0)),
+        ),
+        (
+            versioned,
+            "requiresPassword",
+            None,
+            Some(flpdf::PdfVersion::new(1, 7, 0)),
+        ),
+        (encrypted.clone(), "requiresPassword", None, None),
+        (
+            encrypted,
+            "isEncrypted",
+            Some("user-v4-aes"),
+            Some(flpdf::PdfVersion::new(1, 7, 0)),
+        ),
+    ] {
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(
+            &serde_json::json!({ "inputFile": input, status_key: "" }).to_string(),
+        )
+        .unwrap();
+        if let Some(password) = password {
+            job.set_password(password.as_bytes().to_vec());
+        }
+
+        assert!(job.create_qpdf().unwrap().is_none(), "{status_key}");
+        assert_eq!(job.input_version_floor(), expected, "{status_key}");
+    }
 }
 
 #[test]

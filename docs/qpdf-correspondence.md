@@ -2741,7 +2741,7 @@ CLI から直接到達する複数 entrypoint が残るため、E-15 行の分�
 
 rotationのpage countは`QPDFJob::handleRotations` (`QPDFJob.cc:2638`) の`QIntC::to_int(size_t)`に合わせ、共有`qutil::qpdf_size_to_int`でchecked narrowingする。empty documentでも`parse_numrange(range, 0)`とsigned `pageno` filterを通過させ、先行empty guardや飽和値は置かない。
 
-`flpdf-nv86` では、`--empty --is-encrypted` / `--empty --requires-password` を qpdf 11.9.0 と同じく「空 document は unencrypted」として無言の exit 2 にする。`run_encryption_status` は input filename を要求する前に empty-input の status resultを返し、通常の file-backed status queryの open/error/report境界は変更しない (`QPDFJob.cc:429-456,535-557`)。
+`flpdf-nv86` では、`--empty --is-encrypted` / `--empty --requires-password` を qpdf 11.9.0 と同じく「空 document は unencrypted」として無言の exit 2 にする。`create_qpdf` は空 document を生成してstatusを記録した後、変換前に `None` を返し、`run` はそのstatusから終了コードを得る (`QPDFJob.cc:429-456,535-557`)。
 
 `testJsonSchema` の schema 不一致は、qpdf の `doJSON` (`QPDFJob.cc:1631-1642`) と同じく、生成済みJSONを出力へ流し終えた後に固定ヘッダーと各エラーを `QPDFLogger` の error pipeline へ書き出し、ジョブを失敗させずに戻る。flpdfの `job/json.rs::validate_json_schema` はこの責務を `QPDFJob` の logger から受け取り、JSON parse / 出力 pipeline の実障害だけをエラーとして返す。
 
@@ -5288,12 +5288,31 @@ qpdf の `createQPDF` は status inspection の早期 return より前に
 （`libqpdf/QPDFJob.cc:428-456,1699-1711`、
 `libqpdf/QPDFJob_config.cc:305-308`）。
 
-flpdf の `run_encryption_status` も `json_input` なら既存の
-`create_from_json_document` を使い、`finish_created_document` を通らずに
-暗号状態だけを返す。通常PDF入力は encryption-inspection openerを継続利用する。
+flpdf の `QPDFJob::create_qpdf` は `json_input` なら既存の
+`create_from_json_document` を使い、status query時は `finish_created_document` を
+通らずに暗号状態だけを保持する。`QPDFJob::run` も同じcreate routeを呼ぶ。
 `job_lifecycle_tests.rs::json_input_encryption_status_opens_the_json_document` と
 `cli_job_json.rs::job_json_file_encryption_status_with_json_input_matches_qpdf` が
 `isEncrypted` / `requiresPassword` の終了コード・stdout・stderrをqpdf 11.9.0と比較する。
+
+### Encryption-status create result (`flpdf-6ik2q.30`, 2026-10-04)
+
+qpdf `createQPDF` records the input's encryption bit and returns `nullptr`
+when `check_is_encrypted` or `check_requires_password` is set, before
+`updateFromJSON`, page selection, rotation, and other create-stage work
+(`libqpdf/QPDFJob.cc:449-480`). `doProcessOnce` still selects `createFromJSON`
+for a JSON main input before that return (`QPDFJob.cc:1699-1711`,
+`QPDFJob_config.cc:305-308`).
+
+flpdf now uses the same `create_qpdf` path for ordinary PDF, empty, and JSON
+inputs. It opens/builds the configured document, records encryption status,
+then returns `None` before `finish_created_document` for a status query. The
+separate `run_encryption_status` opener is removed; `run` returns
+`get_exit_code()` after the successful null-document result. Empty/JSON input
+version floors are updated during input processing, matching qpdf's
+`doProcessOnce` post-open update (`QPDFJob.cc:1709-1711`). Public API tests
+cover plaintext, encrypted, bad-password, empty, and JSON-input status cases,
+including a missing `updateFromJSON` file that qpdf must not read in this path.
 
 ### Public QPDFJob initial output requirement (`flpdf-6ik2q.28`, 2026-10-04)
 

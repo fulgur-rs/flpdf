@@ -1571,11 +1571,6 @@ pub struct QPDFJob {
     overlay_sources: Vec<OverlaySpec<Box<dyn ReadSeek>>>,
     /// qpdf's status bits consumed by the side-effect-free exit-code query.
     encryption_status: EncryptionStatus,
-    /// Whether the last create stage returned qpdf's successful null document
-    /// result. `create_qpdf` also uses `None` for errors, so the `run` wrapper
-    /// needs this separate bit to distinguish the `show_encryption`-
-    /// after-bad-password path from an ordinary failed creation.
-    create_qpdf_succeeded_without_document: bool,
     /// Whether this job created its primary document through
     /// [`QPDFJob::create_empty_document`]. qpdf's `Config::emptyInput` keys the
     /// page-spec source map with the empty string while `QPDF::emptyPDF`
@@ -1680,7 +1675,6 @@ impl QPDFJob {
             page_source_documents: Vec::new(),
             overlay_sources: Vec::new(),
             encryption_status: EncryptionStatus::default(),
-            create_qpdf_succeeded_without_document: false,
             empty_primary_created: false,
             argv_early_exit: false,
         }
@@ -3117,16 +3111,6 @@ impl QPDFJob {
         };
 
         let configuration = self.configuration.clone();
-        // qpdf leaves createQPDF before any stage when the job only reports
-        // encryption status: `if (m->check_is_encrypted ||
-        // m->check_requires_password) { return nullptr; }`
-        // (`libqpdf/QPDFJob.cc:455-456`) sits ahead of `updateFromJSON`
-        // (`:462`) and `handleRotations` (`:470`). Running them here would let
-        // a status-only job fail on a missing update file and would mutate a
-        // document that exists solely to be inspected.
-        if configuration.is_encrypted || configuration.requires_password {
-            return Ok(pdf);
-        }
         if let Some(update_path) = configuration.update_from_json.as_deref() {
             // qpdf's QPDF::updateFromJSON(std::string const&) opens the file
             // through FileInputSource, whose constructor calls
@@ -3299,11 +3283,15 @@ impl QPDFJob {
     /// Create the configured input document and propagate failures to the
     /// caller, matching `QPDFJob::createQPDF`'s error boundary.
     pub fn create_qpdf(&mut self) -> Result<Option<JobDocument>> {
-        self.create_qpdf_succeeded_without_document = false;
         self.reset_encryption_status();
         self.check_configuration()?;
         if self.configuration.empty_input {
-            let pdf = self.create_empty_document()?;
+            let mut pdf = self.create_empty_document()?;
+            self.update_writer_version_floor(&mut pdf)?;
+            if self.configuration.is_encrypted || self.configuration.requires_password {
+                self.record_encryption_status(&pdf);
+                return Ok(None);
+            }
             return Ok(Some(self.finish_created_document(pdf)?));
         }
         let Some(input) = self.configuration.input_file.clone() else {
@@ -3314,7 +3302,12 @@ impl QPDFJob {
         let file =
             File::open(&input).map_err(|error| Error::file_io("open", input.clone(), error))?;
         if self.configuration.json_input {
-            let pdf = self.create_from_json_document(file, path_description_bytes(&input))?;
+            let mut pdf = self.create_from_json_document(file, path_description_bytes(&input))?;
+            self.update_writer_version_floor(&mut pdf)?;
+            if self.configuration.is_encrypted || self.configuration.requires_password {
+                self.record_encryption_status(&pdf);
+                return Ok(None);
+            }
             return Ok(Some(self.finish_created_document(pdf)?));
         }
         let input_name = path_description_bytes(&input);
@@ -3361,11 +3354,26 @@ impl QPDFJob {
                 // transformations or write/inspection continuation.
                 self.show_encryption(&mut pdf, self.configuration.password_is_hex_key)?;
             }
-            self.create_qpdf_succeeded_without_document = true;
+            return Ok(None);
+        }
+        if self.configuration.is_encrypted || self.configuration.requires_password {
+            // qpdf's doProcessOnce raises `max_input_version` for every input
+            // that opened successfully before createQPDF reaches the
+            // encryption-status return (`libqpdf/QPDFJob.cc:428-456,1695-1716`);
+            // a password failure above never gets this far.
+            self.update_writer_version_floor(&mut pdf)?;
+            self.record_encryption_status(&pdf);
             return Ok(None);
         }
         let pdf = self.finish_created_document(pdf)?;
         Ok(Some(pdf))
+    }
+
+    fn record_encryption_status<R: Read + Seek>(&mut self, pdf: &Pdf<R>) {
+        self.encryption_status = EncryptionStatus {
+            encrypted: pdf.is_encrypted(),
+            password_incorrect: false,
+        };
     }
 
     /// Return the primary document's encryption status captured by the last
@@ -3718,15 +3726,8 @@ impl QPDFJob {
         if self.argv_early_exit {
             return Ok(JobExitCode::Success);
         }
-        if self.configuration.is_encrypted || self.configuration.requires_password {
-            return self.run_encryption_status();
-        }
         let Some(mut pdf) = self.create_qpdf()? else {
-            return Ok(if self.create_qpdf_succeeded_without_document {
-                self.get_exit_code()
-            } else {
-                JobExitCode::Error
-            });
+            return Ok(self.get_exit_code());
         };
 
         self.write_qpdf(&mut pdf)?;
@@ -3771,69 +3772,6 @@ impl QPDFJob {
             "qpdf-max-memory-usage {}\n",
             crate::memory_usage::max_memory_usage()
         ))
-    }
-
-    fn run_encryption_status(&mut self) -> Result<JobExitCode> {
-        self.check_configuration()?;
-        // Clear before the open so a failure below cannot leave the previous
-        // document's bits behind. qpdf sets `m->encryption_status` while
-        // processing each input and lets an open failure escape `run()` as an
-        // exception, so `getExitCode` is never consulted against a stale
-        // status (`QPDFJob.cc:1699-1708`, `qpdf/qpdf.cc:39-43`). The Rust
-        // getter remains callable after an error, so reset the bits before
-        // opening the next input.
-        self.encryption_status = EncryptionStatus::default();
-        // qpdf's `createQPDF` still creates an empty document for `--empty`
-        // before the encryption-status early return (`QPDFJob.cc:429-456,
-        // 1699-1708`). An empty document is necessarily unencrypted, so both
-        // `isEncrypted` and `requiresPassword` return EXIT_IS_NOT_ENCRYPTED
-        // (2) without attempting to open an input file.
-        if self.configuration.empty_input {
-            return Ok(self.get_exit_code());
-        }
-        let Some(input) = self.configuration.input_file.clone() else {
-            // cov:ignore-start: with `empty_input` handled above,
-            // `check_configuration` rejects an encryption-status query that
-            // has no configured input before this defensive invariant guard
-            return Err(UsageError::new("an input file name is required").into());
-            // cov:ignore-end
-        };
-        let file = match File::open(&input) {
-            Ok(file) => file,
-            Err(error) => return Err(Error::file_io("open", input.clone(), error)),
-        };
-        let source: Box<dyn ReadSeek> = Box::new(BufReader::new(file));
-        let input_name = path_description_bytes(&input);
-        let open_result = if self.configuration.json_input {
-            // qpdf's processFile selects createFromJSON for a JSON main input
-            // before createQPDF's encryption-status early return
-            // (`libqpdf/QPDFJob.cc:455-456,1699-1711`). Use the same job
-            // document boundary here, but do not finish the document because
-            // status inspection returns before updateFromJSON and transforms.
-            self.create_from_json_document(source, &input_name)
-        } else {
-            let options = self.configured_open_options(self.configuration.password.clone());
-            self.open_for_encryption_inspection_with_description(source, &input_name, options)
-        };
-        let pdf = open_result.map_err(|error| qpdf_source_error(&input_name, error))?;
-        let encrypted = pdf.is_encrypted();
-        self.encryption_status = EncryptionStatus {
-            encrypted,
-            password_incorrect: encrypted && pdf.encryption_file_key().is_none(),
-        };
-        if self.configuration.is_encrypted {
-            return Ok(self.get_exit_code());
-        }
-
-        // qpdf's `requiresPassword` uses exit 3 when authentication succeeds,
-        // exit 0 when an encrypted document still needs another password, and
-        // exit 2 for a plaintext document (`QPDFJob::getExitCode`,
-        // `QPDFJob.cc:535-557`). `encryption_file_key` also covers the raw
-        // `passwordIsHexKey` path, where user/owner match flags stay false.
-        if !encrypted {
-            return Ok(self.get_exit_code());
-        }
-        Ok(self.get_exit_code())
     }
 
     fn apply_configured_rotations<R>(
