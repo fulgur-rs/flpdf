@@ -701,7 +701,7 @@ fn job_json_schema() -> crate::json::Json {
     schema
 }
 
-fn validate_job_json_schema(value: &crate::json::Json) -> Result<()> {
+fn validate_job_json_schema(value: &crate::json::Json, message_prefix: &[u8]) -> Result<()> {
     let mut errors = Vec::new();
     if value.check_schema_with_flags(
         &job_json_schema(),
@@ -710,15 +710,16 @@ fn validate_job_json_schema(value: &crate::json::Json) -> Result<()> {
     ) {
         return Ok(());
     }
-    let mut message = "qpdf: job json has errors:".to_owned();
+    let mut message = message_prefix.to_vec();
+    message.extend_from_slice(b": job json has errors:");
     for error in errors {
-        message.push_str("\n  ");
-        message.push_str(&error.to_string());
+        message.extend_from_slice(b"\n  ");
+        message.extend_from_slice(error.to_string().as_bytes());
     }
     Err(Error::Usage(UsageError::new(message)))
 }
 
-fn read_job_json_file(path: &Path) -> Result<crate::json::Json> {
+fn read_job_json_file(path: &Path, message_prefix: &[u8]) -> Result<crate::json::Json> {
     // A nested `jobJsonFile` JSON key dispatches through the same
     // `Config::jobJsonFile` callback as the CLI's `--job-json-file`
     // (`libqpdf/qpdf/auto_job_json_init.hh:472-474`), which reads the file
@@ -736,7 +737,7 @@ fn read_job_json_file(path: &Path) -> Result<crate::json::Json> {
             "top-level object is supposed to be a dictionary",
         )));
     }
-    validate_job_json_schema(&value)?;
+    validate_job_json_schema(&value, message_prefix)?;
     Ok(value)
 }
 
@@ -2317,10 +2318,10 @@ impl QPDFJob {
     }
 
     fn initialize_from_json_with_partial(&mut self, json: &[u8], partial: bool) -> Result<()> {
-        // The qpdf C API sets this prefix before parsing JSON
-        // (`libqpdf/qpdfjob-c.cc:79-87`), so initialization and run-time
-        // configuration errors share the same observable source name.
-        self.set_message_prefix("qpdfjob json");
+        // QPDFJob::initializeFromJson preserves the prefix already stored on
+        // the job (`libqpdf/QPDFJob_json.cc:611-625`). The C wrapper selects
+        // `qpdfjob json` before calling this method, outside the public Job
+        // boundary (`libqpdf/qpdfjob-c.cc:79-83`).
         let value =
             crate::json::Json::parse(json).map_err(|error| Error::System(error.to_string()))?;
         if !value.is_dictionary() {
@@ -2332,7 +2333,7 @@ impl QPDFJob {
         // handler (`QPDFJob_json.cc:611-625`). This must happen before any
         // configuration mutation so a schema failure cannot leave a partially
         // initialized job behind.
-        validate_job_json_schema(&value)?;
+        validate_job_json_schema(&value, self.message_prefix_bytes())?;
         // qpdf's initializeFromJson always dispatches into this job's existing
         // Config; `partial` controls only whether the final
         // checkConfiguration runs (`QPDFJob_json.cc:611-625` and
@@ -2364,7 +2365,7 @@ impl QPDFJob {
         // qpdf validates every document before invoking its generated
         // handlers, including documents reached through jobJsonFile
         // (`QPDFJob_json.cc:611-625`, `QPDFJob_config.cc:774-784`).
-        validate_job_json_schema(value)?;
+        validate_job_json_schema(value, self.message_prefix_bytes())?;
         for (key, item) in job_json_members(value) {
             if key == b"jobJsonFile" {
                 let mut members = std::collections::BTreeMap::new();
@@ -2386,7 +2387,7 @@ impl QPDFJob {
                 }
                 // qpdf-deviation-end
                 let nested_result = (|| {
-                    let nested = read_job_json_file(&path)?;
+                    let nested = read_job_json_file(&path, self.message_prefix_bytes())?;
                     self.dispatch_job_json_document(configuration, &nested, active)
                 })();
                 active.remove(&identity);
@@ -7856,7 +7857,7 @@ mod tests {
             .initialize_from_json_partial(r#"{"json":""}"#)
             .unwrap();
         let unknown = crate::json::Json::parse(br#"{"potato":""}"#).unwrap();
-        let error = validate_job_json_schema(&unknown).unwrap_err();
+        let error = validate_job_json_schema(&unknown, b"qpdf").unwrap_err();
         assert!(error.to_string().contains("qpdf: job json has errors:"));
     }
 

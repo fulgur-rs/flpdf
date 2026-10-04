@@ -1001,6 +1001,35 @@ fn new_job_matches_qpdf_defaults() {
 }
 
 #[test]
+fn initialize_from_json_preserves_the_callers_message_prefix() {
+    let json = serde_json::json!({"empty": "", "showNpages": ""}).to_string();
+
+    let mut full = QPDFJob::new();
+    full.set_message_prefix("custom");
+    full.initialize_from_json(&json).unwrap();
+    assert_eq!(full.message_prefix(), "custom");
+
+    let mut partial = QPDFJob::new();
+    partial.set_message_prefix("custom");
+    partial.initialize_from_json_partial(&json).unwrap();
+    assert_eq!(partial.message_prefix(), "custom");
+}
+
+#[test]
+fn initialize_from_json_schema_error_uses_the_callers_message_prefix() {
+    let mut job = QPDFJob::new();
+    job.set_message_prefix("custom");
+
+    let error = job
+        .initialize_from_json(r#"{"potato":""}"#)
+        .expect_err("qpdf rejects an unknown job JSON key");
+
+    assert!(error
+        .to_string()
+        .starts_with("custom: job json has errors:"));
+}
+
+#[test]
 fn job_json_byte_entry_point_accepts_literal_high_bit_password_bytes() {
     let mut json = br#"{"inputFile":"input.pdf","outputFile":"output.pdf","password":""}"#.to_vec();
     let password_end = json.len() - 2;
@@ -2509,7 +2538,7 @@ fn nested_missing_job_json_file_uses_qpdf_strerror_wording() {
         error.to_string(),
         format!(
             "error with job-json file {}: open {}: {}\n\
-             Run qpdfjob json --job-json-help for information on the file format.",
+             Run qpdf --job-json-help for information on the file format.",
             missing.display(),
             missing.display(),
             "No such file or directory",
@@ -3526,7 +3555,7 @@ fn combined_inspection_completes_once_after_all_reports() {
     .unwrap();
 
     assert_eq!(job.run().unwrap(), JobExitCode::Warning);
-    let summary = b"qpdfjob json: operation succeeded with warnings\n";
+    let summary = b"qpdf: operation succeeded with warnings\n";
     let bytes = warnings.lock().unwrap().bytes.clone();
     assert_eq!(
         bytes
@@ -5604,14 +5633,8 @@ fn json_job_opens_each_attachment_donor_at_its_verbose_boundary() {
 
     assert_eq!(job.run().unwrap(), JobExitCode::Warning);
     let diagnostics = state.lock().unwrap().bytes.clone();
-    let copy_first = format!(
-        "qpdfjob json: copying attachments from {}\n",
-        first.display()
-    );
-    let copy_second = format!(
-        "qpdfjob json: copying attachments from {}\n",
-        damaged.display()
-    );
+    let copy_first = format!("qpdf: copying attachments from {}\n", first.display());
+    let copy_second = format!("qpdf: copying attachments from {}\n", damaged.display());
     let warning = format!("WARNING: {}: file is damaged", damaged.display());
     let key_first = b"  first -> first\n";
     let key_second = b"  second -> second\n";

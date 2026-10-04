@@ -5295,6 +5295,21 @@ flpdf の `run_encryption_status` も `json_input` なら既存の
 `cli_job_json.rs::job_json_file_encryption_status_with_json_input_matches_qpdf` が
 `isEncrypted` / `requiresPassword` の終了コード・stdout・stderrをqpdf 11.9.0と比較する。
 
+### `QPDFJob::initializeFromJson` message-prefix ownership (`flpdf-6ik2q.31`, 2026-10-04)
+
+qpdf's `initializeFromJson` validates and dispatches JSON through the existing
+`config()` without changing `m->message_prefix`; schema diagnostics use that
+current prefix (`libqpdf/QPDFJob_json.cc:611-625`). The `qpdfjob json` prefix is
+set only by the C wrapper before calling the Job method
+(`libqpdf/qpdfjob-c.cc:79-83`).
+
+flpdf's public full and partial JSON initializers now preserve the caller's
+prefix, including schema validation and nested `jobJsonFile` processing. The
+qtest C API adapter selects `qpdfjob json` itself before initialization; the CLI
+keeps its executable prefix. `job_lifecycle_tests.rs` covers both public
+initializer forms and schema-error wording, while `qpdfjob_ctest_cli` checks
+the wrapper-owned prefix at the C boundary.
+
 ### Public QPDFJob initial output requirement (`flpdf-6ik2q.28`, 2026-10-04)
 
 qpdf's `QPDFJob::Members::require_outfile` starts true

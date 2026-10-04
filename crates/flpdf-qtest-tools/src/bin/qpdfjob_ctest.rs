@@ -188,6 +188,9 @@ fn run_argv(argv: Vec<String>, progress_label: Option<&str>) -> Result<JobExitCo
 
 fn run_json(json: &str) -> Result<JobExitCode> {
     let mut job = QPDFJob::new();
+    // qpdf's C API wrapper sets the prefix before calling initializeFromJson
+    // (`libqpdf/qpdfjob-c.cc:79-83`); the C++ Job initializer itself preserves it.
+    job.set_message_prefix("qpdfjob json");
     job.initialize_from_json(json)?;
     run_job_c_wrapper(&mut job)
 }
