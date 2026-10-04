@@ -4052,6 +4052,31 @@ fn json_job_rejects_same_input_output_before_truncating_a_hard_link() {
 }
 
 #[test]
+fn public_job_default_requires_output_like_qpdf() {
+    let mut job = QPDFJob::new();
+    job.config()
+        .empty_input()
+        .expect("empty input is a valid configured source");
+
+    let expected = "an output file name is required; use - for standard output";
+    let error = job
+        .check_configuration()
+        .expect_err("a public Job without output or inspection must match qpdf");
+    assert!(matches!(
+        error,
+        Error::Usage(ref usage) if usage.to_string() == expected
+    ));
+
+    let error = job
+        .run()
+        .expect_err("run must retain the same missing-output usage error");
+    assert!(matches!(
+        error,
+        Error::Usage(ref usage) if usage.to_string() == expected
+    ));
+}
+
+#[test]
 fn create_qpdf_reports_an_ordinary_output_configuration_failure() {
     let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
     let (logger, error_state) = logger_with_error_sink();
@@ -4484,9 +4509,16 @@ fn argv_usage_rejects_short_options_too_many_positionals_and_missing_input() {
 }
 
 #[test]
-fn create_qpdf_reports_unconfigured_and_malformed_inputs() {
+fn create_qpdf_rejects_unconfigured_and_reports_malformed_inputs() {
     let mut job = QPDFJob::new();
-    assert!(job.create_qpdf().unwrap().is_none());
+    let error = match job.create_qpdf() {
+        Err(error) => error,
+        Ok(_) => panic!("qpdf rejects a missing input during checkConfiguration"),
+    };
+    assert!(matches!(
+        error,
+        Error::Usage(ref usage) if usage.to_string() == "an input file name is required"
+    ));
 
     let tempdir = tempfile::tempdir().unwrap();
     let malformed = tempdir.path().join("malformed.pdf");

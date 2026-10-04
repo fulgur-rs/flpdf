@@ -366,9 +366,14 @@ struct JobConfiguration {
 /// explicit setter is replayed by `setWriterOptions`
 /// (`libqpdf/QPDFJob.cc:2865-2875`). `JobConfiguration::default` already keeps
 /// those two states separate: `json_decode_level` defaults to generalized,
-/// while `WriterConfiguration` defaults to the standalone writer state.
+/// while `WriterConfiguration` defaults to the standalone writer state. qpdf's
+/// `Members::require_outfile` also defaults to true (`include/qpdf/QPDFJob.hh:705`);
+/// override the Rust struct's derived false default at this owning boundary.
 fn qpdf_default_job_configuration() -> JobConfiguration {
-    JobConfiguration::default()
+    JobConfiguration {
+        require_output: true,
+        ..JobConfiguration::default()
+    }
 }
 
 /// qpdf opens one `Config::pages()` group and then permits multiple
