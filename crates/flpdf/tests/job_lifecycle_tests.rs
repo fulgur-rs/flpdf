@@ -3905,6 +3905,48 @@ fn build_outline_fixture() -> Vec<u8> {
     raw
 }
 
+/// One-page PDF whose trailer carries a direct Catalog containing an outline.
+fn build_direct_root_outline_fixture() -> Vec<u8> {
+    use std::collections::BTreeMap;
+    let mut objects: BTreeMap<u32, &str> = BTreeMap::new();
+    objects.insert(1, "<< /Type /Pages /Kids [2 0 R] /Count 1 >>");
+    objects.insert(2, "<< /Type /Page /Parent 1 0 R /MediaBox [0 0 612 792] >>");
+    objects.insert(5, "<< /chapter [2 0 R /Fit] >>");
+    objects.insert(
+        10,
+        "<< /Type /Outlines /First 20 0 R /Last 20 0 R /Count 1 >>",
+    );
+    objects.insert(
+        20,
+        "<< /Title (direct-root-bookmark) /Parent 10 0 R /Dest /chapter >>",
+    );
+
+    let mut raw = b"%PDF-1.5\n".to_vec();
+    let mut offsets = BTreeMap::new();
+    for (&number, body) in &objects {
+        offsets.insert(number, raw.len());
+        raw.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+    }
+    let max_number = *objects.keys().max().unwrap();
+    let xref = raw.len();
+    raw.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", max_number + 1).as_bytes());
+    for number in 1..=max_number {
+        if let Some(offset) = offsets.get(&number) {
+            raw.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        } else {
+            raw.extend_from_slice(b"0000000000 65535 f \n");
+        }
+    }
+    raw.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root << /Type /Catalog /Pages 1 0 R /Outlines 10 0 R /Dests 5 0 R >> >>\nstartxref\n{xref}\n%%EOF\n",
+            max_number + 1
+        )
+        .as_bytes(),
+    );
+    raw
+}
+
 /// A single-source `--pages . 1` job (qpdf's own-file page selection) takes
 /// the in-place `QPDFJob::handle_page_specs` route
 /// through the same primary document. Before this test, `QPDFJob::run`'s
@@ -5799,6 +5841,48 @@ fn json_job_run_covers_overlay_attachment_and_copy_stages() {
         .unwrap();
     assert_eq!(attachment_job.run().unwrap(), JobExitCode::Success);
     assert!(attachment_output.exists());
+}
+
+#[test]
+fn json_outline_section_reads_a_direct_catalog_root_like_qpdf() {
+    if qpdf_11_9_empty_show_npages().is_none() {
+        eprintln!("skipping: qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let input = tempdir.path().join("direct-root-outline.pdf");
+    let flpdf_output = tempdir.path().join("flpdf.json");
+    std::fs::write(&input, build_direct_root_outline_fixture()).unwrap();
+
+    let qpdf = Command::new("qpdf")
+        .args(["--json=2", "--json-key=outlines"])
+        .arg(&input)
+        .output()
+        .expect("qpdf 11.9.0 outline oracle should run");
+    assert!(qpdf.status.success(), "qpdf oracle failed: {qpdf:?}");
+    let qpdf_json: serde_json::Value = serde_json::from_slice(&qpdf.stdout).unwrap();
+
+    let job_json = serde_json::json!({
+        "inputFile": input,
+        "outputFile": flpdf_output,
+        "json": "2",
+        "jsonKey": ["outlines"]
+    })
+    .to_string();
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&job_json).unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    let flpdf_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&flpdf_output).unwrap()).unwrap();
+
+    assert_eq!(qpdf_json["outlines"].as_array().unwrap().len(), 1);
+    assert_eq!(flpdf_json["outlines"], qpdf_json["outlines"]);
+    assert_eq!(flpdf_json["outlines"][0]["title"], "direct-root-bookmark");
+    assert_eq!(
+        flpdf_json["outlines"][0]["dest"],
+        qpdf_json["outlines"][0]["dest"]
+    );
 }
 
 #[test]
