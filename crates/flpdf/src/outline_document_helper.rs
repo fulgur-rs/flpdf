@@ -228,10 +228,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     }
 
     fn catalog_handle(&mut self) -> Result<Option<ObjectHandle>> {
-        let Some(catalog_ref) = self.pdf.root_ref() else {
-            return Ok(None);
-        };
-        let catalog = self.pdf.get_object_handle(catalog_ref);
+        let catalog = self.pdf.root_handle()?;
         catalog.try_dereference()?;
         if !catalog.try_is_dictionary()? {
             return Ok(None);
