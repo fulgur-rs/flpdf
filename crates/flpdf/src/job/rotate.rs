@@ -60,7 +60,7 @@ fn flatten_rotation_on_page_handles<R: Read + Seek>(
 mod tests {
     use super::*;
     use crate::writer::write_qpdf_to_memory;
-    use crate::{pages, Error, ObjectHandle, ObjectRef, PageBox, Pdf};
+    use crate::{pages, Error, ObjectHandle, ObjectRef, Pdf, Rectangle};
     use std::io::Cursor;
 
     fn flatten_rotation_on_pages<R: Read + Seek>(
@@ -76,7 +76,7 @@ mod tests {
         flatten_rotation_on_page_handles(pdf, &page_handles)
     }
 
-    fn handle_to_pagebox(obj: &ObjectHandle) -> Option<PageBox> {
+    fn handle_to_rectangle(obj: &ObjectHandle) -> Option<Rectangle> {
         obj.try_is_scalar().ok()?;
         let values = obj.as_array()?;
         if values.len() != 4 {
@@ -90,7 +90,7 @@ mod tests {
                 .map(|value| value as f64)
                 .or_else(|| value.as_real())?;
         }
-        Some(PageBox::new(
+        Some(Rectangle::new(
             numbers[0].min(numbers[2]),
             numbers[1].min(numbers[3]),
             numbers[0].max(numbers[2]),
@@ -110,9 +110,13 @@ mod tests {
         value
     }
 
-    fn pagebox_for(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef, key: &[u8]) -> PageBox {
+    fn rectangle_for(
+        pdf: &mut Pdf<Cursor<Vec<u8>>>,
+        object_ref: ObjectRef,
+        key: &[u8],
+    ) -> Rectangle {
         let value = object_key_handle(pdf, object_ref, key);
-        handle_to_pagebox(&value).expect("page box must be a four-number array")
+        handle_to_rectangle(&value).expect("page box must be a four-number array")
     }
 
     fn rotate_value(pdf: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRef) -> Option<i64> {
@@ -149,19 +153,21 @@ mod tests {
     }
 
     #[test]
-    fn handle_to_pagebox_rejects_bad_shapes_and_accepts_real_literals() {
-        assert!(handle_to_pagebox(&ObjectHandle::integer(1)).is_none());
-        assert!(handle_to_pagebox(&ObjectHandle::array(vec![ObjectHandle::integer(1)])).is_none());
+    fn handle_to_rectangle_rejects_bad_shapes_and_accepts_real_literals() {
+        assert!(handle_to_rectangle(&ObjectHandle::integer(1)).is_none());
+        assert!(
+            handle_to_rectangle(&ObjectHandle::array(vec![ObjectHandle::integer(1)])).is_none()
+        );
         assert_eq!(
-            handle_to_pagebox(&ObjectHandle::array(vec![
+            handle_to_rectangle(&ObjectHandle::array(vec![
                 ObjectHandle::real_from_string(b"1.5"),
                 ObjectHandle::integer(2),
                 ObjectHandle::real(11.5),
                 ObjectHandle::integer(22),
             ])),
-            Some(PageBox::new(1.5, 2.0, 11.5, 22.0))
+            Some(Rectangle::new(1.5, 2.0, 11.5, 22.0))
         );
-        assert!(handle_to_pagebox(&ObjectHandle::array(vec![
+        assert!(handle_to_rectangle(&ObjectHandle::array(vec![
             ObjectHandle::integer(1),
             ObjectHandle::null(),
             ObjectHandle::integer(11),
@@ -171,7 +177,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_to_pagebox_resolves_indirect_numeric_items() {
+    fn handle_to_rectangle_resolves_indirect_numeric_items() {
         let bytes = assemble_pdf(&[
             (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
             (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned()),
@@ -186,8 +192,8 @@ mod tests {
         let media_box = object_key_handle(&mut pdf, page, b"/MediaBox");
 
         assert_eq!(
-            handle_to_pagebox(&media_box),
-            Some(PageBox::new(1.0, 4.0, 3.0, 7.0))
+            handle_to_rectangle(&media_box),
+            Some(Rectangle::new(1.0, 4.0, 3.0, 7.0))
         );
     }
 
@@ -660,7 +666,7 @@ mod tests {
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
 
         assert!(rotate_key_absent(&mut pdf, page));
-        let mb = pagebox_for(&mut pdf, page, b"/MediaBox");
+        let mb = rectangle_for(&mut pdf, page, b"/MediaBox");
         assert_eq!((mb.urx - mb.llx, mb.ury - mb.lly), (300.0, 200.0));
 
         let content = pages::page_content_bytes(&mut pdf, page).unwrap();
@@ -684,7 +690,7 @@ mod tests {
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
         let after = pages::page_content_bytes(&mut pdf, page).unwrap();
         assert_eq!(before, after, "content must be untouched when rotate==0");
-        let mb = pagebox_for(&mut pdf, page, b"/MediaBox");
+        let mb = rectangle_for(&mut pdf, page, b"/MediaBox");
         assert_eq!((mb.urx, mb.ury), (200.0, 300.0));
     }
 
@@ -697,7 +703,7 @@ mod tests {
 
         assert!(rotate_key_absent(&mut pdf, page));
         // 180 maps [0 0 200 300] back onto itself: dims unchanged.
-        let mb = pagebox_for(&mut pdf, page, b"/MediaBox");
+        let mb = rectangle_for(&mut pdf, page, b"/MediaBox");
         assert_eq!((mb.llx, mb.lly, mb.urx, mb.ury), (0.0, 0.0, 200.0, 300.0));
         let content = pages::page_content_bytes(&mut pdf, page).unwrap();
         let s = String::from_utf8(content).unwrap();
@@ -719,10 +725,10 @@ mod tests {
 
         // 90deg map (x,y)->(y, 200 - x): corners (10,10),(190,290) ->
         // (10,190),(290,10) -> bbox [10 10 290 190].
-        let cb = pagebox_for(&mut pdf, page, b"/CropBox");
+        let cb = rectangle_for(&mut pdf, page, b"/CropBox");
         assert_eq!((cb.llx, cb.lly, cb.urx, cb.ury), (10.0, 10.0, 290.0, 190.0));
         // And MediaBox is still swapped, independently.
-        let mb = pagebox_for(&mut pdf, page, b"/MediaBox");
+        let mb = rectangle_for(&mut pdf, page, b"/MediaBox");
         assert_eq!((mb.urx - mb.llx, mb.ury - mb.lly), (300.0, 200.0));
     }
 
@@ -784,7 +790,7 @@ mod tests {
         annotation.try_is_scalar().unwrap();
         let rect = annotation.try_get_key(b"/Rect").unwrap();
         rect.try_is_scalar().unwrap();
-        let r = handle_to_pagebox(&rect).expect("annotation rectangle");
+        let r = handle_to_rectangle(&rect).expect("annotation rectangle");
         assert_eq!((r.llx, r.lly, r.urx, r.ury), (20.0, 140.0, 40.0, 190.0));
     }
 
@@ -809,7 +815,7 @@ mod tests {
                 annotation.try_is_scalar().unwrap();
                 let rect = annotation.try_get_key(b"/Rect").unwrap();
                 rect.try_is_scalar().unwrap();
-                let rectangle = handle_to_pagebox(&rect).expect("annotation rectangle");
+                let rectangle = handle_to_rectangle(&rect).expect("annotation rectangle");
                 (rectangle.llx, rectangle.lly, rectangle.urx, rectangle.ury)
             })
             .collect::<Vec<_>>();
@@ -820,8 +826,8 @@ mod tests {
         );
         let original = object_key_handle(&mut pdf, indirect_annot, b"/Rect");
         assert_eq!(
-            handle_to_pagebox(&original),
-            Some(PageBox::new(20.0, 30.0, 70.0, 50.0))
+            handle_to_rectangle(&original),
+            Some(Rectangle::new(20.0, 30.0, 70.0, 50.0))
         );
     }
 
@@ -858,7 +864,7 @@ mod tests {
         annotation.try_is_scalar().unwrap();
         let rect = annotation.try_get_key(b"/Rect").unwrap();
         rect.try_is_scalar().unwrap();
-        let r = handle_to_pagebox(&rect).expect("annotation rectangle");
+        let r = handle_to_rectangle(&rect).expect("annotation rectangle");
         assert_eq!((r.llx, r.lly, r.urx, r.ury), (20.0, 140.0, 40.0, 190.0));
     }
 
@@ -884,7 +890,7 @@ mod tests {
         assert_eq!(pages::page_content_bytes(&mut pdf, page).unwrap(), before);
         // The direct page box is untouched because qpdf's facade did not see a
         // direct `/Rotate` value.
-        let mb = pagebox_for(&mut pdf, page, b"/MediaBox");
+        let mb = rectangle_for(&mut pdf, page, b"/MediaBox");
         assert_eq!((mb.urx - mb.llx, mb.ury - mb.lly), (200.0, 300.0));
     }
 }

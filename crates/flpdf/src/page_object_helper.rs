@@ -117,34 +117,6 @@ use std::io::{Read, Seek};
 use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
-// PageBox — a typed rectangle
-// ---------------------------------------------------------------------------
-
-/// An axis-aligned rectangle expressed as `[llx, lly, urx, ury]` in user-space
-/// units, corresponding to a PDF rectangle array `[x1 y1 x2 y2]`.
-///
-/// PDF allows any combination of integer and real elements; both are coerced
-/// to `f64`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PageBox {
-    /// Left x coordinate (lower-left x).
-    pub llx: f64,
-    /// Bottom y coordinate (lower-left y).
-    pub lly: f64,
-    /// Right x coordinate (upper-right x).
-    pub urx: f64,
-    /// Top y coordinate (upper-right y).
-    pub ury: f64,
-}
-
-impl PageBox {
-    /// Construct a `PageBox` from its four corner coordinates.
-    pub fn new(llx: f64, lly: f64, urx: f64, ury: f64) -> Self {
-        Self { llx, lly, urx, ury }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // PageObjectHelper
 // ---------------------------------------------------------------------------
 
@@ -1623,30 +1595,11 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     // Bounding boxes
     // -----------------------------------------------------------------------
 
-    fn rectangle_for_matrix(&mut self, value: &ObjectHandle) -> Result<Option<PageBox>> {
-        let Some(items) = value.try_as_array()? else {
-            return Ok(None);
-        };
-        if items.len() != 4 {
+    fn rectangle_for_matrix(&mut self, value: &ObjectHandle) -> Result<Option<Rectangle>> {
+        if !value.try_is_rectangle()? {
             return Ok(None);
         }
-        let mut coords = [0.0f64; 4];
-        for (index, item) in items.into_iter().take(4).enumerate() {
-            let Some(number) = item
-                .try_as_integer()?
-                .map(|value| value as f64)
-                .or_else(|| item.as_real())
-            else {
-                return Ok(None);
-            };
-            coords[index] = number;
-        }
-        Ok(Some(PageBox::new(
-            coords[0].min(coords[2]),
-            coords[1].min(coords[3]),
-            coords[0].max(coords[2]),
-            coords[1].max(coords[3]),
-        )))
+        Ok(Some(value.try_get_array_as_rectangle()?))
     }
 }
 

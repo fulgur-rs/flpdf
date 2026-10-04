@@ -81,7 +81,7 @@
 | `crates/flpdf/src/linearization/show.rs` | correspondence | QPDF_linearization.cc hint decoding plus QPDFJob.cc display formatting |
 | `crates/flpdf/src/linearization/writer.rs` | correspondence | QPDFWriter.cc linearized write path split from the standard writer |
 | `crates/flpdf/src/logger.rs` | correspondence | QPDFLogger.cc shared info, warning, error, and binary-save pipeline routing |
-| `crates/flpdf/src/matrix.rs` | mirror | libqpdf/QPDFMatrix.cc |
+| `crates/flpdf/src/matrix.rs` | correspondence | this module represents qpdf's Matrix and Rectangle value types |
 | `crates/flpdf/src/memory_usage.rs` | correspondence | \`QUtil::get_max_memory_usage\` |
 | `crates/flpdf/src/nntree.rs` | correspondence | NNTree.cc behavior implemented with Rust-specific storage, error, and ownership boundaries |
 | `crates/flpdf/src/object_copy.rs` | correspondence | the canonical \`QPDF::copyForeignObject\` graph copy lives here |

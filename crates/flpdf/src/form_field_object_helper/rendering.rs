@@ -30,18 +30,17 @@ use crate::content_stream::{
 use crate::default_appearance::parse_default_appearance;
 use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::object_handle::ObjectHandle;
-use crate::page_object_helper::PageBox;
 use crate::pdf_syntax::write_string_value;
 use crate::pipeline::PipelineResult;
 use crate::token_filter::{TokenFilter, TokenFilterOutput};
 use crate::tokenizer::{Token, TokenType};
-use crate::{Error, ObjectRef, Pdf, Result};
+use crate::{Error, ObjectRef, Pdf, Rectangle, Result};
 
 /// Read a rectangle-shaped array (`/Rect`, `/BBox`, …) at `key` through a
 /// live handle. qpdf's `QPDFObjectHandle::getArrayAsRectangle` accepts any
 /// four numeric entries and normalizes the two corners with min/max before
 /// returning the rectangle (`libqpdf/QPDFObjectHandle.cc:816-836`).
-fn resolve_rectangle_canonical(handle: &ObjectHandle, key: &[u8]) -> Result<Option<PageBox>> {
+fn resolve_rectangle_canonical(handle: &ObjectHandle, key: &[u8]) -> Result<Option<Rectangle>> {
     let rect = handle.try_get_key(key)?;
     let Some(items) = rect.try_as_array()? else {
         return Ok(None);
@@ -57,7 +56,7 @@ fn resolve_rectangle_canonical(handle: &ObjectHandle, key: &[u8]) -> Result<Opti
         }
         values[index] = item.try_get_numeric_value()?;
     }
-    Ok(Some(PageBox::new(
+    Ok(Some(Rectangle::new(
         values[0].min(values[2]),
         values[1].min(values[3]),
         values[0].max(values[2]),
@@ -66,7 +65,7 @@ fn resolve_rectangle_canonical(handle: &ObjectHandle, key: &[u8]) -> Result<Opti
 }
 
 /// Read a widget rectangle through the live annotation handle.
-fn resolve_rect_canonical(widget: &ObjectHandle) -> Result<Option<PageBox>> {
+fn resolve_rect_canonical(widget: &ObjectHandle) -> Result<Option<Rectangle>> {
     resolve_rectangle_canonical(widget, b"/Rect")
 }
 
@@ -91,7 +90,7 @@ fn resolve_rect_canonical(widget: &ObjectHandle) -> Result<Option<PageBox>> {
 /// `/Rect [10 10 400 130]` is rewritten with `/BBox` still `[0 0 190 20]`,
 /// and the appearance content's `Td` offsets are computed from that
 /// unchanged 190×20 box.
-fn resolve_appearance_bbox_canonical(widget: &ObjectHandle) -> Result<Option<PageBox>> {
+fn resolve_appearance_bbox_canonical(widget: &ObjectHandle) -> Result<Option<Rectangle>> {
     let normal = resolve_normal_appearance_canonical(widget)?;
     normal.try_dereference()?;
     if let Some(stream_dict) = normal.as_stream_dict() {
@@ -100,7 +99,7 @@ fn resolve_appearance_bbox_canonical(widget: &ObjectHandle) -> Result<Option<Pag
     let Some(rect) = resolve_rect_canonical(widget)? else {
         return Ok(None);
     };
-    Ok(Some(PageBox::new(
+    Ok(Some(Rectangle::new(
         0.0,
         0.0,
         rect.urx - rect.llx,
@@ -691,7 +690,7 @@ fn build_qpdf_choice_appearance_content(
     default_appearance: &[u8],
     value: &[u8],
     options: &[Vec<u8>],
-    bbox: PageBox,
+    bbox: Rectangle,
     font_size: f64,
     is_combo: bool,
 ) -> Vec<u8> {
@@ -1203,7 +1202,7 @@ mod tests {
             b"/Helv 10 Tf 0 g",
             b"B",
             &[b"A".to_vec(), b"B".to_vec(), b"C".to_vec()],
-            PageBox::new(0.0, 0.0, 100.0, 36.0),
+            Rectangle::new(0.0, 0.0, 100.0, 36.0),
             10.0,
             false,
         );

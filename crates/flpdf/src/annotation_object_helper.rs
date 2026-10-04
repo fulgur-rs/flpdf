@@ -20,7 +20,7 @@
 //!   `Err`. [`AnnotationObjectHelper::get_subtype`] is the one exception:
 //!   qpdf's own `getSubtype` skips the type check its siblings perform, so
 //!   it defaults to qpdf's dummy-name sentinel rather than an empty name.
-//! - `/Rect` reuses [`PageBox`] from [`crate::page_object_helper`].
+//! - `/Rect` returns the canonical qpdf-shaped [`Rectangle`].
 //!
 //! # Examples
 //!
@@ -49,7 +49,6 @@
 //! ```
 
 use crate::object_handle::ObjectHandle;
-use crate::page_object_helper::PageBox;
 use crate::{Matrix, Rectangle, Result};
 
 // ---------------------------------------------------------------------------
@@ -141,7 +140,7 @@ impl AnnotationObjectHelper {
     // get_rect — /Rect (4-element numeric array, leaf-only)
     // -----------------------------------------------------------------------
 
-    /// Return the annotation rectangle (`/Rect`) as a [`PageBox`].
+    /// Return the annotation rectangle (`/Rect`) as a [`Rectangle`].
     ///
     /// The four numbers are `[llx, lly, urx, ury]` in default user-space
     /// units (ISO 32000-1 §12.5.4). Both integer and real elements are
@@ -151,7 +150,7 @@ impl AnnotationObjectHelper {
     /// (`libqpdf/QPDFObjectHandle.cc:817-836`), used by
     /// `QPDFAnnotationObjectHelper::getRect`: a missing `/Rect`, a
     /// non-array value, an array with a length other than 4, or a
-    /// non-numeric element all yield `PageBox::new(0.0, 0.0, 0.0, 0.0)`
+    /// non-numeric element all yield `Rectangle::default()`
     /// rather than an error. The four corners are normalized to
     /// `llx <= urx` and `lly <= ury` via `min`/`max`, so a rectangle array
     /// stored with corners in reverse order is still returned upright.
@@ -175,7 +174,7 @@ impl AnnotationObjectHelper {
     /// println!("[{} {} {} {}]", r.llx, r.lly, r.urx, r.ury);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn get_rect(&mut self) -> Result<PageBox> {
+    pub fn get_rect(&mut self) -> Result<Rectangle> {
         let rect = self.resolved_key(b"/Rect")?;
         array_as_rectangle(&rect)
     }
@@ -450,10 +449,10 @@ fn as_number(handle: &ObjectHandle) -> Result<Option<f64>> {
         .or_else(|| handle.as_real()))
 }
 
-/// Resolve `handle` as a 4-element numeric array into a [`PageBox`],
+/// Resolve `handle` as a 4-element numeric array into a [`Rectangle`],
 /// mirroring `QPDFObjectHandle::getArrayAsRectangle`.
-fn array_as_rectangle(handle: &ObjectHandle) -> Result<PageBox> {
-    let zero = PageBox::new(0.0, 0.0, 0.0, 0.0);
+fn array_as_rectangle(handle: &ObjectHandle) -> Result<Rectangle> {
+    let zero = Rectangle::default();
     let Some(items) = handle.as_array() else {
         return Ok(zero);
     };
@@ -467,7 +466,7 @@ fn array_as_rectangle(handle: &ObjectHandle) -> Result<PageBox> {
         };
         nums[i] = n;
     }
-    Ok(PageBox::new(
+    Ok(Rectangle::new(
         nums[0].min(nums[2]),
         nums[1].min(nums[3]),
         nums[0].max(nums[2]),

@@ -53,7 +53,7 @@ fn rect_reference_not_array_returns_zero_box() {
     let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(10, 0)));
     assert_eq!(
         annot.get_rect().unwrap(),
-        flpdf::PageBox::new(0.0, 0.0, 0.0, 0.0)
+        flpdf::Rectangle::new(0.0, 0.0, 0.0, 0.0)
     );
 }
 
@@ -64,7 +64,7 @@ fn rect_unexpected_type_returns_zero_box() {
     let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(10, 0)));
     assert_eq!(
         annot.get_rect().unwrap(),
-        flpdf::PageBox::new(0.0, 0.0, 0.0, 0.0)
+        flpdf::Rectangle::new(0.0, 0.0, 0.0, 0.0)
     );
 }
 
@@ -75,7 +75,7 @@ fn rect_wrong_length_returns_zero_box() {
     let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(10, 0)));
     assert_eq!(
         annot.get_rect().unwrap(),
-        flpdf::PageBox::new(0.0, 0.0, 0.0, 0.0)
+        flpdf::Rectangle::new(0.0, 0.0, 0.0, 0.0)
     );
 }
 
@@ -86,7 +86,7 @@ fn rect_non_numeric_element_returns_zero_box() {
     let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(10, 0)));
     assert_eq!(
         annot.get_rect().unwrap(),
-        flpdf::PageBox::new(0.0, 0.0, 0.0, 0.0)
+        flpdf::Rectangle::new(0.0, 0.0, 0.0, 0.0)
     );
 }
 
