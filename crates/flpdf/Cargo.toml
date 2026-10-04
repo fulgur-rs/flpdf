@@ -12,12 +12,13 @@ description = "A pure-Rust PDF toolkit modeled on qpdf — read, rewrite, linear
 documentation = "https://docs.rs/flpdf"
 keywords = ["pdf", "qpdf", "parser", "linearization"]
 categories = ["parser-implementations", "encoding"]
-# These workspace route-lock tests read docs/ from the repository root. Keep
-# them active in workspace CI, but exclude them from the crates.io archive,
-# which does not contain those workspace-only documentation files.
+# These workspace route-lock tests read docs/ (or sibling workspace crates)
+# from the repository root. Keep them active in workspace CI, but exclude them
+# from the crates.io archive, which does not contain those workspace-only files.
 exclude = [
     "tests/linearization_xref_route_cutover_tests.rs",
     "tests/name_tree_dests_route_contract_tests.rs",
+    "tests/page_object_helper_resource_alias_contract_tests.rs",
 ]
 
 [dependencies]
