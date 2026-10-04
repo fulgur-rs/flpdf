@@ -6709,3 +6709,52 @@ fn a_falsy_split_pages_value_still_preserves_primary_orphans() {
 }
 
 mod common;
+
+/// qpdf 11.9.0 starts every `ArgParser` with empty positional slots, so a
+/// positional argument on a job that already holds the selector reaches
+/// `Config::inputFile` and is rejected (`QPDFJob_argv.cc:42-43,73-78`,
+/// `QPDFJob_config.cc:16-51`). Probed with the public C++ API: each case below
+/// reports `input file has already been given`.
+#[test]
+fn argv_initialization_rejects_positional_for_preconfigured_input_slot() {
+    fn init(job: &mut QPDFJob, arguments: &[&str]) -> flpdf::Result<()> {
+        let argv = arguments.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        job.initialize_from_argv(&argv)
+    }
+    fn assert_duplicate_input(case: &str, result: flpdf::Result<()>) {
+        let error = result.expect_err(case);
+        assert!(
+            matches!(&error, Error::Usage(usage) if usage.to_string() == "input file has already been given"),
+            "{case}: {error:?}"
+        );
+    }
+
+    let mut job = QPDFJob::new();
+    job.config().input_file("a.pdf").unwrap();
+    assert_duplicate_input("input then positional", init(&mut job, &["p", "b.pdf"]));
+
+    let mut job = QPDFJob::new();
+    job.config()
+        .input_file("a.pdf")
+        .unwrap()
+        .output_file("o.pdf")
+        .unwrap();
+    assert_duplicate_input(
+        "input and output then positional",
+        init(&mut job, &["p", "x.pdf"]),
+    );
+
+    let mut job = QPDFJob::new();
+    job.config().empty_input().unwrap();
+    assert_duplicate_input(
+        "empty input then positional",
+        init(&mut job, &["p", "o.pdf"]),
+    );
+
+    let mut job = QPDFJob::new();
+    init(&mut job, &["p", "a.pdf", "o.pdf"]).unwrap();
+    assert_duplicate_input(
+        "second argv initialization with two positionals",
+        init(&mut job, &["p", "x.pdf", "y.pdf"]),
+    );
+}

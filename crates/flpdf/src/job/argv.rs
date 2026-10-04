@@ -99,15 +99,16 @@ enum ActiveSegment {
 
 impl<'a> Parser<'a> {
     fn new(job: &'a mut QPDFJob) -> Self {
-        let gave_input = job.configuration.input_file.is_some() || job.configuration.empty_input;
-        let gave_output =
-            job.configuration.output_file.is_some() || job.configuration.replace_input;
+        // qpdf's ArgParser starts `gave_input`/`gave_output` false for every
+        // parse (`libqpdf/QPDFJob_argv.cc:42-43`); a selector already present
+        // on the job is rejected by `Config::inputFile`/`outputFile`
+        // (`libqpdf/QPDFJob_config.cc:16-51`), not absorbed into the slot flags.
         Self {
             job,
             table: Table::Main,
             active: None,
-            gave_input,
-            gave_output,
+            gave_input: false,
+            gave_output: false,
         }
     }
 
