@@ -2982,10 +2982,9 @@ mixed として残り、別の bounded cutover で扱う。
 として入力ファイル名とは独立した責務を持つことに合わせ、`PdfWriter` の file sink 自身が
 失敗時に `qpdf output: Pl_StdioFile::write: <system message>` を組み立てる
 （`Pl_StdioFile.cc:25-37`）。qpdf 非対応の sink（`set_output_writer` 等）は identifier を
-持たず bare `Error::Io` のまま返す。失敗の shape を sink 側で決めるため、`write_qpdf` の
-error path で I/O error を一括変換する必要がなく、writer 内部の lazy input read が返す
-bare `Error::Io` の分類も壊れない。`job_error_message_with_input` の入力名装飾は
-open/read/parse failure と `BadPassword` に対して従来どおり保持する。
+持たず bare `Error::Io` のまま返す。失敗の shape を sink 側で決めるため、`write_qpdf` は
+I/O errorを変換せずcallerへ返す。open/read/parse failureもJob内で文字列化せず、
+file name・source・raw `what()` を含むエラー値のままCLIまたはlibrary callerへ伝える。
 `/dev/full` への実測で qpdf 11.9.0 と CLI 出力が一致することを
 `cli_logger_routing` の differential で検証する。
 
@@ -3637,10 +3636,10 @@ last-wins, and list-plus-show attachment output.
 qpdf の `wrap_qpdfjob`（`libqpdf/qpdfjob-c.cc:32-40`）は、
 `QPDFJob::initializeFromJson`/`run` が投げた例外を job logger の error
 pipeline へ prefix・区切り・本文・改行の順に送り、`EXIT_ERROR`へ変換する。
-flpdf は `QPDFJob::report_job_error` の canonical route を qtest の
-Rust consumerへ公開し、`qpdfjob_ctest.rs` がこの wrapper の継続順序だけを
-担う。通常の `QPDFJob::run` の `UsageError` contractや、CLIの別の usage
-表示経路は変更しない。
+flpdf の `QPDFJob::run` は通常のエラーをそのまま返し、このC-wrapper動作は
+`qpdfjob_ctest.rs` のC API adapter内で行う。`QPDFJob` 公開面にはC wrapper
+専用の報告関数を置かない。Rust CLIは別のqpdf同等境界で通常例外を一度だけ
+描画し、`UsageError`は既存のusage表示経路へ渡す。
 
 ### `qpdf-ctest` test02 の C API 報告境界
 
@@ -5144,16 +5143,13 @@ qpdf の `QPDFJob::copyAttachments` は各 donor を `processFile` で開き、
 password exception をそのまま copy loop の外へ伝播させる
 （`libqpdf/QPDFJob.cc:2089-2100`）。CLI の `qpdf/qpdf.cc` はこの
 `std::exception` を最上位で `qpdf: <what()>` として表示する
-（`qpdf/qpdf.cc:32-43`）。従って donor 認証失敗の分類は job/library
-境界で保持し、donor path の文字列化は CLI reporting 境界に限定する。
+（`qpdf/qpdf.cc:32-43`）。従って donor 認証失敗の分類と filename は
+qpdf例外自体に保持され、CLIはその `what()` を描画する。
 
-flpdf は `prepare_document_transformations` で donor path を job の入力名に
-保持し、public `QPDFJob::apply_transformations` からは
-`Error::Encrypted(BadPassword)`（または diagnostics を伴う同じ source）を
-返す。CLI は typed bad-password だけを `QPDFJob::report_job_error` へ渡し、
-qpdf と同じ donor-path 診断を出して既存の exit-2 sentinel で終了する。
-この分離により通常書き出しと JSON の表示を変えず、ライブラリ利用者が
-`Error::Encrypted` を pattern-match できる。回帰は
+flpdf の secondary-source open が `Error::Encrypted(BadPassword)` を返した
+場合、`open_job_source` は qpdf の `QPDFExc` と同じ Password code・source
+filename・`what()` に変換する。public `QPDFJob::apply_transformations` はこの
+例外を呼び出し元へ返し、CLI の最上位 catch が raw `what()` を一度だけ描画する。回帰は
 `crates/flpdf/tests/job_lifecycle_tests.rs` の public API テストと
 `crates/flpdf-cli/tests/cli_json_donor_policy.rs` の通常/JSON differential
 で固定し、独自 error variant や deviation marker は追加しない。
@@ -5316,6 +5312,25 @@ returns qpdf's exact missing-output `UsageError` from both
 `job_lifecycle_tests.rs::public_job_default_requires_output_like_qpdf`; the
 same default also preserves a clean base for the initializer-layering work in
 `flpdf-6ik2q.27`.
+
+### `QPDFJob::createQPDF` and `run` error ownership (`flpdf-6ik2q.29`, 2026-10-04)
+
+qpdf's `createQPDF` calls `checkConfiguration` and `processFile`, handles only
+the password exception cases needed by encryption status and `showEncryption`,
+then lets other open and create-stage errors escape
+(`libqpdf/QPDFJob.cc:428-480`). `run()` directly calls `createQPDF` and
+`writeQPDF` without converting their exceptions to an exit value
+(`QPDFJob.cc:514-520`). Error text is rendered by the outer CLI catch or the
+C wrapper (`qpdf/qpdf.cc:36-43`, `libqpdf/qpdfjob-c.cc:32-40`).
+
+flpdf now returns configuration, open, JSON-update, transformation, inspection,
+and writer failures as `Result::Err` without reporting them inside the Job.
+`JobExitCode::Error` remains for qpdf operations that return status 2, such as
+`requiresPassword` on plaintext input. The qpdf C-wrapper reporting helper was
+removed from the public `QPDFJob` surface because it is not a C++ Job method;
+the wrapper owns that catch in its own boundary. Public API regressions cover
+missing and malformed inputs, a failing JSON update, writer failure, and the
+absence of Job-level error output.
 
 ### Top-level attachment mutation with a single inspection (`flpdf-awthm`, 2026-09-15)
 

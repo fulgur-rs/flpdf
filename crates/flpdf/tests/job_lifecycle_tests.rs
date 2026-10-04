@@ -1,8 +1,8 @@
 use flpdf::job::{AttachmentAddOptions, JobDocument, JobExitCode, QPDFJob};
 use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
 use flpdf::{
-    EncryptParams, EncryptedError, Error, ObjectHandle, ObjectStreamMode, Pdf, PdfOpenOptions,
-    PdfWriter, QPDFLogger,
+    EncryptParams, Error, ObjectHandle, ObjectStreamMode, Pdf, PdfOpenOptions, PdfWriter,
+    QPDFLogger,
 };
 use std::fs::File;
 use std::io::{BufReader, Cursor, Write};
@@ -107,7 +107,17 @@ fn raw_argv_initializer_matches_qpdf_final_configuration_state() {
             pages_output.to_string_lossy().into_owned().into_bytes(),
         ])
         .expect("named pages arguments should initialize");
-    assert_eq!(named_file_pages.run().unwrap(), JobExitCode::Error);
+    let error = named_file_pages
+        .run()
+        .expect_err("qpdf tries to open the positional filename `1`");
+    assert!(matches!(
+        error,
+        Error::FileIo {
+            operation: "open",
+            path,
+            ..
+        } if path == Path::new("1")
+    ));
 
     for option in [b"--json=".as_slice(), b"--json-output=".as_slice()] {
         let mut job = QPDFJob::new();
@@ -1006,109 +1016,6 @@ fn job_json_byte_entry_point_accepts_literal_high_bit_password_bytes() {
     partial_job
         .initialize_from_json_partial_bytes(&partial_json)
         .expect("partial byte entry point must preserve raw JSON bytes");
-}
-
-#[test]
-fn qpdfjob_error_report_matches_the_qpdf_c_wrapper_boundary() {
-    let (logger, state) = logger_with_error_sink();
-    let mut job = QPDFJob::new();
-    job.set_logger(logger);
-    job.set_message_prefix("qpdfjob json");
-
-    job.report_job_error(&Error::Usage(flpdf::UsageError::new(
-        "an output file name is required; use - for standard output",
-    )))
-    .unwrap();
-
-    assert_eq!(
-        state.lock().unwrap().bytes,
-        b"qpdfjob json: an output file name is required; use - for standard output\n"
-    );
-
-    state.lock().unwrap().bytes.clear();
-    job.report_job_error(&Error::SystemBytes(
-        b"json-input-\xff: errors found in JSON".to_vec(),
-    ))
-    .unwrap();
-    assert_eq!(
-        state.lock().unwrap().bytes,
-        b"qpdfjob json: json-input-\xff: errors found in JSON\n"
-    );
-}
-
-#[test]
-fn qpdfjob_error_report_includes_the_input_name_for_terminal_parse_failure() {
-    let (logger, state) = logger_with_error_sink();
-    let mut job = QPDFJob::new();
-    job.set_logger(logger);
-    job.set_input_name_bytes(b"bad.pdf");
-
-    job.report_job_error(&Error::parse(
-        0,
-        "unable to find trailer dictionary while recovering damaged file",
-    ))
-    .unwrap();
-
-    assert_eq!(
-        state.lock().unwrap().bytes,
-        b"qpdf: bad.pdf: unable to find trailer dictionary while recovering damaged file\n"
-    );
-}
-
-#[test]
-fn qpdfjob_error_report_uses_qpdf_invalid_password_wording() {
-    let (logger, state) = logger_with_error_sink();
-    let mut job = QPDFJob::new();
-    job.set_logger(logger);
-    job.set_input_name("encrypted.pdf");
-
-    job.report_job_error(&Error::Encrypted(flpdf::EncryptedError::BadPassword))
-        .unwrap();
-
-    assert_eq!(
-        state.lock().unwrap().bytes,
-        b"qpdf: encrypted.pdf: invalid password\n"
-    );
-
-    state.lock().unwrap().bytes.clear();
-    job.set_input_name("input.pdf");
-    job.report_job_error(&Error::Io(std::io::Error::from(
-        std::io::ErrorKind::PermissionDenied,
-    )))
-    .unwrap();
-    assert_eq!(
-        state.lock().unwrap().bytes,
-        b"qpdf: input.pdf: Permission denied\n"
-    );
-
-    for (kind, expected) in [
-        (std::io::ErrorKind::AlreadyExists, "File exists"),
-        (std::io::ErrorKind::InvalidInput, "Invalid argument"),
-        (std::io::ErrorKind::IsADirectory, "Is a directory"),
-        (std::io::ErrorKind::NotADirectory, "Not a directory"),
-    ] {
-        state.lock().unwrap().bytes.clear();
-        job.set_input_name("input.pdf");
-        job.report_job_error(&Error::Io(std::io::Error::from(kind)))
-            .unwrap();
-        assert_eq!(
-            state.lock().unwrap().bytes,
-            format!("qpdf: input.pdf: {expected}\n").as_bytes()
-        );
-    }
-
-    state.lock().unwrap().bytes.clear();
-    job.set_input_name_bytes(b"");
-    job.report_job_error(&Error::Io(std::io::Error::from(
-        std::io::ErrorKind::PermissionDenied,
-    )))
-    .unwrap();
-    assert_eq!(state.lock().unwrap().bytes, b"qpdf: Permission denied\n");
-
-    state.lock().unwrap().bytes.clear();
-    job.report_job_error(&Error::Encrypted(flpdf::EncryptedError::BadPassword))
-        .unwrap();
-    assert_eq!(state.lock().unwrap().bytes, b"qpdf: invalid password\n");
 }
 
 #[test]
@@ -2648,17 +2555,16 @@ fn page_label_order_errors_are_not_usage_errors() {
             .to_string(),
         )
         .unwrap();
-        // `run()` reports the failure and turns it into an exit status
-        // (mirroring qpdf's CLI catch), so check what reached the error sink.
-        assert_eq!(job.run().unwrap(), JobExitCode::Error);
-        let reported = String::from_utf8_lossy(&errors.lock().unwrap().bytes).to_string();
+        let error = job
+            .run()
+            .expect_err("qpdf lets page-label runtime errors escape QPDFJob::run");
         assert!(
-            reported.contains(expected),
-            "expected qpdf's own wording, got: {reported}"
+            matches!(&error, Error::SystemBytes(message) if message == expected.as_bytes()),
+            "expected qpdf's own wording, got: {error:?}"
         );
         assert!(
-            !reported.contains("For help:"),
-            "qpdf raises this with a plain runtime error, so no usage banner: {reported}"
+            errors.lock().unwrap().bytes.is_empty(),
+            "the Job leaves exception reporting to its caller"
         );
     }
 }
@@ -3687,7 +3593,6 @@ fn partial_job_json_after_run_rejects_duplicate_input() {
     assert_eq!(job.run().unwrap(), JobExitCode::Success);
     assert_eq!(job.get_exit_code(), JobExitCode::Success);
 
-    let mut job = job;
     let error = job
         .initialize_from_json_partial(
             &serde_json::json!({
@@ -4089,7 +3994,7 @@ fn json_job_progress_uses_the_qpdf_default_info_reporter() {
 }
 
 #[test]
-fn json_job_progress_logger_failures_abort_and_propagate_from_write() {
+fn json_job_progress_logger_failures_propagate_without_job_reporting() {
     let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
     let tempdir = tempfile::tempdir().unwrap();
     let output = tempdir.path().join("progress-output.pdf");
@@ -4105,7 +4010,10 @@ fn json_job_progress_logger_failures_abort_and_propagate_from_write() {
     job.set_logger(logger);
     job.initialize_from_json(&json).unwrap();
 
-    assert_eq!(job.run().unwrap(), JobExitCode::Error);
+    let error = job
+        .run()
+        .expect_err("qpdf propagates a writer progress logger failure");
+    assert!(matches!(error, Error::System(message) if message == "warning sink failed"));
 }
 
 #[test]
@@ -4206,7 +4114,7 @@ fn public_job_default_requires_output_like_qpdf() {
 }
 
 #[test]
-fn create_qpdf_reports_an_ordinary_output_configuration_failure() {
+fn create_qpdf_propagates_output_configuration_failure_without_reporting_it() {
     let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
     let (logger, error_state) = logger_with_error_sink();
     logger.info(Vec::<u8>::new()).unwrap();
@@ -4220,16 +4128,16 @@ fn create_qpdf_reports_an_ordinary_output_configuration_failure() {
     job.set_logger(logger);
     job.initialize_from_json_partial(&json).unwrap();
 
-    assert!(job.create_qpdf().unwrap().is_none());
-    assert!(error_state
-        .lock()
-        .unwrap()
-        .bytes
-        .windows(b"QPDFLogger: called setSave on standard output after standard output has already been used".len())
-        .any(|window| {
-            window
-                == b"QPDFLogger: called setSave on standard output after standard output has already been used"
-        }));
+    let error = match job.create_qpdf() {
+        Err(error) => error,
+        Ok(_) => panic!("qpdf propagates a checkConfiguration logger failure"),
+    };
+    assert!(matches!(
+        error,
+        Error::Internal(ref message)
+            if message == "QPDFLogger: called setSave on standard output after standard output has already been used"
+    ));
+    assert!(error_state.lock().unwrap().bytes.is_empty());
 }
 
 #[test]
@@ -4479,7 +4387,7 @@ fn write_qpdf_failure_returns_an_error() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn write_qpdf_output_sink_error_does_not_prefix_the_input_name() {
+fn write_qpdf_propagates_output_sink_error_without_reporting_it() {
     let input = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat/objstm-lin-outlines-80-200.pdf");
     let args = vec![
@@ -4506,15 +4414,12 @@ fn write_qpdf_output_sink_error_does_not_prefix_the_input_name() {
         ),
         "{error:?}"
     );
-    assert_eq!(
-        state.lock().unwrap().bytes,
-        b"qpdfjob: qpdf output: Pl_StdioFile::write: No space left on device\n"
-    );
+    assert!(state.lock().unwrap().bytes.is_empty());
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn linearized_output_sink_error_reports_the_qpdf_output_pipeline() {
+fn linearized_output_sink_error_propagates_without_job_reporting() {
     // The linearized route hands the finished document to the sink in one
     // piece, so it carries the failure through a different call than the
     // streaming route above. qpdf 11.9.0 prints the same line for both:
@@ -4544,12 +4449,7 @@ fn linearized_output_sink_error_reports_the_qpdf_output_pipeline() {
         ),
         "{error:?}"
     );
-    // The JSON entry point carries qpdf's own `qpdfjob json` message prefix
-    // (`qpdfjob-c.cc:82`); only the prefix differs from the argv route.
-    assert_eq!(
-        state.lock().unwrap().bytes,
-        b"qpdfjob json: qpdf output: Pl_StdioFile::write: No space left on device\n"
-    );
+    assert!(state.lock().unwrap().bytes.is_empty());
 }
 
 #[test]
@@ -4569,7 +4469,7 @@ fn write_qpdf_without_an_output_runs_inspection() {
 }
 
 #[test]
-fn missing_input_returns_qpdf_error_status_without_panicking() {
+fn missing_input_returns_the_qpdf_open_error_without_panicking() {
     let tempdir = tempfile::tempdir().unwrap();
     let args = vec![
         "qpdfjob".to_owned(),
@@ -4587,7 +4487,17 @@ fn missing_input_returns_qpdf_error_status_without_panicking() {
     let mut job = QPDFJob::new();
     job.initialize_from_argv(&args).unwrap();
 
-    assert_eq!(job.run().unwrap(), JobExitCode::Error);
+    let error = job
+        .run()
+        .expect_err("qpdf lets processFile's open failure escape QPDFJob::run");
+    assert!(matches!(
+        error,
+        Error::FileIo {
+            operation: "open",
+            path,
+            ..
+        } if path == tempdir.path().join("missing.pdf")
+    ));
 }
 
 #[test]
@@ -4638,7 +4548,7 @@ fn argv_usage_rejects_short_options_too_many_positionals_and_missing_input() {
 }
 
 #[test]
-fn create_qpdf_rejects_unconfigured_and_reports_malformed_inputs() {
+fn create_qpdf_propagates_unconfigured_and_malformed_input_errors() {
     let mut job = QPDFJob::new();
     let error = match job.create_qpdf() {
         Err(error) => error,
@@ -4661,13 +4571,194 @@ fn create_qpdf_rejects_unconfigured_and_reports_malformed_inputs() {
             .to_string_lossy()
             .into_owned(),
     ];
+    let (logger, warnings) = logger_with_warning_sink();
+    let errors = Arc::new(Mutex::new(SinkState::default()));
+    logger.set_error(Some(PipelineHandle::new(RecordingSink {
+        state: Arc::clone(&errors),
+    })));
     let mut job = QPDFJob::new();
+    job.set_logger(logger);
     job.initialize_from_argv(&args).unwrap();
-    assert!(job.create_qpdf().unwrap().is_none());
+    let error = match job.create_qpdf() {
+        Err(error) => error,
+        Ok(_) => panic!("qpdf propagates malformed processFile errors"),
+    };
+    let (terminal, _) = error
+        .open_failure()
+        .expect("repair diagnostics remain available with the propagated error");
+    let expected = format!(
+        "{}: unable to find trailer dictionary while recovering damaged file",
+        malformed.display()
+    );
+    assert!(matches!(
+        terminal,
+        Error::QpdfExc(error)
+            if error.get_error_code() == flpdf::QpdfErrorCode::DamagedPdf
+                && error.get_filename() == malformed.to_string_lossy().as_bytes()
+                && error.what_bytes() == expected.as_bytes()
+    ));
+    assert!(String::from_utf8_lossy(&warnings.lock().unwrap().bytes).contains("file is damaged"));
+    let error_output = String::from_utf8_lossy(&errors.lock().unwrap().bytes).into_owned();
+    assert!(
+        error_output.is_empty(),
+        "create_qpdf must not report the propagated failure: {error_output}"
+    );
 }
 
 #[test]
-fn run_check_and_check_operation_failure_map_to_error_status() {
+fn create_qpdf_propagates_missing_input_without_reporting_it() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let missing = tempdir.path().join("missing.pdf");
+    let (logger, errors) = logger_with_error_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.config().input_file(&missing).unwrap().show_npages();
+
+    let error = match job.create_qpdf() {
+        Err(error) => error,
+        Ok(_) => panic!("QPDFJob::createQPDF propagates the failed processFile open"),
+    };
+    assert!(matches!(
+        error,
+        Error::FileIo {
+            operation: "open",
+            path,
+            ..
+        } if path == missing
+    ));
+    assert!(
+        errors.lock().unwrap().bytes.is_empty(),
+        "the Job must leave ordinary error reporting to its caller"
+    );
+}
+
+#[test]
+fn create_qpdf_propagates_primary_password_error_with_qpdf_source_context() {
+    let encrypted = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf");
+    let (logger, errors) = logger_with_error_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.config().input_file(&encrypted).unwrap().show_npages();
+    job.set_password(b"wrong-password".to_vec());
+
+    let error = match job.create_qpdf() {
+        Err(error) => error,
+        Ok(_) => panic!("qpdf propagates the primary processFile password exception"),
+    };
+    let expected = format!("{}: invalid password", encrypted.display());
+    assert!(matches!(
+        error,
+        Error::QpdfExc(ref error)
+            if error.get_error_code() == flpdf::QpdfErrorCode::Password
+                && error.get_filename() == encrypted.to_string_lossy().as_bytes()
+                && error.what_bytes() == expected.as_bytes()
+    ));
+    assert!(errors.lock().unwrap().bytes.is_empty());
+}
+
+#[test]
+fn create_qpdf_propagates_create_stage_failure_without_reporting_it() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let missing_update = tempdir.path().join("missing-update.json");
+    let (logger, errors) = logger_with_error_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.initialize_from_json_partial(
+        &serde_json::json!({
+            "inputFile": input,
+            "outputFile": tempdir.path().join("output.pdf"),
+            "updateFromJson": missing_update
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let error = match job.create_qpdf() {
+        Err(error) => error,
+        Ok(_) => panic!("QPDFJob::createQPDF propagates updateFromJSON failures"),
+    };
+    assert!(matches!(
+        error,
+        Error::FileIo {
+            operation: "open",
+            path,
+            ..
+        } if path == missing_update
+    ));
+    assert!(
+        errors.lock().unwrap().bytes.is_empty(),
+        "create-stage errors belong to the caller's qpdf boundary"
+    );
+}
+
+#[test]
+fn run_propagates_write_failure_without_reporting_it() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let missing_output = tempdir.path().join("missing").join("output.pdf");
+    let (logger, errors) = logger_with_error_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.config()
+        .input_file(&input)
+        .unwrap()
+        .output_file(&missing_output)
+        .unwrap();
+
+    let error = job
+        .run()
+        .expect_err("qpdf QPDFJob::run propagates writeOutfile failures");
+
+    assert!(matches!(
+        error,
+        Error::FileIo {
+            operation: "open",
+            path,
+            ..
+        } if path == missing_output
+    ));
+    assert!(
+        errors.lock().unwrap().bytes.is_empty(),
+        "the Job must leave write error reporting to its caller"
+    );
+}
+
+#[test]
+fn run_propagates_copy_encryption_error_with_qpdf_source_context() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let donor = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("output.pdf");
+    let (logger, errors) = logger_with_error_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.config()
+        .input_file(&input)
+        .unwrap()
+        .output_file(&output)
+        .unwrap()
+        .copy_encryption(donor.clone(), b"wrong-password".to_vec());
+
+    let error = job
+        .run()
+        .expect_err("qpdf propagates copyEncryption's donor processFile failure");
+    let expected = format!("{}: invalid password", donor.display());
+    assert!(matches!(
+        error,
+        Error::QpdfExc(ref error)
+            if error.get_error_code() == flpdf::QpdfErrorCode::Password
+                && error.get_filename() == donor.to_string_lossy().as_bytes()
+                && error.what_bytes() == expected.as_bytes()
+    ));
+    assert!(errors.lock().unwrap().bytes.is_empty());
+    assert!(!output.exists());
+}
+
+#[test]
+fn run_check_operation_failure_propagates_to_its_caller() {
     let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
     let args = vec![
         "qpdfjob".to_owned(),
@@ -4683,7 +4774,10 @@ fn run_check_and_check_operation_failure_map_to_error_status() {
     let mut job = QPDFJob::new();
     job.set_logger(logger);
     job.initialize_from_argv(&args).unwrap();
-    assert_eq!(job.run().unwrap(), JobExitCode::Error);
+    let error = job
+        .run()
+        .expect_err("qpdf propagates a check operation logger failure");
+    assert!(matches!(error, Error::System(message) if message == "warning sink failed"));
 }
 
 #[test]
@@ -4877,12 +4971,12 @@ fn warning_sink_errors_are_returned_to_the_caller() {
 }
 
 #[test]
-fn a_check_failure_is_not_reported_twice_at_the_write_boundary() {
+fn a_check_failure_propagates_after_qpdf_check_diagnostics() {
     // qpdf's `doCheck` throws `std::runtime_error("errors detected")`
-    // (`libqpdf/QPDFJob.cc:793`) and its CLI catch prints
-    // `qpdf: errors detected` exactly once (`qpdf/qpdf.cc:39-41`). flpdf's
-    // check consumer writes that line itself, so the write boundary must not
-    // repeat it.
+    // (`libqpdf/QPDFJob.cc:793`) after writing only detailed `ERROR:` lines.
+    // The outer CLI catch owns `qpdf: errors detected`
+    // (`qpdf/qpdf.cc:39-41`), so the Job must propagate it without logging the
+    // final line itself.
     let tempdir = tempfile::tempdir().unwrap();
     let path = tempdir.path().join("bad-stream.pdf");
     // A page whose content stream declares /FlateDecode but holds raw bytes:
@@ -4927,26 +5021,26 @@ fn a_check_failure_is_not_reported_twice_at_the_write_boundary() {
     )
     .unwrap();
 
-    assert_eq!(job.run().unwrap(), JobExitCode::Error);
+    let error = job
+        .run()
+        .expect_err("qpdf propagates doCheck's final runtime error");
+    assert!(matches!(error, Error::SystemBytes(message) if message == b"errors detected"));
     let reported = String::from_utf8_lossy(&errors.lock().unwrap().bytes).to_string();
     assert_eq!(
         reported.matches("errors detected").count(),
-        1,
-        "the check consumer already wrote qpdf's single line: {reported}"
+        0,
+        "the check consumer leaves the final exception line to its caller: {reported}"
     );
     assert!(
-        !reported.contains("unsupported PDF feature"),
-        "qpdf never prefixes this diagnostic: {reported}"
+        reported.contains("ERROR: page 1:"),
+        "doCheck still emits its detailed error before throwing: {reported}"
     );
 }
 
 #[test]
-fn an_unreported_inspection_failure_is_reported_once_at_the_write_boundary() {
-    // The counterpart of the check case: a failure that no inspection step has
-    // already announced must still get qpdf's single `qpdf: <what()>` line,
-    // which qpdf's CLI prints from its catch (`qpdf/qpdf.cc:39-41`). Here the
-    // info sink fails while `--show-npages` writes, so `write_qpdf` owes the
-    // diagnostic.
+fn an_unreported_inspection_failure_propagates_without_job_reporting() {
+    // The info sink fails while `--show-npages` writes. qpdf's writeQPDF lets
+    // the exception escape for the caller to render (`qpdf/qpdf.cc:39-41`).
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat/linearized-one-page.pdf");
     let (logger, errors) = logger_with_error_sink();
@@ -4960,17 +5054,11 @@ fn an_unreported_inspection_failure_is_reported_once_at_the_write_boundary() {
     )
     .unwrap();
 
-    assert_eq!(job.run().unwrap(), JobExitCode::Error);
-    let reported = String::from_utf8_lossy(&errors.lock().unwrap().bytes).to_string();
-    assert!(
-        reported.contains("warning sink failed"),
-        "the boundary must report a failure no inspection step announced: {reported}"
-    );
-    assert_eq!(
-        reported.matches("warning sink failed").count(),
-        1,
-        "qpdf prints exactly one line for it: {reported}"
-    );
+    let error = job
+        .run()
+        .expect_err("qpdf propagates inspection logger failures");
+    assert!(matches!(error, Error::System(message) if message == "warning sink failed"));
+    assert!(errors.lock().unwrap().bytes.is_empty());
 }
 
 #[test]
@@ -5351,7 +5439,7 @@ fn json_job_parser_accepts_all_covered_qpdf_handler_shapes() {
 }
 
 #[test]
-fn json_job_copies_attachments_from_every_donor_before_reporting_conflicts() {
+fn json_job_copies_attachments_from_every_donor_before_propagating_conflicts() {
     // qpdf's copyAttachments visits every configured donor and reports the
     // conflicting keys once after the last one (QPDFJob.cc:2089-2135), so a
     // conflict in the first donor must not stop the second from being
@@ -5417,13 +5505,13 @@ fn json_job_copies_attachments_from_every_donor_before_reporting_conflicts() {
     )
     .unwrap();
 
-    assert_eq!(job.run().unwrap(), flpdf::job::JobExitCode::Error);
-    let message = String::from_utf8_lossy(&errors.lock().unwrap().bytes).into_owned();
-    assert!(
-        message.contains("donor-a.pdf, key: shared")
-            && message.contains("donor-b.pdf, key: shared"),
-        "both donors must be processed before the aggregate error: {message}"
-    );
+    let error = job
+        .run()
+        .expect_err("qpdf propagates the aggregate attachment conflict");
+    assert!(matches!(error, Error::System(message)
+        if message.contains("donor-a.pdf, key: shared")
+            && message.contains("donor-b.pdf, key: shared")));
+    assert!(errors.lock().unwrap().bytes.is_empty());
     assert!(
         !output.exists(),
         "a conflicting copy must not write the output"
@@ -5764,7 +5852,10 @@ fn json_job_json_input_and_replace_input_cover_success_and_failure_boundaries() 
     .to_string();
     let mut bad_job = QPDFJob::new();
     bad_job.initialize_from_json(&bad_json).unwrap();
-    assert_eq!(bad_job.run().unwrap(), JobExitCode::Error);
+    let bad_json_error = bad_job
+        .run()
+        .expect_err("qpdf propagates malformed jsonInput parsing");
+    assert!(matches!(bad_json_error, Error::SystemBytes(_)));
 
     let missing_update = tempdir.path().join("missing-update.json");
     let missing_update_output = tempdir.path().join("missing-update.pdf");
@@ -5779,7 +5870,12 @@ fn json_job_json_input_and_replace_input_cover_success_and_failure_boundaries() 
     missing_update_job
         .initialize_from_json(&missing_update_json)
         .unwrap();
-    assert_eq!(missing_update_job.run().unwrap(), JobExitCode::Error);
+    assert!(matches!(
+        missing_update_job
+            .run()
+            .expect_err("qpdf propagates updateFromJSON open failures"),
+        Error::FileIo { operation: "open", path, .. } if path == missing_update
+    ));
 
     let missing_update_primary = serde_json::json!({
         "inputFile": minimal,
@@ -5791,10 +5887,12 @@ fn json_job_json_input_and_replace_input_cover_success_and_failure_boundaries() 
     missing_update_primary_job
         .initialize_from_json(&missing_update_primary)
         .unwrap();
-    assert_eq!(
-        missing_update_primary_job.run().unwrap(),
-        JobExitCode::Error
-    );
+    assert!(matches!(
+        missing_update_primary_job
+            .run()
+            .expect_err("qpdf propagates primary updateFromJSON open failures"),
+        Error::FileIo { operation: "open", path, .. } if path == missing_update
+    ));
 
     let json_primary = tempdir.path().join("json-primary.json");
     std::fs::write(&json_primary, COMPLETE_JSON).unwrap();
@@ -5809,7 +5907,12 @@ fn json_job_json_input_and_replace_input_cover_success_and_failure_boundaries() 
     json_missing_update_job
         .initialize_from_json(&json_missing_update)
         .unwrap();
-    assert_eq!(json_missing_update_job.run().unwrap(), JobExitCode::Error);
+    assert!(matches!(
+        json_missing_update_job
+            .run()
+            .expect_err("qpdf propagates JSON-input updateFromJSON open failures"),
+        Error::FileIo { operation: "open", path, .. } if path == missing_update
+    ));
 
     let empty_missing_update = serde_json::json!({
         "empty": "",
@@ -5821,7 +5924,12 @@ fn json_job_json_input_and_replace_input_cover_success_and_failure_boundaries() 
     empty_missing_update_job
         .initialize_from_json(&empty_missing_update)
         .unwrap();
-    assert_eq!(empty_missing_update_job.run().unwrap(), JobExitCode::Error);
+    assert!(matches!(
+        empty_missing_update_job
+            .run()
+            .expect_err("qpdf propagates empty-input updateFromJSON open failures"),
+        Error::FileIo { operation: "open", path, .. } if path == missing_update
+    ));
 
     let replace_input = tempdir.path().join("replace.pdf");
     std::fs::copy(&minimal, &replace_input).unwrap();
@@ -5848,7 +5956,9 @@ fn json_job_json_input_and_replace_input_cover_success_and_failure_boundaries() 
     failed_replace_job
         .initialize_from_json(&failed_replace_json)
         .unwrap();
-    assert_eq!(failed_replace_job.run().unwrap(), JobExitCode::Error);
+    failed_replace_job
+        .run()
+        .expect_err("qpdf propagates create-stage attachment removal failures");
     assert!(failed_replace_input.exists());
 }
 
@@ -5915,7 +6025,11 @@ fn json_job_rejects_conflicting_output_configuration_and_bad_page_labels() {
     .to_string();
     let mut job = QPDFJob::new();
     job.initialize_from_json(&bad_labels).unwrap();
-    assert_eq!(job.run().unwrap(), JobExitCode::Error);
+    let error = job
+        .run()
+        .expect_err("qpdf propagates a page-label range beyond the document");
+    assert!(matches!(error, Error::SystemBytes(message)
+        if message == b"page label spec: page 1 is more than the total number of pages (0)"));
 }
 
 #[test]
@@ -6344,15 +6458,19 @@ fn json_page_spec_uses_copy_encryption_password_when_page_password_is_unspecifie
     explicit_empty_job
         .initialize_from_json(&explicit_empty_json)
         .unwrap();
-    assert_eq!(
-        explicit_empty_job.run().unwrap(),
-        JobExitCode::Error,
-        "an explicit empty page password must bypass the encryption-file fallback"
-    );
+    assert!(matches!(
+        explicit_empty_job
+            .run()
+            .expect_err("qpdf propagates the explicit empty page password failure"),
+        Error::QpdfExc(ref error)
+            if error.get_error_code() == flpdf::QpdfErrorCode::Password
+                && error.get_filename() == encrypted.to_string_lossy().as_bytes()
+                && error.get_message_detail() == b"invalid password"
+    ));
 }
 
 #[test]
-fn apply_transformations_preserves_typed_copy_donor_password_error() {
+fn apply_transformations_preserves_qpdf_password_error_and_source_name() {
     let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
     let donor = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf");
@@ -6360,25 +6478,15 @@ fn apply_transformations_preserves_typed_copy_donor_password_error() {
 
     let mut job = QPDFJob::new();
     job.config()
-        .copy_attachments_from(donor, b"wrong-password".to_vec(), Vec::new());
+        .copy_attachments_from(donor.clone(), b"wrong-password".to_vec(), Vec::new());
     let error = job
         .apply_transformations(&mut primary)
         .expect_err("the encrypted donor must reject the wrong password");
 
-    let typed_bad_password = match &error {
-        Error::Encrypted(EncryptedError::BadPassword) => true,
-        Error::OpenFailure { source, .. } => {
-            matches!(
-                source.as_ref(),
-                Error::Encrypted(EncryptedError::BadPassword)
-            )
-        }
-        _ => false,
-    };
-    assert!(
-        typed_bad_password,
-        "copy donor authentication must remain typed, got {error:?}"
-    );
+    assert!(matches!(error, Error::QpdfExc(ref error)
+        if error.get_error_code() == flpdf::QpdfErrorCode::Password
+            && error.get_filename() == donor.to_string_lossy().as_bytes()
+            && error.get_message_detail() == b"invalid password"));
 }
 
 /// `Config::addAttachment` (`QPDFJob_config.cc:894-936`) and the JSON

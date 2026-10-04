@@ -474,9 +474,9 @@ fn linearized_content_normalization_is_job_owned() {
         .expect("another public Job method should follow write_qpdf")
         .0;
     assert!(
-        writer.contains("self.normalize_page_contents(pdf)")
-            && writer.contains("self.report_job_error(&error)?"),
-        "linearized content normalization must run inside QPDFJob::write_qpdf"
+        writer.contains("self.normalize_page_contents(pdf)?")
+            && !writer.contains("report_job_error"),
+        "linearized normalization failures must escape the QPDFJob::write_qpdf boundary"
     );
 
     let rewrite_config = cli_source

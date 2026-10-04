@@ -7577,7 +7577,8 @@ fn is_bad_password_error(error: &flpdf::Error) -> bool {
     matches!(
         source,
         flpdf::Error::Encrypted(flpdf::EncryptedError::BadPassword)
-    )
+    ) || matches!(source, flpdf::Error::QpdfExc(error)
+            if error.get_error_code() == flpdf::QpdfErrorCode::Password)
 }
 
 /// Run qpdf's `QPDFJob::createQPDF` → encryption-status early-return route.
