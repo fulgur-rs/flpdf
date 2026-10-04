@@ -81,7 +81,7 @@
 //! let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
 //! if let Some(page) = pages.into_iter().next() {
 //!     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-//!     let annots = helper.get_annotations(None)?;
+//!     let annots = helper.get_annotations()?;
 //!     println!("{} annotations on page 1", annots.len());
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1581,28 +1581,38 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     // get_annotations
     // -----------------------------------------------------------------------
 
-    /// Return annotation helpers, optionally restricted to a `/Subtype` name,
-    /// matching qpdf's `QPDFPageObjectHelper::getAnnotations`
+    /// Return all annotation helpers, matching qpdf's default
+    /// `getAnnotations("")` call (`include/qpdf/QPDFPageObjectHelper.hh:211`,
+    /// `libqpdf/QPDFPageObjectHelper.cc:439-454`). Missing, null, or non-array
+    /// `/Annots` values yield an empty result; non-dictionary array members
+    /// are skipped. Each returned helper retains the exact direct or indirect
+    /// annotation handle. On non-Form receivers, `/Annots` is read directly
+    /// without requiring `/Type /Page`.
+    pub fn get_annotations(&mut self) -> Result<Vec<AnnotationObjectHelper>> {
+        self.get_annotations_with_subtype(b"")
+    }
+
+    /// Return annotation helpers restricted to qpdf's `only_subtype` string.
+    /// It is compared with the decoded PDF name, so pass `b"Widget"` rather
+    /// than `b"/Widget"`; an empty slice disables filtering. This maps
+    /// `QPDFPageObjectHelper::getAnnotations(only_subtype)`
     /// (`include/qpdf/QPDFPageObjectHelper.hh:211`,
-    /// `libqpdf/QPDFPageObjectHelper.cc:439-454`). A missing, null, or
-    /// non-array `/Annots` value yields an empty result; non-dictionary array
-    /// members are skipped. Each returned helper retains the exact direct or
-    /// indirect annotation handle. On non-Form receivers, the lookup reads
-    /// `/Annots` directly and does not require `/Type /Page`.
-    pub fn get_annotations(
+    /// `libqpdf/QPDFPageObjectHelper.cc:439-454`).
+    pub fn get_annotations_with_subtype(
         &mut self,
-        only_subtype: Option<&[u8]>,
+        only_subtype: &[u8],
     ) -> Result<Vec<AnnotationObjectHelper>> {
         Ok(self
-            .get_annotation_handles(only_subtype)?
+            .get_annotation_handles((!only_subtype.is_empty()).then_some(only_subtype))?
             .into_iter()
             .map(AnnotationObjectHelper::new)
             .collect())
     }
 
     /// Collect raw annotation handles for crate-internal consumers that
-    /// mutate or associate the underlying PDF objects. The public qpdf-shaped
-    /// surface is [`Self::get_annotations`].
+    /// mutate or associate the underlying PDF objects. Public qpdf-shaped
+    /// surfaces are [`Self::get_annotations`] and
+    /// [`Self::get_annotations_with_subtype`].
     pub(crate) fn get_annotation_handles(
         &mut self,
         only_subtype: Option<&[u8]>,
@@ -1611,20 +1621,12 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let Some(annots_array) = annots.try_as_array()? else {
             return Ok(Vec::new());
         };
-        let only_subtype = only_subtype
-            .map(|value| value.strip_prefix(b"/").unwrap_or(value))
-            .filter(|value| !value.is_empty());
+        let only_subtype = only_subtype.filter(|value| !value.is_empty());
         let mut result = Vec::with_capacity(annots_array.len());
         for item in annots_array {
             let annotation = &item;
-            if !annotation.try_is_dictionary()? {
+            if !annotation.try_is_dictionary_of_type(b"", only_subtype.unwrap_or(b""))? {
                 continue;
-            }
-            if let Some(expected) = only_subtype {
-                let subtype = annotation.try_get_key(b"/Subtype")?;
-                if subtype.try_as_name()?.as_deref() != Some(expected) {
-                    continue;
-                }
             }
             result.push(item);
         }

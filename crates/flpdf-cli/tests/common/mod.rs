@@ -66,7 +66,7 @@ pub fn page_annotation_handles<R: std::io::Read + std::io::Seek>(
     page: ObjectHandle,
 ) -> Vec<ObjectHandle> {
     PageObjectHelper::from_object_handle(page, pdf)
-        .get_annotations(None)
+        .get_annotations()
         .unwrap()
         .into_iter()
         .map(|annotation| annotation.get_object_handle())
@@ -83,7 +83,7 @@ pub fn page_annotation_handles<R: std::io::Read + std::io::Seek>(
 pub fn first_widget_ref<R: std::io::Read + std::io::Seek>(pdf: &mut Pdf<R>) -> ObjectRef {
     let page = first_page_handle(pdf);
     let widgets: Vec<_> = PageObjectHelper::from_object_handle(page, pdf)
-        .get_annotations(Some(b"/Widget"))
+        .get_annotations_with_subtype(b"Widget")
         .unwrap();
     assert_eq!(
         widgets.len(),
