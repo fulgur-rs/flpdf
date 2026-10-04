@@ -2357,6 +2357,25 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn internal_leaf_page_check_rejects_form_targets() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let form = pdf.new_stream()?;
+        let dictionary = form.as_stream_dict().unwrap();
+        dictionary.replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))?;
+        dictionary.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))?;
+        let mut helper = PageObjectHelper::from_object_handle(form, &mut pdf);
+
+        let error = helper
+            .ensure_leaf_page()
+            .expect_err("internal leaf-page orchestration rejects Form targets");
+        assert!(matches!(
+            error,
+            Error::Unsupported(message) if message.contains("Form XObject, expected /Type /Page")
+        ));
+        Ok(())
+    }
+
     struct NoopTokenFilter;
 
     impl TokenFilter for NoopTokenFilter {
