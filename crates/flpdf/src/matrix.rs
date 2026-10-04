@@ -1,6 +1,6 @@
-//! PDF coordinate matrices and qpdf-shaped rectangle values.
+//! PDF coordinate matrices and qpdf's rectangle value type.
 //!
-//! qpdf correspondence: this module represents qpdf's Matrix and Rectangle value types.
+//! Mirrors qpdf 11.9.0 libqpdf/QPDFMatrix.cc.
 //!
 //! `Matrix` maps to `QPDFMatrix` (`include/qpdf/QPDFMatrix.hh`,
 //! `libqpdf/QPDFMatrix.cc`), and `Rectangle` maps to
