@@ -48,44 +48,44 @@ fn assert_unsupported<T: std::fmt::Debug>(result: flpdf::Result<T>) {
 }
 
 // ---------------------------------------------------------------------------
-// get_annotations() malformed shapes
+// qpdf's getAnnotations() fail-soft malformed-shape handling
 // ---------------------------------------------------------------------------
 
 #[test]
-fn get_annotations_reference_not_array_errors() {
+fn get_annotation_handles_reference_to_non_array_returns_empty_like_qpdf() {
     let bytes = single_page(
         "<< /Type /Page /Parent 2 0 R /Annots 5 0 R >>",
         &[(5, "42".into())],
     );
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-    assert_unsupported(helper.get_annotations());
+    assert!(helper.get_annotation_handles(None).unwrap().is_empty());
 }
 
 #[test]
-fn get_annotations_unexpected_type_errors() {
+fn get_annotation_handles_non_array_returns_empty_like_qpdf() {
     let bytes = single_page("<< /Type /Page /Parent 2 0 R /Annots 42 >>", &[]);
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-    assert_unsupported(helper.get_annotations());
+    assert!(helper.get_annotation_handles(None).unwrap().is_empty());
 }
 
 #[test]
-fn get_annotations_non_reference_element_errors() {
-    // /Annots array element is an inline integer instead of a reference.
+fn get_annotation_handles_skips_non_dictionary_array_items_like_qpdf() {
+    // /Annots contains an inline integer instead of an annotation dictionary.
     let bytes = single_page("<< /Type /Page /Parent 2 0 R /Annots [42] >>", &[]);
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-    assert_unsupported(helper.get_annotations());
+    assert!(helper.get_annotation_handles(None).unwrap().is_empty());
 }
 
 #[test]
-fn get_annotations_null_returns_empty() {
+fn get_annotation_handles_null_returns_empty_like_qpdf() {
     // /Annots explicitly null is treated as no annotations.
     let bytes = single_page("<< /Type /Page /Parent 2 0 R /Annots null >>", &[]);
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-    assert!(helper.get_annotations().unwrap().is_empty());
+    assert!(helper.get_annotation_handles(None).unwrap().is_empty());
 }
 
 #[test]
@@ -629,7 +629,7 @@ fn box_and_annotation_accessors_do_not_require_page_type() {
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
     assert_eq!(helper.media_box().unwrap(), None);
-    assert!(helper.get_annotations().unwrap().is_empty());
+    assert!(helper.get_annotation_handles(None).unwrap().is_empty());
 }
 
 #[test]

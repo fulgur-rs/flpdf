@@ -21,8 +21,8 @@
 //!   canonical ObjectHandle `/Parent`-chain lookup for `/Resources`.
 //! - [`get_attribute`](PageObjectHelper::get_attribute) — reads the qpdf
 //!   page/Form attribute and inheritance route, including `/Rotate`.
-//! - [`get_annotations`](PageObjectHelper::get_annotations) — reads the leaf's
-//!   `/Annots` array (not inheritable per PDF spec).
+//! - [`get_annotation_handles`](PageObjectHelper::get_annotation_handles) —
+//!   follows qpdf's fail-soft `/Annots` enumeration and optional subtype filter.
 //! - [`media_box`](PageObjectHelper::media_box) — inheritable; walks `/Parent`
 //!   chain.
 //! - [`crop_box`](PageObjectHelper::crop_box) — inheritable; falls back to
@@ -88,7 +88,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! ## List annotation references
+//! ## List annotations
 //!
 //! ```no_run
 //! use std::fs::File;
@@ -99,7 +99,7 @@
 //! let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
 //! if let Some(page) = pages.into_iter().next() {
 //!     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-//!     let annots = helper.get_annotations()?;
+//!     let annots = helper.get_annotation_handles(None)?;
 //!     println!("{} annotations on page 1", annots.len());
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1579,73 +1579,15 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     // get_annotations
     // -----------------------------------------------------------------------
 
-    /// Return the `ObjectRef`s of all annotations on this page.
-    ///
-    /// Reads the leaf page's `/Annots` array. Unlike boxes and resources,
-    /// `/Annots` is **not** inheritable — only the leaf page dictionary is
-    /// consulted.
-    ///
-    /// Returns an empty `Vec` when `/Annots` is absent or empty.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Unsupported`] when `page_ref` does not resolve to a
-    ///   dictionary, when `/Annots` is not an array, or when an array element
-    ///   is not an indirect object handle.
-    /// - Any error from canonical ObjectHandle resolution.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::fs::File;
-    /// use std::io::BufReader;
-    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
-    ///
-    /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
-    /// if let Some(page) = pages.into_iter().next() {
-    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-    ///     let annots = helper.get_annotations()?;
-    ///     for annot_ref in &annots {
-    ///         println!("annotation: {annot_ref}");
-    ///     }
-    /// }
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn get_annotations(&mut self) -> Result<Vec<ObjectRef>> {
-        let page = self.resolved_page_handle()?;
-        let page_ref = self.require_page_ref()?;
-        let annots = page.try_get_key(b"/Annots")?;
-        if annots.try_is_null()? {
-            return Ok(Vec::new());
-        }
-        let Some(annots_array) = annots.try_as_array()? else {
-            return Err(Error::Unsupported(format!(
-                "/Annots on page {page_ref} does not resolve to an array"
-            )));
-        };
-
-        let mut refs = Vec::with_capacity(annots_array.len());
-        for (index, elem) in annots_array.iter().enumerate() {
-            let Some(object_ref) = elem.object_ref() else {
-                return Err(Error::Unsupported(format!(
-                    "/Annots element {index} on page {page_ref} is not an indirect reference"
-                )));
-            };
-            refs.push(object_ref);
-        }
-        Ok(refs)
-    }
-
     /// Return canonical annotation handles, optionally restricted to a
     /// `/Subtype` name, mirroring qpdf's fail-soft
     /// `QPDFPageObjectHelper::getAnnotations`
     /// (`libqpdf/QPDFPageObjectHelper.cc:439-454`). A missing, null, or
     /// non-array `/Annots` value yields an empty result; non-dictionary array
     /// members are skipped. Direct annotation dictionaries are preserved in
-    /// this handle-native method even though [`Self::get_annotations`] retains
-    /// its historical indirect-reference contract. On non-Form receivers,
-    /// the lookup reads `/Annots` directly and does not require `/Type /Page`.
+    /// this handle-native method, matching qpdf's annotation-helper results.
+    /// On non-Form receivers, the lookup reads `/Annots` directly and does not
+    /// require `/Type /Page`.
     pub fn get_annotation_handles(
         &mut self,
         only_subtype: Option<&[u8]>,
