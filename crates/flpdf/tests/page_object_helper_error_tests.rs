@@ -87,6 +87,32 @@ fn get_annotations_null_returns_empty() {
     assert!(helper.get_annotations().unwrap().is_empty());
 }
 
+#[test]
+fn get_annotation_handles_accepts_an_untyped_target_like_qpdf() {
+    let mut pdf = Pdf::empty().unwrap();
+    let annotation = ObjectHandle::dictionary(vec![(
+        b"/Subtype".to_vec(),
+        ObjectHandle::name(b"Text".to_vec()),
+    )]);
+    let object = ObjectHandle::dictionary(vec![(
+        b"/Annots".to_vec(),
+        ObjectHandle::array(vec![annotation.clone()]),
+    )]);
+    let mut helper = PageObjectHelper::from_object_handle(object, &mut pdf);
+
+    let annotations = helper.get_annotation_handles(None).unwrap();
+    assert_eq!(annotations.len(), 1);
+    assert!(annotations[0].is_same_object_as(&annotation));
+    assert_eq!(
+        helper.get_annotation_handles(Some(b"/Text")).unwrap().len(),
+        1
+    );
+    assert!(helper
+        .get_annotation_handles(Some(b"/Link"))
+        .unwrap()
+        .is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // media_box() — /Parent chain anomalies and value resolution
 // ---------------------------------------------------------------------------
