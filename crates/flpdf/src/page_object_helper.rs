@@ -465,12 +465,11 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         resolve_attribute_target(self.object.clone())
     }
 
-    /// Return the live non-Form dictionary target used by page-specific
-    /// mutations. As with qpdf's `QPDFPageObjectHelper`, this does not require
-    /// `/Type /Page`; underlying operations determine their own shape errors.
+    /// Return the live handle used by qpdf-delegating helper operations.
+    /// `QPDFPageObjectHelper` does not preflight the target as `/Type /Page`;
+    /// the delegated operation determines its own behavior for the handle.
     fn resolved_page_handle(&mut self) -> Result<ObjectHandle> {
-        let description = self.target_description();
-        resolve_page_target(self.object.clone(), &description)
+        Ok(self.object.clone())
     }
 
     /// Return a live attribute, applying qpdf's page-tree inheritance rules
@@ -550,14 +549,16 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         self.apply_fallback(b"/ArtBox", fallback, copy_if_fallback)
     }
 
-    /// Convert this page into a new, document-owned Form XObject.
+    /// Convert this indirect handle into a new, document-owned Form XObject.
     ///
     /// The new stream retains a provider over the page's canonical content
     /// route, so conversion does not eagerly decode or concatenate page bytes.
     /// `/Resources`, `/Group`, and the effective `/TrimBox` are shallow-copied;
     /// `/Matrix` is emitted when requested and either `/Rotate` or `/UserUnit`
     /// is present, matching qpdf's `getFormXObjectForPage`
-    /// (`libqpdf/QPDFPageObjectHelper.cc:740-782`).
+    /// (`libqpdf/QPDFPageObjectHelper.cc:706-734`). qpdf accepts Form handles
+    /// here as well; the provider reads `/Contents` from the original handle
+    /// only when the new stream is materialized.
     pub fn get_form_xobject_for_page(
         &mut self,
         handle_transformations: bool,
@@ -569,13 +570,6 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
                     .to_owned(),
             ));
         }
-        // Capture the page's original content container before a consumer can
-        // replace `/Contents` on the page (overlay does exactly that after
-        // creating /Fx0). The provider remains lazy and ObjectHandle-backed,
-        // but its source must be the content graph observed at conversion
-        // time; otherwise a later page rewrite makes the Form provider read
-        // the newly inserted /Fx0 Do fragment recursively.
-        let page_contents = page.try_get_key(b"/Contents")?;
         let page_description = format!(
             "contents from page object {}",
             object_handle_description(&page)
@@ -599,6 +593,11 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         }
         dict.replace_key(b"/BBox", bbox)?;
 
+        // qpdf's ContentProvider retains the original object handle and looks
+        // up /Contents only when stream data is requested. This also preserves
+        // qpdf's stream-handle type warning and null result for Form targets.
+        let provider_page = page.clone();
+
         // qpdf installs the lazy provider before reading the transformation
         // attributes (`QPDFPageObjectHelper.cc:716-729`). Both attributes are
         // read even when `handle_transformations` is false; only matrix
@@ -606,11 +605,9 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         form.replace_stream_data_with_callback(
             move |pipeline| {
                 let mut all_description = String::new();
-                page_contents.pipe_content_streams(
-                    pipeline,
-                    &page_description,
-                    &mut all_description,
-                )
+                provider_page
+                    .try_get_key(b"/Contents")?
+                    .pipe_content_streams(pipeline, &page_description, &mut all_description)
             },
             None,
             None,
@@ -831,7 +828,8 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// bookkeeping. The qpdf-delegating helper routes do not require a
     /// `/Type /Page` entry.
     pub(crate) fn ensure_leaf_page(&mut self) -> Result<()> {
-        self.resolved_page_handle().map(|_| ())
+        let description = self.target_description();
+        resolve_page_target(self.object.clone(), &description).map(|_| ())
     }
 
     // -----------------------------------------------------------------------
@@ -905,14 +903,14 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         Ok(())
     }
 
-    /// Bake the page's direct qpdf `/Rotate` value into its boxes, contents,
+    /// Bake the handle's direct qpdf `/Rotate` value into its boxes, contents,
     /// and annotations.
     ///
     /// This is `QPDFPageObjectHelper::flattenRotation`
     /// (`libqpdf/QPDFPageObjectHelper.cc:862-991`). qpdf intentionally reads
     /// `/Rotate`, `/MediaBox`, and the optional page boxes directly from the
     /// page object here; inherited values are not materialized by this method.
-    /// It operates on the live page handle and does not require an
+    /// It operates on the live handle and does not require an
     /// `ObjectRef` projection. Since flpdf stores the mutable `Pdf` separately
     /// from the handle, the handle must belong to that same `Pdf`; qpdf's
     /// `QPDFObjectHelper` stores only the handle.

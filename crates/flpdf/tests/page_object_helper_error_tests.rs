@@ -12,6 +12,7 @@
 
 use flpdf::{Error, ObjectHandle, ObjectRef, PageBox, PageObjectHelper, Pdf};
 use std::io::Cursor;
+use std::rc::Rc;
 
 mod common;
 use common::build_pdf;
@@ -128,9 +129,9 @@ fn get_page_contents_accepts_an_untyped_dictionary_like_qpdf() {
 }
 
 #[test]
-fn flatten_rotation_still_rejects_form_target_tracked_by_followup() {
+fn flatten_rotation_accepts_a_form_target_like_qpdf() {
     let mut pdf = Pdf::empty().unwrap();
-    let form = pdf.new_stream().unwrap();
+    let form = pdf.new_stream_with_data(Rc::new(Vec::new())).unwrap();
     let form_dict = form.as_stream_dict().unwrap();
     form_dict
         .replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))
@@ -140,13 +141,76 @@ fn flatten_rotation_still_rejects_form_target_tracked_by_followup() {
         .unwrap();
     let mut helper = PageObjectHelper::from_object_handle(form, &mut pdf);
 
-    let error = helper
+    helper
         .flatten_rotation()
-        .expect_err("the separate Form-target guard is tracked by flpdf-6ik2q.38");
-    assert!(matches!(
-        error,
-        Error::Unsupported(message) if message.contains("Form XObject, expected /Type /Page")
-    ));
+        .expect("qpdf accepts the Form handle and returns when it has no page rotation");
+}
+
+#[test]
+fn get_form_xobject_for_form_target_uses_qpdf_contents_lookup() {
+    let mut pdf = Pdf::empty().unwrap();
+    let form = pdf
+        .new_stream_with_data(Rc::new(b"q Q\n".to_vec()))
+        .unwrap();
+    let form_dict = form.as_stream_dict().unwrap();
+    form_dict
+        .replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))
+        .unwrap();
+    form_dict
+        .replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))
+        .unwrap();
+    form_dict
+        .replace_key(
+            b"/BBox",
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(10),
+                ObjectHandle::integer(10),
+            ]),
+        )
+        .unwrap();
+    form_dict
+        .replace_key(b"/Resources", ObjectHandle::dictionary(Vec::new()))
+        .unwrap();
+    let mut helper = PageObjectHelper::from_object_handle(form, &mut pdf);
+
+    let wrapped = helper
+        .get_form_xobject_for_page(false)
+        .expect("qpdf accepts a Form target and wraps its stream");
+    assert!(wrapped.is_form_xobject().unwrap());
+    assert_eq!(
+        wrapped
+            .get_stream_data(flpdf::DecodeLevel::Generalized)
+            .unwrap()
+            .as_slice(),
+        b""
+    );
+}
+
+#[test]
+fn form_provider_reads_live_page_contents_when_materialized_like_qpdf() {
+    let bytes = single_page(
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 30] /Resources << >> /Contents 4 0 R >>",
+        &[(4, "<< /Length 3 >>\nstream\nold\nendstream".into())],
+    );
+    let (mut pdf, page_ref) = helper_for(bytes);
+    let page = pdf.get_object_handle(page_ref);
+    let wrapped = {
+        let mut helper = PageObjectHelper::from_object_handle(page.clone(), &mut pdf);
+        helper.get_form_xobject_for_page(false).unwrap()
+    };
+
+    let replacement = pdf.new_stream_with_data(Rc::new(b"new".to_vec())).unwrap();
+    page.replace_key(b"/Contents", replacement).unwrap();
+
+    assert_eq!(
+        wrapped
+            .get_stream_data(flpdf::DecodeLevel::Generalized)
+            .unwrap()
+            .as_slice(),
+        b"new"
+    );
 }
 
 // ---------------------------------------------------------------------------
