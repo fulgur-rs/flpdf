@@ -5276,6 +5276,24 @@ flpdf の `run_encryption_status` も `json_input` なら既存の
 `cli_job_json.rs::job_json_file_encryption_status_with_json_input_matches_qpdf` が
 `isEncrypted` / `requiresPassword` の終了コード・stdout・stderrをqpdf 11.9.0と比較する。
 
+### Public QPDFJob initial output requirement (`flpdf-6ik2q.28`, 2026-10-04)
+
+qpdf's `QPDFJob::Members::require_outfile` starts true
+(`include/qpdf/QPDFJob.hh:705`). `checkConfiguration` rejects a missing input
+first, then rejects a missing output while that flag remains set
+(`libqpdf/QPDFJob.cc:587-595`). `Config::emptyInput` selects the input but
+does not disable the output requirement; output-free inspection setters such
+as `showNpages` clear it explicitly (`QPDFJob_config.cc:27-40,574-579`).
+
+flpdf's `qpdf_default_job_configuration` now sets `require_output=true` at the
+owning QPDFJob boundary even though the internal struct's derived `Default`
+uses false. Consequently a fresh public `QPDFJob` with only `empty_input`
+returns qpdf's exact missing-output `UsageError` from both
+`check_configuration` and `run`. The regression is
+`job_lifecycle_tests.rs::public_job_default_requires_output_like_qpdf`; the
+same default also preserves a clean base for the initializer-layering work in
+`flpdf-6ik2q.27`.
+
 ### Top-level attachment mutation with a single inspection (`flpdf-awthm`, 2026-09-15)
 
 qpdf's `createQPDF` always completes `handleTransformations`, including
