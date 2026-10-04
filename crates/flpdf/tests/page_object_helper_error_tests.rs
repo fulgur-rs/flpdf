@@ -137,9 +137,9 @@ fn media_box_accepts_real_coordinates() {
 }
 
 #[test]
-fn media_box_depth_limit_errors() {
-    // A /Parent chain deeper than DEFAULT_MAX_PAGE_TREE_DEPTH (100) with no
-    // MediaBox must surface an Unsupported error rather than spinning.
+fn media_box_beyond_the_former_depth_limit_returns_none_when_absent() {
+    // qpdf has no numeric /Parent depth cap. A long acyclic chain with no
+    // MediaBox terminates at the root and returns null.
     let mut objects = vec![
         (1u32, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
         (
@@ -156,7 +156,7 @@ fn media_box_depth_limit_errors() {
     let bytes = build_pdf(&objects, 1);
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-    assert_unsupported(helper.media_box());
+    assert_eq!(helper.media_box().unwrap(), None);
 }
 
 #[test]
