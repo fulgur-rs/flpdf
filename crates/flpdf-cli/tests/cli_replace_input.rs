@@ -718,3 +718,52 @@ fn attachment_diagnostics_preserve_non_utf8_bytes() {
         String::from_utf8_lossy(&combined)
     );
 }
+
+/// A failed replace-input rename propagates `Error::FileIo` to the CLI, whose
+/// renderer must print the original path bytes, not U+FFFD, for a non-UTF-8
+/// input name (qpdf prints `what()` verbatim, `qpdf/qpdf.cc:39-41`).
+#[cfg(unix)]
+#[test]
+fn replace_input_rename_failure_preserves_non_utf8_path_bytes() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let directory = tempfile::tempdir().expect("temporary replace-input directory");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/one-page.pdf");
+    let input = directory
+        .path()
+        .join(OsString::from_vec(b"in-\xff.pdf".to_vec()));
+    fs::copy(&fixture, &input).expect("copy non-UTF-8 input");
+    // Without warnings the backup is `<input>.~qpdf-orig#`; a non-empty
+    // directory of that name makes renaming the original onto it fail.
+    let mut backup = input.as_os_str().as_bytes().to_vec();
+    backup.extend_from_slice(b".~qpdf-orig#");
+    let backup = std::path::PathBuf::from(OsString::from_vec(backup));
+    fs::create_dir(&backup).expect("create blocking backup directory");
+    fs::write(backup.join("keep"), b"x").expect("populate blocking backup directory");
+
+    let output = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .arg("--replace-input")
+        .arg(&input)
+        .output()
+        .expect("run flpdf replace-input");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = output.stderr;
+    assert!(
+        stderr
+            .windows(b"in-\xff.pdf".len())
+            .any(|window| window == b"in-\xff.pdf"),
+        "path bytes must be preserved: {:?}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(
+        !stderr
+            .windows(3)
+            .any(|window| window == "\u{FFFD}".as_bytes()),
+        "no U+FFFD substitution: {:?}",
+        String::from_utf8_lossy(&stderr)
+    );
+}

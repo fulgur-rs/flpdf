@@ -3434,14 +3434,20 @@ fn exit_with_cli_error(error: Box<dyn std::error::Error>) -> ! {
         emit_logger_error(line);
         std::process::exit(2);
     }
+    // Every `FileIo` operation (open, rename, replace input, ...) renders its
+    // path through the byte-preserving helper. Falling through to `Display`
+    // would substitute U+FFFD for non-UTF-8 path bytes, which qpdf prints
+    // verbatim in its `qpdf: <what()>` line (`qpdf/qpdf.cc:39-41`).
     if let Some(flpdf::Error::FileIo {
-        operation: "open",
+        operation,
         path,
         source,
     }) = error.downcast_ref::<flpdf::Error>()
     {
         let mut line = progname().into_bytes();
-        line.extend_from_slice(b": open ");
+        line.extend_from_slice(b": ");
+        line.extend_from_slice(operation.as_bytes());
+        line.push(b' ');
         line.extend_from_slice(&path_description(path));
         line.extend_from_slice(b": ");
         line.extend_from_slice(qpdf_open_io_error_message(source).as_bytes());
