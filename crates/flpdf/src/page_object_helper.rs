@@ -27,6 +27,10 @@
 //!   [`get_art_box`](PageObjectHelper::get_art_box) — return qpdf-shaped raw
 //!   handles and fallback values without projecting them into another type.
 //!
+//! - [`for_each_xobject_with_selector`](PageObjectHelper::for_each_xobject_with_selector)
+//!   — filters callback invocations while preserving qpdf's recursive Form
+//!   traversal and resource-scope callbacks.
+//!
 //! # Examples
 //!
 //! ## Read the qpdf-shaped media box handle
@@ -1387,6 +1391,29 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         F: FnMut(ObjectHandle, ObjectHandle, Vec<u8>) -> Result<()>,
     {
         self.for_each_xobject_filtered(recursive, |_| Ok(true), action)
+    }
+
+    /// Visit XObjects accepted by `selector`, preserving each object's
+    /// containing `/XObject` dictionary and resource key.
+    ///
+    /// When `recursive` is true, rejecting a Form skips its callback but does
+    /// not prevent traversal into that Form's XObjects, matching qpdf's
+    /// `forEachXObject(recursive, action, selector)`
+    /// (`libqpdf/QPDFPageObjectHelper.cc:318-349`). The selector receives a
+    /// clone of the live object handle, matching qpdf's by-value
+    /// `QPDFObjectHandle` callback. Use [`for_each_xobject`](Self::for_each_xobject)
+    /// when no selector is needed.
+    pub fn for_each_xobject_with_selector<S, F>(
+        &mut self,
+        recursive: bool,
+        mut action: F,
+        mut selector: S,
+    ) -> Result<()>
+    where
+        S: FnMut(ObjectHandle) -> Result<bool>,
+        F: FnMut(ObjectHandle, ObjectHandle, Vec<u8>) -> Result<()>,
+    {
+        self.for_each_xobject_filtered(recursive, |object| selector(object.clone()), &mut action)
     }
 
     fn for_each_xobject_filtered<S, F>(
