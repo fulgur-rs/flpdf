@@ -10,7 +10,7 @@
 //! indirect object — including each page's `/Parent` — which the shared
 //! single-page builder does not, so the parent-chain branches are reachable.
 
-use flpdf::{Error, ObjectRef, PageBox, PageObjectHelper, Pdf};
+use flpdf::{Error, ObjectHandle, ObjectRef, PageBox, PageObjectHelper, Pdf};
 use std::io::Cursor;
 
 mod common;
@@ -90,6 +90,36 @@ fn get_annotations_null_returns_empty() {
 // ---------------------------------------------------------------------------
 // media_box() — /Parent chain anomalies and value resolution
 // ---------------------------------------------------------------------------
+
+#[test]
+fn get_media_box_accepts_an_untyped_dictionary_like_qpdf() {
+    let mut pdf = Pdf::empty().unwrap();
+    let object = ObjectHandle::dictionary(vec![(
+        b"/MediaBox".to_vec(),
+        ObjectHandle::array(vec![
+            ObjectHandle::integer(0),
+            ObjectHandle::integer(0),
+            ObjectHandle::integer(20),
+            ObjectHandle::integer(30),
+        ]),
+    )]);
+    let mut helper = PageObjectHelper::from_object_handle(object, &mut pdf);
+
+    let media_box = helper.get_media_box(false).unwrap();
+    assert!(media_box.try_is_array().unwrap());
+    assert_eq!(media_box.try_get_array_n_items().unwrap(), 4);
+}
+
+#[test]
+fn get_media_box_accepts_an_untyped_indirect_dictionary_like_qpdf() {
+    let bytes = single_page("<< /Parent 2 0 R /MediaBox [0 0 20 30] >>", &[]);
+    let (mut pdf, page_ref) = helper_for(bytes);
+    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+
+    let media_box = helper.get_media_box(false).unwrap();
+    assert!(media_box.try_is_array().unwrap());
+    assert_eq!(media_box.try_get_array_n_items().unwrap(), 4);
+}
 
 #[test]
 fn media_box_accepts_real_coordinates() {
@@ -351,7 +381,7 @@ fn bleed_box_unexpected_type_errors() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn accessors_reject_non_page_object() {
+fn media_box_accepts_a_non_page_dictionary_but_page_accessors_reject_it() {
     // Object 3 is a /Pages tree node, not a leaf /Type /Page.
     let bytes = build_pdf(
         &[
@@ -363,16 +393,19 @@ fn accessors_reject_non_page_object() {
     );
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-    assert_unsupported(helper.media_box());
+    assert_eq!(helper.media_box().unwrap(), None);
     assert_unsupported(helper.get_annotations());
 }
 
 #[test]
-fn accessor_rejects_a_non_name_page_type() {
+fn media_box_ignores_a_non_name_page_type_like_qpdf() {
     let bytes = single_page("<< /Type 42 /Parent 2 0 R /MediaBox [0 0 612 792] >>", &[]);
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-    assert_unsupported(helper.media_box());
+    assert_eq!(
+        helper.media_box().unwrap(),
+        Some(PageBox::new(0.0, 0.0, 612.0, 792.0))
+    );
 }
 
 // ---------------------------------------------------------------------------
