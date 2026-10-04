@@ -1,6 +1,6 @@
 use flpdf::{
-    AcroFormDocumentHelper, Error, FormFieldObjectHelper, ObjectHandle, ObjectRef,
-    PageDocumentHelper, PageObjectHelper, Pdf, PdfOpenOptions, Pipeline, PipelineError,
+    AcroFormDocumentHelper, AnnotationObjectHelper, Error, FormFieldObjectHelper, ObjectHandle,
+    ObjectRef, PageDocumentHelper, PageObjectHelper, Pdf, PdfOpenOptions, Pipeline, PipelineError,
     PipelineHandle, QPDFLogger,
 };
 use std::collections::BTreeMap;
@@ -63,10 +63,14 @@ fn canonical_helpers_preserve_grouped_widget_field_association() {
     let bytes = include_bytes!("../../../tests/fixtures/compat/form-fields-and-annotations.pdf");
     let mut pdf = Pdf::open(Cursor::new(bytes.as_slice())).unwrap();
     let page = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap()[0].clone();
-    let widgets = PageObjectHelper::from_object_handle(page, &mut pdf)
-        .get_annotation_handles(Some(b"/Widget"))
-        .unwrap();
+    let mut widgets: Vec<AnnotationObjectHelper> =
+        PageObjectHelper::from_object_handle(page, &mut pdf)
+            .get_annotations(Some(b"/Widget"))
+            .unwrap();
     assert_eq!(widgets.len(), 5);
+    assert!(widgets
+        .iter_mut()
+        .all(|widget| widget.get_subtype().unwrap().as_slice() == b"Widget"));
 
     let annotation_to_field = {
         let mut acroform = AcroFormDocumentHelper::new(&mut pdf).unwrap();
@@ -75,7 +79,7 @@ fn canonical_helpers_preserve_grouped_widget_field_association() {
     let top_level_fields: Vec<ObjectHandle> = widgets
         .into_iter()
         .map(|widget| {
-            let annotation_ref = widget.object_ref().unwrap();
+            let annotation_ref = widget.get_object_handle().object_ref().unwrap();
             FormFieldObjectHelper::new(annotation_to_field[&annotation_ref], &mut pdf)
                 .get_top_level_field()
                 .unwrap()

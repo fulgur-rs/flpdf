@@ -53,44 +53,44 @@ fn page_helper_for_ref(
 // ---------------------------------------------------------------------------
 
 #[test]
-fn get_annotation_handles_reference_to_non_array_returns_empty_like_qpdf() {
+fn get_annotations_reference_to_non_array_returns_empty_like_qpdf() {
     let bytes = single_page(
         "<< /Type /Page /Parent 2 0 R /Annots 5 0 R >>",
         &[(5, "42".into())],
     );
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
-    assert!(helper.get_annotation_handles(None).unwrap().is_empty());
+    assert!(helper.get_annotations(None).unwrap().is_empty());
 }
 
 #[test]
-fn get_annotation_handles_non_array_returns_empty_like_qpdf() {
+fn get_annotations_non_array_returns_empty_like_qpdf() {
     let bytes = single_page("<< /Type /Page /Parent 2 0 R /Annots 42 >>", &[]);
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
-    assert!(helper.get_annotation_handles(None).unwrap().is_empty());
+    assert!(helper.get_annotations(None).unwrap().is_empty());
 }
 
 #[test]
-fn get_annotation_handles_skips_non_dictionary_array_items_like_qpdf() {
+fn get_annotations_skips_non_dictionary_array_items_like_qpdf() {
     // /Annots contains an inline integer instead of an annotation dictionary.
     let bytes = single_page("<< /Type /Page /Parent 2 0 R /Annots [42] >>", &[]);
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
-    assert!(helper.get_annotation_handles(None).unwrap().is_empty());
+    assert!(helper.get_annotations(None).unwrap().is_empty());
 }
 
 #[test]
-fn get_annotation_handles_null_returns_empty_like_qpdf() {
+fn get_annotations_null_returns_empty_like_qpdf() {
     // /Annots explicitly null is treated as no annotations.
     let bytes = single_page("<< /Type /Page /Parent 2 0 R /Annots null >>", &[]);
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
-    assert!(helper.get_annotation_handles(None).unwrap().is_empty());
+    assert!(helper.get_annotations(None).unwrap().is_empty());
 }
 
 #[test]
-fn get_annotation_handles_accepts_an_untyped_target_like_qpdf() {
+fn get_annotations_accepts_an_untyped_target_and_preserves_handle_identity_like_qpdf() {
     let mut pdf = Pdf::empty().unwrap();
     let annotation = ObjectHandle::dictionary(vec![(
         b"/Subtype".to_vec(),
@@ -102,17 +102,13 @@ fn get_annotation_handles_accepts_an_untyped_target_like_qpdf() {
     )]);
     let mut helper = PageObjectHelper::from_object_handle(object, &mut pdf);
 
-    let annotations = helper.get_annotation_handles(None).unwrap();
+    let annotations = helper.get_annotations(None).unwrap();
     assert_eq!(annotations.len(), 1);
-    assert!(annotations[0].is_same_object_as(&annotation));
-    assert_eq!(
-        helper.get_annotation_handles(Some(b"/Text")).unwrap().len(),
-        1
-    );
-    assert!(helper
-        .get_annotation_handles(Some(b"/Link"))
-        .unwrap()
-        .is_empty());
+    assert!(annotations[0]
+        .get_object_handle()
+        .is_same_object_as(&annotation));
+    assert_eq!(helper.get_annotations(Some(b"/Text")).unwrap().len(), 1);
+    assert!(helper.get_annotations(Some(b"/Link")).unwrap().is_empty());
 }
 
 #[test]
@@ -871,7 +867,7 @@ fn box_and_annotation_accessors_do_not_require_page_type() {
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert!(helper.get_media_box(false).unwrap().try_is_null().unwrap());
-    assert!(helper.get_annotation_handles(None).unwrap().is_empty());
+    assert!(helper.get_annotations(None).unwrap().is_empty());
 }
 
 #[test]

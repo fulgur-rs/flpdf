@@ -1985,10 +1985,16 @@ destination 解決や既存の synthetic `Pdf::set_object` bridge の挙動を
 `QPDFPageObjectHelper.hh:211` exposes one annotation enumerator,
 `getAnnotations(only_subtype)`, implemented by reading `/Annots`, returning an
 empty vector for a non-array value, retaining dictionary entries, and applying
-the optional subtype filter (`QPDFPageObjectHelper.cc:439-454`). flpdf's
-canonical `PageObjectHelper::get_annotation_handles` owns this same route.
-`get_annotations_filtered` was a public forwarding alias with no qpdf
-counterpart; its production and test callers now use the canonical method.
+the optional subtype filter (`QPDFPageObjectHelper.cc:439-454`). It returns
+`QPDFAnnotationObjectHelper` values, whose inherited `getObjectHandle()` is
+provided by `QPDFObjectHelper` (`QPDFAnnotationObjectHelper.cc:8-12`;
+`QPDFObjectHelper.hh:34-55`). flpdf's public
+`PageObjectHelper::get_annotations` returns the matching
+`AnnotationObjectHelper` values, and `AnnotationObjectHelper::get_object_handle`
+preserves the underlying direct or indirect handle. The raw
+`get_annotation_handles` collector is crate-private for mutation/association
+consumers; `get_annotations_filtered` was a qpdf-less public forwarding alias
+and has been removed.
 
 `PageDocumentHelper::flatten_annotations` は qpdf と同じく AcroForm の NeedAppearances 判定後に repaired page list を得て、各 page の effective `/Resources`・appearance 処理・annotation removal を行う。qpdf は `getAllPages()` が返した raw `QPDFPageObjectHelper` を `flattenAnnotationsForPage` まで保持する（`QPDFPageDocumentHelper.cc:55-76`）。flpdf も `PageDocumentHelper::get_all_pages()` の raw `ObjectHandle` を resource materialization、rotation lookup、annotation flattening、content insertion へ渡し、`ObjectRef` projection を通さない。raw identity `(17, 65535)` 上の eligible appearance flattening は `page_annotation_flatten::tests::public_qpdf_flatten_copies_a_raw_generation_page_handle` で固定する。
 `flpdf-hrgj` closes the remaining page-operation consumer boundary: primary

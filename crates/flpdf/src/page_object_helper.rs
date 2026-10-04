@@ -15,8 +15,8 @@
 //!
 //! - [`get_attribute`](PageObjectHelper::get_attribute) — reads the qpdf
 //!   page/Form attribute and inheritance route, including `/Rotate`.
-//! - [`get_annotation_handles`](PageObjectHelper::get_annotation_handles) —
-//!   follows qpdf's fail-soft `/Annots` enumeration and optional subtype filter.
+//! - [`get_annotations`](PageObjectHelper::get_annotations) — returns qpdf-shaped
+//!   annotation helpers from the page's fail-soft `/Annots` enumeration.
 //! - [`get_media_box`](PageObjectHelper::get_media_box) and
 //!   [`get_crop_box`](PageObjectHelper::get_crop_box) — return qpdf-shaped raw
 //!   handles, including inheritance and fallback behavior.
@@ -75,12 +75,13 @@
 //! let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
 //! if let Some(page) = pages.into_iter().next() {
 //!     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-//!     let annots = helper.get_annotation_handles(None)?;
+//!     let annots = helper.get_annotations(None)?;
 //!     println!("{} annotations on page 1", annots.len());
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+use crate::annotation_object_helper::AnnotationObjectHelper;
 use crate::content_stream::ObjectHandleParserCallbacks;
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
 use crate::pages::is_inheritable_page_attribute;
@@ -106,14 +107,21 @@ use std::rc::Rc;
 /// infrastructure; no state is cached inside this struct.
 ///
 /// qpdf exposes one annotation enumeration operation with an optional subtype
-/// filter, represented by [`Self::get_annotation_handles`]. There is no second
-/// filtered alias:
+/// filter and typed annotation-helper results through `get_annotations`.
+/// There is no public raw-handle collector:
 ///
 /// ```compile_fail,E0599
 /// use flpdf::PageObjectHelper;
 /// use std::io::Cursor;
 ///
 /// let _method = PageObjectHelper::<Cursor<Vec<u8>>>::get_annotations_filtered;
+/// ```
+///
+/// ```compile_fail,E0624
+/// use flpdf::PageObjectHelper;
+/// use std::io::Cursor;
+///
+/// let _method = PageObjectHelper::<Cursor<Vec<u8>>>::get_annotation_handles;
 /// ```
 pub struct PageObjectHelper<'a, R: Read + Seek + 'static> {
     object: ObjectHandle,
@@ -1429,16 +1437,29 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     // get_annotations
     // -----------------------------------------------------------------------
 
-    /// Return canonical annotation handles, optionally restricted to a
-    /// `/Subtype` name, mirroring qpdf's fail-soft
-    /// `QPDFPageObjectHelper::getAnnotations`
-    /// (`libqpdf/QPDFPageObjectHelper.cc:439-454`). A missing, null, or
+    /// Return annotation helpers, optionally restricted to a `/Subtype` name,
+    /// matching qpdf's `QPDFPageObjectHelper::getAnnotations`
+    /// (`include/qpdf/QPDFPageObjectHelper.hh:211`,
+    /// `libqpdf/QPDFPageObjectHelper.cc:439-454`). A missing, null, or
     /// non-array `/Annots` value yields an empty result; non-dictionary array
-    /// members are skipped. Direct annotation dictionaries are preserved in
-    /// this handle-native method, matching qpdf's annotation-helper results.
-    /// On non-Form receivers, the lookup reads `/Annots` directly and does not
-    /// require `/Type /Page`.
-    pub fn get_annotation_handles(
+    /// members are skipped. Each returned helper retains the exact direct or
+    /// indirect annotation handle. On non-Form receivers, the lookup reads
+    /// `/Annots` directly and does not require `/Type /Page`.
+    pub fn get_annotations(
+        &mut self,
+        only_subtype: Option<&[u8]>,
+    ) -> Result<Vec<AnnotationObjectHelper>> {
+        Ok(self
+            .get_annotation_handles(only_subtype)?
+            .into_iter()
+            .map(AnnotationObjectHelper::new)
+            .collect())
+    }
+
+    /// Collect raw annotation handles for crate-internal consumers that
+    /// mutate or associate the underlying PDF objects. The public qpdf-shaped
+    /// surface is [`Self::get_annotations`].
+    pub(crate) fn get_annotation_handles(
         &mut self,
         only_subtype: Option<&[u8]>,
     ) -> Result<Vec<ObjectHandle>> {

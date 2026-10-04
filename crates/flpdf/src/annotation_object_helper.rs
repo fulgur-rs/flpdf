@@ -35,10 +35,9 @@
 //! let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
 //! if let Some(page) = pages.into_iter().next() {
 //!     let mut page_helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-//!     let annot_handles = page_helper.get_annotation_handles(None)?;
+//!     let annots = page_helper.get_annotations(None)?;
 //!     drop(page_helper);
-//!     for annot_handle in annot_handles {
-//!         let mut annot = AnnotationObjectHelper::new(annot_handle);
+//!     for mut annot in annots {
 //!         let subtype = annot.get_subtype()?;
 //!         println!("annotation subtype: {}", String::from_utf8_lossy(&subtype));
 //!         let rect = annot.get_rect()?;
@@ -58,8 +57,9 @@ use crate::{Matrix, Rectangle, Result};
 /// Typed read-only accessor helper for a PDF annotation dictionary.
 ///
 /// Construct with [`AnnotationObjectHelper::new`], passing a canonical
-/// annotation [`ObjectHandle`] (for example one returned by
-/// [`crate::PageObjectHelper::get_annotation_handles`]).
+/// annotation [`ObjectHandle`] or use
+/// [`crate::PageObjectHelper::get_annotations`] to obtain qpdf-shaped helper
+/// values directly.
 ///
 /// All accessors are **leaf-only**: they read only the annotation dictionary
 /// itself, consistent with ISO 32000-1 §12.5 which specifies that annotation
@@ -83,6 +83,13 @@ impl AnnotationObjectHelper {
     /// `QPDFAnnotationObjectHelper(QPDFObjectHandle)` constructor.
     pub fn new(annot: ObjectHandle) -> Self {
         Self { annot }
+    }
+
+    /// Return the underlying annotation handle, matching the inherited qpdf
+    /// `QPDFObjectHelper::getObjectHandle` accessor
+    /// (`include/qpdf/QPDFObjectHelper.hh:34-55`).
+    pub fn get_object_handle(&self) -> ObjectHandle {
+        self.annot.clone()
     }
 
     /// Resolve `self.annot` and return the key's resolved child handle.
