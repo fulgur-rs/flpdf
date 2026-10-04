@@ -1325,12 +1325,20 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     ///
     /// A helper built over a Form XObject filters that Form's own
     /// content stream rather than a page's.
-    pub fn filter_page_contents<'b>(
+    pub fn filter_page_contents(&mut self, filter: &mut dyn TokenFilter) -> Result<()> {
+        self.filter_page_contents_with_pipeline(filter, None)
+    }
+
+    /// Apply a lexical token filter and send output to the optional pipeline.
+    ///
+    /// Passing `None` discards filter output, matching qpdf's default
+    /// `next = nullptr` argument.
+    pub fn filter_page_contents_with_pipeline<'b>(
         &mut self,
         filter: &'b mut dyn TokenFilter,
         next: Option<&'b mut dyn Pipeline>,
     ) -> Result<()> {
-        self.filter_contents(filter, next)
+        self.filter_contents_with_pipeline(filter, next)
     }
 
     /// Apply a lexical token filter to this helper's decoded contents.
@@ -1339,7 +1347,17 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// content stream rather than a page's.
     ///
     /// qpdf's old name for [`Self::filter_page_contents`], kept as an alias.
-    pub fn filter_contents<'b>(
+    pub fn filter_contents(&mut self, filter: &mut dyn TokenFilter) -> Result<()> {
+        self.filter_contents_with_pipeline(filter, None)
+    }
+
+    /// Apply a lexical token filter and send output to the optional pipeline.
+    ///
+    /// This is qpdf's `filterContents(filter, next)` route
+    /// (`include/qpdf/QPDFPageObjectHelper.hh:261-265`). Passing `None`
+    /// discards generated output, which is qpdf's default `next = nullptr`
+    /// behavior.
+    pub fn filter_contents_with_pipeline<'b>(
         &mut self,
         filter: &'b mut dyn TokenFilter,
         next: Option<&'b mut dyn Pipeline>,
@@ -1407,7 +1425,14 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         crate::resources::remove_unreferenced_resources_on_target(self.pdf, self.object.clone())
     }
 
-    /// Convert inline images into ordinary Image XObjects.
+    /// Convert inline images into ordinary Image XObjects using qpdf's
+    /// defaults `min_size = 0` and `shallow = false`.
+    pub fn externalize_inline_images(&mut self) -> Result<()> {
+        self.externalize_inline_images_with_options(0, false)
+    }
+
+    /// Convert inline images into ordinary Image XObjects with explicit qpdf
+    /// `min_size` and `shallow` options.
     ///
     /// This mirrors qpdf's `externalizeInlineImages` implementation
     /// (`libqpdf/QPDFPageObjectHelper.cc:398-437`). The canonical page/Form
@@ -1416,7 +1441,11 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// content stream is installed only after successful filtering. With
     /// `shallow == false`, nested Form XObjects are processed in the same
     /// bounded traversal as qpdf; `true` limits the operation to this target.
-    pub fn externalize_inline_images(&mut self, min_size: usize, shallow: bool) -> Result<()> {
+    pub fn externalize_inline_images_with_options(
+        &mut self,
+        min_size: usize,
+        shallow: bool,
+    ) -> Result<()> {
         let target = self.object.clone();
         let description = self.target_description();
         let mut nested_forms = Vec::new();

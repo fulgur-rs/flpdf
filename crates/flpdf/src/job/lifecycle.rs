@@ -3867,10 +3867,11 @@ impl QPDFJob {
         } else if configuration.externalize_inline_images {
             let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
             for page in pages {
-                PageObjectHelper::from_object_handle(page, pdf).externalize_inline_images(
-                    configuration.image_options.inline_min_bytes,
-                    false,
-                )?; // cov:ignore: llvm-cov attributes this successful multiline image externalization call to its opening expressions
+                PageObjectHelper::from_object_handle(page, pdf)
+                    .externalize_inline_images_with_options(
+                        configuration.image_options.inline_min_bytes,
+                        false,
+                    )?; // cov:ignore: llvm-cov attributes this successful multiline image externalization call to its opening expressions
             }
         }
 
