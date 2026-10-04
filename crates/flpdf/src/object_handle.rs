@@ -3751,19 +3751,22 @@ impl ObjectHandle {
 
     /// Return whether this handle is exactly a four-number array without
     /// emitting type warnings (`libqpdf/QPDFObjectHandle.cc:789-799`).
+    /// qpdf checks indices 0 through 3 before comparing the array length;
+    /// preserve that order so lazy child resolution and parser diagnostics
+    /// occur before an oversized array returns `false`.
     pub fn try_is_rectangle(&self) -> Result<bool> {
         let Some(items) = self.try_as_array()? else {
             return Ok(false);
         };
-        if items.len() != 4 {
-            return Ok(false);
-        }
-        for item in items {
+        for index in 0..4 {
+            let Some(item) = items.get(index) else {
+                return Ok(false);
+            };
             if !item.try_is_number()? {
                 return Ok(false);
             }
         }
-        Ok(true)
+        Ok(items.len() == 4)
     }
 
     /// Convert a four-number array to qpdf's normalized rectangle, returning
@@ -3821,19 +3824,22 @@ impl ObjectHandle {
 
     /// Return whether this handle is exactly a six-number array without
     /// emitting type warnings (`libqpdf/QPDFObjectHandle.cc:801-811`).
+    /// qpdf checks indices 0 through 5 before comparing the array length;
+    /// preserve that order so lazy child resolution and parser diagnostics
+    /// occur before an oversized array returns `false`.
     pub fn try_is_matrix(&self) -> Result<bool> {
         let Some(items) = self.try_as_array()? else {
             return Ok(false);
         };
-        if items.len() != 6 {
-            return Ok(false);
-        }
-        for item in items {
+        for index in 0..6 {
+            let Some(item) = items.get(index) else {
+                return Ok(false);
+            };
             if !item.try_is_number()? {
                 return Ok(false);
             }
         }
-        Ok(true)
+        Ok(items.len() == 6)
     }
 
     /// Convert a six-number array to the qpdf nested matrix type, returning
