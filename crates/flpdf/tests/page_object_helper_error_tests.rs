@@ -113,6 +113,20 @@ fn get_annotation_handles_accepts_an_untyped_target_like_qpdf() {
         .is_empty());
 }
 
+#[test]
+fn get_page_contents_accepts_an_untyped_dictionary_like_qpdf() {
+    let bytes = single_page(
+        "<< /Parent 2 0 R /MediaBox [0 0 20 30] /Contents 4 0 R >>",
+        &[(4, "<< /Length 3 >>\nstream\nabc\nendstream".into())],
+    );
+    let (mut pdf, page_ref) = helper_for(bytes);
+    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+
+    let contents = helper.get_page_contents().unwrap();
+    assert_eq!(contents.len(), 1);
+    assert_eq!(contents[0].object_ref(), Some(ObjectRef::new(4, 0)));
+}
+
 // ---------------------------------------------------------------------------
 // media_box() — /Parent chain anomalies and value resolution
 // ---------------------------------------------------------------------------

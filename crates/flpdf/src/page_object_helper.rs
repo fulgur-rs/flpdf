@@ -459,11 +459,10 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     }
 
     /// Resolve the target and return whether it is a Form XObject. Page
-    /// dictionaries and Form stream dictionaries are the only supported qpdf
-    /// PageObjectHelper targets.
+    /// attribute and content helpers classify only Form XObjects; qpdf does
+    /// not preflight the other targets as `/Type /Page` dictionaries.
     fn resolved_attribute_target(&mut self) -> Result<(ObjectHandle, bool)> {
-        let description = self.target_description();
-        resolve_attribute_target(self.object.clone(), &description)
+        resolve_attribute_target(self.object.clone())
     }
 
     /// Return the live canonical handle for this page after validating its
@@ -472,14 +471,8 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// subsequent page attributes and mutations operate on the resolver-backed
     /// object graph rather than on a legacy raw snapshot.
     fn resolved_page_handle(&mut self) -> Result<ObjectHandle> {
-        let (object, is_form) = self.resolved_attribute_target()?;
-        if is_form {
-            return Err(Error::Unsupported(format!(
-                "object {} is a Form XObject, expected /Type /Page",
-                self.target_description()
-            )));
-        }
-        Ok(object)
+        let description = self.target_description();
+        resolve_page_target(self.object.clone(), &description)
     }
 
     /// Return a live attribute, applying qpdf's page-tree inheritance rules
@@ -838,7 +831,8 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     ///
     /// Guards the public accessors so a `/Pages` tree node (or any other
     /// dictionary) cannot be misread as a page and return plausible but
-    /// incorrect inherited/default metadata.
+    /// incorrect inherited/default metadata. qpdf-delegating helpers use
+    /// `resolved_attribute_target` instead, which has no page type gate.
     pub(crate) fn ensure_leaf_page(&mut self) -> Result<()> {
         self.resolved_page_handle().map(|_| ())
     }
@@ -888,31 +882,29 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// Return the page's `/Contents` as canonical stream handles.
     ///
     /// This is the direct `QPDFPageObjectHelper::getPageContents` route
-    /// (`libqpdf/QPDFPageObjectHelper.cc:439-442`) and deliberately preserves
+    /// (`libqpdf/QPDFPageObjectHelper.cc:455-459`) and deliberately preserves
     /// each stream's identity and lazy provider instead of decoding it into a
-    /// byte buffer or legacy raw value.
+    /// byte buffer or legacy raw value. Like qpdf, it delegates directly on
+    /// the stored handle without a `/Type /Page` preflight.
     pub fn get_page_contents(&mut self) -> Result<Vec<ObjectHandle>> {
-        let (target, _) = self.resolved_attribute_target()?;
-        target.get_page_contents()
+        self.object.get_page_contents()
     }
 
     /// Add a canonical stream to the beginning or end of `/Contents`.
     ///
     /// Mirrors `QPDFPageObjectHelper::addPageContents`
-    /// (`libqpdf/QPDFPageObjectHelper.cc:449-452`).
+    /// (`libqpdf/QPDFPageObjectHelper.cc:461-465`).
     pub fn add_page_contents(&mut self, contents: ObjectHandle, first: bool) -> Result<()> {
-        let (target, _) = self.resolved_attribute_target()?;
-        target.add_page_contents(contents, first)?;
+        self.object.add_page_contents(contents, first)?;
         Ok(())
     }
 
     /// Rotate the page in the live object graph.
     ///
     /// Mirrors `QPDFPageObjectHelper::rotatePage`
-    /// (`libqpdf/QPDFPageObjectHelper.cc:468-470`).
+    /// (`libqpdf/QPDFPageObjectHelper.cc:467-471`).
     pub fn rotate_page(&mut self, angle: i32, relative: bool) -> Result<()> {
-        let (target, _) = self.resolved_attribute_target()?;
-        target.rotate_page(angle, relative)?;
+        self.object.rotate_page(angle, relative)?;
         Ok(())
     }
 
@@ -1287,8 +1279,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
 
     /// Coalesce the page's content streams into one lazy provider-backed stream.
     pub fn coalesce_content_streams(&mut self) -> Result<()> {
-        let (target, _) = self.resolved_attribute_target()?;
-        target.coalesce_content_streams()?;
+        self.object.coalesce_content_streams()?;
         Ok(())
     }
 
@@ -2001,7 +1992,7 @@ fn externalize_inline_images_for_target<R: Read + Seek + 'static>(
     description: &str,
     min_size: usize,
 ) -> Result<()> {
-    let (target, is_form) = resolve_attribute_target(object, description)?;
+    let (target, is_form) = resolve_attribute_target(object)?;
     let resources = get_attribute_for_target(target.clone(), b"/Resources", true, description)?;
 
     // qpdf uses mergeResources to make /XObject direct and private before the
@@ -2226,16 +2217,19 @@ fn matrix_from_handle(handle: &ObjectHandle) -> Result<Option<Matrix>> {
     Ok(Some(Matrix::from(values)))
 }
 
-fn resolve_attribute_target(
-    object: ObjectHandle,
-    description: &str,
-) -> Result<(ObjectHandle, bool)> {
-    // `is_form_xobject` already dereferences `object` on its way to reading
-    // its type code, so `object` is resolved by the time it reaches the
-    // non-resolving `as_dictionary`/`has_key` checks below regardless of
-    // which branch is taken.
+fn resolve_attribute_target(object: ObjectHandle) -> Result<(ObjectHandle, bool)> {
+    // QPDFPageObjectHelper dispatches by Form XObject only. Page and other
+    // non-Form handles flow into the delegated QPDFObjectHandle operation,
+    // which owns its own type warnings and failures.
+    let is_form = object.is_form_xobject()?;
+    Ok((object, is_form))
+}
+
+fn resolve_page_target(object: ObjectHandle, description: &str) -> Result<ObjectHandle> {
     if object.is_form_xobject()? {
-        return Ok((object, true));
+        return Err(Error::Unsupported(format!(
+            "object {description} is a Form XObject, expected /Type /Page"
+        )));
     }
     if !object.try_is_dictionary()? {
         return Err(Error::Unsupported(format!(
@@ -2245,7 +2239,7 @@ fn resolve_attribute_target(
 
     let page_type = object.try_get_key(b"/Type")?;
     match page_type.try_as_name()? {
-        Some(name) if name.as_slice() == b"Page" => Ok((object, false)),
+        Some(name) if name.as_slice() == b"Page" => Ok(object),
         Some(name) => Err(Error::Unsupported(format!(
             "object {description} has /Type /{}, expected /Page",
             String::from_utf8_lossy(&name)
