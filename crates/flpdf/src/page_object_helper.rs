@@ -13,9 +13,6 @@
 //! call so that mutations applied through other helpers remain visible
 //! immediately.
 //!
-//! - [`content_stream_objects`](PageObjectHelper::content_stream_objects) —
-//!   decode via the existing stream filter pipeline, then parse into
-//!   qpdf-shaped [`ObjectHandle`] events.
 //! - [`get_resources`](PageObjectHelper::get_resources) — delegates to the
 //!   canonical ObjectHandle `/Parent`-chain lookup for `/Resources`.
 //! - [`get_attribute`](PageObjectHelper::get_attribute) — reads the qpdf
@@ -31,23 +28,6 @@
 //!   handles and fallback values without projecting them into another type.
 //!
 //! # Examples
-//!
-//! ## Inspect content-stream tokens
-//!
-//! ```no_run
-//! use std::fs::File;
-//! use std::io::BufReader;
-//! use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
-//!
-//! let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-//! let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
-//! if let Some(page) = pages.into_iter().next() {
-//!     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-//!     let objects = helper.content_stream_objects()?;
-//!     println!("{} content-stream objects on page 1", objects.len());
-//! }
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
 //!
 //! ## Read the qpdf-shaped media box handle
 //!
@@ -103,7 +83,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use crate::content_stream::{ObjectHandleParserCallbacks, ParseControl};
+use crate::content_stream::ObjectHandleParserCallbacks;
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
 use crate::pages::is_inheritable_page_attribute;
 use crate::pipeline::{Pipeline, PipelineError, PlString};
@@ -130,11 +110,6 @@ pub struct PageObjectHelper<'a, R: Read + Seek + 'static> {
     object: ObjectHandle,
     page_ref: Option<ObjectRef>,
     pdf: &'a mut Pdf<R>,
-}
-
-#[derive(Default)]
-struct ObjectRecordingCallbacks {
-    objects: Vec<ObjectHandle>,
 }
 
 struct InlineImageExternalizer<'a, R: Read + Seek + 'static> {
@@ -364,22 +339,6 @@ impl<R: Read + Seek + 'static> TokenFilter for InlineImageExternalizer<'_, R> {
         } else {
             output.write_token(token)?;
         }
-        Ok(())
-    }
-}
-
-impl ObjectHandleParserCallbacks for ObjectRecordingCallbacks {
-    fn handle_object(
-        &mut self,
-        object: ObjectHandle,
-        _offset: usize,
-        _length: usize,
-    ) -> Result<ParseControl> {
-        self.objects.push(object);
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_eof(&mut self) -> Result<()> {
         Ok(())
     }
 }
@@ -792,48 +751,6 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let copy = fallback.shallow_copy()?;
         page.replace_key(key, copy.clone())?;
         Ok(copy)
-    }
-
-    // -----------------------------------------------------------------------
-    // content_stream_objects
-    // -----------------------------------------------------------------------
-
-    /// Return the qpdf-shaped content object events for this page.
-    ///
-    /// Aggregates the page's `/Contents` entry (single stream or array), decodes
-    /// each stream through its filter pipeline (same as
-    /// [`crate::pages::page_content_bytes`]), then parses the concatenated bytes
-    /// through [`crate::content_stream::parse_content_operations`].
-    ///
-    /// Returns an empty `Vec` when the page has no `/Contents`.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Unsupported`] when `page_ref` does not resolve to a
-    ///   `/Type /Page` dictionary, or when a `/Contents` element is not a stream.
-    /// - Any error from [`crate::pages::page_content_bytes`] or
-    ///   [`crate::content_stream::parse_content_operations`].
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::fs::File;
-    /// use std::io::BufReader;
-    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
-    ///
-    /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
-    /// if let Some(page) = pages.into_iter().next() {
-    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-    ///     let objects = helper.content_stream_objects()?;
-    ///     println!("{} objects", objects.len());
-    /// }
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn content_stream_objects(&mut self) -> Result<Vec<ObjectHandle>> {
-        let mut callbacks = ObjectRecordingCallbacks::default();
-        self.parse_contents(&mut callbacks)?;
-        Ok(callbacks.objects)
     }
 
     /// Return the page's `/Contents` as canonical stream handles.
