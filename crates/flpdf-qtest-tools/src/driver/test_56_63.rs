@@ -118,7 +118,7 @@ fn test_56_59_body<R: Read + Seek>(
         let content = {
             let mut destination_page =
                 PageObjectHelper::from_object_handle(pages1[index].clone(), pdf);
-            let resources = destination_page.get_resources(true)?;
+            let resources = destination_page.get_attribute(b"/Resources", true)?;
             let mut min_suffix = 1;
             let name = resources.get_unique_resource_name(b"/Fx", &mut min_suffix, None)?;
             let rect = destination_page

@@ -95,7 +95,8 @@ fn remove_unreferenced_resources_helper<R: Read + Seek>(
         return Ok(false);
     }
 
-    let resources = PageObjectHelper::from_object_handle(target, pdf).get_resources(true)?;
+    let resources =
+        PageObjectHelper::from_object_handle(target, pdf).get_attribute(b"/Resources", true)?;
     let resources_is_dictionary = resources.try_is_dictionary()?;
     let categories = [b"/Font".as_slice(), b"/XObject".as_slice()];
     let mut dictionaries = Vec::new();
@@ -164,8 +165,8 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     root_target: ObjectHandle,
 ) -> Result<(BTreeSet<Vec<u8>>, bool)> {
-    let root_resources =
-        PageObjectHelper::from_object_handle(root_target.clone(), pdf).get_resources(false)?;
+    let root_resources = PageObjectHelper::from_object_handle(root_target.clone(), pdf)
+        .get_attribute(b"/Resources", false)?;
     if !root_resources.try_is_dictionary()? {
         return Ok((BTreeSet::new(), false));
     }
@@ -212,8 +213,8 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
 
         // qpdf dequeues the Form after the pruning callback and reads its live
         // resource dictionary then; children removed by pruning are not visited.
-        let resources =
-            PageObjectHelper::from_object_handle(holder_handle, pdf).get_resources(false)?;
+        let resources = PageObjectHelper::from_object_handle(holder_handle, pdf)
+            .get_attribute(b"/Resources", false)?;
         if resources.try_is_dictionary()? {
             pending.extend(form_xobjects_in_resources(&resources)?);
         }

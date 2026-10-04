@@ -13,8 +13,6 @@
 //! call so that mutations applied through other helpers remain visible
 //! immediately.
 //!
-//! - [`get_resources`](PageObjectHelper::get_resources) — delegates to the
-//!   canonical ObjectHandle `/Parent`-chain lookup for `/Resources`.
 //! - [`get_attribute`](PageObjectHelper::get_attribute) — reads the qpdf
 //!   page/Form attribute and inheritance route, including `/Rotate`.
 //! - [`get_annotation_handles`](PageObjectHelper::get_annotation_handles) —
@@ -512,7 +510,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         dict.replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))?;
         dict.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))?;
 
-        let resources = self.get_resources(false)?.shallow_copy()?;
+        let resources = self.get_attribute(b"/Resources", false)?.shallow_copy()?;
         dict.replace_key(b"/Resources", resources)?;
         let group = self.get_attribute(b"/Group", false)?.shallow_copy()?;
         dict.replace_key(b"/Group", group)?;
@@ -1321,11 +1319,6 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     // -----------------------------------------------------------------------
     // resources
     // -----------------------------------------------------------------------
-
-    /// Return the effective `/Resources` dictionary handle.
-    pub fn get_resources(&mut self, copy_if_shared: bool) -> Result<ObjectHandle> {
-        self.get_attribute(b"/Resources", copy_if_shared)
-    }
 
     /// Visit every XObject directly reachable from this page or Form XObject.
     ///

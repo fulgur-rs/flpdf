@@ -2012,7 +2012,7 @@ status/stdout/stderr および output bytes が一致する。
 
 `qpdf/test_driver.cc:2073-2137` の `test_56`–`test_59` と `:2303-2364` の
 `test_64`–`test_67` は、`PageObjectHelper::get_form_xobject_for_page`、
-`Pdf::copy_foreign_object`、`PageObjectHelper::get_resources`/
+`Pdf::copy_foreign_object`、`PageObjectHelper::get_attribute("/Resources")`/
 `ObjectHandle::merge_resources`、`PageObjectHelper::place_form_xobject`、
 `PageObjectHelper::add_page_contents`、`PdfWriter` のQDF/static-ID経路を通る
 qtest consumerとして実装済みである。pinned qpdf 11.9.0との同一fixture比較で8件の
