@@ -638,6 +638,61 @@ fn for_each_xobject_skips_keys_whose_values_resolve_to_null_like_qpdf() {
 }
 
 #[test]
+fn for_each_xobject_selector_filters_callbacks_without_pruning_form_recursion_like_qpdf() {
+    let bytes = single_page(
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] /Resources 8 0 R >>",
+        &[
+            (
+                4,
+                "<< /Type /XObject /Subtype /Form /BBox [0 0 1 1] /Resources 9 0 R /Length 0 >>\nstream\n\nendstream".into(),
+            ),
+            (
+                6,
+                "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /Length 0 >>\nstream\n\nendstream".into(),
+            ),
+            (
+                8,
+                "<< /XObject << /Pick 6 0 R /RejectForm 4 0 R >> >>".into(),
+            ),
+            (9, "<< /XObject << /Pick 6 0 R >> >>".into()),
+        ],
+    );
+    let (mut pdf, page_ref) = helper_for(bytes);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
+    let image_ref = ObjectRef::new(6, 0);
+    let mut candidates = Vec::new();
+    let mut visits = Vec::new();
+
+    helper
+        .for_each_xobject_with_selector(
+            true,
+            |object, xobject_dict, key| {
+                visits.push((object, xobject_dict, key));
+                Ok(())
+            },
+            |object| {
+                let object_ref = object.object_ref();
+                candidates.push(object_ref);
+                Ok(object_ref == Some(image_ref))
+            },
+        )
+        .unwrap();
+
+    assert!(candidates.contains(&Some(ObjectRef::new(4, 0))));
+    assert_eq!(
+        visits.len(),
+        2,
+        "selector filters actions, not Form recursion"
+    );
+    assert!(visits
+        .iter()
+        .all(|(object, _, _)| object.object_ref() == Some(image_ref)));
+    assert_eq!(visits[0].2, b"/Pick");
+    assert_eq!(visits[1].2, b"/Pick");
+    assert!(!visits[0].1.is_same_object_as(&visits[1].1));
+}
+
+#[test]
 fn remove_unreferenced_resources_copies_categories_before_unresolved_veto_like_qpdf() {
     let bytes = single_page(
         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 30] /Resources << /Font 4 0 R >> /Contents 5 0 R >>",

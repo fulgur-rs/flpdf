@@ -2018,6 +2018,17 @@ qpdf's explicit copy/fallback controls. The implementation continues to route
 through the same raw-handle `get_attribute` and ordered fallback operations
 (`QPDFPageObjectHelper.cc:218-317`).
 
+### `QPDFPageObjectHelper::forEachXObject` selector (`flpdf-6ik2q.56`)
+
+qpdf's optional selector gates only the callback; recursive Form traversal is
+performed independently for every Form XObject (`QPDFPageObjectHelper.hh:166-177`,
+`QPDFPageObjectHelper.cc:318-349`). flpdf keeps
+`for_each_xobject(recursive, action)` as the no-selector route and exposes
+`for_each_xobject_with_selector(recursive, action, selector)` for the public
+selector contract. A rejected Form is not reported to the action but its nested
+XObjects are still visited, and each callback retains its containing resource
+dictionary and key.
+
 `PageDocumentHelper::flatten_annotations` は qpdf と同じく AcroForm の NeedAppearances 判定後に repaired page list を得て、各 page の effective `/Resources`・appearance 処理・annotation removal を行う。qpdf は `getAllPages()` が返した raw `QPDFPageObjectHelper` を `flattenAnnotationsForPage` まで保持する（`QPDFPageDocumentHelper.cc:55-76`）。flpdf も `PageDocumentHelper::get_all_pages()` の raw `ObjectHandle` を resource materialization、rotation lookup、annotation flattening、content insertion へ渡し、`ObjectRef` projection を通さない。raw identity `(17, 65535)` 上の eligible appearance flattening は `page_annotation_flatten::tests::public_qpdf_flatten_copies_a_raw_generation_page_handle` で固定する。
 `flpdf-hrgj` closes the remaining page-operation consumer boundary: primary
 raw label copies register their foreign-map provenance as
