@@ -271,7 +271,9 @@ verified qpdf-faithful and behavior-neutral for their existing callers.
 - Modify: `crates/flpdf-cli/tests/cli_tests.rs`
 
 **Interfaces:**
-- Consumes: Task 2 helper and `PageObjectHelper::get_annotations`.
+- Consumes: Task 2 helper and the qpdf-shaped
+  `PageObjectHelper::get_annotation_handles` route. The later `.40` source
+  audit removed the legacy `ObjectRef`-only `get_annotations` surface.
 - Produces: direct consumer loops without `EnumeratedAnnotation` or exported enumerator functions.
 
 - [ ] **Step 1: Write failing consumer tests**
@@ -291,7 +293,7 @@ Expected: failures until consumers own the handle-native loop.
 
 - [ ] **Step 3: Replace and delete**
 
-Consumers obtain refs with `PageObjectHelper::get_annotations`, resolve handles via `Pdf::resolve_object_handle`, and wrap each in `AnnotationObjectHelper`. Preserve widget linkage: direct non-null `/FT` or `/T` means self; otherwise use the direct `/Parent` reference. Delete the module declaration and public re-exports.
+Consumers obtain raw annotation handles with `PageObjectHelper::get_annotation_handles`, preserving direct entries, then construct `AnnotationObjectHelper` values from those handles as needed. Do not add an `ObjectRef` projection gate; qpdf enumerates annotation helpers directly. Preserve widget linkage: direct non-null `/FT` or `/T` means self; otherwise use the direct `/Parent` reference. Delete the module declaration and public re-exports.
 
 - [ ] **Step 4: Run GREEN tests and source check**
 
