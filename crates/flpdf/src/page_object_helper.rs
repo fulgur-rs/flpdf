@@ -15,6 +15,8 @@
 //!
 //! - [`get_attribute`](PageObjectHelper::get_attribute) — reads the qpdf
 //!   page/Form attribute and inheritance route, including `/Rotate`.
+//! - [`get_object_handle`](PageObjectHelper::get_object_handle) — returns the
+//!   exact handle retained by the helper, matching qpdf's base accessor.
 //! - [`get_annotations`](PageObjectHelper::get_annotations) — returns qpdf-shaped
 //!   annotation helpers from the page's fail-soft `/Annots` enumeration.
 //! - [`get_media_box`](PageObjectHelper::get_media_box) and
@@ -374,6 +376,15 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             page_ref,
             pdf,
         }
+    }
+
+    /// Return the exact object handle retained by this helper, matching the
+    /// inherited `QPDFObjectHelper::getObjectHandle` accessor
+    /// (`include/qpdf/QPDFObjectHelper.hh:34-55`). This preserves direct
+    /// objects and raw indirect identity without resolving or projecting
+    /// through `ObjectRef`.
+    pub fn get_object_handle(&self) -> ObjectHandle {
+        self.object.clone()
     }
 
     fn target_description(&self) -> String {
