@@ -3357,6 +3357,11 @@ impl QPDFJob {
             return Ok(None);
         }
         if self.configuration.is_encrypted || self.configuration.requires_password {
+            // qpdf's doProcessOnce raises `max_input_version` for every input
+            // that opened successfully before createQPDF reaches the
+            // encryption-status return (`libqpdf/QPDFJob.cc:428-456,1695-1716`);
+            // a password failure above never gets this far.
+            self.update_writer_version_floor(&mut pdf)?;
             self.record_encryption_status(&pdf);
             return Ok(None);
         }

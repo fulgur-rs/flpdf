@@ -3290,6 +3290,51 @@ fn create_qpdf_successful_encryption_status_queries_return_no_document() {
     }
 }
 
+/// qpdf's `doProcessOnce` raises `max_input_version` for each source it opens
+/// before `createQPDF` returns for an encryption-status query
+/// (`libqpdf/QPDFJob.cc:428-456,1695-1716`), so the public floor reflects a
+/// file-backed status source too. A wrong password throws before that update.
+#[test]
+fn create_qpdf_encryption_status_records_the_input_version_floor() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+    let versioned = root.join("compat/one-page-v17.pdf");
+    let encrypted = root.join("encrypted/v4-aes-128-r4.pdf");
+
+    for (input, status_key, password, expected) in [
+        (
+            versioned.clone(),
+            "isEncrypted",
+            None,
+            Some(flpdf::PdfVersion::new(1, 7, 0)),
+        ),
+        (
+            versioned,
+            "requiresPassword",
+            None,
+            Some(flpdf::PdfVersion::new(1, 7, 0)),
+        ),
+        (encrypted.clone(), "requiresPassword", None, None),
+        (
+            encrypted,
+            "isEncrypted",
+            Some("user-v4-aes"),
+            Some(flpdf::PdfVersion::new(1, 7, 0)),
+        ),
+    ] {
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(
+            &serde_json::json!({ "inputFile": input, status_key: "" }).to_string(),
+        )
+        .unwrap();
+        if let Some(password) = password {
+            job.set_password(password.as_bytes().to_vec());
+        }
+
+        assert!(job.create_qpdf().unwrap().is_none(), "{status_key}");
+        assert_eq!(job.input_version_floor(), expected, "{status_key}");
+    }
+}
+
 #[test]
 fn create_qpdf_returns_the_primary_after_rotation_transformation() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
