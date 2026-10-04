@@ -2029,6 +2029,16 @@ selector contract. A rejected Form is not reported to the action but its nested
 XObjects are still visited, and each callback retains its containing resource
 dictionary and key.
 
+### `QPDFPageObjectHelper` transform/placement defaults (`flpdf-6ik2q.57`)
+
+qpdf 11.9.0 defaults `getMatrixForTransformations` to `invert = false`,
+`getFormXObjectForPage` to `handle_transformations = true`, and the placement
+APIs to `invert_transformations = true`, `allow_shrink = true`, and
+`allow_expand = false` (`QPDFPageObjectHelper.hh:308-364`). Rust's no-option
+`get_*`/`place_*` methods expose those defaults; the corresponding
+`*_with_options` methods preserve explicit flags. The geometry and placement
+algorithms remain the same qpdf routes (`QPDFPageObjectHelper.cc:663-861`).
+
 `PageDocumentHelper::flatten_annotations` は qpdf と同じく AcroForm の NeedAppearances 判定後に repaired page list を得て、各 page の effective `/Resources`・appearance 処理・annotation removal を行う。qpdf は `getAllPages()` が返した raw `QPDFPageObjectHelper` を `flattenAnnotationsForPage` まで保持する（`QPDFPageDocumentHelper.cc:55-76`）。flpdf も `PageDocumentHelper::get_all_pages()` の raw `ObjectHandle` を resource materialization、rotation lookup、annotation flattening、content insertion へ渡し、`ObjectRef` projection を通さない。raw identity `(17, 65535)` 上の eligible appearance flattening は `page_annotation_flatten::tests::public_qpdf_flatten_copies_a_raw_generation_page_handle` で固定する。
 `flpdf-hrgj` closes the remaining page-operation consumer boundary: primary
 raw label copies register their foreign-map provenance as

@@ -10,7 +10,7 @@
 //! indirect object — including each page's `/Parent` — which the shared
 //! single-page builder does not, so the parent-chain branches are reachable.
 
-use flpdf::{ObjectHandle, ObjectRef, PageObjectHelper, Pdf, Rectangle};
+use flpdf::{Matrix, ObjectHandle, ObjectRef, PageObjectHelper, Pdf, Rectangle};
 use std::io::Cursor;
 use std::rc::Rc;
 
@@ -46,6 +46,75 @@ fn page_helper_for_ref(
 ) -> PageObjectHelper<'_, Cursor<Vec<u8>>> {
     let page = pdf.get_object_handle(page_ref);
     PageObjectHelper::from_object_handle(page, pdf)
+}
+
+#[test]
+fn transform_and_placement_helpers_use_qpdf_default_options() {
+    let mut pdf = Pdf::empty().unwrap();
+    let page = ObjectHandle::dictionary(vec![
+        (
+            b"/MediaBox".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(100),
+                ObjectHandle::integer(200),
+            ]),
+        ),
+        (b"/Rotate".to_vec(), ObjectHandle::integer(90)),
+    ]);
+    let page = pdf.make_indirect_object_handle(page).unwrap();
+    let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
+
+    assert_eq!(
+        helper.get_matrix_for_transformations().unwrap(),
+        Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, 100.0)
+    );
+    let form = helper.get_form_xobject_for_page().unwrap();
+    assert!(!form
+        .as_stream_dict()
+        .unwrap()
+        .try_get_key(b"/Matrix")
+        .unwrap()
+        .try_is_null()
+        .unwrap());
+
+    let rect = Rectangle::new(0.0, 0.0, 300.0, 300.0);
+    let default_matrix = helper
+        .get_matrix_for_form_xobject_placement(form.clone(), rect)
+        .unwrap();
+    let explicit_matrix = helper
+        .get_matrix_for_form_xobject_placement_with_options(form.clone(), rect, true, true, false)
+        .unwrap();
+    assert_eq!(default_matrix, explicit_matrix);
+
+    let (default_content, default_matrix) = helper
+        .place_form_xobject(form.clone(), "/Selected", rect)
+        .unwrap();
+    let (explicit_content, explicit_matrix) = helper
+        .place_form_xobject_with_options(form.clone(), "/Selected", rect, true, true, false)
+        .unwrap();
+    assert_eq!(default_content, explicit_content);
+    assert_eq!(default_matrix, explicit_matrix);
+
+    let mut default_output = Matrix::default();
+    let default_content = helper
+        .place_form_xobject_with_matrix(form.clone(), "/Selected", rect, &mut default_output)
+        .unwrap();
+    let mut explicit_output = Matrix::default();
+    let explicit_content = helper
+        .place_form_xobject_with_matrix_with_options(
+            form,
+            "/Selected",
+            rect,
+            &mut explicit_output,
+            true,
+            true,
+            false,
+        )
+        .unwrap();
+    assert_eq!(default_content, explicit_content);
+    assert_eq!(default_output, explicit_output);
 }
 
 #[test]
@@ -287,7 +356,7 @@ fn get_form_xobject_for_form_target_uses_qpdf_contents_lookup() {
     let mut helper = PageObjectHelper::from_object_handle(form, &mut pdf);
 
     let wrapped = helper
-        .get_form_xobject_for_page(false)
+        .get_form_xobject_for_page_with_options(false)
         .expect("qpdf accepts a Form target and wraps its stream");
     assert!(wrapped.is_form_xobject().unwrap());
     assert_eq!(
@@ -369,7 +438,9 @@ fn form_provider_describes_page_contents_with_qpdf_obj_gen() {
     let page = pdf.get_object_handle(page_ref);
     let wrapped = {
         let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-        helper.get_form_xobject_for_page(false).unwrap()
+        helper
+            .get_form_xobject_for_page_with_options(false)
+            .unwrap()
     };
     wrapped.get_raw_stream_data().unwrap();
 
@@ -403,7 +474,9 @@ fn form_provider_reads_live_page_contents_when_materialized_like_qpdf() {
     let page = pdf.get_object_handle(page_ref);
     let wrapped = {
         let mut helper = PageObjectHelper::from_object_handle(page.clone(), &mut pdf);
-        helper.get_form_xobject_for_page(false).unwrap()
+        helper
+            .get_form_xobject_for_page_with_options(false)
+            .unwrap()
     };
 
     let replacement = pdf.new_stream_with_data(Rc::new(b"new".to_vec())).unwrap();

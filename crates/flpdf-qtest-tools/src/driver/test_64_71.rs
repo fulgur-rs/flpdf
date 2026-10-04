@@ -91,7 +91,7 @@ fn test_64_67_body<R: Read + Seek>(
         let source_form = {
             let mut source_page =
                 PageObjectHelper::from_object_handle(pages2[index].clone(), &mut pdf2);
-            source_page.get_form_xobject_for_page(true)?
+            source_page.get_form_xobject_for_page()?
         };
         emit_new_diagnostics(
             &pdf2,
@@ -113,7 +113,7 @@ fn test_64_67_body<R: Read + Seek>(
                 .try_get_array_as_rectangle()?;
             let name_text = String::from_utf8(name.clone())
                 .expect("qpdf-generated Fx resource names are ASCII");
-            let (content, _matrix) = destination_page.place_form_xobject(
+            let (content, _matrix) = destination_page.place_form_xobject_with_options(
                 form.clone(),
                 &name_text,
                 rect,

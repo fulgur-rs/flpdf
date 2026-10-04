@@ -784,7 +784,7 @@ fn place_form_xobject_canonical<R: Read + Seek>(
 ) -> Result<(String, Matrix)> {
     let mut helper = PageObjectHelper::from_object_handle(dest_page, pdf);
     let resource_name = format!("/{name}");
-    helper.place_form_xobject(
+    helper.place_form_xobject_with_options(
         form,
         &resource_name,
         rect,
