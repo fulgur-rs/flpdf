@@ -839,7 +839,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// Guards the public accessors so a `/Pages` tree node (or any other
     /// dictionary) cannot be misread as a page and return plausible but
     /// incorrect inherited/default metadata.
-    fn ensure_leaf_page(&mut self) -> Result<()> {
+    pub(crate) fn ensure_leaf_page(&mut self) -> Result<()> {
         self.resolved_page_handle().map(|_| ())
     }
 
@@ -1711,13 +1711,13 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// non-array `/Annots` value yields an empty result; non-dictionary array
     /// members are skipped. Direct annotation dictionaries are preserved in
     /// this handle-native method even though [`Self::get_annotations`] retains
-    /// its historical indirect-reference contract.
+    /// its historical indirect-reference contract. On non-Form receivers,
+    /// the lookup reads `/Annots` directly and does not require `/Type /Page`.
     pub fn get_annotation_handles(
         &mut self,
         only_subtype: Option<&[u8]>,
     ) -> Result<Vec<ObjectHandle>> {
-        let page = self.resolved_page_handle()?;
-        let annots = page.try_get_key(b"/Annots")?;
+        let annots = self.object.try_get_key(b"/Annots")?;
         let Some(annots_array) = annots.try_as_array()? else {
             return Ok(Vec::new());
         };

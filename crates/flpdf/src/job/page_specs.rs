@@ -978,7 +978,11 @@ fn set_annotation_page_refs<T: Read + Seek>(
     page_ref: ObjectRef,
     first_output_page: ObjectRef,
 ) -> Result<()> {
-    let annotations = PageObjectHelper::new(page_ref, merged).get_annotation_handles(None)?;
+    let mut helper = PageObjectHelper::new(page_ref, merged);
+    // This test-only page-order repair requires a valid selected page before
+    // invoking qpdf-shaped, fail-soft annotation enumeration.
+    helper.ensure_leaf_page()?;
+    let annotations = helper.get_annotation_handles(None)?;
     let page = merged.get_object_handle(first_output_page);
     for annotation in annotations {
         if annotation.try_has_key(b"/P")? {
