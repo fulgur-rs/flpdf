@@ -110,6 +110,59 @@ fn get_media_box_accepts_an_untyped_dictionary_like_qpdf() {
     assert_eq!(media_box.try_get_array_n_items().unwrap(), 4);
 }
 
+/// qpdf's `getAttribute` copies a fallback box into the supplied handle without
+/// a `/Type /Page` check (`libqpdf/QPDFPageObjectHelper.cc:224-262`); probed
+/// with the public C++ API on an untyped direct and indirect dictionary and on
+/// a `/Type /Pages` node, where `getCropBox(false, true)` copies `/MediaBox`
+/// into `/CropBox` and `getTrimBox(false, true)` then copies that into
+/// `/TrimBox`.
+#[test]
+fn fallback_boxes_are_copied_into_untyped_and_non_page_dictionaries_like_qpdf() {
+    fn media_box_dictionary() -> ObjectHandle {
+        ObjectHandle::dictionary(vec![(
+            b"/MediaBox".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(20),
+                ObjectHandle::integer(30),
+            ]),
+        )])
+    }
+    fn assert_copied(target: &ObjectHandle, result: &ObjectHandle, key: &[u8]) {
+        assert_eq!(result.try_get_array_n_items().unwrap(), 4);
+        let stored = target.try_get_key(key).unwrap();
+        assert_eq!(stored.try_get_array_n_items().unwrap(), 4, "{key:?} copied");
+    }
+
+    // Direct untyped dictionary.
+    let mut pdf = Pdf::empty().unwrap();
+    let target = media_box_dictionary();
+    let mut helper = PageObjectHelper::from_object_handle(target.clone(), &mut pdf);
+    let crop = helper.get_crop_box(false, true).unwrap();
+    assert_copied(&target, &crop, b"/CropBox");
+    let trim = helper.get_trim_box(false, true).unwrap();
+    assert_copied(&target, &trim, b"/TrimBox");
+
+    // Indirect untyped dictionary and a `/Type /Pages` node.
+    for body in [
+        "<< /MediaBox [0 0 20 30] >>",
+        "<< /Type /Pages /MediaBox [0 0 20 30] >>",
+    ] {
+        let bytes = single_page(body, &[]);
+        let (mut pdf, page_ref) = helper_for(bytes);
+        let target = pdf.get_object_handle(page_ref);
+        let mut helper = PageObjectHelper::from_object_handle(target.clone(), &mut pdf);
+        let bleed = helper.get_bleed_box(true, true).unwrap();
+        assert_copied(&target, &bleed, b"/BleedBox");
+        assert_copied(
+            &target,
+            &target.try_get_key(b"/CropBox").unwrap(),
+            b"/CropBox",
+        );
+    }
+}
+
 #[test]
 fn get_media_box_accepts_an_untyped_indirect_dictionary_like_qpdf() {
     let bytes = single_page("<< /Parent 2 0 R /MediaBox [0 0 20 30] >>", &[]);

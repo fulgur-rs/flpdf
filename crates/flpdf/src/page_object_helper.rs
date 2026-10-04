@@ -817,10 +817,14 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         if !copy_if_fallback || fallback.try_is_null()? {
             return Ok(fallback);
         }
-        let (_, is_form) = self.resolved_attribute_target()?;
+        // qpdf copies the fallback into the same dictionary `getAttribute`
+        // reads: a Form's stream dictionary, otherwise the supplied handle
+        // itself, with no `/Type /Page` requirement
+        // (`libqpdf/QPDFPageObjectHelper.cc:224-262`).
+        let is_form = self.object.is_form_xobject()?;
         let page = if is_form {
-            // cov:ignore-start: is_form is returned only for a stream whose
-            // canonical dictionary was already validated by is_form_xobject.
+            // cov:ignore-start: is_form_xobject returns true only for a stream
+            // with a canonical dictionary.
             self.object.as_stream_dict().ok_or_else(|| {
                 Error::Unsupported("Form XObject has no stream dictionary".to_owned())
             })?
