@@ -348,7 +348,7 @@ pub(crate) fn run_test_55<R: Read + Seek>(
     for page_handle in pages {
         let transformed = {
             let mut page = PageObjectHelper::from_object_handle(page_handle.clone(), pdf);
-            page.get_form_xobject_for_page(true)
+            page.get_form_xobject_for_page()
         };
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         let transformed = transformed?;
@@ -356,7 +356,7 @@ pub(crate) fn run_test_55<R: Read + Seek>(
 
         let untransformed = {
             let mut page = PageObjectHelper::from_object_handle(page_handle, pdf);
-            page.get_form_xobject_for_page(false)
+            page.get_form_xobject_for_page_with_options(false)
         };
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         let untransformed = untransformed?;

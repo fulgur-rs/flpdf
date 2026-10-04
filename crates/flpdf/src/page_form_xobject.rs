@@ -83,7 +83,7 @@ pub(crate) fn get_form_xobject_for_handle<R: Read + Seek>(
     page: ObjectHandle,
 ) -> Result<ObjectHandle> {
     let mut helper = PageObjectHelper::from_object_handle(page, pdf);
-    helper.get_form_xobject_for_page(true)
+    helper.get_form_xobject_for_page()
 }
 
 /// Test adapter for converting an ordinary page reference to a Form XObject.

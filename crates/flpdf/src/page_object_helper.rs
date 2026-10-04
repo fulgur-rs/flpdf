@@ -544,8 +544,17 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// is present, matching qpdf's `getFormXObjectForPage`
     /// (`libqpdf/QPDFPageObjectHelper.cc:706-734`). qpdf accepts Form handles
     /// here as well; the provider reads `/Contents` from the original handle
-    /// only when the new stream is materialized.
-    pub fn get_form_xobject_for_page(
+    /// only when the new stream is materialized. The no-option call defaults
+    /// `handle_transformations` to `true`.
+    pub fn get_form_xobject_for_page(&mut self) -> Result<ObjectHandle> {
+        self.get_form_xobject_for_page_with_options(true)
+    }
+
+    /// Convert this indirect page or Form handle into a Form XObject with an
+    /// explicit qpdf transformation option. Use
+    /// [`get_form_xobject_for_page`](Self::get_form_xobject_for_page) for the
+    /// default `true` behavior.
+    pub fn get_form_xobject_for_page_with_options(
         &mut self,
         handle_transformations: bool,
     ) -> Result<ObjectHandle> {
@@ -604,7 +613,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let rotate = self.get_attribute(b"/Rotate", false)?;
         let user_unit = self.get_attribute(b"/UserUnit", false)?;
         if handle_transformations && (!rotate.try_is_null()? || !user_unit.try_is_null()?) {
-            let matrix = self.get_matrix_for_transformations(false)?;
+            let matrix = self.get_matrix_for_transformations()?;
             dict.replace_key(
                 b"/Matrix",
                 ObjectHandle::array(
@@ -620,9 +629,17 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         Ok(form)
     }
 
-    /// Return qpdf's page/Form transformation matrix, using the effective
-    /// `/TrimBox`, inherited `/Rotate`, and leaf `/UserUnit`.
-    pub fn get_matrix_for_transformations(&mut self, invert: bool) -> Result<Matrix> {
+    /// Return qpdf's page/Form transformation matrix using the effective
+    /// `/TrimBox`, inherited `/Rotate`, and leaf `/UserUnit`, with qpdf's
+    /// default `invert = false` behavior.
+    pub fn get_matrix_for_transformations(&mut self) -> Result<Matrix> {
+        self.get_matrix_for_transformations_with_options(false)
+    }
+
+    /// Return qpdf's transformation matrix with an explicit inversion flag.
+    /// Use [`get_matrix_for_transformations`](Self::get_matrix_for_transformations)
+    /// for the default `false` behavior.
+    pub fn get_matrix_for_transformations_with_options(&mut self, invert: bool) -> Result<Matrix> {
         let bbox = self.get_trim_box()?;
         let Some(rect) = self.rectangle_for_matrix(&bbox)? else {
             return Ok(Matrix::default());
@@ -659,8 +676,20 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// destination inverse transformation comes from this page helper. A
     /// malformed or degenerate Form returns `Ok(None)`, matching qpdf's empty
     /// `QPDFMatrix` result from `getMatrixForFormXObjectPlacement`
-    /// (`libqpdf/QPDFPageObjectHelper.cc:764-838`).
+    /// (`libqpdf/QPDFPageObjectHelper.cc:764-838`). The no-option method uses
+    /// qpdf's defaults `invert_transformations = true`, `allow_shrink = true`,
+    /// and `allow_expand = false`.
     pub fn get_matrix_for_form_xobject_placement(
+        &mut self,
+        form: ObjectHandle,
+        rect: Rectangle,
+    ) -> Result<Option<Matrix>> {
+        self.get_matrix_for_form_xobject_placement_with_options(form, rect, true, true, false)
+    }
+
+    /// Compute qpdf's placement matrix with explicit transformation and
+    /// scaling flags. Use the no-option method for qpdf defaults.
+    pub fn get_matrix_for_form_xobject_placement_with_options(
         &mut self,
         form: ObjectHandle,
         rect: Rectangle,
@@ -686,7 +715,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let form_matrix = form_dict.try_get_key(b"/Matrix")?;
         let form_matrix = matrix_from_handle(&form_matrix)?.unwrap_or_default();
         let transform = if invert_transformations {
-            self.get_matrix_for_transformations(true)?
+            self.get_matrix_for_transformations_with_options(true)?
         } else {
             Matrix::default()
         };
@@ -729,8 +758,25 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// Build qpdf's `placeFormXObject` content fragment and return the matrix
     /// used to place the Form. `name` is the complete PDF resource name,
     /// including its leading slash. A malformed or degenerate Form uses
-    /// qpdf's identity-matrix fallback.
+    /// qpdf's identity-matrix fallback. The no-option method uses qpdf's
+    /// defaults `invert_transformations = true`, `allow_shrink = true`, and
+    /// `allow_expand = false`.
     pub fn place_form_xobject(
+        &mut self,
+        form: ObjectHandle,
+        name: &str,
+        rect: Rectangle,
+    ) -> Result<(String, Matrix)> {
+        self.place_form_xobject_with_options(form, name, rect, true, true, false)
+    }
+
+    /// Build qpdf's `placeFormXObject` fragment with explicit transformation
+    /// and scaling flags. Use the no-option method for qpdf defaults.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors qpdf's placeFormXObject flag parameters"
+    )]
+    pub fn place_form_xobject_with_options(
         &mut self,
         form: ObjectHandle,
         name: &str,
@@ -740,7 +786,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         allow_expand: bool,
     ) -> Result<(String, Matrix)> {
         let matrix = self
-            .get_matrix_for_form_xobject_placement(
+            .get_matrix_for_form_xobject_placement_with_options(
                 form,
                 rect,
                 invert_transformations,
@@ -754,12 +800,28 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
 
     /// Variant of [`Self::place_form_xobject`] that writes the placement
     /// matrix into the caller's slot, matching qpdf's overload that accepts a
-    /// `QPDFMatrix&`.
+    /// `QPDFMatrix&`. This no-option form uses qpdf's defaults
+    /// `invert_transformations = true`, `allow_shrink = true`, and
+    /// `allow_expand = false`.
+    pub fn place_form_xobject_with_matrix(
+        &mut self,
+        form: ObjectHandle,
+        name: &str,
+        rect: Rectangle,
+        matrix: &mut Matrix,
+    ) -> Result<String> {
+        self.place_form_xobject_with_matrix_with_options(
+            form, name, rect, matrix, true, true, false,
+        )
+    }
+
+    /// Variant of [`Self::place_form_xobject_with_matrix`] with explicit
+    /// transformation and scaling flags.
     #[allow(
         clippy::too_many_arguments,
-        reason = "mirrors qpdf's placeFormXObject overload and keeps placement flags explicit"
+        reason = "mirrors qpdf's placeFormXObject overload and retains all flags"
     )]
-    pub fn place_form_xobject_with_matrix(
+    pub fn place_form_xobject_with_matrix_with_options(
         &mut self,
         form: ObjectHandle,
         name: &str,
@@ -769,7 +831,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         allow_shrink: bool,
         allow_expand: bool,
     ) -> Result<String> {
-        let (fragment, computed) = self.place_form_xobject(
+        let (fragment, computed) = self.place_form_xobject_with_options(
             form,
             name,
             rect,
@@ -1998,7 +2060,7 @@ mod tests {
         let mut helper = PageObjectHelper::from_object_handle(direct_page_handle(), &mut pdf);
 
         let error = helper
-            .get_form_xobject_for_page(true)
+            .get_form_xobject_for_page()
             .expect_err("qpdf rejects getFormXObjectForPage on a direct page");
         assert!(
             error.to_string().contains(
@@ -2175,7 +2237,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
 
         let form = helper_for_ref(&mut pdf, ObjectRef::new(3, 0))
-            .get_form_xobject_for_page(false)
+            .get_form_xobject_for_page_with_options(false)
             .expect("false transformation variant should still create a Form XObject");
 
         assert!(form.is_form_xobject().expect("classify Form XObject"));

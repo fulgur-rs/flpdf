@@ -79,13 +79,13 @@ fn the_production_wrapper_preserves_raw_identity_through_conversion() {
          wrapper needs it."
     );
 
-    // Exactly one conversion, with qpdf's `handle_transformations = true`. A
+    // Exactly one conversion through the no-option qpdf-default call. A
     // second call would convert the page again, which qpdf's
     // `getFormXObjectForPage` caller never does.
     assert_eq!(
         audit.helper_conversions,
         vec![true],
-        "the wrapper must call PageObjectHelper::get_form_xobject_for_page(true) exactly once \
+        "the wrapper must call PageObjectHelper::get_form_xobject_for_page() exactly once \
          on a helper constructed from its raw page handle: {audit:?}"
     );
 
@@ -139,8 +139,8 @@ struct WrapperAudit {
     /// something else.
     live_parameters: Vec<String>,
     /// Every `get_form_xobject_for_page` call on a recognized helper, with
-    /// whether it passed `true`. One canonical call is the contract; a second
-    /// conversion is not.
+    /// whether it uses qpdf's default arguments. One canonical call is the
+    /// contract; a second conversion is not.
     helper_conversions: Vec<bool>,
     /// Bindings this body obtained from `PageObjectHelper::from_object_handle(...)`.
     helper_bindings: Vec<String>,
@@ -182,7 +182,7 @@ impl<'ast> Visit<'ast> for WrapperAudit {
             return;
         }
         // Rust resolves the initializer before the new binding enters scope,
-        // so `let helper = helper.get_form_xobject_for_page(true)?;` still
+        // so `let helper = helper.get_form_xobject_for_page()?;` still
         // calls on the *outer* helper. Walk the initializer first, then
         // rebind.
         if let Some(init) = local.init.as_ref() {
@@ -324,7 +324,7 @@ impl<'ast> Visit<'ast> for WrapperAudit {
         let method = unraw(&call.method);
         let on_helper = receiver_is_helper(&call.receiver, &self.helper_bindings);
         if on_helper && method == HELPER_METHOD {
-            self.helper_conversions.push(passes_true(call));
+            self.helper_conversions.push(uses_qpdf_default(call));
         }
         self.calls.insert(method);
         syn::visit::visit_expr_method_call(self, call);
@@ -526,16 +526,9 @@ fn receiver_is_helper(receiver: &syn::Expr, bindings: &[String]) -> bool {
     }
 }
 
-/// qpdf's `getFormXObjectForPage(handle_transformations = true)` is the
-/// canonical call; `false` skips the transformation handling.
-fn passes_true(call: &syn::ExprMethodCall) -> bool {
-    matches!(
-        call.args.first(),
-        Some(syn::Expr::Lit(syn::ExprLit {
-            lit: syn::Lit::Bool(syn::LitBool { value: true, .. }),
-            ..
-        }))
-    )
+/// The no-option call uses qpdf's `handle_transformations = true` default.
+fn uses_qpdf_default(call: &syn::ExprMethodCall) -> bool {
+    call.args.is_empty()
 }
 
 /// The last two segments of a path, so `PageObjectHelper::from_object_handle` and
