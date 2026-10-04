@@ -1429,26 +1429,6 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         Ok(result)
     }
 
-    /// Return image XObjects from this target and all nested Forms.
-    pub fn get_images_recursive(&mut self) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
-        let mut result = BTreeMap::new();
-        self.for_each_image(true, |object, _, key| {
-            result.insert(key, object);
-            Ok(())
-        })?;
-        Ok(result)
-    }
-
-    /// Return Form XObjects from this target and all nested Forms.
-    pub fn get_form_xobjects_recursive(&mut self) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
-        let mut result = BTreeMap::new();
-        self.for_each_form_xobject(true, |object, _, key| {
-            result.insert(key, object);
-            Ok(())
-        })?;
-        Ok(result)
-    }
-
     // -----------------------------------------------------------------------
     // get_annotations
     // -----------------------------------------------------------------------
