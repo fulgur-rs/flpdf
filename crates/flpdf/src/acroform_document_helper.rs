@@ -529,14 +529,14 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///
     /// This is the Rust counterpart of
     /// `QPDFAcroFormDocumentHelper::getWidgetAnnotationsForPage(QPDFPageObjectHelper)`,
-    /// which delegates to `QPDFPageObjectHelper::getAnnotations("/Widget")`
+    /// which delegates to `QPDFPageObjectHelper::getAnnotations("Widget")`
     /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:197-201`).
     pub fn get_widget_annotations_for_page(
         &mut self,
         page_handle: ObjectHandle,
     ) -> Result<Vec<ObjectHandle>> {
         let mut page = PageObjectHelper::from_object_handle(page_handle, self.pdf);
-        page.get_annotation_handles(Some(b"/Widget"))
+        page.get_annotation_handles(Some(b"Widget"))
     }
 
     /// Return the top-level form fields associated with Widget annotations
@@ -665,7 +665,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 for page_handle in page_handles {
                     let widgets = {
                         let mut page = PageObjectHelper::from_object_handle(page_handle, self.pdf);
-                        page.get_annotation_handles(Some(b"/Widget"))?
+                        page.get_annotation_handles(Some(b"Widget"))?
                     };
                     for annotation in widgets {
                         annotation.try_dereference()?;

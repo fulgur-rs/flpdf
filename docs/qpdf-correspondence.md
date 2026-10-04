@@ -2039,6 +2039,17 @@ APIs to `invert_transformations = true`, `allow_shrink = true`, and
 `*_with_options` methods preserve explicit flags. The geometry and placement
 algorithms remain the same qpdf routes (`QPDFPageObjectHelper.cc:663-861`).
 
+### `QPDFPageObjectHelper::getAnnotations` default and subtype (`flpdf-8t70z`)
+
+qpdf declares an empty-string default and compares a non-empty subtype string
+exactly with the decoded PDF name (`QPDFPageObjectHelper.hh:211`,
+`QPDFPageObjectHelper.cc:439-454`, `QPDFObjectHandle.cc:461-466`). A live
+qpdf 11.9.0 C++ probe returned 4 annotations for the no-argument/empty-string
+form; `Widget`, `Text`, and `Link` each selected one; slash-prefixed strings,
+`/`, and `Nope` selected none. flpdf's no-argument `get_annotations()` maps the
+default, while `get_annotations_with_subtype` passes decoded subtype bytes to
+`try_is_dictionary_of_type(b"", subtype)` without slash normalization.
+
 `PageDocumentHelper::flatten_annotations` は qpdf と同じく AcroForm の NeedAppearances 判定後に repaired page list を得て、各 page の effective `/Resources`・appearance 処理・annotation removal を行う。qpdf は `getAllPages()` が返した raw `QPDFPageObjectHelper` を `flattenAnnotationsForPage` まで保持する（`QPDFPageDocumentHelper.cc:55-76`）。flpdf も `PageDocumentHelper::get_all_pages()` の raw `ObjectHandle` を resource materialization、rotation lookup、annotation flattening、content insertion へ渡し、`ObjectRef` projection を通さない。raw identity `(17, 65535)` 上の eligible appearance flattening は `page_annotation_flatten::tests::public_qpdf_flatten_copies_a_raw_generation_page_handle` で固定する。
 `flpdf-hrgj` closes the remaining page-operation consumer boundary: primary
 raw label copies register their foreign-map provenance as

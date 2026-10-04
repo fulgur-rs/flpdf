@@ -35,7 +35,7 @@
 //! let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
 //! if let Some(page) = pages.into_iter().next() {
 //!     let mut page_helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-//!     let annots = page_helper.get_annotations(None)?;
+//!     let annots = page_helper.get_annotations()?;
 //!     drop(page_helper);
 //!     for mut annot in annots {
 //!         let subtype = annot.get_subtype()?;
