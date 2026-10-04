@@ -3751,9 +3751,10 @@ impl ObjectHandle {
 
     /// Return whether this handle is exactly a four-number array without
     /// emitting type warnings (`libqpdf/QPDFObjectHandle.cc:789-799`).
-    /// qpdf checks indices 0 through 3 before comparing the array length;
-    /// preserve that order so lazy child resolution and parser diagnostics
-    /// occur before an oversized array returns `false`.
+    /// qpdf checks indices 0 through 3 before comparing the array length.
+    /// Short arrays inspect their available slots before the first missing
+    /// slot fails; oversized arrays resolve all four before length rejection.
+    /// Preserve this order for lazy child resolution and parser diagnostics.
     pub fn try_is_rectangle(&self) -> Result<bool> {
         let Some(items) = self.try_as_array()? else {
             return Ok(false);
@@ -3824,9 +3825,10 @@ impl ObjectHandle {
 
     /// Return whether this handle is exactly a six-number array without
     /// emitting type warnings (`libqpdf/QPDFObjectHandle.cc:801-811`).
-    /// qpdf checks indices 0 through 5 before comparing the array length;
-    /// preserve that order so lazy child resolution and parser diagnostics
-    /// occur before an oversized array returns `false`.
+    /// qpdf checks indices 0 through 5 before comparing the array length.
+    /// Short arrays inspect their available slots before the first missing
+    /// slot fails; oversized arrays resolve all six before length rejection.
+    /// Preserve this order for lazy child resolution and parser diagnostics.
     pub fn try_is_matrix(&self) -> Result<bool> {
         let Some(items) = self.try_as_array()? else {
             return Ok(false);

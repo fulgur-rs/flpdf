@@ -101,6 +101,25 @@ fn rectangle_predicate_checks_indirect_components_before_oversized_length() {
 }
 
 #[test]
+fn rectangle_predicate_checks_available_components_before_missing_slot() {
+    let mut pdf = pdf_with_geometry_arrays(
+        "[2 0 R 4 0 R 5 0 R]",
+        "[2 0 R 4 0 R 5 0 R 6 0 R 7 0 R]",
+        "2",
+    );
+    let (rectangle, children) = array_and_children(&mut pdf, b"/Rectangle");
+    assert_eq!(children.len(), 3);
+    assert!(children.iter().all(|child| !child.is_resolved()));
+
+    assert!(!rectangle
+        .try_is_rectangle()
+        .expect("an undersized array is not a rectangle"));
+
+    assert!(children.iter().all(ObjectHandle::is_resolved));
+    assert!(pdf.repair_diagnostics().entries().is_empty());
+}
+
+#[test]
 fn matrix_predicate_checks_indirect_components_before_oversized_length() {
     let mut pdf = pdf_with_geometry_arrays(
         "[2 0 R 4 0 R 5 0 R 6 0 R 10]",
@@ -116,6 +135,25 @@ fn matrix_predicate_checks_indirect_components_before_oversized_length() {
         .expect("an oversized array is not a matrix"));
 
     assert!(children[..6].iter().all(ObjectHandle::is_resolved));
+    assert!(pdf.repair_diagnostics().entries().is_empty());
+}
+
+#[test]
+fn matrix_predicate_checks_available_components_before_missing_slot() {
+    let mut pdf = pdf_with_geometry_arrays(
+        "[2 0 R 4 0 R 5 0 R 6 0 R 10]",
+        "[2 0 R 4 0 R 5 0 R 6 0 R 7 0 R]",
+        "2",
+    );
+    let (matrix, children) = array_and_children(&mut pdf, b"/Matrix");
+    assert_eq!(children.len(), 5);
+    assert!(children.iter().all(|child| !child.is_resolved()));
+
+    assert!(!matrix
+        .try_is_matrix()
+        .expect("an undersized array is not a matrix"));
+
+    assert!(children.iter().all(ObjectHandle::is_resolved));
     assert!(pdf.repair_diagnostics().entries().is_empty());
 }
 
