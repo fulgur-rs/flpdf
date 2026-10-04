@@ -734,8 +734,8 @@ fn page_box_or_err<R: Read + Seek>(
 ) -> Result<Rectangle> {
     let mut helper = PageObjectHelper::from_object_handle(page.clone(), pdf);
     let value = match kind {
-        BoxKind::Media => helper.get_media_box(false)?,
-        BoxKind::Trim => helper.get_trim_box(false, false)?,
+        BoxKind::Media => helper.get_media_box()?,
+        BoxKind::Trim => helper.get_trim_box()?,
     };
     // Resolving accessor (matches the sibling `try_is_null()` calls inside
     // `get_crop_box`/`get_bleed_box`/`get_trim_box` in page_object_helper.rs

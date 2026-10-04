@@ -40,7 +40,7 @@
 //! let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
 //! if let Some(page) = pages.into_iter().next() {
 //!     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-//!     let media_box = helper.get_media_box(false)?;
+//!     let media_box = helper.get_media_box()?;
 //!     let rectangle = media_box.try_get_array_as_rectangle()?;
 //!     println!("MediaBox: {:?}", rectangle);
 //! }
@@ -432,13 +432,33 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         get_attribute_for_target(self.object.clone(), key, copy_if_shared, &description)
     }
 
-    /// Return the effective `/MediaBox` handle.
-    pub fn get_media_box(&mut self, copy_if_shared: bool) -> Result<ObjectHandle> {
+    /// Return the effective `/MediaBox` handle with qpdf's default
+    /// `copy_if_shared = false` behavior.
+    pub fn get_media_box(&mut self) -> Result<ObjectHandle> {
+        self.get_media_box_with_options(false)
+    }
+
+    /// Return the effective `/MediaBox` handle with explicit qpdf copy options.
+    ///
+    /// This is the Rust spelling for qpdf's `getMediaBox(copy_if_shared)`;
+    /// Rust has no default arguments, so the no-option form is
+    /// [`get_media_box`](Self::get_media_box).
+    pub fn get_media_box_with_options(&mut self, copy_if_shared: bool) -> Result<ObjectHandle> {
         self.get_attribute(b"/MediaBox", copy_if_shared)
     }
 
-    /// Return the effective `/CropBox` handle, falling back to `/MediaBox`.
-    pub fn get_crop_box(
+    /// Return the effective `/CropBox` handle, falling back to `/MediaBox`,
+    /// with qpdf's default copy flags (`false`, `false`).
+    pub fn get_crop_box(&mut self) -> Result<ObjectHandle> {
+        self.get_crop_box_with_options(false, false)
+    }
+
+    /// Return the effective `/CropBox` handle with explicit qpdf copy options.
+    ///
+    /// This is the Rust spelling for qpdf's
+    /// `getCropBox(copy_if_shared, copy_if_fallback)`; Rust has no default
+    /// arguments, so the no-option form is [`get_crop_box`](Self::get_crop_box).
+    pub fn get_crop_box_with_options(
         &mut self,
         copy_if_shared: bool,
         copy_if_fallback: bool,
@@ -447,12 +467,18 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         if !result.try_is_null()? {
             return Ok(result);
         }
-        let fallback = self.get_media_box(copy_if_shared)?;
+        let fallback = self.get_media_box_with_options(copy_if_shared)?;
         self.apply_fallback(b"/CropBox", fallback, copy_if_fallback)
     }
 
-    /// Return the effective `/BleedBox` handle, falling back to `/CropBox`.
-    pub fn get_bleed_box(
+    /// Return the effective `/BleedBox` handle, falling back to `/CropBox`,
+    /// with qpdf's default copy flags (`false`, `false`).
+    pub fn get_bleed_box(&mut self) -> Result<ObjectHandle> {
+        self.get_bleed_box_with_options(false, false)
+    }
+
+    /// Return the effective `/BleedBox` handle with explicit qpdf copy options.
+    pub fn get_bleed_box_with_options(
         &mut self,
         copy_if_shared: bool,
         copy_if_fallback: bool,
@@ -461,12 +487,18 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         if !result.try_is_null()? {
             return Ok(result);
         }
-        let fallback = self.get_crop_box(copy_if_shared, copy_if_fallback)?;
+        let fallback = self.get_crop_box_with_options(copy_if_shared, copy_if_fallback)?;
         self.apply_fallback(b"/BleedBox", fallback, copy_if_fallback)
     }
 
-    /// Return the effective `/TrimBox` handle, falling back to `/CropBox`.
-    pub fn get_trim_box(
+    /// Return the effective `/TrimBox` handle, falling back to `/CropBox`,
+    /// with qpdf's default copy flags (`false`, `false`).
+    pub fn get_trim_box(&mut self) -> Result<ObjectHandle> {
+        self.get_trim_box_with_options(false, false)
+    }
+
+    /// Return the effective `/TrimBox` handle with explicit qpdf copy options.
+    pub fn get_trim_box_with_options(
         &mut self,
         copy_if_shared: bool,
         copy_if_fallback: bool,
@@ -475,12 +507,18 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         if !result.try_is_null()? {
             return Ok(result);
         }
-        let fallback = self.get_crop_box(copy_if_shared, copy_if_fallback)?;
+        let fallback = self.get_crop_box_with_options(copy_if_shared, copy_if_fallback)?;
         self.apply_fallback(b"/TrimBox", fallback, copy_if_fallback)
     }
 
-    /// Return the effective `/ArtBox` handle, falling back to `/CropBox`.
-    pub fn get_art_box(
+    /// Return the effective `/ArtBox` handle, falling back to `/CropBox`,
+    /// with qpdf's default copy flags (`false`, `false`).
+    pub fn get_art_box(&mut self) -> Result<ObjectHandle> {
+        self.get_art_box_with_options(false, false)
+    }
+
+    /// Return the effective `/ArtBox` handle with explicit qpdf copy options.
+    pub fn get_art_box_with_options(
         &mut self,
         copy_if_shared: bool,
         copy_if_fallback: bool,
@@ -489,7 +527,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         if !result.try_is_null()? {
             return Ok(result);
         }
-        let fallback = self.get_crop_box(copy_if_shared, copy_if_fallback)?;
+        let fallback = self.get_crop_box_with_options(copy_if_shared, copy_if_fallback)?;
         self.apply_fallback(b"/ArtBox", fallback, copy_if_fallback)
     }
 
@@ -531,7 +569,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         dict.replace_key(b"/Resources", resources)?;
         let group = self.get_attribute(b"/Group", false)?.shallow_copy()?;
         dict.replace_key(b"/Group", group)?;
-        let bbox = self.get_trim_box(false, false)?.shallow_copy()?;
+        let bbox = self.get_trim_box()?.shallow_copy()?;
         if rectangle_from_handle(&bbox)?.is_none() {
             self.object.warn_if_possible(
                 "bounding box is invalid; form XObject created from page will not work",
@@ -581,7 +619,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// Return qpdf's page/Form transformation matrix, using the effective
     /// `/TrimBox`, inherited `/Rotate`, and leaf `/UserUnit`.
     pub fn get_matrix_for_transformations(&mut self, invert: bool) -> Result<Matrix> {
-        let bbox = self.get_trim_box(false, false)?;
+        let bbox = self.get_trim_box()?;
         let Some(rect) = self.rectangle_for_matrix(&bbox)? else {
             return Ok(Matrix::default());
         };
@@ -2017,7 +2055,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
         let mut helper = helper_for_ref(&mut pdf, ObjectRef::new(leaf_ref, 0));
         let media_box = helper
-            .get_media_box(false)
+            .get_media_box()
             .expect("the 100th ancestor's /MediaBox must be reachable");
         assert!(!media_box.try_is_null().expect("resolved handle"));
     }
@@ -2029,7 +2067,7 @@ mod tests {
         let mut helper = PageObjectHelper::from_object_handle(object, &mut pdf);
 
         let error = helper
-            .get_media_box(false)
+            .get_media_box()
             .expect_err("an unowned indirect handle must not be treated as a direct page");
         assert!(
             error.to_string().contains("belongs to a dropped PDF"),

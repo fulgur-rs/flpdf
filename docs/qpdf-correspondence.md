@@ -2006,6 +2006,18 @@ return the stored `QPDFObjectHandle` directly
 preserving direct handles and raw indirect identity without resolving or
 projecting through `ObjectRef`.
 
+### `QPDFPageObjectHelper` page-box getter defaults (`flpdf-6ik2q.55`)
+
+qpdf 11.9.0 declares `getMediaBox(copy_if_shared = false)` and
+`getCropBox`/`getBleedBox`/`getTrimBox`/`getArtBox` with both copy flags defaulting
+to `false` (`QPDFPageObjectHelper.hh:142-158`); qpdf's own overlay example calls
+`getTrimBox()` without arguments (`examples/pdf-overlay-page.cc:49`). Since Rust
+has no default arguments, flpdf's public `get_*_box()` methods expose those same
+defaults, while the separately named `get_*_box_with_options()` methods preserve
+qpdf's explicit copy/fallback controls. The implementation continues to route
+through the same raw-handle `get_attribute` and ordered fallback operations
+(`QPDFPageObjectHelper.cc:218-317`).
+
 `PageDocumentHelper::flatten_annotations` は qpdf と同じく AcroForm の NeedAppearances 判定後に repaired page list を得て、各 page の effective `/Resources`・appearance 処理・annotation removal を行う。qpdf は `getAllPages()` が返した raw `QPDFPageObjectHelper` を `flattenAnnotationsForPage` まで保持する（`QPDFPageDocumentHelper.cc:55-76`）。flpdf も `PageDocumentHelper::get_all_pages()` の raw `ObjectHandle` を resource materialization、rotation lookup、annotation flattening、content insertion へ渡し、`ObjectRef` projection を通さない。raw identity `(17, 65535)` 上の eligible appearance flattening は `page_annotation_flatten::tests::public_qpdf_flatten_copies_a_raw_generation_page_handle` で固定する。
 `flpdf-hrgj` closes the remaining page-operation consumer boundary: primary
 raw label copies register their foreign-map provenance as

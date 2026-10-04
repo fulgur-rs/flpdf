@@ -503,72 +503,66 @@ pub(crate) fn run_test_94<R: Read + Seek>(
     assert!(p1.try_get_key(b"/MediaBox")?.try_is_null()?);
     {
         let mut page = PageObjectHelper::from_object_handle(p1.clone(), pdf);
-        assert!(page.get_media_box(false)?.is_same_object_as(&root_media));
-        assert!(page
-            .get_crop_box(false, false)?
-            .is_same_object_as(&root_media));
-        assert!(page
-            .get_bleed_box(false, false)?
-            .is_same_object_as(&root_media));
-        assert!(page
-            .get_trim_box(false, false)?
-            .is_same_object_as(&root_media));
-        assert!(page
-            .get_art_box(false, false)?
-            .is_same_object_as(&root_media));
+        assert!(page.get_media_box()?.is_same_object_as(&root_media));
+        assert!(page.get_crop_box()?.is_same_object_as(&root_media));
+        assert!(page.get_bleed_box()?.is_same_object_as(&root_media));
+        assert!(page.get_trim_box()?.is_same_object_as(&root_media));
+        assert!(page.get_art_box()?.is_same_object_as(&root_media));
 
-        let p1_new_art = page.get_art_box(false, true)?;
+        let p1_new_art = page.get_art_box_with_options(false, true)?;
         assert_eq!(p1_new_art.unparse()?, root_media_unparse);
         assert!(!p1_new_art.is_same_object_as(&root_media));
 
-        let p1_new_crop = page.get_crop_box(false, false)?;
+        let p1_new_crop = page.get_crop_box()?;
         assert!(!p1_new_crop.is_same_object_as(&root_media));
         assert!(!p1_new_crop.is_same_object_as(&p1_new_art));
         assert_eq!(p1_new_crop.unparse()?, root_media_unparse);
 
-        assert!(page.get_media_box(false)?.is_same_object_as(&root_media));
-        assert!(page
-            .get_trim_box(false, false)?
-            .is_same_object_as(&p1_new_crop));
+        assert!(page.get_media_box()?.is_same_object_as(&root_media));
+        assert!(page.get_trim_box()?.is_same_object_as(&p1_new_crop));
 
-        let p1_effective_media = page.get_media_box(true)?;
+        let p1_effective_media = page.get_media_box_with_options(true)?;
         assert_eq!(p1_effective_media.unparse()?, root_media_unparse);
         assert!(!p1_effective_media.is_same_object_as(&root_media));
     }
 
     {
         let mut page = PageObjectHelper::from_object_handle(pages[1].clone(), pdf);
-        assert!(page.get_media_box(false)?.is_same_object_as(&root_media));
-        let p2_crop = page.get_crop_box(false, false)?;
-        let p2_new_trim = page.get_trim_box(false, true)?;
+        assert!(page.get_media_box()?.is_same_object_as(&root_media));
+        let p2_crop = page.get_crop_box()?;
+        let p2_new_trim = page.get_trim_box_with_options(false, true)?;
         assert_eq!(p2_new_trim.unparse()?, p2_crop.unparse()?);
         assert!(!p2_new_trim.is_same_object_as(&p2_crop));
-        assert!(page.get_media_box(false)?.is_same_object_as(&root_media));
+        assert!(page.get_media_box()?.is_same_object_as(&root_media));
     }
 
     {
         let mut page = PageObjectHelper::from_object_handle(pages[2].clone(), pdf);
-        let p3_media = page.get_media_box(false)?;
-        let p3_crop = page.get_crop_box(false, false)?;
-        assert!(page.get_media_box(true)?.is_same_object_as(&p3_media));
-        assert!(page.get_crop_box(true, true)?.is_same_object_as(&p3_crop));
+        let p3_media = page.get_media_box()?;
+        let p3_crop = page.get_crop_box()?;
+        assert!(page
+            .get_media_box_with_options(true)?
+            .is_same_object_as(&p3_media));
+        assert!(page
+            .get_crop_box_with_options(true, true)?
+            .is_same_object_as(&p3_crop));
     }
 
     {
         let p4 = pages[3].clone();
         let p4_orig_crop = p4.try_get_key(b"/CropBox")?;
         let mut page = PageObjectHelper::from_object_handle(p4, pdf);
-        let p4_crop = page.get_crop_box(false, false)?;
+        let p4_crop = page.get_crop_box()?;
         assert!(p4_orig_crop.is_same_object_as(&p4_crop));
-        let p4_bleed1 = page.get_bleed_box(false, false)?;
-        let p4_bleed2 = page.get_bleed_box(false, true)?;
+        let p4_bleed1 = page.get_bleed_box()?;
+        let p4_bleed2 = page.get_bleed_box_with_options(false, true)?;
         assert!(!p4_bleed1.is_same_object_as(&p4_crop));
         assert!(p4_bleed1.is_same_object_as(&p4_bleed2));
-        let p4_art1 = page.get_art_box(false, false)?;
+        let p4_art1 = page.get_art_box()?;
         assert!(p4_art1.is_same_object_as(&p4_crop));
-        let p4_art2 = page.get_art_box(false, true)?;
+        let p4_art2 = page.get_art_box_with_options(false, true)?;
         assert!(!p4_art2.is_same_object_as(&p4_crop));
-        let p4_new_crop = page.get_crop_box(true, false)?;
+        let p4_new_crop = page.get_crop_box_with_options(true, false)?;
         assert!(!p4_new_crop.is_same_object_as(&p4_orig_crop));
         assert!(p4_orig_crop.is_indirect());
         assert!(!p4_new_crop.is_indirect());
@@ -577,16 +571,12 @@ pub(crate) fn run_test_94<R: Read + Seek>(
 
     {
         let mut page = PageObjectHelper::from_object_handle(pages[4].clone(), pdf);
-        assert!(page.get_media_box(false)?.is_same_object_as(&root_media));
-        assert!(page
-            .get_crop_box(false, false)?
-            .is_same_object_as(&root_media));
-        assert!(page
-            .get_bleed_box(false, false)?
-            .is_same_object_as(&root_media));
-        let p5_new_bleed = page.get_bleed_box(true, true)?;
-        let p5_new_media = page.get_media_box(false)?;
-        let p5_new_crop = page.get_crop_box(false, false)?;
+        assert!(page.get_media_box()?.is_same_object_as(&root_media));
+        assert!(page.get_crop_box()?.is_same_object_as(&root_media));
+        assert!(page.get_bleed_box()?.is_same_object_as(&root_media));
+        let p5_new_bleed = page.get_bleed_box_with_options(true, true)?;
+        let p5_new_media = page.get_media_box()?;
+        let p5_new_crop = page.get_crop_box()?;
         assert!(!p5_new_media.is_same_object_as(&root_media));
         assert!(!p5_new_crop.is_same_object_as(&root_media));
         assert!(!p5_new_crop.is_same_object_as(&p5_new_media));
