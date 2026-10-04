@@ -1391,20 +1391,14 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         target.add_content_token_filter(filter)
     }
 
-    /// Remove unused `/Font` and `/XObject` entries from this page or Form's
+    /// Remove unused `/Font` and `/XObject` entries from this target's
     /// resource scope through the canonical ObjectHandle parser route.
     ///
     /// This is qpdf's `removeUnreferencedResources`
     /// (`libqpdf/QPDFPageObjectHelper.cc:539-649`). The document-level
     /// `PageDocumentHelper` facade uses this same per-target operation.
     pub fn remove_unreferenced_resources(&mut self) -> Result<()> {
-        let (target, is_form) = self.resolved_attribute_target()?;
-        if is_form {
-            crate::resources::remove_unreferenced_resources_on_form(self.pdf, target)
-        } else {
-            let page_ref = self.require_page_ref()?;
-            crate::resources::remove_unreferenced_resources_on_page(self.pdf, page_ref)
-        }
+        crate::resources::remove_unreferenced_resources_on_target(self.pdf, self.object.clone())
     }
 
     /// Convert inline images into ordinary Image XObjects.

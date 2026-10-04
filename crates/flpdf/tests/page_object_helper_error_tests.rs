@@ -292,6 +292,154 @@ fn get_media_box_accepts_an_untyped_dictionary_like_qpdf() {
     assert_eq!(media_box.try_get_array_n_items().unwrap(), 4);
 }
 
+#[test]
+fn remove_unreferenced_resources_accepts_direct_dictionary_target_like_qpdf() {
+    let mut pdf = Pdf::empty().unwrap();
+    let xobjects = ObjectHandle::dictionary(vec![(
+        b"/Unused".to_vec(),
+        ObjectHandle::dictionary(Vec::new()),
+    )]);
+    let target = ObjectHandle::dictionary(vec![(
+        b"/Resources".to_vec(),
+        ObjectHandle::dictionary(vec![(b"/XObject".to_vec(), xobjects.clone())]),
+    )]);
+    let mut helper = PageObjectHelper::from_object_handle(target, &mut pdf);
+
+    helper
+        .remove_unreferenced_resources()
+        .expect("qpdf removes unused resources from a direct dictionary target");
+    assert!(!xobjects.try_has_key(b"/Unused").unwrap());
+}
+
+#[test]
+fn remove_unreferenced_resources_preserves_unused_fonts_when_content_name_is_unresolved_like_qpdf()
+{
+    let bytes = single_page(
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 30] /Resources << /Font << /Unused 4 0 R >> >> /Contents 5 0 R >>",
+        &[
+            (4, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()),
+            (5, "<< /Length 15 >>\nstream\n/Missing 12 Tf\nendstream".into()),
+        ],
+    );
+    let (mut pdf, page_ref) = helper_for(bytes);
+    let page = pdf.get_object_handle(page_ref);
+    let mut helper = PageObjectHelper::from_object_handle(page.clone(), &mut pdf);
+
+    helper.remove_unreferenced_resources().unwrap();
+
+    let resources = page.try_get_key(b"/Resources").unwrap();
+    let fonts = resources.try_get_key(b"/Font").unwrap();
+    assert!(fonts.try_has_key(b"/Unused").unwrap());
+}
+
+#[test]
+fn remove_unreferenced_resources_prunes_after_an_unconsumed_name_like_qpdf() {
+    let bytes = single_page(
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 30] /Resources << /Font << /Unused 4 0 R >> >> /Contents 5 0 R >>",
+        &[
+            (4, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()),
+            (5, "<< /Length 10 >>\nstream\n/Dangling\nendstream".into()),
+        ],
+    );
+    let (mut pdf, page_ref) = helper_for(bytes);
+    let page = pdf.get_object_handle(page_ref);
+    let mut helper = PageObjectHelper::from_object_handle(page.clone(), &mut pdf);
+
+    helper.remove_unreferenced_resources().unwrap();
+
+    let resources = page.try_get_key(b"/Resources").unwrap();
+    let fonts = resources.try_get_key(b"/Font").unwrap();
+    assert!(!fonts.try_has_key(b"/Unused").unwrap());
+}
+
+#[test]
+fn remove_unreferenced_resources_does_not_visit_child_removed_by_parent_like_qpdf() {
+    let outer_form = "<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources 7 0 R /Length 3 >>\nstream\nq Q\nendstream";
+    let malformed_child = "<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << >> /Length 9 /Filter /FlateDecode >>\nstream\nnot-flate\nendstream";
+    let bytes = single_page(
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 30] /Resources 6 0 R >>",
+        &[
+            (4, outer_form.into()),
+            (5, malformed_child.into()),
+            (6, "<< /XObject << /Outer 4 0 R >> >>".into()),
+            (7, "<< /XObject << /Child 5 0 R >> >>".into()),
+        ],
+    );
+    let (mut pdf, page_ref) = helper_for(bytes);
+    let page = pdf.get_object_handle(page_ref);
+    let warnings_before = pdf.repair_diagnostics().entries().len();
+    let mut helper = PageObjectHelper::from_object_handle(page.clone(), &mut pdf);
+
+    helper.remove_unreferenced_resources().unwrap();
+
+    let resources = page.try_get_key(b"/Resources").unwrap();
+    let xobjects = resources.try_get_key(b"/XObject").unwrap();
+    assert!(!xobjects.try_has_key(b"/Outer").unwrap());
+    assert_eq!(pdf.repair_diagnostics().entries().len(), warnings_before);
+}
+
+#[test]
+fn remove_unreferenced_resources_runs_the_action_for_each_form_reference_like_qpdf() {
+    let malformed_form = "<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << >> /Length 4 >>\nstream\n<0g>\nendstream";
+    let bytes = single_page(
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 30] /Resources << /XObject << /First 4 0 R /Second 4 0 R >> >> >>",
+        &[(4, malformed_form.into())],
+    );
+    let (mut pdf, page_ref) = helper_for(bytes);
+    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+
+    helper.remove_unreferenced_resources().unwrap();
+
+    let warnings = pdf
+        .repair_diagnostics()
+        .entries()
+        .iter()
+        .map(|diagnostic| String::from_utf8_lossy(diagnostic.get_message_detail()).into_owned())
+        .filter(|message| {
+            message.contains("invalid character (g) in hexstring")
+                || message.contains("EOF while reading token")
+                || message.contains("Bad token found while scanning content stream")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        warnings.iter().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "invalid character (g) in hexstring",
+            "EOF while reading token",
+            "Bad token found while scanning content stream; not attempting to remove unreferenced objects from this object",
+            "invalid character (g) in hexstring",
+            "EOF while reading token",
+            "Bad token found while scanning content stream; not attempting to remove unreferenced objects from this object",
+        ]
+    );
+}
+
+#[test]
+fn remove_unreferenced_resources_copies_categories_before_unresolved_veto_like_qpdf() {
+    let bytes = single_page(
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 30] /Resources << /Font 4 0 R >> /Contents 5 0 R >>",
+        &[
+            (4, "<< /Unused 6 0 R >>".into()),
+            (5, "<< /Length 14 >>\nstream\n/Missing 12 Tf\nendstream".into()),
+            (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()),
+        ],
+    );
+    let (mut pdf, page_ref) = helper_for(bytes);
+    let page = pdf.get_object_handle(page_ref);
+    let mut helper = PageObjectHelper::from_object_handle(page.clone(), &mut pdf);
+
+    helper.remove_unreferenced_resources().unwrap();
+
+    let resources = page.try_get_key(b"/Resources").unwrap();
+    let fonts = resources.try_get_key(b"/Font").unwrap();
+    assert!(!fonts.is_indirect());
+    assert!(fonts.try_has_key(b"/Unused").unwrap());
+    assert!(pdf
+        .get_object_handle(ObjectRef::new(4, 0))
+        .try_has_key(b"/Unused")
+        .unwrap());
+}
+
 /// qpdf's `getAttribute` copies a fallback box into the supplied handle without
 /// a `/Type /Page` check (`libqpdf/QPDFPageObjectHelper.cc:224-262`); probed
 /// with the public C++ API on an untyped direct and indirect dictionary and on

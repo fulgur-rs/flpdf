@@ -19,7 +19,6 @@ pub(crate) struct ResourceFinder {
     last_name: Option<(Vec<u8>, usize)>,
     names: BTreeSet<Vec<u8>>,
     names_by_resource_type: ResourceNamesByType,
-    pending_operands: bool,
 }
 
 impl ResourceFinder {
@@ -32,10 +31,6 @@ impl ResourceFinder {
 
     pub(crate) fn names_by_resource_type(&self) -> &ResourceNamesByType {
         &self.names_by_resource_type
-    }
-
-    pub(crate) fn has_pending_operands(&self) -> bool {
-        self.pending_operands
     }
 
     fn insert_resource_name(
@@ -84,19 +79,15 @@ impl ResourceFinder {
         _length: usize,
     ) -> Result<ParseControl> {
         if let Some(name) = object.as_name() {
-            self.pending_operands = true;
             self.last_name = Some((name, offset));
         } else if let Some(operator) = object.as_operator() {
-            self.pending_operands = false;
             if let Some(resource_type) = operator_resource_type(&operator) {
                 self.record_last_name(resource_type);
             }
-        } else if object.as_inline_image().is_some() {
-            // Inline-image payloads carry no resource-operator semantics here;
-            // qpdf's ResourceFinder does not inspect inline-image headers.
-        } else {
-            self.pending_operands = true;
         }
+        // qpdf ResourceFinder ignores non-name, non-operator content objects,
+        // including inline images and operands that are not consumed by an
+        // operator (`libqpdf/ResourceFinder.cc:9-42`).
         Ok(ParseControl::Continue)
     }
 }
@@ -170,7 +161,8 @@ mod tests {
                 .unwrap(),
             ParseControl::Continue
         );
-        assert!(!finder.has_pending_operands());
+        assert!(finder.names().is_empty());
+        assert!(finder.names_by_resource_type().is_empty());
     }
 
     fn hex_encode(bytes: &[u8]) -> String {
@@ -402,15 +394,11 @@ mod tests {
                   /Span /MC1 BDC /Tag /MC2 DP /Sh1 sh /X1 Do /F1 9 Tf"
                     .as_slice(),
             ),
-            ("malformed-content", b"<0g> /F1 12 Tf".as_slice()),
             (
                 "inline-image",
                 b"/F1 12 Tf BI /W 1 ID \x00x EI /X1 Do".as_slice(),
             ),
-            (
-                "incomplete-inline-image-keeps-prefix",
-                b"/F1 12 Tf BI ID".as_slice(),
-            ),
+            ("unconsumed-name", b"/Dangling".as_slice()),
         ] {
             assert_eq!(
                 dump_flpdf_resource_finder(input),
