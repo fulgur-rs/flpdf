@@ -60,14 +60,17 @@ pub fn canonical_object_refs<R: std::io::Read + std::io::Seek + 'static>(
         .collect()
 }
 
-/// Return the canonical annotation handles listed by a page.
+/// Return the handles from qpdf-shaped annotation helpers listed by a page.
 pub fn page_annotation_handles<R: std::io::Read + std::io::Seek>(
     pdf: &mut Pdf<R>,
     page: ObjectHandle,
 ) -> Vec<ObjectHandle> {
     PageObjectHelper::from_object_handle(page, pdf)
-        .get_annotations_filtered(None)
+        .get_annotations(None)
         .unwrap()
+        .into_iter()
+        .map(|annotation| annotation.get_object_handle())
+        .collect()
 }
 
 /// Find the single Widget annotation on the first page by structure.
@@ -80,7 +83,7 @@ pub fn page_annotation_handles<R: std::io::Read + std::io::Seek>(
 pub fn first_widget_ref<R: std::io::Read + std::io::Seek>(pdf: &mut Pdf<R>) -> ObjectRef {
     let page = first_page_handle(pdf);
     let widgets: Vec<_> = PageObjectHelper::from_object_handle(page, pdf)
-        .get_annotations_filtered(Some(b"/Widget"))
+        .get_annotations(Some(b"/Widget"))
         .unwrap();
     assert_eq!(
         widgets.len(),
@@ -89,6 +92,7 @@ pub fn first_widget_ref<R: std::io::Read + std::io::Seek>(pdf: &mut Pdf<R>) -> O
         widgets.len()
     );
     widgets[0]
+        .get_object_handle()
         .object_ref()
         .expect("fixture Widget annotation must be indirect")
 }

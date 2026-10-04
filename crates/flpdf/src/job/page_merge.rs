@@ -1387,7 +1387,9 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
         // original page tree.
         if remove_resources[input_index] {
             for &page_ref in &unique {
-                PageObjectHelper::new(page_ref, input.source).remove_unreferenced_resources()?;
+                let page = input.source.get_object_handle(page_ref);
+                PageObjectHelper::from_object_handle(page, input.source)
+                    .remove_unreferenced_resources()?;
             }
         }
 

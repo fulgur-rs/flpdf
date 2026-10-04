@@ -27,3 +27,37 @@ fn production_page_object_helper_uses_resolving_accessor_routes() {
         );
     }
 }
+
+#[test]
+fn public_page_boxes_remain_qpdf_shaped_raw_handle_accessors() {
+    // qpdf exposes getMediaBox/getCropBox/getBleedBox/getTrimBox/getArtBox as
+    // raw QPDFObjectHandle values; it does not expose these typed
+    // PageObjectHelper projections. Rectangle conversion belongs to
+    // QPDFObjectHandle::getArrayAsRectangle instead.
+    let production = production_source();
+    for qpdf_less in [
+        "pub fn media_box(",
+        "pub fn crop_box(",
+        "pub fn bleed_box(",
+        "pub fn trim_box(",
+        "pub fn art_box(",
+        "fn page_box_from_handle(",
+    ] {
+        assert!(
+            !production.contains(qpdf_less),
+            "PageObjectHelper retains qpdf-less typed page-box route {qpdf_less}"
+        );
+    }
+    for qpdf_raw in [
+        "pub fn get_media_box(",
+        "pub fn get_crop_box(",
+        "pub fn get_bleed_box(",
+        "pub fn get_trim_box(",
+        "pub fn get_art_box(",
+    ] {
+        assert!(
+            production.contains(qpdf_raw),
+            "PageObjectHelper lost qpdf raw box route {qpdf_raw}"
+        );
+    }
+}

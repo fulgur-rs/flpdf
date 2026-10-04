@@ -42,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut widths = Vec::with_capacity(pages.len());
     for page in pages {
         let mut helper = PageObjectHelper::from_object_handle(page, &mut out_pdf);
-        let mb = helper.media_box()?.ok_or("page has no MediaBox")?;
+        let mb = helper.get_media_box(false)?.try_get_array_as_rectangle()?;
         widths.push((mb.urx - mb.llx).round() as i64);
     }
     assert_eq!(

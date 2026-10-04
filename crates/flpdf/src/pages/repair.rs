@@ -454,25 +454,12 @@ fn replace_handle_key(holder: &ObjectHandle, key: &[u8], value: ObjectHandle) ->
     Ok(())
 }
 
+/// qpdf calls `QPDFObjectHandle::isRectangle` here (`QPDF_pages.cc:94,104`),
+/// which examines the first four slots before it checks the exact length, so a
+/// malformed slot is resolved (and warned about) even in an oversized or
+/// undersized array.
 fn is_rectangle_handle(value: &ObjectHandle) -> Result<bool> {
-    let Some(length) = value.try_array_len()? else {
-        return Ok(false);
-    };
-    if length != 4 {
-        return Ok(false);
-    }
-    for index in 0..length {
-        let Some(item) = value.try_array_item(index)? else {
-            return Ok(false);
-        };
-        if item.try_as_integer()?.is_none() {
-            item.try_dereference()?;
-            if item.as_real().is_none() {
-                return Ok(false);
-            }
-        }
-    }
-    Ok(true)
+    value.try_is_rectangle()
 }
 
 #[cfg(test)]
@@ -482,6 +469,56 @@ mod tests {
     use crate::object_handle::ObjectValue;
     use crate::{ObjectHandle, Pdf};
     use std::io::Cursor;
+
+    #[test]
+    fn media_box_predicate_scans_slots_before_length_like_qpdf() {
+        // QPDF_pages.cc:94 uses isRectangle, which resolves the first four
+        // slots before it rejects a wrong-length array, so the malformed
+        // indirect slot warns before the kid MediaBox default is applied.
+        // Probed with qpdf 11.9.0 `--check`: the object 4 warning comes first.
+        for pages_media_box in ["[0 0 4 0 R 1 5]", "[0 4 0 R 1]"] {
+            let objects = [
+                "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+                format!("<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox {pages_media_box} >>"),
+                "<< /Type /Page /Parent 2 0 R >>".to_string(),
+                "foo".to_string(),
+            ];
+            let mut bytes = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::new();
+            for (index, body) in objects.iter().enumerate() {
+                offsets.push(bytes.len());
+                bytes
+                    .extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", index + 1).as_bytes());
+            }
+            let xref_offset = bytes.len();
+            bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+            for offset in offsets {
+                bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+            }
+            bytes.extend_from_slice(
+                format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                    .as_bytes(),
+            );
+            let mut pdf = Pdf::open(Cursor::new(bytes)).expect("fixture should open");
+            prepare_for_optimization(&mut pdf)
+                .expect("page repair succeeds")
+                .expect("the fixture has a page tree");
+            let details = pdf
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|warning| warning.get_message_detail().to_vec())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                details,
+                vec![
+                    b"unknown token while reading object; treating as string".to_vec(),
+                    b"kid 0 (from 0) MediaBox is undefined; setting to letter / ANSI A".to_vec(),
+                ],
+                "{pages_media_box}"
+            );
+        }
+    }
 
     #[test]
     fn direct_pages_root_depth_error_keeps_its_explicit_location() {

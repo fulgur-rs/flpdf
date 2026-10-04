@@ -37,7 +37,9 @@ fn production_consumers_call_the_canonical_coalesce_owner() {
     assert!(empty_rewrite.contains("run_rewrite_with_qpdf_job(None,"));
     assert!(lifecycle
         .contains("PageObjectHelper::from_object_handle(page, pdf).coalesce_content_streams()?"));
-    assert!(flatten.contains("PageObjectHelper::new(page_ref, pdf).coalesce_content_streams()?"));
+    assert!(flatten.contains(
+        "PageObjectHelper::from_object_handle(page.clone(), pdf).coalesce_content_streams()?"
+    ));
 }
 
 #[test]

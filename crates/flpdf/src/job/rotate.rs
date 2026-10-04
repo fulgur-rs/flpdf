@@ -14,10 +14,6 @@
 //! [`crate::AcroFormDocumentHelper`].
 
 use crate::page_object_helper::PageObjectHelper;
-#[cfg(test)]
-use crate::page_object_helper::{
-    resolve_inherited_rotate, resolve_inherited_rotate_with_max_depth,
-};
 use crate::{ObjectHandle, PageDocumentHelper, Pdf, Result};
 use std::io::{Read, Seek};
 
@@ -64,7 +60,7 @@ fn flatten_rotation_on_page_handles<R: Read + Seek>(
 mod tests {
     use super::*;
     use crate::writer::write_qpdf_to_memory;
-    use crate::{pages, Error, ObjectHandle, ObjectRef, PageBox, Pdf};
+    use crate::{pages, Error, ObjectHandle, ObjectRef, Pdf, Rectangle};
     use std::io::Cursor;
 
     fn flatten_rotation_on_pages<R: Read + Seek>(
@@ -80,7 +76,15 @@ mod tests {
         flatten_rotation_on_page_handles(pdf, &page_handles)
     }
 
-    fn handle_to_pagebox(obj: &ObjectHandle) -> Option<PageBox> {
+    fn page_helper_for_ref(
+        pdf: &mut Pdf<Cursor<Vec<u8>>>,
+        page_ref: ObjectRef,
+    ) -> PageObjectHelper<'_, Cursor<Vec<u8>>> {
+        let page = pdf.get_object_handle(page_ref);
+        PageObjectHelper::from_object_handle(page, pdf)
+    }
+
+    fn handle_to_rectangle(obj: &ObjectHandle) -> Option<Rectangle> {
         obj.try_is_scalar().ok()?;
         let values = obj.as_array()?;
         if values.len() != 4 {
@@ -94,7 +98,7 @@ mod tests {
                 .map(|value| value as f64)
                 .or_else(|| value.as_real())?;
         }
-        Some(PageBox::new(
+        Some(Rectangle::new(
             numbers[0].min(numbers[2]),
             numbers[1].min(numbers[3]),
             numbers[0].max(numbers[2]),
@@ -114,9 +118,13 @@ mod tests {
         value
     }
 
-    fn pagebox_for(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef, key: &[u8]) -> PageBox {
+    fn rectangle_for(
+        pdf: &mut Pdf<Cursor<Vec<u8>>>,
+        object_ref: ObjectRef,
+        key: &[u8],
+    ) -> Rectangle {
         let value = object_key_handle(pdf, object_ref, key);
-        handle_to_pagebox(&value).expect("page box must be a four-number array")
+        handle_to_rectangle(&value).expect("page box must be a four-number array")
     }
 
     fn rotate_value(pdf: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRef) -> Option<i64> {
@@ -134,7 +142,8 @@ mod tests {
         relative: bool,
     ) -> Result<()> {
         for &page_ref in pages {
-            PageObjectHelper::new(page_ref, pdf).rotate_page(degrees, relative)?;
+            let page = pdf.get_object_handle(page_ref);
+            PageObjectHelper::from_object_handle(page, pdf).rotate_page(degrees, relative)?;
         }
         Ok(())
     }
@@ -153,19 +162,21 @@ mod tests {
     }
 
     #[test]
-    fn handle_to_pagebox_rejects_bad_shapes_and_accepts_real_literals() {
-        assert!(handle_to_pagebox(&ObjectHandle::integer(1)).is_none());
-        assert!(handle_to_pagebox(&ObjectHandle::array(vec![ObjectHandle::integer(1)])).is_none());
+    fn handle_to_rectangle_rejects_bad_shapes_and_accepts_real_literals() {
+        assert!(handle_to_rectangle(&ObjectHandle::integer(1)).is_none());
+        assert!(
+            handle_to_rectangle(&ObjectHandle::array(vec![ObjectHandle::integer(1)])).is_none()
+        );
         assert_eq!(
-            handle_to_pagebox(&ObjectHandle::array(vec![
+            handle_to_rectangle(&ObjectHandle::array(vec![
                 ObjectHandle::real_from_string(b"1.5"),
                 ObjectHandle::integer(2),
                 ObjectHandle::real(11.5),
                 ObjectHandle::integer(22),
             ])),
-            Some(PageBox::new(1.5, 2.0, 11.5, 22.0))
+            Some(Rectangle::new(1.5, 2.0, 11.5, 22.0))
         );
-        assert!(handle_to_pagebox(&ObjectHandle::array(vec![
+        assert!(handle_to_rectangle(&ObjectHandle::array(vec![
             ObjectHandle::integer(1),
             ObjectHandle::null(),
             ObjectHandle::integer(11),
@@ -175,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_to_pagebox_resolves_indirect_numeric_items() {
+    fn handle_to_rectangle_resolves_indirect_numeric_items() {
         let bytes = assemble_pdf(&[
             (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
             (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned()),
@@ -190,8 +201,8 @@ mod tests {
         let media_box = object_key_handle(&mut pdf, page, b"/MediaBox");
 
         assert_eq!(
-            handle_to_pagebox(&media_box),
-            Some(PageBox::new(1.0, 4.0, 3.0, 7.0))
+            handle_to_rectangle(&media_box),
+            Some(Rectangle::new(1.0, 4.0, 3.0, 7.0))
         );
     }
 
@@ -245,122 +256,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // resolve_inherited_rotate tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn resolve_page_has_direct_rotate() {
-        let bytes = build_single_page_pdf(Some(90), None);
-        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let page_ref = ObjectRef::new(3, 0);
-        assert_eq!(resolve_inherited_rotate(&mut pdf, page_ref).unwrap(), 90);
-    }
-
-    #[test]
-    fn resolve_inherits_from_parent() {
-        // Page has no /Rotate, parent /Pages has /Rotate 180.
-        let bytes = build_single_page_pdf(None, Some(180));
-        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let page_ref = ObjectRef::new(3, 0);
-        assert_eq!(resolve_inherited_rotate(&mut pdf, page_ref).unwrap(), 180);
-    }
-
-    #[test]
-    fn resolve_defaults_to_zero_when_absent() {
-        let bytes = build_single_page_pdf(None, None);
-        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let page_ref = ObjectRef::new(3, 0);
-        assert_eq!(resolve_inherited_rotate(&mut pdf, page_ref).unwrap(), 0);
-    }
-
-    #[test]
-    fn resolve_defaults_to_zero_for_a_parent_cycle() {
-        let bytes = build_single_page_pdf(None, None);
-        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let parent = pdf.get_object_handle(ObjectRef::new(2, 0));
-        parent.try_is_scalar().unwrap();
-        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-        parent
-            .replace_key(b"/Parent", page)
-            .expect("parent must be mutable");
-
-        assert_eq!(
-            resolve_inherited_rotate(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn resolve_defaults_to_zero_for_a_non_dictionary_parent() {
-        let bytes = build_single_page_pdf(None, None);
-        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-        page.try_is_scalar().unwrap();
-        page.replace_key(b"/Parent", ObjectHandle::integer(42))
-            .expect("page must be mutable");
-
-        assert_eq!(
-            resolve_inherited_rotate(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn resolve_preserves_non_standard_value() {
-        // The getter observes the effective page attribute; only a relative
-        // rotate operation treats an invalid existing value as zero.
-        let bytes = build_single_page_pdf(Some(45), None);
-        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let page_ref = ObjectRef::new(3, 0);
-        assert_eq!(resolve_inherited_rotate(&mut pdf, page_ref).unwrap(), 45);
-    }
-
-    #[test]
-    fn resolve_reports_depth_limit_at_a_direct_page_tree_node() {
-        let bytes = build_single_page_pdf(None, None);
-        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let page_ref = ObjectRef::new(3, 0);
-        let page = pdf.get_object_handle(page_ref);
-        page.try_is_scalar().unwrap();
-        let parent =
-            ObjectHandle::dictionary(vec![(b"/Rotate".to_vec(), ObjectHandle::integer(90))]);
-        page.replace_key(b"/Parent", parent)
-            .expect("page must be mutable");
-
-        let error = resolve_inherited_rotate_with_max_depth(&mut pdf, page_ref, 1).unwrap_err();
-        assert!(matches!(
-            error,
-            Error::Unsupported(message)
-                if message.contains("page tree depth exceeds maximum of 1")
-                    && message.contains("direct page-tree dictionary")
-        ));
-    }
-
-    #[test]
-    fn resolve_rejects_a_non_integer_rotate_entry() {
-        let bytes = build_single_page_pdf(None, None);
-        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let page_ref = ObjectRef::new(3, 0);
-        let page = pdf.get_object_handle(page_ref);
-        page.try_is_scalar().unwrap();
-        page.replace_key(b"/Rotate", ObjectHandle::name(b"Bad".to_vec()))
-            .expect("page must be mutable");
-
-        let error = resolve_inherited_rotate(&mut pdf, page_ref).unwrap_err();
-        assert!(matches!(
-            error,
-            Error::Unsupported(message) if message.contains("/Rotate entry")
-                && message.contains("has unexpected type")
-        ));
-    }
-
-    // -----------------------------------------------------------------------
     #[test]
     fn rotate_page_rejects_a_non_multiple_angle_like_qpdf() {
         let bytes = build_single_page_pdf(None, None);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-        let error = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf)
+        let error = page_helper_for_ref(&mut pdf, ObjectRef::new(3, 0))
             .rotate_page(45, false)
             .expect_err("qpdf rejects direct rotation angles that are not multiples of 90");
         assert!(matches!(
@@ -774,7 +675,7 @@ mod tests {
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
 
         assert!(rotate_key_absent(&mut pdf, page));
-        let mb = pagebox_for(&mut pdf, page, b"/MediaBox");
+        let mb = rectangle_for(&mut pdf, page, b"/MediaBox");
         assert_eq!((mb.urx - mb.llx, mb.ury - mb.lly), (300.0, 200.0));
 
         let content = pages::page_content_bytes(&mut pdf, page).unwrap();
@@ -798,7 +699,7 @@ mod tests {
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
         let after = pages::page_content_bytes(&mut pdf, page).unwrap();
         assert_eq!(before, after, "content must be untouched when rotate==0");
-        let mb = pagebox_for(&mut pdf, page, b"/MediaBox");
+        let mb = rectangle_for(&mut pdf, page, b"/MediaBox");
         assert_eq!((mb.urx, mb.ury), (200.0, 300.0));
     }
 
@@ -811,7 +712,7 @@ mod tests {
 
         assert!(rotate_key_absent(&mut pdf, page));
         // 180 maps [0 0 200 300] back onto itself: dims unchanged.
-        let mb = pagebox_for(&mut pdf, page, b"/MediaBox");
+        let mb = rectangle_for(&mut pdf, page, b"/MediaBox");
         assert_eq!((mb.llx, mb.lly, mb.urx, mb.ury), (0.0, 0.0, 200.0, 300.0));
         let content = pages::page_content_bytes(&mut pdf, page).unwrap();
         let s = String::from_utf8(content).unwrap();
@@ -833,10 +734,10 @@ mod tests {
 
         // 90deg map (x,y)->(y, 200 - x): corners (10,10),(190,290) ->
         // (10,190),(290,10) -> bbox [10 10 290 190].
-        let cb = pagebox_for(&mut pdf, page, b"/CropBox");
+        let cb = rectangle_for(&mut pdf, page, b"/CropBox");
         assert_eq!((cb.llx, cb.lly, cb.urx, cb.ury), (10.0, 10.0, 290.0, 190.0));
         // And MediaBox is still swapped, independently.
-        let mb = pagebox_for(&mut pdf, page, b"/MediaBox");
+        let mb = rectangle_for(&mut pdf, page, b"/MediaBox");
         assert_eq!((mb.urx - mb.llx, mb.ury - mb.lly), (300.0, 200.0));
     }
 
@@ -889,7 +790,7 @@ mod tests {
 
         // 90deg map (x,y)->(y, 200 - x): corners (10,20),(60,40) ->
         // (20,190),(40,140) -> bbox [20 140 40 190].
-        let mut page_helper = PageObjectHelper::new(page, &mut pdf);
+        let mut page_helper = page_helper_for_ref(&mut pdf, page);
         let annotations = page_helper
             .get_annotation_handles(None)
             .expect("flattened annotation must remain on the page");
@@ -898,7 +799,7 @@ mod tests {
         annotation.try_is_scalar().unwrap();
         let rect = annotation.try_get_key(b"/Rect").unwrap();
         rect.try_is_scalar().unwrap();
-        let r = handle_to_pagebox(&rect).expect("annotation rectangle");
+        let r = handle_to_rectangle(&rect).expect("annotation rectangle");
         assert_eq!((r.llx, r.lly, r.urx, r.ury), (20.0, 140.0, 40.0, 190.0));
     }
 
@@ -923,7 +824,7 @@ mod tests {
                 annotation.try_is_scalar().unwrap();
                 let rect = annotation.try_get_key(b"/Rect").unwrap();
                 rect.try_is_scalar().unwrap();
-                let rectangle = handle_to_pagebox(&rect).expect("annotation rectangle");
+                let rectangle = handle_to_rectangle(&rect).expect("annotation rectangle");
                 (rectangle.llx, rectangle.lly, rectangle.urx, rectangle.ury)
             })
             .collect::<Vec<_>>();
@@ -934,8 +835,8 @@ mod tests {
         );
         let original = object_key_handle(&mut pdf, indirect_annot, b"/Rect");
         assert_eq!(
-            handle_to_pagebox(&original),
-            Some(PageBox::new(20.0, 30.0, 70.0, 50.0))
+            handle_to_rectangle(&original),
+            Some(Rectangle::new(20.0, 30.0, 70.0, 50.0))
         );
     }
 
@@ -963,7 +864,7 @@ mod tests {
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
 
         // Same mapping as the direct-array case: [10 20 60 40] -> [20 140 40 190].
-        let mut page_helper = PageObjectHelper::new(page, &mut pdf);
+        let mut page_helper = page_helper_for_ref(&mut pdf, page);
         let annotations = page_helper
             .get_annotation_handles(None)
             .expect("flattened annotation must be indirect");
@@ -972,22 +873,19 @@ mod tests {
         annotation.try_is_scalar().unwrap();
         let rect = annotation.try_get_key(b"/Rect").unwrap();
         rect.try_is_scalar().unwrap();
-        let r = handle_to_pagebox(&rect).expect("annotation rectangle");
+        let r = handle_to_rectangle(&rect).expect("annotation rectangle");
         assert_eq!((r.llx, r.lly, r.urx, r.ury), (20.0, 140.0, 40.0, 190.0));
     }
 
     #[test]
-    fn flatten_rejects_non_leaf_target_even_when_rotate_zero() {
-        // obj 2 is the /Pages tree node (not a leaf /Page); its effective /Rotate
-        // is 0. The leaf guard must still reject it instead of silently passing.
+    fn flatten_accepts_non_leaf_dictionary_when_rotate_is_zero_like_qpdf() {
+        // qpdf reads /Rotate directly and returns when it is not 90, 180, or 270;
+        // it does not preflight the target as /Type /Page.
         let bytes = build_single_page_with_content("[0 0 200 300]", None, "BT (x) Tj ET");
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let pages_node = ObjectRef::new(2, 0);
-        let err = flatten_rotation_on_pages(&mut pdf, &[pages_node]).unwrap_err();
-        assert!(
-            matches!(err, Error::Unsupported(_)),
-            "expected Unsupported, got {err:?}"
-        );
+        flatten_rotation_on_pages(&mut pdf, &[pages_node])
+            .expect("zero rotation returns without a /Type /Page preflight");
     }
 
     #[test]
@@ -1001,7 +899,7 @@ mod tests {
         assert_eq!(pages::page_content_bytes(&mut pdf, page).unwrap(), before);
         // The direct page box is untouched because qpdf's facade did not see a
         // direct `/Rotate` value.
-        let mb = pagebox_for(&mut pdf, page, b"/MediaBox");
+        let mb = rectangle_for(&mut pdf, page, b"/MediaBox");
         assert_eq!((mb.urx - mb.llx, mb.ury - mb.lly), (200.0, 300.0));
     }
 }

@@ -2,11 +2,10 @@
 //!
 //! qpdf correspondence: QPDFPageObjectHelper.cc responsibilities shared with page form, resource, flatten, and overlay modules.
 //!
-//! [`PageObjectHelper`] wraps a single leaf `/Page` [`ObjectRef`] together with
-//! a `&mut Pdf<R>` and exposes ergonomic, typed accessors for the most common
-//! per-page attributes. All operations are delegated to the underlying
-//! infrastructure — no page-dictionary state is copied or cached inside this
-//! struct.
+//! [`PageObjectHelper`] wraps a qpdf `QPDFObjectHandle`-shaped target together
+//! with its owning `&mut Pdf<R>` and exposes qpdf's page/Form operations. All
+//! operations are delegated to the underlying infrastructure — no
+//! page-dictionary state is copied or cached inside this struct.
 //!
 //! # Design
 //!
@@ -14,27 +13,21 @@
 //! call so that mutations applied through other helpers remain visible
 //! immediately.
 //!
-//! - [`content_stream_objects`](PageObjectHelper::content_stream_objects) —
-//!   decode via the existing stream filter pipeline, then parse into
-//!   qpdf-shaped [`ObjectHandle`] events.
-//! - [`get_resources`](PageObjectHelper::get_resources) — delegates to the
-//!   canonical ObjectHandle `/Parent`-chain lookup for `/Resources`.
-//! - [`rotate`](PageObjectHelper::rotate) — **getter** that uses the page-local
-//!   inherited `/Rotate` lookup.
-//! - [`get_annotations`](PageObjectHelper::get_annotations) — reads the leaf's
-//!   `/Annots` array (not inheritable per PDF spec).
-//! - [`media_box`](PageObjectHelper::media_box) — inheritable; walks `/Parent`
-//!   chain.
-//! - [`crop_box`](PageObjectHelper::crop_box) — inheritable; falls back to
-//!   `media_box()` when absent.
-//! - [`bleed_box`](PageObjectHelper::bleed_box) /
-//!   [`trim_box`](PageObjectHelper::trim_box) /
-//!   [`art_box`](PageObjectHelper::art_box) — leaf-only; fall back to
-//!   `crop_box()` when absent.
+//! - [`get_attribute`](PageObjectHelper::get_attribute) — reads the qpdf
+//!   page/Form attribute and inheritance route, including `/Rotate`.
+//! - [`get_annotations`](PageObjectHelper::get_annotations) — returns qpdf-shaped
+//!   annotation helpers from the page's fail-soft `/Annots` enumeration.
+//! - [`get_media_box`](PageObjectHelper::get_media_box) and
+//!   [`get_crop_box`](PageObjectHelper::get_crop_box) — return qpdf-shaped raw
+//!   handles, including inheritance and fallback behavior.
+//! - [`get_bleed_box`](PageObjectHelper::get_bleed_box),
+//!   [`get_trim_box`](PageObjectHelper::get_trim_box), and
+//!   [`get_art_box`](PageObjectHelper::get_art_box) — return qpdf-shaped raw
+//!   handles and fallback values without projecting them into another type.
 //!
 //! # Examples
 //!
-//! ## Inspect content-stream tokens
+//! ## Read the qpdf-shaped media box handle
 //!
 //! ```no_run
 //! use std::fs::File;
@@ -45,13 +38,14 @@
 //! let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
 //! if let Some(page) = pages.into_iter().next() {
 //!     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-//!     let objects = helper.content_stream_objects()?;
-//!     println!("{} content-stream objects on page 1", objects.len());
+//!     let media_box = helper.get_media_box(false)?;
+//!     let rectangle = media_box.try_get_array_as_rectangle()?;
+//!     println!("MediaBox: {:?}", rectangle);
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! ## Read the effective media box
+//! ## Read the effective rotation attribute
 //!
 //! ```no_run
 //! use std::fs::File;
@@ -62,14 +56,15 @@
 //! let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
 //! if let Some(page) = pages.into_iter().next() {
 //!     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-//!     if let Some(mb) = helper.media_box()? {
-//!         println!("MediaBox: {:?}", mb);
+//!     let rotate = helper.get_attribute(b"/Rotate", false)?;
+//!     if !rotate.try_is_null()? {
+//!         println!("page rotation: {}°", rotate.try_get_int_value_as_int()?);
 //!     }
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! ## Read effective rotation (getter, not mutating)
+//! ## List annotations
 //!
 //! ```no_run
 //! use std::fs::File;
@@ -80,32 +75,16 @@
 //! let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
 //! if let Some(page) = pages.into_iter().next() {
 //!     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-//!     let degrees = helper.rotate()?;
-//!     println!("page rotation: {degrees}°");
-//! }
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
-//!
-//! ## List annotation references
-//!
-//! ```no_run
-//! use std::fs::File;
-//! use std::io::BufReader;
-//! use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
-//!
-//! let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-//! let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
-//! if let Some(page) = pages.into_iter().next() {
-//!     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-//!     let annots = helper.get_annotations()?;
+//!     let annots = helper.get_annotations(None)?;
 //!     println!("{} annotations on page 1", annots.len());
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use crate::content_stream::{ObjectHandleParserCallbacks, ParseControl};
+use crate::annotation_object_helper::AnnotationObjectHelper;
+use crate::content_stream::ObjectHandleParserCallbacks;
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
-use crate::pages::{is_inheritable_page_attribute, DEFAULT_MAX_PAGE_TREE_DEPTH};
+use crate::pages::is_inheritable_page_attribute;
 use crate::pipeline::{Pipeline, PipelineError, PlString};
 use crate::token_filter::TokenFilter;
 use crate::tokenizer::{Token, TokenType};
@@ -117,52 +96,37 @@ use std::io::{Read, Seek};
 use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
-// PageBox — a typed rectangle
-// ---------------------------------------------------------------------------
-
-/// An axis-aligned rectangle expressed as `[llx, lly, urx, ury]` in user-space
-/// units, corresponding to a PDF rectangle array `[x1 y1 x2 y2]`.
-///
-/// PDF allows any combination of integer and real elements; both are coerced
-/// to `f64`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PageBox {
-    /// Left x coordinate (lower-left x).
-    pub llx: f64,
-    /// Bottom y coordinate (lower-left y).
-    pub lly: f64,
-    /// Right x coordinate (upper-right x).
-    pub urx: f64,
-    /// Top y coordinate (upper-right y).
-    pub ury: f64,
-}
-
-impl PageBox {
-    /// Construct a `PageBox` from its four corner coordinates.
-    pub fn new(llx: f64, lly: f64, urx: f64, ury: f64) -> Self {
-        Self { llx, lly, urx, ury }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // PageObjectHelper
 // ---------------------------------------------------------------------------
 
 /// Per-page typed accessor helper.
 ///
-/// Construct with [`PageObjectHelper::new`], then use the provided methods to
-/// inspect the page's content streams, resources, rotation, annotations, and
+/// Construct with [`PageObjectHelper::from_object_handle`], then use the provided methods to
+/// inspect the page's attributes, content streams, resources, annotations, and
 /// bounding boxes. All operations are delegated to the underlying `Pdf<R>`
 /// infrastructure; no state is cached inside this struct.
+///
+/// qpdf exposes one annotation enumeration operation with an optional subtype
+/// filter and typed annotation-helper results through `get_annotations`.
+/// There is no public raw-handle collector:
+///
+/// ```compile_fail,E0599
+/// use flpdf::PageObjectHelper;
+/// use std::io::Cursor;
+///
+/// let _method = PageObjectHelper::<Cursor<Vec<u8>>>::get_annotations_filtered;
+/// ```
+///
+/// ```compile_fail,E0624
+/// use flpdf::PageObjectHelper;
+/// use std::io::Cursor;
+///
+/// let _method = PageObjectHelper::<Cursor<Vec<u8>>>::get_annotation_handles;
+/// ```
 pub struct PageObjectHelper<'a, R: Read + Seek + 'static> {
     object: ObjectHandle,
     page_ref: Option<ObjectRef>,
     pdf: &'a mut Pdf<R>,
-}
-
-#[derive(Default)]
-struct ObjectRecordingCallbacks {
-    objects: Vec<ObjectHandle>,
 }
 
 struct InlineImageExternalizer<'a, R: Read + Seek + 'static> {
@@ -396,38 +360,7 @@ impl<R: Read + Seek + 'static> TokenFilter for InlineImageExternalizer<'_, R> {
     }
 }
 
-impl ObjectHandleParserCallbacks for ObjectRecordingCallbacks {
-    fn handle_object(
-        &mut self,
-        object: ObjectHandle,
-        _offset: usize,
-        _length: usize,
-    ) -> Result<ParseControl> {
-        self.objects.push(object);
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_eof(&mut self) -> Result<()> {
-        Ok(())
-    }
-}
-
 impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
-    /// Create a new helper for `page_ref` borrowing `pdf` mutably.
-    ///
-    /// `page_ref` should be the `ObjectRef` of a leaf `/Page` dictionary.
-    /// The helper does not validate this at construction time. Methods that
-    /// require a page apply their own checks; attribute access follows qpdf
-    /// and does not require `/Type /Page`.
-    pub fn new(page_ref: ObjectRef, pdf: &'a mut Pdf<R>) -> Self {
-        let object = pdf.get_object_handle(page_ref);
-        Self {
-            object,
-            page_ref: Some(page_ref),
-            pdf,
-        }
-    }
-
     /// Create a helper over an object handle.
     ///
     /// For attribute access, Form XObjects use their stream dictionary and all
@@ -459,27 +392,17 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     }
 
     /// Resolve the target and return whether it is a Form XObject. Page
-    /// dictionaries and Form stream dictionaries are the only supported qpdf
-    /// PageObjectHelper targets.
+    /// attribute and content helpers classify only Form XObjects; qpdf does
+    /// not preflight the other targets as `/Type /Page` dictionaries.
     fn resolved_attribute_target(&mut self) -> Result<(ObjectHandle, bool)> {
-        let description = self.target_description();
-        resolve_attribute_target(self.object.clone(), &description)
+        resolve_attribute_target(self.object.clone())
     }
 
-    /// Return the live canonical handle for this page after validating its
-    /// `/Type`. This is the page-helper equivalent of qpdf's
-    /// `QPDFPageObjectHelper` construction over a `QPDFObjectHandle`: all
-    /// subsequent page attributes and mutations operate on the resolver-backed
-    /// object graph rather than on a legacy raw snapshot.
+    /// Return the live handle used by qpdf-delegating helper operations.
+    /// `QPDFPageObjectHelper` does not preflight the target as `/Type /Page`;
+    /// the delegated operation determines its own behavior for the handle.
     fn resolved_page_handle(&mut self) -> Result<ObjectHandle> {
-        let (object, is_form) = self.resolved_attribute_target()?;
-        if is_form {
-            return Err(Error::Unsupported(format!(
-                "object {} is a Form XObject, expected /Type /Page",
-                self.target_description()
-            )));
-        }
-        Ok(object)
+        Ok(self.object.clone())
     }
 
     /// Return a live attribute, applying qpdf's page-tree inheritance rules
@@ -559,14 +482,16 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         self.apply_fallback(b"/ArtBox", fallback, copy_if_fallback)
     }
 
-    /// Convert this page into a new, document-owned Form XObject.
+    /// Convert this indirect handle into a new, document-owned Form XObject.
     ///
     /// The new stream retains a provider over the page's canonical content
     /// route, so conversion does not eagerly decode or concatenate page bytes.
     /// `/Resources`, `/Group`, and the effective `/TrimBox` are shallow-copied;
     /// `/Matrix` is emitted when requested and either `/Rotate` or `/UserUnit`
     /// is present, matching qpdf's `getFormXObjectForPage`
-    /// (`libqpdf/QPDFPageObjectHelper.cc:740-782`).
+    /// (`libqpdf/QPDFPageObjectHelper.cc:706-734`). qpdf accepts Form handles
+    /// here as well; the provider reads `/Contents` from the original handle
+    /// only when the new stream is materialized.
     pub fn get_form_xobject_for_page(
         &mut self,
         handle_transformations: bool,
@@ -578,16 +503,11 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
                     .to_owned(),
             ));
         }
-        // Capture the page's original content container before a consumer can
-        // replace `/Contents` on the page (overlay does exactly that after
-        // creating /Fx0). The provider remains lazy and ObjectHandle-backed,
-        // but its source must be the content graph observed at conversion
-        // time; otherwise a later page rewrite makes the Form provider read
-        // the newly inserted /Fx0 Do fragment recursively.
-        let page_contents = page.try_get_key(b"/Contents")?;
+        // qpdf: "contents from page object " + getObjGen().unparse(' ')
+        // (`libqpdf/QPDFPageObjectHelper.cc:35`), e.g. "3 0" without " R".
         let page_description = format!(
             "contents from page object {}",
-            object_handle_description(&page)
+            page.get_obj_gen().unparse_with_separator(' ')
         );
         let form = self.pdf.new_stream()?;
         let dict = form
@@ -596,7 +516,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         dict.replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))?;
         dict.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))?;
 
-        let resources = self.get_resources(false)?.shallow_copy()?;
+        let resources = self.get_attribute(b"/Resources", false)?.shallow_copy()?;
         dict.replace_key(b"/Resources", resources)?;
         let group = self.get_attribute(b"/Group", false)?.shallow_copy()?;
         dict.replace_key(b"/Group", group)?;
@@ -608,6 +528,11 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         }
         dict.replace_key(b"/BBox", bbox)?;
 
+        // qpdf's ContentProvider retains the original object handle and looks
+        // up /Contents only when stream data is requested. This also preserves
+        // qpdf's stream-handle type warning and null result for Form targets.
+        let provider_page = page.clone();
+
         // qpdf installs the lazy provider before reading the transformation
         // attributes (`QPDFPageObjectHelper.cc:716-729`). Both attributes are
         // read even when `handle_transformations` is false; only matrix
@@ -615,11 +540,9 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         form.replace_stream_data_with_callback(
             move |pipeline| {
                 let mut all_description = String::new();
-                page_contents.pipe_content_streams(
-                    pipeline,
-                    &page_description,
-                    &mut all_description,
-                )
+                provider_page
+                    .try_get_key(b"/Contents")?
+                    .pipe_content_streams(pipeline, &page_description, &mut all_description)
             },
             None,
             None,
@@ -834,96 +757,43 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         Ok(copy)
     }
 
-    /// Verify `page_ref` resolves to a leaf `/Type /Page` dictionary.
-    ///
-    /// Guards the public accessors so a `/Pages` tree node (or any other
-    /// dictionary) cannot be misread as a page and return plausible but
-    /// incorrect inherited/default metadata.
-    pub(crate) fn ensure_leaf_page(&mut self) -> Result<()> {
-        self.resolved_page_handle().map(|_| ())
-    }
-
-    // -----------------------------------------------------------------------
-    // content_stream_objects
-    // -----------------------------------------------------------------------
-
-    /// Return the qpdf-shaped content object events for this page.
-    ///
-    /// Aggregates the page's `/Contents` entry (single stream or array), decodes
-    /// each stream through its filter pipeline (same as
-    /// [`crate::pages::page_content_bytes`]), then parses the concatenated bytes
-    /// through [`crate::content_stream::parse_content_operations`].
-    ///
-    /// Returns an empty `Vec` when the page has no `/Contents`.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Unsupported`] when `page_ref` does not resolve to a
-    ///   `/Type /Page` dictionary, or when a `/Contents` element is not a stream.
-    /// - Any error from [`crate::pages::page_content_bytes`] or
-    ///   [`crate::content_stream::parse_content_operations`].
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::fs::File;
-    /// use std::io::BufReader;
-    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
-    ///
-    /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
-    /// if let Some(page) = pages.into_iter().next() {
-    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-    ///     let objects = helper.content_stream_objects()?;
-    ///     println!("{} objects", objects.len());
-    /// }
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn content_stream_objects(&mut self) -> Result<Vec<ObjectHandle>> {
-        let mut callbacks = ObjectRecordingCallbacks::default();
-        self.parse_contents(&mut callbacks)?;
-        Ok(callbacks.objects)
-    }
-
     /// Return the page's `/Contents` as canonical stream handles.
     ///
     /// This is the direct `QPDFPageObjectHelper::getPageContents` route
-    /// (`libqpdf/QPDFPageObjectHelper.cc:439-442`) and deliberately preserves
+    /// (`libqpdf/QPDFPageObjectHelper.cc:455-459`) and deliberately preserves
     /// each stream's identity and lazy provider instead of decoding it into a
-    /// byte buffer or legacy raw value.
+    /// byte buffer or legacy raw value. Like qpdf, it delegates directly on
+    /// the stored handle without a `/Type /Page` preflight.
     pub fn get_page_contents(&mut self) -> Result<Vec<ObjectHandle>> {
-        let (target, _) = self.resolved_attribute_target()?;
-        target.get_page_contents()
+        self.object.get_page_contents()
     }
 
     /// Add a canonical stream to the beginning or end of `/Contents`.
     ///
     /// Mirrors `QPDFPageObjectHelper::addPageContents`
-    /// (`libqpdf/QPDFPageObjectHelper.cc:449-452`).
+    /// (`libqpdf/QPDFPageObjectHelper.cc:461-465`).
     pub fn add_page_contents(&mut self, contents: ObjectHandle, first: bool) -> Result<()> {
-        let (target, _) = self.resolved_attribute_target()?;
-        target.add_page_contents(contents, first)?;
+        self.object.add_page_contents(contents, first)?;
         Ok(())
     }
 
     /// Rotate the page in the live object graph.
     ///
     /// Mirrors `QPDFPageObjectHelper::rotatePage`
-    /// (`libqpdf/QPDFPageObjectHelper.cc:468-470`).
+    /// (`libqpdf/QPDFPageObjectHelper.cc:467-471`).
     pub fn rotate_page(&mut self, angle: i32, relative: bool) -> Result<()> {
-        let (target, _) = self.resolved_attribute_target()?;
-        target.rotate_page(angle, relative)?;
+        self.object.rotate_page(angle, relative)?;
         Ok(())
     }
 
-    /// Bake the page's direct qpdf `/Rotate` value into its boxes, contents,
+    /// Bake the handle's direct qpdf `/Rotate` value into its boxes, contents,
     /// and annotations.
     ///
     /// This is `QPDFPageObjectHelper::flattenRotation`
     /// (`libqpdf/QPDFPageObjectHelper.cc:862-991`). qpdf intentionally reads
     /// `/Rotate`, `/MediaBox`, and the optional page boxes directly from the
     /// page object here; inherited values are not materialized by this method.
-    /// It operates on the live page handle and does not require an
+    /// It operates on the live handle and does not require an
     /// `ObjectRef` projection. Since flpdf stores the mutable `Pdf` separately
     /// from the handle, the handle must belong to that same `Pdf`; qpdf's
     /// `QPDFObjectHelper` stores only the handle.
@@ -1287,8 +1157,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
 
     /// Coalesce the page's content streams into one lazy provider-backed stream.
     pub fn coalesce_content_streams(&mut self) -> Result<()> {
-        let (target, _) = self.resolved_attribute_target()?;
-        target.coalesce_content_streams()?;
+        self.object.coalesce_content_streams()?;
         Ok(())
     }
 
@@ -1413,20 +1282,14 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         target.add_content_token_filter(filter)
     }
 
-    /// Remove unused `/Font` and `/XObject` entries from this page or Form's
+    /// Remove unused `/Font` and `/XObject` entries from this target's
     /// resource scope through the canonical ObjectHandle parser route.
     ///
     /// This is qpdf's `removeUnreferencedResources`
     /// (`libqpdf/QPDFPageObjectHelper.cc:539-649`). The document-level
     /// `PageDocumentHelper` facade uses this same per-target operation.
     pub fn remove_unreferenced_resources(&mut self) -> Result<()> {
-        let (target, is_form) = self.resolved_attribute_target()?;
-        if is_form {
-            crate::resources::remove_unreferenced_resources_on_form(self.pdf, target)
-        } else {
-            let page_ref = self.require_page_ref()?;
-            crate::resources::remove_unreferenced_resources_on_page(self.pdf, page_ref)
-        }
+        crate::resources::remove_unreferenced_resources_on_target(self.pdf, self.object.clone())
     }
 
     /// Convert inline images into ordinary Image XObjects.
@@ -1462,11 +1325,6 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     // -----------------------------------------------------------------------
     // resources
     // -----------------------------------------------------------------------
-
-    /// Return the effective `/Resources` dictionary handle.
-    pub fn get_resources(&mut self, copy_if_shared: bool) -> Result<ObjectHandle> {
-        self.get_attribute(b"/Resources", copy_if_shared)
-    }
 
     /// Visit every XObject directly reachable from this page or Form XObject.
     ///
@@ -1512,12 +1370,16 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
                 continue;
             }
             let xobjects = resources.try_get_key(b"/XObject")?;
-            let Some(entries) = xobjects.try_as_dictionary()? else {
+            if !xobjects.try_is_dictionary()? {
                 continue;
-            };
+            }
 
-            for (key, value) in entries {
-                let object = value;
+            // qpdf iterates `xobj_dict.getKeys()`, which omits keys whose values
+            // resolve to null, and reads each value with `getKey`
+            // (`libqpdf/QPDFPageObjectHelper.cc:335-338`,
+            // `libqpdf/QPDF_Dictionary.cc:118-127`).
+            for key in xobjects.try_get_keys()? {
+                let object = xobjects.try_get_key(&key)?;
                 if selector(&object)? {
                     action(object.clone(), xobjects.clone(), key)?;
                 }
@@ -1577,143 +1439,33 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         Ok(result)
     }
 
-    /// Return image XObjects from this target and all nested Forms.
-    pub fn get_images_recursive(&mut self) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
-        let mut result = BTreeMap::new();
-        self.for_each_image(true, |object, _, key| {
-            result.insert(key, object);
-            Ok(())
-        })?;
-        Ok(result)
-    }
-
-    /// Return Form XObjects from this target and all nested Forms.
-    pub fn get_form_xobjects_recursive(&mut self) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
-        let mut result = BTreeMap::new();
-        self.for_each_form_xobject(true, |object, _, key| {
-            result.insert(key, object);
-            Ok(())
-        })?;
-        Ok(result)
-    }
-
-    // -----------------------------------------------------------------------
-    // rotate  (GETTER — resolves inherited value, does not mutate)
-    // -----------------------------------------------------------------------
-
-    /// Return the effective `/Rotate` value for this page in degrees, resolved
-    /// through the `/Parent` chain.
-    ///
-    /// Returns `0` (the PDF default, ISO 32000-1 §7.7.3.3 Table 30) when no
-    /// node in the chain carries a `/Rotate` entry. A present value is
-    /// returned as-is, including one that is not a multiple of 90, matching
-    /// qpdf's raw `getAttribute("/Rotate", false)` passthrough
-    /// (`QPDFPageObjectHelper.cc:670`) -- normalization to
-    /// `{0, 90, 180, 270}` only happens as part of a *mutation* via
-    /// [`Self::rotate_page`].
-    ///
-    /// This is a **getter** — it does not mutate the document. To rotate this
-    /// page, use [`Self::rotate_page`].
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Unsupported`] if the page-tree depth limit is exceeded.
-    /// - Any error from canonical ObjectHandle resolution.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::fs::File;
-    /// use std::io::BufReader;
-    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
-    ///
-    /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
-    /// if let Some(page) = pages.into_iter().next() {
-    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-    ///     let deg = helper.rotate()?;
-    ///     println!("rotation: {deg}°");
-    /// }
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn rotate(&mut self) -> Result<i32> {
-        self.ensure_leaf_page()?;
-        let page_ref = self.require_page_ref()?;
-        resolve_inherited_rotate(self.pdf, page_ref)
-    }
-
     // -----------------------------------------------------------------------
     // get_annotations
     // -----------------------------------------------------------------------
 
-    /// Return the `ObjectRef`s of all annotations on this page.
-    ///
-    /// Reads the leaf page's `/Annots` array. Unlike boxes and resources,
-    /// `/Annots` is **not** inheritable — only the leaf page dictionary is
-    /// consulted.
-    ///
-    /// Returns an empty `Vec` when `/Annots` is absent or empty.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Unsupported`] when `page_ref` does not resolve to a
-    ///   dictionary, when `/Annots` is not an array, or when an array element
-    ///   is not an indirect object handle.
-    /// - Any error from canonical ObjectHandle resolution.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::fs::File;
-    /// use std::io::BufReader;
-    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
-    ///
-    /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
-    /// if let Some(page) = pages.into_iter().next() {
-    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-    ///     let annots = helper.get_annotations()?;
-    ///     for annot_ref in &annots {
-    ///         println!("annotation: {annot_ref}");
-    ///     }
-    /// }
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn get_annotations(&mut self) -> Result<Vec<ObjectRef>> {
-        let page = self.resolved_page_handle()?;
-        let page_ref = self.require_page_ref()?;
-        let annots = page.try_get_key(b"/Annots")?;
-        if annots.try_is_null()? {
-            return Ok(Vec::new());
-        }
-        let Some(annots_array) = annots.try_as_array()? else {
-            return Err(Error::Unsupported(format!(
-                "/Annots on page {page_ref} does not resolve to an array"
-            )));
-        };
-
-        let mut refs = Vec::with_capacity(annots_array.len());
-        for (index, elem) in annots_array.iter().enumerate() {
-            let Some(object_ref) = elem.object_ref() else {
-                return Err(Error::Unsupported(format!(
-                    "/Annots element {index} on page {page_ref} is not an indirect reference"
-                )));
-            };
-            refs.push(object_ref);
-        }
-        Ok(refs)
+    /// Return annotation helpers, optionally restricted to a `/Subtype` name,
+    /// matching qpdf's `QPDFPageObjectHelper::getAnnotations`
+    /// (`include/qpdf/QPDFPageObjectHelper.hh:211`,
+    /// `libqpdf/QPDFPageObjectHelper.cc:439-454`). A missing, null, or
+    /// non-array `/Annots` value yields an empty result; non-dictionary array
+    /// members are skipped. Each returned helper retains the exact direct or
+    /// indirect annotation handle. On non-Form receivers, the lookup reads
+    /// `/Annots` directly and does not require `/Type /Page`.
+    pub fn get_annotations(
+        &mut self,
+        only_subtype: Option<&[u8]>,
+    ) -> Result<Vec<AnnotationObjectHelper>> {
+        Ok(self
+            .get_annotation_handles(only_subtype)?
+            .into_iter()
+            .map(AnnotationObjectHelper::new)
+            .collect())
     }
 
-    /// Return canonical annotation handles, optionally restricted to a
-    /// `/Subtype` name, mirroring qpdf's fail-soft
-    /// `QPDFPageObjectHelper::getAnnotations`
-    /// (`libqpdf/QPDFPageObjectHelper.cc:439-454`). A missing, null, or
-    /// non-array `/Annots` value yields an empty result; non-dictionary array
-    /// members are skipped. Direct annotation dictionaries are preserved in
-    /// this handle-native method even though [`Self::get_annotations`] retains
-    /// its historical indirect-reference contract. On non-Form receivers,
-    /// the lookup reads `/Annots` directly and does not require `/Type /Page`.
-    pub fn get_annotation_handles(
+    /// Collect raw annotation handles for crate-internal consumers that
+    /// mutate or associate the underlying PDF objects. The public qpdf-shaped
+    /// surface is [`Self::get_annotations`].
+    pub(crate) fn get_annotation_handles(
         &mut self,
         only_subtype: Option<&[u8]>,
     ) -> Result<Vec<ObjectHandle>> {
@@ -1741,242 +1493,15 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         Ok(result)
     }
 
-    /// Return canonical annotation handles using qpdf's filtered, fail-soft
-    /// enumeration boundary. Direct and indirect annotation dictionaries are
-    /// both retained, matching the `QPDFAnnotationObjectHelper` values
-    /// returned by qpdf.
-    pub fn get_annotations_filtered(
-        &mut self,
-        only_subtype: Option<&[u8]>,
-    ) -> Result<Vec<ObjectHandle>> {
-        self.get_annotation_handles(only_subtype)
-    }
-
     // -----------------------------------------------------------------------
     // Bounding boxes
     // -----------------------------------------------------------------------
 
-    /// Return the effective `/MediaBox` for this page, resolving inheritance
-    /// through the `/Parent` chain.
-    ///
-    /// Returns `Ok(None)` when no node in the chain carries a `/MediaBox`
-    /// entry.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Unsupported`] if the page-tree depth limit is exceeded, or
-    ///   the rectangle array has fewer than 4 numeric elements.
-    /// - Any error from canonical ObjectHandle resolution.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::fs::File;
-    /// use std::io::BufReader;
-    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
-    ///
-    /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
-    /// if let Some(page) = pages.into_iter().next() {
-    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-    ///     if let Some(mb) = helper.media_box()? {
-    ///         println!("[{} {} {} {}]", mb.llx, mb.lly, mb.urx, mb.ury);
-    ///     }
-    /// }
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn media_box(&mut self) -> Result<Option<PageBox>> {
-        let value = self.get_media_box(false)?;
-        self.page_box_from_handle(b"/MediaBox", value)
-    }
-
-    /// Return the effective `/CropBox` for this page, resolving inheritance
-    /// through the `/Parent` chain.
-    ///
-    /// Per ISO 32000-1 §14.11.2: when `/CropBox` is absent, the default is the
-    /// `/MediaBox`. Returns `Ok(None)` only when `/MediaBox` is also absent.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`media_box`](PageObjectHelper::media_box).
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::fs::File;
-    /// use std::io::BufReader;
-    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
-    ///
-    /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
-    /// if let Some(page) = pages.into_iter().next() {
-    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-    ///     if let Some(cb) = helper.crop_box()? {
-    ///         println!("[{} {} {} {}]", cb.llx, cb.lly, cb.urx, cb.ury);
-    ///     }
-    /// }
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn crop_box(&mut self) -> Result<Option<PageBox>> {
-        let value = self.get_crop_box(false, false)?;
-        self.page_box_from_handle(b"/CropBox", value)
-    }
-
-    /// Return the effective `/BleedBox` for this page.
-    ///
-    /// Per ISO 32000-1 §14.11.2: `/BleedBox` is **not** inheritable and its
-    /// default is the `/CropBox` (which itself defaults to `/MediaBox`).
-    ///
-    /// # Errors
-    ///
-    /// Same as [`crop_box`](PageObjectHelper::crop_box).
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::fs::File;
-    /// use std::io::BufReader;
-    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
-    ///
-    /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
-    /// if let Some(page) = pages.into_iter().next() {
-    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-    ///     if let Some(bb) = helper.bleed_box()? {
-    ///         println!("[{} {} {} {}]", bb.llx, bb.lly, bb.urx, bb.ury);
-    ///     }
-    /// }
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn bleed_box(&mut self) -> Result<Option<PageBox>> {
-        let value = self.get_bleed_box(false, false)?;
-        self.page_box_from_handle(b"/BleedBox", value)
-    }
-
-    /// Return the effective `/TrimBox` for this page.
-    ///
-    /// Per ISO 32000-1 §14.11.2: `/TrimBox` is **not** inheritable and its
-    /// default is the `/CropBox` (which itself defaults to `/MediaBox`).
-    ///
-    /// # Errors
-    ///
-    /// Same as [`crop_box`](PageObjectHelper::crop_box).
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::fs::File;
-    /// use std::io::BufReader;
-    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
-    ///
-    /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
-    /// if let Some(page) = pages.into_iter().next() {
-    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-    ///     if let Some(tb) = helper.trim_box()? {
-    ///         println!("[{} {} {} {}]", tb.llx, tb.lly, tb.urx, tb.ury);
-    ///     }
-    /// }
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn trim_box(&mut self) -> Result<Option<PageBox>> {
-        let value = self.get_trim_box(false, false)?;
-        self.page_box_from_handle(b"/TrimBox", value)
-    }
-
-    /// Return the effective `/ArtBox` for this page.
-    ///
-    /// Per ISO 32000-1 §14.11.2: `/ArtBox` is **not** inheritable and its
-    /// default is the `/CropBox` (which itself defaults to `/MediaBox`).
-    ///
-    /// # Errors
-    ///
-    /// Same as [`crop_box`](PageObjectHelper::crop_box).
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::fs::File;
-    /// use std::io::BufReader;
-    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
-    ///
-    /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
-    /// if let Some(page) = pages.into_iter().next() {
-    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-    ///     if let Some(ab) = helper.art_box()? {
-    ///         println!("[{} {} {} {}]", ab.llx, ab.lly, ab.urx, ab.ury);
-    ///     }
-    /// }
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn art_box(&mut self) -> Result<Option<PageBox>> {
-        let value = self.get_art_box(false, false)?;
-        self.page_box_from_handle(b"/ArtBox", value)
-    }
-
-    fn page_box_from_handle(&mut self, key: &[u8], value: ObjectHandle) -> Result<Option<PageBox>> {
-        if value.try_is_null()? {
+    fn rectangle_for_matrix(&mut self, value: &ObjectHandle) -> Result<Option<Rectangle>> {
+        if !value.try_is_rectangle()? {
             return Ok(None);
         }
-        let Some(items) = value.try_as_array()? else {
-            return Err(Error::Unsupported(format!(
-                "{} on page {} does not resolve to an array",
-                String::from_utf8_lossy(key),
-                self.target_description()
-            )));
-        };
-        if items.len() < 4 {
-            return Err(Error::Unsupported(format!(
-                "{} rectangle array has {} elements, expected 4",
-                String::from_utf8_lossy(key),
-                items.len()
-            )));
-        }
-        let mut coords = [0.0f64; 4];
-        for (index, item) in items.into_iter().take(4).enumerate() {
-            let Some(value) = item
-                .try_as_integer()?
-                .map(|value| value as f64)
-                .or_else(|| item.as_real())
-            else {
-                let type_name = item.type_name()?;
-                return Err(Error::Unsupported(format!(
-                    "{} rectangle element {index} has type {type_name} (expected number)",
-                    String::from_utf8_lossy(key),
-                )));
-            };
-            coords[index] = value;
-        }
-        Ok(Some(PageBox::new(
-            coords[0], coords[1], coords[2], coords[3],
-        )))
-    }
-
-    fn rectangle_for_matrix(&mut self, value: &ObjectHandle) -> Result<Option<PageBox>> {
-        let Some(items) = value.try_as_array()? else {
-            return Ok(None);
-        };
-        if items.len() != 4 {
-            return Ok(None);
-        }
-        let mut coords = [0.0f64; 4];
-        for (index, item) in items.into_iter().take(4).enumerate() {
-            let Some(number) = item
-                .try_as_integer()?
-                .map(|value| value as f64)
-                .or_else(|| item.as_real())
-            else {
-                return Ok(None);
-            };
-            coords[index] = number;
-        }
-        Ok(Some(PageBox::new(
-            coords[0].min(coords[2]),
-            coords[1].min(coords[3]),
-            coords[0].max(coords[2]),
-            coords[1].max(coords[3]),
-        )))
+        Ok(Some(value.try_get_array_as_rectangle()?))
     }
 }
 
@@ -2001,7 +1526,7 @@ fn externalize_inline_images_for_target<R: Read + Seek + 'static>(
     description: &str,
     min_size: usize,
 ) -> Result<()> {
-    let (target, is_form) = resolve_attribute_target(object, description)?;
+    let (target, is_form) = resolve_attribute_target(object)?;
     let resources = get_attribute_for_target(target.clone(), b"/Resources", true, description)?;
 
     // qpdf uses mergeResources to make /XObject direct and private before the
@@ -2226,37 +1751,12 @@ fn matrix_from_handle(handle: &ObjectHandle) -> Result<Option<Matrix>> {
     Ok(Some(Matrix::from(values)))
 }
 
-fn resolve_attribute_target(
-    object: ObjectHandle,
-    description: &str,
-) -> Result<(ObjectHandle, bool)> {
-    // `is_form_xobject` already dereferences `object` on its way to reading
-    // its type code, so `object` is resolved by the time it reaches the
-    // non-resolving `as_dictionary`/`has_key` checks below regardless of
-    // which branch is taken.
-    if object.is_form_xobject()? {
-        return Ok((object, true));
-    }
-    if !object.try_is_dictionary()? {
-        return Err(Error::Unsupported(format!(
-            "object {description} is not a page dictionary or Form XObject"
-        )));
-    }
-
-    let page_type = object.try_get_key(b"/Type")?;
-    match page_type.try_as_name()? {
-        Some(name) if name.as_slice() == b"Page" => Ok((object, false)),
-        Some(name) => Err(Error::Unsupported(format!(
-            "object {description} has /Type /{}, expected /Page",
-            String::from_utf8_lossy(&name)
-        ))),
-        None if object.try_has_key(b"/Type")? => Err(Error::Unsupported(format!(
-            "object {description} has a non-name /Type entry"
-        ))),
-        None => Err(Error::Unsupported(format!(
-            "object {description} has no /Type entry"
-        ))),
-    }
+fn resolve_attribute_target(object: ObjectHandle) -> Result<(ObjectHandle, bool)> {
+    // QPDFPageObjectHelper dispatches by Form XObject only. Page and other
+    // non-Form handles flow into the delegated QPDFObjectHandle operation,
+    // which owns its own type warnings and failures.
+    let is_form = object.is_form_xobject()?;
+    Ok((object, is_form))
 }
 
 fn get_attribute_for_target(
@@ -2314,73 +1814,19 @@ fn get_attribute_for_target(
     Ok(result)
 }
 
-/// Return the effective `/Rotate` value for a page, keeping the inherited
-/// lookup beside the other page-local attribute accessors.
-pub(crate) fn resolve_inherited_rotate<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
-) -> Result<i32> {
-    resolve_inherited_rotate_with_max_depth(pdf, page_ref, DEFAULT_MAX_PAGE_TREE_DEPTH)
-}
-
-/// Test-supporting form of [`resolve_inherited_rotate`] with an explicit
-/// page-tree depth bound.
-pub(crate) fn resolve_inherited_rotate_with_max_depth<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
-    max_depth: usize,
-) -> Result<i32> {
-    let mut current = pdf.get_object_handle(page_ref);
-    let mut depth: usize = 0;
-    #[allow(
-        clippy::mutable_key_type,
-        reason = "qpdf identity keys intentionally retain the live handle allocation"
-    )]
-    let mut seen = HashSet::new();
-
-    loop {
-        if depth >= max_depth {
-            return Err(Error::Unsupported(format!(
-                "page tree depth exceeds maximum of {max_depth} at {}",
-                current_description(&current)
-            )));
-        }
-        if !seen.insert(current.identity_key()) {
-            return Ok(0);
-        }
-
-        let rotate = current.try_get_key(b"/Rotate")?;
-        if rotate.try_as_integer()?.is_some() {
-            return rotate.try_get_int_value_as_int();
-        }
-        if !rotate.try_is_null()? {
-            return Err(Error::Unsupported(format!(
-                "/Rotate entry on node {} has unexpected type",
-                current_description(&current)
-            )));
-        }
-
-        let parent = current.try_get_key(b"/Parent")?;
-        if !parent.try_is_dictionary()? {
-            return Ok(0);
-        }
-        current = parent;
-        depth += 1;
-    }
-}
-
-fn current_description(current: &ObjectHandle) -> String {
-    current
-        .object_ref()
-        .map(|reference| reference.to_string())
-        .unwrap_or_else(|| "direct page-tree dictionary".to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    fn helper_for_ref(
+        pdf: &mut Pdf<Cursor<Vec<u8>>>,
+        object_ref: ObjectRef,
+    ) -> PageObjectHelper<'_, Cursor<Vec<u8>>> {
+        let object = pdf.get_object_handle(object_ref);
+        PageObjectHelper::from_object_handle(object, pdf)
+    }
 
     struct NoopTokenFilter;
 
@@ -2558,7 +2004,7 @@ mod tests {
 
         let bytes = pdf_from_objects(1, &objects);
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
-        let mut helper = PageObjectHelper::new(ObjectRef::new(leaf_ref, 0), &mut pdf);
+        let mut helper = helper_for_ref(&mut pdf, ObjectRef::new(leaf_ref, 0));
         let media_box = helper
             .get_media_box(false)
             .expect("the 100th ancestor's /MediaBox must be reachable");
@@ -2596,7 +2042,7 @@ mod tests {
             ],
         );
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
-        PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf)
+        helper_for_ref(&mut pdf, ObjectRef::new(3, 0))
             .add_content_token_filter(Rc::new(RefCell::new(NoopTokenFilter)))
             .expect("page content filter should use the page route");
         pdf.get_object_handle(ObjectRef::new(4, 0))
@@ -2652,7 +2098,7 @@ mod tests {
         );
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
 
-        let form = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf)
+        let form = helper_for_ref(&mut pdf, ObjectRef::new(3, 0))
             .get_form_xobject_for_page(false)
             .expect("false transformation variant should still create a Form XObject");
 

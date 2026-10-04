@@ -30,7 +30,7 @@ use std::rc::Rc;
 
 use super::page_range::PageRange;
 use crate::page_form_xobject::get_form_xobject_for_handle;
-use crate::page_object_helper::{rectangle_from_handle, PageBox, PageObjectHelper};
+use crate::page_object_helper::{rectangle_from_handle, PageObjectHelper};
 use crate::{Error, Matrix, ObjectHandle, Pdf, Rectangle, Result};
 
 /// Whether a source page is drawn beneath (`Underlay`) or above (`Overlay`) the
@@ -159,8 +159,8 @@ fn under_overlay_for_page<R: Read + Seek, RS: Read + Seek>(
     //    annotations through the canonical PageObjectHelper foreign route.
     // Placement rects mirror qpdf's getTrimBox()/getMediaBox().getArrayAsRectangle()
     // in doUnderOverlayForPage: corners normalized before scaling/centring.
-    let trim_rect = normalize_rectangle(trim_box);
-    let media_rect = normalize_rectangle(media_box);
+    let trim_rect = trim_box;
+    let media_rect = media_box;
     let mut content = String::new();
     for source_page in &underlays {
         let xobject = resolve_overlay_xobject(
@@ -731,7 +731,7 @@ fn page_box_or_err<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page: ObjectHandle,
     kind: BoxKind,
-) -> Result<PageBox> {
+) -> Result<Rectangle> {
     let mut helper = PageObjectHelper::from_object_handle(page.clone(), pdf);
     let value = match kind {
         BoxKind::Media => helper.get_media_box(false)?,
@@ -758,12 +758,7 @@ fn page_box_or_err<R: Read + Seek>(
     // malformed value; the destination Form-XObject conversion owns the
     // warning that makes the overlay operation observable as repaired.
     let rectangle = rectangle_from_handle(&value)?.unwrap_or_default();
-    Ok(PageBox::new(
-        rectangle.llx,
-        rectangle.lly,
-        rectangle.urx,
-        rectangle.ury,
-    ))
+    Ok(rectangle)
 }
 
 /// Build a placement fragment through the canonical page/Form handle route.
@@ -796,21 +791,6 @@ fn place_form_xobject_canonical<R: Read + Seek>(
         invert_transformations,
         allow_shrink,
         allow_expand,
-    )
-}
-
-/// Normalize a rectangle's corners the way qpdf's
-/// `QPDFObjectHandle::getArrayAsRectangle` does: `llx = min(x0, x2)`,
-/// `lly = min(x1, x3)`, `urx = max(x0, x2)`, `ury = max(x1, x3)`. qpdf reads all
-/// box geometry for placement through this accessor, so a page with a reversed box
-/// (`llx > urx` or `lly > ury`) still yields a non-negative width/height and places
-/// identically to its ordered form.
-fn normalize_rectangle(rectangle: PageBox) -> Rectangle {
-    Rectangle::new(
-        rectangle.llx.min(rectangle.urx),
-        rectangle.lly.min(rectangle.ury),
-        rectangle.llx.max(rectangle.urx),
-        rectangle.lly.max(rectangle.ury),
     )
 }
 
@@ -1668,7 +1648,7 @@ mod tests {
     }
 
     /// The non-null path (an actual `/MediaBox`) must still resolve to a
-    /// usable `PageBox`, so the changed `try_is_null()` branch does not
+    /// usable `Rectangle`, so the changed `try_is_null()` branch does not
     /// regress the common case.
     #[test]
     fn page_box_or_err_accepts_a_page_with_a_media_box() {
@@ -1687,6 +1667,6 @@ mod tests {
 
         let page_box = page_box_or_err(&mut pdf, page, BoxKind::Media)
             .expect("a page with a direct /MediaBox has a usable box");
-        assert_eq!(page_box, PageBox::new(0.0, 0.0, 612.0, 792.0));
+        assert_eq!(page_box, Rectangle::new(0.0, 0.0, 612.0, 792.0));
     }
 }

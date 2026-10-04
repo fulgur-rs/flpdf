@@ -1,8 +1,10 @@
-//! PDF coordinate matrices and rectangle transforms.
+//! PDF coordinate matrices and qpdf's rectangle value type.
 //!
 //! Mirrors qpdf 11.9.0 libqpdf/QPDFMatrix.cc.
 //!
-//! Public API: qpdf 11.9.0 include/qpdf/QPDFMatrix.hh.
+//! `Matrix` maps to `QPDFMatrix` (`include/qpdf/QPDFMatrix.hh`,
+//! `libqpdf/QPDFMatrix.cc`), and `Rectangle` maps to
+//! `QPDFObjectHandle::Rectangle` (`include/qpdf/QPDFObjectHandle.hh:229-260`).
 
 /// An axis-aligned rectangle represented by its lower-left and upper-right corners.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

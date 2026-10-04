@@ -229,7 +229,7 @@ fn annotation_rect_absent_returns_zero_box() {
     let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
     assert_eq!(
         annot.get_rect().expect("get_rect()"),
-        flpdf::PageBox::new(0.0, 0.0, 0.0, 0.0)
+        flpdf::Rectangle::new(0.0, 0.0, 0.0, 0.0)
     );
 }
 
@@ -305,7 +305,7 @@ fn annotation_handle_reads_qpdf_leaf_attributes() {
     assert_eq!(annot.get_flags().unwrap(), 12);
     assert_eq!(
         annot.get_rect().unwrap(),
-        flpdf::PageBox::new(10.0, 20.0, 200.0, 50.0)
+        flpdf::Rectangle::new(10.0, 20.0, 200.0, 50.0)
     );
     assert!(annot.get_appearance_dictionary().unwrap().is_null());
 }
@@ -987,7 +987,7 @@ fn annotation_object_helper_on_non_dict_returns_defaults() {
     );
     assert_eq!(
         annot.get_rect().expect("get_rect()"),
-        flpdf::PageBox::new(0.0, 0.0, 0.0, 0.0)
+        flpdf::Rectangle::new(0.0, 0.0, 0.0, 0.0)
     );
     assert_eq!(annot.get_flags().expect("get_flags()"), 0);
 }
