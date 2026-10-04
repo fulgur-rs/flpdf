@@ -27,8 +27,8 @@ use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
 use crate::qutil::{qpdf_string_to_int_checked, QpdfIntParse};
 use crate::{
     AcroFormDocumentHelper, Error, ObjectHandle, ObjectStreamMode, PageDocumentHelper,
-    PageObjectHelper, Pdf, PdfOpenOptions, PdfVersion, PdfWriter, QPDFLogger, ReadSeek, Result,
-    UsageError, WriterConfiguration,
+    PageObjectHelper, Pdf, PdfOpenOptions, PdfVersion, PdfWriter, QPDFLogger, QpdfErrorCode,
+    QpdfExc, ReadSeek, Result, UsageError, WriterConfiguration,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -53,6 +53,37 @@ fn path_description_bytes(path: &Path) -> Vec<u8> {
     #[cfg(not(unix))]
     {
         path.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+fn qpdf_source_error(source_name: &[u8], error: Error) -> Error {
+    match error {
+        Error::Encrypted(crate::EncryptedError::BadPassword) => Error::QpdfExc(QpdfExc::new(
+            QpdfErrorCode::Password,
+            source_name,
+            b"",
+            0,
+            b"invalid password",
+        )),
+        Error::Parse { message, .. }
+            if message == "unable to find trailer dictionary while recovering damaged file" =>
+        {
+            Error::QpdfExc(QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                source_name,
+                b"",
+                0,
+                message.as_bytes(),
+            ))
+        }
+        Error::OpenFailure {
+            source,
+            diagnostics,
+        } => Error::OpenFailure {
+            source: Box::new(qpdf_source_error(source_name, *source)),
+            diagnostics,
+        },
+        other => other,
     }
 }
 
@@ -1484,7 +1515,10 @@ pub enum JobExitCode {
     /// No warning was recorded, or warnings were explicitly configured to be
     /// exit-zero.
     Success = 0,
-    /// The job could not create or write its requested document.
+    /// qpdf's status value for a completed operation that reports errors,
+    /// such as `--requires-password` on an unencrypted document. Ordinary
+    /// create and write exceptions are returned by [`QPDFJob::run`] as
+    /// `Err`.
     Error = 2,
     /// Warnings were recorded and the job was not configured to suppress the
     /// warning exit status.
@@ -1571,20 +1605,18 @@ impl Default for QPDFJob {
     }
 }
 
-/// How an inspection-stage failure reaches the `write_qpdf` boundary.
+/// How an inspection-stage failure is returned by the report helpers.
 ///
-/// qpdf's inspection stage reports nothing itself; every failure escapes as an
-/// exception and the CLI's single catch prints `qpdf: <what()>` once
-/// (`qpdf/qpdf.cc:39-41`). flpdf's check consumer already writes that line for
-/// detected structural errors (`job/check.rs::report_errors_detected`,
-/// mirroring the `std::runtime_error("errors detected")` qpdf throws at
-/// `libqpdf/QPDFJob.cc:793`), so the boundary has to know which failures are
-/// still owed a diagnostic.
+/// qpdf's inspection stage lets exceptions escape to the outer CLI catch
+/// (`qpdf/qpdf.cc:39-41`). The standalone Rust report helper also supports a
+/// direct check boundary that has already emitted `errors detected`; the Job
+/// `run`/`write_qpdf` path defers that final line to its caller, matching
+/// qpdf's `doCheck` throw (`QPDFJob.cc:788-793`).
 #[derive(Debug)]
 enum InspectionFailure {
-    /// The diagnostic has already been written; the boundary must stay silent.
+    /// The report helper already emitted the final check diagnostic.
     Reported(Error),
-    /// The boundary still owes the caller its one diagnostic line.
+    /// The caller must render the propagated exception.
     Unreported(Error),
 }
 
@@ -3264,58 +3296,26 @@ impl QPDFJob {
         Ok(primary)
     }
 
-    /// Create the configured input document, returning `None` after qpdf-style
-    /// error reporting for a missing or malformed input.
+    /// Create the configured input document and propagate failures to the
+    /// caller, matching `QPDFJob::createQPDF`'s error boundary.
     pub fn create_qpdf(&mut self) -> Result<Option<JobDocument>> {
         self.create_qpdf_succeeded_without_document = false;
         self.reset_encryption_status();
-        match self.check_configuration() {
-            Ok(()) => {}
-            Err(error @ Error::Usage(_)) => return Err(error),
-            Err(error) => {
-                self.report_job_error(&error)?;
-                return Ok(None);
-            }
-        }
+        self.check_configuration()?;
         if self.configuration.empty_input {
             let pdf = self.create_empty_document()?;
-            return match self.finish_created_document(pdf) {
-                Ok(pdf) => Ok(Some(pdf)),
-                Err(error @ Error::Usage(_)) => Err(error),
-                Err(error) => {
-                    self.report_job_error(&error)?;
-                    Ok(None)
-                }
-            };
+            return Ok(Some(self.finish_created_document(pdf)?));
         }
         let Some(input) = self.configuration.input_file.clone() else {
-            let error = Error::Unsupported("qpdfjob input file is not configured".to_owned());
-            self.report_job_error(&error)?;
-            return Ok(None);
+            // cov:ignore-start: check_configuration rejects a missing input before this invariant guard
+            return Err(UsageError::new("an input file name is required").into());
+            // cov:ignore-end
         };
-        let file = match File::open(&input) {
-            Ok(file) => file,
-            Err(error) => {
-                let error = Error::file_io("open", input.clone(), error);
-                self.report_job_error(&error)?;
-                return Ok(None);
-            }
-        };
+        let file =
+            File::open(&input).map_err(|error| Error::file_io("open", input.clone(), error))?;
         if self.configuration.json_input {
-            return match self.create_from_json_document(file, path_description_bytes(&input)) {
-                Ok(pdf) => match self.finish_created_document(pdf) {
-                    Ok(pdf) => Ok(Some(pdf)),
-                    Err(error @ Error::Usage(_)) => Err(error),
-                    Err(error) => {
-                        self.report_job_error(&error)?;
-                        Ok(None)
-                    }
-                },
-                Err(error) => {
-                    self.report_job_error(&error)?;
-                    Ok(None)
-                }
-            };
+            let pdf = self.create_from_json_document(file, path_description_bytes(&input))?;
+            return Ok(Some(self.finish_created_document(pdf)?));
         }
         let input_name = path_description_bytes(&input);
         let needs_encryption_inspection_open = self.configuration.show_encryption
@@ -3341,47 +3341,31 @@ impl QPDFJob {
                 self.configured_open_options(self.configuration.password.clone()),
             )
         };
-        match open_result {
-            Ok(mut pdf)
-                if needs_encryption_inspection_open
-                    && pdf.is_encrypted()
-                    && pdf.encryption_file_key().is_none() =>
-            {
-                // qpdf evaluates encryption-status queries before its
-                // show-encryption fallback in the password-error catch
-                // (`libqpdf/QPDFJob.cc:436-448`). Record the status and skip
-                // the report when both kinds of inspection are configured.
-                if self.configuration.is_encrypted || self.configuration.requires_password {
-                    self.encryption_status = EncryptionStatus {
-                        encrypted: true,
-                        password_incorrect: true,
-                    };
-                } else {
-                    // qpdf reports the encryption parameters from the partial
-                    // document and returns nullptr before update/page
-                    // transformations or write/inspection continuation.
-                    self.show_encryption(&mut pdf, self.configuration.password_is_hex_key)?;
-                }
-                self.create_qpdf_succeeded_without_document = true;
-                Ok(None)
+        let mut pdf = open_result.map_err(|error| qpdf_source_error(&input_name, error))?;
+        if needs_encryption_inspection_open
+            && pdf.is_encrypted()
+            && pdf.encryption_file_key().is_none()
+        {
+            // qpdf evaluates encryption-status queries before its
+            // show-encryption fallback in the password-error catch
+            // (`libqpdf/QPDFJob.cc:436-448`). Record the status and skip the
+            // report when both kinds of inspection are configured.
+            if self.configuration.is_encrypted || self.configuration.requires_password {
+                self.encryption_status = EncryptionStatus {
+                    encrypted: true,
+                    password_incorrect: true,
+                };
+            } else {
+                // qpdf reports the encryption parameters from the partial
+                // document and returns nullptr before update/page
+                // transformations or write/inspection continuation.
+                self.show_encryption(&mut pdf, self.configuration.password_is_hex_key)?;
             }
-            Ok(pdf) => match self.finish_created_document(pdf) {
-                Ok(pdf) => Ok(Some(pdf)),
-                // A usage error belongs to qpdf's `QPDFUsage` path, which the
-                // CLI renders through `usageExit` (`qpdf/qpdf.cc:12-22,37-38`).
-                // Reporting it here would print the bare message instead, so
-                // propagate it the way `check_configuration` already does.
-                Err(error @ Error::Usage(_)) => Err(error),
-                Err(error) => {
-                    self.report_job_error(&error)?;
-                    Ok(None)
-                }
-            },
-            Err(error) => {
-                self.report_job_error(&error)?;
-                Ok(None)
-            }
+            self.create_qpdf_succeeded_without_document = true;
+            return Ok(None);
         }
+        let pdf = self.finish_created_document(pdf)?;
+        Ok(Some(pdf))
     }
 
     /// Return the primary document's encryption status captured by the last
@@ -3414,13 +3398,10 @@ impl QPDFJob {
     {
         if !self.creates_output() {
             let configuration = self.configuration.clone();
-            if let Err(failure) = self.run_configured_inspection(pdf, &configuration) {
+            if let Err(failure) = self.run_configured_inspection(pdf, &configuration, false) {
                 let error = match failure {
                     InspectionFailure::Reported(error) => error,
-                    InspectionFailure::Unreported(error) => {
-                        self.report_job_error(&error)?;
-                        error
-                    }
+                    InspectionFailure::Unreported(error) => error,
                 };
                 return Err(error);
             }
@@ -3433,14 +3414,7 @@ impl QPDFJob {
         }
 
         if self.configuration.linearize && self.configuration.normalize_content == Some(true) {
-            match self.normalize_page_contents(pdf) {
-                Ok(()) => {}
-                Err(error @ Error::Usage(_)) => return Err(error),
-                Err(error) => {
-                    self.report_job_error(&error)?;
-                    return Err(error);
-                }
-            }
+            self.normalize_page_contents(pdf)?;
         }
 
         // Reserving again here is a no-op once `apply_transformations` has
@@ -3494,10 +3468,7 @@ impl QPDFJob {
                     // donor has no `/Encrypt` key (`QPDFWriter.cc:651-658`).
                     writer_configuration.set_preserve_encryption(false);
                 }
-                Err(error) => {
-                    self.report_job_error(&error)?;
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             }
         }
         writer_configuration.set_linearization(self.configuration.linearize);
@@ -3621,20 +3592,14 @@ impl QPDFJob {
                         spec.source.close_input_source();
                     }
                     // A rename failure escapes qpdf's `writeOutfile` as an
-                    // exception and its CLI catch still prints one
-                    // `qpdf: <what()>` line (`qpdf/qpdf.cc:39-41`). Report it
-                    // here for the same reason the write-failure arm below
-                    // does: `run()` turns the error into an exit status and
-                    // would otherwise discard the explanation entirely.
+                    // exception; the outer caller owns its diagnostic
+                    // (`qpdf/qpdf.cc:39-41`).
                     // cov:ignore-start: reaching this arm needs the rename
                     // itself to fail after a successful write, which requires
                     // a filesystem-level failure (permissions revoked between
                     // write and rename, or a still-open handle on Windows)
                     // that cannot be induced in-process on Linux CI
-                    if let Err(error) = self.finish_replace_input() {
-                        self.report_job_error(&error)?;
-                        return Err(error);
-                    }
+                    self.finish_replace_input()?;
                     // cov:ignore-end
                 }
                 // The drain qpdf performs after `writeOutfile` returns
@@ -3651,18 +3616,7 @@ impl QPDFJob {
                 }
                 Ok(())
             }
-            // A usage error belongs to qpdf's `QPDFUsage` path: `writeJSON`
-            // calls `usage()` for a stdout destination that cannot name its
-            // stream side files (`libqpdf/QPDFJob.cc:3105-3110`), and that
-            // exception passes straight through `writeOutfile`/`writeQPDF` to
-            // the CLI's `usageExit` (`qpdf/qpdf.cc:37-38`). Reporting it here
-            // would print the bare message instead of qpdf's usage block, the
-            // same reason `create_qpdf` propagates it unreported.
-            Err(error @ Error::Usage(_)) => Err(error),
-            Err(error) => {
-                self.report_job_error(&error)?;
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -3751,14 +3705,15 @@ impl QPDFJob {
         if !output_file_is_stdout && !show_attachment_to_stdout {
             return Ok(());
         }
-        if let Err(error) = self.logger.save_to_standard_output(true) {
-            self.report_job_error(&error)?;
-            return Err(error);
-        }
-        Ok(())
+        self.logger.save_to_standard_output(true)
     }
 
     /// Run the configured create/write or check lifecycle.
+    ///
+    /// Like qpdf's `QPDFJob::run`, configuration, input, transformation, and
+    /// writer exceptions escape to the caller. `Ok(JobExitCode::Error)` is
+    /// reserved for qpdf operations whose documented result is an exit status,
+    /// including encryption-status queries.
     pub fn run(&mut self) -> Result<JobExitCode> {
         if self.argv_early_exit {
             return Ok(JobExitCode::Success);
@@ -3774,18 +3729,8 @@ impl QPDFJob {
             });
         };
 
-        let status = match self.write_qpdf(&mut pdf) {
-            Ok(()) => self.get_exit_code(),
-            // qpdf's `QPDFUsage` is not caught by `run()`; it reaches the
-            // caller, which renders it through `usageExit`
-            // (`qpdf/qpdf.cc:37-38`). Every other write failure has already
-            // been reported by `writeQPDF`, so it only contributes its status.
-            Err(error @ Error::Usage(_)) => return Err(error),
-            Err(_error) => JobExitCode::Error,
-        };
-        // The replace-input rename is `write_qpdf`'s own responsibility
-        // (mirroring qpdf's `writeOutfile`, `libqpdf/QPDFJob.cc:3057-3086`).
-        Ok(status)
+        self.write_qpdf(&mut pdf)?;
+        Ok(self.get_exit_code())
     }
 
     /// Run the configured qpdf inspection column on one already-open document.
@@ -3803,7 +3748,7 @@ impl QPDFJob {
         R: Read + Seek + 'static,
     {
         let configuration = self.configuration.clone();
-        match self.run_configured_inspection(pdf, &configuration) {
+        match self.run_configured_inspection(pdf, &configuration, true) {
             Ok(()) => {
                 self.drain_document_warnings(pdf);
                 self.complete(false)?;
@@ -3834,9 +3779,9 @@ impl QPDFJob {
         // document's bits behind. qpdf sets `m->encryption_status` while
         // processing each input and lets an open failure escape `run()` as an
         // exception, so `getExitCode` is never consulted against a stale
-        // status (`QPDFJob.cc:1699-1708`, `qpdf/qpdf.cc:39-43`). flpdf turns
-        // that failure into `JobExitCode::Error` instead of unwinding, and
-        // `get_exit_code` is a public query, so the reset has to be explicit.
+        // status (`QPDFJob.cc:1699-1708`, `qpdf/qpdf.cc:39-43`). The Rust
+        // getter remains callable after an error, so reset the bits before
+        // opening the next input.
         self.encryption_status = EncryptionStatus::default();
         // qpdf's `createQPDF` still creates an empty document for `--empty`
         // before the encryption-status early return (`QPDFJob.cc:429-456,
@@ -3855,11 +3800,7 @@ impl QPDFJob {
         };
         let file = match File::open(&input) {
             Ok(file) => file,
-            Err(error) => {
-                let error = Error::file_io("open", input.clone(), error);
-                self.report_job_error(&error)?;
-                return Ok(JobExitCode::Error);
-            }
+            Err(error) => return Err(Error::file_io("open", input.clone(), error)),
         };
         let source: Box<dyn ReadSeek> = Box::new(BufReader::new(file));
         let input_name = path_description_bytes(&input);
@@ -3869,18 +3810,12 @@ impl QPDFJob {
             // (`libqpdf/QPDFJob.cc:455-456,1699-1711`). Use the same job
             // document boundary here, but do not finish the document because
             // status inspection returns before updateFromJSON and transforms.
-            self.create_from_json_document(source, input_name)
+            self.create_from_json_document(source, &input_name)
         } else {
             let options = self.configured_open_options(self.configuration.password.clone());
-            self.open_for_encryption_inspection_with_description(source, input_name, options)
+            self.open_for_encryption_inspection_with_description(source, &input_name, options)
         };
-        let pdf = match open_result {
-            Ok(pdf) => pdf,
-            Err(error) => {
-                self.report_job_error(&error)?;
-                return Ok(JobExitCode::Error);
-            }
-        };
+        let pdf = open_result.map_err(|error| qpdf_source_error(&input_name, error))?;
         let encrypted = pdf.is_encrypted();
         self.encryption_status = EncryptionStatus {
             encrypted,
@@ -4084,10 +4019,9 @@ impl QPDFJob {
             .collect::<Vec<_>>();
         self.copy_attachments_with_opener(pdf, &copy_options, |job, option| {
             // qpdf's `copyAttachments` lets the donor's `processFile`
-            // exception escape directly (`QPDFJob.cc:2100`), so a password
-            // failure remains typed here. The CLI adds the donor path at its
-            // reporting boundary, while library callers retain the original
-            // `Encrypted(BadPassword)` classification.
+            // exception escape directly (`QPDFJob.cc:2100`). The Job open
+            // boundary returns the same password code and donor filename in
+            // QPDFExc, preserving qpdf's `what()` for every caller.
             job.open_job_source(&option.path, &option.password)
         })?;
 
@@ -4134,6 +4068,7 @@ impl QPDFJob {
         &mut self,
         pdf: &mut Pdf<R>,
         configuration: &JobConfiguration,
+        report_final_check_errors: bool,
     ) -> std::result::Result<(), InspectionFailure>
     where
         R: Read + Seek + 'static,
@@ -4145,16 +4080,24 @@ impl QPDFJob {
         // duplicate summaries.
         pdf.set_logger(self.logger.clone());
         if configuration.check {
-            if let Err(error) = self.run_check_report(pdf) {
+            let check_result = if report_final_check_errors {
+                self.run_check_report(pdf)
+            } else {
+                self.run_check_report_for_job(pdf)
+            };
+            if let Err(error) = check_result {
                 return match error {
-                    // qpdf's `doCheck` throws `std::runtime_error("errors
-                    // detected")` (`libqpdf/QPDFJob.cc:793`) and the CLI's
-                    // catch prints `qpdf: errors detected` exactly once
-                    // (`qpdf/qpdf.cc:39-41`). `run_check_report` has already
-                    // written that line (`job/check.rs::report_errors_detected`),
-                    // so the boundary must not report it a second time.
-                    super::check::CheckError::ErrorsDetected => Err(InspectionFailure::Reported(
-                        Error::Unsupported("errors detected".to_owned()),
+                    // qpdf's doCheck writes detailed ERROR lines, then throws
+                    // `std::runtime_error("errors detected")`; its outer CLI
+                    // catch owns the final line (`QPDFJob.cc:788-793`,
+                    // `qpdf/qpdf.cc:39-41`).
+                    super::check::CheckError::ErrorsDetected if report_final_check_errors => {
+                        Err(InspectionFailure::Reported(Error::SystemBytes(
+                            b"errors detected".to_vec(),
+                        )))
+                    }
+                    super::check::CheckError::ErrorsDetected => Err(InspectionFailure::Unreported(
+                        Error::SystemBytes(b"errors detected".to_vec()),
                     )),
                     super::check::CheckError::Operation(error) => {
                         Err(InspectionFailure::Unreported(error))
@@ -4275,21 +4218,12 @@ impl QPDFJob {
         // keep the job's warning policy on this secondary document exactly as
         // `open_document` does for the primary.
         options.suppress_warnings |= self.suppress_warnings;
-        let result = (|| {
+        (|| {
             let mut pdf = Pdf::<Box<dyn ReadSeek>>::open_file_with_options(path, options)?;
             pdf.root_handle()?;
             Ok(pdf)
-        })();
-        if result.is_err() {
-            // qpdf reports an opening failure against the source that failed,
-            // even though the job's primary input name remains unchanged
-            // after a successful donor open. Retain the source name only on
-            // this error path so the job-level reporter can render the same
-            // path-scoped diagnostic without contaminating later primary
-            // errors or duplicate-attachment messages.
-            self.set_input_name_bytes(&input_name);
-        }
-        result
+        })()
+        .map_err(|error| qpdf_source_error(&input_name, error))
     }
 
     fn update_writer_version_floor(&mut self, source: &mut JobDocument) -> Result<()> {
@@ -4672,111 +4606,6 @@ impl QPDFJob {
             .into());
         }
         Ok(())
-    }
-
-    /// Report one qpdf job error through the job's error logger.
-    ///
-    /// This is the Rust consumer boundary corresponding to the exception
-    /// catch in `qpdfjob-c.cc:32-40`: the prefix, separator, message, and
-    /// newline remain four writes so custom pipelines observe the same
-    /// boundaries as qpdf's stream insertion sequence. The ordinary
-    /// [`QPDFJob::run`] contract still returns usage errors to its caller;
-    /// callers that model qpdf's C wrapper can report the error here and map
-    /// it to the wrapper's error status.
-    pub fn report_job_error(&self, error: &Error) -> Result<()> {
-        // qpdf's C wrapper streams the prefix, separator, message, and final
-        // newline separately (`qpdfjob-c.cc:32-39`). Keeping those writes
-        // separate preserves custom-pipeline boundaries as well as bytes.
-        let pipeline = self.logger.get_error()?;
-        pipeline
-            .write(&self.message_prefix_bytes)
-            .map_err(Error::from)?;
-        pipeline.write(b": ").map_err(Error::from)?;
-        pipeline
-            .write(&self.job_error_message_with_input(error))
-            .map_err(Error::from)?;
-        pipeline.write(b"\n").map_err(Error::from)
-    }
-
-    fn job_error_message_with_input(&self, error: &Error) -> Vec<u8> {
-        if let Some(message) = error.raw_message() {
-            return message.to_vec();
-        }
-        match error {
-            Error::OpenFailure { source, .. } => self.job_error_message_with_input(source),
-            Error::Encrypted(crate::EncryptedError::BadPassword)
-                if !self.input_name_bytes.is_empty() =>
-            {
-                let mut rendered = self.input_name_bytes.clone();
-                rendered.extend_from_slice(b": invalid password");
-                rendered
-            }
-            // An output-sink failure never reaches this arm: the writer's file
-            // sink reports itself as qpdf's `qpdf output` pipeline
-            // (`QPDFWriter.cc:101-110`), so a bare `Error::Io` here comes from
-            // the input side and keeps the input name qpdf prints for it.
-            // A failed open carries the path as a `PathBuf`, so render it
-            // through the byte-preserving helper. Falling through to the
-            // `Display` formatting below would substitute U+FFFD for any byte
-            // that is not valid UTF-8, and qpdf prints the original bytes.
-            Error::FileIo {
-                operation,
-                path,
-                source,
-            } => {
-                let mut rendered = operation.as_bytes().to_vec();
-                rendered.push(b' ');
-                rendered.extend_from_slice(&path_description_bytes(path));
-                rendered.extend_from_slice(b": ");
-                rendered.extend_from_slice(crate::qutil::strerror_text(source).as_bytes());
-                rendered
-            }
-            Error::Io(error) if !self.input_name_bytes.is_empty() => {
-                let mut rendered = self.input_name_bytes.clone();
-                rendered.extend_from_slice(b": ");
-                rendered.extend_from_slice(crate::qutil::strerror_text(error).as_bytes());
-                rendered
-            }
-            Error::Parse { offset, message } if !self.input_name_bytes.is_empty() => {
-                let mut rendered = self.input_name_bytes.clone();
-                rendered.extend_from_slice(b": ");
-                if message == "unable to find trailer dictionary while recovering damaged file" {
-                    // qpdf's reconstruction terminal error already is a
-                    // complete QPDFExc detail (`QPDF.cc:604`); do not add the
-                    // Rust parser prefix around that qpdf-shaped message.
-                    rendered.extend_from_slice(message.as_bytes());
-                } else {
-                    // Other parser failures retain flpdf's established CLI
-                    // source diagnostic (`error_with_file`), including the
-                    // explicit byte offset. They have not crossed the
-                    // QPDFExc normalization boundary yet.
-                    rendered.extend_from_slice(
-                        format!("parse error at byte {offset}: {message}").as_bytes(),
-                    );
-                }
-                rendered
-            }
-            _ => Self::job_error_message(error),
-        }
-    }
-
-    fn job_error_message(error: &Error) -> Vec<u8> {
-        if let Some(message) = error.raw_message() {
-            return message.to_vec();
-        }
-        match error {
-            Error::FileIo {
-                operation,
-                path,
-                source,
-            } => {
-                let source = crate::qutil::strerror_text(source);
-                format!("{operation} {}: {source}", path.display()).into_bytes()
-            }
-            Error::Io(error) => crate::qutil::strerror_text(error).into_bytes(),
-            Error::Encrypted(crate::EncryptedError::BadPassword) => b"invalid password".to_vec(),
-            _ => error.to_string().into_bytes(),
-        }
     }
 
     /// Create a complete JSON-input document with this job's logger already
@@ -5996,7 +5825,7 @@ mod tests {
     }
 
     #[test]
-    fn write_qpdf_reports_non_usage_content_normalization_errors() {
+    fn write_qpdf_propagates_content_normalization_errors_without_reporting() {
         crate::register_stream_filter(b"/FlpdfJobContentNormalizationSystemError", || {
             Ok(JobNormalizationFilter)
         });
@@ -6020,11 +5849,7 @@ mod tests {
         assert!(
             matches!(error, Error::System(message) if message == "content filter decode failed")
         );
-        assert!(
-            String::from_utf8_lossy(&bytes.lock().unwrap())
-                .contains("content filter decode failed"),
-            "the Job must report pre-write failures through its logger"
-        );
+        assert!(bytes.lock().unwrap().is_empty());
         assert!(
             !output.exists(),
             "writer must not run after the pre-write failure"
@@ -6413,29 +6238,6 @@ mod tests {
                 .expect("written stream data")
                 .as_ref(),
             b"q\nQ"
-        );
-    }
-
-    #[test]
-    fn job_error_message_uses_qpdf_portable_not_found_text() {
-        let missing = Error::file_io(
-            "open",
-            "missing-parent/output.pdf",
-            std::io::Error::from(std::io::ErrorKind::NotFound),
-        );
-        assert_eq!(
-            QPDFJob::job_error_message(&missing),
-            b"open missing-parent/output.pdf: No such file or directory"
-        );
-
-        let fallback = Error::file_io(
-            "open",
-            "output.pdf",
-            std::io::Error::other("native fallback"),
-        );
-        assert_eq!(
-            QPDFJob::job_error_message(&fallback),
-            b"open output.pdf: native fallback"
         );
     }
 
@@ -7228,11 +7030,8 @@ mod tests {
             .write_qpdf(&mut input)
             .expect_err("writer preflight error must be returned to the caller");
         assert!(!error.to_string().is_empty());
-        let error = String::from_utf8_lossy(&errors.lock().unwrap()).into_owned();
-        assert!(
-            error.contains("deterministic") && !error.contains("called setSave"),
-            "stdout reservation must precede the diagnostic: {error:?}"
-        );
+        assert!(error.to_string().contains("deterministic"));
+        assert!(errors.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -7317,7 +7116,7 @@ mod tests {
     }
 
     #[test]
-    fn write_qpdf_maps_direct_stdout_reservation_failure_to_job_error() {
+    fn write_qpdf_propagates_direct_stdout_reservation_failure_without_reporting() {
         let mut input = Pdf::open(Cursor::new(
             std::fs::read(
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -7346,14 +7145,9 @@ mod tests {
         let error = job
             .write_qpdf(&mut input)
             .expect_err("stdout reservation failure must be returned to the caller");
-        assert!(!error.to_string().is_empty());
-        let error = String::from_utf8_lossy(&errors.lock().unwrap()).into_owned();
-        assert!(
-            error.contains(
-                "called setSave on standard output after standard output has already been used"
-            ),
-            "direct write_qpdf must report the reservation failure: {error:?}"
-        );
+        assert!(matches!(error, Error::Internal(message)
+            if message == "QPDFLogger: called setSave on standard output after standard output has already been used"));
+        assert!(errors.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -8460,7 +8254,17 @@ mod tests {
                 .to_string(),
             )
             .unwrap();
-        assert_eq!(missing_job.run().unwrap(), JobExitCode::Error);
+        let missing_error = missing_job
+            .run()
+            .expect_err("qpdf propagates a missing status-query input");
+        assert!(matches!(
+            missing_error,
+            Error::FileIo {
+                operation: "open",
+                path,
+                ..
+            } if path == missing
+        ));
 
         let malformed = tempdir.path().join("malformed.pdf");
         std::fs::write(&malformed, b"not a PDF").unwrap();
@@ -8479,7 +8283,10 @@ mod tests {
                 .to_string(),
             )
             .unwrap();
-        assert_eq!(malformed_job.run().unwrap(), JobExitCode::Error);
+        let malformed_error = malformed_job
+            .run()
+            .expect_err("qpdf propagates a failed status-query processFile");
+        assert!(malformed_error.open_failure().is_some());
 
         let mut copy_job = QPDFJob::new();
         let logger = QPDFLogger::create();

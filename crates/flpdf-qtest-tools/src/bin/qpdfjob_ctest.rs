@@ -5,7 +5,7 @@
 //! remain in [`flpdf::job::QPDFJob`]. This keeps the qtest helper from growing
 //! a second lifecycle or a legacy compatibility route.
 
-use flpdf::job::{JobExitCode, QPDFJob};
+use flpdf::job::{JobDocument, JobExitCode, QPDFJob};
 use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
 use flpdf::{Error, QPDFLogger, Result};
 use std::env;
@@ -145,11 +145,16 @@ fn run_tests() -> Result<()> {
         Ok(())
     });
     job.initialize_from_argv(&argv)?;
-    let mut pdf = job
-        .create_qpdf()?
-        .ok_or_else(|| Error::Internal("qpdfjob createQPDF returned no document".to_owned()))?;
-    job.write_qpdf(&mut pdf)?;
-    expect_status(job.get_exit_code(), JobExitCode::Success, "create/write")?;
+    let Some(mut pdf) = create_qpdf_c_wrapper(&mut job)? else {
+        return Err(Error::Internal(
+            "qpdfjob createQPDF returned no document for a normal job".to_owned(),
+        ));
+    };
+    expect_status(
+        write_qpdf_c_wrapper(&mut job, &mut pdf)?,
+        JobExitCode::Success,
+        "create/write",
+    )?;
 
     let missing_argv = vec![
         "qpdfjob".to_owned(),
@@ -159,7 +164,7 @@ fn run_tests() -> Result<()> {
     let mut job = QPDFJob::new();
     job.set_message_prefix("qpdfjob");
     job.initialize_from_argv(&missing_argv)?;
-    if job.create_qpdf()?.is_some() {
+    if create_qpdf_c_wrapper(&mut job)?.is_some() {
         return Err(Error::Internal(
             "qpdfjob createQPDF unexpectedly opened missing input".to_owned(),
         ));
@@ -178,34 +183,105 @@ fn run_argv(argv: Vec<String>, progress_label: Option<&str>) -> Result<JobExitCo
         });
     }
     job.initialize_from_argv(&argv)?;
-    job.run()
+    run_job_c_wrapper(&mut job)
 }
 
 fn run_json(json: &str) -> Result<JobExitCode> {
     let mut job = QPDFJob::new();
     job.initialize_from_json(json)?;
-    job.run()
+    run_job_c_wrapper(&mut job)
 }
 
 /// Continue after an intentionally ignored initialization result, mirroring
 /// the full-interface sequence in `qpdfjob-ctest.c:94-99`. The qpdf C wrapper
 /// reports both the initialization exception and the subsequent `run()`
-/// exception through `wrap_qpdfjob` (`qpdfjob-c.cc:32-40`), so this adapter
-/// keeps `QPDFJob::run`'s library-level `Error` contract unchanged while
-/// reproducing the helper's observable status and logger ordering.
+/// exception through `wrap_qpdfjob` (`qpdfjob-c.cc:32-40`). This adapter owns
+/// that C-wrapper catch and leaves the public `QPDFJob` methods' errors intact.
 fn run_after_ignored_initialization(
     job: &mut QPDFJob,
     initialization: Result<()>,
 ) -> Result<JobExitCode> {
     if let Err(error) = initialization {
-        job.report_job_error(&error)?;
+        report_qpdfjob_error(job, &error)?;
     }
+    run_job_c_wrapper(job)
+}
+
+fn run_job_c_wrapper(job: &mut QPDFJob) -> Result<JobExitCode> {
     match job.run() {
         Ok(status) => Ok(status),
         Err(error) => {
-            job.report_job_error(&error)?;
+            report_qpdfjob_error(job, &error)?;
             Ok(JobExitCode::Error)
         }
+    }
+}
+
+fn create_qpdf_c_wrapper(job: &mut QPDFJob) -> Result<Option<JobDocument>> {
+    match job.create_qpdf() {
+        Ok(document) => Ok(document),
+        Err(error) => {
+            report_qpdfjob_error(job, &error)?;
+            Ok(None)
+        }
+    }
+}
+
+fn write_qpdf_c_wrapper(job: &mut QPDFJob, document: &mut JobDocument) -> Result<JobExitCode> {
+    match job.write_qpdf(document) {
+        Ok(()) => Ok(job.get_exit_code()),
+        Err(error) => {
+            report_qpdfjob_error(job, &error)?;
+            Ok(JobExitCode::Error)
+        }
+    }
+}
+
+/// Render the exception at qpdf's C wrapper boundary, outside the public Job
+/// API (`libqpdf/qpdfjob-c.cc:32-40`).
+fn report_qpdfjob_error(job: &QPDFJob, error: &Error) -> Result<()> {
+    let message = qpdfjob_error_message(job, error);
+    let logger = job.logger();
+    let pipeline = logger.get_error()?;
+    pipeline.write(job.message_prefix().as_bytes())?;
+    pipeline.write(b": ")?;
+    pipeline.write(&message)?;
+    pipeline.write(b"\n")?;
+    Ok(())
+}
+
+fn qpdfjob_error_message(job: &QPDFJob, error: &Error) -> Vec<u8> {
+    if let Some(message) = error.raw_message() {
+        return message.to_vec();
+    }
+    match error {
+        Error::OpenFailure { source, .. } => qpdfjob_error_message(job, source),
+        Error::Encrypted(flpdf::EncryptedError::BadPassword)
+            if !job.input_name_bytes().is_empty() =>
+        {
+            let mut message = job.input_name_bytes().to_vec();
+            message.extend_from_slice(b": invalid password");
+            message
+        }
+        Error::Io(error) if !job.input_name_bytes().is_empty() => {
+            let mut message = job.input_name_bytes().to_vec();
+            message.extend_from_slice(b": ");
+            message.extend_from_slice(error.to_string().as_bytes());
+            message
+        }
+        Error::Parse { offset, message } if !job.input_name_bytes().is_empty() => {
+            let mut rendered = job.input_name_bytes().to_vec();
+            rendered.extend_from_slice(b": ");
+            if message == "unable to find trailer dictionary while recovering damaged file" {
+                rendered.extend_from_slice(message.as_bytes());
+            } else {
+                rendered.extend_from_slice(
+                    format!("parse error at byte {offset}: {message}").as_bytes(),
+                );
+            }
+            rendered
+        }
+        _ => error.to_string().into_bytes(),
     }
 }
 

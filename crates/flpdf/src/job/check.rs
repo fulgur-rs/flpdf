@@ -48,6 +48,13 @@ struct CheckOutcome {
     warnings: bool,
 }
 
+struct CheckDocumentOptions {
+    suppress_warnings: bool,
+    show_encryption_key: bool,
+    replay_diagnostics: bool,
+    report_final_errors: bool,
+}
+
 /// A qpdf `DiscardContents` equivalent for the canonical ObjectHandle parser.
 struct DiscardContents;
 
@@ -182,6 +189,21 @@ impl QPDFJob {
         &mut self,
         pdf: &mut Pdf<R>,
     ) -> std::result::Result<(), CheckError> {
+        self.run_check_report_with_final_error_report(pdf, true)
+    }
+
+    pub(crate) fn run_check_report_for_job<R: Read + Seek + 'static>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+    ) -> std::result::Result<(), CheckError> {
+        self.run_check_report_with_final_error_report(pdf, false)
+    }
+
+    fn run_check_report_with_final_error_report<R: Read + Seek + 'static>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        report_final_errors: bool,
+    ) -> std::result::Result<(), CheckError> {
         let logger = self.logger();
         let input_name = self.input_name_bytes().to_owned();
         let message_prefix = self.message_prefix_bytes().to_owned();
@@ -198,9 +220,12 @@ impl QPDFJob {
             &logger,
             &message_prefix,
             &input_name,
-            self.warnings_suppressed(),
-            self.show_encryption_key(),
-            replay_diagnostics,
+            CheckDocumentOptions {
+                suppress_warnings: self.warnings_suppressed(),
+                show_encryption_key: self.show_encryption_key(),
+                replay_diagnostics,
+                report_final_errors,
+            },
         )?;
         self.record_document_warnings(pdf);
         if outcome.warnings {
@@ -264,9 +289,12 @@ fn check_document<R: Read + Seek + 'static>(
         logger,
         message_prefix.as_bytes(),
         input_name.as_bytes(),
-        false,
-        false,
-        true,
+        CheckDocumentOptions {
+            suppress_warnings: false,
+            show_encryption_key: false,
+            replay_diagnostics: true,
+            report_final_errors: true,
+        },
     )
 }
 
@@ -275,10 +303,14 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     logger: &QPDFLogger,
     message_prefix: &[u8],
     input_name: &[u8],
-    suppress_warnings: bool,
-    show_encryption_key: bool,
-    replay_diagnostics: bool,
+    options: CheckDocumentOptions,
 ) -> std::result::Result<CheckOutcome, CheckError> {
+    let CheckDocumentOptions {
+        suppress_warnings,
+        show_encryption_key,
+        replay_diagnostics,
+        report_final_errors,
+    } = options;
     let mut warnings = false;
     let mut diagnostics_seen = 0;
 
@@ -370,6 +402,7 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
             message_prefix,
             error,
             logger_failure_since(pdf, encryption_diagnostics_seen),
+            report_final_errors,
         ));
     }
 
@@ -385,6 +418,7 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
                     error,
                     logger_failure_since(pdf, linearized_diagnostics_seen),
                 ),
+                report_final_errors,
             ));
         }
     };
@@ -403,6 +437,7 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
                     message_prefix,
                     error,
                     logger_failure_since(pdf, linearized_diagnostics_seen),
+                    report_final_errors,
                 ));
             }
         }
@@ -421,9 +456,15 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     )?; // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
     warnings |= new_warnings;
     diagnostics_seen = pdf.repair_diagnostics().entries().len();
+    // cov:ignore-start: current qpdf-shaped PDF repair diagnostics have warning severity only
     if new_errors {
-        return Err(report_errors_detected(logger, message_prefix)); // cov:ignore: Pdf repair diagnostics are warning-severity; retain this defensive boundary.
+        return Err(final_check_error(
+            logger,
+            message_prefix,
+            report_final_errors,
+        ));
     }
+    // cov:ignore-end
 
     let writer_diagnostics_seen = diagnostic_count(pdf);
     let writer_result = (|| -> Result<()> {
@@ -441,6 +482,7 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
                 error,
                 logger_failure_since(pdf, writer_diagnostics_seen),
             ),
+            report_final_errors,
         ));
     }
 
@@ -455,9 +497,15 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     )?; // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
     warnings |= new_warnings;
     diagnostics_seen = pdf.repair_diagnostics().entries().len();
+    // cov:ignore-start: current qpdf-shaped PDF repair diagnostics have warning severity only
     if new_errors {
-        return Err(report_errors_detected(logger, message_prefix)); // cov:ignore: Pdf repair diagnostics are warning-severity; retain this defensive boundary.
+        return Err(final_check_error(
+            logger,
+            message_prefix,
+            report_final_errors,
+        ));
     }
+    // cov:ignore-end
 
     let page_tree_diagnostics_seen = diagnostic_count(pdf);
     let pages_result = PageDocumentHelper::new(pdf).get_all_pages();
@@ -476,6 +524,7 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
                     error,
                     logger_failure_since(pdf, page_tree_diagnostics_seen),
                 ),
+                report_final_errors,
             ));
         } // cov:ignore-end
     };
@@ -496,7 +545,11 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
         }
     }
     if page_errors {
-        return Err(report_errors_detected(logger, message_prefix));
+        return Err(final_check_error(
+            logger,
+            message_prefix,
+            report_final_errors,
+        ));
     }
 
     let (new_warnings, new_errors) = inspect_new_diagnostics(
@@ -509,9 +562,15 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
         replay_diagnostics,
     )?; // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
     warnings |= new_warnings;
+    // cov:ignore-start: current qpdf-shaped PDF repair diagnostics have warning severity only
     if new_errors {
-        return Err(report_errors_detected(logger, message_prefix)); // cov:ignore: Pdf repair diagnostics are warning-severity; retain this defensive boundary.
+        return Err(final_check_error(
+            logger,
+            message_prefix,
+            report_final_errors,
+        ));
     }
+    // cov:ignore-end
 
     if !warnings {
         logger.info(
@@ -889,11 +948,13 @@ fn map_check_phase_error(
     message_prefix: &[u8],
     error: crate::Error,
     logger_failure: bool,
+    report_final_errors: bool,
 ) -> CheckError {
     finish_check_error(
         logger,
         message_prefix,
         map_in_try_error(logger, error, logger_failure),
+        report_final_errors,
     )
 }
 
@@ -905,10 +966,25 @@ fn finish_check_error(
     logger: &QPDFLogger,
     message_prefix: &[u8],
     result: CheckError,
+    report_final_errors: bool,
 ) -> CheckError {
     match result {
-        CheckError::ErrorsDetected => report_errors_detected(logger, message_prefix),
+        CheckError::ErrorsDetected => {
+            final_check_error(logger, message_prefix, report_final_errors)
+        }
         other => other,
+    }
+}
+
+fn final_check_error(
+    logger: &QPDFLogger,
+    message_prefix: &[u8],
+    report_final_errors: bool,
+) -> CheckError {
+    if report_final_errors {
+        report_errors_detected(logger, message_prefix)
+    } else {
+        CheckError::ErrorsDetected
     }
 }
 
@@ -1350,6 +1426,7 @@ mod tests {
             b"qpdf",
             Error::Internal("encrypted PDF has no encryption revision".to_owned()),
             false,
+            true,
         );
 
         assert!(matches!(result, CheckError::ErrorsDetected));

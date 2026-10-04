@@ -384,12 +384,11 @@ fn multi_source_rewrite_pages_collate_matches_qpdf() {
     );
 }
 
-/// `run_page_extraction_from_multiple_sources` reports a missing primary
-/// through `QPDFJob::create_qpdf`'s canonical `report_job_error` path (the
-/// `None` arm) now, rather than the CLI-local `open_page_source`'s own error
-/// formatting. qpdf's own wording for a missing input is `open <path>: No
-/// such file or directory` (`libqpdf/QPDFJob.cc:2129-2130`, `QUtil::strerror`)
-/// -- pinned here byte-for-byte against the real qpdf 11.9.0 binary.
+/// `run_page_extraction_from_multiple_sources` lets the primary-open error
+/// escape `QPDFJob::run`; the outer CLI renderer owns qpdf's fatal diagnostic
+/// (`qpdf/qpdf.cc:36-43`). qpdf's wording for a missing input is
+/// `open <path>: No such file or directory` (`libqpdf/QPDFJob.cc:2129-2130`,
+/// `QUtil::strerror`) -- pinned here byte-for-byte against qpdf 11.9.0.
 #[test]
 fn multi_source_rewrite_pages_missing_primary_matches_qpdf_open_wording() {
     if !qpdf_available() {
