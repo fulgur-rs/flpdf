@@ -2,11 +2,10 @@
 //!
 //! qpdf correspondence: QPDFPageObjectHelper.cc responsibilities shared with page form, resource, flatten, and overlay modules.
 //!
-//! [`PageObjectHelper`] wraps a single leaf `/Page` [`ObjectRef`] together with
-//! a `&mut Pdf<R>` and exposes ergonomic, typed accessors for the most common
-//! per-page attributes. All operations are delegated to the underlying
-//! infrastructure — no page-dictionary state is copied or cached inside this
-//! struct.
+//! [`PageObjectHelper`] wraps a qpdf `QPDFObjectHandle`-shaped target together
+//! with its owning `&mut Pdf<R>` and exposes qpdf's page/Form operations. All
+//! operations are delegated to the underlying infrastructure — no
+//! page-dictionary state is copied or cached inside this struct.
 //!
 //! # Design
 //!
@@ -23,14 +22,13 @@
 //!   page/Form attribute and inheritance route, including `/Rotate`.
 //! - [`get_annotation_handles`](PageObjectHelper::get_annotation_handles) —
 //!   follows qpdf's fail-soft `/Annots` enumeration and optional subtype filter.
-//! - [`media_box`](PageObjectHelper::media_box) — inheritable; walks `/Parent`
-//!   chain.
-//! - [`crop_box`](PageObjectHelper::crop_box) — inheritable; falls back to
-//!   `media_box()` when absent.
-//! - [`bleed_box`](PageObjectHelper::bleed_box) /
-//!   [`trim_box`](PageObjectHelper::trim_box) /
-//!   [`art_box`](PageObjectHelper::art_box) — leaf-only; fall back to
-//!   `crop_box()` when absent.
+//! - [`get_media_box`](PageObjectHelper::get_media_box) and
+//!   [`get_crop_box`](PageObjectHelper::get_crop_box) — return qpdf-shaped raw
+//!   handles, including inheritance and fallback behavior.
+//! - [`get_bleed_box`](PageObjectHelper::get_bleed_box),
+//!   [`get_trim_box`](PageObjectHelper::get_trim_box), and
+//!   [`get_art_box`](PageObjectHelper::get_art_box) — return qpdf-shaped raw
+//!   handles and fallback values without projecting them into another type.
 //!
 //! # Examples
 //!
@@ -51,7 +49,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! ## Read the effective media box
+//! ## Read the qpdf-shaped media box handle
 //!
 //! ```no_run
 //! use std::fs::File;
@@ -62,9 +60,9 @@
 //! let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
 //! if let Some(page) = pages.into_iter().next() {
 //!     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-//!     if let Some(mb) = helper.media_box()? {
-//!         println!("MediaBox: {:?}", mb);
-//!     }
+//!     let media_box = helper.get_media_box(false)?;
+//!     let rectangle = media_box.try_get_array_as_rectangle()?;
+//!     println!("MediaBox: {:?}", rectangle);
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
@@ -1624,203 +1622,6 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     // -----------------------------------------------------------------------
     // Bounding boxes
     // -----------------------------------------------------------------------
-
-    /// Return the effective `/MediaBox` for this page, resolving inheritance
-    /// through the `/Parent` chain.
-    ///
-    /// Returns `Ok(None)` when no node in the chain carries a `/MediaBox`
-    /// entry.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Unsupported`] if the page-tree depth limit is exceeded, or
-    ///   the rectangle array has fewer than 4 numeric elements.
-    /// - Any error from canonical ObjectHandle resolution.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::fs::File;
-    /// use std::io::BufReader;
-    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
-    ///
-    /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
-    /// if let Some(page) = pages.into_iter().next() {
-    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-    ///     if let Some(mb) = helper.media_box()? {
-    ///         println!("[{} {} {} {}]", mb.llx, mb.lly, mb.urx, mb.ury);
-    ///     }
-    /// }
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn media_box(&mut self) -> Result<Option<PageBox>> {
-        let value = self.get_media_box(false)?;
-        self.page_box_from_handle(b"/MediaBox", value)
-    }
-
-    /// Return the effective `/CropBox` for this page, resolving inheritance
-    /// through the `/Parent` chain.
-    ///
-    /// Per ISO 32000-1 §14.11.2: when `/CropBox` is absent, the default is the
-    /// `/MediaBox`. Returns `Ok(None)` only when `/MediaBox` is also absent.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`media_box`](PageObjectHelper::media_box).
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::fs::File;
-    /// use std::io::BufReader;
-    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
-    ///
-    /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
-    /// if let Some(page) = pages.into_iter().next() {
-    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-    ///     if let Some(cb) = helper.crop_box()? {
-    ///         println!("[{} {} {} {}]", cb.llx, cb.lly, cb.urx, cb.ury);
-    ///     }
-    /// }
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn crop_box(&mut self) -> Result<Option<PageBox>> {
-        let value = self.get_crop_box(false, false)?;
-        self.page_box_from_handle(b"/CropBox", value)
-    }
-
-    /// Return the effective `/BleedBox` for this page.
-    ///
-    /// Per ISO 32000-1 §14.11.2: `/BleedBox` is **not** inheritable and its
-    /// default is the `/CropBox` (which itself defaults to `/MediaBox`).
-    ///
-    /// # Errors
-    ///
-    /// Same as [`crop_box`](PageObjectHelper::crop_box).
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::fs::File;
-    /// use std::io::BufReader;
-    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
-    ///
-    /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
-    /// if let Some(page) = pages.into_iter().next() {
-    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-    ///     if let Some(bb) = helper.bleed_box()? {
-    ///         println!("[{} {} {} {}]", bb.llx, bb.lly, bb.urx, bb.ury);
-    ///     }
-    /// }
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn bleed_box(&mut self) -> Result<Option<PageBox>> {
-        let value = self.get_bleed_box(false, false)?;
-        self.page_box_from_handle(b"/BleedBox", value)
-    }
-
-    /// Return the effective `/TrimBox` for this page.
-    ///
-    /// Per ISO 32000-1 §14.11.2: `/TrimBox` is **not** inheritable and its
-    /// default is the `/CropBox` (which itself defaults to `/MediaBox`).
-    ///
-    /// # Errors
-    ///
-    /// Same as [`crop_box`](PageObjectHelper::crop_box).
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::fs::File;
-    /// use std::io::BufReader;
-    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
-    ///
-    /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
-    /// if let Some(page) = pages.into_iter().next() {
-    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-    ///     if let Some(tb) = helper.trim_box()? {
-    ///         println!("[{} {} {} {}]", tb.llx, tb.lly, tb.urx, tb.ury);
-    ///     }
-    /// }
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn trim_box(&mut self) -> Result<Option<PageBox>> {
-        let value = self.get_trim_box(false, false)?;
-        self.page_box_from_handle(b"/TrimBox", value)
-    }
-
-    /// Return the effective `/ArtBox` for this page.
-    ///
-    /// Per ISO 32000-1 §14.11.2: `/ArtBox` is **not** inheritable and its
-    /// default is the `/CropBox` (which itself defaults to `/MediaBox`).
-    ///
-    /// # Errors
-    ///
-    /// Same as [`crop_box`](PageObjectHelper::crop_box).
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::fs::File;
-    /// use std::io::BufReader;
-    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
-    ///
-    /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
-    /// if let Some(page) = pages.into_iter().next() {
-    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-    ///     if let Some(ab) = helper.art_box()? {
-    ///         println!("[{} {} {} {}]", ab.llx, ab.lly, ab.urx, ab.ury);
-    ///     }
-    /// }
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn art_box(&mut self) -> Result<Option<PageBox>> {
-        let value = self.get_art_box(false, false)?;
-        self.page_box_from_handle(b"/ArtBox", value)
-    }
-
-    fn page_box_from_handle(&mut self, key: &[u8], value: ObjectHandle) -> Result<Option<PageBox>> {
-        if value.try_is_null()? {
-            return Ok(None);
-        }
-        let Some(items) = value.try_as_array()? else {
-            return Err(Error::Unsupported(format!(
-                "{} on page {} does not resolve to an array",
-                String::from_utf8_lossy(key),
-                self.target_description()
-            )));
-        };
-        if items.len() < 4 {
-            return Err(Error::Unsupported(format!(
-                "{} rectangle array has {} elements, expected 4",
-                String::from_utf8_lossy(key),
-                items.len()
-            )));
-        }
-        let mut coords = [0.0f64; 4];
-        for (index, item) in items.into_iter().take(4).enumerate() {
-            let Some(value) = item
-                .try_as_integer()?
-                .map(|value| value as f64)
-                .or_else(|| item.as_real())
-            else {
-                let type_name = item.type_name()?;
-                return Err(Error::Unsupported(format!(
-                    "{} rectangle element {index} has type {type_name} (expected number)",
-                    String::from_utf8_lossy(key),
-                )));
-            };
-            coords[index] = value;
-        }
-        Ok(Some(PageBox::new(
-            coords[0], coords[1], coords[2], coords[3],
-        )))
-    }
 
     fn rectangle_for_matrix(&mut self, value: &ObjectHandle) -> Result<Option<PageBox>> {
         let Some(items) = value.try_as_array()? else {

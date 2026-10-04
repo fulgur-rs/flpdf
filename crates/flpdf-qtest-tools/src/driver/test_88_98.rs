@@ -483,10 +483,9 @@ pub(crate) fn run_test_94<R: Read + Seek>(
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    // qpdf 11.9.0 qpdf/test_driver.cc:3271-3371. The handle-returning
-    // PageObjectHelper methods below preserve the same live identity and
-    // copy-on-fallback semantics as qpdf; the numeric PageBox convenience
-    // methods are intentionally not used here.
+    // qpdf 11.9.0 qpdf/test_driver.cc:3271-3371. PageObjectHelper box getters
+    // return the raw handles whose identity and copy-on-fallback semantics
+    // this test compares directly with qpdf.
     let root_result = pdf.root_handle();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let root = root_result?;

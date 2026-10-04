@@ -206,7 +206,7 @@ where
 /// `/TrimBox` is leaf-only (not inheritable, ISO 32000-1 Table 30), while
 /// `/CropBox` and `/MediaBox` are inheritable and resolved through the `/Parent`
 /// chain — matching qpdf's `getTrimBox`/`getCropBox`/`getMediaBox` fallback and
-/// flpdf's own [`PageObjectHelper::crop_box`](crate::PageObjectHelper::crop_box).
+/// flpdf's own [`PageObjectHelper::get_crop_box`](crate::PageObjectHelper::get_crop_box).
 #[cfg(test)]
 fn effective_box_array<R: Read + Seek>(
     pdf: &mut Pdf<R>,

@@ -10,7 +10,7 @@
 //! indirect object — including each page's `/Parent` — which the shared
 //! single-page builder does not, so the parent-chain branches are reachable.
 
-use flpdf::{Error, ObjectHandle, ObjectRef, PageBox, PageObjectHelper, Pdf};
+use flpdf::{ObjectHandle, ObjectRef, PageObjectHelper, Pdf, Rectangle};
 use std::io::Cursor;
 use std::rc::Rc;
 
@@ -38,13 +38,6 @@ fn single_page(page_body: &str, extras: &[(u32, String)]) -> Vec<u8> {
 
 fn helper_for(bytes: Vec<u8>) -> (Pdf<Cursor<Vec<u8>>>, ObjectRef) {
     (open(bytes), ObjectRef::new(3, 0))
-}
-
-fn assert_unsupported<T: std::fmt::Debug>(result: flpdf::Result<T>) {
-    match result {
-        Err(Error::Unsupported(_)) => {}
-        other => panic!("expected Error::Unsupported, got {other:?}"),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -505,17 +498,44 @@ fn get_media_box_accepts_an_untyped_indirect_dictionary_like_qpdf() {
 }
 
 #[test]
-fn media_box_accepts_real_coordinates() {
-    // Rectangle elements may be reals, not just integers (ISO 32000-1 §7.9.5).
+fn get_media_box_preserves_raw_shape_and_rectangle_projection_matches_qpdf() {
+    let extra_item = single_page(
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 20 30] >>",
+        &[],
+    );
+    let (mut pdf, page_ref) = helper_for(extra_item);
+    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let raw = helper.get_media_box(false).unwrap();
+    assert_eq!(raw.try_get_array_n_items().unwrap(), 5);
+    assert_eq!(
+        raw.try_get_array_as_rectangle().unwrap(),
+        Rectangle::default()
+    );
+
+    let reversed = single_page("<< /Type /Page /Parent 2 0 R /MediaBox [10 20 0 0] >>", &[]);
+    let (mut pdf, page_ref) = helper_for(reversed);
+    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let raw = helper.get_media_box(false).unwrap();
+    assert_eq!(
+        raw.try_get_array_as_rectangle().unwrap(),
+        Rectangle::new(0.0, 0.0, 10.0, 20.0)
+    );
+}
+
+#[test]
+fn get_media_box_preserves_real_coordinates_as_a_raw_handle_like_qpdf() {
+    // The PageObjectHelper qpdf API returns the raw attribute handle. Typed
+    // projection belongs to QPDFObjectHandle::getArrayAsRectangle.
     let bytes = single_page(
         "<< /Type /Page /Parent 2 0 R /MediaBox [0.0 0.5 612.25 792.75] >>",
         &[],
     );
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let media_box = helper.get_media_box(false).unwrap();
     assert_eq!(
-        helper.media_box().unwrap(),
-        Some(PageBox::new(0.0, 0.5, 612.25, 792.75))
+        media_box.try_get_array_as_rectangle().unwrap(),
+        Rectangle::new(0.0, 0.5, 612.25, 792.75)
     );
 }
 
@@ -539,7 +559,7 @@ fn media_box_beyond_the_former_depth_limit_returns_none_when_absent() {
     let bytes = build_pdf(&objects, 1);
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-    assert_eq!(helper.media_box().unwrap(), None);
+    assert!(helper.get_media_box(false).unwrap().try_is_null().unwrap());
 }
 
 #[test]
@@ -560,8 +580,12 @@ fn media_box_value_null_climbs_to_parent() {
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
     assert_eq!(
-        helper.media_box().unwrap(),
-        Some(PageBox::new(0.0, 0.0, 200.0, 300.0))
+        helper
+            .get_media_box(false)
+            .unwrap()
+            .try_get_array_as_rectangle()
+            .unwrap(),
+        Rectangle::new(0.0, 0.0, 200.0, 300.0)
     );
 }
 
@@ -582,47 +606,75 @@ fn media_box_indirect_null_climbs_to_parent() {
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
     assert_eq!(
-        helper.media_box().unwrap(),
-        Some(PageBox::new(0.0, 0.0, 11.0, 22.0))
+        helper
+            .get_media_box(false)
+            .unwrap()
+            .try_get_array_as_rectangle()
+            .unwrap(),
+        Rectangle::new(0.0, 0.0, 11.0, 22.0)
     );
 }
 
 #[test]
-fn media_box_reference_not_array_errors() {
+fn get_media_box_returns_a_referenced_scalar_verbatim_like_qpdf() {
     let bytes = single_page(
         "<< /Type /Page /Parent 2 0 R /MediaBox 5 0 R >>",
         &[(5, "42".into())],
     );
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-    assert_unsupported(helper.media_box());
+    assert_eq!(
+        helper
+            .get_media_box(false)
+            .unwrap()
+            .try_get_value_as_int()
+            .unwrap(),
+        Some(42)
+    );
 }
 
 #[test]
-fn media_box_unexpected_type_errors() {
+fn get_media_box_returns_a_direct_scalar_verbatim_like_qpdf() {
     let bytes = single_page("<< /Type /Page /Parent 2 0 R /MediaBox 42 >>", &[]);
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-    assert_unsupported(helper.media_box());
+    assert_eq!(
+        helper
+            .get_media_box(false)
+            .unwrap()
+            .try_get_value_as_int()
+            .unwrap(),
+        Some(42)
+    );
 }
 
 #[test]
-fn media_box_too_few_elements_errors() {
+fn get_media_box_returns_a_short_array_without_projection_like_qpdf() {
     let bytes = single_page("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612] >>", &[]);
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-    assert_unsupported(helper.media_box());
+    let raw = helper.get_media_box(false).unwrap();
+    assert_eq!(raw.try_get_array_n_items().unwrap(), 3);
+    assert_eq!(
+        raw.try_get_array_as_rectangle().unwrap(),
+        Rectangle::default()
+    );
 }
 
 #[test]
-fn media_box_non_numeric_element_errors() {
+fn get_media_box_returns_a_non_numeric_array_without_projection_like_qpdf() {
     let bytes = single_page(
         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 /Nope] >>",
         &[],
     );
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-    assert_unsupported(helper.media_box());
+    let raw = helper.get_media_box(false).unwrap();
+    assert_eq!(raw.try_get_array_n_items().unwrap(), 4);
+    assert_eq!(
+        raw.try_get_array_as_rectangle().unwrap(),
+        Rectangle::default()
+    );
 }
 
 #[test]
@@ -632,7 +684,7 @@ fn media_box_parent_not_reference_returns_none() {
     let bytes = single_page("<< /Type /Page /Parent 42 >>", &[]);
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-    assert_eq!(helper.media_box().unwrap(), None);
+    assert!(helper.get_media_box(false).unwrap().try_is_null().unwrap());
 }
 
 #[test]
@@ -641,7 +693,7 @@ fn media_box_parent_not_dictionary_returns_none() {
     let bytes = single_page("<< /Type /Page /Parent 5 0 R >>", &[(5, "42".into())]);
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-    assert_eq!(helper.media_box().unwrap(), None);
+    assert!(helper.get_media_box(false).unwrap().try_is_null().unwrap());
 }
 
 #[test]
@@ -659,7 +711,7 @@ fn media_box_parent_cycle_returns_none() {
     );
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-    assert_eq!(helper.media_box().unwrap(), None);
+    assert!(helper.get_media_box(false).unwrap().try_is_null().unwrap());
 }
 
 // ---------------------------------------------------------------------------
@@ -675,8 +727,12 @@ fn trim_box_explicit_on_leaf() {
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
     assert_eq!(
-        helper.trim_box().unwrap(),
-        Some(PageBox::new(1.0, 2.0, 3.0, 4.0))
+        helper
+            .get_trim_box(false, false)
+            .unwrap()
+            .try_get_array_as_rectangle()
+            .unwrap(),
+        Rectangle::new(1.0, 2.0, 3.0, 4.0)
     );
 }
 
@@ -689,8 +745,12 @@ fn art_box_explicit_on_leaf() {
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
     assert_eq!(
-        helper.art_box().unwrap(),
-        Some(PageBox::new(5.0, 6.0, 7.0, 8.0))
+        helper
+            .get_art_box(false, false)
+            .unwrap()
+            .try_get_array_as_rectangle()
+            .unwrap(),
+        Rectangle::new(5.0, 6.0, 7.0, 8.0)
     );
 }
 
@@ -704,8 +764,12 @@ fn bleed_box_null_falls_back_to_crop() {
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
     assert_eq!(
-        helper.bleed_box().unwrap(),
-        Some(PageBox::new(0.0, 0.0, 50.0, 60.0))
+        helper
+            .get_bleed_box(false, false)
+            .unwrap()
+            .try_get_array_as_rectangle()
+            .unwrap(),
+        Rectangle::new(0.0, 0.0, 50.0, 60.0)
     );
 }
 
@@ -718,8 +782,12 @@ fn trim_box_indirect_null_falls_back_to_crop() {
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
     assert_eq!(
-        helper.trim_box().unwrap(),
-        Some(PageBox::new(0.0, 0.0, 50.0, 60.0))
+        helper
+            .get_trim_box(false, false)
+            .unwrap()
+            .try_get_array_as_rectangle()
+            .unwrap(),
+        Rectangle::new(0.0, 0.0, 50.0, 60.0)
     );
 }
 
@@ -732,31 +800,49 @@ fn art_box_indirect_array_resolved() {
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
     assert_eq!(
-        helper.art_box().unwrap(),
-        Some(PageBox::new(9.0, 9.0, 19.0, 19.0))
+        helper
+            .get_art_box(false, false)
+            .unwrap()
+            .try_get_array_as_rectangle()
+            .unwrap(),
+        Rectangle::new(9.0, 9.0, 19.0, 19.0)
     );
 }
 
 #[test]
-fn bleed_box_reference_not_array_errors() {
+fn get_bleed_box_returns_a_referenced_scalar_verbatim_like_qpdf() {
     let bytes = single_page(
         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /BleedBox 5 0 R >>",
         &[(5, "42".into())],
     );
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-    assert_unsupported(helper.bleed_box());
+    assert_eq!(
+        helper
+            .get_bleed_box(false, false)
+            .unwrap()
+            .try_get_value_as_int()
+            .unwrap(),
+        Some(42)
+    );
 }
 
 #[test]
-fn bleed_box_unexpected_type_errors() {
+fn get_bleed_box_returns_a_direct_scalar_verbatim_like_qpdf() {
     let bytes = single_page(
         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /BleedBox 42 >>",
         &[],
     );
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-    assert_unsupported(helper.bleed_box());
+    assert_eq!(
+        helper
+            .get_bleed_box(false, false)
+            .unwrap()
+            .try_get_value_as_int()
+            .unwrap(),
+        Some(42)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -776,7 +862,7 @@ fn box_and_annotation_accessors_do_not_require_page_type() {
     );
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-    assert_eq!(helper.media_box().unwrap(), None);
+    assert!(helper.get_media_box(false).unwrap().try_is_null().unwrap());
     assert!(helper.get_annotation_handles(None).unwrap().is_empty());
 }
 
@@ -786,8 +872,12 @@ fn media_box_ignores_a_non_name_page_type_like_qpdf() {
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
     assert_eq!(
-        helper.media_box().unwrap(),
-        Some(PageBox::new(0.0, 0.0, 612.0, 792.0))
+        helper
+            .get_media_box(false)
+            .unwrap()
+            .try_get_array_as_rectangle()
+            .unwrap(),
+        Rectangle::new(0.0, 0.0, 612.0, 792.0)
     );
 }
 
