@@ -722,7 +722,9 @@ fn attachment_diagnostics_preserve_non_utf8_bytes() {
 /// A failed replace-input rename propagates `Error::FileIo` to the CLI, whose
 /// renderer must print the original path bytes, not U+FFFD, for a non-UTF-8
 /// input name (qpdf prints `what()` verbatim, `qpdf/qpdf.cc:39-41`).
-#[cfg(unix)]
+// Linux only: macOS file systems reject non-UTF-8 file names outright
+// (EILSEQ), so the input cannot even be created there.
+#[cfg(target_os = "linux")]
 #[test]
 fn replace_input_rename_failure_preserves_non_utf8_path_bytes() {
     use std::ffi::OsString;
