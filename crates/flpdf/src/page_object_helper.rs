@@ -100,7 +100,7 @@ use std::rc::Rc;
 
 /// Per-page typed accessor helper.
 ///
-/// Construct with [`PageObjectHelper::new`], then use the provided methods to
+/// Construct with [`PageObjectHelper::from_object_handle`], then use the provided methods to
 /// inspect the page's attributes, content streams, resources, annotations, and
 /// bounding boxes. All operations are delegated to the underlying `Pdf<R>`
 /// infrastructure; no state is cached inside this struct.
@@ -342,21 +342,6 @@ impl<R: Read + Seek + 'static> TokenFilter for InlineImageExternalizer<'_, R> {
 }
 
 impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
-    /// Create a new helper for `page_ref` borrowing `pdf` mutably.
-    ///
-    /// `page_ref` should be the `ObjectRef` of a leaf `/Page` dictionary.
-    /// The helper does not validate this at construction time. Methods that
-    /// require a page apply their own checks; attribute access follows qpdf
-    /// and does not require `/Type /Page`.
-    pub fn new(page_ref: ObjectRef, pdf: &'a mut Pdf<R>) -> Self {
-        let object = pdf.get_object_handle(page_ref);
-        Self {
-            object,
-            page_ref: Some(page_ref),
-            pdf,
-        }
-    }
-
     /// Create a helper over an object handle.
     ///
     /// For attribute access, Form XObjects use their stream dictionary and all
@@ -1808,6 +1793,14 @@ mod tests {
 
     use super::*;
 
+    fn helper_for_ref(
+        pdf: &mut Pdf<Cursor<Vec<u8>>>,
+        object_ref: ObjectRef,
+    ) -> PageObjectHelper<'_, Cursor<Vec<u8>>> {
+        let object = pdf.get_object_handle(object_ref);
+        PageObjectHelper::from_object_handle(object, pdf)
+    }
+
     struct NoopTokenFilter;
 
     impl TokenFilter for NoopTokenFilter {
@@ -1984,7 +1977,7 @@ mod tests {
 
         let bytes = pdf_from_objects(1, &objects);
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
-        let mut helper = PageObjectHelper::new(ObjectRef::new(leaf_ref, 0), &mut pdf);
+        let mut helper = helper_for_ref(&mut pdf, ObjectRef::new(leaf_ref, 0));
         let media_box = helper
             .get_media_box(false)
             .expect("the 100th ancestor's /MediaBox must be reachable");
@@ -2022,7 +2015,7 @@ mod tests {
             ],
         );
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
-        PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf)
+        helper_for_ref(&mut pdf, ObjectRef::new(3, 0))
             .add_content_token_filter(Rc::new(RefCell::new(NoopTokenFilter)))
             .expect("page content filter should use the page route");
         pdf.get_object_handle(ObjectRef::new(4, 0))
@@ -2078,7 +2071,7 @@ mod tests {
         );
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
 
-        let form = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf)
+        let form = helper_for_ref(&mut pdf, ObjectRef::new(3, 0))
             .get_form_xobject_for_page(false)
             .expect("false transformation variant should still create a Form XObject");
 

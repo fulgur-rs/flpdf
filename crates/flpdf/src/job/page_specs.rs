@@ -211,7 +211,8 @@ pub fn copy_duplicate_page_annotations<R: Read + Seek>(
         let source_page = pdf.get_object_handle(source_page_ref);
         let destination_page = pdf.get_object_handle(new_page);
         destination_page.remove_key(b"/Annots")?;
-        PageObjectHelper::new(new_page, pdf).copy_annotations(source_page, Matrix::default())?;
+        PageObjectHelper::from_object_handle(destination_page, pdf)
+            .copy_annotations(source_page, Matrix::default())?;
     }
     Ok(())
 }
@@ -343,7 +344,8 @@ fn handle_single_source_page_specs<R: Read + Seek>(
     let mut copy_duplicate_annotations =
         |pdf: &mut Pdf<R>, source_page_ref: ObjectRef, new_page: ObjectRef| -> Result<()> {
             let source_page = pdf.get_object_handle(source_page_ref);
-            PageObjectHelper::new(new_page, pdf)
+            let new_page = pdf.get_object_handle(new_page);
+            PageObjectHelper::from_object_handle(new_page, pdf)
                 .fix_copied_annotations_with_field_tree_only(source_page, &BTreeSet::new())
         };
     let result = crate::pages::tree_rebuild::rebuild_page_tree_with_duplicate_hook(
@@ -513,10 +515,12 @@ fn handle_multi_source_page_specs_in_place<R: Read + Seek + 'static>(
         // it into the primary.
         if first_copy && remove_resources[source_index] {
             if source_index == 0 {
-                PageObjectHelper::new(source_page_ref, &mut sources[0])
+                let source_page = sources[0].get_object_handle(source_page_ref);
+                PageObjectHelper::from_object_handle(source_page, &mut sources[0])
                     .remove_unreferenced_resources()?;
             } else {
-                PageObjectHelper::new(source_page_ref, &mut sources[source_index])
+                let source_page = sources[source_index].get_object_handle(source_page_ref);
+                PageObjectHelper::from_object_handle(source_page, &mut sources[source_index])
                     .remove_unreferenced_resources()?;
             }
         }
@@ -555,12 +559,14 @@ fn handle_multi_source_page_specs_in_place<R: Read + Seek + 'static>(
         // occurrence keeps its original annotation graph.
         if source_index == 0 && !first_copy {
             let source_page = sources[0].get_object_handle(source_page_ref);
-            PageObjectHelper::new(page_ref, &mut sources[0])
+            let page = sources[0].get_object_handle(page_ref);
+            PageObjectHelper::from_object_handle(page, &mut sources[0])
                 .fix_copied_annotations_with_field_tree_only(source_page, &primary_field_names)?;
         } else if source_index != 0 {
             let (primary, secondary) = sources.split_at_mut(1);
             let source_page = secondary[source_index - 1].get_object_handle(source_page_ref);
-            PageObjectHelper::new(page_ref, &mut primary[0])
+            let page = primary[0].get_object_handle(page_ref);
+            PageObjectHelper::from_object_handle(page, &mut primary[0])
                 .fix_copied_annotations_from_with_field_tree_only(
                     source_page,
                     &mut secondary[source_index - 1],
@@ -978,7 +984,8 @@ fn set_annotation_page_refs<T: Read + Seek>(
     page_ref: ObjectRef,
     first_output_page: ObjectRef,
 ) -> Result<()> {
-    let mut helper = PageObjectHelper::new(page_ref, merged);
+    let page = merged.get_object_handle(page_ref);
+    let mut helper = PageObjectHelper::from_object_handle(page, merged);
     let annotations = helper.get_annotation_handles(None)?;
     let page = merged.get_object_handle(first_output_page);
     for annotation in annotations {
@@ -1115,7 +1122,7 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static, T: Read + Seek
             // A repeated primary page is a same-document transform: it must
             // not create or merge a foreign destination `/DR`.
             let source_page = merged.get_object_handle(first_output_page);
-            PageObjectHelper::new(final_refs[output_index], merged)
+            PageObjectHelper::from_object_handle(destination_page.clone(), merged)
                 .copy_annotations_with_field_tree_only(
                     source_page,
                     Matrix::default(),
@@ -1124,7 +1131,8 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static, T: Read + Seek
         } else {
             let source_page = sources[source_index].get_object_handle(source_page_ref);
             let source = &mut sources[source_index];
-            let mut destination = PageObjectHelper::new(final_refs[output_index], merged);
+            let mut destination =
+                PageObjectHelper::from_object_handle(destination_page.clone(), merged);
             destination.copy_annotations_from_with_field_tree_only(
                 source_page,
                 Matrix::default(),

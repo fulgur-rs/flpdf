@@ -40,6 +40,14 @@ fn helper_for(bytes: Vec<u8>) -> (Pdf<Cursor<Vec<u8>>>, ObjectRef) {
     (open(bytes), ObjectRef::new(3, 0))
 }
 
+fn page_helper_for_ref(
+    pdf: &mut Pdf<Cursor<Vec<u8>>>,
+    page_ref: ObjectRef,
+) -> PageObjectHelper<'_, Cursor<Vec<u8>>> {
+    let page = pdf.get_object_handle(page_ref);
+    PageObjectHelper::from_object_handle(page, pdf)
+}
+
 // ---------------------------------------------------------------------------
 // qpdf's getAnnotations() fail-soft malformed-shape handling
 // ---------------------------------------------------------------------------
@@ -51,7 +59,7 @@ fn get_annotation_handles_reference_to_non_array_returns_empty_like_qpdf() {
         &[(5, "42".into())],
     );
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert!(helper.get_annotation_handles(None).unwrap().is_empty());
 }
 
@@ -59,7 +67,7 @@ fn get_annotation_handles_reference_to_non_array_returns_empty_like_qpdf() {
 fn get_annotation_handles_non_array_returns_empty_like_qpdf() {
     let bytes = single_page("<< /Type /Page /Parent 2 0 R /Annots 42 >>", &[]);
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert!(helper.get_annotation_handles(None).unwrap().is_empty());
 }
 
@@ -68,7 +76,7 @@ fn get_annotation_handles_skips_non_dictionary_array_items_like_qpdf() {
     // /Annots contains an inline integer instead of an annotation dictionary.
     let bytes = single_page("<< /Type /Page /Parent 2 0 R /Annots [42] >>", &[]);
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert!(helper.get_annotation_handles(None).unwrap().is_empty());
 }
 
@@ -77,7 +85,7 @@ fn get_annotation_handles_null_returns_empty_like_qpdf() {
     // /Annots explicitly null is treated as no annotations.
     let bytes = single_page("<< /Type /Page /Parent 2 0 R /Annots null >>", &[]);
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert!(helper.get_annotation_handles(None).unwrap().is_empty());
 }
 
@@ -114,7 +122,7 @@ fn get_page_contents_accepts_an_untyped_dictionary_like_qpdf() {
         &[(4, "<< /Length 3 >>\nstream\nabc\nendstream".into())],
     );
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
 
     let contents = helper.get_page_contents().unwrap();
     assert_eq!(contents.len(), 1);
@@ -218,7 +226,7 @@ fn get_attribute_inherits_rotate_from_page_parent_like_qpdf() {
         1,
     );
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
 
     let rotation = helper.get_attribute(b"/Rotate", false).unwrap();
     assert_eq!(rotation.try_get_int_value_as_int().unwrap(), 180);
@@ -231,7 +239,7 @@ fn get_attribute_preserves_nonstandard_page_rotate_value_like_qpdf() {
         &[],
     );
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
 
     let rotation = helper.get_attribute(b"/Rotate", false).unwrap();
     assert_eq!(rotation.try_get_int_value_as_int().unwrap(), 45);
@@ -379,7 +387,7 @@ fn remove_unreferenced_resources_runs_the_action_for_each_form_reference_like_qp
         &[(4, malformed_form.into())],
     );
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
 
     helper.remove_unreferenced_resources().unwrap();
 
@@ -490,7 +498,7 @@ fn fallback_boxes_are_copied_into_untyped_and_non_page_dictionaries_like_qpdf() 
 fn get_media_box_accepts_an_untyped_indirect_dictionary_like_qpdf() {
     let bytes = single_page("<< /Parent 2 0 R /MediaBox [0 0 20 30] >>", &[]);
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
 
     let media_box = helper.get_media_box(false).unwrap();
     assert!(media_box.try_is_array().unwrap());
@@ -504,7 +512,7 @@ fn get_media_box_preserves_raw_shape_and_rectangle_projection_matches_qpdf() {
         &[],
     );
     let (mut pdf, page_ref) = helper_for(extra_item);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     let raw = helper.get_media_box(false).unwrap();
     assert_eq!(raw.try_get_array_n_items().unwrap(), 5);
     assert_eq!(
@@ -514,7 +522,7 @@ fn get_media_box_preserves_raw_shape_and_rectangle_projection_matches_qpdf() {
 
     let reversed = single_page("<< /Type /Page /Parent 2 0 R /MediaBox [10 20 0 0] >>", &[]);
     let (mut pdf, page_ref) = helper_for(reversed);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     let raw = helper.get_media_box(false).unwrap();
     assert_eq!(
         raw.try_get_array_as_rectangle().unwrap(),
@@ -531,7 +539,7 @@ fn get_media_box_preserves_real_coordinates_as_a_raw_handle_like_qpdf() {
         &[],
     );
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     let media_box = helper.get_media_box(false).unwrap();
     assert_eq!(
         media_box.try_get_array_as_rectangle().unwrap(),
@@ -558,7 +566,7 @@ fn media_box_beyond_the_former_depth_limit_returns_none_when_absent() {
     objects.push((133, "<< /Type /Pages >>".to_string()));
     let bytes = build_pdf(&objects, 1);
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert!(helper.get_media_box(false).unwrap().try_is_null().unwrap());
 }
 
@@ -578,7 +586,7 @@ fn media_box_value_null_climbs_to_parent() {
         1,
     );
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
             .get_media_box(false)
@@ -604,7 +612,7 @@ fn media_box_indirect_null_climbs_to_parent() {
         1,
     );
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
             .get_media_box(false)
@@ -622,7 +630,7 @@ fn get_media_box_returns_a_referenced_scalar_verbatim_like_qpdf() {
         &[(5, "42".into())],
     );
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
             .get_media_box(false)
@@ -637,7 +645,7 @@ fn get_media_box_returns_a_referenced_scalar_verbatim_like_qpdf() {
 fn get_media_box_returns_a_direct_scalar_verbatim_like_qpdf() {
     let bytes = single_page("<< /Type /Page /Parent 2 0 R /MediaBox 42 >>", &[]);
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
             .get_media_box(false)
@@ -652,7 +660,7 @@ fn get_media_box_returns_a_direct_scalar_verbatim_like_qpdf() {
 fn get_media_box_returns_a_short_array_without_projection_like_qpdf() {
     let bytes = single_page("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612] >>", &[]);
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     let raw = helper.get_media_box(false).unwrap();
     assert_eq!(raw.try_get_array_n_items().unwrap(), 3);
     assert_eq!(
@@ -668,7 +676,7 @@ fn get_media_box_returns_a_non_numeric_array_without_projection_like_qpdf() {
         &[],
     );
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     let raw = helper.get_media_box(false).unwrap();
     assert_eq!(raw.try_get_array_n_items().unwrap(), 4);
     assert_eq!(
@@ -683,7 +691,7 @@ fn media_box_parent_not_reference_returns_none() {
     // reports no inherited box.
     let bytes = single_page("<< /Type /Page /Parent 42 >>", &[]);
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert!(helper.get_media_box(false).unwrap().try_is_null().unwrap());
 }
 
@@ -692,7 +700,7 @@ fn media_box_parent_not_dictionary_returns_none() {
     // /Parent resolves to a non-dictionary object: the walk stops gracefully.
     let bytes = single_page("<< /Type /Page /Parent 5 0 R >>", &[(5, "42".into())]);
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert!(helper.get_media_box(false).unwrap().try_is_null().unwrap());
 }
 
@@ -710,7 +718,7 @@ fn media_box_parent_cycle_returns_none() {
         1,
     );
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert!(helper.get_media_box(false).unwrap().try_is_null().unwrap());
 }
 
@@ -725,7 +733,7 @@ fn trim_box_explicit_on_leaf() {
         &[],
     );
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
             .get_trim_box(false, false)
@@ -743,7 +751,7 @@ fn art_box_explicit_on_leaf() {
         &[],
     );
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
             .get_art_box(false, false)
@@ -762,7 +770,7 @@ fn bleed_box_null_falls_back_to_crop() {
         &[],
     );
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
             .get_bleed_box(false, false)
@@ -780,7 +788,7 @@ fn trim_box_indirect_null_falls_back_to_crop() {
         &[(5, "null".into())],
     );
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
             .get_trim_box(false, false)
@@ -798,7 +806,7 @@ fn art_box_indirect_array_resolved() {
         &[(5, "[9 9 19 19]".into())],
     );
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
             .get_art_box(false, false)
@@ -816,7 +824,7 @@ fn get_bleed_box_returns_a_referenced_scalar_verbatim_like_qpdf() {
         &[(5, "42".into())],
     );
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
             .get_bleed_box(false, false)
@@ -834,7 +842,7 @@ fn get_bleed_box_returns_a_direct_scalar_verbatim_like_qpdf() {
         &[],
     );
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
             .get_bleed_box(false, false)
@@ -861,7 +869,7 @@ fn box_and_annotation_accessors_do_not_require_page_type() {
         1,
     );
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert!(helper.get_media_box(false).unwrap().try_is_null().unwrap());
     assert!(helper.get_annotation_handles(None).unwrap().is_empty());
 }
@@ -870,7 +878,7 @@ fn box_and_annotation_accessors_do_not_require_page_type() {
 fn media_box_ignores_a_non_name_page_type_like_qpdf() {
     let bytes = single_page("<< /Type 42 /Parent 2 0 R /MediaBox [0 0 612 792] >>", &[]);
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
             .get_media_box(false)
@@ -909,7 +917,7 @@ fn image_mask_page() -> Vec<u8> {
 fn image_enumeration_excludes_image_masks_like_qpdf() {
     let (mut pdf, page_ref) = helper_for(image_mask_page());
 
-    let mut direct = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut direct = page_helper_for_ref(&mut pdf, page_ref);
     let mut direct_names = Vec::new();
     direct
         .for_each_image(false, |_, _, key| {
@@ -919,7 +927,7 @@ fn image_enumeration_excludes_image_masks_like_qpdf() {
         .unwrap();
     assert_eq!(direct_names, vec![b"/Image".to_vec()]);
 
-    let mut recursive = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut recursive = page_helper_for_ref(&mut pdf, page_ref);
     let mut recursive_names = Vec::new();
     recursive
         .for_each_image(true, |_, _, key| {
@@ -929,7 +937,7 @@ fn image_enumeration_excludes_image_masks_like_qpdf() {
         .unwrap();
     assert_eq!(recursive_names, vec![b"/Image".to_vec()]);
 
-    let mut maps = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut maps = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         maps.get_images().unwrap().into_keys().collect::<Vec<_>>(),
         vec![b"/Image".to_vec()]
@@ -958,7 +966,7 @@ fn xobject_enumeration_uses_inherited_resources() {
         1,
     );
     let (mut pdf, page_ref) = helper_for(bytes);
-    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     let mut names = Vec::new();
     helper
         .for_each_xobject(false, |_, _, key| {

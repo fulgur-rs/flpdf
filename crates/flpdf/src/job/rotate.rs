@@ -76,6 +76,14 @@ mod tests {
         flatten_rotation_on_page_handles(pdf, &page_handles)
     }
 
+    fn page_helper_for_ref(
+        pdf: &mut Pdf<Cursor<Vec<u8>>>,
+        page_ref: ObjectRef,
+    ) -> PageObjectHelper<'_, Cursor<Vec<u8>>> {
+        let page = pdf.get_object_handle(page_ref);
+        PageObjectHelper::from_object_handle(page, pdf)
+    }
+
     fn handle_to_rectangle(obj: &ObjectHandle) -> Option<Rectangle> {
         obj.try_is_scalar().ok()?;
         let values = obj.as_array()?;
@@ -134,7 +142,8 @@ mod tests {
         relative: bool,
     ) -> Result<()> {
         for &page_ref in pages {
-            PageObjectHelper::new(page_ref, pdf).rotate_page(degrees, relative)?;
+            let page = pdf.get_object_handle(page_ref);
+            PageObjectHelper::from_object_handle(page, pdf).rotate_page(degrees, relative)?;
         }
         Ok(())
     }
@@ -252,7 +261,7 @@ mod tests {
         let bytes = build_single_page_pdf(None, None);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-        let error = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf)
+        let error = page_helper_for_ref(&mut pdf, ObjectRef::new(3, 0))
             .rotate_page(45, false)
             .expect_err("qpdf rejects direct rotation angles that are not multiples of 90");
         assert!(matches!(
@@ -781,7 +790,7 @@ mod tests {
 
         // 90deg map (x,y)->(y, 200 - x): corners (10,20),(60,40) ->
         // (20,190),(40,140) -> bbox [20 140 40 190].
-        let mut page_helper = PageObjectHelper::new(page, &mut pdf);
+        let mut page_helper = page_helper_for_ref(&mut pdf, page);
         let annotations = page_helper
             .get_annotation_handles(None)
             .expect("flattened annotation must remain on the page");
@@ -855,7 +864,7 @@ mod tests {
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
 
         // Same mapping as the direct-array case: [10 20 60 40] -> [20 140 40 190].
-        let mut page_helper = PageObjectHelper::new(page, &mut pdf);
+        let mut page_helper = page_helper_for_ref(&mut pdf, page);
         let annotations = page_helper
             .get_annotation_handles(None)
             .expect("flattened annotation must be indirect");

@@ -142,7 +142,7 @@ struct WrapperAudit {
     /// whether it passed `true`. One canonical call is the contract; a second
     /// conversion is not.
     helper_conversions: Vec<bool>,
-    /// Bindings this body obtained from `PageObjectHelper::new(...)`.
+    /// Bindings this body obtained from `PageObjectHelper::from_object_handle(...)`.
     helper_bindings: Vec<String>,
     /// Every call the body makes: methods by name, free and qualified calls
     /// by their last two path segments when qualified.
@@ -538,7 +538,7 @@ fn passes_true(call: &syn::ExprMethodCall) -> bool {
     )
 }
 
-/// The last two segments of a path, so `PageObjectHelper::new` and
+/// The last two segments of a path, so `PageObjectHelper::from_object_handle` and
 /// `Error::Internal` stay distinguishable from any other `new` or `Internal`.
 fn qualified_name(path: &syn::Path) -> String {
     let segments: Vec<String> = path

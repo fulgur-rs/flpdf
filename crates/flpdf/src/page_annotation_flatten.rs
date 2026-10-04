@@ -276,10 +276,7 @@ fn flatten_annotations_on_page_handle<R: Read + Seek>(
     // below and does not need this compatibility-only branch.
     #[cfg(test)]
     if !qpdf_flag_contract {
-        let page_ref = page
-            .object_ref()
-            .expect("test-only legacy mode starts from an ObjectRef page");
-        PageObjectHelper::new(page_ref, pdf).coalesce_content_streams()?;
+        PageObjectHelper::from_object_handle(page.clone(), pdf).coalesce_content_streams()?;
     }
 
     // ── Step 4: Materialize /Resources on the leaf page ────────────────────
@@ -943,6 +940,14 @@ mod tests {
     use crate::writer::write_qpdf_to_memory;
     use crate::{ObjectRef, Pdf};
     use std::io::Cursor;
+
+    fn page_helper_for_ref(
+        pdf: &mut Pdf<Cursor<Vec<u8>>>,
+        page_ref: ObjectRef,
+    ) -> PageObjectHelper<'_, Cursor<Vec<u8>>> {
+        let page = pdf.get_object_handle(page_ref);
+        PageObjectHelper::from_object_handle(page, pdf)
+    }
 
     /// `acroform_default_resources` reports presence only. qpdf reaches `/DR`
     /// through `ff.getDefaultResources()` (`QPDFFormFieldObjectHelper.cc:190-194`,
@@ -2683,7 +2688,7 @@ mod tests {
             1
         );
         let annotations = {
-            let mut page_helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+            let mut page_helper = page_helper_for_ref(&mut pdf, ObjectRef::new(3, 0));
             page_helper
                 .get_annotation_handles(None)
                 .expect("annotation list should be readable after flattening")
@@ -2818,7 +2823,7 @@ mod tests {
 
         // The non-Print annotation (obj 7) should still be in /Annots.
         let annotations = {
-            let mut page_helper = PageObjectHelper::new(page_ref, &mut pdf);
+            let mut page_helper = page_helper_for_ref(&mut pdf, page_ref);
             page_helper
                 .get_annotation_handles(None)
                 .expect("remaining annotation list should be readable")
@@ -2868,7 +2873,7 @@ mod tests {
 
         // The Print annotation (obj 4) should still be in /Annots.
         let annotations = {
-            let mut page_helper = PageObjectHelper::new(page_ref, &mut pdf);
+            let mut page_helper = page_helper_for_ref(&mut pdf, page_ref);
             page_helper
                 .get_annotation_handles(None)
                 .expect("remaining annotation list should be readable")
