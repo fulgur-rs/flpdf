@@ -189,6 +189,62 @@ fn get_form_xobject_for_form_target_uses_qpdf_contents_lookup() {
 }
 
 #[test]
+fn get_attribute_does_not_inherit_rotate_for_form_xobject_like_qpdf() {
+    let bytes = single_page(
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 30] >>",
+        &[
+            (
+                4,
+                "<< /Type /XObject /Subtype /Form /Parent 5 0 R /BBox [0 0 10 10] /Resources << >> /Length 0 >>\nstream\n\nendstream".into(),
+            ),
+            (5, "<< /Rotate 90 >>".into()),
+        ],
+    );
+    let (mut pdf, _) = helper_for(bytes);
+    let form = pdf.get_object_handle(ObjectRef::new(4, 0));
+    let mut helper = PageObjectHelper::from_object_handle(form, &mut pdf);
+
+    let rotation = helper.get_attribute(b"/Rotate", false).unwrap();
+    assert!(rotation.try_is_null().unwrap());
+}
+
+#[test]
+fn get_attribute_inherits_rotate_from_page_parent_like_qpdf() {
+    let bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (
+                2,
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 /Rotate 180 >>".into(),
+            ),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 30] >>".into(),
+            ),
+        ],
+        1,
+    );
+    let (mut pdf, page_ref) = helper_for(bytes);
+    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+
+    let rotation = helper.get_attribute(b"/Rotate", false).unwrap();
+    assert_eq!(rotation.try_get_int_value_as_int().unwrap(), 180);
+}
+
+#[test]
+fn get_attribute_preserves_nonstandard_page_rotate_value_like_qpdf() {
+    let bytes = single_page(
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 30] /Rotate 45 >>",
+        &[],
+    );
+    let (mut pdf, page_ref) = helper_for(bytes);
+    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+
+    let rotation = helper.get_attribute(b"/Rotate", false).unwrap();
+    assert_eq!(rotation.try_get_int_value_as_int().unwrap(), 45);
+}
+
+#[test]
 fn form_provider_reads_live_page_contents_when_materialized_like_qpdf() {
     let bytes = single_page(
         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 30] /Resources << >> /Contents 4 0 R >>",
@@ -556,7 +612,7 @@ fn bleed_box_unexpected_type_errors() {
 }
 
 // ---------------------------------------------------------------------------
-// ensure_leaf_page guard: non-Page object is rejected by every accessor
+// qpdf-delegating accessors do not require /Type /Page
 // ---------------------------------------------------------------------------
 
 #[test]

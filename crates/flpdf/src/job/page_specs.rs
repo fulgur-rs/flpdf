@@ -979,9 +979,6 @@ fn set_annotation_page_refs<T: Read + Seek>(
     first_output_page: ObjectRef,
 ) -> Result<()> {
     let mut helper = PageObjectHelper::new(page_ref, merged);
-    // This test-only page-order repair requires a valid selected page before
-    // invoking qpdf-shaped, fail-soft annotation enumeration.
-    helper.ensure_leaf_page()?;
     let annotations = helper.get_annotation_handles(None)?;
     let page = merged.get_object_handle(first_output_page);
     for annotation in annotations {
@@ -2034,7 +2031,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_acroform_propagates_annotation_copy_errors() {
+    fn rebuild_acroform_treats_missing_page_annotations_as_empty_like_qpdf() {
         let mut merged = three_page_pdf();
         let invalid_final_ref = ObjectRef::new(999, 0);
         let mut sources = vec![three_page_pdf()];
@@ -2043,7 +2040,7 @@ mod tests {
             .map(crate::pages::page_refs)
             .collect::<Result<Vec<_>>>()
             .unwrap();
-        rebuild_acroform_in_final_page_order(
+        let annotations = rebuild_acroform_in_final_page_order(
             &mut merged,
             &mut sources,
             &source_page_refs,
@@ -2051,7 +2048,8 @@ mod tests {
             &[(0, 0)],
             &[invalid_final_ref],
         )
-        .expect_err("an invalid destination page must escape the foreign copy route");
+        .expect("qpdf returns an empty annotation list for a null destination handle");
+        assert_eq!(annotations, vec![vec![]]);
     }
 
     #[test]

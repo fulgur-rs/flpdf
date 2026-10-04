@@ -14,10 +14,6 @@
 //! [`crate::AcroFormDocumentHelper`].
 
 use crate::page_object_helper::PageObjectHelper;
-#[cfg(test)]
-use crate::page_object_helper::{
-    resolve_inherited_rotate, resolve_inherited_rotate_with_max_depth,
-};
 use crate::{ObjectHandle, PageDocumentHelper, Pdf, Result};
 use std::io::{Read, Seek};
 
@@ -242,116 +238,6 @@ mod tests {
             format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
         pdf.extend_from_slice(trailer.as_bytes());
         pdf
-    }
-
-    // -----------------------------------------------------------------------
-    // resolve_inherited_rotate tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn resolve_page_has_direct_rotate() {
-        let bytes = build_single_page_pdf(Some(90), None);
-        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let page_ref = ObjectRef::new(3, 0);
-        assert_eq!(resolve_inherited_rotate(&mut pdf, page_ref).unwrap(), 90);
-    }
-
-    #[test]
-    fn resolve_inherits_from_parent() {
-        // Page has no /Rotate, parent /Pages has /Rotate 180.
-        let bytes = build_single_page_pdf(None, Some(180));
-        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let page_ref = ObjectRef::new(3, 0);
-        assert_eq!(resolve_inherited_rotate(&mut pdf, page_ref).unwrap(), 180);
-    }
-
-    #[test]
-    fn resolve_defaults_to_zero_when_absent() {
-        let bytes = build_single_page_pdf(None, None);
-        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let page_ref = ObjectRef::new(3, 0);
-        assert_eq!(resolve_inherited_rotate(&mut pdf, page_ref).unwrap(), 0);
-    }
-
-    #[test]
-    fn resolve_defaults_to_zero_for_a_parent_cycle() {
-        let bytes = build_single_page_pdf(None, None);
-        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let parent = pdf.get_object_handle(ObjectRef::new(2, 0));
-        parent.try_is_scalar().unwrap();
-        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-        parent
-            .replace_key(b"/Parent", page)
-            .expect("parent must be mutable");
-
-        assert_eq!(
-            resolve_inherited_rotate(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn resolve_defaults_to_zero_for_a_non_dictionary_parent() {
-        let bytes = build_single_page_pdf(None, None);
-        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-        page.try_is_scalar().unwrap();
-        page.replace_key(b"/Parent", ObjectHandle::integer(42))
-            .expect("page must be mutable");
-
-        assert_eq!(
-            resolve_inherited_rotate(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn resolve_preserves_non_standard_value() {
-        // The getter observes the effective page attribute; only a relative
-        // rotate operation treats an invalid existing value as zero.
-        let bytes = build_single_page_pdf(Some(45), None);
-        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let page_ref = ObjectRef::new(3, 0);
-        assert_eq!(resolve_inherited_rotate(&mut pdf, page_ref).unwrap(), 45);
-    }
-
-    #[test]
-    fn resolve_reports_depth_limit_at_a_direct_page_tree_node() {
-        let bytes = build_single_page_pdf(None, None);
-        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let page_ref = ObjectRef::new(3, 0);
-        let page = pdf.get_object_handle(page_ref);
-        page.try_is_scalar().unwrap();
-        let parent =
-            ObjectHandle::dictionary(vec![(b"/Rotate".to_vec(), ObjectHandle::integer(90))]);
-        page.replace_key(b"/Parent", parent)
-            .expect("page must be mutable");
-
-        let error = resolve_inherited_rotate_with_max_depth(&mut pdf, page_ref, 1).unwrap_err();
-        assert!(matches!(
-            error,
-            Error::Unsupported(message)
-                if message.contains("page tree depth exceeds maximum of 1")
-                    && message.contains("direct page-tree dictionary")
-        ));
-    }
-
-    #[test]
-    fn resolve_rejects_a_non_integer_rotate_entry() {
-        let bytes = build_single_page_pdf(None, None);
-        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let page_ref = ObjectRef::new(3, 0);
-        let page = pdf.get_object_handle(page_ref);
-        page.try_is_scalar().unwrap();
-        page.replace_key(b"/Rotate", ObjectHandle::name(b"Bad".to_vec()))
-            .expect("page must be mutable");
-
-        let error = resolve_inherited_rotate(&mut pdf, page_ref).unwrap_err();
-        assert!(matches!(
-            error,
-            Error::Unsupported(message) if message.contains("/Rotate entry")
-                && message.contains("has unexpected type")
-        ));
     }
 
     // -----------------------------------------------------------------------

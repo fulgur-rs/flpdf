@@ -19,8 +19,8 @@
 //!   qpdf-shaped [`ObjectHandle`] events.
 //! - [`get_resources`](PageObjectHelper::get_resources) — delegates to the
 //!   canonical ObjectHandle `/Parent`-chain lookup for `/Resources`.
-//! - [`rotate`](PageObjectHelper::rotate) — **getter** that uses the page-local
-//!   inherited `/Rotate` lookup.
+//! - [`get_attribute`](PageObjectHelper::get_attribute) — reads the qpdf
+//!   page/Form attribute and inheritance route, including `/Rotate`.
 //! - [`get_annotations`](PageObjectHelper::get_annotations) — reads the leaf's
 //!   `/Annots` array (not inheritable per PDF spec).
 //! - [`media_box`](PageObjectHelper::media_box) — inheritable; walks `/Parent`
@@ -69,7 +69,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! ## Read effective rotation (getter, not mutating)
+//! ## Read the effective rotation attribute
 //!
 //! ```no_run
 //! use std::fs::File;
@@ -80,8 +80,10 @@
 //! let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
 //! if let Some(page) = pages.into_iter().next() {
 //!     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-//!     let degrees = helper.rotate()?;
-//!     println!("page rotation: {degrees}°");
+//!     let rotate = helper.get_attribute(b"/Rotate", false)?;
+//!     if !rotate.try_is_null()? {
+//!         println!("page rotation: {}°", rotate.try_get_int_value_as_int()?);
+//!     }
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
@@ -105,7 +107,7 @@
 
 use crate::content_stream::{ObjectHandleParserCallbacks, ParseControl};
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
-use crate::pages::{is_inheritable_page_attribute, DEFAULT_MAX_PAGE_TREE_DEPTH};
+use crate::pages::is_inheritable_page_attribute;
 use crate::pipeline::{Pipeline, PipelineError, PlString};
 use crate::token_filter::TokenFilter;
 use crate::tokenizer::{Token, TokenType};
@@ -151,7 +153,7 @@ impl PageBox {
 /// Per-page typed accessor helper.
 ///
 /// Construct with [`PageObjectHelper::new`], then use the provided methods to
-/// inspect the page's content streams, resources, rotation, annotations, and
+/// inspect the page's attributes, content streams, resources, annotations, and
 /// bounding boxes. All operations are delegated to the underlying `Pdf<R>`
 /// infrastructure; no state is cached inside this struct.
 pub struct PageObjectHelper<'a, R: Read + Seek + 'static> {
@@ -820,16 +822,6 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let copy = fallback.shallow_copy()?;
         page.replace_key(key, copy.clone())?;
         Ok(copy)
-    }
-
-    /// Verify `page_ref` resolves to a non-Form dictionary.
-    ///
-    /// Internal page-tree orchestration uses this before its own page-specific
-    /// bookkeeping. The qpdf-delegating helper routes do not require a
-    /// `/Type /Page` entry.
-    pub(crate) fn ensure_leaf_page(&mut self) -> Result<()> {
-        let description = self.target_description();
-        resolve_page_target(self.object.clone(), &description).map(|_| ())
     }
 
     // -----------------------------------------------------------------------
@@ -1584,51 +1576,6 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     }
 
     // -----------------------------------------------------------------------
-    // rotate  (GETTER — resolves inherited value, does not mutate)
-    // -----------------------------------------------------------------------
-
-    /// Return the effective `/Rotate` value for this page in degrees, resolved
-    /// through the `/Parent` chain.
-    ///
-    /// Returns `0` (the PDF default, ISO 32000-1 §7.7.3.3 Table 30) when no
-    /// node in the chain carries a `/Rotate` entry. A present value is
-    /// returned as-is, including one that is not a multiple of 90, matching
-    /// qpdf's raw `getAttribute("/Rotate", false)` passthrough
-    /// (`QPDFPageObjectHelper.cc:670`) -- normalization to
-    /// `{0, 90, 180, 270}` only happens as part of a *mutation* via
-    /// [`Self::rotate_page`].
-    ///
-    /// This is a **getter** — it does not mutate the document. To rotate this
-    /// page, use [`Self::rotate_page`].
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Unsupported`] if the page-tree depth limit is exceeded.
-    /// - Any error from canonical ObjectHandle resolution.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::fs::File;
-    /// use std::io::BufReader;
-    /// use flpdf::{PageDocumentHelper, Pdf, PageObjectHelper};
-    ///
-    /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let pages = PageDocumentHelper::new(&mut pdf).get_all_pages()?;
-    /// if let Some(page) = pages.into_iter().next() {
-    ///     let mut helper = PageObjectHelper::from_object_handle(page, &mut pdf);
-    ///     let deg = helper.rotate()?;
-    ///     println!("rotation: {deg}°");
-    /// }
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn rotate(&mut self) -> Result<i32> {
-        self.ensure_leaf_page()?;
-        let page_ref = self.require_page_ref()?;
-        resolve_inherited_rotate(self.pdf, page_ref)
-    }
-
-    // -----------------------------------------------------------------------
     // get_annotations
     // -----------------------------------------------------------------------
 
@@ -2220,20 +2167,6 @@ fn resolve_attribute_target(object: ObjectHandle) -> Result<(ObjectHandle, bool)
     Ok((object, is_form))
 }
 
-fn resolve_page_target(object: ObjectHandle, description: &str) -> Result<ObjectHandle> {
-    if object.is_form_xobject()? {
-        return Err(Error::Unsupported(format!(
-            "object {description} is a Form XObject, expected /Type /Page"
-        )));
-    }
-    if !object.try_is_dictionary()? {
-        return Err(Error::Unsupported(format!(
-            "object {description} is not a page dictionary or Form XObject"
-        )));
-    }
-    Ok(object)
-}
-
 fn get_attribute_for_target(
     object: ObjectHandle,
     key: &[u8],
@@ -2289,92 +2222,11 @@ fn get_attribute_for_target(
     Ok(result)
 }
 
-/// Return the effective `/Rotate` value for a page, keeping the inherited
-/// lookup beside the other page-local attribute accessors.
-pub(crate) fn resolve_inherited_rotate<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
-) -> Result<i32> {
-    resolve_inherited_rotate_with_max_depth(pdf, page_ref, DEFAULT_MAX_PAGE_TREE_DEPTH)
-}
-
-/// Test-supporting form of [`resolve_inherited_rotate`] with an explicit
-/// page-tree depth bound.
-pub(crate) fn resolve_inherited_rotate_with_max_depth<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
-    max_depth: usize,
-) -> Result<i32> {
-    let mut current = pdf.get_object_handle(page_ref);
-    let mut depth: usize = 0;
-    #[allow(
-        clippy::mutable_key_type,
-        reason = "qpdf identity keys intentionally retain the live handle allocation"
-    )]
-    let mut seen = HashSet::new();
-
-    loop {
-        if depth >= max_depth {
-            return Err(Error::Unsupported(format!(
-                "page tree depth exceeds maximum of {max_depth} at {}",
-                current_description(&current)
-            )));
-        }
-        if !seen.insert(current.identity_key()) {
-            return Ok(0);
-        }
-
-        let rotate = current.try_get_key(b"/Rotate")?;
-        if rotate.try_as_integer()?.is_some() {
-            return rotate.try_get_int_value_as_int();
-        }
-        if !rotate.try_is_null()? {
-            return Err(Error::Unsupported(format!(
-                "/Rotate entry on node {} has unexpected type",
-                current_description(&current)
-            )));
-        }
-
-        let parent = current.try_get_key(b"/Parent")?;
-        if !parent.try_is_dictionary()? {
-            return Ok(0);
-        }
-        current = parent;
-        depth += 1;
-    }
-}
-
-fn current_description(current: &ObjectHandle) -> String {
-    current
-        .object_ref()
-        .map(|reference| reference.to_string())
-        .unwrap_or_else(|| "direct page-tree dictionary".to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
 
     use super::*;
-
-    #[test]
-    fn internal_leaf_page_check_rejects_form_targets() -> Result<()> {
-        let mut pdf = Pdf::empty()?;
-        let form = pdf.new_stream()?;
-        let dictionary = form.as_stream_dict().unwrap();
-        dictionary.replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))?;
-        dictionary.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))?;
-        let mut helper = PageObjectHelper::from_object_handle(form, &mut pdf);
-
-        let error = helper
-            .ensure_leaf_page()
-            .expect_err("internal leaf-page orchestration rejects Form targets");
-        assert!(matches!(
-            error,
-            Error::Unsupported(message) if message.contains("Form XObject, expected /Type /Page")
-        ));
-        Ok(())
-    }
 
     struct NoopTokenFilter;
 
