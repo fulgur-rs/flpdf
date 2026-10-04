@@ -127,6 +127,28 @@ fn get_page_contents_accepts_an_untyped_dictionary_like_qpdf() {
     assert_eq!(contents[0].object_ref(), Some(ObjectRef::new(4, 0)));
 }
 
+#[test]
+fn flatten_rotation_still_rejects_form_target_tracked_by_followup() {
+    let mut pdf = Pdf::empty().unwrap();
+    let form = pdf.new_stream().unwrap();
+    let form_dict = form.as_stream_dict().unwrap();
+    form_dict
+        .replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))
+        .unwrap();
+    form_dict
+        .replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))
+        .unwrap();
+    let mut helper = PageObjectHelper::from_object_handle(form, &mut pdf);
+
+    let error = helper
+        .flatten_rotation()
+        .expect_err("the separate Form-target guard is tracked by flpdf-6ik2q.38");
+    assert!(matches!(
+        error,
+        Error::Unsupported(message) if message.contains("Form XObject, expected /Type /Page")
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // media_box() — /Parent chain anomalies and value resolution
 // ---------------------------------------------------------------------------
