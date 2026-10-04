@@ -474,7 +474,7 @@ fn bleed_box_unexpected_type_errors() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn media_box_accepts_a_non_page_dictionary_but_page_accessors_reject_it() {
+fn box_and_annotation_accessors_do_not_require_page_type() {
     // Object 3 is a /Pages tree node, not a leaf /Type /Page.
     let bytes = build_pdf(
         &[
@@ -487,7 +487,7 @@ fn media_box_accepts_a_non_page_dictionary_but_page_accessors_reject_it() {
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
     assert_eq!(helper.media_box().unwrap(), None);
-    assert_unsupported(helper.get_annotations());
+    assert!(helper.get_annotations().unwrap().is_empty());
 }
 
 #[test]

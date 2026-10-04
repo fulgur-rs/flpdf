@@ -465,11 +465,9 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         resolve_attribute_target(self.object.clone())
     }
 
-    /// Return the live canonical handle for this page after validating its
-    /// `/Type`. This is the page-helper equivalent of qpdf's
-    /// `QPDFPageObjectHelper` construction over a `QPDFObjectHandle`: all
-    /// subsequent page attributes and mutations operate on the resolver-backed
-    /// object graph rather than on a legacy raw snapshot.
+    /// Return the live non-Form dictionary target used by page-specific
+    /// mutations. As with qpdf's `QPDFPageObjectHelper`, this does not require
+    /// `/Type /Page`; underlying operations determine their own shape errors.
     fn resolved_page_handle(&mut self) -> Result<ObjectHandle> {
         let description = self.target_description();
         resolve_page_target(self.object.clone(), &description)
@@ -827,12 +825,11 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         Ok(copy)
     }
 
-    /// Verify `page_ref` resolves to a leaf `/Type /Page` dictionary.
+    /// Verify `page_ref` resolves to a non-Form dictionary.
     ///
-    /// Guards the public accessors so a `/Pages` tree node (or any other
-    /// dictionary) cannot be misread as a page and return plausible but
-    /// incorrect inherited/default metadata. qpdf-delegating helpers use
-    /// `resolved_attribute_target` instead, which has no page type gate.
+    /// Internal page-tree orchestration uses this before its own page-specific
+    /// bookkeeping. The qpdf-delegating helper routes do not require a
+    /// `/Type /Page` entry.
     pub(crate) fn ensure_leaf_page(&mut self) -> Result<()> {
         self.resolved_page_handle().map(|_| ())
     }
@@ -2236,21 +2233,7 @@ fn resolve_page_target(object: ObjectHandle, description: &str) -> Result<Object
             "object {description} is not a page dictionary or Form XObject"
         )));
     }
-
-    let page_type = object.try_get_key(b"/Type")?;
-    match page_type.try_as_name()? {
-        Some(name) if name.as_slice() == b"Page" => Ok(object),
-        Some(name) => Err(Error::Unsupported(format!(
-            "object {description} has /Type /{}, expected /Page",
-            String::from_utf8_lossy(&name)
-        ))),
-        None if object.try_has_key(b"/Type")? => Err(Error::Unsupported(format!(
-            "object {description} has a non-name /Type entry"
-        ))),
-        None => Err(Error::Unsupported(format!(
-            "object {description} has no /Type entry"
-        ))),
-    }
+    Ok(object)
 }
 
 fn get_attribute_for_target(

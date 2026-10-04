@@ -1060,11 +1060,17 @@ mod tests {
     }
 
     #[test]
-    fn page_to_form_xobject_rejects_non_page() {
-        // Object 2 is /Type /Pages, not /Page -> content extraction fails.
+    fn page_to_form_xobject_accepts_a_pages_dictionary_like_qpdf() {
+        // QPDFPageObjectHelper::getFormXObjectForPage dispatches through the
+        // object handle without requiring /Type /Page.
         let mut pdf = open(one_page_doc("", "x", &[]));
-        let err = get_form_xobject_for_page(&mut pdf, ObjectRef::new(2, 0));
-        assert!(matches!(err, Err(Error::Unsupported(_))));
+        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(2, 0))
+            .expect("a non-Page dictionary is handled through qpdf's helper route");
+        let stream = form_stream(&mut pdf, xref);
+        assert_eq!(
+            stream.dict.get("Subtype").unwrap().as_name(),
+            Some(b"Form".to_vec())
+        );
     }
 
     #[test]

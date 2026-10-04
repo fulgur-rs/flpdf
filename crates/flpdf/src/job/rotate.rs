@@ -977,17 +977,14 @@ mod tests {
     }
 
     #[test]
-    fn flatten_rejects_non_leaf_target_even_when_rotate_zero() {
-        // obj 2 is the /Pages tree node (not a leaf /Page); its effective /Rotate
-        // is 0. The leaf guard must still reject it instead of silently passing.
+    fn flatten_accepts_non_leaf_dictionary_when_rotate_is_zero_like_qpdf() {
+        // qpdf reads /Rotate directly and returns when it is not 90, 180, or 270;
+        // it does not preflight the target as /Type /Page.
         let bytes = build_single_page_with_content("[0 0 200 300]", None, "BT (x) Tj ET");
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let pages_node = ObjectRef::new(2, 0);
-        let err = flatten_rotation_on_pages(&mut pdf, &[pages_node]).unwrap_err();
-        assert!(
-            matches!(err, Error::Unsupported(_)),
-            "expected Unsupported, got {err:?}"
-        );
+        flatten_rotation_on_pages(&mut pdf, &[pages_node])
+            .expect("zero rotation returns without a /Type /Page preflight");
     }
 
     #[test]
