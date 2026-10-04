@@ -2298,6 +2298,29 @@ clap駆動経路が同じファイルを再度読み、警告が二重出力さ�
 `crates/flpdf/src/job/lifecycle.rs::tests::partial_job_json_preserves_preconfigured_qpdf_state`
 が、qpdf 11.9.0とのstatus/stdout/stderrと共有Configの差分を固定する。
 
+### Public initializer state accumulation (`flpdf-6ik2q.27`, 2026-10-04)
+
+qpdf の full/partial `initializeFromJson` は同じ `QPDFJob::Config` に生成
+handlerを適用し、`partial` は最後の `checkConfiguration` を行うかだけを決める
+（`libqpdf/QPDFJob_json.cc:611-625`、`include/qpdf/QPDFJob.hh:78-90`）。
+`initializeFromArgv` も既存Configを `ArgParser` へ渡して一度だけparseする
+（`libqpdf/QPDFJob_argv.cc:418-430`）。`QPDFJob::Members::require_outfile` の
+初期値もtrueである（`include/qpdf/QPDFJob.hh:705`）。
+
+flpdf は同じ `JobConfiguration` を保持し、schema検証後にその既存値をcloneして
+JSON handlerを適用する。argv初期化も既存値へparseし、initializerごとのfresh
+configurationや`has_run`/partial sequence分岐を持たない。これによりfull JSON,
+argv, full/partialのjob-JSON file occurrenceがwriter/security設定を含めて同じ
+Configへ積み上がる。`.28`は基礎stateの`require_output=true`を復元し、`.27`の
+累積経路はそのPRの上に積む。
+
+`job_lifecycle_tests.rs` の
+`full_json_initialization_layers_over_existing_job_config`,
+`argv_initialization_layers_over_existing_job_config`,
+`full_json_initialization_preserves_preconfigured_writer_and_security_state`,
+`argv_initialization_after_a_run_layers_later_job_json_on_existing_config` が、
+public Jobの終了コード・出力および既存設定保持をqpdf 11.9.0と比較する。
+
 ### job-json selector usage boundary (`flpdf-n9q36`, 2026-09-16)
 
 qpdf の `Config::jobJsonFile` は `initializeFromJson(..., true)` の失敗だけを
