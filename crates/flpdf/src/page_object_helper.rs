@@ -419,8 +419,9 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// Create a new helper for `page_ref` borrowing `pdf` mutably.
     ///
     /// `page_ref` should be the `ObjectRef` of a leaf `/Page` dictionary.
-    /// The helper does not validate this at construction time — methods will
-    /// propagate errors when given a non-`/Page` reference.
+    /// The helper does not validate this at construction time. Methods that
+    /// require a page apply their own checks; attribute access follows qpdf
+    /// and does not require `/Type /Page`.
     pub fn new(page_ref: ObjectRef, pdf: &'a mut Pdf<R>) -> Self {
         let object = pdf.get_object_handle(page_ref);
         Self {
@@ -430,11 +431,12 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         }
     }
 
-    /// Create a helper over a page or Form XObject handle.
+    /// Create a helper over an object handle.
     ///
-    /// A Form XObject is represented by its stream handle; page attributes are
-    /// read from the stream dictionary and do not walk a page-tree parent
-    /// chain, matching qpdf's `QPDFPageObjectHelper(QPDFObjectHandle)`.
+    /// For attribute access, Form XObjects use their stream dictionary and all
+    /// other objects are queried directly, matching qpdf's
+    /// `QPDFPageObjectHelper(QPDFObjectHandle)` and `getAttribute`. Other
+    /// page-specific operations apply their own target requirements.
     pub fn from_object_handle(object: ObjectHandle, pdf: &'a mut Pdf<R>) -> Self {
         let page_ref = object.object_ref();
         Self {
@@ -483,8 +485,10 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         Ok(object)
     }
 
-    /// Return a live page attribute, applying qpdf's page-tree inheritance
-    /// rules for `/MediaBox`, `/CropBox`, `/Resources`, and `/Rotate`.
+    /// Return a live attribute, applying qpdf's page-tree inheritance rules
+    /// for `/MediaBox`, `/CropBox`, `/Resources`, and `/Rotate` on non-Form
+    /// targets. As in qpdf's `getAttribute`, this lookup does not require a
+    /// `/Type /Page` entry.
     ///
     /// When `copy_if_shared` is true, an inherited or indirect value is
     /// shallow-copied into the page dictionary before it is returned. The
@@ -813,10 +817,14 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         if !copy_if_fallback || fallback.try_is_null()? {
             return Ok(fallback);
         }
-        let (_, is_form) = self.resolved_attribute_target()?;
+        // qpdf copies the fallback into the same dictionary `getAttribute`
+        // reads: a Form's stream dictionary, otherwise the supplied handle
+        // itself, with no `/Type /Page` requirement
+        // (`libqpdf/QPDFPageObjectHelper.cc:224-262`).
+        let is_form = self.object.is_form_xobject()?;
         let page = if is_form {
-            // cov:ignore-start: is_form is returned only for a stream whose
-            // canonical dictionary was already validated by is_form_xobject.
+            // cov:ignore-start: is_form_xobject returns true only for a stream
+            // with a canonical dictionary.
             self.object.as_stream_dict().ok_or_else(|| {
                 Error::Unsupported("Form XObject has no stream dictionary".to_owned())
             })?
@@ -2260,10 +2268,13 @@ fn get_attribute_for_target(
     copy_if_shared: bool,
     description: &str,
 ) -> Result<ObjectHandle> {
-    let (object, is_form) = resolve_attribute_target(object, description)?;
+    // qpdf's getAttribute classifies only Form XObjects. It reads a Form's
+    // stream dictionary and otherwise invokes getKey directly on the supplied
+    // handle, without requiring a /Type /Page entry or a dictionary preflight.
+    let is_form = object.is_form_xobject()?;
     let dict = if is_form {
-        // cov:ignore-start: resolve_attribute_target classifies a Form only
-        // after is_form_xobject confirms that its stream dictionary exists.
+        // cov:ignore-start: is_form_xobject returns true only for a stream
+        // with a canonical dictionary.
         object.as_stream_dict().ok_or_else(|| {
             Error::Unsupported(format!("object {description} is not a Form stream"))
         })?

@@ -10,7 +10,7 @@
 //! indirect object — including each page's `/Parent` — which the shared
 //! single-page builder does not, so the parent-chain branches are reachable.
 
-use flpdf::{Error, ObjectRef, PageBox, PageObjectHelper, Pdf};
+use flpdf::{Error, ObjectHandle, ObjectRef, PageBox, PageObjectHelper, Pdf};
 use std::io::Cursor;
 
 mod common;
@@ -90,6 +90,89 @@ fn get_annotations_null_returns_empty() {
 // ---------------------------------------------------------------------------
 // media_box() — /Parent chain anomalies and value resolution
 // ---------------------------------------------------------------------------
+
+#[test]
+fn get_media_box_accepts_an_untyped_dictionary_like_qpdf() {
+    let mut pdf = Pdf::empty().unwrap();
+    let object = ObjectHandle::dictionary(vec![(
+        b"/MediaBox".to_vec(),
+        ObjectHandle::array(vec![
+            ObjectHandle::integer(0),
+            ObjectHandle::integer(0),
+            ObjectHandle::integer(20),
+            ObjectHandle::integer(30),
+        ]),
+    )]);
+    let mut helper = PageObjectHelper::from_object_handle(object, &mut pdf);
+
+    let media_box = helper.get_media_box(false).unwrap();
+    assert!(media_box.try_is_array().unwrap());
+    assert_eq!(media_box.try_get_array_n_items().unwrap(), 4);
+}
+
+/// qpdf's `getAttribute` copies a fallback box into the supplied handle without
+/// a `/Type /Page` check (`libqpdf/QPDFPageObjectHelper.cc:224-262`); probed
+/// with the public C++ API on an untyped direct and indirect dictionary and on
+/// a `/Type /Pages` node, where `getCropBox(false, true)` copies `/MediaBox`
+/// into `/CropBox` and `getTrimBox(false, true)` then copies that into
+/// `/TrimBox`.
+#[test]
+fn fallback_boxes_are_copied_into_untyped_and_non_page_dictionaries_like_qpdf() {
+    fn media_box_dictionary() -> ObjectHandle {
+        ObjectHandle::dictionary(vec![(
+            b"/MediaBox".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(20),
+                ObjectHandle::integer(30),
+            ]),
+        )])
+    }
+    fn assert_copied(target: &ObjectHandle, result: &ObjectHandle, key: &[u8]) {
+        assert_eq!(result.try_get_array_n_items().unwrap(), 4);
+        let stored = target.try_get_key(key).unwrap();
+        assert_eq!(stored.try_get_array_n_items().unwrap(), 4, "{key:?} copied");
+    }
+
+    // Direct untyped dictionary.
+    let mut pdf = Pdf::empty().unwrap();
+    let target = media_box_dictionary();
+    let mut helper = PageObjectHelper::from_object_handle(target.clone(), &mut pdf);
+    let crop = helper.get_crop_box(false, true).unwrap();
+    assert_copied(&target, &crop, b"/CropBox");
+    let trim = helper.get_trim_box(false, true).unwrap();
+    assert_copied(&target, &trim, b"/TrimBox");
+
+    // Indirect untyped dictionary and a `/Type /Pages` node.
+    for body in [
+        "<< /MediaBox [0 0 20 30] >>",
+        "<< /Type /Pages /MediaBox [0 0 20 30] >>",
+    ] {
+        let bytes = single_page(body, &[]);
+        let (mut pdf, page_ref) = helper_for(bytes);
+        let target = pdf.get_object_handle(page_ref);
+        let mut helper = PageObjectHelper::from_object_handle(target.clone(), &mut pdf);
+        let bleed = helper.get_bleed_box(true, true).unwrap();
+        assert_copied(&target, &bleed, b"/BleedBox");
+        assert_copied(
+            &target,
+            &target.try_get_key(b"/CropBox").unwrap(),
+            b"/CropBox",
+        );
+    }
+}
+
+#[test]
+fn get_media_box_accepts_an_untyped_indirect_dictionary_like_qpdf() {
+    let bytes = single_page("<< /Parent 2 0 R /MediaBox [0 0 20 30] >>", &[]);
+    let (mut pdf, page_ref) = helper_for(bytes);
+    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+
+    let media_box = helper.get_media_box(false).unwrap();
+    assert!(media_box.try_is_array().unwrap());
+    assert_eq!(media_box.try_get_array_n_items().unwrap(), 4);
+}
 
 #[test]
 fn media_box_accepts_real_coordinates() {
@@ -351,7 +434,7 @@ fn bleed_box_unexpected_type_errors() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn accessors_reject_non_page_object() {
+fn media_box_accepts_a_non_page_dictionary_but_page_accessors_reject_it() {
     // Object 3 is a /Pages tree node, not a leaf /Type /Page.
     let bytes = build_pdf(
         &[
@@ -363,16 +446,19 @@ fn accessors_reject_non_page_object() {
     );
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-    assert_unsupported(helper.media_box());
+    assert_eq!(helper.media_box().unwrap(), None);
     assert_unsupported(helper.get_annotations());
 }
 
 #[test]
-fn accessor_rejects_a_non_name_page_type() {
+fn media_box_ignores_a_non_name_page_type_like_qpdf() {
     let bytes = single_page("<< /Type 42 /Parent 2 0 R /MediaBox [0 0 612 792] >>", &[]);
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-    assert_unsupported(helper.media_box());
+    assert_eq!(
+        helper.media_box().unwrap(),
+        Some(PageBox::new(0.0, 0.0, 612.0, 792.0))
+    );
 }
 
 // ---------------------------------------------------------------------------
