@@ -854,10 +854,16 @@ fn qpdf_11_9_empty_show_npages() -> Option<std::process::Output> {
     {
         return None;
     }
-    Command::new("qpdf")
+    let mut output = Command::new("qpdf")
         .args(["--empty", "--show-npages"])
         .output()
-        .ok()
+        .ok()?;
+    // The qpdf Windows CLI writes through a text-mode stdout stream (CRLF);
+    // this public Job test captures the logger's pre-terminal pipeline bytes.
+    output.stdout = String::from_utf8_lossy(&output.stdout)
+        .replace("\r\n", "\n")
+        .into_bytes();
+    Some(output)
 }
 
 fn add_raw_argv_output_if_required(args: &mut Vec<Vec<u8>>) {
