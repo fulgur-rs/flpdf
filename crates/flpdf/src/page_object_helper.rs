@@ -105,10 +105,7 @@
 
 use crate::content_stream::{ObjectHandleParserCallbacks, ParseControl};
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
-use crate::pages::{
-    is_inheritable_page_attribute, next_page_parent,
-    resolve_inherited_handle_from_node_with_max_depth, DEFAULT_MAX_PAGE_TREE_DEPTH,
-};
+use crate::pages::{is_inheritable_page_attribute, DEFAULT_MAX_PAGE_TREE_DEPTH};
 use crate::pipeline::{Pipeline, PipelineError, PlString};
 use crate::token_filter::TokenFilter;
 use crate::tokenizer::{Token, TokenType};
@@ -2287,28 +2284,24 @@ fn get_attribute_for_target(
     let mut inherited = false;
 
     if result.try_is_null()? && inheritable {
-        // qpdf's own loop (`QPDFPageObjectHelper.cc:236-247`) checks the
-        // leaf's key once before the loop, then its `while (seen.add(node)
-        // && node.hasKey("/Parent")) { node = node.getKey("/Parent"); result
-        // = node.getKey(name); ... }` body only ever advances to and
-        // examines an ancestor -- the leaf itself is never re-entered. The
-        // leaf's own key was already checked above (found null), so advance
-        // to the first parent before invoking the shared walk to mirror
-        // that same shape: otherwise the shared walk's depth count would
-        // charge one slot to re-examining the already-checked leaf, one
-        // level short of qpdf's structure (qpdf itself has no numeric depth
-        // cap -- DEFAULT_MAX_PAGE_TREE_DEPTH is flpdf's own DoS bound layered
-        // on top of qpdf's cycle-only guard).
-        let parent_ref = dict.try_get_key(b"/Parent")?;
-        if let Some(cursor) = next_page_parent(parent_ref)? {
-            if let Some(value) = resolve_inherited_handle_from_node_with_max_depth(
-                cursor.handle(),
-                key,
-                DEFAULT_MAX_PAGE_TREE_DEPTH,
-            )? {
-                value.try_dereference()?;
-                result = value;
+        // qpdf starts its seen set with this dictionary, then tests and
+        // follows each parent in source order. Identity terminates cycles;
+        // the walk has no numeric depth limit.
+        #[allow(
+            clippy::mutable_key_type,
+            reason = "qpdf cycle detection keys the live object identity"
+        )]
+        let mut seen: HashSet<ObjectHandleIdentity> = HashSet::new();
+        let mut node = dict.clone();
+        loop {
+            if !seen.insert(node.identity_key()) || !node.try_has_key(b"/Parent")? {
+                break;
+            }
+            node = node.try_get_key(b"/Parent")?;
+            result = node.try_get_key(key)?;
+            if !result.try_is_null()? {
                 inherited = true;
+                break;
             }
         }
     }
@@ -2526,20 +2519,18 @@ mod tests {
         );
     }
 
-    /// `get_attribute` (via `get_media_box`) must reach exactly qpdf's
-    /// depth: `QPDFPageObjectHelper::getAttribute` (`libqpdf/QPDFPageObjectHelper.cc:236-247`)
-    /// checks the leaf's own key once, then its loop only ever advances to
-    /// and examines an ancestor. A value set on the 100th ancestor -- the
-    /// deepest level `DEFAULT_MAX_PAGE_TREE_DEPTH` still permits -- must be
-    /// found, not rejected one level short by charging the leaf a depth slot.
+    /// qpdf `getAttribute` (`libqpdf/QPDFPageObjectHelper.cc:236-247`) walks
+    /// an acyclic `/Parent` chain until it finds the value, without a numeric
+    /// depth limit. Keep a case beyond flpdf's former limit so the live helper
+    /// remains aligned with that behavior.
     #[test]
-    fn get_media_box_reaches_the_100th_ancestor() {
-        // Objects 2..=101 are 100 nested /Pages nodes (2 = outermost, the
-        // 100th ancestor of the leaf; 101 = the leaf's immediate parent).
+    fn get_media_box_reaches_a_120th_ancestor_like_qpdf() {
+        // Objects 2..=121 are 120 nested /Pages nodes (2 = outermost, the
+        // 120th ancestor of the leaf; 121 = the leaf's immediate parent).
         // /MediaBox is set only on object 2.
         let mut objects: Vec<(u32, String)> =
             vec![(1, "<< /Type /Catalog /Pages 2 0 R >>".to_string())];
-        for depth in 0..100u32 {
+        for depth in 0..120u32 {
             let num = 2 + depth;
             let kid = num + 1;
             let parent_entry = if depth == 0 {
@@ -2559,7 +2550,7 @@ mod tests {
                 ),
             ));
         }
-        let leaf_ref = 2 + 100;
+        let leaf_ref = 2 + 120;
         objects.push((
             leaf_ref,
             format!("<< /Type /Page /Parent {} 0 R >>", leaf_ref - 1),
