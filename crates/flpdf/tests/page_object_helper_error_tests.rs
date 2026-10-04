@@ -49,6 +49,94 @@ fn page_helper_for_ref(
 }
 
 #[test]
+fn page_box_getters_use_qpdf_default_copy_options() {
+    let bytes = single_page(
+        "<< /Type /Page /Parent 2 0 R /MediaBox 5 0 R >>",
+        &[(5, "[0 0 20 30]".into())],
+    );
+    let (mut pdf, page_ref) = helper_for(bytes);
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
+
+    let media = helper.get_media_box().unwrap();
+    assert_eq!(media.object_ref(), Some(ObjectRef::new(5, 0)));
+    for fallback in [
+        helper.get_crop_box().unwrap(),
+        helper.get_bleed_box().unwrap(),
+        helper.get_trim_box().unwrap(),
+        helper.get_art_box().unwrap(),
+    ] {
+        assert!(fallback.is_same_object_as(&media));
+    }
+
+    drop(helper);
+    let page = pdf.get_object_handle(page_ref);
+    for key in [
+        b"/CropBox".as_slice(),
+        b"/BleedBox",
+        b"/TrimBox",
+        b"/ArtBox",
+    ] {
+        assert!(page.try_get_key(key).unwrap().try_is_null().unwrap());
+    }
+}
+
+#[test]
+fn media_box_copy_option_copies_an_inherited_direct_value_like_qpdf() {
+    let bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (
+                2,
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 20 30] >>".into(),
+            ),
+            (3, "<< /Type /Page /Parent 2 0 R >>".into()),
+        ],
+        1,
+    );
+    let (mut pdf, page_ref) = helper_for(bytes);
+    let parent = pdf.get_object_handle(ObjectRef::new(2, 0));
+    let original = parent.try_get_key(b"/MediaBox").unwrap();
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
+
+    let media = helper.get_media_box_with_options(true).unwrap();
+    assert!(!media.is_same_object_as(&original));
+    drop(helper);
+
+    let page = pdf.get_object_handle(page_ref);
+    let copied = page.try_get_key(b"/MediaBox").unwrap();
+    assert!(copied.is_same_object_as(&media));
+    assert!(parent
+        .try_get_key(b"/MediaBox")
+        .unwrap()
+        .is_same_object_as(&original));
+}
+
+#[test]
+fn media_box_copy_option_copies_an_indirect_value_like_qpdf() {
+    let bytes = single_page(
+        "<< /Type /Page /Parent 2 0 R /MediaBox 5 0 R >>",
+        &[(5, "[0 0 20 30]".into())],
+    );
+    let (mut pdf, page_ref) = helper_for(bytes);
+    let original = pdf
+        .get_object_handle(page_ref)
+        .try_get_key(b"/MediaBox")
+        .unwrap();
+    assert_eq!(original.object_ref(), Some(ObjectRef::new(5, 0)));
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
+
+    let media = helper.get_media_box_with_options(true).unwrap();
+    assert_eq!(media.object_ref(), None);
+    assert!(!media.is_same_object_as(&original));
+    drop(helper);
+
+    let page = pdf.get_object_handle(page_ref);
+    let copied = page.try_get_key(b"/MediaBox").unwrap();
+    assert!(copied.is_same_object_as(&media));
+    assert_eq!(original.object_ref(), Some(ObjectRef::new(5, 0)));
+}
+
+#[test]
 fn page_helper_get_object_handle_preserves_the_wrapped_direct_handle() {
     let mut pdf = Pdf::empty().unwrap();
     let page =
@@ -348,7 +436,7 @@ fn get_media_box_accepts_an_untyped_dictionary_like_qpdf() {
     )]);
     let mut helper = PageObjectHelper::from_object_handle(object, &mut pdf);
 
-    let media_box = helper.get_media_box(false).unwrap();
+    let media_box = helper.get_media_box().unwrap();
     assert!(media_box.try_is_array().unwrap());
     assert_eq!(media_box.try_get_array_n_items().unwrap(), 4);
 }
@@ -604,10 +692,12 @@ fn fallback_boxes_are_copied_into_untyped_and_non_page_dictionaries_like_qpdf() 
     let mut pdf = Pdf::empty().unwrap();
     let target = media_box_dictionary();
     let mut helper = PageObjectHelper::from_object_handle(target.clone(), &mut pdf);
-    let crop = helper.get_crop_box(false, true).unwrap();
+    let crop = helper.get_crop_box_with_options(false, true).unwrap();
     assert_copied(&target, &crop, b"/CropBox");
-    let trim = helper.get_trim_box(false, true).unwrap();
+    let trim = helper.get_trim_box_with_options(false, true).unwrap();
     assert_copied(&target, &trim, b"/TrimBox");
+    let art = helper.get_art_box_with_options(false, true).unwrap();
+    assert_copied(&target, &art, b"/ArtBox");
 
     // Indirect untyped dictionary and a `/Type /Pages` node.
     for body in [
@@ -618,7 +708,7 @@ fn fallback_boxes_are_copied_into_untyped_and_non_page_dictionaries_like_qpdf() 
         let (mut pdf, page_ref) = helper_for(bytes);
         let target = pdf.get_object_handle(page_ref);
         let mut helper = PageObjectHelper::from_object_handle(target.clone(), &mut pdf);
-        let bleed = helper.get_bleed_box(true, true).unwrap();
+        let bleed = helper.get_bleed_box_with_options(true, true).unwrap();
         assert_copied(&target, &bleed, b"/BleedBox");
         assert_copied(
             &target,
@@ -634,7 +724,7 @@ fn get_media_box_accepts_an_untyped_indirect_dictionary_like_qpdf() {
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
 
-    let media_box = helper.get_media_box(false).unwrap();
+    let media_box = helper.get_media_box().unwrap();
     assert!(media_box.try_is_array().unwrap());
     assert_eq!(media_box.try_get_array_n_items().unwrap(), 4);
 }
@@ -647,7 +737,7 @@ fn get_media_box_preserves_raw_shape_and_rectangle_projection_matches_qpdf() {
     );
     let (mut pdf, page_ref) = helper_for(extra_item);
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
-    let raw = helper.get_media_box(false).unwrap();
+    let raw = helper.get_media_box().unwrap();
     assert_eq!(raw.try_get_array_n_items().unwrap(), 5);
     assert_eq!(
         raw.try_get_array_as_rectangle().unwrap(),
@@ -657,7 +747,7 @@ fn get_media_box_preserves_raw_shape_and_rectangle_projection_matches_qpdf() {
     let reversed = single_page("<< /Type /Page /Parent 2 0 R /MediaBox [10 20 0 0] >>", &[]);
     let (mut pdf, page_ref) = helper_for(reversed);
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
-    let raw = helper.get_media_box(false).unwrap();
+    let raw = helper.get_media_box().unwrap();
     assert_eq!(
         raw.try_get_array_as_rectangle().unwrap(),
         Rectangle::new(0.0, 0.0, 10.0, 20.0)
@@ -674,7 +764,7 @@ fn get_media_box_preserves_real_coordinates_as_a_raw_handle_like_qpdf() {
     );
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
-    let media_box = helper.get_media_box(false).unwrap();
+    let media_box = helper.get_media_box().unwrap();
     assert_eq!(
         media_box.try_get_array_as_rectangle().unwrap(),
         Rectangle::new(0.0, 0.5, 612.25, 792.75)
@@ -701,7 +791,7 @@ fn media_box_beyond_the_former_depth_limit_returns_none_when_absent() {
     let bytes = build_pdf(&objects, 1);
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
-    assert!(helper.get_media_box(false).unwrap().try_is_null().unwrap());
+    assert!(helper.get_media_box().unwrap().try_is_null().unwrap());
 }
 
 #[test]
@@ -723,7 +813,7 @@ fn media_box_value_null_climbs_to_parent() {
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
-            .get_media_box(false)
+            .get_media_box()
             .unwrap()
             .try_get_array_as_rectangle()
             .unwrap(),
@@ -749,7 +839,7 @@ fn media_box_indirect_null_climbs_to_parent() {
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
-            .get_media_box(false)
+            .get_media_box()
             .unwrap()
             .try_get_array_as_rectangle()
             .unwrap(),
@@ -767,7 +857,7 @@ fn get_media_box_returns_a_referenced_scalar_verbatim_like_qpdf() {
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
-            .get_media_box(false)
+            .get_media_box()
             .unwrap()
             .try_get_value_as_int()
             .unwrap(),
@@ -782,7 +872,7 @@ fn get_media_box_returns_a_direct_scalar_verbatim_like_qpdf() {
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
-            .get_media_box(false)
+            .get_media_box()
             .unwrap()
             .try_get_value_as_int()
             .unwrap(),
@@ -795,7 +885,7 @@ fn get_media_box_returns_a_short_array_without_projection_like_qpdf() {
     let bytes = single_page("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612] >>", &[]);
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
-    let raw = helper.get_media_box(false).unwrap();
+    let raw = helper.get_media_box().unwrap();
     assert_eq!(raw.try_get_array_n_items().unwrap(), 3);
     assert_eq!(
         raw.try_get_array_as_rectangle().unwrap(),
@@ -811,7 +901,7 @@ fn get_media_box_returns_a_non_numeric_array_without_projection_like_qpdf() {
     );
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
-    let raw = helper.get_media_box(false).unwrap();
+    let raw = helper.get_media_box().unwrap();
     assert_eq!(raw.try_get_array_n_items().unwrap(), 4);
     assert_eq!(
         raw.try_get_array_as_rectangle().unwrap(),
@@ -826,7 +916,7 @@ fn media_box_parent_not_reference_returns_none() {
     let bytes = single_page("<< /Type /Page /Parent 42 >>", &[]);
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
-    assert!(helper.get_media_box(false).unwrap().try_is_null().unwrap());
+    assert!(helper.get_media_box().unwrap().try_is_null().unwrap());
 }
 
 #[test]
@@ -835,7 +925,7 @@ fn media_box_parent_not_dictionary_returns_none() {
     let bytes = single_page("<< /Type /Page /Parent 5 0 R >>", &[(5, "42".into())]);
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
-    assert!(helper.get_media_box(false).unwrap().try_is_null().unwrap());
+    assert!(helper.get_media_box().unwrap().try_is_null().unwrap());
 }
 
 #[test]
@@ -853,7 +943,7 @@ fn media_box_parent_cycle_returns_none() {
     );
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
-    assert!(helper.get_media_box(false).unwrap().try_is_null().unwrap());
+    assert!(helper.get_media_box().unwrap().try_is_null().unwrap());
 }
 
 // ---------------------------------------------------------------------------
@@ -870,7 +960,7 @@ fn trim_box_explicit_on_leaf() {
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
-            .get_trim_box(false, false)
+            .get_trim_box()
             .unwrap()
             .try_get_array_as_rectangle()
             .unwrap(),
@@ -888,7 +978,7 @@ fn art_box_explicit_on_leaf() {
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
-            .get_art_box(false, false)
+            .get_art_box()
             .unwrap()
             .try_get_array_as_rectangle()
             .unwrap(),
@@ -907,7 +997,7 @@ fn bleed_box_null_falls_back_to_crop() {
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
-            .get_bleed_box(false, false)
+            .get_bleed_box()
             .unwrap()
             .try_get_array_as_rectangle()
             .unwrap(),
@@ -925,7 +1015,7 @@ fn trim_box_indirect_null_falls_back_to_crop() {
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
-            .get_trim_box(false, false)
+            .get_trim_box()
             .unwrap()
             .try_get_array_as_rectangle()
             .unwrap(),
@@ -943,7 +1033,7 @@ fn art_box_indirect_array_resolved() {
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
-            .get_art_box(false, false)
+            .get_art_box()
             .unwrap()
             .try_get_array_as_rectangle()
             .unwrap(),
@@ -961,7 +1051,7 @@ fn get_bleed_box_returns_a_referenced_scalar_verbatim_like_qpdf() {
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
-            .get_bleed_box(false, false)
+            .get_bleed_box()
             .unwrap()
             .try_get_value_as_int()
             .unwrap(),
@@ -979,7 +1069,7 @@ fn get_bleed_box_returns_a_direct_scalar_verbatim_like_qpdf() {
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
-            .get_bleed_box(false, false)
+            .get_bleed_box()
             .unwrap()
             .try_get_value_as_int()
             .unwrap(),
@@ -1004,7 +1094,7 @@ fn box_and_annotation_accessors_do_not_require_page_type() {
     );
     let (mut pdf, page_ref) = helper_for(bytes);
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
-    assert!(helper.get_media_box(false).unwrap().try_is_null().unwrap());
+    assert!(helper.get_media_box().unwrap().try_is_null().unwrap());
     assert!(helper.get_annotations(None).unwrap().is_empty());
 }
 
@@ -1015,7 +1105,7 @@ fn media_box_ignores_a_non_name_page_type_like_qpdf() {
     let mut helper = page_helper_for_ref(&mut pdf, page_ref);
     assert_eq!(
         helper
-            .get_media_box(false)
+            .get_media_box()
             .unwrap()
             .try_get_array_as_rectangle()
             .unwrap(),

@@ -109,7 +109,7 @@ fn test_64_67_body<R: Read + Seek>(
             let mut min_suffix = 1;
             let name = resources.get_unique_resource_name(b"/Fx", &mut min_suffix, None)?;
             let rect = destination_page
-                .get_trim_box(false, false)?
+                .get_trim_box()?
                 .try_get_array_as_rectangle()?;
             let name_text = String::from_utf8(name.clone())
                 .expect("qpdf-generated Fx resource names are ASCII");
