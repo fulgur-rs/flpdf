@@ -64,7 +64,7 @@ fn canonical_helpers_preserve_grouped_widget_field_association() {
     let mut pdf = Pdf::open(Cursor::new(bytes.as_slice())).unwrap();
     let page = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap()[0].clone();
     let widgets = PageObjectHelper::from_object_handle(page, &mut pdf)
-        .get_annotations_filtered(Some(b"/Widget"))
+        .get_annotation_handles(Some(b"/Widget"))
         .unwrap();
     assert_eq!(widgets.len(), 5);
 

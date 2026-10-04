@@ -3297,7 +3297,7 @@ fn job_json_file_flatten_annotations_all_removes_widget_from_annots() {
     let page = first_page_handle(&mut pdf);
     assert!(
         PageObjectHelper::from_object_handle(page, &mut pdf)
-            .get_annotations_filtered(None)
+            .get_annotation_handles(None)
             .unwrap()
             .is_empty(),
         "flattenAnnotations=all must remove the Widget from /Annots"
@@ -3367,7 +3367,7 @@ fn job_json_file_flatten_annotations_modes_follow_qpdf_flag_masks() {
         let page = first_page_handle(&mut pdf);
         let page_ref = checked_page_ref(&page);
         let remaining = PageObjectHelper::from_object_handle(page.clone(), &mut pdf)
-            .get_annotations_filtered(None)
+            .get_annotation_handles(None)
             .unwrap()
             .len();
         assert_eq!(
@@ -3437,7 +3437,7 @@ fn job_json_file_generate_appearances_runs_before_flatten_annotations() {
     let page = first_page_handle(&mut pdf);
     assert!(
         PageObjectHelper::from_object_handle(page, &mut pdf)
-            .get_annotations_filtered(None)
+            .get_annotation_handles(None)
             .unwrap()
             .is_empty(),
         "generateAppearances must run before flattenAnnotations"

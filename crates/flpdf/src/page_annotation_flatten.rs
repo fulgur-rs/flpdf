@@ -616,7 +616,7 @@ fn page_annotation_handles<R: Read + Seek>(
     page: &ObjectHandle,
 ) -> Result<Vec<ObjectHandle>> {
     let mut page_helper = PageObjectHelper::from_object_handle(page.clone(), pdf);
-    page_helper.get_annotations_filtered(None)
+    page_helper.get_annotation_handles(None)
 }
 
 /// Returns the AcroForm `/DR` handle, unresolved.

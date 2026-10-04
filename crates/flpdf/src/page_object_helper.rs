@@ -104,6 +104,17 @@ use std::rc::Rc;
 /// inspect the page's attributes, content streams, resources, annotations, and
 /// bounding boxes. All operations are delegated to the underlying `Pdf<R>`
 /// infrastructure; no state is cached inside this struct.
+///
+/// qpdf exposes one annotation enumeration operation with an optional subtype
+/// filter, represented by [`Self::get_annotation_handles`]. There is no second
+/// filtered alias:
+///
+/// ```compile_fail,E0599
+/// use flpdf::PageObjectHelper;
+/// use std::io::Cursor;
+///
+/// let _method = PageObjectHelper::<Cursor<Vec<u8>>>::get_annotations_filtered;
+/// ```
 pub struct PageObjectHelper<'a, R: Read + Seek + 'static> {
     object: ObjectHandle,
     page_ref: Option<ObjectRef>,
@@ -1453,17 +1464,6 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             result.push(item);
         }
         Ok(result)
-    }
-
-    /// Return canonical annotation handles using qpdf's filtered, fail-soft
-    /// enumeration boundary. Direct and indirect annotation dictionaries are
-    /// both retained, matching the `QPDFAnnotationObjectHelper` values
-    /// returned by qpdf.
-    pub fn get_annotations_filtered(
-        &mut self,
-        only_subtype: Option<&[u8]>,
-    ) -> Result<Vec<ObjectHandle>> {
-        self.get_annotation_handles(only_subtype)
     }
 
     // -----------------------------------------------------------------------
