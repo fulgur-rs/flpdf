@@ -60,6 +60,20 @@ fn page_helper_get_object_handle_preserves_the_wrapped_direct_handle() {
     assert_eq!(returned.object_ref(), None);
 }
 
+#[test]
+fn page_helper_get_object_handle_preserves_the_wrapped_indirect_handle() {
+    let mut pdf = open(single_page("<< /Type /Page /Parent 2 0 R >>", &[]));
+    let page_ref = ObjectRef::new(3, 0);
+    let page = pdf.get_object_handle(page_ref);
+    assert_eq!(page.object_ref(), Some(page_ref));
+
+    let helper = PageObjectHelper::from_object_handle(page.clone(), &mut pdf);
+    let returned = helper.get_object_handle();
+
+    assert!(returned.is_same_object_as(&page));
+    assert_eq!(returned.object_ref(), Some(page_ref));
+}
+
 // ---------------------------------------------------------------------------
 // qpdf's getAnnotations() fail-soft malformed-shape handling
 // ---------------------------------------------------------------------------
