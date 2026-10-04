@@ -1549,14 +1549,6 @@ pub struct QPDFJob {
     /// `libqpdf/QPDF.cc:290-293`); track the factory outcome separately so a
     /// reused job can still receive an input file afterwards.
     empty_primary_created: bool,
-    /// Whether the current pre-run JSON initialization sequence has already
-    /// populated the configuration. qpdf applies repeated `jobJsonFile`
-    /// occurrences to the same Config object.
-    partial_json_initialized: bool,
-    /// Preserve flpdf's existing reusable-job boundary after `run`: a later
-    /// partial JSON sequence starts fresh, while CLI settings before the first
-    /// sequence remain visible to qpdf's shared Config.
-    has_run: bool,
     /// qpdf's help/version callbacks terminate the argv entry point before a
     /// document lifecycle starts. Keep that result on the job so a caller that
     /// uniformly invokes `run` observes the same successful early exit.
@@ -1658,8 +1650,6 @@ impl QPDFJob {
             encryption_status: EncryptionStatus::default(),
             create_qpdf_succeeded_without_document: false,
             empty_primary_created: false,
-            partial_json_initialized: false,
-            has_run: false,
             argv_early_exit: false,
         }
     }
@@ -2311,51 +2301,15 @@ impl QPDFJob {
         // configuration mutation so a schema failure cannot leave a partially
         // initialized job behind.
         validate_job_json_schema(&value)?;
-        // qpdf's initializeFromJson configures the existing QPDFJob rather
-        // than replacing its state (`QPDFJob_json.cc:611-625`). Partial
-        // job-json-file occurrences therefore continue from the same mutable
-        // configuration, including settings applied by an earlier argv
-        // occurrence.
-        let mut configuration = if partial && !self.has_run {
-            // qpdf's partial initializer always dispatches into the Config
-            // already owned by this QPDFJob. This is what lets an argv
-            // occurrence before --job-json-file remain visible when the JSON
-            // handler runs (`QPDFJob_json.cc:611-625`).
-            let mut configuration = self.configuration.clone();
-            if !(configuration.check
-                || configuration.show_npages
-                || configuration.show_pages
-                || configuration.check_linearization
-                || configuration.show_xref
-                || configuration.show_linearization
-                || configuration.show_object.is_some()
-                || configuration.list_attachments
-                || configuration.show_attachment.is_some()
-                || configuration.show_encryption
-                || configuration.is_encrypted
-                || configuration.requires_password)
-            {
-                // A newly constructed QPDFJob stores the library's optional
-                // output default, but qpdf's partial job-JSON CLI boundary
-                // requires an output unless an inspection selector disabled
-                // it (`QPDFJob.hh:705`, `QPDFJob.cc:591-595`).
-                configuration.require_output = true;
-            }
-            configuration
-        } else if partial && self.partial_json_initialized {
-            self.configuration.clone()
-        } else {
-            let mut configuration = qpdf_default_job_configuration();
-            configuration.require_output = true;
-            configuration.json_decode_level = crate::writer::DecodeLevel::Generalized;
-            configuration.page_specs = self.configuration.page_specs.clone();
-            configuration.page_specs_origin = self.configuration.page_specs_origin;
-            configuration
-        };
+        // qpdf's initializeFromJson always dispatches into this job's existing
+        // Config; `partial` controls only whether the final
+        // checkConfiguration runs (`QPDFJob_json.cc:611-625` and
+        // `include/qpdf/QPDFJob.hh:78-90`). Preserve every prior setting and
+        // let the generated handlers mutate only the fields they own.
+        let mut configuration = self.configuration.clone();
         self.dispatch_job_json_document(&mut configuration, &value, &mut BTreeSet::new())?;
 
         self.configuration = configuration;
-        self.partial_json_initialized = partial;
         let input_name = self
             .configuration
             .input_file
@@ -3804,21 +3758,11 @@ impl QPDFJob {
         Ok(())
     }
 
-    /// Clear the completed-run flag when a new initialization restarts the
-    /// job's lifecycle. qpdf has no such flag: `initializeFromArgv` simply
-    /// rebuilds the configuration, so this reset keeps the Rust side's
-    /// post-run JSON-layering branch from seeing a stale value.
-    pub(super) fn reset_has_run_for_initialization(&mut self) {
-        self.has_run = false;
-    }
-
     /// Run the configured create/write or check lifecycle.
     pub fn run(&mut self) -> Result<JobExitCode> {
         if self.argv_early_exit {
             return Ok(JobExitCode::Success);
         }
-        self.partial_json_initialized = false;
-        self.has_run = true;
         if self.configuration.is_encrypted || self.configuration.requires_password {
             return self.run_encryption_status();
         }

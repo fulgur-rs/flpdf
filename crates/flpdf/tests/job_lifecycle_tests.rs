@@ -844,6 +844,28 @@ fn logger_with_error_sink() -> (QPDFLogger, Arc<Mutex<SinkState>>) {
     (logger, state)
 }
 
+fn qpdf_11_9_empty_show_npages() -> Option<std::process::Output> {
+    let version = Command::new("qpdf").arg("--version").output().ok()?;
+    if !version.status.success()
+        || !String::from_utf8_lossy(&version.stdout)
+            .lines()
+            .next()
+            .is_some_and(|line| line.trim() == "qpdf version 11.9.0")
+    {
+        return None;
+    }
+    let mut output = Command::new("qpdf")
+        .args(["--empty", "--show-npages"])
+        .output()
+        .ok()?;
+    // The qpdf Windows CLI writes through a text-mode stdout stream (CRLF);
+    // this public Job test captures the logger's pre-terminal pipeline bytes.
+    output.stdout = String::from_utf8_lossy(&output.stdout)
+        .replace("\r\n", "\n")
+        .into_bytes();
+    Some(output)
+}
+
 fn add_raw_argv_output_if_required(args: &mut Vec<Vec<u8>>) {
     let inspection = args.iter().any(|argument| {
         let name = argument
@@ -2893,6 +2915,111 @@ fn json_job_empty_input_uses_the_job_document_boundary() {
 }
 
 #[test]
+fn full_json_initialization_layers_over_existing_job_config() {
+    let oracle = qpdf_11_9_empty_show_npages();
+    let (logger, info) = logger_with_info_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.config()
+        .empty_input()
+        .expect("empty input is a valid preconfigured source");
+    job.initialize_from_json(r#"{"showNpages":""}"#)
+        .expect("full JSON initialization must augment the existing Config");
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    let output = info.lock().unwrap().bytes.clone();
+    if let Some(oracle) = oracle {
+        assert_eq!(oracle.status.code(), Some(0), "qpdf probe: {oracle:?}");
+        assert_eq!(oracle.stderr, b"", "qpdf probe: {oracle:?}");
+        assert_eq!(output, oracle.stdout);
+    } else {
+        assert_eq!(output, b"0\n");
+    }
+}
+
+#[test]
+fn argv_initialization_layers_over_existing_job_config() {
+    let oracle = qpdf_11_9_empty_show_npages();
+    let (logger, info) = logger_with_info_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.config()
+        .empty_input()
+        .expect("empty input is a valid preconfigured source");
+    job.initialize_from_argv(&["qpdfjob".to_owned(), "--show-npages".to_owned()])
+        .expect("argv initialization must augment the existing Config");
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    let output = info.lock().unwrap().bytes.clone();
+    if let Some(oracle) = oracle {
+        assert_eq!(oracle.status.code(), Some(0), "qpdf probe: {oracle:?}");
+        assert_eq!(oracle.stderr, b"", "qpdf probe: {oracle:?}");
+        assert_eq!(output, oracle.stdout);
+    } else {
+        assert_eq!(output, b"0\n");
+    }
+}
+
+#[test]
+fn full_json_initialization_preserves_preconfigured_writer_and_security_state() {
+    let input =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("qdf-encrypted.pdf");
+    let qpdf_output = tempdir.path().join("qpdf-qdf-encrypted.pdf");
+
+    let qpdf = Command::new("qpdf")
+        .args([
+            "--allow-weak-crypto",
+            "--qdf",
+            "--static-id",
+            "--encrypt",
+            "user",
+            "owner",
+            "40",
+            "--",
+        ])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf 11.9.0 oracle should run");
+    assert!(qpdf.status.success(), "qpdf probe: {qpdf:?}");
+    let qpdf_bytes = std::fs::read(&qpdf_output).unwrap();
+    assert!(qpdf_bytes
+        .windows(b"%QDF-1.0".len())
+        .any(|w| w == b"%QDF-1.0"));
+    assert!(qpdf_bytes.windows(b"/R 2".len()).any(|w| w == b"/R 2"));
+
+    let configuration = serde_json::json!({
+        "inputFile": input,
+        "outputFile": output,
+        "encrypt": {
+            "userPassword": "user",
+            "ownerPassword": "owner",
+            "40bit": {}
+        }
+    });
+    let mut job = QPDFJob::new();
+    job.config().qdf();
+    job.set_allow_weak_crypto(true);
+    job.initialize_from_json(&configuration.to_string())
+        .expect("full JSON must augment preconfigured writer and crypto state");
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+
+    let flpdf_bytes = std::fs::read(output).unwrap();
+    assert!(
+        flpdf_bytes
+            .windows(b"%QDF-1.0".len())
+            .any(|w| w == b"%QDF-1.0"),
+        "the preconfigured QDF writer setting must survive full JSON initialization"
+    );
+    assert!(
+        flpdf_bytes.windows(b"/R 2".len()).any(|w| w == b"/R 2"),
+        "the preconfigured weak-crypto allowance must let qpdf's 40-bit settings reach the writer"
+    );
+}
+
+#[test]
 fn json_job_empty_encryption_status_returns_qpdf_exit_code() {
     for option in ["isEncrypted", "requiresPassword"] {
         let json = serde_json::json!({
@@ -3344,9 +3471,10 @@ fn create_qpdf_returns_the_primary_with_multi_source_pages_for_later_write() {
     assert_eq!(common::raw_page_count(&mut written).unwrap(), 2);
 }
 
-/// A failed `create_qpdf` must reset the status from its previous document.
+/// A second full JSON initializer keeps qpdf's existing Config and therefore
+/// rejects another input selector (`QPDFJob_config.cc:16-23`).
 #[test]
-fn a_failed_create_clears_the_previous_encryption_status() {
+fn full_json_initialization_after_create_rejects_duplicate_input() {
     let primary = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
     let secondary =
@@ -3381,12 +3509,16 @@ fn a_failed_create_clears_the_previous_encryption_status() {
         "outputFile": tempdir.path().join("second.pdf"),
     })
     .to_string();
-    job.initialize_from_json(&second).unwrap();
-    let _ = job.create_qpdf();
-
+    let error = job
+        .initialize_from_json(&second)
+        .expect_err("a second inputFile must be rejected by the existing Config");
     assert!(
-        !job.encryption_status().0,
-        "a create that never opened a document must not report encryption"
+        matches!(error, Error::Usage(ref usage) if usage.to_string() == "input file has already been given"),
+        "duplicate input must match qpdf's Config::inputFile usage error"
+    );
+    assert!(
+        job.encryption_status().0,
+        "a rejected initializer leaves prior status intact"
     );
 }
 
@@ -3540,13 +3672,10 @@ fn get_exit_code_is_pure_before_and_after_completion() {
 }
 
 #[test]
-fn a_failed_reopen_clears_the_previous_encryption_status() {
-    // `get_exit_code` is a public, side-effect-free query, so a reused job
-    // must not answer it from the previous document's encryption bits. qpdf
-    // never faces this because an open failure escapes `run()` as an
-    // exception and the CLI exits from its catch without consulting
-    // `getExitCode` (`qpdf/qpdf.cc:39-43`); flpdf converts that failure into
-    // `JobExitCode::Error` instead, so the status has to be cleared up front.
+fn partial_job_json_after_run_rejects_duplicate_input() {
+    // qpdf's initializer applies JSON handlers to the existing Config even
+    // after run; `Config::inputFile` rejects the second input before another
+    // document open (`QPDFJob_json.cc:611-625`, `QPDFJob_config.cc:16-23`).
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
     let encrypted = root.join("encrypted/v4-aes-128-r4.pdf");
 
@@ -3559,20 +3688,20 @@ fn a_failed_reopen_clears_the_previous_encryption_status() {
     assert_eq!(job.get_exit_code(), JobExitCode::Success);
 
     let mut job = job;
-    job.initialize_from_json_partial(
-        &serde_json::json!({
-            "inputFile": root.join("this-file-does-not-exist.pdf"),
-            "isEncrypted": "",
-        })
-        .to_string(),
-    )
-    .unwrap();
-    assert_eq!(job.run().unwrap(), JobExitCode::Error);
-    assert_eq!(
-        job.get_exit_code(),
-        JobExitCode::Error,
-        "a failed open must not leave the previous document's encryption status behind"
+    let error = job
+        .initialize_from_json_partial(
+            &serde_json::json!({
+                "inputFile": root.join("this-file-does-not-exist.pdf"),
+                "isEncrypted": "",
+            })
+            .to_string(),
+        )
+        .expect_err("a second inputFile must be rejected by the existing Config");
+    assert!(
+        matches!(error, Error::Usage(ref usage) if usage.to_string() == "input file has already been given"),
+        "duplicate input must match qpdf's Config::inputFile usage error"
     );
+    assert_eq!(job.get_exit_code(), JobExitCode::Success);
 }
 
 #[test]
@@ -6429,19 +6558,16 @@ fn missing_password_file_is_a_usage_error() {
     );
 }
 
-/// A second argv initialization restarts the lifecycle.
-///
-/// `initialize_from_json_with_partial` layers onto the existing configuration
-/// only while the job has not run. Without clearing that flag here, a
-/// `--job-json-file` occurrence in the second argv would take the post-run
-/// fresh-configuration branch and discard the input/output parsed before it.
+/// Repeated argv initialization continues to mutate qpdf's same Config after
+/// `run`; `initializeFromArgv` does not replace the job state
+/// (`QPDFJob_argv.cc:418-430`). A later partial job-JSON file therefore keeps
+/// the prior input/output and adds QDF mode to that same write.
 #[test]
-fn argv_initialization_after_a_run_keeps_later_job_json_layering() {
+fn argv_initialization_after_a_run_layers_later_job_json_on_existing_config() {
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
     let tempdir = tempfile::tempdir().unwrap();
     let first_output = tempdir.path().join("first.pdf");
-    let second_output = tempdir.path().join("second.pdf");
     let job_json = tempdir.path().join("job.json");
     std::fs::write(&job_json, br#"{"qdf": ""}"#).unwrap();
 
@@ -6456,15 +6582,20 @@ fn argv_initialization_after_a_run_keeps_later_job_json_layering() {
 
     job.initialize_from_raw_argv(&[
         b"qpdfjob".to_vec(),
-        fixture.to_string_lossy().into_owned().into_bytes(),
         format!("--job-json-file={}", job_json.display()).into_bytes(),
-        second_output.to_string_lossy().into_owned().into_bytes(),
     ])
-    .expect("the input and output parsed before --job-json-file must survive");
+    .expect("a later job-JSON file must update the existing Config");
     assert_eq!(job.run().unwrap(), JobExitCode::Success);
     assert!(
-        second_output.exists(),
-        "the second run must write its output"
+        first_output.exists(),
+        "the output set before the second initialization must survive"
+    );
+    assert!(
+        std::fs::read(first_output)
+            .unwrap()
+            .windows(b"%QDF-1.0".len())
+            .any(|window| window == b"%QDF-1.0"),
+        "the later job-JSON writer setting must reach the existing output"
     );
 }
 
@@ -6578,3 +6709,52 @@ fn a_falsy_split_pages_value_still_preserves_primary_orphans() {
 }
 
 mod common;
+
+/// qpdf 11.9.0 starts every `ArgParser` with empty positional slots, so a
+/// positional argument on a job that already holds the selector reaches
+/// `Config::inputFile` and is rejected (`QPDFJob_argv.cc:42-43,73-78`,
+/// `QPDFJob_config.cc:16-51`). Probed with the public C++ API: each case below
+/// reports `input file has already been given`.
+#[test]
+fn argv_initialization_rejects_positional_for_preconfigured_input_slot() {
+    fn init(job: &mut QPDFJob, arguments: &[&str]) -> flpdf::Result<()> {
+        let argv = arguments.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        job.initialize_from_argv(&argv)
+    }
+    fn assert_duplicate_input(case: &str, result: flpdf::Result<()>) {
+        let error = result.expect_err(case);
+        assert!(
+            matches!(&error, Error::Usage(usage) if usage.to_string() == "input file has already been given"),
+            "{case}: {error:?}"
+        );
+    }
+
+    let mut job = QPDFJob::new();
+    job.config().input_file("a.pdf").unwrap();
+    assert_duplicate_input("input then positional", init(&mut job, &["p", "b.pdf"]));
+
+    let mut job = QPDFJob::new();
+    job.config()
+        .input_file("a.pdf")
+        .unwrap()
+        .output_file("o.pdf")
+        .unwrap();
+    assert_duplicate_input(
+        "input and output then positional",
+        init(&mut job, &["p", "x.pdf"]),
+    );
+
+    let mut job = QPDFJob::new();
+    job.config().empty_input().unwrap();
+    assert_duplicate_input(
+        "empty input then positional",
+        init(&mut job, &["p", "o.pdf"]),
+    );
+
+    let mut job = QPDFJob::new();
+    init(&mut job, &["p", "a.pdf", "o.pdf"]).unwrap();
+    assert_duplicate_input(
+        "second argv initialization with two positionals",
+        init(&mut job, &["p", "x.pdf", "y.pdf"]),
+    );
+}

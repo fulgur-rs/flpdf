@@ -32,17 +32,10 @@ pub(super) fn initialize(job: &mut QPDFJob, argv: Vec<Vec<u8>>) -> Result<()> {
 /// parser can run) is the one such caller; qpdf has no equivalent two-pass
 /// argv boundary to translate.
 pub(super) fn initialize_expanded(job: &mut QPDFJob, expanded: Vec<Vec<u8>>) -> Result<()> {
-    job.configuration = qpdf_default_job_configuration();
-    // qpdf's Config defaults `require_outfile` to true for the argv boundary;
-    // inspection selectors and JSON output options turn it off explicitly
-    // (`QPDFJob_config.cc:75-83, QPDFJob.cc:591-595`).
-    job.configuration.require_output = true;
-    job.partial_json_initialized = false;
-    // A fresh argv initialization restarts the job's lifecycle. Leaving
-    // `has_run` set would send a later `--job-json-file` occurrence down
-    // `initialize_from_json_with_partial`'s post-run fresh-configuration
-    // branch, discarding the argv options parsed before it.
-    job.reset_has_run_for_initialization();
+    // qpdf's initializeFromArgv parses options directly into `config()` and
+    // leaves settings established by prior fluent/JSON/argv calls intact
+    // (`libqpdf/QPDFJob_argv.cc:418-430`). Start each parser at the qpdf main
+    // option table, but keep the owning job's configuration as its state.
     job.argv_early_exit = false;
     // qpdf sets the diagnostic prefix from `QPDFArgParser::getProgname()`
     // immediately before parsing (`QPDFJob_argv.cc:418-428`). That value is
@@ -106,15 +99,16 @@ enum ActiveSegment {
 
 impl<'a> Parser<'a> {
     fn new(job: &'a mut QPDFJob) -> Self {
-        let gave_input = job.configuration.input_file.is_some() || job.configuration.empty_input;
-        let gave_output =
-            job.configuration.output_file.is_some() || job.configuration.replace_input;
+        // qpdf's ArgParser starts `gave_input`/`gave_output` false for every
+        // parse (`libqpdf/QPDFJob_argv.cc:42-43`); a selector already present
+        // on the job is rejected by `Config::inputFile`/`outputFile`
+        // (`libqpdf/QPDFJob_config.cc:16-51`), not absorbed into the slot flags.
         Self {
             job,
             table: Table::Main,
             active: None,
-            gave_input,
-            gave_output,
+            gave_input: false,
+            gave_output: false,
         }
     }
 
