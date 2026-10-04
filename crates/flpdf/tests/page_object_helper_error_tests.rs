@@ -48,6 +48,18 @@ fn page_helper_for_ref(
     PageObjectHelper::from_object_handle(page, pdf)
 }
 
+#[test]
+fn page_helper_get_object_handle_preserves_the_wrapped_direct_handle() {
+    let mut pdf = Pdf::empty().unwrap();
+    let page =
+        ObjectHandle::dictionary(vec![(b"/Annots".to_vec(), ObjectHandle::array(Vec::new()))]);
+    let helper = PageObjectHelper::from_object_handle(page.clone(), &mut pdf);
+
+    let returned = helper.get_object_handle();
+    assert!(returned.is_same_object_as(&page));
+    assert_eq!(returned.object_ref(), None);
+}
+
 // ---------------------------------------------------------------------------
 // qpdf's getAnnotations() fail-soft malformed-shape handling
 // ---------------------------------------------------------------------------

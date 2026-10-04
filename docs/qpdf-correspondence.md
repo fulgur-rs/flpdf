@@ -1996,6 +1996,16 @@ preserves the underlying direct or indirect handle. The raw
 consumers; `get_annotations_filtered` was a qpdf-less public forwarding alias
 and has been removed.
 
+### `QPDFObjectHelper::getObjectHandle` on `PageObjectHelper` (`flpdf-6ik2q.53`)
+
+`QPDFPageObjectHelper` publicly derives from `QPDFObjectHelper`
+(`QPDFPageObjectHelper.hh:33`), whose public `getObjectHandle()` overloads
+return the stored `QPDFObjectHandle` directly
+(`QPDFObjectHelper.hh:34-55`). flpdf's public
+`PageObjectHelper::get_object_handle` clones the exact retained `ObjectHandle`,
+preserving direct handles and raw indirect identity without resolving or
+projecting through `ObjectRef`.
+
 `PageDocumentHelper::flatten_annotations` は qpdf と同じく AcroForm の NeedAppearances 判定後に repaired page list を得て、各 page の effective `/Resources`・appearance 処理・annotation removal を行う。qpdf は `getAllPages()` が返した raw `QPDFPageObjectHelper` を `flattenAnnotationsForPage` まで保持する（`QPDFPageDocumentHelper.cc:55-76`）。flpdf も `PageDocumentHelper::get_all_pages()` の raw `ObjectHandle` を resource materialization、rotation lookup、annotation flattening、content insertion へ渡し、`ObjectRef` projection を通さない。raw identity `(17, 65535)` 上の eligible appearance flattening は `page_annotation_flatten::tests::public_qpdf_flatten_copies_a_raw_generation_page_handle` で固定する。
 `flpdf-hrgj` closes the remaining page-operation consumer boundary: primary
 raw label copies register their foreign-map provenance as
