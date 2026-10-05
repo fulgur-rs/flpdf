@@ -40,7 +40,8 @@ ObjectHandle アクセサ自身が resolve のたびに `&mut Pdf` を要求す�
 - `get_rect(&mut self) -> Result<PageBox>`
 - `get_appearance_dictionary(&mut self) -> Result<ObjectHandle>`
 - `get_flags(&mut self) -> Result<i64>`
-- `get_appearance_stream(&mut self, which: &[u8], state: Option<&[u8]>) -> Result<ObjectHandle>`
+- `get_appearance_stream(&mut self, which: &[u8]) -> Result<ObjectHandle>`
+- `get_appearance_stream_with_state(&mut self, which: &[u8], state: &[u8]) -> Result<ObjectHandle>`
 
 戻り値が `Result` なのは、ObjectHandle の resolve 経路が壊れた間接参照や
 深いネストで実際にエラーを返しうるため — qpdf 側の対応 accessor は

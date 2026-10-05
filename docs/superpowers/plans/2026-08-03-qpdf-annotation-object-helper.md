@@ -166,7 +166,7 @@ git commit -m "feat: add ObjectHandle annotation helper"
 
 **Interfaces:**
 - Consumes: Task 2 `get_appearance_stream`, `get_rect`, and `get_flags`.
-- Produces: `get_page_content_for_appearance(name, rotate, required_flags, forbidden_flags)`.
+- Produces: `get_page_content_for_appearance(name, rotate)` and the explicit-mask `get_page_content_for_appearance_with_flags(name, rotate, required_flags, forbidden_flags)`.
 
 - [ ] **Step 1: Write a failing helper-owned flatten test**
 

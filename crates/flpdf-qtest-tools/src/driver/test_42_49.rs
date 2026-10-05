@@ -510,7 +510,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
 
             let normal_appearance = {
                 let mut annotation_helper = AnnotationObjectHelper::new(annotation.clone());
-                annotation_helper.get_appearance_stream(b"N", None)?
+                annotation_helper.get_appearance_stream(b"/N")?
             };
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             write!(stdout, "    Appearance stream (/N): ")?;
@@ -519,7 +519,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
 
             let state_appearance = {
                 let mut annotation_helper = AnnotationObjectHelper::new(annotation);
-                annotation_helper.get_appearance_stream(b"N", Some(b"3"))?
+                annotation_helper.get_appearance_stream_with_state(b"/N", b"/3")?
             };
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             write!(stdout, "    Appearance stream (/N, /3): ")?;
