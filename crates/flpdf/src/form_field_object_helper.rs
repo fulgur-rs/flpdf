@@ -462,8 +462,21 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         )
     }
 
-    /// Set the field's `/V` value using qpdf's form-field dispatch.
-    pub fn set_value(&mut self, value: ObjectHandle, need_appearances: bool) -> Result<()> {
+    /// Set the field's `/V` value using qpdf's default `need_appearances` value.
+    ///
+    /// This matches `QPDFFormFieldObjectHelper::setV(value, need_appearances = true)`
+    /// (`include/qpdf/QPDFFormFieldObjectHelper.hh:173`).
+    pub fn set_value(&mut self, value: ObjectHandle) -> Result<()> {
+        self.set_value_with_options(value, true)
+    }
+
+    /// Set the field's `/V` value using qpdf's form-field dispatch and an
+    /// explicit `/NeedAppearances` choice.
+    pub fn set_value_with_options(
+        &mut self,
+        value: ObjectHandle,
+        need_appearances: bool,
+    ) -> Result<()> {
         let value = self.dereferenced(value)?;
         if self.get_field_type()?.as_deref() == Some(b"/Btn") {
             if self.is_checkbox()? {
@@ -499,9 +512,22 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         Ok(())
     }
 
-    /// Set `/V` from UTF-8 text using qpdf's Unicode-string encoding.
-    pub fn set_value_string(&mut self, value: &str, need_appearances: bool) -> Result<()> {
-        self.set_value(
+    /// Set `/V` from UTF-8 text using qpdf's Unicode-string encoding and its
+    /// default `need_appearances = true`.
+    ///
+    /// This matches `QPDFFormFieldObjectHelper::setV(utf8_value,
+    /// need_appearances = true)` (`include/qpdf/QPDFFormFieldObjectHelper.hh:178`).
+    pub fn set_value_string(&mut self, value: &str) -> Result<()> {
+        self.set_value_string_with_options(value, true)
+    }
+
+    /// Set `/V` from UTF-8 text with an explicit `/NeedAppearances` choice.
+    pub fn set_value_string_with_options(
+        &mut self,
+        value: &str,
+        need_appearances: bool,
+    ) -> Result<()> {
+        self.set_value_with_options(
             ObjectHandle::string(crate::pdf_string::new_unicode_string(value.as_bytes())),
             need_appearances,
         )
@@ -1036,7 +1062,7 @@ mod tests {
         ]);
         let mut helper = super::FormFieldObjectHelper::from_object_handle(field.clone(), &mut pdf);
         helper
-            .set_value(ObjectHandle::name(b"On".to_vec()), true)
+            .set_value(ObjectHandle::name(b"On".to_vec()))
             .expect("set direct merged checkbox value");
 
         assert_eq!(
@@ -1068,7 +1094,7 @@ mod tests {
         {
             let mut helper = super::FormFieldObjectHelper::new(field_ref, &mut pdf);
             helper
-                .set_value(ObjectHandle::name(b"2".to_vec()), true)
+                .set_value(ObjectHandle::name(b"2".to_vec()))
                 .expect("set broken radio value");
         }
 
@@ -1098,7 +1124,7 @@ mod tests {
         {
             let mut helper = super::FormFieldObjectHelper::new(field_ref, &mut pdf);
             helper
-                .set_value(ObjectHandle::name(b"Sure".to_vec()), true)
+                .set_value(ObjectHandle::name(b"Sure".to_vec()))
                 .expect("set broken checkbox value");
         }
 
@@ -1149,7 +1175,7 @@ mod tests {
                 &mut pdf,
             );
             helper
-                .set_value(ObjectHandle::integer(1), true)
+                .set_value(ObjectHandle::integer(1))
                 .expect("set checkbox with invalid value type");
         }
         {
@@ -1158,7 +1184,7 @@ mod tests {
                 &mut pdf,
             );
             helper
-                .set_value(ObjectHandle::integer(1), true)
+                .set_value(ObjectHandle::integer(1))
                 .expect("set radio with invalid value type");
         }
         {
@@ -1167,7 +1193,7 @@ mod tests {
                 &mut pdf,
             );
             helper
-                .set_value(ObjectHandle::name(b"On".to_vec()), true)
+                .set_value(ObjectHandle::name(b"On".to_vec()))
                 .expect("set pushbutton value");
         }
 
@@ -1221,7 +1247,7 @@ mod tests {
                 &mut pdf,
             );
             helper
-                .set_value(ObjectHandle::name(b"On".to_vec()), true)
+                .set_value(ObjectHandle::name(b"On".to_vec()))
                 .expect("set malformed radio value");
         }
 

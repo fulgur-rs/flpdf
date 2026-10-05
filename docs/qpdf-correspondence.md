@@ -1993,6 +1993,15 @@ and an empty state slice maps to qpdf's empty-string default
 `include/qpdf/Constants.h:220-221`). The existing `/AP`, `/AS`, flag, and
 geometry processing order is unchanged.
 
+`FormFieldObjectHelper::set_value(value)` and `set_value_string(text)` map
+qpdf's `need_appearances = true` defaults for both `setV` overloads
+(`include/qpdf/QPDFFormFieldObjectHelper.hh:173,178`). Explicit bool choices
+remain available through `set_value_with_options` and
+`set_value_string_with_options`. Both forms delegate to the same field-type
+dispatch; `/Btn` handling returns before the `/NeedAppearances` update, while
+non-button values update `/V` and set the AcroForm flag when requested
+(`libqpdf/QPDFFormFieldObjectHelper.cc:300-345`).
+
 ### `QPDFPageObjectHelper::getAnnotations` public surface (`flpdf-6ik2q.51`)
 
 `QPDFPageObjectHelper.hh:211` exposes one annotation enumerator,

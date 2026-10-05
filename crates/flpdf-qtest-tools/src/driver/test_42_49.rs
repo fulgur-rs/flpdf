@@ -548,7 +548,7 @@ pub(crate) fn run_test_44<R: Read + Seek>(
     for field in fields {
         let mut field_helper = FormFieldObjectHelper::from_object_handle(field, pdf);
         if field_helper.get_field_type()?.as_deref() == Some(b"/Tx") {
-            field_helper.set_value_string("3.14 ÷ 0", true)?;
+            field_helper.set_value_string("3.14 ÷ 0")?;
             writeln!(
                 stdout,
                 "Set field value: {} -> {}",
