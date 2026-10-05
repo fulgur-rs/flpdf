@@ -1013,15 +1013,15 @@ mod byte_gate {
         b: &mut Pdf<R2>,
     ) -> crate::PdfVersion {
         let a_version =
-            crate::parse_pdf_version(a.version()).unwrap_or(crate::PdfVersion::new(1, 0, 0));
+            crate::parse_pdf_version(a.version()).unwrap_or(crate::PdfVersion::new(1, 0));
         let b_version =
-            crate::parse_pdf_version(b.version()).unwrap_or(crate::PdfVersion::new(1, 0, 0));
-        let mut best = crate::PdfVersion::new(
+            crate::parse_pdf_version(b.version()).unwrap_or(crate::PdfVersion::new(1, 0));
+        let mut best = crate::PdfVersion::new_with_extension_level(
             a_version.major(),
             a_version.minor(),
             a.adobe_extension_level().unwrap_or(None).unwrap_or(0),
         );
-        best.update_if_greater(crate::PdfVersion::new(
+        best.update_if_greater(crate::PdfVersion::new_with_extension_level(
             b_version.major(),
             b_version.minor(),
             b.adobe_extension_level().unwrap_or(None).unwrap_or(0),
@@ -1062,7 +1062,7 @@ mod byte_gate {
             writer.set_static_id(true);
             writer.set_qdf_mode(true);
             writer.set_suppress_original_object_ids(true);
-            writer.set_minimum_pdf_version(version, max_ext);
+            writer.set_minimum_pdf_version_with_extension_level(version, max_ext);
         });
         assert_byte_identical(&actual, "overlay-copy-annotations.pdf");
     }
@@ -1111,7 +1111,7 @@ mod byte_gate {
             writer.set_static_id(true);
             writer.set_qdf_mode(true);
             writer.set_suppress_original_object_ids(true);
-            writer.set_minimum_pdf_version(version, max_ext);
+            writer.set_minimum_pdf_version_with_extension_level(version, max_ext);
         });
         assert_byte_identical(&actual, "overlay-copy-annotations-two-specs-same-page.pdf");
     }
@@ -1149,7 +1149,7 @@ mod byte_gate {
             writer.set_static_id(true);
             writer.set_qdf_mode(true);
             writer.set_suppress_original_object_ids(true);
-            writer.set_minimum_pdf_version(version, max_ext);
+            writer.set_minimum_pdf_version_with_extension_level(version, max_ext);
         });
         assert_byte_identical(&actual, "overlay-source-p-and-inline.pdf");
     }
@@ -1178,7 +1178,7 @@ mod byte_gate {
             writer.set_static_id(true);
             writer.set_qdf_mode(true);
             writer.set_suppress_original_object_ids(true);
-            writer.set_minimum_pdf_version(version, max_ext);
+            writer.set_minimum_pdf_version_with_extension_level(version, max_ext);
         });
         assert_byte_identical(&actual, "overlay-link-annot-no-acroform.pdf");
     }
@@ -1251,7 +1251,7 @@ mod byte_gate {
             writer.set_static_id(true);
             writer.set_qdf_mode(true);
             writer.set_suppress_original_object_ids(true);
-            writer.set_minimum_pdf_version(version, max_ext);
+            writer.set_minimum_pdf_version_with_extension_level(version, max_ext);
         });
         assert_byte_identical(&actual, "overlay-onto-indirect-fields.pdf");
     }
@@ -1278,7 +1278,7 @@ mod byte_gate {
             writer.set_static_id(true);
             writer.set_qdf_mode(true);
             writer.set_suppress_original_object_ids(true);
-            writer.set_minimum_pdf_version(version, max_ext);
+            writer.set_minimum_pdf_version_with_extension_level(version, max_ext);
         });
         assert_byte_identical(&actual, "overlay-source-direct-dr.pdf");
     }
@@ -1315,7 +1315,7 @@ mod byte_gate {
             writer.set_static_id(true);
             writer.set_qdf_mode(true);
             writer.set_suppress_original_object_ids(true);
-            writer.set_minimum_pdf_version(version, max_ext);
+            writer.set_minimum_pdf_version_with_extension_level(version, max_ext);
         });
         assert_byte_identical(&actual, "overlay-onto-existing-acroform.pdf");
     }
@@ -1372,7 +1372,7 @@ mod byte_gate {
             writer.set_static_id(true);
             writer.set_qdf_mode(true);
             writer.set_suppress_original_object_ids(true);
-            writer.set_minimum_pdf_version(version, max_ext);
+            writer.set_minimum_pdf_version_with_extension_level(version, max_ext);
         });
         assert_byte_identical(&actual, "overlay-onto-existing-acroform-dr.pdf");
     }

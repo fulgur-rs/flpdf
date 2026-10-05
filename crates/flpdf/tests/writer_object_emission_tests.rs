@@ -441,7 +441,7 @@ fn encrypted_normalize_root_progress_failure_precedes_adbe_reconciliation() {
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_static_id(true);
     writer.set_static_aes_iv(true);
-    writer.force_pdf_version("1.7", 8);
+    writer.force_pdf_version_with_extension_level("1.7", 8);
     writer.set_encryption_parameters(EncryptParams::v4_aes128(b"u", b"o"));
     writer.set_output_memory().unwrap();
     writer.register_progress_reporter(Box::new(|percent| {
@@ -490,7 +490,7 @@ fn encrypted_qdf_live_root_maps_an_extraneous_xref_child_to_null() {
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_static_id(true);
     writer.set_static_aes_iv(true);
-    writer.force_pdf_version("1.7", 8);
+    writer.force_pdf_version_with_extension_level("1.7", 8);
     writer.set_encryption_parameters(EncryptParams::v4_aes128(b"u", b"o"));
     writer.set_output_memory().unwrap();
     writer.write().unwrap();
@@ -533,7 +533,7 @@ fn encrypted_qdf_and_normalize_encrypt_direct_page_dictionary_strings() {
         writer.set_compress_streams(false);
         writer.set_static_id(true);
         writer.set_static_aes_iv(true);
-        writer.force_pdf_version("1.7", 8);
+        writer.force_pdf_version_with_extension_level("1.7", 8);
         writer.set_encryption_parameters(EncryptParams::v4_aes128(b"u", b"o"));
         writer.set_output_memory().unwrap();
         writer.write().unwrap();

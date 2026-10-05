@@ -53,7 +53,7 @@ fn plain_disable_reconciles_direct_adbe_before_live_child_enqueue() {
     .expect("open direct ADBE fixture");
     let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
-    writer.force_pdf_version("1.7", 8);
+    writer.force_pdf_version_with_extension_level("1.7", 8);
     writer.set_static_id(true);
     writer.set_output_memory().expect("configure memory output");
     writer.write().expect("write live queue output");

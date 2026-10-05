@@ -630,7 +630,7 @@ fn extra_header_fallback_reaches_the_sink_before_the_next_provider() {
 fn forced_version_fallback_reaches_the_sink_before_the_next_provider() {
     assert_fallback_reaches_sink_before_provider_b(|writer| {
         writer.set_object_stream_mode(ObjectStreamMode::Generate);
-        writer.force_pdf_version("1.4", 0);
+        writer.force_pdf_version("1.4");
     });
 }
 

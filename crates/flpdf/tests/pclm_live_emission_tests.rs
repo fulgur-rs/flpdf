@@ -274,7 +274,7 @@ fn pclm_indirect_root_reconciles_adbe_to_the_forced_extension_level() {
     let mut pdf = indirect_root_adbe_pdf();
     let mut writer = PdfWriter::new(&mut pdf);
     writer.set_pclm(true);
-    writer.force_pdf_version("1.7", 8);
+    writer.force_pdf_version_with_extension_level("1.7", 8);
     writer.set_static_id(true);
     writer.set_output_memory().unwrap();
     writer
@@ -314,7 +314,7 @@ fn pclm_indirect_root_removes_adbe_only_extensions_at_level_zero() {
     let mut pdf = indirect_root_adbe_pdf();
     let mut writer = PdfWriter::new(&mut pdf);
     writer.set_pclm(true);
-    writer.force_pdf_version("1.7", 0);
+    writer.force_pdf_version("1.7");
     writer.set_static_id(true);
     writer.set_output_memory().unwrap();
     writer
@@ -357,7 +357,7 @@ fn pclm_direct_root_does_not_reconcile_adbe() {
 
     let mut writer = PdfWriter::new(&mut pdf);
     writer.set_pclm(true);
-    writer.force_pdf_version("1.7", 8);
+    writer.force_pdf_version_with_extension_level("1.7", 8);
     writer.set_static_id(true);
     writer.set_output_memory().unwrap();
     writer.write().expect("PCLm direct-root write must succeed");

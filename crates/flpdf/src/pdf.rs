@@ -521,7 +521,11 @@ impl<R: Read + Seek> Pdf<R> {
     pub fn get_version_as_pdf_version(&mut self) -> Result<PdfVersion> {
         let extension_level = self.get_extension_level()?;
         let (major, minor) = leading_major_minor(self.version())?;
-        Ok(PdfVersion::new(major, minor, i64::from(extension_level)))
+        Ok(PdfVersion::new_with_extension_level(
+            major,
+            minor,
+            i64::from(extension_level),
+        ))
     }
 
     /// The live trailer dictionary as an [`ObjectHandle`].

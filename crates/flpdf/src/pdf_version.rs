@@ -16,11 +16,19 @@ pub struct PdfVersion {
 }
 
 impl PdfVersion {
-    /// Creates a PDF version value.
+    /// Create a PDF version with qpdf's default extension level of zero.
+    ///
+    /// (`PDFVersion(major, minor, extension = 0)`,
+    /// `include/qpdf/PDFVersion.hh:38`).
+    pub const fn new(major: i32, minor: i32) -> Self {
+        Self::new_with_extension_level(major, minor, 0)
+    }
+
+    /// Create a PDF version with an explicit extension level.
     ///
     /// qpdf's `PDFVersion` stores `major_version`/`minor_version` as `int`
     /// (`include/qpdf/PDFVersion.hh:60-62`), not a narrower type.
-    pub const fn new(major: i32, minor: i32, extension_level: i64) -> Self {
+    pub const fn new_with_extension_level(major: i32, minor: i32, extension_level: i64) -> Self {
         Self {
             major,
             minor,
@@ -41,7 +49,6 @@ impl PdfVersion {
         Some(Self::new(
             i32::from(major.parse::<u8>().ok()?),
             i32::from(minor.parse::<u8>().ok()?),
-            0,
         ))
     }
 
@@ -229,13 +236,16 @@ mod tests {
 
     #[test]
     fn standard_version_strings_cover_writer_encryption_floors() {
-        assert_eq!(PdfVersion::new(1, 3, 0).static_version_str(), Some("1.3"));
-        assert_eq!(PdfVersion::new(1, 4, 0).static_version_str(), Some("1.4"));
-        assert_eq!(PdfVersion::new(1, 5, 0).static_version_str(), Some("1.5"));
-        assert_eq!(PdfVersion::new(1, 6, 0).static_version_str(), Some("1.6"));
-        assert_eq!(PdfVersion::new(1, 7, 0).static_version_str(), Some("1.7"));
-        assert_eq!(PdfVersion::new(1, 7, 8).static_version_str(), Some("1.7"));
-        assert_eq!(PdfVersion::new(2, 0, 0).static_version_str(), None);
+        assert_eq!(PdfVersion::new(1, 3).static_version_str(), Some("1.3"));
+        assert_eq!(PdfVersion::new(1, 4).static_version_str(), Some("1.4"));
+        assert_eq!(PdfVersion::new(1, 5).static_version_str(), Some("1.5"));
+        assert_eq!(PdfVersion::new(1, 6).static_version_str(), Some("1.6"));
+        assert_eq!(PdfVersion::new(1, 7).static_version_str(), Some("1.7"));
+        assert_eq!(
+            PdfVersion::new_with_extension_level(1, 7, 8).static_version_str(),
+            Some("1.7")
+        );
+        assert_eq!(PdfVersion::new(2, 0).static_version_str(), None);
     }
 
     #[test]

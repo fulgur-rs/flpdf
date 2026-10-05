@@ -45,7 +45,7 @@ fn shared_extensions(linearize: bool, level: i64, fail: bool) {
     let mut writer = PdfWriter::new(&mut pdf);
     writer.set_extra_header_text("% ADBE probe\n"); // selects specialized output
     writer.set_static_id(true);
-    writer.force_pdf_version("1.7", level);
+    writer.force_pdf_version_with_extension_level("1.7", level);
     writer.set_linearization(linearize);
     if fail {
         writer.set_output_writer(FailingOutput).unwrap();
@@ -123,7 +123,7 @@ fn legacy_planned_shared_extensions(qdf: bool, level: i64, fail: bool) {
     writer.set_object_stream_mode(flpdf::ObjectStreamMode::Generate);
     writer.set_extra_header_text("% legacy QDF ADBE probe\n");
     writer.set_static_id(true);
-    writer.force_pdf_version("1.7", level);
+    writer.force_pdf_version_with_extension_level("1.7", level);
     if fail {
         writer.set_output_writer(FailingOutput).unwrap();
     } else {
@@ -204,7 +204,7 @@ fn legacy_normalize_reconciles_an_uncompressed_root() {
         writer.set_object_stream_mode(flpdf::ObjectStreamMode::Preserve);
         writer.set_extra_header_text("% legacy normalize ADBE probe\n");
         writer.set_static_id(true);
-        writer.force_pdf_version("1.7", level);
+        writer.force_pdf_version_with_extension_level("1.7", level);
         writer.set_output_memory().unwrap();
         writer.write().expect("legacy normalization rewrite");
 
@@ -239,7 +239,7 @@ fn callback_failure(percent: u8, expected_level: i64) {
     let (mut pdf, _root, extensions) = document();
     let mut writer = PdfWriter::new(&mut pdf);
     writer.set_linearization(true);
-    writer.force_pdf_version("1.7", 8);
+    writer.force_pdf_version_with_extension_level("1.7", 8);
     writer.set_output_memory().unwrap();
     writer.register_progress_reporter(Box::new(move |current| {
         if current == percent {
@@ -301,7 +301,7 @@ fn linearized_extension_bytes_match_qpdf_with_and_without_encryption() {
                 writer.set_linearization(true);
                 writer.set_static_id(true);
                 writer.set_static_aes_iv(true);
-                writer.force_pdf_version("1.7", level);
+                writer.force_pdf_version_with_extension_level("1.7", level);
                 if encrypt {
                     writer.set_encryption_parameters(flpdf::EncryptParams::v4_aes128(
                         b"u".to_vec(),

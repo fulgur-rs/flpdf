@@ -364,7 +364,8 @@ impl QPDFJob {
             self.prepare_writer_configuration(&mut writer_configuration)?;
             writer_configuration.apply_to(&mut writer);
             if let Some(version) = source_version.as_deref() {
-                writer.set_minimum_pdf_version(version, source_extension_level);
+                writer
+                    .set_minimum_pdf_version_with_extension_level(version, source_extension_level);
             }
             if options.deterministic_id {
                 writer.set_deterministic_id(true);

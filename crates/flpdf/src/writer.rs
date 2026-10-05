@@ -349,8 +349,18 @@ impl WriterConfiguration {
         };
     }
 
-    /// Set qpdf's minimum output PDF version and extension level.
-    pub fn set_minimum_pdf_version(&mut self, version: impl Into<String>, extension_level: i64) {
+    /// Set qpdf's minimum output PDF version using its default extension level
+    /// of zero (`include/qpdf/QPDFWriter.hh:243`).
+    pub fn set_minimum_pdf_version(&mut self, version: impl Into<String>) {
+        self.set_minimum_pdf_version_with_extension_level(version, 0);
+    }
+
+    /// Set qpdf's minimum output PDF version and an explicit extension level.
+    pub fn set_minimum_pdf_version_with_extension_level(
+        &mut self,
+        version: impl Into<String>,
+        extension_level: i64,
+    ) {
         update_minimum_pdf_version(
             &mut self.settings.minimum_pdf_version,
             version.into(),
@@ -385,8 +395,18 @@ impl WriterConfiguration {
         }
     }
 
-    /// Force qpdf's output PDF version and extension level.
-    pub fn force_pdf_version(&mut self, version: impl Into<String>, extension_level: i64) {
+    /// Force qpdf's output PDF version using its default extension level of
+    /// zero (`include/qpdf/QPDFWriter.hh:258`).
+    pub fn force_pdf_version(&mut self, version: impl Into<String>) {
+        self.force_pdf_version_with_extension_level(version, 0);
+    }
+
+    /// Force qpdf's output PDF version and an explicit extension level.
+    pub fn force_pdf_version_with_extension_level(
+        &mut self,
+        version: impl Into<String>,
+        extension_level: i64,
+    ) {
         self.settings.forced_pdf_version = Some((version.into(), extension_level));
     }
 
@@ -713,7 +733,19 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         };
     }
 
-    pub fn set_minimum_pdf_version(&mut self, version: impl Into<String>, extension_level: i64) {
+    /// Set the qpdf minimum output version with extension level zero, matching
+    /// `QPDFWriter::setMinimumPDFVersion(version, extension_level = 0)`
+    /// (`include/qpdf/QPDFWriter.hh:243`).
+    pub fn set_minimum_pdf_version(&mut self, version: impl Into<String>) {
+        self.set_minimum_pdf_version_with_extension_level(version, 0);
+    }
+
+    /// Set the qpdf minimum output version and an explicit extension level.
+    pub fn set_minimum_pdf_version_with_extension_level(
+        &mut self,
+        version: impl Into<String>,
+        extension_level: i64,
+    ) {
         update_minimum_pdf_version(
             &mut self.settings.minimum_pdf_version,
             version.into(),
@@ -721,7 +753,19 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         );
     }
 
-    pub fn force_pdf_version(&mut self, version: impl Into<String>, extension_level: i64) {
+    /// Force qpdf's output version with extension level zero, matching
+    /// `QPDFWriter::forcePDFVersion(version, extension_level = 0)`
+    /// (`include/qpdf/QPDFWriter.hh:258`).
+    pub fn force_pdf_version(&mut self, version: impl Into<String>) {
+        self.force_pdf_version_with_extension_level(version, 0);
+    }
+
+    /// Force qpdf's output version and an explicit extension level.
+    pub fn force_pdf_version_with_extension_level(
+        &mut self,
+        version: impl Into<String>,
+        extension_level: i64,
+    ) {
         let version = version.into();
         self.settings.forced_pdf_version = Some((version, extension_level));
     }
@@ -2157,12 +2201,12 @@ fn encryption_version_floor(options: &WriterOptions) -> Option<PdfVersion> {
     use crate::encryption::EncryptMethod;
     if let Some(ref enc) = options.encrypt {
         return Some(match enc.method {
-            EncryptMethod::V5R6Aes256 => PdfVersion::new(1, 7, 8),
-            EncryptMethod::V5R5Aes256 => PdfVersion::new(1, 7, 3),
-            EncryptMethod::V4Aes128 => PdfVersion::new(1, 6, 0),
-            EncryptMethod::V4Rc4128 => PdfVersion::new(1, 5, 0),
-            EncryptMethod::V2Rc4128 => PdfVersion::new(1, 4, 0),
-            EncryptMethod::V1Rc440 => PdfVersion::new(1, 3, 0),
+            EncryptMethod::V5R6Aes256 => PdfVersion::new_with_extension_level(1, 7, 8),
+            EncryptMethod::V5R5Aes256 => PdfVersion::new_with_extension_level(1, 7, 3),
+            EncryptMethod::V4Aes128 => PdfVersion::new(1, 6),
+            EncryptMethod::V4Rc4128 => PdfVersion::new(1, 5),
+            EncryptMethod::V2Rc4128 => PdfVersion::new(1, 4),
+            EncryptMethod::V1Rc440 => PdfVersion::new(1, 3),
         });
     }
     if let Some(source) = options.copy_encryption.as_ref() {
@@ -2179,23 +2223,23 @@ fn encryption_version_floor(options: &WriterOptions) -> Option<PdfVersion> {
             .try_as_integer()
             .ok()??;
         return Some(if revision >= 6 {
-            PdfVersion::new(1, 7, 8)
+            PdfVersion::new_with_extension_level(1, 7, 8)
         } else if revision == 5 {
-            PdfVersion::new(1, 7, 3)
+            PdfVersion::new_with_extension_level(1, 7, 3)
         } else if revision == 4 {
             // `copyEncryptionParameters` forces AES for every V>=4 donor
             // (`QPDFWriter.cc:674-679`), and
             // `setEncryptionParametersInternal` picks 1.6 for AES and 1.5
             // for RC4 at R=4 (`QPDFWriter.cc:806-814`).
             if version >= 4 {
-                PdfVersion::new(1, 6, 0)
+                PdfVersion::new(1, 6)
             } else {
-                PdfVersion::new(1, 5, 0)
+                PdfVersion::new(1, 5)
             }
         } else if revision == 3 {
-            PdfVersion::new(1, 4, 0)
+            PdfVersion::new(1, 4)
         } else {
-            PdfVersion::new(1, 3, 0)
+            PdfVersion::new(1, 3)
         });
     }
     None
@@ -4511,7 +4555,7 @@ mod final_handle_writer_tests {
         let mut writer = PdfWriter::new(&mut pdf);
         writer.set_static_id(true);
         writer.set_deterministic_id(true);
-        writer.force_pdf_version("1.3", 0);
+        writer.force_pdf_version("1.3");
         writer
             .set_output_writer(Vec::new())
             .expect("install an in-memory output sink");
@@ -5612,7 +5656,7 @@ mod final_handle_writer_tests {
         ))
         .expect("no-extension fixture");
         let mut writer = PdfWriter::new(&mut pdf);
-        writer.set_minimum_pdf_version("1.7", 8);
+        writer.set_minimum_pdf_version_with_extension_level("1.7", 8);
         writer
             .set_output_writer(AlwaysFailingOutput)
             .expect("install failing output");

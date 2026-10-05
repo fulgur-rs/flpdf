@@ -473,13 +473,21 @@ fn writer_configuration_unnormalized(
     configuration.set_preserve_encryption(options.preserve_encryption);
     if let Some(version) = options.input_version_floor {
         let (version, extension_level) = version.get_version();
-        configuration.set_minimum_pdf_version(version, extension_level);
+        configuration.set_minimum_pdf_version_with_extension_level(version, extension_level);
     }
     if let Some(version) = options.min_version.as_deref() {
-        configuration.set_minimum_pdf_version(version, options.min_extension_level.unwrap_or(0));
+        if let Some(extension_level) = options.min_extension_level {
+            configuration.set_minimum_pdf_version_with_extension_level(version, extension_level);
+        } else {
+            configuration.set_minimum_pdf_version(version);
+        }
     }
     if let Some(version) = options.force_version.as_deref() {
-        configuration.force_pdf_version(version, options.force_extension_level.unwrap_or(0));
+        if let Some(extension_level) = options.force_extension_level {
+            configuration.force_pdf_version_with_extension_level(version, extension_level);
+        } else {
+            configuration.force_pdf_version(version);
+        }
     }
     if let Some(params) = options.encrypt.clone() {
         configuration.set_encryption_parameters(params);
