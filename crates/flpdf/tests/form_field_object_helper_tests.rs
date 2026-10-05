@@ -1,7 +1,8 @@
 //! Integration coverage for the public qpdf-shaped form-field helper.
 
 use flpdf::form_field_object_helper::FormFieldObjectHelper;
-use flpdf::{DecodeLevel, Error, ObjectHandle, ObjectRef, Pdf};
+use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
+use flpdf::{AcroFormDocumentHelper, DecodeLevel, Error, ObjectHandle, ObjectRef, Pdf, QPDFLogger};
 use std::io::Cursor;
 
 mod common;
@@ -42,6 +43,22 @@ fn doc_with_root(root: &str, mut objects: Vec<(u32, String)>) -> Vec<u8> {
     ];
     base.append(&mut objects);
     build_pdf(&base, 1)
+}
+
+struct FailingWarningSink;
+
+impl Pipeline for FailingWarningSink {
+    fn identifier(&self) -> &str {
+        "form-field helper failing warning sink"
+    }
+
+    fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
+        Err(PipelineError::runtime("sink write failure 1"))
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
 }
 
 fn resolved_handle(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef) -> ObjectHandle {
@@ -956,6 +973,120 @@ fn set_value_defaults_to_need_appearances_for_text_and_choice_fields() {
             Some(true)
         );
     }
+}
+
+#[test]
+fn set_need_appearances_warns_without_a_dictionary() {
+    const WARNING: &[u8] = b"ignoring call to QPDFAcroFormDocumentHelper::setNeedAppearances on a file that lacks an /AcroForm dictionary";
+
+    let cases = [
+        ("missing /AcroForm", doc(vec![]), None),
+        (
+            "non-dictionary /AcroForm",
+            doc_with_root(
+                "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>",
+                vec![(4, "17".into())],
+            ),
+            Some(17),
+        ),
+    ];
+
+    for (case, bytes, original_acroform_integer) in cases {
+        for value in [true, false] {
+            let mut pdf = open(bytes.clone());
+            AcroFormDocumentHelper::new(&mut pdf)
+                .expect("construct AcroForm helper")
+                .set_need_appearances(value)
+                .expect("qpdf warns and returns normally");
+
+            let diagnostics = pdf.repair_diagnostics();
+            assert_eq!(diagnostics.entries().len(), 1, "{case}, value={value}");
+            assert!(
+                diagnostics.entries()[0]
+                    .get_object()
+                    .windows(b"object 1 0".len())
+                    .any(|window| window == b"object 1 0"),
+                "{case} warning must be attributed to the Catalog"
+            );
+            assert_eq!(
+                diagnostics.entries()[0].get_message_detail(),
+                WARNING,
+                "{case}, value={value}"
+            );
+
+            let catalog = resolved_handle(&mut pdf, ObjectRef::new(1, 0));
+            let acroform = resolved_key(&catalog, b"/AcroForm");
+            assert_eq!(
+                acroform.as_integer(),
+                original_acroform_integer,
+                "{case} must remain unchanged for value={value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn set_need_appearances_replaces_true_and_removes_false_for_dictionary() {
+    let mut pdf = open(doc_with_acroform(vec![(
+        20,
+        "<< /NeedAppearances false >>".into(),
+    )]));
+
+    AcroFormDocumentHelper::new(&mut pdf)
+        .expect("construct AcroForm helper")
+        .set_need_appearances(true)
+        .expect("set true on a dictionary");
+    let acroform = resolved_handle(&mut pdf, ObjectRef::new(20, 0));
+    assert_eq!(
+        key_boolean(&mut pdf, &acroform, b"/NeedAppearances"),
+        Some(true)
+    );
+
+    AcroFormDocumentHelper::new(&mut pdf)
+        .expect("construct AcroForm helper")
+        .set_need_appearances(false)
+        .expect("remove the key on a dictionary");
+    assert!(!has_entry(&acroform, b"/NeedAppearances"));
+    assert!(pdf.repair_diagnostics().entries().is_empty());
+}
+
+#[test]
+fn set_need_appearances_propagates_catalog_warning_sink_failure() {
+    let mut pdf = open(doc(vec![]));
+    let logger = QPDFLogger::create();
+    logger.set_warn(Some(PipelineHandle::new(FailingWarningSink)));
+    pdf.set_logger(logger);
+
+    let result = AcroFormDocumentHelper::new(&mut pdf)
+        .expect("construct AcroForm helper")
+        .set_need_appearances(true);
+    assert!(matches!(
+        result,
+        Err(Error::System(message)) if message == "sink write failure 1"
+    ));
+}
+
+#[test]
+fn set_value_updates_v_before_warning_without_acroform() {
+    const WARNING: &[u8] = b"ignoring call to QPDFAcroFormDocumentHelper::setNeedAppearances on a file that lacks an /AcroForm dictionary";
+    let mut pdf = open(doc(vec![(10, "<< /FT /Tx /V (old) >>".into())]));
+
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value_string("updated")
+        .expect("set the value and warn about missing AcroForm");
+
+    let field = resolved_handle(&mut pdf, ObjectRef::new(10, 0));
+    assert_eq!(
+        key_string(&mut pdf, &field, b"/V"),
+        Some(flpdf::pdf_string::new_unicode_string(b"updated"))
+    );
+    let diagnostics = pdf.repair_diagnostics();
+    assert_eq!(diagnostics.entries().len(), 1);
+    assert!(diagnostics.entries()[0]
+        .get_object()
+        .windows(b"object 1 0".len())
+        .any(|window| window == b"object 1 0"));
+    assert_eq!(diagnostics.entries()[0].get_message_detail(), WARNING);
 }
 
 #[test]

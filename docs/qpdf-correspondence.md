@@ -2006,6 +2006,13 @@ dispatch; `/Btn` handling returns before the `/NeedAppearances` update, while
 non-button values update `/V` and set the AcroForm flag when requested
 (`libqpdf/QPDFFormFieldObjectHelper.cc:300-345`).
 
+`AcroFormDocumentHelper::set_need_appearances` preserves that mutation order
+and matches `QPDFAcroFormDocumentHelper::setNeedAppearances`: when Catalog
+`/AcroForm` is absent or not a dictionary, it warns on the Catalog with qpdf's
+exact message and returns without mutation. The warning occurs for both
+`true` and `false`, before the qpdf branch that replaces or removes
+`/NeedAppearances` (`libqpdf/QPDFAcroFormDocumentHelper.cc:376-391`).
+
 ### `QPDFPageObjectHelper::getAnnotations` public surface (`flpdf-6ik2q.51`)
 
 `QPDFPageObjectHelper.hh:211` exposes one annotation enumerator,

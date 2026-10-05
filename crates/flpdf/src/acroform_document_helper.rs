@@ -2004,18 +2004,26 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// Set or remove `/AcroForm /NeedAppearances`.
     ///
     /// `true` replaces the entry with a direct boolean. `false` removes the
-    /// entry unconditionally. A missing or non-dictionary `/AcroForm` is a
-    /// qpdf-style no-op, matching `setNeedAppearances`
-    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:376-391`).
+    /// entry unconditionally. A missing or non-dictionary `/AcroForm` emits
+    /// qpdf's warning from the Catalog and returns without mutation, matching
+    /// `setNeedAppearances` (`libqpdf/QPDFAcroFormDocumentHelper.cc:376-391`).
     ///
     /// # Errors
     ///
-    /// Propagates errors while resolving the catalog and AcroForm handles, or
-    /// after mutating a live handle.
+    /// Propagates errors while resolving `/AcroForm`, reporting the Catalog
+    /// warning, or mutating a live handle. If the Catalog cannot be resolved,
+    /// this retains the existing no-document no-op behavior.
     pub fn set_need_appearances(&mut self, value: bool) -> Result<()> {
-        let Some(acroform) = self.canonical_acroform()? else {
+        let Ok(catalog) = self.pdf.root_handle() else {
             return Ok(());
         };
+        let acroform = catalog.try_get_key(b"/AcroForm")?;
+        if !acroform.try_is_dictionary()? {
+            catalog.warn_if_possible(
+                "ignoring call to QPDFAcroFormDocumentHelper::setNeedAppearances on a file that lacks an /AcroForm dictionary",
+            )?;
+            return Ok(());
+        }
         if value {
             acroform.replace_key(b"/NeedAppearances", ObjectHandle::boolean(true))?;
             Ok(())
