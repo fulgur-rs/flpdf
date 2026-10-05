@@ -258,9 +258,10 @@ impl AnnotationObjectHelper {
     ///
     /// `which` selects the entry within `/AP` — typically `b"/N"` (normal),
     /// `b"/R"` (rollover), or `b"/D"` (down), matching qpdf's PDF-name string.
-    /// An empty `state` resolves `/AS` before checking `/AP` or its selected
-    /// entry, matching qpdf's eager `desired_state` calculation; diagnostics
-    /// from `/AS` therefore precede a direct appearance-stream return.
+    /// An empty `state` resolves `/AS` after fetching `/AP` but before checking
+    /// its type or selected entry, matching qpdf's eager `desired_state`
+    /// calculation; diagnostics from `/AS` therefore precede `/AP` value
+    /// resolution and a direct appearance-stream return.
     /// If `/AP/<which>` is itself a stream, it is returned directly. If it is
     /// a subdictionary (a state dictionary), `state` selects a key within it
     /// when non-empty, falling back to [`Self::get_appearance_state`]'s `/AS`
@@ -283,7 +284,11 @@ impl AnnotationObjectHelper {
         which: &[u8],
         state: &[u8],
     ) -> Result<ObjectHandle> {
-        let ap = self.get_appearance_dictionary()?;
+        // Keep the /AP child handle unresolved until after desired_state,
+        // matching getAppearanceDictionary() followed by getAppearanceState()
+        // in qpdf. In particular, malformed indirect /AS must warn before a
+        // malformed indirect /AP when both are present.
+        let ap = self.annot.try_get_key(b"/AP")?;
         let desired_state = if state.is_empty() {
             self.get_appearance_state()?
         } else {
