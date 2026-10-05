@@ -897,7 +897,7 @@ fn trailer_dictionary_end(bytes: &[u8], trailer_keyword_end: usize) -> Option<us
     let mut dictionary_depth = 0usize;
     let mut array_depth = 0usize;
     loop {
-        let token = tokenizer.read_token(false, 0).ok()?;
+        let token = tokenizer.read_token().ok()?;
         match token.token_type {
             TokenType::DictOpen => dictionary_depth = dictionary_depth.saturating_add(1),
             TokenType::DictClose if dictionary_depth == 1 && array_depth == 0 => {

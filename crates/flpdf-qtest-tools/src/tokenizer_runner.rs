@@ -453,7 +453,7 @@ fn dump_tokens(
         } else {
             max_len
         };
-        let token = match tokenizer.read_token(true, effective_max_len) {
+        let token = match tokenizer.read_token_with_options(true, effective_max_len) {
             Ok(t) => t,
             Err(e) => {
                 let _ = writeln!(stdout, "tokenizer error: {e}");
@@ -530,7 +530,7 @@ fn find_endstream(input: &[u8], start: usize) -> Option<usize> {
         let found = search[pos..].windows(9).position(|w| w == b"endstream")?;
         let abs = start + pos + found;
         let mut probe = Tokenizer::new(&input[abs..]);
-        if let Ok(token) = probe.read_token(true, 0) {
+        if let Ok(token) = probe.read_token_with_options(true, 0) {
             if token.token_type == TokenType::Word && token.value == b"endstream" {
                 return Some(abs);
             }

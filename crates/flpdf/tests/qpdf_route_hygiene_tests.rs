@@ -286,19 +286,19 @@ fn no_underscore_bound_pdf_carriers_remain_outside_marked_exceptions() {
 
 /// `QPDF::readToken(input, max_len = 0)` (`libqpdf/QPDF.cc:1535-1539`) is one
 /// function; every flpdf realization that used to construct its own
-/// `Tokenizer` and call `.read_token(true, ...)` -- `ByteCursor::read_token`,
+/// `Tokenizer` and call `.read_token_with_options(true, ...)` -- `ByteCursor::read_token`,
 /// the trailer's `stream`-keyword lookahead, `next_object_stream_header_pair`'s
 /// ObjStm header pair, the xref-reconstruction line scan, and the
 /// canonical resolve path's `endstream`/`endobj` framing checks -- now routes
-/// through `Tokenizer::read_qpdf_token`. The only direct `.read_token(true,`
-/// calls left in the crate are that method's own definition and
-/// `inline_lookahead_is_plausible`'s inline-image `EI` lookahead, which is a
-/// different qpdf owner (`QPDFTokenizer`'s own lookahead, not `QPDF`'s).
+/// through `Tokenizer::read_qpdf_token`. The only direct
+/// `.read_token_with_options(true,` calls left are the `read_qpdf_token`
+/// wrapper and `inline_lookahead_is_plausible`'s inline-image `EI` lookahead,
+/// owned by `QPDFTokenizer` directly rather than by `QPDF`.
 #[test]
 fn qpdf_read_token_calls_route_through_one_allow_bad_entrypoint() {
     let tokenizer = read_source("tokenizer.rs");
     assert_eq!(
-        tokenizer.matches("read_token(true, ").count(),
+        tokenizer.matches("read_token_with_options(true, ").count(),
         2,
         "tokenizer.rs should have exactly `read_qpdf_token`'s own call and \
          `inline_lookahead_is_plausible`'s out-of-scope EI lookahead"
@@ -307,10 +307,11 @@ fn qpdf_read_token_calls_route_through_one_allow_bad_entrypoint() {
     for path in ["xref.rs", "reader/resolver.rs"] {
         let source = read_source(path);
         assert_eq!(
-            source.matches("read_token(true, ").count(),
+            source.matches("read_token_with_options(true, ").count(),
             0,
             "{path} should route every allow_bad read through \
-             Tokenizer::read_qpdf_token instead of calling read_token(true, ...) directly"
+             Tokenizer::read_qpdf_token instead of calling \
+             read_token_with_options(true, ...) directly"
         );
     }
 }

@@ -151,7 +151,7 @@ fn parse_content_stream_handles_internal<C: ObjectHandleParserCallbacks>(
     let mut stopped_on_container_eof = false;
 
     while tokenizer.position() < input.len() {
-        let probe = tokenizer.read_token(true, 0)?;
+        let probe = tokenizer.read_token_with_options(true, 0)?;
         let offset = probe.start;
         tokenizer.set_position(offset)?;
         live_input.seek_to(offset)?;
@@ -214,7 +214,7 @@ fn parse_content_stream_handles_internal<C: ObjectHandleParserCallbacks>(
                 Error::parse(inline_offset, message)
             })?;
             // cov:ignore-end
-            let image = tokenizer.read_token(true, 0)?;
+            let image = tokenizer.read_token_with_options(true, 0)?;
             if image.token_type == TokenType::Bad {
                 // QPDFObjectHandle::parseContentStream_data warns and lets the
                 // surrounding parseContentStream_internal deliver handleEOF;

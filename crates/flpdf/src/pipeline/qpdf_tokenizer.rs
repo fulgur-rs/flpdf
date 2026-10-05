@@ -105,7 +105,7 @@ impl Pipeline for QpdfTokenizer<'_> {
 
         loop {
             let token = tokenizer
-                .read_token(true, 0)
+                .read_token_with_options(true, 0)
                 .map_err(|error| PipelineError::runtime(format!("{}: {error}", self.identifier)))?;
             let is_eof = token.token_type == TokenType::Eof;
             let is_id = token.is_word_value(b"ID");
