@@ -913,7 +913,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// only to propagate live-handle errors. The array handle is mutated in
     /// place. This preserves an indirect `/Fields` holder and keeps a direct
     /// array nested in an indirect `/AcroForm` object live.
-    pub(crate) fn remove_form_fields(&mut self, to_remove: &BTreeSet<QpdfObjGen>) -> Result<()> {
+    pub fn remove_form_fields(&mut self, to_remove: &BTreeSet<QpdfObjGen>) -> Result<()> {
         let Some(acroform) = self.canonical_acroform()? else {
             return Ok(());
         };
