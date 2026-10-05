@@ -247,7 +247,7 @@ fn widget_normal_appearance_data(path: &Path) -> Vec<u8> {
     let widget_ref = first_widget_ref(&mut pdf);
     let mut helper = AnnotationObjectHelper::new(pdf.get_object_handle(widget_ref));
     helper
-        .get_appearance_stream(b"N", None)
+        .get_appearance_stream(b"/N")
         .unwrap()
         .get_stream_data(DecodeLevel::Generalized)
         .unwrap()
@@ -421,7 +421,7 @@ fn top_level_generate_appearances_routes_to_canonical_writer() {
     drop(form);
     let mut helper = AnnotationObjectHelper::new(pdf.get_object_handle(widget_ref));
     let appearance = helper
-        .get_appearance_stream(b"N", None)
+        .get_appearance_stream(b"/N")
         .unwrap()
         .get_stream_data(DecodeLevel::Generalized)
         .expect("top-level generation must install /AP/N");
@@ -478,7 +478,7 @@ fn top_level_generate_appearances_compress_streams_n_without_qdf_stays_stale_lik
         let widget_ref = first_widget_ref(&mut pdf);
         let mut helper = AnnotationObjectHelper::new(pdf.get_object_handle(widget_ref));
         helper
-            .get_appearance_stream(b"N", None)
+            .get_appearance_stream(b"/N")
             .unwrap()
             .get_stream_data(DecodeLevel::Generalized)
             .expect("/AP/N must be present after --generate-appearances")
@@ -728,7 +728,7 @@ fn generate_appearances_tx_ap_n_contains_tj() {
     // /AP/N must be present after generate-appearances, and resolve to the
     // Form XObject stream.
     let mut helper = AnnotationObjectHelper::new(pdf.get_object_handle(widget_ref));
-    let n = helper.get_appearance_stream(b"N", None).unwrap();
+    let n = helper.get_appearance_stream(b"/N").unwrap();
     let data = n
         .get_stream_data(DecodeLevel::Generalized)
         .expect("Tx widget should have /AP/N after --generate-appearances");
@@ -767,7 +767,7 @@ fn generate_appearances_tx_reuses_existing_ap() {
     let widget_ref = first_widget_ref(&mut pdf);
     let mut helper = AnnotationObjectHelper::new(pdf.get_object_handle(widget_ref));
     let n_handle = helper
-        .get_appearance_stream(b"N", None)
+        .get_appearance_stream(b"/N")
         .expect("/AP must survive --generate-appearances for widget that already has one");
 
     assert!(
@@ -1002,7 +1002,7 @@ fn generate_appearances_combo_ap_n_contains_tj() {
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget_ref = first_widget_ref(&mut pdf);
     let mut helper = AnnotationObjectHelper::new(pdf.get_object_handle(widget_ref));
-    let n = helper.get_appearance_stream(b"N", None).unwrap();
+    let n = helper.get_appearance_stream(b"/N").unwrap();
     let data = n
         .get_stream_data(DecodeLevel::Generalized)
         .expect("combo widget should have /AP/N after --generate-appearances");

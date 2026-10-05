@@ -158,7 +158,7 @@ fn flatten_annotations_on_page_handle<R: Read + Seek>(
         };
         let appearance = {
             let mut helper = AnnotationObjectHelper::new(annotation.clone());
-            helper.get_appearance_stream(b"N", None)?
+            helper.get_appearance_stream(b"/N")?
         };
 
         // qpdf resolves /AP/N before reading /Subtype, including when
@@ -334,7 +334,7 @@ fn flatten_annotations_on_page_handle<R: Read + Seek>(
         // conversion never substitutes a replacement character.
         let resource_name = String::from_utf8_lossy(&xobj_name);
         let content_result = AnnotationObjectHelper::new(data.annotation.clone())
-            .get_page_content_for_appearance(
+            .get_page_content_for_appearance_with_flags(
                 &resource_name,
                 page_rotate,
                 required_flags,
@@ -789,7 +789,7 @@ fn merge_widget_default_resources_on_page_with_associations<R: Read + Seek>(
         if annotation_object_helper.get_subtype()? != b"Widget" {
             continue;
         }
-        let appearance = annotation_object_helper.get_appearance_stream(b"N", None)?;
+        let appearance = annotation_object_helper.get_appearance_stream(b"/N")?;
         if appearance.try_is_null()? {
             continue;
         }
@@ -2524,7 +2524,7 @@ mod tests {
             open_annotation_object_helper_fixture("<< /Type /Annot /Rect [0 0 100 20] >>", None);
         assert!(
             AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)))
-                .get_page_content_for_appearance("/Fxo1", 0, 0, 0)
+                .get_page_content_for_appearance_with_flags("/Fxo1", 0, 0, 0)
                 .unwrap()
                 .is_empty()
         );
@@ -2532,7 +2532,7 @@ mod tests {
         let mut pdf = open_annotation_object_helper_fixture(annotation, Some(stream_dictionary));
         assert!(
             AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)))
-                .get_page_content_for_appearance("/Fxo1", 0, 0, 4)
+                .get_page_content_for_appearance_with_flags("/Fxo1", 0, 0, 4)
                 .unwrap()
                 .is_empty()
         );
@@ -2543,7 +2543,7 @@ mod tests {
         );
         assert!(
             AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)))
-                .get_page_content_for_appearance("/Fxo1", 0, 0, 0)
+                .get_page_content_for_appearance_with_flags("/Fxo1", 0, 0, 0)
                 .unwrap()
                 .is_empty()
         );
@@ -2554,7 +2554,7 @@ mod tests {
         );
         assert!(
             AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)))
-                .get_page_content_for_appearance("/Fxo1", 0, 0, 0)
+                .get_page_content_for_appearance_with_flags("/Fxo1", 0, 0, 0)
                 .unwrap()
                 .is_empty()
         );
@@ -2567,7 +2567,7 @@ mod tests {
         );
         assert!(
             !AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)))
-                .get_page_content_for_appearance("/Fxo1", 0, 0, 0)
+                .get_page_content_for_appearance_with_flags("/Fxo1", 0, 0, 0)
                 .unwrap()
                 .is_empty()
         );
@@ -2580,7 +2580,7 @@ mod tests {
         );
         assert!(
             !AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)))
-                .get_page_content_for_appearance("/Fxo1", 0, 0, 0)
+                .get_page_content_for_appearance_with_flags("/Fxo1", 0, 0, 0)
                 .unwrap()
                 .is_empty()
         );
@@ -2591,7 +2591,7 @@ mod tests {
                 open_annotation_object_helper_fixture(annotation, Some(stream_dictionary));
             assert!(
                 !AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)))
-                    .get_page_content_for_appearance("/Fxo1", rotate, 0, 0)
+                    .get_page_content_for_appearance_with_flags("/Fxo1", rotate, 0, 0)
                     .unwrap()
                     .is_empty(),
                 "qpdf NoRotate path must produce content for rotation {rotate}"

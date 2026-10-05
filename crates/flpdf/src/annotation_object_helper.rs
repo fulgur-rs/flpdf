@@ -244,18 +244,26 @@ impl AnnotationObjectHelper {
     // get_appearance_stream — /AP/<which>[/<state>]
     // -----------------------------------------------------------------------
 
-    /// Select an appearance stream from `/AP`.
+    /// Select an appearance stream from `/AP` using qpdf's default state.
     ///
-    /// `which` selects the entry within `/AP` — typically `b"N"` (normal),
-    /// `b"R"` (rollover), or `b"D"` (down), as a decoded PDF name (no
-    /// leading `/`, matching [`Self::get_subtype`]/
-    /// [`Self::get_appearance_state`]'s own convention — [`ObjectHandle::
-    /// get_key`] requires the `/`, so both `which` and `state` get it
-    /// prepended internally). If `/AP/<which>` is itself a stream, it is
-    /// returned directly. If it is a subdictionary (a state dictionary),
-    /// `state` selects a key within it when non-empty, falling back to
-    /// [`Self::get_appearance_state`]'s `/AS` value when `state` is `None`
-    /// or empty. Returns a null [`ObjectHandle`] when no stream can be
+    /// An empty state selects the annotation's `/AS` value when `/AP/<which>`
+    /// is a state dictionary, matching
+    /// `QPDFAnnotationObjectHelper::getAppearanceStream(which, state = "")`
+    /// (`include/qpdf/QPDFAnnotationObjectHelper.hh:70`).
+    pub fn get_appearance_stream(&mut self, which: &[u8]) -> Result<ObjectHandle> {
+        self.get_appearance_stream_with_state(which, b"")
+    }
+
+    /// Select an appearance stream from `/AP` with an explicit state.
+    ///
+    /// `which` selects the entry within `/AP` — typically `b"/N"` (normal),
+    /// `b"/R"` (rollover), or `b"/D"` (down), matching qpdf's PDF-name string.
+    /// If `/AP/<which>` is itself a stream, it is returned directly. If it is
+    /// a subdictionary (a state dictionary), `state` selects a key within it
+    /// when non-empty, falling back to [`Self::get_appearance_state`]'s `/AS`
+    /// value when `state` is empty. Explicit `state` values use the same
+    /// leading-`/` PDF-name spelling as qpdf. Returns a null [`ObjectHandle`]
+    /// when no stream can be
     /// selected.
     ///
     /// Mirrors `QPDFAnnotationObjectHelper::getAppearanceStream`
@@ -267,14 +275,14 @@ impl AnnotationObjectHelper {
     ///
     /// Propagates any error from resolving the annotation object, `/AP`,
     /// `/AS`, or the selected appearance entries.
-    pub fn get_appearance_stream(
+    pub fn get_appearance_stream_with_state(
         &mut self,
         which: &[u8],
-        state: Option<&[u8]>,
+        state: &[u8],
     ) -> Result<ObjectHandle> {
         let ap = self.get_appearance_dictionary()?;
         if ap.try_is_dictionary()? {
-            let ap_sub = ap.try_get_key(&dict_key(which))?;
+            let ap_sub = ap.try_get_key(which)?;
             ap_sub.try_dereference()?;
             if ap_sub.as_stream_dict().is_some() {
                 // A direct appearance stream disregards state entirely
@@ -287,12 +295,18 @@ impl AnnotationObjectHelper {
                 return Ok(ap_sub);
             }
             if ap_sub.try_is_dictionary()? {
-                let desired_state: Vec<u8> = match state {
-                    Some(s) if !s.is_empty() => s.to_vec(),
-                    _ => self.get_appearance_state()?,
+                let state_key: Vec<u8> = if state.is_empty() {
+                    let desired_state = self.get_appearance_state()?;
+                    if desired_state.is_empty() {
+                        Vec::new()
+                    } else {
+                        dict_key(&desired_state)
+                    }
+                } else {
+                    state.to_vec()
                 };
-                if !desired_state.is_empty() {
-                    let ap_sub_val = ap_sub.try_get_key(&dict_key(&desired_state))?;
+                if !state_key.is_empty() {
+                    let ap_sub_val = ap_sub.try_get_key(&state_key)?;
                     ap_sub_val.try_dereference()?;
                     if ap_sub_val.as_stream_dict().is_some() {
                         return Ok(ap_sub_val);
@@ -307,7 +321,17 @@ impl AnnotationObjectHelper {
     // get_page_content_for_appearance — qpdf appearance placement
     // -----------------------------------------------------------------------
 
-    /// Generate page content that draws the normal appearance as a Form XObject.
+    /// Generate page content using qpdf's default annotation-flag masks.
+    ///
+    /// The defaults require no flag bits and forbid `an_invisible | an_hidden`
+    /// (`0` and `3`; `include/qpdf/QPDFAnnotationObjectHelper.hh:82-86`,
+    /// `include/qpdf/Constants.h:220-221`).
+    pub fn get_page_content_for_appearance(&mut self, name: &str, rotate: i32) -> Result<Vec<u8>> {
+        self.get_page_content_for_appearance_with_flags(name, rotate, 0, 0x3)
+    }
+
+    /// Generate page content that draws the normal appearance as a Form XObject
+    /// with explicit required and forbidden annotation-flag masks.
     ///
     /// This is the Rust counterpart of
     /// `QPDFAnnotationObjectHelper::getPageContentForAppearance`
@@ -317,14 +341,14 @@ impl AnnotationObjectHelper {
     /// normal appearance, its flags do not satisfy the requested contract, its
     /// rectangle or appearance bounding box is invalid, or its transformed
     /// appearance has zero width or height.
-    pub fn get_page_content_for_appearance(
+    pub fn get_page_content_for_appearance_with_flags(
         &mut self,
         name: &str,
         rotate: i32,
         required_flags: i64,
         forbidden_flags: i64,
     ) -> Result<Vec<u8>> {
-        let appearance = self.get_appearance_stream(b"N", None)?;
+        let appearance = self.get_appearance_stream(b"/N")?;
         self.build_page_content_for_appearance(
             name,
             appearance,
@@ -535,7 +559,7 @@ mod tests {
         let mut helper = AnnotationObjectHelper::new(annot);
 
         let error = helper
-            .get_appearance_stream(b"N", None)
+            .get_appearance_stream(b"/N")
             .expect_err("unresolved appearance stream child must be reported");
         assert!(matches!(
             error,

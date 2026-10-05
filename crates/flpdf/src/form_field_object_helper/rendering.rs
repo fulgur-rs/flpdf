@@ -111,7 +111,7 @@ fn resolve_appearance_bbox_canonical(widget: &ObjectHandle) -> Result<Option<Rec
 /// dictionary. The annotation helper owns this qpdf responsibility.
 fn resolve_normal_appearance_canonical(widget: &ObjectHandle) -> Result<ObjectHandle> {
     let mut annotation = AnnotationObjectHelper::new(widget.clone());
-    annotation.get_appearance_stream(b"N", None)
+    annotation.get_appearance_stream(b"/N")
 }
 
 #[derive(Clone, Copy)]
