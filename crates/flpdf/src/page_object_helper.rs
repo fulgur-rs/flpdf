@@ -2151,10 +2151,8 @@ mod tests {
             .copy_annotations(source_page.clone())?;
 
         PageObjectHelper::from_object_handle(translated_target.clone(), &mut pdf)
-            .copy_annotations_with_matrix(
-                source_page,
-                Matrix::new(1.0, 0.0, 0.0, 1.0, 10.0, 20.0),
-            )?;
+            .copy_annotations_with_matrix(source_page, Matrix::new(1.0, 0.0, 0.0, 1.0, 10.0, 20.0))
+            .expect("explicit custom-matrix copy should succeed");
 
         let identity_annotation = identity_target
             .try_get_key(b"/Annots")?
