@@ -70,7 +70,7 @@ where
     for (key, filespec) in entries {
         let ef_entries = {
             let mut file_spec = FileSpec::new(filespec, pdf)?;
-            let stream = file_spec.get_embedded_file_stream("")?;
+            let stream = file_spec.get_embedded_file_stream()?;
             out.extend_from_slice(&key)?;
             out.extend_from_slice(b" -> ")?;
             out.extend_from_slice(object_generation(&stream).as_bytes())?;

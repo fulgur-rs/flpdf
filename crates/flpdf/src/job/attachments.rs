@@ -606,7 +606,7 @@ where
     let fallback = ascii_filename_fallback(basename);
     {
         let mut filespec = FileSpec::new(pdf.get_object_handle(filespec_ref), pdf)?;
-        filespec.set_filename(basename.as_bytes(), Some(fallback.as_slice()))?;
+        filespec.set_filename_with_compatibility_name(basename.as_bytes(), fallback.as_slice())?;
     }
     crate::embedded_files::insert_embedded_file(pdf, key, filespec_ref)?;
 

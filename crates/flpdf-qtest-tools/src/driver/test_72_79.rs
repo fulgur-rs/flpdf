@@ -487,7 +487,7 @@ pub(crate) fn run_test_76<R: Read + Seek>(
     }
     let efs1_stream = {
         let mut fs1 = FileSpec::new(fs1_handle.clone(), pdf)?;
-        fs1.get_embedded_file_stream("")?
+        fs1.get_embedded_file_stream()?
     };
     {
         let mut efs1 = EmbeddedFileStream::new(efs1_stream.clone(), pdf)?;
@@ -536,7 +536,7 @@ pub(crate) fn run_test_76<R: Read + Seek>(
         let mut fs3 = FileSpec::new(fs3_handle, pdf)?;
         // "\xcf\x80.txt" is pi (U+03C0) + ".txt" in UTF-8, matching qpdf's
         // C++ string literal byte-for-byte.
-        fs3.set_filename(b"\xcf\x80.txt", Some(b"att3.txt"))?;
+        fs3.set_filename_with_compatibility_name(b"\xcf\x80.txt", b"att3.txt")?;
     }
 
     {

@@ -327,7 +327,7 @@ fn embedded_file_stream_ref<R: Read + Seek + 'static>(
     let candidate = {
         let filespec = pdf.get_object_handle(filespec_ref);
         let mut filespec = crate::filespec_helper::FileSpec::new(filespec, pdf)?;
-        filespec.get_embedded_file_stream("")?
+        filespec.get_embedded_file_stream()?
     };
     Ok(candidate.object_ref())
 }

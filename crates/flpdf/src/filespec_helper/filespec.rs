@@ -139,28 +139,39 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         Ok(self)
     }
 
-    /// Set `/UF` and `/F` with qpdf's compatibility-filename behavior.
+    /// Set `/UF` and `/F` using qpdf's empty compatibility-name default.
     ///
-    /// `unicode_name` and a non-empty `compatibility_name` are byte sequences,
-    /// matching qpdf's `std::string` parameters. The Unicode value is stored
-    /// with `newUnicodeString`; the compatibility value is stored verbatim.
-    pub fn set_filename(
+    /// The Unicode value is stored with `newUnicodeString` and, when no
+    /// compatibility name is supplied, is also stored as `/F`, matching
+    /// `QPDFFileSpecObjectHelper::setFilename(unicode_name,
+    /// compat_name = "")` (`include/qpdf/QPDFFileSpecObjectHelper.hh:87`).
+    pub fn set_filename(&mut self, unicode_name: impl AsRef<[u8]>) -> Result<&mut Self> {
+        self.set_filename_with_compatibility_name(unicode_name, b"")
+    }
+
+    /// Set `/UF` and `/F` with an explicit compatibility filename.
+    ///
+    /// Both parameters are byte sequences matching qpdf's `std::string`
+    /// parameters. The Unicode value is stored with `newUnicodeString`; a
+    /// non-empty compatibility value is stored verbatim, while an empty one
+    /// uses the Unicode value for `/F` just like qpdf.
+    pub fn set_filename_with_compatibility_name(
         &mut self,
         unicode_name: impl AsRef<[u8]>,
-        compatibility_name: Option<&[u8]>,
+        compatibility_name: impl AsRef<[u8]>,
     ) -> Result<&mut Self> {
         let Some(dict) = self.filespec_dict()? else {
             return Ok(self);
         };
         let unicode_name = new_unicode_string(unicode_name.as_ref());
         dict.replace_key(b"/UF", ObjectHandle::string(unicode_name.clone()))?;
-        let compatibility_name = compatibility_name
-            .map(ToOwned::to_owned)
-            .filter(|name| !name.is_empty());
-        dict.replace_key(
-            b"/F",
-            ObjectHandle::string(compatibility_name.unwrap_or(unicode_name)),
-        )?; // cov:ignore: FileSpec::new validates the receiver's document ownership
+        let compatibility_name = compatibility_name.as_ref();
+        let compatibility_name = if compatibility_name.is_empty() {
+            unicode_name
+        } else {
+            compatibility_name.to_vec()
+        };
+        dict.replace_key(b"/F", ObjectHandle::string(compatibility_name))?; // cov:ignore: FileSpec::new validates the receiver's document ownership
         Ok(self)
     }
 
@@ -251,13 +262,23 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         Ok(filenames)
     }
 
-    /// Return the raw `/EF` entry for `key`, or qpdf's null-object equivalent
-    /// when `/EF` or the requested key is absent.
+    /// Return qpdf's preferred embedded-file stream from `/EF`.
     ///
-    /// An empty `key` performs qpdf's preferred stream lookup: it skips
-    /// non-stream candidates and returns the first candidate that resolves to
-    /// a stream, preserving the original reference when it was indirect.
-    pub fn get_embedded_file_stream(&mut self, key: &str) -> Result<ObjectHandle> {
+    /// Candidates use qpdf's `/UF`, `/F`, `/Unix`, `/DOS`, `/Mac` order;
+    /// non-stream values are skipped. The selected handle preserves its
+    /// original reference when it was indirect. Returns null when `/EF` or a
+    /// stream candidate is absent. This matches the empty `key` default of
+    /// `QPDFFileSpecObjectHelper::getEmbeddedFileStream`
+    /// (`include/qpdf/QPDFFileSpecObjectHelper.hh:57`).
+    pub fn get_embedded_file_stream(&mut self) -> Result<ObjectHandle> {
+        self.get_embedded_file_stream_with_key("")
+    }
+
+    /// Return the raw `/EF` entry for an explicit filename key.
+    ///
+    /// Returns qpdf's null-object equivalent when `/EF` or the requested key
+    /// is absent.
+    pub fn get_embedded_file_stream_with_key(&mut self, key: &str) -> Result<ObjectHandle> {
         let ef = self.get_embedded_file_streams()?;
         ef.try_dereference()?;
         let Some(entries) = ef.try_as_dictionary()? else {
@@ -346,7 +367,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn embedded_file(&mut self) -> Result<Option<EmbeddedFileStream<'_, R>>> {
-        let candidate = self.get_embedded_file_stream("")?;
+        let candidate = self.get_embedded_file_stream()?;
         let terminal_ref = candidate.object_ref();
         candidate.try_dereference()?;
         if candidate.as_stream_dict().is_none() {
@@ -511,7 +532,8 @@ impl FileSpecBuilder {
             .expect("create_file_spec must create an indirect Filespec");
         {
             let mut filespec = FileSpec::new(pdf.get_object_handle(filespec_ref), pdf)?;
-            filespec.set_filename(&uf_filename, Some(self.filename.as_slice()))?;
+            filespec
+                .set_filename_with_compatibility_name(&uf_filename, self.filename.as_slice())?;
             if let Some(description) = self.description {
                 filespec.set_description(description)?;
             }
