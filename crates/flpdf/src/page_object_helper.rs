@@ -987,6 +987,18 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         Ok(())
     }
 
+    /// Copy annotations from another page in the same document using qpdf's
+    /// default identity transformation matrix.
+    ///
+    /// qpdf 11.9.0 declares `copyAnnotations` with `cm = QPDFMatrix()`
+    /// (`include/qpdf/QPDFPageObjectHelper.hh:393-397`), whose default
+    /// constructor is the identity matrix (`libqpdf/QPDFMatrix.cc:6-14`).
+    /// Use [`copy_annotations_with_matrix`](Self::copy_annotations_with_matrix)
+    /// to provide a custom transform.
+    pub fn copy_annotations(&mut self, from_page: ObjectHandle) -> Result<()> {
+        self.copy_annotations_with_matrix(from_page, Matrix::default())
+    }
+
     /// Copy annotations from another page in the same document, applying
     /// `cm` to every copied rectangle and appearance matrix.
     ///
@@ -994,7 +1006,11 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// `QPDFPageObjectHelper::copyAnnotations`
     /// (`libqpdf/QPDFPageObjectHelper.cc:992-1039`). The canonical AcroForm
     /// helper owns field-tree copying and qualified-name renaming.
-    pub fn copy_annotations(&mut self, from_page: ObjectHandle, cm: Matrix) -> Result<()> {
+    pub fn copy_annotations_with_matrix(
+        &mut self,
+        from_page: ObjectHandle,
+        cm: Matrix,
+    ) -> Result<()> {
         self.copy_annotations_with_reserved_names(from_page, cm, &BTreeSet::new())
     }
 
@@ -2099,6 +2115,67 @@ mod tests {
             (b"/Resources".to_vec(), ObjectHandle::dictionary(Vec::new())),
             (b"/Annots".to_vec(), ObjectHandle::array(Vec::new())),
         ])
+    }
+
+    #[test]
+    fn copy_annotations_defaults_to_identity_and_preserves_explicit_matrix() -> Result<()> {
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>".to_owned()),
+                (
+                    3,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Annots [6 0 R] >>".to_owned(),
+                ),
+                (
+                    4,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Annots [] >>".to_owned(),
+                ),
+                (
+                    5,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Annots [] >>".to_owned(),
+                ),
+                (
+                    6,
+                    "<< /Type /Annot /Subtype /Link /Rect [1.25 2.5 11.75 22.125] >>".to_owned(),
+                ),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("annotation fixture should parse");
+        let source_page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        let identity_target = pdf.get_object_handle(ObjectRef::new(4, 0));
+        let translated_target = pdf.get_object_handle(ObjectRef::new(5, 0));
+
+        PageObjectHelper::from_object_handle(identity_target.clone(), &mut pdf)
+            .copy_annotations(source_page.clone())?;
+
+        PageObjectHelper::from_object_handle(translated_target.clone(), &mut pdf)
+            .copy_annotations_with_matrix(source_page, Matrix::new(1.0, 0.0, 0.0, 1.0, 10.0, 20.0))
+            .expect("explicit custom-matrix copy should succeed");
+
+        let identity_annotation = identity_target
+            .try_get_key(b"/Annots")?
+            .try_get_array_item(0)?;
+        let identity_rect = identity_annotation
+            .try_get_key(b"/Rect")?
+            .try_get_array_as_rectangle()?;
+        assert_eq!(
+            identity_rect,
+            crate::Rectangle::new(1.25, 2.5, 11.75, 22.125)
+        );
+
+        let translated_annotation = translated_target
+            .try_get_key(b"/Annots")?
+            .try_get_array_item(0)?;
+        let translated_rect = translated_annotation
+            .try_get_key(b"/Rect")?
+            .try_get_array_as_rectangle()?;
+        assert_eq!(
+            translated_rect,
+            crate::Rectangle::new(11.25, 22.5, 21.75, 42.125)
+        );
+        Ok(())
     }
 
     #[test]
