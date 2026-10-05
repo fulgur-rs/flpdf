@@ -316,6 +316,55 @@ fn qpdf_read_token_calls_route_through_one_allow_bad_entrypoint() {
     }
 }
 
+#[test]
+fn acroform_fix_copied_annotations_keeps_qpdf_transform_and_mutation_order() {
+    let source = read_source("acroform_document_helper.rs");
+    for (function, transform) in [
+        (
+            "fn fix_copied_annotations_with_options(",
+            "self.transform_annotations(old_annots, Matrix::default())",
+        ),
+        (
+            "fn fix_copied_annotations_from_with_options<",
+            "self.transform_annotations_from(old_annots, Matrix::default(), source)",
+        ),
+    ] {
+        let body = source
+            .split_once(function)
+            .and_then(|(_, rest)| rest.split_once("\n    }").map(|(body, _)| body))
+            .unwrap_or_else(|| panic!("missing production route `{function}`"));
+        let early_return = body
+            .find("Self::nonempty_copied_annotations(&from_page)")
+            .expect("qpdf Annots early return must precede transformation");
+        let transform = body
+            .find(transform)
+            .unwrap_or_else(|| panic!("missing transform call for `{function}`"));
+        assert!(
+            early_return < transform,
+            "{function}: Annots guard must run first"
+        );
+    }
+
+    let finish = source
+        .split_once("    fn finish_fix_copied_annotations(")
+        .and_then(|(_, rest)| rest.split_once("\n    /// Copy `/Annots` for a foreign page"))
+        .map(|(body, _)| body)
+        .expect("one shared copied-annotation completion route");
+    let replace = finish
+        .find("to_page.replace_key(b\"/Annots\"")
+        .expect("replace destination Annots");
+    let add = finish
+        .find("self.add_and_rename_form_fields_with_reserved_names(")
+        .expect("register copied fields");
+    let report = finish
+        .find("if let Some(new_fields)")
+        .expect("write optional new-field identities");
+    assert!(
+        replace < add && add < report,
+        "qpdf replaces /Annots, adds fields, then inserts optional ObjGens"
+    );
+}
+
 /// qpdf has one owner-password entry point, `check_owner_password`
 /// (`QPDF_encryption.cc:582-590`), and it always yields the recovered user
 /// password through its `std::string& user_password` out-parameter

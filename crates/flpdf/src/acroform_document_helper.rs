@@ -1155,6 +1155,200 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         Ok(transformed)
     }
 
+    /// Fix copied annotations after a page has been copied within this PDF.
+    ///
+    /// This is qpdf's same-document
+    /// `QPDFAcroFormDocumentHelper::fixCopiedAnnotations` boundary
+    /// (`include/qpdf/QPDFAcroFormDocumentHelper.hh:196-210`,
+    /// `libqpdf/QPDFAcroFormDocumentHelper.cc:1017-1047`). It returns without
+    /// mutation when the source `/Annots` value is not an array or is empty.
+    /// Otherwise it transforms with the identity matrix, replaces the
+    /// destination `/Annots`, then adds and renames the copied fields.
+    ///
+    /// Use [`Self::fix_copied_annotations_with_new_fields`] to collect newly
+    /// added field identities.
+    pub fn fix_copied_annotations(
+        &mut self,
+        to_page: ObjectHandle,
+        from_page: ObjectHandle,
+    ) -> Result<()> {
+        self.fix_copied_annotations_with_options(to_page, from_page, &BTreeSet::new(), None)
+    }
+
+    /// Fix same-document copied annotations and insert newly added field
+    /// identities into `new_fields`, matching qpdf's optional
+    /// `std::set<QPDFObjGen>*` output parameter. Existing entries are kept.
+    #[allow(clippy::mutable_key_type)]
+    pub fn fix_copied_annotations_with_new_fields(
+        &mut self,
+        to_page: ObjectHandle,
+        from_page: ObjectHandle,
+        new_fields: &mut BTreeSet<QpdfObjGen>,
+    ) -> Result<()> {
+        self.fix_copied_annotations_with_options(
+            to_page,
+            from_page,
+            &BTreeSet::new(),
+            Some(new_fields),
+        )
+    }
+
+    /// Fix annotations copied from `source` after a foreign page has been
+    /// inserted into this document.
+    ///
+    /// `source` supplies qpdf's `from_afdh` ownership context; the
+    /// replacement and field-addition order matches
+    /// [`Self::fix_copied_annotations`].
+    pub fn fix_copied_annotations_from<RS: Read + Seek>(
+        &mut self,
+        to_page: ObjectHandle,
+        from_page: ObjectHandle,
+        source: &mut Pdf<RS>,
+    ) -> Result<()> {
+        self.fix_copied_annotations_from_with_options(
+            to_page,
+            from_page,
+            source,
+            &BTreeSet::new(),
+            None,
+        )
+    }
+
+    /// Foreign-source variant of
+    /// [`Self::fix_copied_annotations_with_new_fields`]. Existing entries in
+    /// `new_fields` are kept.
+    #[allow(clippy::mutable_key_type)]
+    pub fn fix_copied_annotations_from_with_new_fields<RS: Read + Seek>(
+        &mut self,
+        to_page: ObjectHandle,
+        from_page: ObjectHandle,
+        source: &mut Pdf<RS>,
+        new_fields: &mut BTreeSet<QpdfObjGen>,
+    ) -> Result<()> {
+        self.fix_copied_annotations_from_with_options(
+            to_page,
+            from_page,
+            source,
+            &BTreeSet::new(),
+            Some(new_fields),
+        )
+    }
+
+    /// Page-selection route that keeps qpdf's live primary field-name
+    /// reservations while using the same copied-annotation implementation.
+    #[allow(clippy::mutable_key_type)]
+    pub(crate) fn fix_copied_annotations_with_reserved_names(
+        &mut self,
+        to_page: ObjectHandle,
+        from_page: ObjectHandle,
+        reserved_names: &BTreeSet<Vec<u8>>,
+    ) -> Result<()> {
+        self.fix_copied_annotations_with_options(to_page, from_page, reserved_names, None)
+    }
+
+    /// Foreign page-selection route with qpdf's live primary field-name
+    /// reservations.
+    #[allow(clippy::mutable_key_type)]
+    pub(crate) fn fix_copied_annotations_from_with_reserved_names<RS: Read + Seek>(
+        &mut self,
+        to_page: ObjectHandle,
+        from_page: ObjectHandle,
+        source: &mut Pdf<RS>,
+        reserved_names: &BTreeSet<Vec<u8>>,
+    ) -> Result<()> {
+        self.fix_copied_annotations_from_with_options(
+            to_page,
+            from_page,
+            source,
+            reserved_names,
+            None,
+        )
+    }
+
+    fn nonempty_copied_annotations(from_page: &ObjectHandle) -> Result<Option<ObjectHandle>> {
+        let old_annots = from_page.try_get_key(b"/Annots")?;
+        if !old_annots.try_is_array()? || old_annots.try_get_array_n_items()? == 0 {
+            return Ok(None);
+        }
+        Ok(Some(old_annots))
+    }
+
+    #[allow(clippy::mutable_key_type)]
+    fn fix_copied_annotations_with_options(
+        &mut self,
+        to_page: ObjectHandle,
+        from_page: ObjectHandle,
+        reserved_names: &BTreeSet<Vec<u8>>,
+        new_fields: Option<&mut BTreeSet<QpdfObjGen>>,
+    ) -> Result<()> {
+        let Some(old_annots) = Self::nonempty_copied_annotations(&from_page)? else {
+            return Ok(());
+        };
+        let transformed = self.transform_annotations(old_annots, Matrix::default())?;
+        self.finish_fix_copied_annotations(to_page, transformed, reserved_names, new_fields)
+    }
+
+    #[allow(clippy::mutable_key_type)]
+    fn fix_copied_annotations_from_with_options<RS: Read + Seek>(
+        &mut self,
+        to_page: ObjectHandle,
+        from_page: ObjectHandle,
+        source: &mut Pdf<RS>,
+        reserved_names: &BTreeSet<Vec<u8>>,
+        new_fields: Option<&mut BTreeSet<QpdfObjGen>>,
+    ) -> Result<()> {
+        let Some(old_annots) = Self::nonempty_copied_annotations(&from_page)? else {
+            return Ok(());
+        };
+        let transformed = self.transform_annotations_from(old_annots, Matrix::default(), source)?;
+        self.finish_fix_copied_annotations(to_page, transformed, reserved_names, new_fields)
+    }
+
+    #[allow(clippy::mutable_key_type)]
+    fn finish_fix_copied_annotations(
+        &mut self,
+        to_page: ObjectHandle,
+        transformed: AnnotationTransformResult,
+        reserved_names: &BTreeSet<Vec<u8>>,
+        new_fields: Option<&mut BTreeSet<QpdfObjGen>>,
+    ) -> Result<()> {
+        let AnnotationTransformResult {
+            new_annotations,
+            new_fields: copied_fields,
+            ..
+        } = transformed;
+        to_page.replace_key(b"/Annots", ObjectHandle::array(new_annotations))?;
+        self.add_and_rename_form_fields_with_reserved_names(copied_fields.clone(), reserved_names)?;
+        if let Some(new_fields) = new_fields {
+            for field in copied_fields {
+                new_fields.insert(field.get_obj_gen());
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy `/Annots` for a foreign page with qpdf's page-selection field-tree
+    /// analysis boundary.
+    ///
+    /// The page-selection caller uses this internal route while postponing
+    /// orphan-widget analysis until the final output tree is complete.
+    #[allow(clippy::mutable_key_type)]
+    pub(crate) fn fix_copied_annotations_from_with_field_tree_only<RS: Read + Seek>(
+        &mut self,
+        to_page: ObjectHandle,
+        from_page: ObjectHandle,
+        source: &mut Pdf<RS>,
+        reserved_names: &BTreeSet<Vec<u8>>,
+    ) -> Result<()> {
+        self.fix_copied_annotations_from_with_options(
+            to_page,
+            from_page,
+            source,
+            reserved_names,
+            None,
+        )
+    }
+
     #[allow(clippy::mutable_key_type)]
     fn copy_transform_object(
         &mut self,
@@ -1524,11 +1718,10 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         fields: Vec<ObjectHandle>,
         reserved_names: &BTreeSet<Vec<u8>>,
     ) -> Result<()> {
+        self.analyze()?;
         if fields.is_empty() {
             return Ok(());
         }
-
-        self.analyze()?;
         let mut existing_names: BTreeSet<String> = {
             let cache = self.cache.borrow();
             cache
@@ -2740,6 +2933,20 @@ mod final_handle_tests {
             .join("../../tests/fixtures/compat")
             .join(name);
         Pdf::open(Cursor::new(std::fs::read(path).expect("fixture exists"))).expect("fixture opens")
+    }
+
+    #[test]
+    fn add_and_rename_form_fields_analyzes_even_when_the_field_list_is_empty() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).expect("analyze empty form");
+        helper.invalidate_cache();
+        assert!(helper.cache.borrow().is_none());
+
+        helper
+            .add_and_rename_form_fields(Vec::new())
+            .expect("empty addAndRenameFormFields still analyzes");
+
+        assert!(helper.cache.borrow().is_some());
     }
 
     fn indirect_default_appearance_pdf() -> Pdf<Cursor<Vec<u8>>> {

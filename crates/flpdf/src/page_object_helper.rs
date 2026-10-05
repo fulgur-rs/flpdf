@@ -1057,24 +1057,8 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let destination = self.resolved_page_handle()?;
         self.require_page_ref()?;
         validate_same_document_page_handle(self.pdf, &from_page)?;
-        let old_annots = from_page.try_get_key(b"/Annots")?;
-        if !old_annots.try_is_array()? {
-            return Ok(());
-        }
-        if old_annots.try_get_array_n_items()? == 0 {
-            return Ok(());
-        }
-        let transformed = {
-            let mut acroform = crate::AcroFormDocumentHelper::new_for_field_tree(self.pdf)?;
-            let transformed = acroform.transform_annotations(old_annots, Matrix::default())?;
-            acroform.add_and_rename_form_fields_with_reserved_names(
-                transformed.new_fields.clone(),
-                reserved_names,
-            )?; // cov:ignore: malformed field-copy errors are covered by AcroForm transform tests.
-            transformed
-        };
-        destination.replace_key(b"/Annots", ObjectHandle::array(transformed.new_annotations))?;
-        Ok(())
+        let mut acroform = crate::AcroFormDocumentHelper::new_for_field_tree(self.pdf)?;
+        acroform.fix_copied_annotations_with_reserved_names(destination, from_page, reserved_names)
     }
 
     fn copy_annotations_with_reserved_names_impl(
@@ -1163,23 +1147,13 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let destination = self.resolved_page_handle()?;
         self.require_page_ref()?;
         validate_foreign_page_handle(source, self.pdf, &from_page)?;
-        let old_annots = from_page.try_get_key(b"/Annots")?;
-        if !old_annots.try_is_array()? {
-            return Ok(());
-        }
-
-        let transformed = {
-            let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf)?;
-            let transformed =
-                acroform.transform_annotations_from(old_annots, Matrix::default(), source)?; // cov:ignore: LLVM attributes this multiline generic call terminator to the defensive error edge; the direct helper regression covers the success path.
-            acroform.add_and_rename_form_fields_with_reserved_names(
-                transformed.new_fields.clone(),
-                &BTreeSet::new(),
-            )?; // cov:ignore: malformed field-copy errors are covered by AcroForm transform tests.
-            transformed
-        };
-        destination.replace_key(b"/Annots", ObjectHandle::array(transformed.new_annotations))?;
-        Ok(())
+        let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf)?;
+        acroform.fix_copied_annotations_from_with_reserved_names(
+            destination,
+            from_page,
+            source,
+            &BTreeSet::new(),
+        )
     }
 
     /// Foreign-page variant of qpdf's `fixCopiedAnnotations` that keeps the
@@ -1196,21 +1170,15 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let destination = self.resolved_page_handle()?;
         self.require_page_ref()?;
         validate_foreign_page_handle(source, self.pdf, &from_page)?;
-        let old_annots = from_page.try_get_key(b"/Annots")?;
-        if !old_annots.try_is_array()? {
-            return Ok(());
-        }
-        let transformed = {
+        {
             let mut acroform = crate::AcroFormDocumentHelper::new_for_field_tree(self.pdf)?;
-            let transformed =
-                acroform.transform_annotations_from(old_annots, Matrix::default(), source)?;
-            acroform.add_and_rename_form_fields_with_reserved_names(
-                transformed.new_fields.clone(),
+            acroform.fix_copied_annotations_from_with_field_tree_only(
+                destination,
+                from_page,
+                source,
                 reserved_names,
-            )?; // cov:ignore: malformed field-copy errors are covered by AcroForm transform tests.
-            transformed
-        };
-        destination.replace_key(b"/Annots", ObjectHandle::array(transformed.new_annotations))?;
+            )?;
+        }
         *self.pdf.acroform_cache.borrow_mut() = None;
         Ok(())
     }
