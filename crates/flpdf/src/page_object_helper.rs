@@ -1090,6 +1090,22 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         Ok(())
     }
 
+    /// Copy annotations from a page owned by `source` using qpdf's default
+    /// identity transformation matrix.
+    ///
+    /// qpdf 11.9.0 declares `copyAnnotations` with `cm = QPDFMatrix()`
+    /// (`include/qpdf/QPDFPageObjectHelper.hh:393-397`).
+    ///
+    /// Use [`copy_annotations_from_with_matrix`](Self::copy_annotations_from_with_matrix)
+    /// to provide an explicit transform.
+    pub fn copy_annotations_from<RS: Read + Seek>(
+        &mut self,
+        from_page: ObjectHandle,
+        source: &mut Pdf<RS>,
+    ) -> Result<()> {
+        self.copy_annotations_from_with_matrix(from_page, Matrix::default(), source)
+    }
+
     /// Copy annotations from a page owned by `source`, applying `cm` to every
     /// copied rectangle and appearance matrix.
     ///
@@ -1097,7 +1113,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// handle must be an indirect page handle owned by the supplied source
     /// document; destination field/resource reconciliation remains in the
     /// canonical [`crate::AcroFormDocumentHelper`] implementation.
-    pub fn copy_annotations_from<RS: Read + Seek>(
+    pub fn copy_annotations_from_with_matrix<RS: Read + Seek>(
         &mut self,
         from_page: ObjectHandle,
         cm: Matrix,
@@ -2124,7 +2140,7 @@ mod tests {
             PageObjectHelper::from_object_handle(direct_page_handle(), &mut target);
 
         let error = destination
-            .copy_annotations_from(source_page, Matrix::default(), &mut source)
+            .copy_annotations_from(source_page, &mut source)
             .expect_err("qpdf rejects copyAnnotations on a direct destination page");
         assert!(
             error
@@ -2459,7 +2475,7 @@ mod tests {
         let (mut target, new_page) = target_with_warm_empty_acroform();
 
         PageObjectHelper::from_object_handle(new_page.clone(), &mut target)
-            .copy_annotations_from(source_page, Matrix::default(), &mut source)
+            .copy_annotations_from(source_page, &mut source)
             .expect("field-backed annotations should copy");
 
         assert!(
@@ -2522,7 +2538,7 @@ mod tests {
         let (mut target, new_page) = target_with_warm_empty_acroform();
 
         PageObjectHelper::from_object_handle(new_page.clone(), &mut target)
-            .copy_annotations_from(source_page, Matrix::default(), &mut source)
+            .copy_annotations_from(source_page, &mut source)
             .expect("non-widget annotations should copy");
 
         assert!(
@@ -2538,7 +2554,7 @@ mod tests {
         let (mut target, new_page) = target_with_warm_empty_acroform();
 
         PageObjectHelper::from_object_handle(new_page.clone(), &mut target)
-            .copy_annotations_from(source_page, Matrix::default(), &mut source)
+            .copy_annotations_from(source_page, &mut source)
             .expect("orphan annotation should copy");
 
         assert!(

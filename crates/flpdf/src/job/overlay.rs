@@ -45,7 +45,7 @@ pub enum OverlayKind {
 
 /// A single overlay/underlay source: a source page identity retained for lazy
 /// Form XObject import and the canonical foreign-document
-/// `PageObjectHelper::copy_annotations_from` route.
+/// `PageObjectHelper::copy_annotations_from_with_matrix` route.
 #[derive(Debug, Clone)]
 pub(crate) struct OverlaySource {
     /// The source's kind (overlay or underlay).
@@ -199,7 +199,11 @@ fn under_overlay_for_page<R: Read + Seek, RS: Read + Seek>(
             })?;
             let mut destination_page =
                 PageObjectHelper::from_object_handle(dest_page.clone(), dest);
-            destination_page.copy_annotations_from(source_page_handle.clone(), cm, source)?;
+            destination_page.copy_annotations_from_with_matrix(
+                source_page_handle.clone(),
+                cm,
+                source,
+            )?;
         }
         // cov:ignore-end
         next_index += 1;
@@ -257,7 +261,11 @@ fn under_overlay_for_page<R: Read + Seek, RS: Read + Seek>(
             })?;
             let mut destination_page =
                 PageObjectHelper::from_object_handle(dest_page.clone(), dest);
-            destination_page.copy_annotations_from(source_page_handle.clone(), cm, source)?;
+            destination_page.copy_annotations_from_with_matrix(
+                source_page_handle.clone(),
+                cm,
+                source,
+            )?;
         }
         // cov:ignore-end
         next_index += 1;
@@ -1113,7 +1121,7 @@ mod byte_gate {
     /// - one widget (obj 3, "Text Box 1") carries an explicit `/P`
     ///   pointing at the source page — after copy that ref goes stale
     ///   and gets Null'd by canonical foreign-object replacement, so the
-    ///   `PageObjectHelper::copy_annotations_from` path must repoint it at
+    ///   `PageObjectHelper::copy_annotations_from_with_matrix` path must repoint it at
     ///   dest_page_ref;
     /// - one entry is a DIRECT annot dictionary (an inline
     ///   `<< /Subtype /FreeText ... >>` where an indirect ref would

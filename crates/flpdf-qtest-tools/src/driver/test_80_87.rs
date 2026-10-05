@@ -130,7 +130,7 @@ pub(crate) fn run_test_80<R: Read + Seek>(
     second_matrix.scale(-1.0, 1.0);
     {
         let mut page2 = PageObjectHelper::from_object_handle(page2, &mut pdf2);
-        page2.copy_annotations_from(page1.clone(), second_matrix, pdf)?;
+        page2.copy_annotations_from_with_matrix(page1.clone(), second_matrix, pdf)?;
     }
     emit_new_diagnostics(
         &pdf2,
