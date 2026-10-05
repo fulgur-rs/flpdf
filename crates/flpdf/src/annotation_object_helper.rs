@@ -258,6 +258,10 @@ impl AnnotationObjectHelper {
     ///
     /// `which` selects the entry within `/AP` — typically `b"/N"` (normal),
     /// `b"/R"` (rollover), or `b"/D"` (down), matching qpdf's PDF-name string.
+    /// An empty `state` resolves `/AS` after fetching `/AP` but before checking
+    /// its type or selected entry, matching qpdf's eager `desired_state`
+    /// calculation; diagnostics from `/AS` therefore precede `/AP` value
+    /// resolution and a direct appearance-stream return.
     /// If `/AP/<which>` is itself a stream, it is returned directly. If it is
     /// a subdictionary (a state dictionary), `state` selects a key within it
     /// when non-empty, falling back to [`Self::get_appearance_state`]'s `/AS`
@@ -280,37 +284,39 @@ impl AnnotationObjectHelper {
         which: &[u8],
         state: &[u8],
     ) -> Result<ObjectHandle> {
-        let ap = self.get_appearance_dictionary()?;
+        // Keep the /AP child handle unresolved until after desired_state,
+        // matching getAppearanceDictionary() followed by getAppearanceState()
+        // in qpdf. In particular, malformed indirect /AS must warn before a
+        // malformed indirect /AP when both are present.
+        let ap = self.annot.try_get_key(b"/AP")?;
+        let desired_state = if state.is_empty() {
+            self.get_appearance_state()?
+        } else {
+            state.to_vec()
+        };
+        let state_key = if state.is_empty() {
+            if desired_state.is_empty() {
+                Vec::new()
+            } else {
+                dict_key(&desired_state)
+            }
+        } else {
+            desired_state
+        };
         if ap.try_is_dictionary()? {
             let ap_sub = ap.try_get_key(which)?;
             ap_sub.try_dereference()?;
             if ap_sub.as_stream_dict().is_some() {
-                // A direct appearance stream disregards state entirely
-                // (`QPDFAnnotationObjectHelper.cc:59-63`).
-                // `/AS` must not even be resolved on this path — qpdf's own
-                // eager `getAppearanceState()` call is infallible in C++,
-                // but this crate's `/AS` resolution can genuinely error (a
-                // malformed or cyclic indirect reference), and that error
-                // must not surface for a state qpdf never consults here.
+                // A direct appearance stream disregards the selected state,
+                // but qpdf resolves the default `/AS` before reaching this
+                // branch (`QPDFAnnotationObjectHelper.cc:52-63`).
                 return Ok(ap_sub);
             }
-            if ap_sub.try_is_dictionary()? {
-                let state_key: Vec<u8> = if state.is_empty() {
-                    let desired_state = self.get_appearance_state()?;
-                    if desired_state.is_empty() {
-                        Vec::new()
-                    } else {
-                        dict_key(&desired_state)
-                    }
-                } else {
-                    state.to_vec()
-                };
-                if !state_key.is_empty() {
-                    let ap_sub_val = ap_sub.try_get_key(&state_key)?;
-                    ap_sub_val.try_dereference()?;
-                    if ap_sub_val.as_stream_dict().is_some() {
-                        return Ok(ap_sub_val);
-                    }
+            if ap_sub.try_is_dictionary()? && !state_key.is_empty() {
+                let ap_sub_val = ap_sub.try_get_key(&state_key)?;
+                ap_sub_val.try_dereference()?;
+                if ap_sub_val.as_stream_dict().is_some() {
+                    return Ok(ap_sub_val);
                 }
             } // cov:ignore: llvm-cov brace-region artifact, not untested — reached by both annotation_handle_appearance_stream_missing_state_returns_null and _state_dictionary_key_missing_returns_null, same as the pre-existing single-block version of this brace
         } // cov:ignore: llvm-cov brace-region artifact, not untested — same two tests fall through to this outer brace after the inner one
