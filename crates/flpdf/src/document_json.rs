@@ -283,7 +283,7 @@ pub fn write_json_key<R: Read + Seek>(
     )?;
     Json::write_dictionary_key(out, &mut metadata_first, b"maxobjectid", 3)?;
     let max_object_id = pdf.get_object_count().map_err(ConvertError::from)?;
-    Json::make_int(i64::from(max_object_id)).write(out, 3)?;
+    Json::make_int(i64::from(max_object_id)).write_with_depth(out, 3)?;
     Json::write_dictionary_close(out, metadata_first, 2)?;
 
     Json::write_next(out, &mut qpdf_first, 2)?;
