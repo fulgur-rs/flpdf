@@ -606,7 +606,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     // moving one backward selects the last, matching qpdf's own wrap
     // behavior (`NumberTreeCursor::next`/`::previous` doc comments).
     let qtest = pdf.trailer_key_handle(b"QTest");
-    let mut ntoh = NumberTree::new(qtest, true);
+    let mut ntoh = NumberTree::new(qtest);
 
     let qpdf_flush_result_39 = ntoh.begin(pdf);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -643,7 +643,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     assert_eq!(tree_string_value(&six)?, b"six");
     assert_eq!(2, offset);
 
-    let mut new1 = NumberTree::new_empty(pdf, true)?;
+    let mut new1 = NumberTree::new_empty(pdf)?;
     let mut iter1 = new1.begin(pdf)?;
     assert!(iter1 == new1.end());
     iter1.next(&mut new1, pdf)?;
@@ -679,7 +679,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     assert_eq!(iter1.current().expect("cursor at 2").0, 2);
 
     writeln!(stdout, "insertAfter")?;
-    let mut new2 = NumberTree::new_empty(pdf, true)?;
+    let mut new2 = NumberTree::new_empty(pdf)?;
     let mut iter2 = new2.begin(pdf)?;
     assert!(iter2 == new2.end());
     iter2.insert_after(&mut new2, pdf, 3, ObjectHandle::string(b"3!".to_vec()))?;
@@ -695,7 +695,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     }
 
     writeln!(stdout, "/Bad1")?;
-    let mut bad1 = NumberTree::new(pdf.trailer_key_handle(b"Bad1"), true);
+    let mut bad1 = NumberTree::new(pdf.trailer_key_handle(b"Bad1"));
     let bad1_begin = bad1.begin(pdf)?;
     assert!(bad1_begin == bad1.end());
     let qpdf_flush_result_41 = bad1.last(pdf);
@@ -704,7 +704,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     assert!(bad1_last == bad1.end());
 
     writeln!(stdout, "/Bad2")?;
-    let mut bad2 = NumberTree::new(pdf.trailer_key_handle(b"Bad2"), true);
+    let mut bad2 = NumberTree::new(pdf.trailer_key_handle(b"Bad2"));
     let qpdf_flush_result_42 = bad2.begin(pdf);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let mut cursor = qpdf_flush_result_42?;
@@ -721,7 +721,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
         write!(stdout, "/")?;
         write_bytes(stdout, key)?;
         writeln!(stdout)?;
-        let mut empty = NumberTree::new(pdf.trailer_key_handle(key), true);
+        let mut empty = NumberTree::new(pdf.trailer_key_handle(key));
         let empty_begin = empty.begin(pdf)?;
         assert!(empty_begin == empty.end());
         let qpdf_flush_result_44 = empty.last(pdf);
@@ -757,7 +757,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     }
 
     writeln!(stdout, "Insert into invalid")?;
-    let mut invalid1 = NumberTree::new(ObjectHandle::dictionary(Vec::new()), true);
+    let mut invalid1 = NumberTree::new(ObjectHandle::dictionary(Vec::new()));
     let invalid_insert = invalid1.insert(pdf, 1, ObjectHandle::null());
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     if let Err(error) = invalid_insert {
@@ -766,7 +766,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
 
     writeln!(stdout, "/Bad3, no repair")?;
     let bad3_object = pdf.trailer_key_handle(b"Bad3");
-    let mut bad3 = NumberTree::new(bad3_object.clone(), false);
+    let mut bad3 = NumberTree::new_with_options(bad3_object.clone(), false);
     let qpdf_flush_result_45 = bad3.begin(pdf);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let mut cursor = qpdf_flush_result_45?;
@@ -781,7 +781,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     assert!(!kids_item_0_is_indirect(&bad3_object)?);
 
     writeln!(stdout, "/Bad3, repair")?;
-    let mut bad3 = NumberTree::new(bad3_object.clone(), true);
+    let mut bad3 = NumberTree::new_with_options(bad3_object.clone(), true);
     let qpdf_flush_result_47 = bad3.begin(pdf);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let mut cursor = qpdf_flush_result_47?;
@@ -796,7 +796,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     assert!(kids_item_0_is_indirect(&bad3_object)?);
 
     writeln!(stdout, "/Bad4 -- missing limits")?;
-    let mut bad4 = NumberTree::new(pdf.trailer_key_handle(b"Bad4"), true);
+    let mut bad4 = NumberTree::new(pdf.trailer_key_handle(b"Bad4"));
     bad4.insert(pdf, 5, ObjectHandle::string(b"5".to_vec()))?;
     let qpdf_flush_result_49 = bad4.begin(pdf);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -811,8 +811,8 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     }
 
     writeln!(stdout, "/Bad5 -- limit errors")?;
-    let mut bad5 = NumberTree::new(pdf.trailer_key_handle(b"Bad5"), true);
-    let qpdf_flush_result_51 = bad5.find(pdf, 10, false);
+    let mut bad5 = NumberTree::new(pdf.trailer_key_handle(b"Bad5"));
+    let qpdf_flush_result_51 = bad5.find(pdf, 10);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let found = qpdf_flush_result_51?;
     assert!(found == bad5.end());
@@ -888,7 +888,7 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     // header comment for the shared iterator-wrap and value-aliasing notes,
     // which apply identically here.
     let qtest = pdf.trailer_key_handle(b"QTest");
-    let mut ntoh = NameTree::new(qtest, true);
+    let mut ntoh = NameTree::new(qtest);
 
     let qpdf_flush_result_52 = ntoh.begin(pdf);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -928,7 +928,7 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     assert_eq!(last_key, b"29 twenty-nine");
     assert_eq!(last_value.try_get_utf8_value()?, b"twenty-nine!");
 
-    let mut new1 = NameTree::new_empty(pdf, true)?;
+    let mut new1 = NameTree::new_empty(pdf)?;
     let mut iter1 = new1.begin(pdf)?;
     assert!(iter1 == new1.end());
     iter1.next(&mut new1, pdf)?;
@@ -959,7 +959,7 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     assert_eq!(iter1.current().expect("cursor at 2").0, b"2");
 
     writeln!(stdout, "insertAfter")?;
-    let mut new2 = NameTree::new_empty(pdf, true)?;
+    let mut new2 = NameTree::new_empty(pdf)?;
     let mut iter2 = new2.begin(pdf)?;
     assert!(iter2 == new2.end());
     iter2.insert_after(&mut new2, pdf, "3", ObjectHandle::string(b"3!".to_vec()))?;
@@ -979,7 +979,7 @@ pub(crate) fn run_test_48<R: Read + Seek>(
         write!(stdout, "/")?;
         write_bytes(stdout, key)?;
         writeln!(stdout)?;
-        let mut empty = NameTree::new(pdf.trailer_key_handle(key), true);
+        let mut empty = NameTree::new(pdf.trailer_key_handle(key));
         let qpdf_flush_result_54 = empty.begin(pdf);
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         let empty_begin = qpdf_flush_result_54?;
@@ -1017,8 +1017,8 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     }
 
     writeln!(stdout, "/Bad1 -- wrong key type")?;
-    let mut bad1 = NameTree::new(pdf.trailer_key_handle(b"Bad1"), true);
-    let qpdf_flush_result_55 = bad1.find(pdf, "G", true);
+    let mut bad1 = NameTree::new(pdf.trailer_key_handle(b"Bad1"));
+    let qpdf_flush_result_55 = bad1.find_with_options(pdf, "G", true);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let found = qpdf_flush_result_55?;
     assert_eq!(found.current().expect("closest key below G").0, b"A");
@@ -1030,8 +1030,8 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     }
 
     writeln!(stdout, "/Bad2 -- invalid kid")?;
-    let mut bad2 = NameTree::new(pdf.trailer_key_handle(b"Bad2"), true);
-    let qpdf_flush_result_56 = bad2.find(pdf, "G", true);
+    let mut bad2 = NameTree::new(pdf.trailer_key_handle(b"Bad2"));
+    let qpdf_flush_result_56 = bad2.find_with_options(pdf, "G", true);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let found = qpdf_flush_result_56?;
     assert_eq!(found.current().expect("closest key below G").0, b"B");
@@ -1043,15 +1043,15 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     }
 
     writeln!(stdout, "/Bad3 -- invalid kid")?;
-    let mut bad3 = NameTree::new(pdf.trailer_key_handle(b"Bad3"), true);
-    let qpdf_flush_result_57 = bad3.find(pdf, "G", true);
+    let mut bad3 = NameTree::new(pdf.trailer_key_handle(b"Bad3"));
+    let qpdf_flush_result_57 = bad3.find_with_options(pdf, "G", true);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let found = qpdf_flush_result_57?;
     assert!(found == bad3.end());
 
     writeln!(stdout, "/Bad4 -- invalid kid")?;
-    let mut bad4 = NameTree::new(pdf.trailer_key_handle(b"Bad4"), true);
-    let qpdf_flush_result_58 = bad4.find(pdf, "F", true);
+    let mut bad4 = NameTree::new(pdf.trailer_key_handle(b"Bad4"));
+    let qpdf_flush_result_58 = bad4.find_with_options(pdf, "F", true);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let found = qpdf_flush_result_58?;
     assert_eq!(found.current().expect("closest key below F").0, b"C");
@@ -1063,14 +1063,14 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     }
 
     writeln!(stdout, "/Bad5 -- loop in find")?;
-    let mut bad5 = NameTree::new(pdf.trailer_key_handle(b"Bad5"), true);
-    let qpdf_flush_result_59 = bad5.find(pdf, "F", true);
+    let mut bad5 = NameTree::new(pdf.trailer_key_handle(b"Bad5"));
+    let qpdf_flush_result_59 = bad5.find_with_options(pdf, "F", true);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let found = qpdf_flush_result_59?;
     assert_eq!(found.current().expect("closest key below F").0, b"D");
 
     writeln!(stdout, "/Bad6 -- bad limits")?;
-    let mut bad6 = NameTree::new(pdf.trailer_key_handle(b"Bad6"), true);
+    let mut bad6 = NameTree::new(pdf.trailer_key_handle(b"Bad6"));
     let qpdf_flush_result_60 = bad6.insert(pdf, "H", ObjectHandle::null());
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let inserted = qpdf_flush_result_60?;

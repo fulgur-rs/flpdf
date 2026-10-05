@@ -120,7 +120,7 @@ fn embedded_files_tree_with_options<R: Read + Seek>(
         return Ok(None);
     }
 
-    let mut tree = NameTree::new(root, auto_repair);
+    let mut tree = NameTree::new_with_options(root, auto_repair);
     if let Some(max_depth) = max_depth {
         tree.set_max_depth(max_depth);
     }
@@ -166,7 +166,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
 
         let root = self.new_empty_embedded_files_root(&names)?;
 
-        Ok(Some(NameTree::new(root, true)))
+        Ok(Some(NameTree::new(root)))
     }
 
     fn new_empty_embedded_files_root(&mut self, names: &ObjectHandle) -> Result<ObjectHandle> {

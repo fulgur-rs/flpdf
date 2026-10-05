@@ -483,7 +483,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             if !root.try_is_dictionary()? {
                 return Ok(None);
             }
-            self.names_dest = Some(NameTree::new(root, true));
+            self.names_dest = Some(NameTree::new(root));
         }
         let tree = self
             .names_dest

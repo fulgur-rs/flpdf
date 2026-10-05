@@ -259,7 +259,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         let Some(root) = self.pagelabels_root_handle()? else {
             return Ok(None);
         };
-        let mut tree = crate::nntree::NumberTree::new(root, true);
+        let mut tree = crate::nntree::NumberTree::new(root);
         tree.set_max_depth(DEFAULT_MAX_TREE_DEPTH);
         Ok(Some(tree))
     }

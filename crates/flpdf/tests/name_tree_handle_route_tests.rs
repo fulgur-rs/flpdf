@@ -127,7 +127,11 @@ fn name_tree_with_wrong_first_key<R: Read + Seek>(
             ObjectHandle::array(vec![wrong_type_key, ObjectHandle::integer(11)]),
         )]))
         .expect("allocate name-tree root");
-    NameTree::new(root, auto_repair)
+    if auto_repair {
+        NameTree::new(root)
+    } else {
+        NameTree::new_with_options(root, false)
+    }
 }
 
 fn number_tree_with_wrong_first_key<R: Read + Seek>(
@@ -141,7 +145,11 @@ fn number_tree_with_wrong_first_key<R: Read + Seek>(
             ObjectHandle::array(vec![wrong_type_key, ObjectHandle::integer(11)]),
         )]))
         .expect("allocate number-tree root");
-    NumberTree::new(root, auto_repair)
+    if auto_repair {
+        NumberTree::new(root)
+    } else {
+        NumberTree::new_with_options(root, false)
+    }
 }
 
 fn assert_single_repair_warning<R: Read + Seek>(pdf: &Pdf<R>) {
@@ -150,6 +158,68 @@ fn assert_single_repair_warning<R: Read + Seek>(pdf: &Pdf<R>) {
     assert_eq!(warnings.len(), 1);
     assert!(String::from_utf8_lossy(warnings[0].get_message_detail())
         .contains("attempting to repair after error"));
+}
+
+#[test]
+fn name_and_number_tree_qpdf_default_call_shapes() {
+    let mut pdf = Pdf::empty().expect("create empty PDF");
+
+    let name_root = pdf
+        .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+            b"/Names".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::string(b"a".to_vec()),
+                ObjectHandle::integer(11),
+                ObjectHandle::string(b"c".to_vec()),
+                ObjectHandle::integer(13),
+            ]),
+        )]))
+        .expect("allocate name-tree root");
+    let mut name_tree = NameTree::new(name_root);
+    let missing_name = name_tree
+        .find(&mut pdf, b"b")
+        .expect("default name-tree find");
+    assert!(
+        !missing_name.valid(),
+        "default find does not return a predecessor"
+    );
+    let previous_name = name_tree
+        .find_with_options(&mut pdf, b"b", true)
+        .expect("explicit predecessor search");
+    assert_eq!(previous_name.current().expect("predecessor value").0, b"a");
+
+    let number_root = pdf
+        .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+            b"/Nums".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(1),
+                ObjectHandle::integer(11),
+                ObjectHandle::integer(3),
+                ObjectHandle::integer(13),
+            ]),
+        )]))
+        .expect("allocate number-tree root");
+    let mut number_tree = NumberTree::new(number_root);
+    let missing_number = number_tree
+        .find(&mut pdf, 2)
+        .expect("default number-tree find");
+    assert!(
+        !missing_number.valid(),
+        "default find does not return a predecessor"
+    );
+    let previous_number = number_tree
+        .find_with_options(&mut pdf, 2, true)
+        .expect("explicit predecessor search");
+    assert_eq!(previous_number.current().expect("predecessor value").0, 1);
+
+    let empty_name_tree = NameTree::new_empty(&mut pdf).expect("default empty name tree");
+    let empty_number_tree = NumberTree::new_empty(&mut pdf).expect("default empty number tree");
+    let _configured_empty_name_tree = NameTree::new_empty_with_options(&mut pdf, false)
+        .expect("explicit empty name-tree options");
+    let _configured_empty_number_tree = NumberTree::new_empty_with_options(&mut pdf, false)
+        .expect("explicit empty number-tree options");
+    assert!(empty_name_tree.get_object_handle().object_ref().is_some());
+    assert!(empty_number_tree.get_object_handle().object_ref().is_some());
 }
 
 #[test]
@@ -164,9 +234,9 @@ fn name_tree_find_wrong_typed_key_uses_qpdf_tree_error() {
             ObjectHandle::array(vec![wrong_type_key, ObjectHandle::integer(11)]),
         )]))
         .expect("allocate name-tree root");
-    let mut tree = NameTree::new(root, false);
+    let mut tree = NameTree::new_with_options(root, false);
 
-    let error = match tree.find(&mut pdf, b"probe", false) {
+    let error = match tree.find(&mut pdf, b"probe") {
         Ok(_) => panic!("qpdf rejects a wrong-typed key during find"),
         Err(error) => error,
     };
@@ -190,9 +260,9 @@ fn number_tree_find_wrong_typed_key_uses_qpdf_tree_error() {
             ]),
         )]))
         .expect("allocate number-tree root");
-    let mut tree = NumberTree::new(root, false);
+    let mut tree = NumberTree::new_with_options(root, false);
 
-    let error = match tree.find(&mut pdf, 1, false) {
+    let error = match tree.find(&mut pdf, 1) {
         Ok(_) => panic!("qpdf rejects a wrong-typed key during find"),
         Err(error) => error,
     };
@@ -218,9 +288,9 @@ fn number_tree_find_before_wrong_typed_first_key_uses_qpdf_tree_error() {
             ]),
         )]))
         .expect("allocate number-tree root");
-    let mut tree = NumberTree::new(root, false);
+    let mut tree = NumberTree::new_with_options(root, false);
 
-    let error = match tree.find(&mut pdf, -1, false) {
+    let error = match tree.find(&mut pdf, -1) {
         Ok(_) => panic!("qpdf rejects a wrong-typed key during find"),
         Err(error) => error,
     };
@@ -243,9 +313,9 @@ fn name_tree_find_reports_error_when_search_reaches_direct_wrong_typed_key() {
             ]),
         )]))
         .expect("allocate name-tree root");
-    let mut tree = NameTree::new(root, false);
+    let mut tree = NameTree::new_with_options(root, false);
 
-    let error = match tree.find(&mut pdf, b"a", false) {
+    let error = match tree.find(&mut pdf, b"a") {
         Ok(_) => panic!("qpdf rejects a wrong-typed key during find"),
         Err(error) => error,
     };
@@ -260,7 +330,7 @@ fn name_tree_auto_repair_preserves_direct_wrong_key_error_and_warning_order() {
     let wrong_type_key = ObjectHandle::integer(7);
     let mut tree = name_tree_with_wrong_first_key(&mut pdf, wrong_type_key, true);
 
-    let error = match tree.find(&mut pdf, b"a", false) {
+    let error = match tree.find(&mut pdf, b"a") {
         Ok(_) => panic!("qpdf repair leaves this malformed tree unsearchable"),
         Err(error) => error,
     };
@@ -275,7 +345,7 @@ fn name_tree_auto_repair_preserves_indirect_wrong_key_error_and_warning_order() 
     let wrong_type_key = maybe_make_indirect(&mut pdf, ObjectHandle::integer(7), true);
     let mut tree = name_tree_with_wrong_first_key(&mut pdf, wrong_type_key, true);
 
-    let error = match tree.find(&mut pdf, b"a", false) {
+    let error = match tree.find(&mut pdf, b"a") {
         Ok(_) => panic!("qpdf repair leaves this malformed tree unsearchable"),
         Err(error) => error,
     };
@@ -290,7 +360,7 @@ fn number_tree_auto_repair_preserves_direct_wrong_key_error_and_warning_order() 
     let wrong_type_key = ObjectHandle::string(b"not-an-integer".to_vec());
     let mut tree = number_tree_with_wrong_first_key(&mut pdf, wrong_type_key, true);
 
-    let error = match tree.find(&mut pdf, -1, false) {
+    let error = match tree.find(&mut pdf, -1) {
         Ok(_) => panic!("qpdf repair leaves this malformed tree unsearchable"),
         Err(error) => error,
     };
@@ -309,7 +379,7 @@ fn number_tree_auto_repair_preserves_indirect_wrong_key_error_and_warning_order(
     );
     let mut tree = number_tree_with_wrong_first_key(&mut pdf, wrong_type_key, true);
 
-    let error = match tree.find(&mut pdf, -1, false) {
+    let error = match tree.find(&mut pdf, -1) {
         Ok(_) => panic!("qpdf repair leaves this malformed tree unsearchable"),
         Err(error) => error,
     };
@@ -330,7 +400,7 @@ fn name_tree_resolves_an_indirect_string_key() {
             ObjectHandle::array(vec![key, ObjectHandle::integer(17)]),
         )]))
         .expect("allocate name-tree root");
-    let mut tree = NameTree::new(root, false);
+    let mut tree = NameTree::new_with_options(root, false);
 
     let value = tree
         .find_object(&mut pdf, b"tree-key")
@@ -352,7 +422,7 @@ fn number_tree_resolves_an_indirect_integer_key() {
             ObjectHandle::array(vec![key, ObjectHandle::string(b"label".to_vec())]),
         )]))
         .expect("allocate number-tree root");
-    let mut tree = NumberTree::new(root, false);
+    let mut tree = NumberTree::new_with_options(root, false);
 
     let value = tree
         .find_object(&mut pdf, 42)
@@ -374,7 +444,7 @@ fn name_tree_indirect_null_kids_value_is_treated_as_missing() {
             null_kids,
         )]))
         .expect("allocate name-tree root");
-    let mut tree = NameTree::new(root, false);
+    let mut tree = NameTree::new_with_options(root, false);
 
     let cursor = tree.begin(&mut pdf).expect("null /Kids is not an array");
 
@@ -402,7 +472,7 @@ fn name_tree_begin_reads_qpdf_default_value_for_wrong_typed_key() {
             ]),
         )]))
         .expect("allocate name-tree root");
-    let mut tree = NameTree::new(root, false);
+    let mut tree = NameTree::new_with_options(root, false);
 
     let mut cursor = tree.begin(&mut pdf).expect("match qpdf iterator begin");
     assert!(
@@ -447,7 +517,7 @@ fn number_tree_begin_reads_qpdf_default_value_for_wrong_typed_key() {
             ]),
         )]))
         .expect("allocate number-tree root");
-    let mut tree = NumberTree::new(root, false);
+    let mut tree = NumberTree::new_with_options(root, false);
 
     let mut cursor = tree.begin(&mut pdf).expect("match qpdf iterator begin");
     assert!(
@@ -490,7 +560,7 @@ fn name_tree_increment_skips_wrong_typed_key_and_warns_in_order() {
             ]),
         )]))
         .expect("allocate name-tree root");
-    let mut tree = NameTree::new(root, false);
+    let mut tree = NameTree::new_with_options(root, false);
     let mut cursor = tree.begin(&mut pdf).expect("begin at first valid key");
 
     cursor
@@ -524,7 +594,7 @@ fn number_tree_increment_skips_wrong_typed_key_and_warns_in_order() {
             ]),
         )]))
         .expect("allocate number-tree root");
-    let mut tree = NumberTree::new(root, false);
+    let mut tree = NumberTree::new_with_options(root, false);
     let mut cursor = tree.begin(&mut pdf).expect("begin at first valid key");
 
     cursor
@@ -571,7 +641,7 @@ fn name_tree_increment_skips_wrong_typed_key_in_next_leaf() {
             ObjectHandle::array(vec![first_leaf, next_leaf]),
         )]))
         .expect("allocate name-tree root");
-    let mut tree = NameTree::new(root, false);
+    let mut tree = NameTree::new_with_options(root, false);
     let mut cursor = tree.begin(&mut pdf).expect("begin at first leaf");
 
     cursor
@@ -618,7 +688,7 @@ fn number_tree_increment_skips_wrong_typed_key_in_next_leaf() {
             ObjectHandle::array(vec![first_leaf, next_leaf]),
         )]))
         .expect("allocate number-tree root");
-    let mut tree = NumberTree::new(root, false);
+    let mut tree = NumberTree::new_with_options(root, false);
     let mut cursor = tree.begin(&mut pdf).expect("begin at first leaf");
 
     cursor
@@ -662,7 +732,7 @@ fn assert_name_tree_remove_last_leaf_with_wrong_previous_key(indirect: bool) {
             ObjectHandle::array(vec![previous_leaf, last_leaf]),
         )]))
         .expect("allocate name-tree root");
-    let mut tree = NameTree::new(root, false);
+    let mut tree = NameTree::new_with_options(root, false);
     let mut cursor = tree
         .last(&mut pdf)
         .expect("position at last name-tree entry");
@@ -719,7 +789,7 @@ fn assert_number_tree_remove_last_leaf_with_wrong_previous_key(indirect: bool) {
             ObjectHandle::array(vec![previous_leaf, last_leaf]),
         )]))
         .expect("allocate number-tree root");
-    let mut tree = NumberTree::new(root, false);
+    let mut tree = NumberTree::new_with_options(root, false);
     let mut cursor = tree
         .last(&mut pdf)
         .expect("position at last number-tree entry");
@@ -757,7 +827,7 @@ fn assert_name_tree_remove_last_item_with_wrong_previous_key(indirect: bool) {
             ]),
         )]))
         .expect("allocate name-tree root");
-    let mut tree = NameTree::new(root, false);
+    let mut tree = NameTree::new_with_options(root, false);
     let mut cursor = tree
         .last(&mut pdf)
         .expect("position at last name-tree entry");
@@ -799,7 +869,7 @@ fn assert_number_tree_remove_last_item_with_wrong_previous_key(indirect: bool) {
             ]),
         )]))
         .expect("allocate number-tree root");
-    let mut tree = NumberTree::new(root, false);
+    let mut tree = NumberTree::new_with_options(root, false);
     let mut cursor = tree
         .last(&mut pdf)
         .expect("position at last number-tree entry");
@@ -892,7 +962,7 @@ fn name_tree_with_wrong_successor<R: Read + Seek>(
         )]))
         .expect("allocate name-tree root")
     };
-    NameTree::new(root, false)
+    NameTree::new_with_options(root, false)
 }
 
 fn number_tree_with_wrong_successor<R: Read + Seek>(
@@ -955,7 +1025,7 @@ fn number_tree_with_wrong_successor<R: Read + Seek>(
         )]))
         .expect("allocate number-tree root")
     };
-    NumberTree::new(root, false)
+    NumberTree::new_with_options(root, false)
 }
 
 fn assert_name_tree_keyed_remove_does_not_materialize_successor(indirect: bool, next_leaf: bool) {
@@ -1030,7 +1100,7 @@ fn name_tree_keyed_remove_preserves_short_successor_pair_error() {
             ]),
         )]))
         .expect("allocate short name-tree root");
-    let mut tree = NameTree::new(root, false);
+    let mut tree = NameTree::new_with_options(root, false);
 
     let error = match tree.remove(&mut pdf, b"a") {
         Ok(_) => panic!("qpdf rejects the short successor pair after removal"),
@@ -1057,7 +1127,7 @@ fn number_tree_keyed_remove_preserves_short_successor_pair_error() {
             ]),
         )]))
         .expect("allocate short number-tree root");
-    let mut tree = NumberTree::new(root, false);
+    let mut tree = NumberTree::new_with_options(root, false);
 
     let error = match tree.remove(&mut pdf, 1) {
         Ok(_) => panic!("qpdf rejects the short successor pair after removal"),
@@ -1078,7 +1148,7 @@ fn assert_name_tree_cursor_remove_materializes_successor(indirect: bool, next_le
     let mut cursor = if next_leaf {
         tree.begin(&mut pdf).expect("begin at left leaf")
     } else {
-        tree.find(&mut pdf, b"c", false)
+        tree.find(&mut pdf, b"c")
             .expect("find same-leaf removal target")
     };
     let removal = cursor.remove(&mut tree, &mut pdf);
@@ -1124,7 +1194,7 @@ fn assert_number_tree_cursor_remove_materializes_successor(indirect: bool, next_
     let mut cursor = if next_leaf {
         tree.begin(&mut pdf).expect("begin at left leaf")
     } else {
-        tree.find(&mut pdf, 3, false)
+        tree.find(&mut pdf, 3)
             .expect("find same-leaf removal target")
     };
     let removal = cursor.remove(&mut tree, &mut pdf);
