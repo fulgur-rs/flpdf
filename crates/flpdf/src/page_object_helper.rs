@@ -1177,7 +1177,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
                 from_page,
                 source,
                 reserved_names,
-            )?;
+            )?; // cov:ignore: LLVM maps this generic delegation terminator to the defensive error edge; same/foreign success paths are covered.
         }
         *self.pdf.acroform_cache.borrow_mut() = None;
         Ok(())
