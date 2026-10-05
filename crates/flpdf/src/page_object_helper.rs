@@ -1061,6 +1061,9 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         if !old_annots.try_is_array()? {
             return Ok(());
         }
+        if old_annots.try_get_array_n_items()? == 0 {
+            return Ok(());
+        }
         let transformed = {
             let mut acroform = crate::AcroFormDocumentHelper::new_for_field_tree(self.pdf)?;
             let transformed = acroform.transform_annotations(old_annots, Matrix::default())?;
