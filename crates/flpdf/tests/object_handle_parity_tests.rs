@@ -410,6 +410,62 @@ fn get_all_objects_prepares_source_and_dangling_canonical_handles() {
 }
 
 #[test]
+fn fix_dangling_references_is_public_and_idempotent() {
+    let bytes = classic_pdf_with_bodies(
+        &[
+            b"1 0 obj\n<< /Dangling 9 0 R >>\nendobj\n",
+            b"2 0 obj\n42\nendobj\n",
+        ],
+        ObjectRef::new(1, 0),
+    );
+    let mut pdf = Pdf::open_mem(std::sync::Arc::from(bytes)).unwrap();
+    let later_object = pdf.get_object_handle(ObjectRef::new(2, 0));
+    assert!(!later_object.is_resolved());
+
+    pdf.fix_dangling_references()
+        .expect("prepare canonical cache");
+    assert!(later_object.is_resolved());
+
+    let objects = pdf
+        .get_all_objects()
+        .expect("enumerate prepared canonical cache");
+    let first_refs: Vec<_> = objects
+        .iter()
+        .map(|handle| handle.object_ref().expect("indirect object"))
+        .collect();
+    assert_eq!(
+        first_refs,
+        vec![
+            ObjectRef::new(1, 0),
+            ObjectRef::new(2, 0),
+            ObjectRef::new(9, 0)
+        ]
+    );
+    let dangling_reference = objects
+        .iter()
+        .find(|handle| handle.object_ref() == Some(ObjectRef::new(9, 0)))
+        .expect("prepared dangling reference is in the object cache");
+    assert!(dangling_reference
+        .try_is_null()
+        .expect("resolve the prepared dangling reference"));
+
+    pdf.fix_dangling_references()
+        .expect("repeat canonical cache preparation");
+    pdf.fix_dangling_references_with_force(false)
+        .expect("prepare with force=false");
+    pdf.fix_dangling_references_with_force(true)
+        .expect("prepare with force=true");
+
+    let repeated_refs: Vec<_> = pdf
+        .get_all_objects()
+        .expect("enumerate the idempotent canonical cache")
+        .into_iter()
+        .map(|handle| handle.object_ref().expect("indirect object"))
+        .collect();
+    assert_eq!(repeated_refs, first_refs);
+}
+
+#[test]
 fn make_indirect_object_prepares_repaired_xref_before_allocating() {
     let mut pdf = Pdf::open_mem_owned_with_options(
         recovery_discovers_an_unindexed_object_pdf(),

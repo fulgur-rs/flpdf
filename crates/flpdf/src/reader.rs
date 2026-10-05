@@ -1538,13 +1538,25 @@ impl<R: Read + Seek> Pdf<R> {
     /// Prepare the canonical object cache through qpdf's
     /// `QPDF::fixDanglingReferences` boundary.
     ///
-    /// `QPDFWriter::prepareFileForWrite` calls this before it touches the
-    /// Catalog, and the writer must be able to perform that preparation
-    /// without taking the broader `getAllObjects` enumeration route. Keep the
-    /// resolver's idempotent fixed-state guard as the single owner of the
-    /// operation (`libqpdf/QPDF.cc:1259-1269`).
-    pub(crate) fn fix_dangling_references(&self) -> Result<()> {
+    /// This resolves the effective xref table and registers parser-discovered
+    /// dangling references in the canonical object cache. qpdf also calls it
+    /// before object enumeration and file writing. Repeated calls are no-ops
+    /// after the cache has been prepared.
+    ///
+    /// Use [`Self::fix_dangling_references_with_force`] to provide qpdf's
+    /// optional `force` argument. qpdf 11.9.0 does not consult that argument.
+    pub fn fix_dangling_references(&self) -> Result<()> {
         self.resolver.fix_dangling_references()
+    }
+
+    /// Prepare the canonical object cache with qpdf's optional `force`
+    /// argument (`QPDF::fixDanglingReferences(bool)`).
+    ///
+    /// qpdf 11.9.0 returns immediately whenever dangling-reference repair has
+    /// already run, regardless of `force`, so this delegates to
+    /// [`Self::fix_dangling_references`] and preserves that version's behavior.
+    pub fn fix_dangling_references_with_force(&self, _force: bool) -> Result<()> {
+        self.fix_dangling_references()
     }
 
     /// Compatibility-only explicit resolution for the qtest-driver binary.
