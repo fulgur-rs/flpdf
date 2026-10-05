@@ -28,9 +28,11 @@ use crate::pages::tree_rebuild::RebuildResult;
 use crate::pdf::WriterObjectOrderKey;
 use crate::qpdf_obj_gen::QpdfObjGen;
 #[cfg(test)]
+use crate::Matrix;
+#[cfg(test)]
 use crate::ObjectStreamMode;
 use crate::{
-    AcroFormDocumentHelper, Error, Matrix, ObjectHandle, ObjectRef, PageDocumentHelper, PageInput,
+    AcroFormDocumentHelper, Error, ObjectHandle, ObjectRef, PageDocumentHelper, PageInput,
     PageObjectHelper, PageRange, Pdf, Result, UsageError,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -212,7 +214,7 @@ pub fn copy_duplicate_page_annotations<R: Read + Seek>(
         let destination_page = pdf.get_object_handle(new_page);
         destination_page.remove_key(b"/Annots")?;
         PageObjectHelper::from_object_handle(destination_page, pdf)
-            .copy_annotations(source_page, Matrix::default())?;
+            .copy_annotations(source_page)?;
     }
     Ok(())
 }
