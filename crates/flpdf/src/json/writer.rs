@@ -58,7 +58,7 @@ impl Json {
         depth: usize,
     ) -> PipelineResult<()> {
         Self::write_dictionary_key(out, first, key, depth)?;
-        value.write(out, depth)
+        value.write_with_depth(out, depth)
     }
 
     pub fn write_dictionary_key(
@@ -117,7 +117,7 @@ impl Json {
         depth: usize,
     ) -> PipelineResult<()> {
         Self::write_next(out, first, depth)?;
-        value.write(out, depth)
+        value.write_with_depth(out, depth)
     }
 
     pub fn write_next(
@@ -134,7 +134,16 @@ impl Json {
         write_indented(out, prefix, depth, b"")
     }
 
-    pub fn write(&self, out: &mut dyn Pipeline, depth: usize) -> PipelineResult<()> {
+    /// Write this JSON value to the caller-supplied pipeline at depth zero,
+    /// matching qpdf's default `JSON::write` depth.
+    pub fn write(&self, out: &mut dyn Pipeline) -> PipelineResult<()> {
+        self.write_with_depth(out, 0)
+    }
+
+    /// Write this JSON value to the caller-supplied pipeline at an explicit nesting depth.
+    ///
+    /// The depth controls indentation by two spaces per enclosing JSON container.
+    pub fn write_with_depth(&self, out: &mut dyn Pipeline, depth: usize) -> PipelineResult<()> {
         match self.value_snapshot() {
             None => out.write(b"null"),
             Some(ValueSnapshot::Number(value)) => out.write(&value),
@@ -162,7 +171,7 @@ impl Json {
         let mut bytes = Vec::new();
         {
             let mut output = PlString::new("unparse", None, &mut bytes);
-            self.write(&mut output, 0)?;
+            self.write(&mut output)?;
         }
         Ok(bytes)
     }
@@ -196,7 +205,7 @@ fn write_container_or_blob(
                 let selected = value;
                 Json::write_dictionary_key(out, &mut first, &key, depth + 1)?;
                 let value = owner.dictionary_item_for_write(&key).unwrap_or(selected);
-                value.write(out, depth + 1)?;
+                value.write_with_depth(out, depth + 1)?;
                 previous_key = Some(key);
             }
             Json::write_dictionary_close(out, first, depth)

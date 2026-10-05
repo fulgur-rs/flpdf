@@ -767,7 +767,7 @@ pub(crate) fn run_test_98<R: Read + Seek>(
             let mut out = PlString::new("get", None, &mut fetched);
             oh.get_json_with_options(JSON_LATEST, true)
                 .map_err(|error| Error::System(error.to_string()))?
-                .write(&mut out, 7)
+                .write_with_depth(&mut out, 7)
                 .map_err(|error| Error::System(error.to_string()))?;
         }
 

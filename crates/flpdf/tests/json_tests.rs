@@ -191,7 +191,9 @@ fn incremental_writer_writes_dictionary_keys_that_are_already_encoded() {
 fn quoted_string_is_one_qpdf_pipeline_write() {
     let mut out = ChunkRecordingPipeline::default();
 
-    Json::make_string(b"line\n\\\"").write(&mut out, 0).unwrap();
+    Json::make_string(b"line\n\\\"")
+        .write_with_depth(&mut out, 0)
+        .unwrap();
 
     assert_eq!(out.chunks, [b"\"line\\n\\\\\\\"\"".to_vec()]);
 }
@@ -314,7 +316,7 @@ fn qpdf_blob_batches_base64_into_bounded_writes() {
         write_sizes: Vec::new(),
     };
 
-    blob.write(&mut out, 0).unwrap();
+    blob.write_with_depth(&mut out, 0).unwrap();
 
     let expected = format!("\"{}Wg==\"", "Wlpa".repeat(1365)).into_bytes();
     assert_eq!(out.bytes, expected);
@@ -333,7 +335,7 @@ fn blob_callback_receives_pipeline_and_outer_pipeline_is_not_finished() {
     });
     let mut out = RecordingPipeline::default();
 
-    blob.write(&mut out, 0).unwrap();
+    blob.write_with_depth(&mut out, 0).unwrap();
 
     assert_eq!(out.bytes, b"\"AQIDBA==\"");
     assert_eq!(out.finishes, 0);
@@ -347,7 +349,7 @@ fn blob_callback_failure_keeps_prefix_without_tail_or_closing_quote() {
     });
     let mut out = RecordingPipeline::default();
 
-    let error = blob.write(&mut out, 0).unwrap_err();
+    let error = blob.write_with_depth(&mut out, 0).unwrap_err();
 
     assert!(matches!(error, PipelineError::Runtime(_)));
     assert_eq!(error.message(), "blob callback failure");
@@ -360,7 +362,7 @@ fn blob_callback_finish_does_not_finish_outer_pipeline() {
     let blob = Json::make_blob(|out| out.finish());
     let mut out = RecordingPipeline::default();
 
-    blob.write(&mut out, 0).unwrap();
+    blob.write_with_depth(&mut out, 0).unwrap();
 
     assert_eq!(out.bytes, b"\"\"");
     assert_eq!(out.finishes, 0);
@@ -407,7 +409,7 @@ fn blob_callback_can_reenter_the_same_callback() {
                     .as_ref()
                     .expect("blob is installed")
                     .clone();
-                blob.write(out, 0)?;
+                blob.write_with_depth(out, 0)?;
             }
             Ok(())
         }
@@ -431,7 +433,7 @@ fn blob_error_does_not_finalize_a_partial_base64_group() {
         });
         let mut out = RecordingPipeline::default();
 
-        let error = blob.write(&mut out, 0).unwrap_err();
+        let error = blob.write_with_depth(&mut out, 0).unwrap_err();
 
         assert!(matches!(error, PipelineError::Runtime(_)));
         assert_eq!(error.to_string(), "producer failed");
@@ -448,7 +450,7 @@ fn blob_base64_finish_failure_keeps_open_quote_and_complete_groups() {
         category: ErrorCategory::Runtime,
     };
 
-    let error = blob.write(&mut out, 0).unwrap_err();
+    let error = blob.write_with_depth(&mut out, 0).unwrap_err();
 
     assert!(matches!(error, PipelineError::Runtime(_)));
     assert_eq!(error.message(), "pipeline runtime failure");
@@ -462,12 +464,36 @@ fn unparse_uses_pl_string_without_finishing() {
     let mut downstream = RecordingPipeline::default();
     {
         let mut output = PlString::new("unparse", Some(&mut downstream), &mut bytes);
-        value.write(&mut output, 0).unwrap();
+        value.write_with_depth(&mut output, 0).unwrap();
     }
 
     assert_eq!(bytes, value.unparse().unwrap());
     assert_eq!(downstream.bytes, bytes);
     assert_eq!(downstream.finishes, 0);
+}
+
+#[test]
+fn json_write_defaults_depth_to_zero_without_changing_explicit_depth() {
+    let values = Json::make_array();
+    values.add_array_element(Json::make_int(42)).unwrap();
+    let value = Json::make_dictionary();
+    value.add_dictionary_member(b"values", values).unwrap();
+
+    let mut default_depth = RecordingPipeline::default();
+    value.write(&mut default_depth).unwrap();
+
+    let mut explicit_zero = RecordingPipeline::default();
+    value.write_with_depth(&mut explicit_zero, 0).unwrap();
+
+    assert_eq!(default_depth.bytes, explicit_zero.bytes);
+    assert_eq!(default_depth.bytes, b"{\n  \"values\": [\n    42\n  ]\n}");
+
+    let mut explicit_depth = RecordingPipeline::default();
+    value.write_with_depth(&mut explicit_depth, 2).unwrap();
+    assert_eq!(
+        explicit_depth.bytes,
+        b"{\n      \"values\": [\n        42\n      ]\n    }"
+    );
 }
 
 #[test]
@@ -482,7 +508,9 @@ fn json_write_propagates_pipeline_logic_and_runtime_categories() {
             category,
         };
 
-        let error = Json::make_int(42).write(&mut out, 0).unwrap_err();
+        let error = Json::make_int(42)
+            .write_with_depth(&mut out, 0)
+            .unwrap_err();
 
         assert_eq!(error.message(), expected_message);
         match category {
@@ -515,7 +543,7 @@ fn dictionary_writer_rereads_value_after_key_output() {
         },
     };
 
-    dictionary.write(&mut sink, 0).unwrap();
+    dictionary.write_with_depth(&mut sink, 0).unwrap();
 
     assert!(replaced.get());
     assert_eq!(sink.bytes, b"{\n  \"a\": 99\n}");
@@ -544,7 +572,7 @@ fn dictionary_writer_starts_iteration_after_opening_brace() {
         },
     };
 
-    dictionary.write(&mut sink, 0).unwrap();
+    dictionary.write_with_depth(&mut sink, 0).unwrap();
 
     assert_eq!(sink.bytes, b"{\n  \"a\": 1,\n  \"b\": 2\n}");
 }
@@ -568,7 +596,7 @@ fn array_writer_snapshots_elements_after_opening_bracket() {
         },
     };
 
-    array.write(&mut sink, 0).unwrap();
+    array.write_with_depth(&mut sink, 0).unwrap();
 
     assert_eq!(sink.bytes, b"[\n  1,\n  2\n]");
 }
@@ -638,7 +666,7 @@ fn dictionary_writer_stops_after_blob_pipeline_error() {
         .unwrap();
     let mut out = RecordingPipeline::default();
 
-    let error = dictionary.write(&mut out, 0).unwrap_err();
+    let error = dictionary.write_with_depth(&mut out, 0).unwrap_err();
 
     assert!(matches!(error, PipelineError::Runtime(_)));
     assert_eq!(error.to_string(), "first blob failed");
