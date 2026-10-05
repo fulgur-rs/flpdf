@@ -16,7 +16,7 @@ fn direct_self_dictionary_can_be_promoted_to_an_indirect_self_reference() {
     let expected = format!("<< /Self {} >>", indirect.object_ref().unwrap());
     assert_eq!(indirect.unparse_resolved().unwrap(), expected.as_bytes());
     let mut direct = indirect.clone();
-    let error = direct.make_direct(false).unwrap_err();
+    let error = direct.make_direct().unwrap_err();
     assert!(matches!(error, flpdf::Error::System(message)
         if message == "loop detected while converting object from indirect to direct"));
 }

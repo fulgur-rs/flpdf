@@ -206,7 +206,7 @@ pub(crate) fn run_test_4<R: Read + Seek>(
 ) -> flpdf::Result<()> {
     let trailer = pdf.trailer();
     let mut qtest = trailer.try_get_key(b"/QTest")?;
-    qtest.make_direct(false)?;
+    qtest.make_direct()?;
     qtest.remove_key(b"/Subject")?;
     qtest.replace_key(
         b"/Author",
@@ -247,7 +247,7 @@ pub(crate) fn run_test_4<R: Read + Seek>(
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
         .map_err(Error::from)?;
     if !qtest2_is_null? {
-        qtest2.make_direct(true)?;
+        qtest2.make_direct_with_options(true)?;
         trailer.replace_key(b"/QTest2", qtest2)?;
     }
 

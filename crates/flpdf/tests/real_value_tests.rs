@@ -85,11 +85,11 @@ fn real_precision_and_raw_json_follow_qpdf_text_rules() {
         let real = ObjectHandle::real_from_string(text);
         let mut bytes = Vec::new();
         let mut sink = flpdf::pipeline::PlString::new("real", None, &mut bytes);
-        real.write_json(2, &mut sink, false, 0).unwrap();
+        real.write_json(2, &mut sink).unwrap();
         assert_eq!(bytes, expected.as_bytes());
     }
     assert!(matches!(
-        ObjectHandle::real(f64::NAN).get_json(2, false),
+        ObjectHandle::real(f64::NAN).get_json(2),
         Err(flpdf::ObjectJsonError::Json(_))
     ));
 }

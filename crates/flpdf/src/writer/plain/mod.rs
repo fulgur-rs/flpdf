@@ -415,11 +415,11 @@ fn assign_late_references<R: Read + Seek>(
             continue;
         }
         let handle = pdf.get_object_handle(reference);
-        if qdf && handle.try_is_stream_of_type(b"XRef", b"")? {
+        if qdf && handle.try_is_stream_of_type(b"XRef")? {
             map.insert(reference, ObjectRef::new(0, 0));
             continue;
         }
-        let is_stream = qdf && handle.try_is_stream_of_type(b"", b"")?;
+        let is_stream = qdf && handle.try_is_stream_of_type(b"")?;
         map.insert(reference, ObjectRef::new(next, 0));
         let increment = if is_stream { 2 } else { 1 };
         next = next.checked_add(increment).ok_or_else(|| {

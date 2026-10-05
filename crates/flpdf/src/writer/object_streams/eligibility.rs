@@ -281,7 +281,7 @@ pub(crate) fn even_split_into_streams_with_cap(
 /// predicate. This is shared by Generate's `getCompressibleObjGens` port and
 /// Preserve's source-container filtering.
 pub(crate) fn is_qpdf_signature_dict(object: &ObjectHandle) -> crate::Result<bool> {
-    if !object.try_is_dictionary_of_type(b"", b"")? {
+    if !object.try_is_dictionary_of_type(b"")? {
         return Ok(false);
     }
     let type_value = object.try_get_key(b"/Type")?;
@@ -300,7 +300,7 @@ fn push_handle_children(object: &ObjectHandle, stack: &mut Vec<ObjectHandle>) ->
     if let Some(dict) = object.as_stream_dict() {
         return push_handle_dict_children(&dict, stack, true);
     }
-    if object.try_is_dictionary_of_type(b"", b"")? {
+    if object.try_is_dictionary_of_type(b"")? {
         return push_handle_dict_children(object, stack, false);
     }
     if object.try_is_array()? {

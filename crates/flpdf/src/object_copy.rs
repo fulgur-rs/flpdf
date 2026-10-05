@@ -418,7 +418,7 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
                 ));
             }
         }
-        if self.stop_at_page_tree && foreign.try_is_dictionary_of_type(b"Pages", b"")? {
+        if self.stop_at_page_tree && foreign.try_is_dictionary_of_type(b"Pages")? {
             return Ok(());
         }
 
@@ -426,7 +426,7 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
             .qpdf_obj_gen()
             .filter(|object_gen| object_gen.is_indirect())
         {
-            let is_page = foreign.try_is_dictionary_of_type(b"Page", b"")?;
+            let is_page = foreign.try_is_dictionary_of_type(b"Page")?;
             let is_stream = foreign.as_stream_dict().is_some();
             if self.visiting.contains(&source_object_gen) {
                 return Ok(());

@@ -51,7 +51,7 @@ fn shallow_copy_and_unparse_accept_programmatic_graphs_beyond_parser_depth() {
 #[test]
 fn make_direct_uses_qpdf_object_generations_and_accepts_deep_direct_graphs() {
     let mut value = deeply_nested_array(DIRECT_DEPTH);
-    value.make_direct(false).unwrap();
+    value.make_direct().unwrap();
     assert_eq!(
         value.unparse_resolved().unwrap(),
         qpdf_nested_array_unparse(DIRECT_DEPTH)
@@ -62,7 +62,7 @@ fn make_direct_uses_qpdf_object_generations_and_accepts_deep_direct_graphs() {
 fn make_direct_preserves_qpdf_uninitialized_receiver_error() {
     let mut value = ObjectHandle::uninitialized();
     let error = value
-        .make_direct(false)
+        .make_direct()
         .expect_err("qpdf asserts initialization before reading ObjGen");
 
     assert!(matches!(
@@ -79,7 +79,9 @@ fn direct_json_writer_has_no_container_depth_cap() {
     let mut bytes = Vec::new();
     let mut output = flpdf::pipeline::PlString::new("direct JSON depth", None, &mut bytes);
 
-    value.write_json(2, &mut output, true, 0).unwrap();
+    value
+        .write_json_with_options(2, &mut output, true, 0)
+        .unwrap();
 
     assert_eq!(bytes, expected);
 }
@@ -88,7 +90,7 @@ fn direct_json_writer_has_no_container_depth_cap() {
 fn get_json_keeps_the_qpdf_input_parser_depth_limit() {
     let value = deeply_nested_array(DIRECT_DEPTH);
     let error = value
-        .get_json(2, true)
+        .get_json_with_options(2, true)
         .expect_err("getJSON reparses the serialized value with qpdf's JSON parser");
 
     assert!(matches!(

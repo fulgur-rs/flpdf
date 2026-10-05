@@ -875,7 +875,7 @@ impl WriteObject for LinearizedObjectEmitter<'_, '_> {
                     && self.content_normalize_refs.contains(&original_ref),
             )?; // cov:ignore: LLVM maps this covered stream-output call terminator to a zero-count continuation region
         let payload_ctx = self.encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref);
-        let is_metadata_stream = stream_dict.try_is_dictionary_of_type(b"Metadata", b"")?;
+        let is_metadata_stream = stream_dict.try_is_dictionary_of_type(b"Metadata")?;
         let cleartext_metadata =
             payload_ctx.is_some_and(|ctx| !ctx.encrypt_metadata && is_metadata_stream);
         // qpdf clears the active data key for cleartext metadata and leaves the

@@ -758,14 +758,14 @@ pub(crate) fn run_test_98<R: Read + Seek>(
         let mut written = Vec::new();
         {
             let mut out = PlString::new("write", None, &mut written);
-            oh.write_json(JSON_LATEST, &mut out, true, 7)
+            oh.write_json_with_options(JSON_LATEST, &mut out, true, 7)
                 .map_err(|error| Error::System(error.to_string()))?;
         }
 
         let mut fetched = Vec::new();
         {
             let mut out = PlString::new("get", None, &mut fetched);
-            oh.get_json(JSON_LATEST, true)
+            oh.get_json_with_options(JSON_LATEST, true)
                 .map_err(|error| Error::System(error.to_string()))?
                 .write(&mut out, 7)
                 .map_err(|error| Error::System(error.to_string()))?;

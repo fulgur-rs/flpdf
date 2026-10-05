@@ -120,7 +120,7 @@ fn test_56_59_body<R: Read + Seek>(
                 PageObjectHelper::from_object_handle(pages1[index].clone(), pdf);
             let resources = destination_page.get_attribute(b"/Resources", true)?;
             let mut min_suffix = 1;
-            let name = resources.get_unique_resource_name(b"/Fx", &mut min_suffix, None)?;
+            let name = resources.get_unique_resource_name(b"/Fx", &mut min_suffix)?;
             let rect = destination_page
                 .get_trim_box()?
                 .try_get_array_as_rectangle()?;
@@ -134,7 +134,7 @@ fn test_56_59_body<R: Read + Seek>(
                 true,
                 false,
             )?; // cov:ignore: valid qpdf fixtures cover placement success; this is only the defensive Result propagation edge
-            resources.merge_resources(&ObjectHandle::parse(b"<< /XObject << >> >>")?, None)?;
+            resources.merge_resources(&ObjectHandle::parse(b"<< /XObject << >> >>")?)?;
             resources
                 .try_get_key(b"/XObject")?
                 .replace_key(&name, form)?;
@@ -322,8 +322,8 @@ pub(crate) fn run_test_60<R: Read + Seek + 'static>(
     let r1 = ObjectHandle::dictionary(vec![]);
     let mut min_suffix: usize = 1;
     for _ in 1..3 {
-        let name = r1.get_unique_resource_name(b"/Quack", &mut min_suffix, None)?;
-        r1.merge_resources(&ObjectHandle::parse(b"<< /Z << >> >>")?, None)?;
+        let name = r1.get_unique_resource_name(b"/Quack", &mut min_suffix)?;
+        r1.merge_resources(&ObjectHandle::parse(b"<< /Z << >> >>")?)?;
         r1.try_get_key(b"/Z")?
             .replace_key(&name, ObjectHandle::string(b"moo".to_vec()))?;
     }
@@ -348,21 +348,21 @@ pub(crate) fn run_test_60<R: Read + Seek + 'static>(
 
     let mut conflicts: MergeConflicts = MergeConflicts::new();
 
-    r1.merge_resources(&r2, Some(&mut conflicts))?;
+    r1.merge_resources_with_conflicts(&r2, Some(&mut conflicts))?;
     show_conflicts("first merge", &conflicts, stdout)?;
     let r3 = r1.shallow_copy()?;
     // Merge again. The direct object gets recopied. Everything else is the same
     // (test_driver.cc:2189-2190).
-    r1.merge_resources(&r2, Some(&mut conflicts))?;
+    r1.merge_resources_with_conflicts(&r2, Some(&mut conflicts))?;
     show_conflicts("second merge", &conflicts, stdout)?;
 
     // qpdf promotes every direct value in r2's resource subdictionaries
     // before the third and fourth merges. This is the canonical qpdf-shaped
     // operation, not a driver-local traversal.
     r2.make_resources_indirect(pdf)?;
-    r1.merge_resources(&r2, Some(&mut conflicts))?;
+    r1.merge_resources_with_conflicts(&r2, Some(&mut conflicts))?;
     show_conflicts("third merge", &conflicts, stdout)?;
-    r1.merge_resources(&r2, Some(&mut conflicts))?;
+    r1.merge_resources_with_conflicts(&r2, Some(&mut conflicts))?;
     show_conflicts("fourth merge", &conflicts, stdout)?;
 
     // Pdf::trailer returns the live dictionary observed by the writer, so the

@@ -588,7 +588,7 @@ fn encrypted_linearized_raw_metadata_does_not_cleartext_other_raw_streams() {
         10
     );
     assert!(raw_metadata
-        .try_is_stream_of_type(b"Metadata", b"")
+        .try_is_stream_of_type(b"Metadata")
         .expect("inspect raw metadata type"));
     let root = pdf.root_handle().expect("resolve Catalog");
     root.replace_key(b"/Metadata", raw_metadata)
@@ -598,7 +598,7 @@ fn encrypted_linearized_raw_metadata_does_not_cleartext_other_raw_streams() {
         .expect("attach non-metadata raw stream");
     assert!(pdf
         .get_object_handle_by_raw_identity(5, 65_536)
-        .try_is_stream_of_type(b"Metadata", b"")
+        .try_is_stream_of_type(b"Metadata")
         .expect("reinspect attached raw metadata type"));
 
     let mut encryption = EncryptParams::v4_aes128(b"user", b"owner");

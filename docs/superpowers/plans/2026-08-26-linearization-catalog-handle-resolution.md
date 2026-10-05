@@ -102,7 +102,7 @@ fn prepare_linearization_catalog<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()>
     if extensions.try_has_key(b"/ADBE")? {
         let mut adbe = extensions.try_get_key(b"/ADBE")?;
         if adbe.is_indirect() {
-            adbe.make_direct(false)?;
+            adbe.make_direct()?;
             extensions.replace_key(b"/ADBE", adbe)?;
             pdf.mark_object_handle_dirty(&root)?;
         }

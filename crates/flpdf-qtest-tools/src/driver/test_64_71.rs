@@ -107,7 +107,7 @@ fn test_64_67_body<R: Read + Seek>(
                 PageObjectHelper::from_object_handle(pages1[index].clone(), pdf);
             let resources = destination_page.get_attribute(b"/Resources", true)?;
             let mut min_suffix = 1;
-            let name = resources.get_unique_resource_name(b"/Fx", &mut min_suffix, None)?;
+            let name = resources.get_unique_resource_name(b"/Fx", &mut min_suffix)?;
             let rect = destination_page
                 .get_trim_box()?
                 .try_get_array_as_rectangle()?;
@@ -121,7 +121,7 @@ fn test_64_67_body<R: Read + Seek>(
                 allow_shrink,
                 allow_expand,
             )?; // cov:ignore: valid qpdf fixtures cover placement success; this is only the defensive Result propagation edge
-            resources.merge_resources(&ObjectHandle::parse(b"<< /XObject << >> >>")?, None)?;
+            resources.merge_resources(&ObjectHandle::parse(b"<< /XObject << >> >>")?)?;
             resources
                 .try_get_key(b"/XObject")?
                 .replace_key(&name, form)?;

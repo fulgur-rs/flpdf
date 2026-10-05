@@ -209,7 +209,7 @@ fn object_number_zero_resolves_to_null_through_a_real_pdf() {
         let mut pdf = open();
         let handle = pdf.get_object_handle(object_zero());
         let json = handle
-            .get_json(2, dereference_indirect)
+            .get_json_with_options(2, dereference_indirect)
             .expect("object number zero must serialize as JSON null");
         assert!(
             json.is_null(),
@@ -240,7 +240,7 @@ fn an_unresolved_object_number_zero_array_element_is_not_resolved_for_json() {
     let array = ObjectHandle::array(vec![zero, ObjectHandle::integer(1)]);
 
     let error = array
-        .get_json(2, true)
+        .get_json_with_options(2, true)
         .expect_err("the value route must not resolve an array element");
 
     assert_eq!(
@@ -268,7 +268,7 @@ fn a_dictionary_value_at_object_number_zero_is_omitted_from_json_like_qpdf() {
     ]);
 
     let json = dictionary
-        .get_json(2, true)
+        .get_json_with_options(2, true)
         .expect("object number zero settles to null on the handle route, not an error");
 
     let mut keys = Vec::new();

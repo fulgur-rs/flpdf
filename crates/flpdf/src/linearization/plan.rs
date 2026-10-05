@@ -405,8 +405,7 @@ fn collect_handle_children_with_stream_parameters(
 
 /// Returns whether a live handle is a page-tree interior or leaf node.
 fn is_page_tree_handle(handle: &ObjectHandle) -> Result<bool> {
-    Ok(handle.try_is_dictionary_of_type(b"Pages", b"")?
-        || handle.try_is_dictionary_of_type(b"Page", b"")?)
+    Ok(handle.try_is_dictionary_of_type(b"Pages")? || handle.try_is_dictionary_of_type(b"Page")?)
 }
 
 fn compute_closure_with_stream_parameters<R: Read + Seek>(
@@ -489,8 +488,8 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
 
         // Determine whether this is a Pages node (intermediate page-tree node)
         // or a Page leaf node.
-        let is_pages_node = current_handle.try_is_dictionary_of_type(b"Pages", b"")?;
-        let is_page_leaf = current_handle.try_is_dictionary_of_type(b"Page", b"")?;
+        let is_pages_node = current_handle.try_is_dictionary_of_type(b"Pages")?;
+        let is_page_leaf = current_handle.try_is_dictionary_of_type(b"Page")?;
 
         if is_pages_node || is_page_leaf {
             if let Some(dict) = current_handle.try_as_dictionary()? {
@@ -1117,9 +1116,7 @@ fn build_raw_linearization_plan<R: Read + Seek>(
         let object =
             pdf.get_object_handle_by_raw_identity(object_gen.get_obj(), object_gen.get_gen());
         // cov:ignore-start: linearization object-user maps do not admit writer-owned structural streams as raw body identities
-        if object.try_is_stream_of_type(b"XRef", b"")?
-            || object.try_is_stream_of_type(b"ObjStm", b"")?
-        {
+        if object.try_is_stream_of_type(b"XRef")? || object.try_is_stream_of_type(b"ObjStm")? {
             continue;
         }
         // cov:ignore-end
@@ -1860,8 +1857,8 @@ impl LinearizationPlan {
             // `isDictionaryOfType`, `libqpdf/QPDFObjectHandle.cc:461-466`),
             // so it can never match here; `try_is_stream_of_type` mirrors
             // qpdf's dedicated `isStreamOfType` (`:468-471`) instead.
-            if object_handle.try_is_stream_of_type(b"XRef", b"")?
-                || object_handle.try_is_stream_of_type(b"ObjStm", b"")?
+            if object_handle.try_is_stream_of_type(b"XRef")?
+                || object_handle.try_is_stream_of_type(b"ObjStm")?
             {
                 continue;
             }

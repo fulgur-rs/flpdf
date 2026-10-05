@@ -94,7 +94,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         let resolved = filespec.clone();
         if !resolved.try_is_dictionary()? {
             resolved.warn_if_possible("Embedded file object is not a dictionary")?;
-        } else if !resolved.try_is_dictionary_of_type(b"Filespec", b"")? {
+        } else if !resolved.try_is_dictionary_of_type(b"Filespec")? {
             resolved.warn_if_possible("Embedded file object's type is not /Filespec")?;
         }
         Ok(Self { filespec, pdf })

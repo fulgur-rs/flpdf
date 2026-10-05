@@ -362,9 +362,7 @@ fn preserve_planner_keeps_members_when_reachable_source_container_is_removed() {
     .unwrap();
     let source_container = pdf.get_object_handle(ObjectRef::new(1, 0));
     assert!(
-        source_container
-            .try_is_stream_of_type(b"ObjStm", b"")
-            .unwrap(),
+        source_container.try_is_stream_of_type(b"ObjStm").unwrap(),
         "the fixture must expose its source ObjStm before the mutation"
     );
     pdf.root_handle()

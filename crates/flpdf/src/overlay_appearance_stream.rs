@@ -127,7 +127,7 @@ pub(crate) fn adjust_appearance_stream_handle<R: Read + Seek>(
             })
             .collect(),
     );
-    private_resources.merge_resources(&merge_with, None)?;
+    private_resources.merge_resources(&merge_with)?;
 
     // The first merge is live and sequential, exactly like qpdf's
     // subdict.getKey/replaceKey loop. Values displaced by a destination name
@@ -159,7 +159,7 @@ pub(crate) fn adjust_appearance_stream_handle<R: Read + Seek>(
     }
 
     let mut conflicts = ResourceConflicts::new();
-    private_resources.merge_resources(&merge_with, Some(&mut conflicts))?;
+    private_resources.merge_resources_with_conflicts(&merge_with, Some(&mut conflicts))?;
     let mut local_dr_map = dr_map.clone();
     extend_dr_map_from_conflicts(&mut local_dr_map, &conflicts);
 

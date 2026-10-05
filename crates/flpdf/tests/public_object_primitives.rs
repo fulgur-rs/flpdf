@@ -23,7 +23,7 @@ fn qpdf_object_handle_primitives_are_available_to_external_crates() {
         ),
     ]);
     assert!(filter
-        .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"Identity")
+        .try_is_dictionary_of_type_with_subtype(b"CryptFilterDecodeParms", b"Identity")
         .unwrap());
 
     let resources = ObjectHandle::dictionary(vec![
@@ -52,10 +52,14 @@ fn qpdf_stream_type_predicate_is_available_to_external_crates() {
         .replace_key(b"/Subtype", ObjectHandle::name(b"Member".to_vec()))
         .unwrap();
 
-    assert!(stream.try_is_stream_of_type(b"ObjStm", b"Member").unwrap());
-    assert!(!stream.try_is_stream_of_type(b"XRef", b"Member").unwrap());
+    assert!(stream
+        .try_is_stream_of_type_with_subtype(b"ObjStm", b"Member")
+        .unwrap());
+    assert!(!stream
+        .try_is_stream_of_type_with_subtype(b"XRef", b"Member")
+        .unwrap());
     assert!(!ObjectHandle::dictionary(Vec::new())
-        .try_is_stream_of_type(b"ObjStm", b"")
+        .try_is_stream_of_type(b"ObjStm")
         .unwrap());
 }
 

@@ -350,7 +350,7 @@ fn add_default_font_to_existing_appearance<R: Read + Seek>(
         b"/Font".to_vec(),
         ObjectHandle::dictionary(Vec::new()),
     )]);
-    resources.merge_resources(&empty_font, None)?;
+    resources.merge_resources(&empty_font)?;
     resources
         .try_get_key(b"/Font")?
         .replace_key(&resource_key(&font.resource_name), font.font.clone())?;

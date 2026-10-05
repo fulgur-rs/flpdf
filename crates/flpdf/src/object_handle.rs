@@ -3332,7 +3332,17 @@ impl ObjectHandle {
     /// keys use qpdf's canonical leading slash; the requested type names
     /// remain decoded name bytes without it, such as
     /// `CryptFilterDecodeParms`.
-    pub fn try_is_dictionary_of_type(&self, type_name: &[u8], subtype_name: &[u8]) -> Result<bool> {
+    pub fn try_is_dictionary_of_type(&self, type_name: &[u8]) -> Result<bool> {
+        self.try_is_dictionary_of_type_with_subtype(type_name, b"")
+    }
+
+    /// Test a dictionary type with an explicit subtype, matching qpdf's
+    /// `isDictionaryOfType(type, subtype)` form.
+    pub fn try_is_dictionary_of_type_with_subtype(
+        &self,
+        type_name: &[u8],
+        subtype_name: &[u8],
+    ) -> Result<bool> {
         self.try_dereference()?;
         let is_dictionary =
             self.with_value(|value| matches!(value, Some(ObjectValue::Dictionary(_))));
@@ -3401,12 +3411,21 @@ impl ObjectHandle {
     /// dictionary value, this matches a stream's *nested* dictionary --
     /// the shape every `/Type /ObjStm` or `/Type /XRef` object actually
     /// has, since both are required to carry stream data.
-    pub fn try_is_stream_of_type(&self, type_name: &[u8], subtype_name: &[u8]) -> Result<bool> {
+    pub fn try_is_stream_of_type(&self, type_name: &[u8]) -> Result<bool> {
+        self.try_is_stream_of_type_with_subtype(type_name, b"")
+    }
+
+    /// Test a stream's dictionary type with an explicit subtype.
+    pub fn try_is_stream_of_type_with_subtype(
+        &self,
+        type_name: &[u8],
+        subtype_name: &[u8],
+    ) -> Result<bool> {
         self.try_dereference()?;
         let Some(stream_dict) = self.as_stream_dict() else {
             return Ok(false);
         };
-        stream_dict.try_is_dictionary_of_type(type_name, subtype_name)
+        stream_dict.try_is_dictionary_of_type_with_subtype(type_name, subtype_name)
     }
 
     /// qpdf-compatible array inspection with lazy dereference. Only the array
@@ -5474,10 +5493,19 @@ impl ObjectHandle {
     /// cycle while it is being traversed. qpdf's `QPDFObjGen::set` ignores
     /// object number zero, so direct containers are not cycle-tracked here.
     ///
-    /// When `allow_streams` is true, stream handles are retained as-is and
-    /// are not converted to direct values. When it is false, encountering a
-    /// stream returns qpdf's exact runtime-error text.
-    pub fn make_direct(&mut self, allow_streams: bool) -> Result<()> {
+    /// This no-option form uses qpdf's `allow_streams = false` default
+    /// (`include/qpdf/QPDFObjectHandle.hh:919`), so encountering a stream
+    /// returns qpdf's exact runtime-error text. Use
+    /// [`Self::make_direct_with_options`] to select the explicit stream policy.
+    pub fn make_direct(&mut self) -> Result<()> {
+        self.make_direct_with_options(false)
+    }
+
+    /// Recursively make this object direct with qpdf's explicit stream policy.
+    /// When `allow_streams` is true, stream handles are retained as-is and are
+    /// not converted to direct values; when false, encountering a stream
+    /// returns qpdf's exact runtime-error text.
+    pub fn make_direct_with_options(&mut self, allow_streams: bool) -> Result<()> {
         if !self.is_initialized() {
             return Err(Error::Internal(
                 "operation attempted on uninitialized QPDFObjectHandle".to_owned(),
@@ -5618,10 +5646,12 @@ impl ObjectHandle {
     /// mirroring `QPDFObjectHandle::mergeResources`
     /// (`libqpdf/QPDFObjectHandle.cc:1063-1153`; intended for merging two
     /// `/Resources`- or `/DR`-shaped dictionaries, per its own header doc,
-    /// `include/qpdf/QPDFObjectHandle.hh:820-829`). `conflicts`, if given,
-    /// records `rtype -> old_key -> new_key` for some (not all — see below)
-    /// inner keys `other` had that collided with an existing key under the
-    /// same top-level `rtype`.
+    /// `include/qpdf/QPDFObjectHandle.hh:820-829`). This no-conflicts form
+    /// uses qpdf's default `conflicts = nullptr`. The explicit
+    /// [`Self::merge_resources_with_conflicts`] variant can record
+    /// `rtype -> old_key -> new_key` for some (not all — see below) inner
+    /// keys `other` had that collided with an existing key under the same
+    /// top-level `rtype`.
     ///
     /// A no-op unless both `self` and `other` are dictionaries. For each of
     /// `other`'s top-level entries `(rtype, other_val)`:
@@ -5693,7 +5723,14 @@ impl ObjectHandle {
     /// qpdf's own loop.
     /// Also propagates lazy-resolution errors from nested array items and
     /// second-level dictionary values inspected by the qpdf-shaped helpers.
-    pub fn merge_resources(
+    pub fn merge_resources(&self, other: &ObjectHandle) -> Result<()> {
+        self.merge_resources_with_conflicts(other, None)
+    }
+
+    /// Merge resources with qpdf's optional conflict-name map.
+    ///
+    /// Passing `None` has the same behavior as [`Self::merge_resources`].
+    pub fn merge_resources_with_conflicts(
         &self,
         other: &ObjectHandle,
         mut conflicts: Option<&mut ResourceConflicts>,
@@ -5796,6 +5833,15 @@ impl ObjectHandle {
         &self,
         prefix: &[u8],
         min_suffix: &mut usize,
+    ) -> Result<Vec<u8>> {
+        self.get_unique_resource_name_with_resource_names(prefix, min_suffix, None)
+    }
+
+    /// Find a unique resource name using an explicit caller-supplied name set.
+    pub fn get_unique_resource_name_with_resource_names(
+        &self,
+        prefix: &[u8],
+        min_suffix: &mut usize,
         resource_names: Option<&std::collections::BTreeSet<Vec<u8>>>,
     ) -> Result<Vec<u8>> {
         let names = match resource_names {
@@ -5844,10 +5890,17 @@ impl ObjectHandle {
     /// Whether this handle is an Image XObject.
     ///
     /// This ports `QPDFObjectHandle::isImage`
-    /// (`libqpdf/QPDFObjectHandle.cc:2345-2352`). With
-    /// `exclude_imagemask` set, a boolean `/ImageMask true` excludes the
-    /// stream; non-boolean or missing `/ImageMask` values do not.
-    pub fn is_image(&self, exclude_imagemask: bool) -> Result<bool> {
+    /// (`libqpdf/QPDFObjectHandle.cc:2345-2352`) using qpdf's
+    /// `exclude_imagemask = true` default (`include/qpdf/QPDFObjectHandle.hh:1334`).
+    /// A boolean `/ImageMask true` excludes the stream; non-boolean or
+    /// missing `/ImageMask` values do not. Use [`Self::is_image_with_options`]
+    /// to include imagemasks.
+    pub fn is_image(&self) -> Result<bool> {
+        self.is_image_with_options(true)
+    }
+
+    /// Test whether this handle is an image with an explicit imagemask policy.
+    pub fn is_image_with_options(&self, exclude_imagemask: bool) -> Result<bool> {
         if self.type_code()? != 10 {
             return Ok(false);
         }
@@ -6175,10 +6228,17 @@ impl ObjectHandle {
 
     /// Apply one qpdf lexical token filter to decoded page contents.
     ///
-    /// `next` is the optional downstream pipeline corresponding to qpdf's
-    /// nullable `Pipeline*` argument. The canonical page-content route owns
-    /// tokenizer construction and finishes it exactly once.
-    pub fn filter_page_contents<'a>(
+    /// This no-pipeline form maps qpdf's `next = nullptr` default
+    /// (`include/qpdf/QPDFObjectHandle.hh:458`). The canonical page-content
+    /// route owns tokenizer construction and finishes it exactly once. Use
+    /// [`Self::filter_page_contents_with_pipeline`] to provide a downstream
+    /// pipeline.
+    pub fn filter_page_contents(&self, filter: &mut dyn TokenFilter) -> Result<()> {
+        self.filter_page_contents_with_pipeline(filter, None)
+    }
+
+    /// Apply a token filter to page contents with an optional output pipeline.
+    pub fn filter_page_contents_with_pipeline<'a>(
         &self,
         filter: &'a mut dyn TokenFilter,
         next: Option<&'a mut dyn Pipeline>,
@@ -6194,9 +6254,17 @@ impl ObjectHandle {
     /// Apply one qpdf lexical token filter to this stream/Form contents.
     ///
     /// This ports `QPDFObjectHandle::filterAsContents`
-    /// (`libqpdf/QPDFObjectHandle.cc:1762-1767`) over the specialized decode
-    /// path, without introducing a second tokenizer or filter implementation.
-    pub fn filter_as_contents<'a>(
+    /// (`include/qpdf/QPDFObjectHandle.hh:469`,
+    /// `libqpdf/QPDFObjectHandle.cc:1762-1767`) with qpdf's `next = nullptr`
+    /// default over the specialized decode path, without introducing a
+    /// second tokenizer or filter implementation. Use
+    /// [`Self::filter_as_contents_with_pipeline`] to provide a pipeline.
+    pub fn filter_as_contents(&self, filter: &mut dyn TokenFilter) -> Result<()> {
+        self.filter_as_contents_with_pipeline(filter, None)
+    }
+
+    /// Apply a token filter to Form/content-stream data with an optional pipeline.
+    pub fn filter_as_contents_with_pipeline<'a>(
         &self,
         filter: &'a mut dyn TokenFilter,
         next: Option<&'a mut dyn Pipeline>,
@@ -6864,7 +6932,7 @@ impl ObjectHandle {
 
         if matches!(json_data, QpdfStreamJsonData::None) {
             Json::write_dictionary_key(out, &mut stream_first, b"dict", depth + 1)?;
-            stream_dict.write_json(json_version, out, false, depth + 1)?;
+            stream_dict.write_json_with_options(json_version, out, false, depth + 1)?;
             Json::write_dictionary_close(out, stream_first, depth)?;
             return Ok(decode_level);
         }
@@ -6953,7 +7021,7 @@ impl ObjectHandle {
         }
 
         Json::write_dictionary_key(out, &mut stream_first, b"dict", depth + 1)?;
-        dict.write_json(json_version, out, false, depth + 1)?;
+        dict.write_json_with_options(json_version, out, false, depth + 1)?;
         Json::write_dictionary_close(out, stream_first, depth)?;
         Ok(decode_level)
     }
@@ -7578,21 +7646,19 @@ impl ObjectHandle {
 
     /// Write this handle's JSON encoding to a pipeline.
     ///
-    /// This ports `QPDFObjectHandle::writeJSON`
+    /// This maps qpdf's default call `writeJSON(json_version, p)`
     /// (`include/qpdf/QPDFObjectHandle.hh:1205`,
-    /// `libqpdf/QPDFObjectHandle.cc:1630-1647`), which qpdf documents as
-    /// equivalent to, but more efficient than, calling
-    /// `getJSON(json_version, dereference_indirect).write(p, depth)` — see
-    /// [`Self::get_json`]. The writer is deliberately owned by the handle
-    /// layer: qpdf dispatches from `QPDFObjectHandle::writeJSON` into each
+    /// `libqpdf/QPDFObjectHandle.cc:1630-1647`) to the `false` dereference
+    /// and zero initial-depth defaults, equivalent to
+    /// `getJSON(json_version).write(p, 0)`. The writer is deliberately owned
+    /// by the handle layer: qpdf dispatches from `QPDFObjectHandle::writeJSON` into each
     /// `QPDF_*::writeJSON` implementation using one `JSON::Writer`
     /// (`QPDF_Array.cc:153-187`, `QPDF_Dictionary.cc:72-95`,
     /// `qpdf/JSON_writer.hh:16-135`), and the caller retains the outer
-    /// pipeline's `finish` boundary. `dereference_indirect` applies only to
-    /// this handle: array and dictionary children use qpdf's ordinary
-    /// non-dereferencing child dispatch, so an indirect child remains an
-    /// `"N G R"` string even when the parent was requested with
-    /// `dereference_indirect = true`.
+    /// pipeline's `finish` boundary. This default route does not dereference
+    /// the handle; indirect objects are serialized as `"N G R"` references.
+    /// Use [`Self::write_json_with_options`] for qpdf's explicit
+    /// dereference/depth arguments.
     ///
     /// # Errors
     ///
@@ -7600,6 +7666,20 @@ impl ObjectHandle {
     /// is `1` or `2`, and otherwise propagates the pipeline and object-state
     /// failures documented on [`ObjectJsonError`].
     pub fn write_json(
+        &self,
+        json_version: i32,
+        out: &mut dyn Pipeline,
+    ) -> std::result::Result<(), ObjectJsonError> {
+        self.write_json_with_options(json_version, out, false, 0)
+    }
+
+    /// Write JSON with qpdf's explicit dereference and initial-depth options.
+    ///
+    /// `dereference_indirect` applies only to this handle: array and
+    /// dictionary children use qpdf's ordinary non-dereferencing child
+    /// dispatch, so an indirect child remains an `"N G R"` string even when
+    /// this handle is requested with `dereference_indirect = true`.
+    pub fn write_json_with_options(
         &self,
         json_version: i32,
         out: &mut dyn Pipeline,
@@ -7620,8 +7700,11 @@ impl ObjectHandle {
 
     /// Return this handle's JSON encoding.
     ///
-    /// This ports `QPDFObjectHandle::getJSON(int json_version, bool
-    /// dereference_indirect)` (`include/qpdf/QPDFObjectHandle.hh:1198`).
+    /// This maps qpdf's default `getJSON(json_version)` call, which uses
+    /// `dereference_indirect = false`
+    /// (`include/qpdf/QPDFObjectHandle.hh:1198`). Use
+    /// [`Self::get_json_with_options`] to request qpdf's explicit
+    /// indirect-dereference option.
     /// `PlString` is the flpdf equivalent of qpdf's `Pl_Buffer` at this
     /// boundary: `get_json` writes through the same canonical handle writer
     /// used by [`Self::write_json`] and only parses the completed bytes
@@ -7635,12 +7718,20 @@ impl ObjectHandle {
     pub fn get_json(
         &self,
         json_version: i32,
+    ) -> std::result::Result<crate::json::Json, ObjectJsonError> {
+        self.get_json_with_options(json_version, false)
+    }
+
+    /// Return JSON with qpdf's explicit indirect-dereference option.
+    pub fn get_json_with_options(
+        &self,
+        json_version: i32,
         dereference_indirect: bool,
     ) -> std::result::Result<crate::json::Json, ObjectJsonError> {
         let mut bytes = Vec::new();
         {
             let mut out = PlString::new("object json", None, &mut bytes);
-            self.write_json(json_version, &mut out, dereference_indirect, 0)?;
+            self.write_json_with_options(json_version, &mut out, dereference_indirect, 0)?;
         }
         crate::json::Json::parse(&bytes).map_err(|error| ObjectJsonError::Json(error.to_string()))
     }
@@ -8667,7 +8758,9 @@ mod object_json_writer_tests {
         ] {
             let mut bytes = Vec::new();
             let mut output = PlString::new("promoted-json", None, &mut bytes);
-            promoted.write_json(2, &mut output, dereference, 0).unwrap();
+            promoted
+                .write_json_with_options(2, &mut output, dereference, 0)
+                .unwrap();
             assert_eq!(bytes, expected);
             assert_eq!(original.is_resolved(), dereference);
             assert!(original.is_same_object_as(&promoted));
@@ -8685,7 +8778,7 @@ mod object_json_writer_tests {
         let mut bytes = Vec::new();
         let mut output = PlString::new("raw-generation-json", None, &mut bytes);
 
-        raw.write_json(2, &mut output, false, 0)
+        raw.write_json(2, &mut output)
             .expect("raw qpdf identity is sufficient for a JSON reference");
 
         assert_eq!(bytes, b"\"9 65535 R\"");
@@ -8698,7 +8791,7 @@ mod object_json_writer_tests {
         let mut output = PlString::new("object-handle-json", None, &mut bytes);
 
         let error = handle
-            .write_json(2, &mut output, false, 0)
+            .write_json(2, &mut output)
             .expect_err("reserved values have no JSON representation");
 
         assert!(matches!(error, ObjectJsonError::Reserved));
@@ -8715,7 +8808,7 @@ mod object_json_writer_tests {
         let mut output = PlString::new("object-handle-json", None, &mut bytes);
 
         let error = handle
-            .write_json(2, &mut output, false, 0)
+            .write_json(2, &mut output)
             .expect_err("reserved children retain their identity but cannot be written");
 
         assert!(matches!(error, ObjectJsonError::Reserved));
@@ -9088,7 +9181,7 @@ mod object_json_writer_tests {
             let mut bytes = Vec::new();
             let mut output = PlString::new("object-handle-json", None, &mut bytes);
             let error = handle
-                .write_json(2, &mut output, false, 0)
+                .write_json(2, &mut output)
                 .expect_err("internal qpdf states are not JSON values");
             assert!(matches!(
                 (error, expected),
@@ -9108,7 +9201,7 @@ mod object_json_writer_tests {
             let mut bytes = Vec::new();
             let mut output = PlString::new("object-handle-json", None, &mut bytes);
             handle
-                .write_json(2, &mut output, false, 0)
+                .write_json(2, &mut output)
                 .expect("finite real literals serialize as JSON numbers");
             assert_eq!(bytes, expected);
         }
@@ -9120,7 +9213,7 @@ mod object_json_writer_tests {
             let mut bytes = Vec::new();
             let mut output = PlString::new("object-handle-json", None, &mut bytes);
             handle
-                .write_json(2, &mut output, false, 0)
+                .write_json(2, &mut output)
                 .expect("leading-dot real literals serialize as JSON numbers");
             assert_eq!(bytes, expected);
         }
@@ -9134,7 +9227,7 @@ mod object_json_writer_tests {
             let mut bytes = Vec::new();
             let mut output = PlString::new("object-handle-json", None, &mut bytes);
             handle
-                .write_json(2, &mut output, false, 0)
+                .write_json(2, &mut output)
                 .expect("JSON string variant should serialize");
             assert_eq!(bytes, expected);
         }
@@ -9147,7 +9240,7 @@ mod object_json_writer_tests {
         );
         let mut bytes = Vec::new();
         let mut output = PlString::new("object-handle-json", None, &mut bytes);
-        raw.write_json(2, &mut output, false, 0)
+        raw.write_json(2, &mut output)
             .expect("raw qpdf identity should serialize");
         assert_eq!(bytes, b"\"-1 -2 R\"");
 
@@ -9156,7 +9249,7 @@ mod object_json_writer_tests {
         let mut unresolved_output =
             PlString::new("object-handle-json", None, &mut unresolved_bytes);
         let error = unresolved
-            .write_json(2, &mut unresolved_output, true, 0)
+            .write_json_with_options(2, &mut unresolved_output, true, 0)
             .expect_err("an indirect value without a resolver is uninitialized");
         assert!(matches!(error, ObjectJsonError::Uninitialized));
 
@@ -9168,7 +9261,7 @@ mod object_json_writer_tests {
         let mut child_error_output =
             PlString::new("object-handle-json", None, &mut child_error_bytes);
         let error = dictionary_with_unresolved_child
-            .write_json(2, &mut child_error_output, false, 0)
+            .write_json(2, &mut child_error_output)
             .expect_err("a resolver-less unresolved dictionary child is uninitialized");
         assert!(matches!(error, ObjectJsonError::Uninitialized));
 
@@ -9477,7 +9570,7 @@ mod content_shape_internal_tests {
 
         assert_eq!(
             handle
-                .get_unique_resource_name(b"/F", &mut min_suffix, Some(&names))
+                .get_unique_resource_name_with_resource_names(b"/F", &mut min_suffix, Some(&names))
                 .unwrap(),
             b"/F1"
         );
@@ -10653,13 +10746,15 @@ pub(crate) mod identity_tests {
         ]);
 
         assert!(dict
-            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")
+            .try_is_dictionary_of_type(b"CryptFilterDecodeParms")
             .unwrap());
         assert!(dict
-            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"Identity")
+            .try_is_dictionary_of_type_with_subtype(b"CryptFilterDecodeParms", b"Identity")
             .unwrap());
-        assert!(dict.try_is_dictionary_of_type(b"", b"").unwrap());
-        assert!(dict.try_is_dictionary_of_type(b"", b"Identity").unwrap());
+        assert!(dict.try_is_dictionary_of_type(b"").unwrap());
+        assert!(dict
+            .try_is_dictionary_of_type_with_subtype(b"", b"Identity")
+            .unwrap());
     }
 
     #[test]
@@ -10679,19 +10774,19 @@ pub(crate) mod identity_tests {
         ]);
 
         assert!(!wrong
-            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")
+            .try_is_dictionary_of_type(b"CryptFilterDecodeParms")
             .unwrap());
         assert!(!non_name
-            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")
+            .try_is_dictionary_of_type(b"CryptFilterDecodeParms")
             .unwrap());
         assert!(!missing
-            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")
+            .try_is_dictionary_of_type(b"CryptFilterDecodeParms")
             .unwrap());
         assert!(!wrong_subtype
-            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"Identity")
+            .try_is_dictionary_of_type_with_subtype(b"CryptFilterDecodeParms", b"Identity")
             .unwrap());
         assert!(!ObjectHandle::integer(1)
-            .try_is_dictionary_of_type(b"", b"")
+            .try_is_dictionary_of_type(b"")
             .unwrap());
     }
 
@@ -10705,7 +10800,7 @@ pub(crate) mod identity_tests {
             b"Type".to_vec(),
             ObjectHandle::name(b"XRef".to_vec()),
         )]);
-        assert!(!plain_dict.try_is_stream_of_type(b"XRef", b"").unwrap());
+        assert!(!plain_dict.try_is_stream_of_type(b"XRef").unwrap());
 
         // Arm 2: a stream whose nested dictionary has the wrong /Type.
         let wrong_type_dict = ObjectHandle::dictionary(vec![(
@@ -10714,9 +10809,7 @@ pub(crate) mod identity_tests {
         )]);
         let wrong_type_stream =
             ObjectHandle::direct_stream(wrong_type_dict, std::rc::Rc::new(Vec::new()));
-        assert!(!wrong_type_stream
-            .try_is_stream_of_type(b"XRef", b"")
-            .unwrap());
+        assert!(!wrong_type_stream.try_is_stream_of_type(b"XRef").unwrap());
 
         // Arm 3: a stream whose nested dictionary has the requested /Type --
         // the shape every real `/Type /XRef` or `/Type /ObjStm` object has,
@@ -10726,14 +10819,14 @@ pub(crate) mod identity_tests {
             ObjectHandle::name(b"XRef".to_vec()),
         )]);
         let xref_stream = ObjectHandle::direct_stream(xref_dict, std::rc::Rc::new(Vec::new()));
-        assert!(xref_stream.try_is_stream_of_type(b"XRef", b"").unwrap());
+        assert!(xref_stream.try_is_stream_of_type(b"XRef").unwrap());
 
         let objstm_dict = ObjectHandle::dictionary(vec![(
             b"Type".to_vec(),
             ObjectHandle::name(b"ObjStm".to_vec()),
         )]);
         let objstm_stream = ObjectHandle::direct_stream(objstm_dict, std::rc::Rc::new(Vec::new()));
-        assert!(objstm_stream.try_is_stream_of_type(b"ObjStm", b"").unwrap());
+        assert!(objstm_stream.try_is_stream_of_type(b"ObjStm").unwrap());
     }
 
     #[test]
@@ -10746,7 +10839,7 @@ pub(crate) mod identity_tests {
             ])));
 
         assert!(dict
-            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")
+            .try_is_dictionary_of_type(b"CryptFilterDecodeParms")
             .unwrap());
         assert!(dict.is_resolved());
         assert!(type_name.is_resolved());
@@ -10761,7 +10854,7 @@ pub(crate) mod identity_tests {
         ]);
 
         assert!(!dict
-            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"Identity")
+            .try_is_dictionary_of_type_with_subtype(b"CryptFilterDecodeParms", b"Identity")
             .unwrap());
     }
 
@@ -10771,7 +10864,7 @@ pub(crate) mod identity_tests {
         let dict = ObjectHandle::dictionary(vec![(b"Type".to_vec(), erroring_type)]);
 
         assert_eq!(
-            dict.try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")
+            dict.try_is_dictionary_of_type(b"CryptFilterDecodeParms")
                 .unwrap_err()
                 .to_string(),
             "resolver failed"
@@ -10785,9 +10878,7 @@ pub(crate) mod identity_tests {
         drop(resolver);
 
         assert_eq!(
-            dict.try_is_dictionary_of_type(b"", b"")
-                .unwrap_err()
-                .to_string(),
+            dict.try_is_dictionary_of_type(b"").unwrap_err().to_string(),
             "object 20 0 belongs to a dropped PDF"
         );
     }
@@ -13254,7 +13345,7 @@ mod mutation_tests {
         let original_alias = original.clone();
         let mut direct = original;
 
-        direct.make_direct(false).expect("direct conversion");
+        direct.make_direct().expect("direct conversion");
 
         assert!(original_alias.as_dictionary().is_some());
         assert!(original_alias.try_get_key(b"/A").unwrap().is_indirect());
@@ -13297,7 +13388,7 @@ mod mutation_tests {
 
         let mut rejects_stream = original.clone();
         let error = rejects_stream
-            .make_direct(false)
+            .make_direct()
             .expect_err("makeDirect must reject a stream without allow_streams");
         assert!(matches!(
             error,
@@ -13311,7 +13402,7 @@ mod mutation_tests {
 
         let mut stops_at_stream = original;
         stops_at_stream
-            .make_direct(true)
+            .make_direct_with_options(true)
             .expect("allow_streams must preserve the stream reference");
         assert!(stops_at_stream
             .try_get_key(b"/Stream")
@@ -13335,7 +13426,7 @@ mod mutation_tests {
         let mut candidate = first;
 
         let error = candidate
-            .make_direct(false)
+            .make_direct()
             .expect_err("recursive indirect graph must be rejected");
         assert!(matches!(
             error,
@@ -13350,7 +13441,7 @@ mod mutation_tests {
     fn make_direct_rejects_reserved_and_non_pdf_object_values() {
         let mut reserved = ObjectHandle::new_reserved_direct();
         let reserved_error = reserved
-            .make_direct(false)
+            .make_direct()
             .expect_err("reserved handles cannot become direct values");
         assert!(matches!(
             reserved_error,
@@ -13360,7 +13451,7 @@ mod mutation_tests {
 
         let mut operator = ObjectHandle::operator(b"q".to_vec());
         let operator_error = operator
-            .make_direct(false)
+            .make_direct()
             .expect_err("content operators are not PDF object values");
         assert!(matches!(
             operator_error,
@@ -15675,8 +15766,8 @@ mod mutation_tests {
     fn merge_resources_is_a_no_op_unless_both_sides_are_dictionaries() {
         let scalar = ObjectHandle::integer(1);
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
-        scalar.merge_resources(&dict, None).expect("merge");
-        dict.merge_resources(&scalar, None).expect("merge");
+        scalar.merge_resources(&dict).expect("merge");
+        dict.merge_resources(&scalar).expect("merge");
         assert_eq!(dict.try_get_key(b"/A").unwrap().as_integer(), Some(1));
         assert!(dict.try_get_key(b"/B").unwrap().is_null());
     }
@@ -15706,7 +15797,7 @@ mod mutation_tests {
             ));
 
         destination
-            .merge_resources(&other, None)
+            .merge_resources(&other)
             .expect("unresolved qpdf resource operands must merge");
 
         assert_eq!(
@@ -15738,7 +15829,7 @@ mod mutation_tests {
         let other = ObjectHandle::dictionary(vec![(b"ProcSet".to_vec(), other_procset)]);
 
         destination
-            .merge_resources(&other, None)
+            .merge_resources(&other)
             .expect("an unresolved array category must merge");
 
         let values: Vec<_> = destination
@@ -15760,7 +15851,7 @@ mod mutation_tests {
             identity_tests::error_resolving_handle(ObjectRef::new(90, 0));
         let other = ObjectHandle::dictionary(vec![]);
         let error = unresolved_destination
-            .merge_resources(&other, None)
+            .merge_resources(&other)
             .expect_err("receiver resolution failure must propagate");
         assert!(matches!(error, Error::System(message) if message == "resolver failed"));
         drop(destination_resolver);
@@ -15769,7 +15860,7 @@ mod mutation_tests {
         let (unresolved_other, other_resolver) =
             identity_tests::error_resolving_handle(ObjectRef::new(91, 0));
         let error = destination
-            .merge_resources(&unresolved_other, None)
+            .merge_resources(&unresolved_other)
             .expect_err("other resolution failure must propagate");
         assert!(matches!(error, Error::System(message) if message == "resolver failed"));
         drop(other_resolver);
@@ -15780,7 +15871,7 @@ mod mutation_tests {
             identity_tests::error_resolving_handle(ObjectRef::new(92, 0));
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), unresolved_category)]);
         let error = destination
-            .merge_resources(&other, None)
+            .merge_resources(&other)
             .expect_err("category resolution failure must propagate");
         assert!(matches!(error, Error::System(message) if message == "resolver failed"));
         drop(category_resolver);
@@ -15804,7 +15895,7 @@ mod mutation_tests {
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
 
         destination
-            .merge_resources(&other, None)
+            .merge_resources(&other)
             .expect("an unresolved missing category must still merge");
 
         assert_eq!(
@@ -15830,7 +15921,7 @@ mod mutation_tests {
         let (other, other_resolver) = identity_tests::error_resolving_handle(ObjectRef::new(93, 0));
 
         destination
-            .merge_resources(&other, None)
+            .merge_resources(&other)
             .expect("a non-dictionary receiver must no-op without touching other");
 
         drop(other_resolver);
@@ -15936,7 +16027,7 @@ mod mutation_tests {
             (inner_key_dest, inner_key_other),
         ] {
             let error = dest
-                .merge_resources(&other, None)
+                .merge_resources(&other)
                 .expect_err("a direct stream resource cannot be privatized");
             assert!(
                 matches!(error, Error::System(ref message)
@@ -15951,7 +16042,7 @@ mod mutation_tests {
         let source_sub = ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(1))]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), source_sub.clone())]);
         let dest = ObjectHandle::dictionary(vec![]);
-        dest.merge_resources(&other, None).expect("merge");
+        dest.merge_resources(&other).expect("merge");
         let installed = dest.try_get_key(b"/Font").unwrap();
         assert_eq!(installed.try_get_key(b"/F1").unwrap().as_integer(), Some(1));
         assert!(!installed.ptr_eq(&source_sub)); // privatized, not shared
@@ -15963,7 +16054,7 @@ mod mutation_tests {
         let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), this_font)]);
         let other_font = ObjectHandle::dictionary(vec![(b"F2".to_vec(), ObjectHandle::integer(2))]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
-        dest.merge_resources(&other, None).expect("merge");
+        dest.merge_resources(&other).expect("merge");
         let font = dest.try_get_key(b"/Font").unwrap();
         assert_eq!(font.try_get_key(b"/F1").unwrap().as_integer(), Some(1));
         assert_eq!(font.try_get_key(b"/F2").unwrap().as_integer(), Some(2));
@@ -15976,7 +16067,7 @@ mod mutation_tests {
         let other_font =
             ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(99))]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
-        dest.merge_resources(&other, None).expect("merge");
+        dest.merge_resources(&other).expect("merge");
         assert_eq!(
             dest.try_get_key(b"/Font")
                 .unwrap()
@@ -15999,7 +16090,7 @@ mod mutation_tests {
         let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), shared.clone())]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
         let mut conflicts = std::collections::BTreeMap::new();
-        dest.merge_resources(&other, Some(&mut conflicts))
+        dest.merge_resources_with_conflicts(&other, Some(&mut conflicts))
             .expect("merge");
         assert!(conflicts.is_empty());
         assert!(dest
@@ -16020,7 +16111,7 @@ mod mutation_tests {
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
         let mut conflicts = std::collections::BTreeMap::new();
 
-        dest.merge_resources(&other, Some(&mut conflicts))
+        dest.merge_resources_with_conflicts(&other, Some(&mut conflicts))
             .expect("merge");
 
         assert!(conflicts.is_empty());
@@ -16046,7 +16137,7 @@ mod mutation_tests {
         let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), shared.clone())]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
         let mut conflicts = std::collections::BTreeMap::new();
-        dest.merge_resources(&other, Some(&mut conflicts))
+        dest.merge_resources_with_conflicts(&other, Some(&mut conflicts))
             .expect("merge");
         assert_eq!(
             conflicts
@@ -16073,7 +16164,7 @@ mod mutation_tests {
         let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(2))]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
         let mut conflicts = std::collections::BTreeMap::new();
-        dest.merge_resources(&other, Some(&mut conflicts))
+        dest.merge_resources_with_conflicts(&other, Some(&mut conflicts))
             .expect("merge");
         let new_name = conflicts
             .get(b"/Font".as_slice())
@@ -16111,7 +16202,7 @@ mod mutation_tests {
             ObjectHandle::dictionary(vec![(b"Font".to_vec(), indirect_font.clone())]);
         let other_font = ObjectHandle::dictionary(vec![(b"F2".to_vec(), ObjectHandle::integer(2))]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
-        shared_dest.merge_resources(&other, None).expect("merge");
+        shared_dest.merge_resources(&other).expect("merge");
         // shared_dest's own /Font is now a private direct copy...
         assert!(shared_dest.try_get_key(b"/Font").unwrap().is_direct());
         assert_eq!(
@@ -16145,7 +16236,7 @@ mod mutation_tests {
                 ObjectHandle::name(b"Text".to_vec()),
             ]),
         )]);
-        dest.merge_resources(&other, None).expect("merge");
+        dest.merge_resources(&other).expect("merge");
         let items = dest.try_get_key(b"/ProcSet").unwrap().as_array().unwrap();
         let names: Vec<_> = items.iter().map(|i| i.as_name().unwrap()).collect();
         assert_eq!(names, vec![b"PDF".to_vec(), b"Text".to_vec()]);
@@ -16168,7 +16259,7 @@ mod mutation_tests {
             ObjectHandle::array(vec![ObjectHandle::name(b"Text".to_vec())]),
         )]);
 
-        dest.merge_resources(&other, None)
+        dest.merge_resources(&other)
             .expect("indirect scalar array items merge");
 
         let items = dest
@@ -16196,7 +16287,7 @@ mod mutation_tests {
         )]);
 
         let error = dest
-            .merge_resources(&other, None)
+            .merge_resources(&other)
             .expect_err("array item resolution failure must propagate");
         assert!(matches!(
             error,
@@ -16224,7 +16315,7 @@ mod mutation_tests {
             ObjectHandle::array(vec![retained.clone()]),
         )]);
 
-        dest.merge_resources(&other, None).expect("merge");
+        dest.merge_resources(&other).expect("merge");
 
         let merged = dest
             .try_get_key(b"/ProcSet")
@@ -16242,7 +16333,7 @@ mod mutation_tests {
             b"Font".to_vec(),
             ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(2))]),
         )]);
-        dest.merge_resources(&other, None).expect("merge");
+        dest.merge_resources(&other).expect("merge");
         assert_eq!(dest.try_get_key(b"/Font").unwrap().as_integer(), Some(1));
     }
 
@@ -16837,7 +16928,7 @@ mod mutation_tests {
         let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), this_font)]);
         let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), shared.clone())]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
-        dest.merge_resources(&other, None).expect("merge");
+        dest.merge_resources(&other).expect("merge");
         assert!(dest
             .try_get_key(b"/Font")
             .unwrap()
@@ -16854,7 +16945,7 @@ mod mutation_tests {
             b"ProcSet".to_vec(),
             ObjectHandle::array(vec![ObjectHandle::dictionary(vec![])]),
         )]);
-        dest.merge_resources(&other, None).expect("merge");
+        dest.merge_resources(&other).expect("merge");
         assert!(dest
             .try_get_key(b"/ProcSet")
             .unwrap()
@@ -16893,7 +16984,7 @@ mod mutation_tests {
         let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(2))]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
         let mut conflicts = std::collections::BTreeMap::new();
-        dest.merge_resources(&other, Some(&mut conflicts))
+        dest.merge_resources_with_conflicts(&other, Some(&mut conflicts))
             .expect("merge");
         let new_name = conflicts
             .get(b"/Font".as_slice())
@@ -16930,7 +17021,7 @@ mod mutation_tests {
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
         let mut conflicts = std::collections::BTreeMap::new();
 
-        dest.merge_resources(&other, Some(&mut conflicts))
+        dest.merge_resources_with_conflicts(&other, Some(&mut conflicts))
             .expect("nested dictionary value resolves");
 
         let new_name = conflicts
@@ -16960,7 +17051,7 @@ mod mutation_tests {
         let mut conflicts = std::collections::BTreeMap::new();
 
         let error = dest
-            .merge_resources(&other, Some(&mut conflicts))
+            .merge_resources_with_conflicts(&other, Some(&mut conflicts))
             .expect_err("nested dictionary resolution failure must propagate");
         assert!(matches!(
             error,
@@ -18157,7 +18248,7 @@ pub(crate) mod warning_emission_tests {
         let mut bytes = Vec::new();
         let mut output = crate::pipeline::PlString::new("uninitialized", None, &mut bytes);
         let error = handle
-            .write_json(2, &mut output, true, 0)
+            .write_json_with_options(2, &mut output, true, 0)
             .expect_err("JSON dereference must reject an uninitialized handle");
         assert_eq!(
             error.to_string(),

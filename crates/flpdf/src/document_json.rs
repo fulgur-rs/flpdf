@@ -80,11 +80,11 @@ pub(crate) fn write_json_v1_objects_key<R: Read + Seek>(
         }
         let key = handle.unparse().map_err(ConvertError::from)?;
         Json::write_dictionary_key(out, &mut object_first, &key, 2)?;
-        handle.write_json(1, out, true, 2)?;
+        handle.write_json_with_options(1, out, true, 2)?;
     }
     if trailer_selected(&wanted_objects, false) {
         Json::write_dictionary_key(out, &mut object_first, b"trailer", 2)?;
-        pdf.trailer().write_json(1, out, true, 2)?; // cov:ignore: llvm-cov attributes this successful trailer serialization to its opening write expressions
+        pdf.trailer().write_json_with_options(1, out, true, 2)?; // cov:ignore: llvm-cov attributes this successful trailer serialization to its opening write expressions
     } // cov:ignore: llvm-cov attributes the successful trailer branch continuation to its write expressions
     Json::write_dictionary_close(out, object_first, 1)?;
     Ok(())
@@ -137,7 +137,7 @@ pub(crate) fn write_json_v1_objectinfo_key<R: Read + Seek>(
         let mut stream_first = true;
         Json::write_dictionary_open(out, &mut stream_first, 3)?;
         Json::write_dictionary_key(out, &mut stream_first, b"filter", 4)?;
-        filter.write_json(1, out, true, 4)?;
+        filter.write_json_with_options(1, out, true, 4)?;
         Json::write_dictionary_item(
             out,
             &mut stream_first,
@@ -146,7 +146,7 @@ pub(crate) fn write_json_v1_objectinfo_key<R: Read + Seek>(
             4,
         )?; // cov:ignore: llvm-cov attributes this successful objectinfo field serialization to its opening write expressions
         Json::write_dictionary_key(out, &mut stream_first, b"length", 4)?;
-        length.write_json(1, out, true, 4)?;
+        length.write_json_with_options(1, out, true, 4)?;
         Json::write_dictionary_close(out, stream_first, 3)?;
         Json::write_dictionary_close(out, details_first, 2)?;
     }
@@ -323,7 +323,7 @@ pub fn write_json_key<R: Read + Seek>(
         let mut trailer_first = true;
         Json::write_dictionary_open(out, &mut trailer_first, 3)?;
         Json::write_dictionary_key(out, &mut trailer_first, b"value", 4)?;
-        trailer.write_json(SUPPORTED_JSON_VERSION, out, true, 4)?;
+        trailer.write_json_with_options(SUPPORTED_JSON_VERSION, out, true, 4)?;
         Json::write_dictionary_close(out, trailer_first, 3)?;
     }
     // qpdf keeps the raw object map expanded even when selectors match
@@ -461,7 +461,7 @@ fn write_non_stream_value_entry(
     let mut object_first = true;
     Json::write_dictionary_open(out, &mut object_first, 3)?;
     Json::write_dictionary_key(out, &mut object_first, b"value", 4)?;
-    handle.write_json(SUPPORTED_JSON_VERSION, out, true, 4)?;
+    handle.write_json_with_options(SUPPORTED_JSON_VERSION, out, true, 4)?;
     Json::write_dictionary_close(out, object_first, 3)?;
     Ok(())
 }

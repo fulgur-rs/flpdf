@@ -586,7 +586,7 @@ impl<R: Read + Seek> Pdf<R> {
         // cannot observe a destroyed donor handle. The Standard encryption
         // dictionary is a value graph and contains no stream objects, making
         // qpdf's make-direct copy the appropriate ownership boundary here.
-        encrypt_dict.make_direct(false)?;
+        encrypt_dict.make_direct()?;
         let id0 = cached_id0.or(live_id0).unwrap_or_default();
 
         Ok(Some(CopyEncryptionSource {
