@@ -76,6 +76,73 @@ fn build_annotation_pdf(annot_extras: &str) -> Vec<u8> {
 }
 
 #[test]
+fn appearance_helpers_match_qpdf_default_state_and_flag_masks() {
+    let appearance =
+        b"<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Resources << >> /Length 4 >>\nstream\nq Q\nendstream";
+    let bytes = build_pdf(vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>".to_vec(),
+        ),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /Annots [4 0 R 7 0 R 9 0 R] >>".to_vec(),
+        ),
+        (
+            4,
+            b"<< /Type /Annot /Subtype /Square /Rect [10 20 110 40] /F 0 /AS /On /AP << /N << /On 5 0 R /Off 6 0 R >> >> >>".to_vec(),
+        ),
+        (5, appearance.to_vec()),
+        (6, appearance.to_vec()),
+        (
+            7,
+            b"<< /Type /Annot /Subtype /Square /Rect [10 20 110 40] /F 1 /AP << /N 8 0 R >> >>".to_vec(),
+        ),
+        (8, appearance.to_vec()),
+        (
+            9,
+            b"<< /Type /Annot /Subtype /Square /Rect [10 20 110 40] /F 2 /AP << /N 10 0 R >> >>".to_vec(),
+        ),
+        (10, appearance.to_vec()),
+    ]);
+    let mut pdf = open(bytes);
+
+    let mut visible = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
+    assert_eq!(
+        visible.get_appearance_stream(b"/N").unwrap().object_ref(),
+        Some(ObjectRef::new(5, 0)),
+        "an omitted state uses /AS"
+    );
+    assert_eq!(
+        visible
+            .get_appearance_stream_with_state(b"/N", b"")
+            .unwrap()
+            .object_ref(),
+        Some(ObjectRef::new(5, 0)),
+        "an explicit empty state uses qpdf's /AS fallback"
+    );
+    assert_eq!(
+        visible.get_page_content_for_appearance("/Fxo1", 0).unwrap(),
+        b"q\n1 0 0 1 10 20 cm\n/Fxo1 Do\nQ\n"
+    );
+
+    for (annotation_ref, resource_name, flag) in [
+        (ObjectRef::new(7, 0), "/Fxo2", "Invisible"),
+        (ObjectRef::new(9, 0), "/Fxo3", "Hidden"),
+    ] {
+        let mut annotation = AnnotationObjectHelper::new(pdf.get_object_handle(annotation_ref));
+        assert!(
+            annotation
+                .get_page_content_for_appearance(resource_name, 0)
+                .unwrap()
+                .is_empty(),
+            "qpdf default masks forbid {flag} annotations"
+        );
+    }
+}
+
+#[test]
 fn annotation_helpers_from_handles_can_coexist_with_pdf_access() {
     let bytes = build_pdf(vec![
         (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
@@ -325,7 +392,7 @@ fn annotation_handle_uses_direct_appearance_stream_even_with_state() {
     let mut pdf = open(bytes);
     let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
     let stream = annot
-        .get_appearance_stream(b"N", None)
+        .get_appearance_stream_with_state(b"/N", b"/On")
         .expect("get_appearance_stream()");
 
     assert_eq!(stream.object_ref(), Some(ObjectRef::new(5, 0)));
@@ -351,7 +418,7 @@ fn annotation_handle_appearance_stream_state_dictionary_uses_as() {
     let mut pdf = open(bytes);
     let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
     let stream = annot
-        .get_appearance_stream(b"N", None)
+        .get_appearance_stream(b"/N")
         .expect("get_appearance_stream()");
     assert_eq!(stream.object_ref(), Some(ObjectRef::new(5, 0)));
 }
@@ -375,7 +442,7 @@ fn annotation_handle_appearance_stream_explicit_state_overrides_as() {
     let mut pdf = open(bytes);
     let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
     let stream = annot
-        .get_appearance_stream(b"N", Some(b"Off"))
+        .get_appearance_stream_with_state(b"/N", b"/Off")
         .expect("get_appearance_stream()");
     assert_eq!(stream.object_ref(), Some(ObjectRef::new(6, 0)));
 }
@@ -401,7 +468,7 @@ fn annotation_handle_appearance_stream_missing_state_returns_null() {
     // so the state-dictionary branch (which requires a non-empty state) is
     // never taken.
     let stream = annot
-        .get_appearance_stream(b"N", None)
+        .get_appearance_stream(b"/N")
         .expect("get_appearance_stream()");
     assert!(stream.is_null());
 }
@@ -427,7 +494,7 @@ fn annotation_handle_appearance_stream_state_dictionary_key_missing_returns_null
     // taken; but /N's state dictionary only has an "On" entry, so the
     // selected key doesn't resolve to a stream and the result is null.
     let stream = annot
-        .get_appearance_stream(b"N", None)
+        .get_appearance_stream(b"/N")
         .expect("get_appearance_stream()");
     assert!(stream.is_null());
 }
@@ -451,12 +518,12 @@ fn annotation_handle_builds_qpdf_page_content_for_appearance() {
     let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
 
     let content = annot
-        .get_page_content_for_appearance("/Fxo1", 0, 0, 0x3)
+        .get_page_content_for_appearance("/Fxo1", 0)
         .expect("get_page_content_for_appearance()");
     assert_eq!(content, b"q\n1 0 0 1 10 20 cm\n/Fxo1 Do\nQ\n".to_vec());
 
     let appearance = annot
-        .get_appearance_stream(b"N", None)
+        .get_appearance_stream(b"/N")
         .expect("get_appearance_stream()");
     assert_eq!(
         appearance
@@ -469,7 +536,7 @@ fn annotation_handle_builds_qpdf_page_content_for_appearance() {
     );
 
     let skipped = annot
-        .get_page_content_for_appearance("/Fxo1", 0, 8, 0)
+        .get_page_content_for_appearance_with_flags("/Fxo1", 0, 8, 0)
         .expect("flag-gated appearance content");
     assert!(
         skipped.is_empty(),
@@ -502,7 +569,7 @@ fn annotation_handle_builds_no_rotate_page_content_for_appearance() {
     // The helper owns the same qpdf NoRotate transform used by page flattening.
     let mut annot = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
     let content = annot
-        .get_page_content_for_appearance("/Fxo1", 90, 0, 0x3)
+        .get_page_content_for_appearance("/Fxo1", 90)
         .expect("get_page_content_for_appearance()");
     assert_eq!(content, b"q\n0 1 -1 0 30 40 cm\n/Fxo1 Do\nQ\n".to_vec());
 }
