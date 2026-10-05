@@ -894,9 +894,15 @@ impl<'a> Tokenizer<'a> {
         candidate_distance
     }
 
+    /// Read one token with qpdf's default `allow_bad = false` and `max_len = 0`
+    /// options (`include/qpdf/QPDFTokenizer.hh:177-184`).
+    pub fn read_token(&mut self) -> Result<Token> {
+        self.read_token_with_options(false, 0)
+    }
+
     /// Pull adapter matching qpdf 11.9.0 `QPDFTokenizer::readToken` and
-    /// `nextToken` (`libqpdf/QPDFTokenizer.cc:887-965`).
-    pub fn read_token(&mut self, allow_bad: bool, max_len: usize) -> Result<Token> {
+    /// `nextToken` (`libqpdf/QPDFTokenizer.cc:887-965`) with explicit options.
+    pub fn read_token_with_options(&mut self, allow_bad: bool, max_len: usize) -> Result<Token> {
         if self.state != State::InlineImage {
             self.reset();
         }
@@ -1002,7 +1008,7 @@ impl<'a> Tokenizer<'a> {
 
     /// `QPDF::readToken(input, max_len = 0)` (`libqpdf/QPDF.cc:1535-1539`):
     /// the document-level wrapper every non-content-stream `QPDF` reader
-    /// calls instead of `QPDFTokenizer::readToken` (`read_token`, above)
+    /// calls instead of `QPDFTokenizer::readToken` (`read_token_with_options`, above)
     /// directly. It fixes `allow_bad = true` and threads `max_len` through
     /// unchanged, so a bad or malformed token comes back as an ordinary
     /// value for the caller to inspect rather than as an error.
@@ -1034,7 +1040,7 @@ impl<'a> Tokenizer<'a> {
     /// different qpdf owner and does not route through this method.
     pub(crate) fn read_qpdf_token(&mut self, max_len: usize) -> Result<Token> {
         self.allow_eof();
-        self.read_token(true, max_len)
+        self.read_token_with_options(true, max_len)
     }
 
     /// Read and type-check one ObjStm header pair using qpdf's
@@ -1088,7 +1094,7 @@ fn inline_lookahead_is_plausible(input: &[u8], after_ei: usize) -> (bool, usize)
 
     for _ in 0..10 {
         let token = tokenizer
-            .read_token(true, 0)
+            .read_token_with_options(true, 0)
             .expect("allow_bad makes tokenizer errors observable as tokens");
         let next_search_pos = after_ei + tokenizer.position();
         if token.token_type == TokenType::Eof {
