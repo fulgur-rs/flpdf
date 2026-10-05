@@ -10,7 +10,10 @@
 //! indirect object — including each page's `/Parent` — which the shared
 //! single-page builder does not, so the parent-chain branches are reachable.
 
-use flpdf::{Matrix, ObjectHandle, ObjectRef, PageObjectHelper, Pdf, Rectangle};
+use flpdf::{
+    ContentToken, Matrix, ObjectHandle, ObjectRef, PageObjectHelper, Pdf, PipelineResult,
+    Rectangle, TokenFilter, TokenFilterOutput,
+};
 use std::io::Cursor;
 use std::rc::Rc;
 
@@ -46,6 +49,61 @@ fn page_helper_for_ref(
 ) -> PageObjectHelper<'_, Cursor<Vec<u8>>> {
     let page = pdf.get_object_handle(page_ref);
     PageObjectHelper::from_object_handle(page, pdf)
+}
+
+#[derive(Default)]
+struct CountingTokenFilter {
+    tokens: usize,
+    eof_calls: usize,
+}
+
+impl TokenFilter for CountingTokenFilter {
+    fn handle_token(
+        &mut self,
+        token: &ContentToken,
+        output: &mut TokenFilterOutput<'_>,
+    ) -> PipelineResult<()> {
+        self.tokens += 1;
+        output.write_token(token)
+    }
+
+    fn handle_eof(&mut self, output: &mut TokenFilterOutput<'_>) -> PipelineResult<()> {
+        self.eof_calls += 1;
+        output.write(b"eof")
+    }
+}
+
+#[test]
+fn content_helpers_use_qpdf_default_pipeline_and_inline_image_options() {
+    let bytes = single_page(
+        "<< /Type /Page /Parent 2 0 R /Resources << >> /Contents 4 0 R >>",
+        &[(4, "<< /Length 6 >>\nstream\n1 2 cm\nendstream".into())],
+    );
+    let (mut pdf, page_ref) = helper_for(bytes);
+    let original_contents = pdf
+        .get_object_handle(page_ref)
+        .try_get_key(b"/Contents")
+        .unwrap();
+    let mut helper = page_helper_for_ref(&mut pdf, page_ref);
+
+    let mut filter = CountingTokenFilter::default();
+    helper.filter_contents(&mut filter).unwrap();
+    assert!(filter.tokens > 0);
+    assert!(filter.eof_calls > 0);
+
+    let mut old_name_filter = CountingTokenFilter::default();
+    helper.filter_page_contents(&mut old_name_filter).unwrap();
+    assert!(old_name_filter.tokens > 0);
+    assert!(old_name_filter.eof_calls > 0);
+
+    helper.externalize_inline_images().unwrap();
+    drop(helper);
+
+    let page = pdf.get_object_handle(page_ref);
+    assert!(page
+        .try_get_key(b"/Contents")
+        .unwrap()
+        .is_same_object_as(&original_contents));
 }
 
 #[test]

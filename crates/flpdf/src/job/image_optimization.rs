@@ -70,7 +70,7 @@ pub fn optimize_images<R: Read + Seek + 'static>(
         let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
         for page in pages {
             PageObjectHelper::from_object_handle(page, pdf)
-                .externalize_inline_images(options.inline_min_bytes, false)?;
+                .externalize_inline_images_with_options(options.inline_min_bytes, false)?;
         }
     }
 
