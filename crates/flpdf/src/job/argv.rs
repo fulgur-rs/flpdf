@@ -431,7 +431,7 @@ impl<'a> Parser<'a> {
                 self.job
                     .configuration
                     .writer
-                    .force_pdf_version(version, extension);
+                    .force_pdf_version_with_extension_level(version, extension);
                 Ok(())
             }
             b"ii-min-bytes" => {
@@ -469,7 +469,7 @@ impl<'a> Parser<'a> {
                 self.job
                     .configuration
                     .writer
-                    .set_minimum_pdf_version(version, extension);
+                    .set_minimum_pdf_version_with_extension_level(version, extension);
                 Ok(())
             }
             b"oi-min-area" => {

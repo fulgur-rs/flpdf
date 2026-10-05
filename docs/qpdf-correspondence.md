@@ -3909,6 +3909,11 @@ fresh merged document に明示的に伝播する。primary と全 secondary の
 source floor の後に適用する。`QPDFWriter.cc:217-250` の numeric tie では
 incumbent の raw version を保持して extension level だけ更新し、
 `--force-version` は従来どおり最終的に優先させる。
+`PdfVersion::new(major, minor)` and the no-extension-level writer setters map
+qpdf's default `extension = 0` / `extension_level = 0`; explicit values use
+`new_with_extension_level`, `set_minimum_pdf_version_with_extension_level`,
+and `force_pdf_version_with_extension_level`
+(`PDFVersion.hh:38`, `QPDFWriter.hh:243,258`).
 `.50qd.3` では `QPDFJob.cc:2462-2472` の「primary QPDF をページ操作の
 base として in-place 更新する」責務と、`QPDFJob.cc:2590-2632` の
 `/Pages`・`/PageLabels`・AcroForm の選択ページ側更新を分離した。`job/page_merge.rs`

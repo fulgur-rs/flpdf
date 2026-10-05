@@ -3334,20 +3334,20 @@ fn create_qpdf_encryption_status_records_the_input_version_floor() {
             versioned.clone(),
             "isEncrypted",
             None,
-            Some(flpdf::PdfVersion::new(1, 7, 0)),
+            Some(flpdf::PdfVersion::new(1, 7)),
         ),
         (
             versioned,
             "requiresPassword",
             None,
-            Some(flpdf::PdfVersion::new(1, 7, 0)),
+            Some(flpdf::PdfVersion::new(1, 7)),
         ),
         (encrypted.clone(), "requiresPassword", None, None),
         (
             encrypted,
             "isEncrypted",
             Some("user-v4-aes"),
-            Some(flpdf::PdfVersion::new(1, 7, 0)),
+            Some(flpdf::PdfVersion::new(1, 7)),
         ),
     ] {
         let mut job = QPDFJob::new();

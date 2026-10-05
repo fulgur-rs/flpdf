@@ -1775,7 +1775,7 @@ impl QPDFJob {
     pub fn input_version_floor(&self) -> Option<PdfVersion> {
         let (version, extension_level) = self.configuration.max_input_version.as_ref()?;
         let version = crate::parse_pdf_version(version)?;
-        Some(PdfVersion::new(
+        Some(PdfVersion::new_with_extension_level(
             version.major(),
             version.minor(),
             *extension_level,
@@ -2687,11 +2687,13 @@ impl QPDFJob {
             let (version, extension) = parse_job_version(&value, ".minVersion")?;
             configuration
                 .writer
-                .set_minimum_pdf_version(version, extension);
+                .set_minimum_pdf_version_with_extension_level(version, extension);
         }
         if let Some(value) = job_json_string(&members, b"forceVersion")? {
             let (version, extension) = parse_job_version(&value, ".forceVersion")?;
-            configuration.writer.force_pdf_version(version, extension);
+            configuration
+                .writer
+                .force_pdf_version_with_extension_level(version, extension);
         }
         if let Some(value) = job_json_string(&members, b"linearizePass1")? {
             configuration.linearize_pass1 = Some(path_from_qpdf_json_bytes(&value));
@@ -6117,7 +6119,7 @@ mod tests {
 
         assert_eq!(
             job.input_version_floor(),
-            Some(PdfVersion::new(1, 7, 0)),
+            Some(PdfVersion::new(1, 7)),
             "the public floor must expose qpdf's accumulated max_input_version"
         );
     }

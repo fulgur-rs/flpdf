@@ -239,10 +239,19 @@ impl WriterTestSettings {
             NewlineBeforeEndstream::Yes
         ));
         if let Some(version) = self.min_version.as_ref() {
-            writer.set_minimum_pdf_version(version.clone(), self.min_extension_level.unwrap_or(0));
+            if let Some(extension_level) = self.min_extension_level {
+                writer
+                    .set_minimum_pdf_version_with_extension_level(version.clone(), extension_level);
+            } else {
+                writer.set_minimum_pdf_version(version.clone());
+            }
         }
         if let Some(version) = self.force_version.as_ref() {
-            writer.force_pdf_version(version.clone(), self.force_extension_level.unwrap_or(0));
+            if let Some(extension_level) = self.force_extension_level {
+                writer.force_pdf_version_with_extension_level(version.clone(), extension_level);
+            } else {
+                writer.force_pdf_version(version.clone());
+            }
         }
         writer.set_extra_header_text(self.extra_header_text.clone());
         writer.set_deterministic_id(self.deterministic_id);
