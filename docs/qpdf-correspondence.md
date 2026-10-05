@@ -1971,6 +1971,8 @@ destination 解決や既存の synthetic `Pdf::set_object` bridge の挙動を
 
 `QPDFAcroFormDocumentHelper::removeFormFields`（`include/qpdf/QPDFAcroFormDocumentHelper.hh:101-103`; 実装 `libqpdf/QPDFAcroFormDocumentHelper.cc:112-151`）も `AcroFormDocumentHelper::remove_form_fields(&BTreeSet<QpdfObjGen>)` として公開する。既存のlive `/Fields` array mutationとassociation/name cache cleanupを保ち、Job / PageObjectHelper callersは同じ実装を使う。
 
+`QPDFAcroFormDocumentHelper::setFormFieldName`（`include/qpdf/QPDFAcroFormDocumentHelper.hh:108`; 実装 `libqpdf/QPDFAcroFormDocumentHelper.cc:153-160`）は `set_form_field_name_from_handle(ObjectHandle, name)` でlive handleを受け取り、`/T` のUnicode mutation後に同じhandleをcache traversalへ渡す。ObjectRef版はresolved handleを取得してdelegationする。Direct handleも`/T` mutation後に`traverseField`のwarning/skipを保つ（`QPDFAcroFormDocumentHelper.cc:289-301`）。
+
 `QPDFAcroFormDocumentHelper::addFormField`（`include/qpdf/QPDFAcroFormDocumentHelper.hh:88-93`; 実装 `libqpdf/QPDFAcroFormDocumentHelper.cc:49-59`）は `AcroFormDocumentHelper::add_form_field(ObjectHandle)` として公開する。既存の単一field `/Fields` append/cache-update routeを再利用し、name renamingは行わない。qpdf同様にdirect field handleも配列へappendし、その後の`traverseField`ではwarningを出してcacheから無視する。
 
 `QPDFAcroFormDocumentHelper::generateAppearancesIfNeeded` の page loop は `QPDFPageDocumentHelper::getAllPages` が返す raw page helper を順に使う（`QPDFAcroFormDocumentHelper.cc:399-401`）。flpdf の `generate_appearances_if_needed` も `PageDocumentHelper::get_all_pages` の raw `ObjectHandle` を `get_widget_annotations_for_page` へ渡し、`ObjectRef` 投影なしで同じ順序の Widget dispatch を保つ。

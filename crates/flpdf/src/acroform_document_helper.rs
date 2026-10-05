@@ -778,15 +778,31 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             .collect())
     }
 
-    /// Set a field's partial name and update the warm qualified-name cache.
+    /// Set a field's partial name by reference, then update the warm
+    /// qualified-name cache.
     ///
-    /// This mirrors `QPDFAcroFormDocumentHelper::setFormFieldName`
-    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:153-160`). The supplied name
-    /// is encoded as a PDF Unicode string by
-    /// [`FormFieldObjectHelper::set_field_attribute_string`].
+    /// This convenience form resolves the `ObjectRef` in this `Pdf` and
+    /// delegates to [`Self::set_form_field_name_from_handle`].
     pub fn set_form_field_name(&mut self, field_ref: ObjectRef, name: &str) -> Result<()> {
-        self.analyze()?;
         let field = self.pdf.get_object_handle(field_ref);
+        self.set_form_field_name_from_handle(field, name)
+    }
+
+    /// Set a field's partial name from a live handle, then traverse that same
+    /// handle to update the AcroForm association and name caches.
+    ///
+    /// This mirrors qpdf's public
+    /// `QPDFAcroFormDocumentHelper::setFormFieldName`
+    /// (`include/qpdf/QPDFAcroFormDocumentHelper.hh:108`,
+    /// `libqpdf/QPDFAcroFormDocumentHelper.cc:153-160`). The `/T` mutation
+    /// uses [`FormFieldObjectHelper::set_field_attribute_string`] before
+    /// cache traversal. Direct handles are mutated, then warned and ignored
+    /// by the cache traversal, matching qpdf's `traverseField`.
+    pub fn set_form_field_name_from_handle(
+        &mut self,
+        field: ObjectHandle,
+        name: &str,
+    ) -> Result<()> {
         {
             let mut field_helper =
                 FormFieldObjectHelper::from_object_handle(field.clone(), self.pdf);
