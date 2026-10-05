@@ -489,7 +489,18 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         Ok(())
     }
 
-    /// Flatten annotations into their containing pages.
+    /// Flatten annotations into their containing pages using qpdf's defaults.
+    ///
+    /// This maps `QPDFPageDocumentHelper::flattenAnnotations()` to
+    /// `required_flags = 0` and `forbidden_flags = 3`, the bits for
+    /// `an_invisible | an_hidden`
+    /// (`include/qpdf/QPDFPageDocumentHelper.hh:104`,
+    /// `include/qpdf/Constants.h:220-221`).
+    pub fn flatten_annotations(&mut self) -> Result<()> {
+        self.flatten_annotations_with_flags(0, 0x3)
+    }
+
+    /// Flatten annotations into their containing pages with explicit flag masks.
     ///
     /// Mirrors `QPDFPageDocumentHelper::flattenAnnotations`.
     ///
@@ -497,7 +508,11 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// of `forbidden_flags` are set. As in qpdf, annotations with an
     /// appearance dictionary are removed even if no selected appearance can
     /// be drawn; annotations without one are retained.
-    pub fn flatten_annotations(&mut self, required_flags: i64, forbidden_flags: i64) -> Result<()> {
+    pub fn flatten_annotations_with_flags(
+        &mut self,
+        required_flags: i64,
+        forbidden_flags: i64,
+    ) -> Result<()> {
         // Keep enumeration inside the document-level operation so it can
         // follow qpdf's order: AcroForm analysis and NeedAppearances warning,
         // then `getAllPages()`, then per-page flattening. That page list must
