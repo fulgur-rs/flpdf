@@ -7,6 +7,31 @@ use std::io::Cursor;
 mod common;
 use common::build_pdf;
 
+fn annotation_flags_pdf() -> Vec<u8> {
+    let annotation = |flags: i32, appearance: u32| {
+        format!(
+            "<< /Type /Annot /Subtype /Square /Rect [0 0 10 10] /F {flags} /AP << /N {appearance} 0 R >> >>"
+        )
+    };
+    let appearance =
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << >> /Length 4 >>\nstream\nq Q\nendstream";
+    let objects = vec![
+        (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned()),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /Annots [4 0 R 6 0 R 8 0 R] >>".to_owned(),
+        ),
+        (4, annotation(0, 5)),
+        (5, appearance.to_owned()),
+        (6, annotation(1, 7)),
+        (7, appearance.to_owned()),
+        (8, annotation(2, 9)),
+        (9, appearance.to_owned()),
+    ];
+    build_pdf(&objects, 1)
+}
+
 fn one_page_nested_tree_with_unknown_key() -> Vec<u8> {
     let objects: [&[u8]; 4] = [
         b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
@@ -776,4 +801,42 @@ fn add_page_rejects_an_append_index_out_of_range_after_flattening() {
             .len(),
         1
     );
+}
+
+#[test]
+fn flatten_annotations_defaults_to_no_required_flags_and_forbids_invisible_hidden() {
+    let bytes = annotation_flags_pdf();
+    let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("open flag fixture");
+
+    PageDocumentHelper::new(&mut pdf)
+        .flatten_annotations()
+        .expect("the public default call uses qpdf's all-annotations flag mask");
+
+    let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+    assert!(page.try_get_key(b"/Annots").unwrap().try_is_null().unwrap());
+    let xobjects = page
+        .try_get_key(b"/Resources")
+        .unwrap()
+        .try_get_key(b"/XObject")
+        .unwrap();
+    let names = xobjects.try_get_keys().unwrap();
+    assert_eq!(names.len(), 1, "only the F=0 annotation is eligible");
+    assert_eq!(
+        xobjects.try_get_key(b"/Fxo1").unwrap().object_ref(),
+        Some(ObjectRef::new(5, 0)),
+        "required_flags defaults to zero and forbidden_flags defaults to 1|2"
+    );
+
+    let mut print_only = Pdf::open(Cursor::new(bytes)).expect("reopen flag fixture");
+    PageDocumentHelper::new(&mut print_only)
+        .flatten_annotations_with_flags(0x4, 0x3)
+        .expect("explicit flags remain available through the named variant");
+    let page = print_only.get_object_handle(ObjectRef::new(3, 0));
+    assert!(page
+        .try_get_key(b"/Resources")
+        .unwrap()
+        .try_get_key(b"/XObject")
+        .unwrap()
+        .try_is_null()
+        .unwrap());
 }

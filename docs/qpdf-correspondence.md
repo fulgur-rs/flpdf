@@ -2050,6 +2050,8 @@ form; `Widget`, `Text`, and `Link` each selected one; slash-prefixed strings,
 default, while `get_annotations_with_subtype` passes decoded subtype bytes to
 `try_is_dictionary_of_type_with_subtype(b"", subtype)` without slash normalization.
 
+`PageDocumentHelper::flatten_annotations()` maps qpdf's `required_flags = 0` and `forbidden_flags = an_invisible | an_hidden` defaults to `(0, 3)` (`include/qpdf/QPDFPageDocumentHelper.hh:104`, `include/qpdf/Constants.h:220-221`); explicit masks remain available as `flatten_annotations_with_flags`.
+
 `PageDocumentHelper::flatten_annotations` は qpdf と同じく AcroForm の NeedAppearances 判定後に repaired page list を得て、各 page の effective `/Resources`・appearance 処理・annotation removal を行う。qpdf は `getAllPages()` が返した raw `QPDFPageObjectHelper` を `flattenAnnotationsForPage` まで保持する（`QPDFPageDocumentHelper.cc:55-76`）。flpdf も `PageDocumentHelper::get_all_pages()` の raw `ObjectHandle` を resource materialization、rotation lookup、annotation flattening、content insertion へ渡し、`ObjectRef` projection を通さない。raw identity `(17, 65535)` 上の eligible appearance flattening は `page_annotation_flatten::tests::public_qpdf_flatten_copies_a_raw_generation_page_handle` で固定する。
 `flpdf-hrgj` closes the remaining page-operation consumer boundary: primary
 raw label copies register their foreign-map provenance as

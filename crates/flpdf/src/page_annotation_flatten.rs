@@ -1075,7 +1075,7 @@ mod tests {
             .expect("update page count");
 
         crate::PageDocumentHelper::new(&mut pdf)
-            .flatten_annotations(0, 0x3)
+            .flatten_annotations()
             .expect("flatten the raw-generation page");
 
         let pages = crate::PageDocumentHelper::new(&mut pdf)
