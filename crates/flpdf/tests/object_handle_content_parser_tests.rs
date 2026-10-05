@@ -1,7 +1,7 @@
 use flpdf::{
     parse_content_operations, pipeline::PlString, ContentToken, ContentTokenType, ObjectHandle,
-    ObjectHandleParserCallbacks, ObjectRef, ParseControl, Pdf, PipelineResult, QpdfExc,
-    TokenFilter, TokenFilterOutput,
+    ObjectHandleParserCallbacks, ObjectRef, PageObjectHelper, ParseControl, Pdf, PipelineResult,
+    QpdfExc, TokenFilter, TokenFilterOutput,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -529,6 +529,33 @@ fn filter_page_contents_uses_the_canonical_pipeline_and_eof_lifecycle() {
         .unwrap();
 
     assert_eq!(output, b"1 2 cm!");
+    assert_eq!(filter.eof_calls, 1);
+    assert!(filter
+        .tokens
+        .iter()
+        .any(|(token_type, raw)| *token_type == ContentTokenType::Word && raw == b"cm"));
+}
+
+#[test]
+fn page_helper_filter_contents_routes_form_targets_through_stream_filtering() {
+    let mut pdf = Pdf::empty().unwrap();
+    let form = pdf
+        .new_stream_with_data(Rc::new(b"1 2 cm\n".to_vec()))
+        .unwrap();
+    let form_dict = form.as_stream_dict().unwrap();
+    form_dict
+        .replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))
+        .unwrap();
+    form_dict
+        .replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))
+        .unwrap();
+    let mut helper = PageObjectHelper::from_object_handle(form, &mut pdf);
+    let mut filter = RecordingFilter::default();
+
+    helper
+        .filter_contents(&mut filter)
+        .expect("qpdf filters a Form target as stream contents");
+
     assert_eq!(filter.eof_calls, 1);
     assert!(filter
         .tokens
