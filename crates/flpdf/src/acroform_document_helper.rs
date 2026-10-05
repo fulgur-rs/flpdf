@@ -1822,6 +1822,15 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         self.add_and_rename_form_fields_with_reserved_names(fields, &BTreeSet::new())
     }
 
+    /// Add one form field without renaming it, matching qpdf's public
+    /// `QPDFAcroFormDocumentHelper::addFormField`
+    /// (`include/qpdf/QPDFAcroFormDocumentHelper.hh:88-93`,
+    /// `libqpdf/QPDFAcroFormDocumentHelper.cc:49-59`). Same-name fields are
+    /// retained as distinct entries, as in qpdf.
+    pub fn add_form_field(&mut self, field: ObjectHandle) -> Result<()> {
+        self.add_form_fields(vec![field])
+    }
+
     /// Append copied top-level fields without renaming them, mirroring qpdf's
     /// `addFormField` (`QPDFAcroFormDocumentHelper.cc:49-59`). The
     /// `flattenRotation` caller has already removed the original field tree,
