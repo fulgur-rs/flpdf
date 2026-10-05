@@ -76,6 +76,56 @@ fn build_annotation_pdf(annot_extras: &str) -> Vec<u8> {
 }
 
 #[test]
+fn appearance_stream_resolves_default_as_before_direct_stream_dispatch() {
+    let appearance = b"<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << >> /Length 3 >>\nstream\nq Q\nendstream";
+    let bytes = || {
+        build_pdf(vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (
+                2,
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>".to_vec(),
+            ),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /Annots [4 0 R] >>".to_vec(),
+            ),
+            (
+                4,
+                b"<< /Type /Annot /Subtype /Widget /Rect [0 0 10 10] /AS 6 0 R /AP << /N 5 0 R >> >>".to_vec(),
+            ),
+            (5, appearance.to_vec()),
+            (6, b"6 0 R".to_vec()),
+        ])
+    };
+
+    let mut pdf = open(bytes());
+    assert!(pdf.repair_diagnostics().entries().is_empty());
+    let mut annotation = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
+    let stream = annotation
+        .get_appearance_stream(b"/N")
+        .expect("direct appearance stream remains selectable");
+    assert_eq!(stream.object_ref(), Some(ObjectRef::new(5, 0)));
+    assert!(
+        pdf.repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|warning| { warning.get_message_detail() == b"expected endobj" }),
+        "qpdf resolves the default /AS before the direct /AP/N stream return"
+    );
+
+    let mut pdf = open(bytes());
+    let mut annotation = AnnotationObjectHelper::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
+    let stream = annotation
+        .get_appearance_stream_with_state(b"/N", b"/On")
+        .expect("explicit state still returns the direct appearance stream");
+    assert_eq!(stream.object_ref(), Some(ObjectRef::new(5, 0)));
+    assert!(
+        pdf.repair_diagnostics().entries().is_empty(),
+        "an explicit non-empty state bypasses /AS in qpdf"
+    );
+}
+
+#[test]
 fn appearance_helpers_match_qpdf_default_state_and_flag_masks() {
     let appearance =
         b"<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Resources << >> /Length 4 >>\nstream\nq Q\nendstream";

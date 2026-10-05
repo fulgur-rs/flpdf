@@ -1990,8 +1990,11 @@ and an empty state slice maps to qpdf's empty-string default
 `forbidden_flags = an_invisible | an_hidden` to `(0, 3)`; custom masks remain in
 `get_page_content_for_appearance_with_flags`
 (`include/qpdf/QPDFAnnotationObjectHelper.hh:82-86`,
-`include/qpdf/Constants.h:220-221`). The existing `/AP`, `/AS`, flag, and
-geometry processing order is unchanged.
+`include/qpdf/Constants.h:220-221`). For an empty state, the Rust helper now
+resolves `/AS` before checking `/AP` or `/AP/<which>`, matching qpdf's eager
+`desired_state` calculation and warning order even when the selected entry is a
+direct stream (`QPDFAnnotationObjectHelper.cc:52-63`). Flag and geometry
+processing order remains unchanged.
 
 `FormFieldObjectHelper::set_value(value)` and `set_value_string(text)` map
 qpdf's `need_appearances = true` defaults for both `setV` overloads
