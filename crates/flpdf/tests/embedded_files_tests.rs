@@ -100,6 +100,50 @@ fn make_filespec(pdf: &mut Pdf<Cursor<Vec<u8>>>, filename: &[u8]) -> ObjectHandl
     FileSpec::create_file_spec(pdf, filename, embedded_file).expect("filespec")
 }
 
+#[test]
+fn filespec_default_stream_and_filename_call_shapes_match_qpdf() {
+    let mut pdf = Pdf::empty().expect("create empty PDF");
+    let unicode_stream =
+        EmbeddedFileStream::create_ef_stream(&mut pdf, b"unicode payload").expect("UF stream");
+    let compatibility_stream =
+        EmbeddedFileStream::create_ef_stream(&mut pdf, b"compat payload").expect("F stream");
+    let filespec_handle =
+        FileSpec::create_file_spec(&mut pdf, b"initial.txt", unicode_stream.clone())
+            .expect("create FileSpec");
+    filespec_handle
+        .try_get_key(b"/EF")
+        .unwrap()
+        .replace_key(b"/F", compatibility_stream.clone())
+        .unwrap();
+    let mut filespec = FileSpec::new(filespec_handle, &mut pdf).expect("wrap FileSpec");
+
+    let preferred = filespec
+        .get_embedded_file_stream()
+        .expect("default embedded-file stream lookup");
+    assert_eq!(preferred.object_ref(), unicode_stream.object_ref());
+    let explicit = filespec
+        .get_embedded_file_stream_with_key("/F")
+        .expect("explicit embedded-file stream key");
+    assert_eq!(explicit.object_ref(), compatibility_stream.object_ref());
+
+    let unicode_name = "π.txt".as_bytes();
+    let encoded_unicode_name = flpdf::pdf_string::new_unicode_string(unicode_name);
+    filespec
+        .set_filename(unicode_name)
+        .expect("default compatibility name");
+    assert_eq!(
+        filespec.filename().unwrap(),
+        Some(encoded_unicode_name.clone())
+    );
+    assert_eq!(filespec.uf().unwrap(), Some(encoded_unicode_name.clone()));
+
+    filespec
+        .set_filename_with_compatibility_name(unicode_name, b"compat.txt")
+        .expect("explicit compatibility name");
+    assert_eq!(filespec.filename().unwrap(), Some(b"compat.txt".to_vec()));
+    assert_eq!(filespec.uf().unwrap(), Some(encoded_unicode_name));
+}
+
 fn embedded_names_handle(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> ObjectHandle {
     let catalog = catalog_handle(pdf);
     let mut names = catalog.try_get_key(b"/Names").unwrap();
@@ -2125,7 +2169,7 @@ fn payload_round_trips_an_encrypted_compressed_attachment() {
     // skips decryption would not simply happen to match by producing
     // identical bytes unfiltered.
     let stream_handle = fs
-        .get_embedded_file_stream("")
+        .get_embedded_file_stream()
         .expect("resolve /EF stream handle");
     let stream_dict = stream_handle.as_stream_dict().expect("stream dictionary");
     assert_eq!(

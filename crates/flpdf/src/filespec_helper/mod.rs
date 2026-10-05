@@ -321,7 +321,7 @@ mod tests {
         let filespec = pdf.get_object_handle(fs_ref);
         let mut filespec = FileSpec::new(filespec, pdf).expect("Filespec handle");
         filespec
-            .get_embedded_file_stream("")
+            .get_embedded_file_stream()
             .expect("embedded file stream handle")
     }
 
