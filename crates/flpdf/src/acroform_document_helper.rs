@@ -2057,7 +2057,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 if form_field.get_field_type()?.as_deref() == Some(b"/Btn") {
                     if form_field.is_checkbox()? || form_field.is_radio_button()? {
                         let value = form_field.field_value()?.unwrap_or_else(ObjectHandle::null);
-                        form_field.set_value(value, false)?;
+                        form_field.set_value_with_options(value, false)?;
                     } // cov:ignore: llvm-cov maps this covered branch closing brace to a zero-count structural region
                 } else {
                     form_field.generate_appearance_for_handle(widget)?;

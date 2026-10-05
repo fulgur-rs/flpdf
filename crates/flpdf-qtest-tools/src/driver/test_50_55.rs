@@ -132,7 +132,7 @@ pub(crate) fn run_test_51<R: Read + Seek>(
         if utf8 == b"r1" {
             writeln!(stdout, "setting r1 via parent")?;
             let mut foh = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
-            let qpdf_flush_result_62 = foh.set_value(ObjectHandle::name(b"2".to_vec()), true);
+            let qpdf_flush_result_62 = foh.set_value(ObjectHandle::name(b"2".to_vec()));
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             qpdf_flush_result_62?;
         } else if utf8 == b"r2" {
@@ -144,7 +144,7 @@ pub(crate) fn run_test_51<R: Read + Seek>(
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             let kid = kid?;
             let mut foh = FormFieldObjectHelper::from_object_handle(kid, pdf);
-            let qpdf_flush_result_63 = foh.set_value(ObjectHandle::name(b"3".to_vec()), true);
+            let qpdf_flush_result_63 = foh.set_value(ObjectHandle::name(b"3".to_vec()));
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             qpdf_flush_result_63?;
         } else if utf8 == b"checkbox1" {
@@ -153,13 +153,13 @@ pub(crate) fn run_test_51<R: Read + Seek>(
             // in /N and may not match this value (matches qpdf's own comment:
             // setV maps any non-/Off name to "checked").
             let mut foh = FormFieldObjectHelper::from_object_handle(field, pdf);
-            let qpdf_flush_result_64 = foh.set_value(ObjectHandle::name(b"Sure".to_vec()), true);
+            let qpdf_flush_result_64 = foh.set_value(ObjectHandle::name(b"Sure".to_vec()));
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             qpdf_flush_result_64?;
         } else if utf8 == b"checkbox2" {
             writeln!(stdout, "turning checkbox2 off")?;
             let mut foh = FormFieldObjectHelper::from_object_handle(field, pdf);
-            let qpdf_flush_result_65 = foh.set_value(ObjectHandle::name(b"Off".to_vec()), true);
+            let qpdf_flush_result_65 = foh.set_value(ObjectHandle::name(b"Off".to_vec()));
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             qpdf_flush_result_65?;
         }
@@ -240,7 +240,7 @@ pub(crate) fn run_test_52<R: Read + Seek>(
             // `value.isString()` branch.)
             let value = ObjectHandle::string(os_str_diagnostic_bytes(arg2).into_owned());
             let mut foh = FormFieldObjectHelper::from_object_handle(field, pdf);
-            let qpdf_flush_result_66 = foh.set_value(value, true);
+            let qpdf_flush_result_66 = foh.set_value(value);
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             qpdf_flush_result_66?;
         }
