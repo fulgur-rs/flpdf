@@ -7868,6 +7868,66 @@ fn pages_duplicate_selection_matches_qpdf_resource_copy_boundary() {
 }
 
 #[test]
+fn pages_duplicate_selection_preserves_empty_indirect_annots_like_qpdf() {
+    if !qpdf_11_9_available() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("empty-indirect-annots.pdf");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    let bytes = build_classic_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Annots 5 0 R >>\nendobj\n",
+        b"4 0 obj\nnull\nendobj\n",
+        b"5 0 obj\n[]\nendobj\n",
+    ]);
+    std::fs::write(&input, bytes).unwrap();
+
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(["--static-id"])
+        .arg(&input)
+        .args(["--pages", input.to_str().unwrap(), "1,1", "--"])
+        .arg(&qpdf_output)
+        .output()
+        .unwrap();
+    assert!(
+        qpdf.status.success(),
+        "qpdf --pages duplicate selection failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--static-id"])
+        .arg(&input)
+        .args(["--pages", ".", "1,1", "--"])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    let flpdf_bytes = std::fs::read(&flpdf_output).unwrap();
+    let qpdf_bytes = std::fs::read(&qpdf_output).unwrap();
+    let first_difference = flpdf_bytes
+        .iter()
+        .zip(&qpdf_bytes)
+        .position(|(flpdf, qpdf)| flpdf != qpdf)
+        .unwrap_or_else(|| flpdf_bytes.len().min(qpdf_bytes.len()));
+    if flpdf_bytes != qpdf_bytes {
+        let flpdf_start = first_difference.saturating_sub(24).min(flpdf_bytes.len());
+        let qpdf_start = first_difference.saturating_sub(24).min(qpdf_bytes.len());
+        let flpdf_end = (first_difference + 56).min(flpdf_bytes.len());
+        let qpdf_end = (first_difference + 56).min(qpdf_bytes.len());
+        panic!(
+            "repeated page selection must preserve an empty indirect /Annots array like qpdf; first byte difference at {first_difference}; flpdf={:?}; qpdf={:?}",
+            &flpdf_bytes[flpdf_start..flpdf_end],
+            &qpdf_bytes[qpdf_start..qpdf_end]
+        );
+    }
+}
+
+#[test]
 fn pages_inherited_resource_non_target_categories_match_qpdf() {
     if !qpdf_11_9_available() {
         return;
