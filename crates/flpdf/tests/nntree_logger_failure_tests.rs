@@ -80,7 +80,7 @@ fn name_tree_does_not_downgrade_a_child_resolution_logger_failure() {
     logger.set_warn(Some(PipelineHandle::new(FailOnceSink { failed: false })));
     pdf.set_logger(logger);
 
-    let mut tree = NameTree::new(pdf.get_object_handle(ObjectRef::new(4, 0)), true);
+    let mut tree = NameTree::new(pdf.get_object_handle(ObjectRef::new(4, 0)));
     let result = tree.begin(&mut pdf);
 
     assert!(result.is_ok());
@@ -95,7 +95,7 @@ fn name_tree_structural_non_dictionary_is_downgraded_to_a_warning() {
     let scalar = pdf
         .make_indirect_from_object_handle(flpdf::ObjectHandle::integer(1))
         .expect("scalar tree root should be allocatable");
-    let mut tree = NameTree::new(scalar, true);
+    let mut tree = NameTree::new(scalar);
 
     let cursor = tree
         .begin(&mut pdf)
@@ -120,7 +120,7 @@ fn name_tree_structural_warning_logger_failure_is_propagated() {
     let logger = QPDFLogger::create();
     logger.set_warn(Some(PipelineHandle::new(FailOnceSink { failed: false })));
     pdf.set_logger(logger);
-    let mut tree = NameTree::new(scalar, true);
+    let mut tree = NameTree::new(scalar);
 
     let result = tree.begin(&mut pdf);
 

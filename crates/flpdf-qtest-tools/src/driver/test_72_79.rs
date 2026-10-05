@@ -272,7 +272,7 @@ pub(crate) fn run_test_74<R: Read + Seek>(
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     writeln!(stdout, "/Split1")?;
-    let mut split1 = NumberTree::new(pdf.trailer_key_handle(b"Split1"), true);
+    let mut split1 = NumberTree::new(pdf.trailer_key_handle(b"Split1"));
     split1.set_split_threshold(4);
     for key in [15_i64, 35, 125] {
         let value = ObjectHandle::string(key.to_string().into_bytes());
@@ -294,7 +294,7 @@ pub(crate) fn run_test_74<R: Read + Seek>(
     }
 
     writeln!(stdout, "/Split2")?;
-    let mut split2 = NameTree::new(pdf.trailer_key_handle(b"Split2"), true);
+    let mut split2 = NameTree::new(pdf.trailer_key_handle(b"Split2"));
     split2.set_split_threshold(4);
     let value = ObjectHandle::string(flpdf::pdf_string::new_unicode_string(b"C"));
     let inserted = split2.insert(pdf, b"C", value)?;
@@ -316,7 +316,7 @@ pub(crate) fn run_test_74<R: Read + Seek>(
     }
 
     writeln!(stdout, "/Split3")?;
-    let mut split3 = NameTree::new(pdf.trailer_key_handle(b"Split3"), true);
+    let mut split3 = NameTree::new(pdf.trailer_key_handle(b"Split3"));
     split3.set_split_threshold(4);
     // "\xcf\x80" is the raw UTF-8 bytes qpdf's C++ string literal
     // holds -- the two-byte encoding of U+03C0 (pi) -- passed as-is as the
@@ -368,13 +368,13 @@ pub(crate) fn run_test_75<R: Read + Seek>(
 ) -> flpdf::Result<()> {
     // qpdf's own function has no `std::cout` calls at all -- its entire
     // observable surface is assertions plus the closing `QPDFWriter` write.
-    let mut erase1 = NameTree::new(pdf.trailer_key_handle(b"Erase1"), true);
+    let mut erase1 = NameTree::new(pdf.trailer_key_handle(b"Erase1"));
     assert!(erase1.remove(pdf, b"1X")?.is_none());
     let removed = erase1.remove(pdf, b"1C")?.expect("1C must be present");
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let removed_text = removed.try_get_utf8_value()?;
     assert_eq!(removed_text, b"c");
-    let mut iter1 = erase1.find(pdf, b"1B", false)?;
+    let mut iter1 = erase1.find(pdf, b"1B")?;
     iter1.remove(&mut erase1, pdf)?;
     assert_eq!(
         iter1.current().expect("cursor at 1D after removing 1B").0,
@@ -394,8 +394,8 @@ pub(crate) fn run_test_75<R: Read + Seek>(
     assert!(iter1 == erase1.end());
 
     let erase2_handle = pdf.trailer_key_handle(b"Erase2");
-    let mut erase2 = NumberTree::new(erase2_handle.clone(), true);
-    let qpdf_flush_result_79 = erase2.find(pdf, 250, false);
+    let mut erase2 = NumberTree::new(erase2_handle.clone());
+    let qpdf_flush_result_79 = erase2.find(pdf, 250);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let mut iter2 = qpdf_flush_result_79?;
     iter2.remove(&mut erase2, pdf)?;
@@ -416,7 +416,7 @@ pub(crate) fn run_test_75<R: Read + Seek>(
     assert_eq!(limit1_low, 230);
     assert_eq!(limit1_high, 240);
 
-    let mut iter2b = erase2.find(pdf, 210, false)?;
+    let mut iter2b = erase2.find(pdf, 210)?;
     iter2b.remove(&mut erase2, pdf)?;
     assert_eq!(
         iter2b
@@ -435,8 +435,8 @@ pub(crate) fn run_test_75<R: Read + Seek>(
     let kid0_kids = kid0.try_get_key(b"/Kids")?;
     assert_eq!(kid0_kids.try_get_array_n_items()?, 1);
 
-    let mut erase3 = NumberTree::new(pdf.trailer_key_handle(b"Erase3"), true);
-    let qpdf_flush_result_80 = erase3.find(pdf, 320, false);
+    let mut erase3 = NumberTree::new(pdf.trailer_key_handle(b"Erase3"));
+    let qpdf_flush_result_80 = erase3.find(pdf, 320);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let mut iter3 = qpdf_flush_result_80?;
     iter3.remove(&mut erase3, pdf)?;
@@ -444,8 +444,8 @@ pub(crate) fn run_test_75<R: Read + Seek>(
     erase3.remove(pdf, 310)?;
     assert!(erase3.begin(pdf)? == erase3.end());
 
-    let mut erase4 = NumberTree::new(pdf.trailer_key_handle(b"Erase4"), true);
-    let qpdf_flush_result_81 = erase4.find(pdf, 420, false);
+    let mut erase4 = NumberTree::new(pdf.trailer_key_handle(b"Erase4"));
+    let qpdf_flush_result_81 = erase4.find(pdf, 420);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let mut iter4 = qpdf_flush_result_81?;
     iter4.remove(&mut erase4, pdf)?;

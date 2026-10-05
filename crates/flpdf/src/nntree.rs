@@ -439,7 +439,15 @@ impl NameTree {
     ///
     /// The first PDF passed to an operation claims the handle's document
     /// boundary; subsequent operations reject handles from another PDF.
-    pub fn new(root: ObjectHandle, auto_repair: bool) -> Self {
+    ///
+    /// This uses qpdf's default `auto_repair = true`
+    /// (`include/qpdf/QPDFNameTreeObjectHelper.hh:46`).
+    pub fn new(root: ObjectHandle) -> Self {
+        Self::new_with_options(root, true)
+    }
+
+    /// Wrap an existing name-tree root handle with an explicit repair policy.
+    pub fn new_with_options(root: ObjectHandle, auto_repair: bool) -> Self {
         Self {
             inner: NNTree::new(root, auto_repair),
             cursor_owner: Arc::new(()),
@@ -451,13 +459,28 @@ impl NameTree {
     /// # Errors
     ///
     /// Returns an error when the PDF object-number space is exhausted.
-    pub fn new_empty<R: Read + Seek>(pdf: &mut Pdf<R>, auto_repair: bool) -> Result<Self> {
+    ///
+    /// This uses qpdf's default `auto_repair = true`
+    /// (`include/qpdf/QPDFNameTreeObjectHelper.hh:50`).
+    pub fn new_empty<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Self> {
+        Self::new_empty_with_options(pdf, true)
+    }
+
+    /// Create an empty name tree with an explicit repair policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the PDF object-number space is exhausted.
+    pub fn new_empty_with_options<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        auto_repair: bool,
+    ) -> Result<Self> {
         let root = ObjectHandle::dictionary(vec![(
             canonical_dictionary_key(NameKey::ITEMS_KEY.as_bytes()),
             ObjectHandle::array(Vec::new()),
         )]);
         let root = pdf.make_indirect_from_object_handle(root)?;
-        Ok(Self::new(root, auto_repair))
+        Ok(Self::new_with_options(root, auto_repair))
     }
 
     /// Return the live root handle, matching qpdf's `getObjectHandle`.
@@ -497,12 +520,26 @@ impl NameTree {
         })
     }
 
-    /// Find `key`, optionally returning the closest lower entry.
+    /// Find `key`, matching qpdf's default `return_prev_if_not_found = false`
+    /// (`include/qpdf/QPDFNameTreeObjectHelper.hh:147`).
     ///
     /// # Errors
     ///
     /// Returns an error when the tree cannot be resolved or searched.
     pub fn find<R: Read + Seek, K: AsRef<[u8]>>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        key: K,
+    ) -> Result<NameTreeCursor> {
+        self.find_with_options(pdf, key, false)
+    }
+
+    /// Find `key`, optionally returning the closest lower entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or searched.
+    pub fn find_with_options<R: Read + Seek, K: AsRef<[u8]>>(
         &mut self,
         pdf: &mut Pdf<R>,
         key: K,
@@ -751,7 +788,15 @@ impl NumberTree {
     ///
     /// The first PDF passed to an operation claims the handle's document
     /// boundary; subsequent operations reject handles from another PDF.
-    pub fn new(root: ObjectHandle, auto_repair: bool) -> Self {
+    ///
+    /// This uses qpdf's default `auto_repair = true`
+    /// (`include/qpdf/QPDFNumberTreeObjectHelper.hh:44`).
+    pub fn new(root: ObjectHandle) -> Self {
+        Self::new_with_options(root, true)
+    }
+
+    /// Wrap an existing number-tree root handle with an explicit repair policy.
+    pub fn new_with_options(root: ObjectHandle, auto_repair: bool) -> Self {
         Self {
             inner: NNTree::new(root, auto_repair),
             cursor_owner: Arc::new(()),
@@ -763,13 +808,28 @@ impl NumberTree {
     /// # Errors
     ///
     /// Returns an error when the PDF object-number space is exhausted.
-    pub fn new_empty<R: Read + Seek>(pdf: &mut Pdf<R>, auto_repair: bool) -> Result<Self> {
+    ///
+    /// This uses qpdf's default `auto_repair = true`
+    /// (`include/qpdf/QPDFNumberTreeObjectHelper.hh:51`).
+    pub fn new_empty<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Self> {
+        Self::new_empty_with_options(pdf, true)
+    }
+
+    /// Create an empty number tree with an explicit repair policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the PDF object-number space is exhausted.
+    pub fn new_empty_with_options<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        auto_repair: bool,
+    ) -> Result<Self> {
         let root = ObjectHandle::dictionary(vec![(
             canonical_dictionary_key(NumberKey::ITEMS_KEY.as_bytes()),
             ObjectHandle::array(Vec::new()),
         )]);
         let root = pdf.make_indirect_from_object_handle(root)?;
-        Ok(Self::new(root, auto_repair))
+        Ok(Self::new_with_options(root, auto_repair))
     }
 
     /// Return the live root handle, matching qpdf's `getObjectHandle`.
@@ -809,12 +869,22 @@ impl NumberTree {
         })
     }
 
+    /// Find `key`, matching qpdf's default `return_prev_if_not_found = false`
+    /// (`include/qpdf/QPDFNumberTreeObjectHelper.hh:162`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or searched.
+    pub fn find<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>, key: i64) -> Result<NumberTreeCursor> {
+        self.find_with_options(pdf, key, false)
+    }
+
     /// Find `key`, optionally returning the closest lower entry.
     ///
     /// # Errors
     ///
     /// Returns an error when the tree cannot be resolved or searched.
-    pub fn find<R: Read + Seek>(
+    pub fn find_with_options<R: Read + Seek>(
         &mut self,
         pdf: &mut Pdf<R>,
         key: i64,
@@ -2673,7 +2743,7 @@ mod tests {
             ObjectHandle::array(vec![leaf(0, 9), ObjectHandle::integer(7), leaf(20, 29)]),
         )]);
         let mut pdf = Pdf::empty().expect("empty PDF");
-        let mut tree = NumberTree::new(root, false);
+        let mut tree = NumberTree::new_with_options(root, false);
 
         let error = tree
             .find_object(&mut pdf, 15)
@@ -2703,7 +2773,7 @@ mod tests {
             let root =
                 ObjectHandle::dictionary(vec![(b"Kids".to_vec(), ObjectHandle::array(vec![leaf]))]);
             let mut pdf = Pdf::empty().expect("empty PDF");
-            let mut tree = NumberTree::new(root, false);
+            let mut tree = NumberTree::new_with_options(root, false);
             assert!(
                 tree.find_object(&mut pdf, 0).is_err(),
                 "malformed Limits must be rejected"
@@ -2727,7 +2797,7 @@ mod tests {
                 ]),
             ),
         ]);
-        assert!(NumberTree::new(bad_items, false)
+        assert!(NumberTree::new_with_options(bad_items, false)
             .find_object(&mut pdf, 0)
             .is_err());
 
@@ -2743,7 +2813,7 @@ mod tests {
         ]);
         let root =
             ObjectHandle::dictionary(vec![(b"Kids".to_vec(), ObjectHandle::array(vec![leaf]))]);
-        assert!(NumberTree::new(root, false)
+        assert!(NumberTree::new_with_options(root, false)
             .find_object(&mut pdf, 20)
             .is_ok());
     }

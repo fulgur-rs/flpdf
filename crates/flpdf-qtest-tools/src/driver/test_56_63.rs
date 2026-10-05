@@ -486,7 +486,7 @@ pub(crate) fn run_test_61(
 
     {
         let _name_tree = Test61ExtendNameTree {
-            _inner: NameTree::new(ObjectHandle::null(), true),
+            _inner: NameTree::new(ObjectHandle::null()),
             stdout,
         };
     }
