@@ -1702,7 +1702,8 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         // still gets created/promoted above, but there is nothing to merge.
         if let Some(source_resources) = source_resources {
             source_resources.make_resources_indirect(self.pdf)?;
-            destination_resources.merge_resources(&source_resources, Some(&mut conflicts))?;
+            destination_resources
+                .merge_resources_with_conflicts(&source_resources, Some(&mut conflicts))?;
         }
         if source_need_appearances {
             self.set_need_appearances(true)?;
@@ -1814,7 +1815,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         annotation: ObjectHandle,
     ) -> Result<Option<ObjectHandle>> {
         annotation.try_dereference()?;
-        if !annotation.try_is_dictionary_of_type(b"", b"Widget")? {
+        if !annotation.try_is_dictionary_of_type_with_subtype(b"", b"Widget")? {
             return Ok(None);
         }
         self.analyze()?;
@@ -1854,7 +1855,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ) -> Result<bool> {
         for annotation in annotations {
             annotation.try_dereference()?;
-            if annotation.try_is_dictionary_of_type(b"", b"Widget")?
+            if annotation.try_is_dictionary_of_type_with_subtype(b"", b"Widget")?
                 && self
                     .canonical_field_for_annotation(annotation.clone())?
                     .is_none()

@@ -25,7 +25,7 @@ fn normalize_content_uses_canonical_handle_accessors() {
         );
     }
     assert!(source.contains(".try_get_key("));
-    assert!(source.contains(".try_is_stream_of_type(b\"\", b\"\")?"));
+    assert!(source.contains(".try_is_stream_of_type(b\"\")?"));
     let array_guard = source
         .find(".try_is_array()?")
         .expect("normalize-content must resolve the Contents array predicate");

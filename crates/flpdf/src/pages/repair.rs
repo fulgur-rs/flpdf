@@ -318,7 +318,7 @@ fn repair_page_tree_handle<R: Read + Seek>(
             }
         }
 
-        if !kid.try_is_dictionary_of_type(b"Page", b"")? {
+        if !kid.try_is_dictionary_of_type(b"Page")? {
             kid.warn_if_possible("/Type key should be /Page but is not; overriding")?;
             replace_handle_key(&kid, b"/Type", ObjectHandle::name(b"Page".to_vec()))?;
         }
@@ -373,7 +373,7 @@ fn repair_page_tree_frame<R: Read + Seek>(
         return Ok(None); // cov:ignore: callers recurse only after observing a dictionary /Kids key
     }
 
-    if !node.try_is_dictionary_of_type(b"Pages", b"")? {
+    if !node.try_is_dictionary_of_type(b"Pages")? {
         node.warn_if_possible("/Type key should be /Pages but is not; overriding")?;
         replace_handle_key(&node, b"/Type", ObjectHandle::name(b"Pages".to_vec()))?;
     }

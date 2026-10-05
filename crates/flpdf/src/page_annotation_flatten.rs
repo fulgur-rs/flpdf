@@ -329,7 +329,7 @@ fn flatten_annotations_on_page_handle<R: Read + Seek>(
         // accepted candidate's number is "the value used, not the next
         // value" -- it only becomes final once this annotation is confirmed
         // to produce content, below.
-        let xobj_name = resources.get_unique_resource_name(b"/Fxo", &mut xobj_counter, None)?;
+        let xobj_name = resources.get_unique_resource_name(b"/Fxo", &mut xobj_counter)?;
         // The `/Fxo` prefix and the decimal suffix are both ASCII, so this
         // conversion never substitutes a replacement character.
         let resource_name = String::from_utf8_lossy(&xobj_name);
@@ -359,7 +359,7 @@ fn flatten_annotations_on_page_handle<R: Read + Seek>(
         )]);
         // The live merge is intentionally allowed to partially apply before
         // a later category reports an error, matching qpdf's call boundary.
-        resources.merge_resources(&empty_xobject_placeholder, None)?;
+        resources.merge_resources(&empty_xobject_placeholder)?;
         let xobj_dict = resources.try_get_key(b"/XObject")?;
 
         let xobject = if data.appearance.is_indirect() {
@@ -843,7 +843,7 @@ fn merge_widget_default_resources_on_page_with_associations<R: Read + Seek>(
         // source and matching-destination categories interleaved, one DR
         // category at a time, rather than in two whole-dictionary passes.
         resolve_matched_category_handles(&resources, default_resources)?;
-        resources.merge_resources(default_resources, None)?;
+        resources.merge_resources(default_resources)?;
     }
     Ok(())
 }

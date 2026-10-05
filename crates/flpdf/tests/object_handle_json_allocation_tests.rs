@@ -51,7 +51,7 @@ fn allocations_for(handle: &ObjectHandle) -> usize {
     ALLOCATIONS.store(0, Ordering::Relaxed);
     let mut sink = CountingSink { bytes: 0 };
     black_box(handle)
-        .write_json(2, &mut sink, true, 0)
+        .write_json_with_options(2, &mut sink, true, 0)
         .expect("JSON serialization");
     assert!(sink.bytes > 0);
     ALLOCATIONS.load(Ordering::Relaxed)

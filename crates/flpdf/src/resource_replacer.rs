@@ -164,7 +164,7 @@ pub(crate) fn filter_resource_names_from_stream(
 ) -> crate::Result<Vec<u8>> {
     let mut buffer = Buffer::new("ResourceReplacer buffer", None);
     let mut replacer = ResourceReplacer::new(renames, names);
-    stream.filter_as_contents(&mut replacer, Some(&mut buffer))?;
+    stream.filter_as_contents_with_pipeline(&mut replacer, Some(&mut buffer))?;
     Ok(buffer.take_buffer()?)
 }
 

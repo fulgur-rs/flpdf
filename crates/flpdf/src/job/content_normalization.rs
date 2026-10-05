@@ -49,7 +49,7 @@ fn apply_normalize_content<R: Read + Seek>(
     let contents_ref = contents.object_ref();
 
     let mut streams = Vec::new();
-    if contents.try_is_stream_of_type(b"", b"")? {
+    if contents.try_is_stream_of_type(b"")? {
         if let Some(stream_ref) = contents_ref {
             streams.push((stream_ref, contents));
         }
@@ -57,7 +57,7 @@ fn apply_normalize_content<R: Read + Seek>(
         let items = contents.try_get_array_as_vector()?;
         for item in items {
             let item_ref = item.object_ref();
-            if item.try_is_stream_of_type(b"", b"")? {
+            if item.try_is_stream_of_type(b"")? {
                 if let Some(item_ref) = item_ref {
                     streams.push((item_ref, item));
                 }

@@ -156,7 +156,7 @@ impl LiveQueue {
                     .to_string(),
             ));
         }
-        if self.qdf && handle.try_is_stream_of_type(b"XRef", b"")? {
+        if self.qdf && handle.try_is_stream_of_type(b"XRef")? {
             if let Some(source) = handle
                 .qpdf_obj_gen()
                 .filter(|object_gen| object_gen.is_indirect())
@@ -850,7 +850,7 @@ impl crate::writer::object::DynamicDirectStreamWriter for LiveDirectStreamWriter
         stream.try_dereference()?;
         let (dict, data, dictionary_options) =
             canonical_stream_output_for_rewrite(stream, self.options, false)?;
-        let is_metadata_stream = dict.try_is_dictionary_of_type(b"Metadata", b"")?;
+        let is_metadata_stream = dict.try_is_dictionary_of_type(b"Metadata")?;
         let encrypt_stream = self
             .encryption_context
             .is_some_and(|context| context.encrypt_metadata || !is_metadata_stream);
@@ -2527,7 +2527,7 @@ fn canonical_stream_data_with_rewrite_policy(
     // writer policy would preserve or compress a lone-Flate source. The plain
     // route is unencrypted, so this exception always applies here.
     let is_metadata_stream = apply_full_rewrite_metadata_policy
-        && stream_dict.try_is_dictionary_of_type(b"Metadata", b"")?
+        && stream_dict.try_is_dictionary_of_type(b"Metadata")?
         && options
             .encrypt
             .as_ref()
@@ -2686,7 +2686,7 @@ fn canonical_stream_filter_plan(
     let normalize_content = normalize_content && !normalization_applied;
     let source_has_lone_flate = canonical_is_lone_flate(&stream_dict)?;
     let is_metadata_stream = apply_full_rewrite_metadata_policy
-        && stream_dict.try_is_dictionary_of_type(b"Metadata", b"")?
+        && stream_dict.try_is_dictionary_of_type(b"Metadata")?
         && options
             .encrypt
             .as_ref()

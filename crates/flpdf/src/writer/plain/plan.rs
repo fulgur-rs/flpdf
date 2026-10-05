@@ -380,12 +380,12 @@ impl PlainWritePlan {
                 let is_xref = match &object {
                     PlannedIndirectObject::Source { source, .. } => pdf
                         .get_object_handle(*source)
-                        .try_is_stream_of_type(b"XRef", b"")?,
+                        .try_is_stream_of_type(b"XRef")?,
                     // cov:ignore-start: qdf XRef-stream raw identities are
                     // not representable as a valid input object reference.
                     PlannedIndirectObject::RawSource { raw, .. } => pdf
                         .get_object_handle_by_raw_identity(raw.get_obj(), raw.get_gen())
-                        .try_is_stream_of_type(b"XRef", b"")?,
+                        .try_is_stream_of_type(b"XRef")?,
                     // cov:ignore-end
                     PlannedIndirectObject::ObjectStream { .. } => false,
                 };
@@ -805,8 +805,8 @@ fn build_qdf_emission_plan<R: Read + Seek>(
                 // dedicated placement arm below (`QPDFWriter.cc:1620-1775`).
                 let handle = pdf.get_object_handle(*source);
                 handle.try_dereference()?;
-                let is_real_stream = handle.as_stream_dict().is_some()
-                    && !handle.try_is_stream_of_type(b"XRef", b"")?;
+                let is_real_stream =
+                    handle.as_stream_dict().is_some() && !handle.try_is_stream_of_type(b"XRef")?;
                 if is_real_stream {
                     let holder = next_number()?;
                     result.holder_numbers.insert(holder);
@@ -819,9 +819,7 @@ fn build_qdf_emission_plan<R: Read + Seek>(
                 result.map.insert(*source, ObjectRef::new(emission, 0));
                 let handle = pdf.get_object_handle_by_raw_identity(raw.get_obj(), raw.get_gen());
                 handle.try_dereference()?;
-                if handle.as_stream_dict().is_some()
-                    && !handle.try_is_stream_of_type(b"XRef", b"")?
-                {
+                if handle.as_stream_dict().is_some() && !handle.try_is_stream_of_type(b"XRef")? {
                     let holder = next_number()?;
                     result.holder_numbers.insert(holder);
                 }

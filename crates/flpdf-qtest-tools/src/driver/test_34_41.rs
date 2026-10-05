@@ -246,7 +246,7 @@ fn matching_filespec_ef_f_stream<R: Read + Seek>(
         stderr,
     )?;
     let ef_f_is_stream = after_qpdf_call(pdf, filename, diagnostics_written, stdout, stderr)(
-        ef_f.try_is_stream_of_type(b"", b""),
+        ef_f.try_is_stream_of_type(b""),
     )?;
     if !ef_f_is_stream {
         return Ok(None);

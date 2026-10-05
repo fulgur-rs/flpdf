@@ -220,31 +220,31 @@ pub(crate) fn run_test_82<R: Read + Seek>(
     assert!(!string.try_is_name_and_equals(b"Marvin")?);
 
     let mut dictionary = ObjectHandle::parse(b"<</A 1 /Type /Test /Subtype /Marvin>>")?;
-    assert!(dictionary.try_is_dictionary_of_type(b"Test", b"")?);
-    assert!(dictionary.try_is_dictionary_of_type(b"Test", b"")?);
-    assert!(dictionary.try_is_dictionary_of_type(b"Test", b"Marvin")?);
-    assert!(dictionary.try_is_dictionary_of_type(b"", b"Marvin")?);
-    assert!(dictionary.try_is_dictionary_of_type(b"", b"")?);
-    assert!(!dictionary.try_is_dictionary_of_type(b"Test2", b"")?);
-    assert!(!dictionary.try_is_dictionary_of_type(b"Test2", b"Marvin")?);
-    assert!(!dictionary.try_is_dictionary_of_type(b"Test", b"M")?);
-    assert!(!name.try_is_dictionary_of_type(b"", b"")?);
+    assert!(dictionary.try_is_dictionary_of_type(b"Test")?);
+    assert!(dictionary.try_is_dictionary_of_type(b"Test")?);
+    assert!(dictionary.try_is_dictionary_of_type_with_subtype(b"Test", b"Marvin")?);
+    assert!(dictionary.try_is_dictionary_of_type_with_subtype(b"", b"Marvin")?);
+    assert!(dictionary.try_is_dictionary_of_type(b"")?);
+    assert!(!dictionary.try_is_dictionary_of_type(b"Test2")?);
+    assert!(!dictionary.try_is_dictionary_of_type_with_subtype(b"Test2", b"Marvin")?);
+    assert!(!dictionary.try_is_dictionary_of_type_with_subtype(b"Test", b"M")?);
+    assert!(!name.try_is_dictionary_of_type(b"")?);
 
     dictionary = ObjectHandle::parse(b"<</A 1 /Type null /Subtype /Marvin>>")?;
-    assert!(!dictionary.try_is_dictionary_of_type(b"Test", b"")?);
+    assert!(!dictionary.try_is_dictionary_of_type(b"Test")?);
     dictionary = ObjectHandle::parse(b"<</A 1 /Type (Test) /Subtype /Marvin>>")?;
-    assert!(!dictionary.try_is_dictionary_of_type(b"/Test", b"")?);
+    assert!(!dictionary.try_is_dictionary_of_type(b"/Test")?);
     dictionary = ObjectHandle::parse(b"<</A 1 /Type /Test /Subtype (Marvin)>>")?;
-    assert!(!dictionary.try_is_dictionary_of_type(b"/Test", b"")?);
+    assert!(!dictionary.try_is_dictionary_of_type(b"/Test")?);
     dictionary = ObjectHandle::parse(b"<</A 1 /Subtype /Marvin>>")?;
-    assert!(!dictionary.try_is_dictionary_of_type(b"Test", b"/Marvin")?);
+    assert!(!dictionary.try_is_dictionary_of_type_with_subtype(b"Test", b"/Marvin")?);
 
     let stream = pdf.get_object_handle(ObjectRef::new(1, 0));
-    assert!(stream.try_is_stream_of_type(b"ObjStm", b"")?);
-    assert!(!stream.try_is_stream_of_type(b"Test", b"")?);
+    assert!(stream.try_is_stream_of_type(b"ObjStm")?);
+    assert!(!stream.try_is_stream_of_type(b"Test")?);
     assert!(!pdf
         .get_object_handle(ObjectRef::new(2, 0))
-        .try_is_stream_of_type(b"Pages", b"")?);
+        .try_is_stream_of_type(b"Pages")?);
 
     let mut array = ObjectHandle::parse(b"[/Blah /Blaah /Blaaah]")?;
     assert!(array.try_is_or_has_name(b"Blah")?);

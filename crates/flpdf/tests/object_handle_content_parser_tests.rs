@@ -525,7 +525,7 @@ fn filter_page_contents_uses_the_canonical_pipeline_and_eof_lifecycle() {
     let mut output = Vec::new();
     let mut sink = PlString::new("filtered page content", None, &mut output);
 
-    page.filter_page_contents(&mut filter, Some(&mut sink))
+    page.filter_page_contents_with_pipeline(&mut filter, Some(&mut sink))
         .unwrap();
 
     assert_eq!(output, b"1 2 cm!");
@@ -545,7 +545,7 @@ fn filter_as_contents_can_discard_tokens_and_add_content_filter_is_lazy() {
     };
     let mut output = Vec::new();
     let mut sink = PlString::new("filtered form content", None, &mut output);
-    form.filter_as_contents(&mut filter, Some(&mut sink))
+    form.filter_as_contents_with_pipeline(&mut filter, Some(&mut sink))
         .unwrap();
     assert_eq!(output, b" 1 ");
     assert_eq!(filter.eof_calls, 1);
@@ -590,7 +590,7 @@ fn filter_as_contents_ignores_failed_stream_decoding_like_qpdf() {
     let mut filter = RecordingFilter::default();
 
     failing
-        .filter_as_contents(&mut filter, None)
+        .filter_as_contents(&mut filter)
         .expect("qpdf ignores an unsuccessful specialized stream pipe");
     assert_eq!(filter.eof_calls, 0);
 }
@@ -609,7 +609,7 @@ fn filter_as_contents_propagates_provider_errors() {
     let mut filter = RecordingFilter::default();
 
     let error = failing
-        .filter_as_contents(&mut filter, None)
+        .filter_as_contents(&mut filter)
         .expect_err("provider exceptions must cross filterAsContents");
     assert_eq!(error.to_string(), "provider failure");
 }

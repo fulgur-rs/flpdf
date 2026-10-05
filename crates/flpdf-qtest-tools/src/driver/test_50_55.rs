@@ -32,7 +32,7 @@ pub(crate) fn run_test_50<R: Read + Seek>(
     let d1 = d1_handle.clone();
     let d2 = d2_handle.clone();
 
-    let merge_result = d1.merge_resources(&d2, None);
+    let merge_result = d1.merge_resources(&d2);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     merge_result?;
 
@@ -61,7 +61,7 @@ pub(crate) fn run_test_50<R: Read + Seek>(
     let d2_k1 = d2.try_get_key(b"/k1");
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let d2_k1 = d2_k1?;
-    let merge_result = d1.merge_resources(&d2_k1, None);
+    let merge_result = d1.merge_resources(&d2_k1);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     merge_result?;
 

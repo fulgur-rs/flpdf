@@ -454,7 +454,7 @@ impl StreamFilter for CryptStreamFilter {
             let is_allowed_key = (key.as_slice() == b"/Type") || (key.as_slice() == b"/Name");
             if is_allowed_key
                 && (!decode_params.try_has_key(b"/Type")?
-                    || decode_params.try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")?)
+                    || decode_params.try_is_dictionary_of_type(b"CryptFilterDecodeParms")?)
             {
                 // qpdf handles these two in decryptStream.
             } else {

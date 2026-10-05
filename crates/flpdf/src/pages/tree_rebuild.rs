@@ -273,7 +273,7 @@ fn collect_page_tree_frame(
     }
 
     node.try_dereference()?;
-    if !node.try_is_dictionary_of_type(b"Pages", b"")? {
+    if !node.try_is_dictionary_of_type(b"Pages")? {
         return Ok(None);
     }
     nodes.push(node.clone());
@@ -563,7 +563,7 @@ fn rebuild_page_tree_canonical<R: Read + Seek>(
     for &src in selected {
         let page = pdf.get_object_handle(src);
         page.try_dereference()?;
-        if !page.try_is_dictionary_of_type(b"Page", b"")? {
+        if !page.try_is_dictionary_of_type(b"Page")? {
             return Err(Error::Unsupported(format!(
                 "selected object {src} is not a /Page dictionary"
             )));

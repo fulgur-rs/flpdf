@@ -1520,7 +1520,7 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
         // (`QPDFWriter.cc:1093-1103,1955-2003`).
         if is_primary && preserve_primary_unreferenced {
             for source_object in input.source.canonical_live_object_handles()? {
-                if source_object.try_is_stream_of_type(b"ObjStm", b"")? {
+                if source_object.try_is_stream_of_type(b"ObjStm")? {
                     continue;
                 }
                 copy_foreign_object_for_preserve(&mut target, &source_object)?;

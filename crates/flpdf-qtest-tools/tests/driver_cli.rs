@@ -71,7 +71,7 @@ fn test_50_uses_canonical_resource_merge_accessors() {
     // `?` by an intervening `emit_new_diagnostics` flush.
     assert!(
         test_50.contains(
-            "let merge_result = d1.merge_resources(&d2, None);\n    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;\n    merge_result?;"
+            "let merge_result = d1.merge_resources(&d2);\n    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;\n    merge_result?;"
         ),
         "test 50's first merge_resources call must flush diagnostics before propagating its own failure"
     );
@@ -83,7 +83,7 @@ fn test_50_uses_canonical_resource_merge_accessors() {
     );
     assert!(
         test_50.contains(
-            "let merge_result = d1.merge_resources(&d2_k1, None);\n    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;\n    merge_result?;"
+            "let merge_result = d1.merge_resources(&d2_k1);\n    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;\n    merge_result?;"
         ),
         "test 50's second merge_resources call must flush diagnostics before propagating its own failure"
     );

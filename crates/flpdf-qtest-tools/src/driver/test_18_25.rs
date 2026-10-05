@@ -311,7 +311,7 @@ pub(crate) fn run_test_24<R: Read + Seek + 'static>(
     // (`libqpdf/QPDFObjectHandle.cc:2091-2131`) before the second
     // `replaceReserved` installs the other array.
     let mut res2_direct = res2.clone();
-    match res2_direct.make_direct(false) {
+    match res2_direct.make_direct() {
         Ok(()) => writeln!(stdout, "oops -- didn't throw")?,
         Err(error) => writeln!(stdout, "logic error: {error}")?,
     }

@@ -2824,7 +2824,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             return Ok(());
         };
 
-        if !stream_dict.try_is_dictionary_of_type(b"ObjStm", b"")? {
+        if !stream_dict.try_is_dictionary_of_type(b"ObjStm")? {
             // qpdf uses damagedPDF(message) here, so the warning carries the
             // current object description and input-source last offset
             // (`QPDF.cc:1760-1779,2630-2644`) rather than a bare message.
@@ -5220,8 +5220,8 @@ fn inspect_stream_encryption(
         // qpdf's `if (isDictionary()) { if (isDictionaryOfType()) ... }
         // else if (isArray() && filter.isArray()) ...` shape matters: a
         // dictionary of the wrong type never falls through to array pairing.
-        if decode_params.try_is_dictionary_of_type(b"", b"")? {
-            if decode_params.try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")? {
+        if decode_params.try_is_dictionary_of_type(b"")? {
+            if decode_params.try_is_dictionary_of_type(b"CryptFilterDecodeParms")? {
                 let name = decode_params.try_get_key(b"/Name")?;
                 method = Some(interpret_cf_from_handle(encryption, &name)?);
                 method_source = "stream's Crypt decode parameters";
@@ -5238,7 +5238,7 @@ fn inspect_stream_encryption(
                         continue; // cov:ignore: equal-length in-range array indexes always exist
                     };
                     let is_crypt = filter_item.try_is_name_and_equals(b"Crypt")?;
-                    let has_dictionary_params = crypt_params.try_is_dictionary_of_type(b"", b"")?;
+                    let has_dictionary_params = crypt_params.try_is_dictionary_of_type(b"")?;
                     if !is_crypt || !has_dictionary_params {
                         continue;
                     }

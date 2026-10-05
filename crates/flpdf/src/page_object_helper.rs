@@ -291,7 +291,7 @@ impl<'a, R: Read + Seek + 'static> InlineImageExternalizer<'a, R> {
 
     fn next_name(&mut self) -> std::result::Result<Vec<u8>, PipelineError> {
         self.resources
-            .get_unique_resource_name(b"/IIm", &mut self.min_suffix, None)
+            .get_unique_resource_name(b"/IIm", &mut self.min_suffix)
             .map_err(|error| PipelineError::runtime(error.to_string()))
     }
 }
@@ -1396,9 +1396,9 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     ) -> Result<()> {
         let (target, is_form) = self.resolved_attribute_target()?;
         if is_form {
-            target.filter_as_contents(filter, next)
+            target.filter_as_contents_with_pipeline(filter, next)
         } else {
-            target.filter_page_contents(filter, next)
+            target.filter_page_contents_with_pipeline(filter, next)
         }
     }
 
@@ -1599,7 +1599,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     where
         F: FnMut(ObjectHandle, ObjectHandle, Vec<u8>) -> Result<()>,
     {
-        self.for_each_xobject_filtered(recursive, |object| object.is_image(true), action)
+        self.for_each_xobject_filtered(recursive, |object| object.is_image(), action)
     }
 
     /// Visit Form XObjects, optionally recursing through nested Forms.
@@ -1686,7 +1686,9 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let mut result = Vec::with_capacity(annots_array.len());
         for item in annots_array {
             let annotation = &item;
-            if !annotation.try_is_dictionary_of_type(b"", only_subtype.unwrap_or(b""))? {
+            if !annotation
+                .try_is_dictionary_of_type_with_subtype(b"", only_subtype.unwrap_or(b""))?
+            {
                 continue;
             }
             result.push(item);
@@ -1735,7 +1737,7 @@ fn externalize_inline_images_for_target<R: Read + Seek + 'static>(
     // preserving qpdf's warning/no-resource boundary for those documents.
     let empty_xobjects = ObjectHandle::dictionary(Vec::new());
     let seed = ObjectHandle::dictionary(vec![(b"/XObject".to_vec(), empty_xobjects)]);
-    resources.merge_resources(&seed, None)?;
+    resources.merge_resources(&seed)?;
 
     let mut rewritten = Vec::new();
     let any_images = {
@@ -1746,9 +1748,9 @@ fn externalize_inline_images_for_target<R: Read + Seek + 'static>(
         // for setup/mutation errors; an unsuccessful filter is the same
         // warning-only no-op rather than a partially rewritten page.
         let filter_result = if is_form {
-            target.filter_as_contents(&mut filter, Some(&mut sink))
+            target.filter_as_contents_with_pipeline(&mut filter, Some(&mut sink))
         } else {
-            target.filter_page_contents(&mut filter, Some(&mut sink))
+            target.filter_page_contents_with_pipeline(&mut filter, Some(&mut sink))
         };
         match filter_result {
             Ok(()) => filter.any_images,
@@ -2576,7 +2578,7 @@ mod tests {
                     .try_is_scalar()
                     .expect("annotation should resolve");
                 annotation
-                    .try_is_dictionary_of_type(b"", b"Widget")
+                    .try_is_dictionary_of_type_with_subtype(b"", b"Widget")
                     .expect("widget classification should resolve")
                     .then(|| annotation.object_ref())
                     .flatten()

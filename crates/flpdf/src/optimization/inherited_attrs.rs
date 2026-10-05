@@ -443,7 +443,7 @@ fn push_internal<R: Read + Seek>(
 }
 
 fn is_pages_dictionary(handle: &ObjectHandle) -> Result<bool> {
-    handle.try_is_dictionary_of_type(b"Pages", b"")
+    handle.try_is_dictionary_of_type(b"Pages")
 }
 
 fn handle_reference(handle: &ObjectHandle) -> bool {

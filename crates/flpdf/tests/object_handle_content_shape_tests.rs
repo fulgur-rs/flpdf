@@ -49,10 +49,10 @@ fn form_and_image_classification_matches_qpdf() {
             (b"/ImageMask".to_vec(), ObjectHandle::boolean(true)),
         ],
     );
-    assert!(image.is_image(false).unwrap());
-    assert!(!image.is_image(true).unwrap());
-    assert!(!stream(b"Form").is_image(true).unwrap());
-    assert!(!ObjectHandle::integer(1).is_image(true).unwrap());
+    assert!(image.is_image_with_options(false).unwrap());
+    assert!(!image.is_image().unwrap());
+    assert!(!stream(b"Form").is_image().unwrap());
+    assert!(!ObjectHandle::integer(1).is_image().unwrap());
 }
 
 #[test]
@@ -61,8 +61,8 @@ fn indirect_form_image_and_page_contents_use_canonical_handles() {
     let form = pdf.get_object_handle(ObjectRef::new(4, 0));
     let image = pdf.get_object_handle(ObjectRef::new(5, 0));
     assert!(form.is_form_xobject().unwrap());
-    assert!(image.is_image(false).unwrap());
-    assert!(!image.is_image(true).unwrap());
+    assert!(image.is_image_with_options(false).unwrap());
+    assert!(!image.is_image().unwrap());
 
     let page = pdf.get_object_handle(ObjectRef::new(3, 0));
     let contents = page.get_page_contents().unwrap();
@@ -83,7 +83,7 @@ fn unique_resource_name_uses_the_supplied_prefix_and_suffix_cursor() {
 
     assert_eq!(
         resources
-            .get_unique_resource_name(b"/F", &mut min_suffix, None)
+            .get_unique_resource_name(b"/F", &mut min_suffix)
             .unwrap(),
         b"/F1"
     );
@@ -147,7 +147,7 @@ fn unique_resource_name_accepts_a_precomputed_name_set() {
 
     assert_eq!(
         resources
-            .get_unique_resource_name(b"/Im", &mut min_suffix, Some(&names))
+            .get_unique_resource_name_with_resource_names(b"/Im", &mut min_suffix, Some(&names))
             .unwrap(),
         b"/Im2"
     );
@@ -168,7 +168,7 @@ fn unique_resource_name_resolves_nested_indirect_resource_dictionaries() {
 
     assert_eq!(
         resources
-            .get_unique_resource_name(b"/F", &mut min_suffix, None)
+            .get_unique_resource_name(b"/F", &mut min_suffix)
             .unwrap(),
         b"/F1"
     );
@@ -179,7 +179,7 @@ fn unique_resource_name_on_a_non_dictionary_uses_an_empty_name_set() {
     let mut min_suffix = 0;
     assert_eq!(
         ObjectHandle::integer(1)
-            .get_unique_resource_name(b"/F", &mut min_suffix, None)
+            .get_unique_resource_name(b"/F", &mut min_suffix)
             .unwrap(),
         b"/F0"
     );

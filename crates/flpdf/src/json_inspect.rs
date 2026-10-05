@@ -54,9 +54,7 @@ pub(crate) fn pdf_object_to_json_with_version(
     handle: &ObjectHandle,
     version: i32,
 ) -> Result<Json, ConvertError> {
-    handle
-        .get_json(version, false)
-        .map_err(convert_object_json_error)
+    handle.get_json(version).map_err(convert_object_json_error)
 }
 
 fn convert_object_json_error(error: ObjectJsonError) -> ConvertError {
@@ -91,7 +89,7 @@ pub(crate) fn pdf_dest_to_json_with_version(
     version: i32,
 ) -> Result<Json, ConvertError> {
     handle
-        .get_json(version, true)
+        .get_json_with_options(version, true)
         .map_err(convert_object_json_error)
 }
 

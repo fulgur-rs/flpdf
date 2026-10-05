@@ -47,7 +47,7 @@ resolver would leave the plan/renumber graph inconsistent with qpdf.
 1. Add a small canonical pre-plan Catalog preparation boundary in the
    linearization writer. Resolve the live Catalog handle; if `/Extensions` is
    an indirect dictionary, replace it with `ObjectHandle::shallow_copy()`; then
-   if `/ADBE` is indirect, call `ObjectHandle::make_direct(false)` and replace
+   if `/ADBE` is indirect, call `ObjectHandle::make_direct()` and replace
    that child. Mark the Catalog dirty once when a replacement occurs. This is
    the direct Rust translation of qpdf's `prepareFileForWrite`; it does not
    recursively normalize unrelated Catalog keys or invent a generic adapter.
