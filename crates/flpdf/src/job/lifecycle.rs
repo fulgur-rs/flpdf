@@ -3890,7 +3890,8 @@ impl QPDFJob {
         // boundary so JSON and CLI callers reach the same page helper route.
         if let Some(mode) = configuration.flatten_annotations {
             let (required_flags, forbidden_flags) = mode.qpdf_flags();
-            PageDocumentHelper::new(pdf).flatten_annotations(required_flags, forbidden_flags)?;
+            PageDocumentHelper::new(pdf)
+                .flatten_annotations_with_flags(required_flags, forbidden_flags)?;
         }
 
         // qpdf's `handleTransformations` coalesces every page after the
