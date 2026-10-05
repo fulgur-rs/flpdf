@@ -1,7 +1,8 @@
 //! Integration coverage for the public qpdf-shaped form-field helper.
 
 use flpdf::form_field_object_helper::FormFieldObjectHelper;
-use flpdf::{AcroFormDocumentHelper, DecodeLevel, Error, ObjectHandle, ObjectRef, Pdf};
+use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
+use flpdf::{AcroFormDocumentHelper, DecodeLevel, Error, ObjectHandle, ObjectRef, Pdf, QPDFLogger};
 use std::io::Cursor;
 
 mod common;
@@ -42,6 +43,22 @@ fn doc_with_root(root: &str, mut objects: Vec<(u32, String)>) -> Vec<u8> {
     ];
     base.append(&mut objects);
     build_pdf(&base, 1)
+}
+
+struct FailingWarningSink;
+
+impl Pipeline for FailingWarningSink {
+    fn identifier(&self) -> &str {
+        "form-field helper failing warning sink"
+    }
+
+    fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
+        Err(PipelineError::runtime("sink write failure 1"))
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
 }
 
 fn resolved_handle(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef) -> ObjectHandle {
@@ -1031,6 +1048,22 @@ fn set_need_appearances_replaces_true_and_removes_false_for_dictionary() {
         .expect("remove the key on a dictionary");
     assert!(!has_entry(&acroform, b"/NeedAppearances"));
     assert!(pdf.repair_diagnostics().entries().is_empty());
+}
+
+#[test]
+fn set_need_appearances_propagates_catalog_warning_sink_failure() {
+    let mut pdf = open(doc(vec![]));
+    let logger = QPDFLogger::create();
+    logger.set_warn(Some(PipelineHandle::new(FailingWarningSink)));
+    pdf.set_logger(logger);
+
+    let result = AcroFormDocumentHelper::new(&mut pdf)
+        .expect("construct AcroForm helper")
+        .set_need_appearances(true);
+    assert!(matches!(
+        result,
+        Err(Error::System(message)) if message == "sink write failure 1"
+    ));
 }
 
 #[test]
