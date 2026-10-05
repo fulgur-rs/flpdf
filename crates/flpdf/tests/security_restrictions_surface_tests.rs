@@ -12,7 +12,7 @@ fn security_restriction_helpers_do_not_expose_changed_bool() {
     assert!(acroform.contains("pub fn disable_digital_signatures(&mut self) -> Result<()>"));
     assert!(!acroform.contains("pub fn disable_digital_signatures(&mut self) -> Result<bool>"));
     assert!(acroform.contains(
-        "pub(crate) fn remove_form_fields(&mut self, to_remove: &BTreeSet<QpdfObjGen>) -> Result<()>"
+        "pub fn remove_form_fields(&mut self, to_remove: &BTreeSet<QpdfObjGen>) -> Result<()>"
     ));
     assert!(!acroform.contains(
         "pub(crate) fn remove_form_fields(&mut self, to_remove: &BTreeSet<QpdfObjGen>) -> Result<bool>"
