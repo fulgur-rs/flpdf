@@ -932,6 +932,17 @@ document-wide の独自 aggregate route ではなく、保持された各 leaf �
 
 | `QPDF::resolve` / `QPDF::resolveObjectsInStream`（xref object-read/cache boundary） | `QPDF.cc:1700-1857`; `QPDF.cc:1541-1697` | `engine.rs` が parse 前に作る `ResolverHandle` を `xref.rs::CanonicalTrailerOwner` として渡し、active xref stream、hybrid `/XRefStm`、`/Prev` chain、reconstruction candidate の object read を `ResolverHandle::resolve_at_offset_with_optional_description`（live `readObjectAtOffset` → `readObject` → `readStream`）へ統一する。`/Type`/`/W`/`/Index`/`/Size`/filter は `XrefObjectContext` から同じ canonical handle/cache と warning snapshot を参照する。`.48.14`でbootstrap ObjStmの specialized decode順序をqpdf責務へ揃え、`.48.15.1`でcanonical recovery candidateも live ownerから直接 trailer/object handleを生成して `LoadedXrefState` handoff後のrebind/second teardownを無くした。`.48.72`でowner-less public loader/exportとproduction callerを撤去し、残るBootstrapHandleState/bounded reconstruction windowはtest-only scaffoldingとして隔離した。 | 🔀 `.48.13` / `.48.15.1` / `.48.72` / `.48.73` で canonical production xref-stream/read, canonical handoff, public route撤去, warning live deliveryを完了。残るtest-only bootstrap reconstructionはqpdfのproduction document ownerを迂回しない |
 
+Hybrid-xref `/XRefStm` selection also follows qpdf's resolving key-presence
+contract: `QPDF::readXref` calls `cur_trailer.hasKey("/XRefStm")` before its
+ignore-streams and integer gates (`QPDF.cc:915-924`). `QPDFObjectHandle::hasKey`
+resolves the holder and delegates to `QPDF_Dictionary::hasKey`, which treats a
+value resolving to null as absent (`QPDFObjectHandle.cc:965-975`;
+`QPDF_Dictionary.cc:97-101`; `QPDFObjectHandle::isNull`:353-356). flpdf's
+`merge_xref_stream_from_classic_trailer_with_build_diagnostics` uses
+`ObjectHandle::try_has_key` at that boundary. The direct-null and indirect-null
+cases are differential-tested against qpdf 11.9.0 in
+`crates/flpdf-cli/tests/cli_xrefstm_null_qpdf.rs`.
+
 ### Persistent null after a resolution loop (`flpdf-64dx9`, 2026-09-17)
 
 qpdf 11.9.0 の `QPDF::resolve` は、`isUnresolved` を確認してから
