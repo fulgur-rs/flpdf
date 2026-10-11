@@ -39,7 +39,7 @@
 //!
 //! `QPDFObjectHandle` (`include/qpdf/QPDFObjectHandle.hh`) shares a canonical `QPDFObject`
 //! (`libqpdf/qpdf/QPDFObject.hh`), which owns the `QPDFValue` payload
-//! (`libqpdf/qpdf/QPDFValue.hh`).
+//! (`libqpdf/qpdf/QPDFValue.hh`). Its fourteen subclasses (`libqpdf/qpdf/QPDF_*.hh`) are folded into one variant each of the crate-private `ObjectValue` enum: a container substitution only, since every variant keeps its subclass's type code, type name, unparse text, and JSON text, so emitted bytes do not change.
 //!
 //! qpdf stores a stream's deferred source as a
 //! `std::shared_ptr<QPDFObjectHandle::StreamDataProvider>` in
