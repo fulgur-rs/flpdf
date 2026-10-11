@@ -51,6 +51,21 @@ jobs:
   quality:
     name: Quality
     runs-on: ubuntu-latest
+    # Stacked pull requests: GitHub runs this workflow for every pull request
+    # in a native stack, each evaluated as if it targeted the stack base
+    # (https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/optimizing-ci-for-stacked-pull-requests).
+    # Quality stays on every layer; the expensive jobs below (test matrix,
+    # release, coverage, fuzz, qtest) read `full_ci` and run only where they
+    # are needed:
+    #   - outside a stack (pushes, ordinary pull requests): `stack` is absent;
+    #   - the lowest unmerged pull request, which targets the stack base
+    #     directly and is the one that merges next;
+    #   - the top pull request, which carries the whole stack's changes.
+    # Middle layers report those jobs as skipped.  Once the bottom lands, the
+    # next pull request is rebased onto the stack base and becomes the new
+    # lowest unmerged one, so it gets the full run before it merges.
+    outputs:
+      full_ci: ${{ github.event.pull_request.stack == null || github.event.pull_request.stack.base.ref == github.event.pull_request.base.ref || github.event.pull_request.stack.position == github.event.pull_request.stack.size }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -135,6 +150,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     needs: quality
+    if: needs.quality.outputs.full_ci == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -470,6 +486,7 @@ jobs:
   release:
     name: Release
     needs: quality
+    if: needs.quality.outputs.full_ci == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -513,6 +530,7 @@ jobs:
   coverage:
     name: Coverage
     needs: quality
+    if: needs.quality.outputs.full_ci == 'true'
     runs-on: ubuntu-latest
     # Codecov OIDC upload needs id-token: write.  Isolating coverage in its
     # own single-runner job keeps that elevated permission off the cross-
@@ -595,6 +613,7 @@ jobs:
   fuzz:
     name: Fuzz (short)
     needs: quality
+    if: needs.quality.outputs.full_ci == 'true'
     runs-on: ubuntu-latest
     # Backstop in case `cargo fuzz build` hangs or -max_total_time is not
     # honored; the run itself should finish in a few minutes (build + 60s).
@@ -700,6 +719,7 @@ jobs:
   qtest:
     name: qtest survey
     needs: quality
+    if: needs.quality.outputs.full_ci == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # Nothing about qtest blocks a merge. This covers more than a regression

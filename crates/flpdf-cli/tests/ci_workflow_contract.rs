@@ -17,6 +17,13 @@ const RELEASE_JOB_RUNS_ON: &str = "ubuntu-latest";
 const RELEASE_TEST_COMMAND: &str = "cargo test --workspace --profile release-ci";
 const FILTERED_TEST_CONTRACT_COMMAND: &str =
     "cargo test -p flpdf-cli --test ci_workflow_contract -- --ignored";
+/// The only job-level `if:` a gating job may carry: the stacked-PR gate, which
+/// skips the expensive jobs on the middle layers of a native pull request stack.
+const STACK_GATE_JOB_CONDITION: &str = "needs.quality.outputs.full_ci == 'true'";
+/// The `quality` job output the stack gate reads. It is true outside a stack, on
+/// the lowest unmerged pull request and on the top one, so pushes and ordinary
+/// pull requests always get the full run; any other value could silence a job.
+const STACK_GATE_FULL_CI_OUTPUT: &str = "${{ github.event.pull_request.stack == null || github.event.pull_request.stack.base.ref == github.event.pull_request.base.ref || github.event.pull_request.stack.position == github.event.pull_request.stack.size }}";
 const LIBJPEG_COMPAT_TEST_CONDITION: &str = "${{ runner.os == 'Linux' && matrix.arch == 'amd64' }}";
 /// Filtered commands whose step installs a system library on an earlier line of
 /// its own `run:` block. The workspace test run happens before that install, so
@@ -394,6 +401,21 @@ fn workflow_contains_test_command(workflow: &str, command: &str) -> ContractResu
     Ok(false)
 }
 
+/// Whether a job's own `if:` leaves it gating: either it has none, or it is
+/// exactly the stacked-PR gate reading the approved `quality` output.
+fn job_condition_is_gating(jobs: &Yaml, job: &Yaml) -> bool {
+    let Some(condition) = mapping_get(job, "if") else {
+        return true;
+    };
+    condition.as_str() == Some(STACK_GATE_JOB_CONDITION)
+        && mapping_get(job, "needs").and_then(Yaml::as_str) == Some("quality")
+        && mapping_get(jobs, "quality")
+            .and_then(|quality| mapping_get(quality, "outputs"))
+            .and_then(|outputs| mapping_get(outputs, "full_ci"))
+            .and_then(Yaml::as_str)
+            == Some(STACK_GATE_FULL_CI_OUTPUT)
+}
+
 fn test_job_contains_test_command(workflow: &str, command: &str) -> ContractResult<bool> {
     let workflow = parse_workflow(workflow)?;
     if has_default_run_override(&workflow, "workflow")? {
@@ -406,7 +428,7 @@ fn test_job_contains_test_command(workflow: &str, command: &str) -> ContractResu
         .ok_or_else(|| "ci workflow must define the test job".to_owned())?;
     let test_job = require_mapping(test_job, "test job")?;
     if has_default_run_override(test_job, "test job")?
-        || mapping_contains_key(test_job, "if")
+        || !job_condition_is_gating(jobs, test_job)
         || !continue_on_error_is_gating(test_job)
     {
         return Ok(false);
@@ -850,7 +872,7 @@ fn release_job_contains_test_command(workflow: &str, command: &str) -> ContractR
     let release_job = require_mapping(release_job, "release job")?;
 
     if has_default_run_override(release_job, "release job")?
-        || mapping_contains_key(release_job, "if")
+        || !job_condition_is_gating(jobs, release_job)
         || !continue_on_error_is_gating(release_job)
     {
         return Ok(false);
@@ -1223,6 +1245,121 @@ jobs:
 {release_job_fields}
 "
     )
+}
+
+fn stack_gated_release_workflow(full_ci_output: &str, release_job_fields: &str) -> String {
+    let release_job_fields = release_job_fields
+        .lines()
+        .map(|line| format!("    {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "\
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    outputs:
+      full_ci: \"{full_ci_output}\"
+    steps:
+      - run: echo quality
+  release:
+{release_job_fields}
+"
+    )
+}
+
+fn stack_gated_release_job_fields(condition: &str, needs: &str) -> String {
+    format!(
+        "\
+needs: {needs}
+if: \"{condition}\"
+runs-on: ubuntu-latest
+steps:
+  - shell: bash
+    run: |
+      set -euo pipefail
+      cargo test --workspace --profile release-ci
+"
+    )
+}
+
+#[test]
+fn release_job_contract_accepts_stack_gate() {
+    let workflow = stack_gated_release_workflow(
+        STACK_GATE_FULL_CI_OUTPUT,
+        &stack_gated_release_job_fields(STACK_GATE_JOB_CONDITION, "quality"),
+    );
+
+    assert!(
+        release_job_contains_test_command(&workflow, RELEASE_TEST_COMMAND)
+            .expect("synthetic release workflow must be valid")
+    );
+}
+
+#[test]
+fn release_job_contract_rejects_stack_gate_with_altered_output() {
+    let workflow = stack_gated_release_workflow(
+        "false",
+        &stack_gated_release_job_fields(STACK_GATE_JOB_CONDITION, "quality"),
+    );
+
+    assert!(
+        !release_job_contains_test_command(&workflow, RELEASE_TEST_COMMAND)
+            .expect("synthetic release workflow must be valid")
+    );
+}
+
+#[test]
+fn release_job_contract_rejects_stack_gate_without_quality_output() {
+    let workflow = release_job_workflow(&stack_gated_release_job_fields(
+        STACK_GATE_JOB_CONDITION,
+        "quality",
+    ));
+
+    assert!(
+        !release_job_contains_test_command(&workflow, RELEASE_TEST_COMMAND)
+            .expect("synthetic release workflow must be valid")
+    );
+}
+
+#[test]
+fn release_job_contract_rejects_other_job_condition() {
+    let workflow = stack_gated_release_workflow(
+        STACK_GATE_FULL_CI_OUTPUT,
+        &stack_gated_release_job_fields("github.event_name == 'push'", "quality"),
+    );
+
+    assert!(
+        !release_job_contains_test_command(&workflow, RELEASE_TEST_COMMAND)
+            .expect("synthetic release workflow must be valid")
+    );
+}
+
+#[test]
+fn stack_gate_requires_the_quality_dependency() {
+    let workflow = parse_workflow(&stack_gated_release_workflow(
+        STACK_GATE_FULL_CI_OUTPUT,
+        &stack_gated_release_job_fields(STACK_GATE_JOB_CONDITION, "setup"),
+    ))
+    .expect("synthetic release workflow must be valid");
+    let jobs = mapping_get(&workflow, "jobs").expect("synthetic workflow defines jobs");
+    let release = mapping_get(jobs, "release").expect("synthetic workflow defines release");
+
+    assert!(!job_condition_is_gating(jobs, release));
+}
+
+#[test]
+fn ci_expensive_jobs_run_unconditionally_or_behind_the_stack_gate() {
+    let workflow = parse_workflow(CI_WORKFLOW).expect("ci workflow must parse");
+    let jobs = mapping_get(&workflow, "jobs").expect("ci workflow defines jobs");
+    for job_name in ["test", RELEASE_JOB_NAME, "coverage", "fuzz", "qtest"] {
+        let job = mapping_get(jobs, job_name).expect("ci workflow defines the job");
+        assert!(
+            job_condition_is_gating(jobs, job),
+            "{job_name} must run unconditionally or behind the stacked-PR gate"
+        );
+    }
 }
 
 #[test]
