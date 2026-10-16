@@ -259,6 +259,37 @@ fn open_and_resolve_recovery_share_one_owner_operation() {
 }
 
 #[test]
+fn hybrid_xref_key_presence_uses_the_resolving_has_key_route() {
+    let xref = source_file("xref.rs");
+    let hybrid = xref
+        .split_once("fn merge_xref_stream_from_classic_trailer_with_build_diagnostics(")
+        .and_then(|(_, rest)| rest.split_once("\n/// `error_diagnostics_sink`"))
+        .map_or_else(
+            || panic!("production hybrid xref merge function must remain identifiable"),
+            |(function, _)| function,
+        );
+
+    assert!(
+        hybrid.contains("loaded.loaded.trailer.try_has_key(b\"/XRefStm\")?"),
+        "hybrid xref key presence must resolve the trailer value like QPDFObjectHandle::hasKey"
+    );
+    let key_check = hybrid
+        .find("loaded.loaded.trailer.try_has_key(b\"/XRefStm\")?")
+        .expect("the hybrid trailer key is checked with the resolving accessor");
+    let ignore_gate = hybrid
+        .find("if options.ignore_xref_streams")
+        .expect("the existing ignore-xref-streams gate must remain");
+    assert!(
+        key_check < ignore_gate,
+        "qpdf checks trailer key presence before the ignore-xref-streams gate"
+    );
+    assert!(
+        !hybrid.contains(".as_dictionary()") && !hybrid.contains("contains_key(b\"/XRefStm\""),
+        "hybrid xref key presence must not inspect the unresolved raw map"
+    );
+}
+
+#[test]
 fn candidate_recovery_reentry_without_a_trailer_matches_qpdf_failure() {
     let fixture = include_bytes!("fixtures/xref-reconstruction-reentrant-before-trailer.pdf");
     assert_eq!(
