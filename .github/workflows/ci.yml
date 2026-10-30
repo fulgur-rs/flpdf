@@ -130,7 +130,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -184,7 +184,7 @@ jobs:
           toolchain: 1.97.1
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31
         with:
           shared-key: ${{ matrix.cache-key }}
 
@@ -498,7 +498,7 @@ jobs:
           toolchain: 1.97.1
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31
         with:
           shared-key: ubuntu-latest-flpdf-release-ci
 
@@ -552,7 +552,7 @@ jobs:
           toolchain: 1.97.1
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31
         with:
           shared-key: ubuntu-latest-flpdf-cov
 
@@ -597,7 +597,7 @@ jobs:
         run: scripts/patch-coverage.sh --base "origin/${{ github.base_ref || 'main' }}" --lcov target/patch-cov.lcov
 
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: lcov
           path: target/patch-cov.lcov
@@ -632,7 +632,7 @@ jobs:
           components: rust-src
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31
         with:
           shared-key: ubuntu-latest-flpdf-fuzz
           workspaces: fuzz
@@ -739,7 +739,7 @@ jobs:
       # The survey builds --release with qpdf-zlib-compat, which no other cell
       # here does, so it gets its own key rather than evicting theirs.
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31
         with:
           shared-key: ubuntu-latest-flpdf-qtest
 
